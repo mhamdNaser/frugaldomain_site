@@ -18,8 +18,17 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 - 19 tools: select, pan, pen, line, arrow, curve, rect, circle, ellipse,
   triangle, diamond, star, pentagon, hexagon, octagon, text, plus place-image,
   the icon library, grouping and boolean ops
-- Raw `<svg>` canvas driven by React state, split across `utils/`, eight hooks
-  and sixteen components
+- Raw `<svg>` canvas driven by React state, split across `utils/`, nine hooks
+  and nineteen components
+- **Menu bar** (File / Edit / Insert / Arrange / View / Help) carrying every
+  action, so the toolbar stays short. Nothing is menu-only by necessity: the
+  frequent actions are still on the toolbar, the status bar or a shortcut
+- **Show or hide any region** from View > Panels - toolbar, inspector, icon
+  library, status bar - plus the rulers. The arrangement is remembered
+- **Rulers** on both edges, in px, cm, mm, inches or points, shading the
+  artboard, marking the selection's extent and tracking the cursor
+- **Save and open** a drawing as an editable `.fruga.json` file
+  (<kbd>Ctrl/Cmd+S</kbd>), separate from image export
 - Undo/redo (50 steps), layers panel with rename / reorder / lock / hide /
   duplicate, groups
 - Per-element **fill, stroke, stroke width, opacity, dash, cap and join**;
@@ -54,6 +63,7 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 | Gap | Impact |
 |---|---|
 | No central store | State still lives in `DrawBoard.jsx` + hooks. It is now behind a shared `utils/` layer, so this is maintenance debt rather than a blocker |
+| Menus are mouse-driven | They open on click and hover and close on Escape, but arrow-key navigation between rows is not wired yet |
 | Group rotation | A multi-selection resizes as one but still rotates one member at a time |
 | No equal-spacing hints | Guides snap to edges and centres; they do not yet suggest matching gaps between three or more elements |
 | Icons need the API | The library is fetched live, so the panel shows an error state offline. Placed icons are inlined and keep working |
@@ -95,6 +105,11 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 - [ ] Rotate a multi-selection as one
 - [x] **Canvas presets**: icon, social and print sizes, custom, orientation swap
 - [x] **Autosave to `localStorage`** plus a recover-on-reload prompt
+- [x] **Menu bar** over every action, with the toolbar cut back to the
+      constantly-used handful
+- [x] **Show/hide every panel** from the menu, remembered between sessions
+- [x] **Rulers** with a selectable unit (px / cm / mm / in / pt)
+- [x] **Save and open** an editable document file
 
 ---
 
@@ -170,5 +185,5 @@ Carried over from problems already fixed in this codebase:
 ---
 
 **Next action:** templates (Phase 4) - the last thing between a blank canvas
-and a finished piece - then the document model and store from Phase 1, which
-every later phase depends on.
+and a finished piece. The document file format added alongside the menu bar is
+most of the groundwork: a template is a saved document with a thumbnail.
