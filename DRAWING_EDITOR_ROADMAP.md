@@ -17,18 +17,30 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 
 - 19 tools: select, pan, pen, line, arrow, curve, rect, circle, ellipse,
   triangle, diamond, star, pentagon, hexagon, octagon, text, plus place-image,
-  grouping and boolean ops
-- Raw `<svg>` canvas driven by React state, split across `utils/`, six hooks
-  and eleven components
+  the icon library, grouping and boolean ops
+- Raw `<svg>` canvas driven by React state, split across `utils/`, eight hooks
+  and sixteen components
 - Undo/redo (50 steps), layers panel with rename / reorder / lock / hide /
   duplicate, groups
 - Per-element **fill, stroke, stroke width, opacity, dash, cap and join**;
   with nothing selected the same panel sets the style for the next shape
-- Multi-select (marquee + Shift-click) that drags as one rigid group
+- **Gradients** (linear / radial, presets), **drop shadow** and **blur**, all
+  built from one set of descriptors so canvas and exported file cannot diverge
+- **Smart guides**: dragging snaps to other elements' edges and centres and to
+  the artboard's edges and centre lines, with guide lines drawn live.
+  <kbd>Alt</kbd> suspends them; the threshold is in screen pixels, so it feels
+  identical at any zoom
+- **Icon library**: all 324 icons from the site's own gallery, searchable and
+  filterable by category, dropped on the canvas as inlined vector artwork -
+  recolourable, resizable and losslessly exportable
+- Multi-select (marquee + Shift-click) that drags *and resizes* as one object
 - Align 6 ways, distribute on both axes, four z-order moves, flip, rotate
 - Copy / cut / paste / duplicate, arrow-key nudge, right-click context menu
+- **Command palette** (<kbd>Ctrl/Cmd+K</kbd>) over every action
+- **Status bar**: cursor position, selection size, artboard size, grid / snap /
+  guide toggles and a zoom slider
 - Eight-handle resize with a rotation handle, Shift to keep the ratio, and a
-  live size readout — works on **every** shape type, paths and images included
+  live size readout - works on **every** shape type, paths, icons and images
 - Images: file picker, drag-and-drop and clipboard paste, stored as data URIs
 - Artboard presets (icon / social / print), orientation swap, background colour
   including transparent
@@ -37,67 +49,71 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 - Export: SVG, PNG, JPG, WebP at 1-4x, and PDF, plus copy-image-to-clipboard
 - SVG import, keyboard shortcuts dialog
 
-**What is missing — the honest gaps**
+**What is missing - the honest gaps**
 
 | Gap | Impact |
 |---|---|
 | No central store | State still lives in `DrawBoard.jsx` + hooks. It is now behind a shared `utils/` layer, so this is maintenance debt rather than a blocker |
-| No smart guides | Alignment is button-driven; nothing snaps to other elements while dragging |
-| Multi-select resizes one at a time | Dragging moves the group as one, but the handles only bind to a single selection |
-| No gradients, shadows or blur | Flat fills and strokes only |
-| No icon-library integration | The 324-icon gallery still cannot be placed on the canvas |
+| Group rotation | A multi-selection resizes as one but still rotates one member at a time |
+| No equal-spacing hints | Guides snap to edges and centres; they do not yet suggest matching gaps between three or more elements |
+| Icons need the API | The library is fetched live, so the panel shows an error state offline. Placed icons are inlined and keep working |
 | No templates or server persistence | Every document starts blank, and autosave is per-browser |
 | Rotated shapes hit-test as unrotated | Selection uses the axis-aligned box, so a heavily rotated shape has a slightly off click target |
+| No image crop | Images can be resized, flipped and faded, but not cropped |
 
 ---
 
-## Phase 1 — Foundation
+## Phase 1 - Foundation
 
-- [x] Settle the renderer decision — Option A, SVG stays
+- [x] Settle the renderer decision - Option A, SVG stays
 - [x] **Undo/redo**, 50 steps, on <kbd>Ctrl/Cmd+Z</kbd> and
       <kbd>Ctrl/Cmd+Shift+Z</kbd>, plus toolbar buttons (`hooks/useHistory.js`)
-- [x] Split `DrawBoard.jsx` — geometry, styling, serialisation and resizing now
-      live in `utils/`; arrange, clipboard, autosave and images in `hooks/`;
-      the toolbar, inspector, menus and context menu in `components/`
+- [x] Split `DrawBoard.jsx` - geometry, styling, serialisation, resizing,
+      effects, guides and icon parsing now live in `utils/`; arrange,
+      clipboard, autosave, images and the icon library in `hooks/`; the
+      toolbar, inspector, menus, palette and status bar in `components/`
 - [ ] Define a serialisable document model as a first-class type. The autosave
       payload (`{ version, paths, textItems, width, height, background }`) is
-      the de-facto schema — promote it and version it properly
+      the de-facto schema - promote it and version it properly
 - [ ] Move editor state into a store (**Zustand + Immer**)
 
 **Done when:** every canvas action goes through one owner of state.
 
 ---
 
-## Phase 2 — Editor essentials
+## Phase 2 - Editor essentials
 
 - [x] **Layers panel**: reorder, rename, lock, hide, duplicate
 - [ ] Nest layers into groups in the panel (groups exist, the tree does not)
 - [x] **Copy / paste / duplicate** (<kbd>Ctrl+C/V/D</kbd>) and cut
-- [ ] Clipboard across tabs — it is in-memory, so it does not survive a reload
+- [ ] Clipboard across tabs - it is in-memory, so it does not survive a reload
 - [x] **Alignment**: align 6 ways, distribute on both axes
-- [ ] Smart guides against other elements and canvas centre
-- [x] **Multi-select**: marquee drag, <kbd>Shift</kbd>+click, moves as one
-- [ ] Transform a multi-selection as one (resize/rotate the whole group)
+- [x] **Smart guides** against other elements and the artboard centre
+- [ ] Equal-spacing hints between three or more elements
+- [x] **Multi-select**: marquee drag, <kbd>Shift</kbd>+click, moves and resizes
+      as one object
+- [ ] Rotate a multi-selection as one
 - [x] **Canvas presets**: icon, social and print sizes, custom, orientation swap
 - [x] **Autosave to `localStorage`** plus a recover-on-reload prompt
 
 ---
 
-## Phase 3 — Content
+## Phase 3 - Content
 
-- [x] **Image support** — upload, drag-drop, paste from clipboard; opacity,
+- [x] **Image support** - upload, drag-drop, paste from clipboard; opacity,
       flip and free resize
 - [ ] Image crop and corner radius
-- [ ] **Icon library integration** — pull from the existing 324-icon gallery
-      straight onto the canvas. This is the feature only *this* product can
-      offer, and it is why Option A matters
+- [x] **Icon library integration** - all 324 icons from the gallery, searchable
+      and filterable, inlined as editable vectors. Fetched through the API's
+      `/download-icon/` route, which is the only one that answers with CORS
+      headers; the static `/icons/` path does not
 - [x] **Text**: family, size, weight, italic, underline, alignment, letter
       spacing, rotation, and a per-item colour
 - [ ] Line height, lists, and a curated web-font set (subset the files; do not
       ship whole families)
-- [x] **Stroke styles** — dashed, dotted, dash-dot, cap and join
-- [ ] **Gradients & effects** — linear/radial fills, drop shadow, blur
-- [x] **Export presets** — SVG (lossless, rebuilt from the model), PNG/JPG/WebP
+- [x] **Stroke styles** - dashed, dotted, dash-dot, cap and join
+- [x] **Gradients & effects** - linear/radial fills, drop shadow, blur
+- [x] **Export presets** - SVG (lossless, rebuilt from the model), PNG/JPG/WebP
       at 1x-4x, PDF via the lazily imported `jspdf`, and copy-to-clipboard
 - [ ] **Background remover** for placed images *(optional, evaluate cost)*
 
@@ -153,5 +169,6 @@ Carried over from problems already fixed in this codebase:
 
 ---
 
-**Next action:** smart guides and group transforms (the two Phase 2 gaps a
-user notices first), then the icon-library integration from Phase 3.
+**Next action:** templates (Phase 4) - the last thing between a blank canvas
+and a finished piece - then the document model and store from Phase 1, which
+every later phase depends on.
