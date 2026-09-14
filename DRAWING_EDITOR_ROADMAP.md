@@ -11,117 +11,94 @@ remains below is the work still outstanding.
 
 ## Where the editor stands today
 
-Audited `sydev-front/src/page/site/drower/` (1,874 lines across 15 files).
+Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 
 **What already works**
 
-- 13 tools: select, pen, curve, line, rect, circle, triangle, star,
-  pentagon, hexagon, text, plus grouping
-- Raw `<svg>` canvas driven by React state (`DrawBoard.jsx`, 707 lines)
-- Zoom, toggleable grid, snap-to-grid
-- Resize handles (`ResizableElement.jsx`), inline text editing
-  (`EditableText.jsx`), font family/size pickers, colour picker
-- SVG import (`useImportSVG.js`) and SVG export
-- Boolean operations (union / subtract / intersect)
-- Interaction logic already split into 5 hooks
+- 19 tools: select, pan, pen, line, arrow, curve, rect, circle, ellipse,
+  triangle, diamond, star, pentagon, hexagon, octagon, text, plus place-image,
+  grouping and boolean ops
+- Raw `<svg>` canvas driven by React state, split across `utils/`, six hooks
+  and eleven components
+- Undo/redo (50 steps), layers panel with rename / reorder / lock / hide /
+  duplicate, groups
+- Per-element **fill, stroke, stroke width, opacity, dash, cap and join**;
+  with nothing selected the same panel sets the style for the next shape
+- Multi-select (marquee + Shift-click) that drags as one rigid group
+- Align 6 ways, distribute on both axes, four z-order moves, flip, rotate
+- Copy / cut / paste / duplicate, arrow-key nudge, right-click context menu
+- Eight-handle resize with a rotation handle, Shift to keep the ratio, and a
+  live size readout — works on **every** shape type, paths and images included
+- Images: file picker, drag-and-drop and clipboard paste, stored as data URIs
+- Artboard presets (icon / social / print), orientation swap, background colour
+  including transparent
+- Zoom to 10-800%, Ctrl+wheel zoom, fit-to-window, space-drag panning
+- Autosave to `localStorage` with a recover-on-reload prompt
+- Export: SVG, PNG, JPG, WebP at 1-4x, and PDF, plus copy-image-to-clipboard
+- SVG import, keyboard shortcuts dialog
 
 **What is missing — the honest gaps**
 
 | Gap | Impact |
 |---|---|
-| **No undo/redo anywhere** | Confirmed: zero `undo`/`redo` matches in the whole folder. The single biggest usability hole. |
-| No layers panel | `shapeGroups` exists in state but there is no z-order UI |
-| No image support | Cannot place a photo on the canvas at all |
-| SVG-only export | No PNG, JPG or PDF output |
-| No persistence | Reloading the page loses the entire document |
-| No templates or presets | Every document starts empty at a fixed size |
-| All state in one component | 707-line file holding ~12 `useState` calls; every new feature compounds the cost |
-
-**Already installed but unused:** `konva` (1.7 MB) and `react-konva`
-(224 KB) are in `package.json` and `node_modules` but **imported nowhere**.
-They are shipped as dead weight. Phase 1 decides their fate.
+| No central store | State still lives in `DrawBoard.jsx` + hooks. It is now behind a shared `utils/` layer, so this is maintenance debt rather than a blocker |
+| No smart guides | Alignment is button-driven; nothing snaps to other elements while dragging |
+| Multi-select resizes one at a time | Dragging moves the group as one, but the handles only bind to a single selection |
+| No gradients, shadows or blur | Flat fills and strokes only |
+| No icon-library integration | The 324-icon gallery still cannot be placed on the canvas |
+| No templates or server persistence | Every document starts blank, and autosave is per-browser |
+| Rotated shapes hit-test as unrotated | Selection uses the axis-aligned box, so a heavily rotated shape has a slightly off click target |
 
 ---
 
-## Phase 1 — Foundation *(prerequisite for everything after)*
+## Phase 1 — Foundation
 
-Nothing else is safe to build until this lands.
-
-### The architectural decision (settle first)
-
-**Option A — stay on SVG, add a state layer *(recommended)***
-Keep the existing `<svg>` renderer; add a document model, undo/redo, and
-split the god component.
-- *For:* no rewrite; SVG export stays lossless; text stays selectable and
-  accessible; crisp at any zoom; all 13 tools keep working; uninstalling
-  `konva`/`react-konva` cuts ~2 MB
-- *Against:* hand-rolled hit-testing; slows past ~1,000 nodes; raster
-  effects (blur, filters, brushes) are harder
-
-**Option B — migrate the canvas to Konva**
-- *For:* built-in transformer handles, hit detection, layers; comfortable
-  into tens of thousands of nodes; PNG/JPG export built in
-- *Against:* a real rewrite of all 13 tools and 5 hooks; **SVG export
-  becomes lossy** — Konva is a raster engine; text becomes pixels
-
-**Recommendation: Option A.** This product is an *icon* tool — its value is
-clean vector output feeding the icon library, which is exactly what Option B
-trades away. Revisit only if a document ever needs 1,000+ elements.
-
-> **Decision: Option A.** Taken 2026-09-11. The SVG renderer stays.
-
-### Tasks
-
-- [x] Settle the renderer decision — Option A
-- [ ] Define the document model — a serialisable tree:
-      `{ id, version, width, height, background, elements[], groups[] }`,
-      each element `{ id, type, x, y, w, h, rotation, opacity, z, style, data }`
-- [ ] Move editor state out of `DrawBoard.jsx` into a store.
-      Use **Zustand + Immer** — small, hook-shaped, and Immer's structural
-      sharing is what makes cheap history snapshots work
+- [x] Settle the renderer decision — Option A, SVG stays
 - [x] **Undo/redo**, 50 steps, on <kbd>Ctrl/Cmd+Z</kbd> and
-      <kbd>Ctrl/Cmd+Shift+Z</kbd>, plus toolbar buttons. Implemented in
-      `hooks/useHistory.js` as a watcher over `paths`/`textItems` rather than
-      a store rewrite, so no existing hook or call site had to change
-- [ ] Split `DrawBoard.jsx` into `<Canvas>`, `<Toolbar>`, `<Inspector>`,
-      `<LayersPanel>`
-- [ ] If Option A: `npm uninstall konva react-konva` (−2 MB)
+      <kbd>Ctrl/Cmd+Shift+Z</kbd>, plus toolbar buttons (`hooks/useHistory.js`)
+- [x] Split `DrawBoard.jsx` — geometry, styling, serialisation and resizing now
+      live in `utils/`; arrange, clipboard, autosave and images in `hooks/`;
+      the toolbar, inspector, menus and context menu in `components/`
+- [ ] Define a serialisable document model as a first-class type. The autosave
+      payload (`{ version, paths, textItems, width, height, background }`) is
+      the de-facto schema — promote it and version it properly
+- [ ] Move editor state into a store (**Zustand + Immer**)
 
-**Done when:** every existing tool still works, and every action is undoable.
+**Done when:** every canvas action goes through one owner of state.
 
 ---
 
 ## Phase 2 — Editor essentials
 
-The things users assume exist.
-
-- [ ] **Layers panel**: reorder, rename, lock, hide, nest into groups
-- [ ] **Copy / paste / duplicate** (<kbd>Ctrl+C/V/D</kbd>), including across tabs
-- [ ] **Alignment**: align 6 ways, distribute, smart guides against other
-      elements and canvas centre
-- [ ] **Multi-select**: marquee drag, <kbd>Shift</kbd>+click, transform as one
-- [ ] **Canvas presets**: A4, square, story, banner, custom, with orientation
-- [ ] **Autosave to `localStorage`** plus a recover-on-reload prompt
-
-**Done when:** a user can build a multi-element layout without losing work.
+- [x] **Layers panel**: reorder, rename, lock, hide, duplicate
+- [ ] Nest layers into groups in the panel (groups exist, the tree does not)
+- [x] **Copy / paste / duplicate** (<kbd>Ctrl+C/V/D</kbd>) and cut
+- [ ] Clipboard across tabs — it is in-memory, so it does not survive a reload
+- [x] **Alignment**: align 6 ways, distribute on both axes
+- [ ] Smart guides against other elements and canvas centre
+- [x] **Multi-select**: marquee drag, <kbd>Shift</kbd>+click, moves as one
+- [ ] Transform a multi-selection as one (resize/rotate the whole group)
+- [x] **Canvas presets**: icon, social and print sizes, custom, orientation swap
+- [x] **Autosave to `localStorage`** plus a recover-on-reload prompt
 
 ---
 
 ## Phase 3 — Content
 
-Where it starts feeling like Canva.
-
-- [ ] **Image support** — upload, drag-drop, paste from clipboard; crop,
-      flip, corner radius, opacity
+- [x] **Image support** — upload, drag-drop, paste from clipboard; opacity,
+      flip and free resize
+- [ ] Image crop and corner radius
 - [ ] **Icon library integration** — pull from the existing 324-icon gallery
       straight onto the canvas. This is the feature only *this* product can
       offer, and it is why Option A matters
-- [ ] **Rich text** — line height, letter spacing, alignment, lists, and a
-      curated web-font set (subset the files; do not ship whole families)
-- [ ] **Gradients & effects** — linear/radial fills, drop shadow, blur,
-      stroke styles (dashed, dotted, join/cap)
-- [ ] **Export presets** — SVG (lossless), PNG/JPG at 1×/2×/3×, PDF. Reuse
-      the **already dynamically imported** `jspdf`; keep it lazy
+- [x] **Text**: family, size, weight, italic, underline, alignment, letter
+      spacing, rotation, and a per-item colour
+- [ ] Line height, lists, and a curated web-font set (subset the files; do not
+      ship whole families)
+- [x] **Stroke styles** — dashed, dotted, dash-dot, cap and join
+- [ ] **Gradients & effects** — linear/radial fills, drop shadow, blur
+- [x] **Export presets** — SVG (lossless, rebuilt from the model), PNG/JPG/WebP
+      at 1x-4x, PDF via the lazily imported `jspdf`, and copy-to-clipboard
 - [ ] **Background remover** for placed images *(optional, evaluate cost)*
 
 **Done when:** a complete social post or icon sheet can be produced end to end.
@@ -176,5 +153,5 @@ Carried over from problems already fixed in this codebase:
 
 ---
 
-**Next action:** settle the renderer decision, then start Phase 1 with the
-document model and undo/redo.
+**Next action:** smart guides and group transforms (the two Phase 2 gaps a
+user notices first), then the icon-library integration from Phase 3.
