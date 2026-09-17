@@ -16,10 +16,24 @@ use Illuminate\Support\Facades\DB;
  */
 class AppCatalogueSeeder extends Seeder
 {
-    /** Where the legacy catalogue is looked for, relative to the repo root. */
+    /**
+     * Where the catalogue is looked for, relative to base_path() (= the api/
+     * directory).
+     *
+     * The deployed layout matters here: the repository mirrors public_html, so
+     * on the server the API lives at public_html/api and the built front end -
+     * including json/apps.json - sits one level up at public_html/json. The
+     * sydev-front sources are gitignored and are NOT deployed, so a path that
+     * only looked there found nothing and the seeder imported zero rows.
+     */
     protected const CANDIDATES = [
+        // Deployed layout: public_html/api -> public_html/json/apps.json
+        '/../json/apps.json',
+        // Local development, where the sources are present
         '/../sydev-front/public/json/apps.json',
         '/../../sydev-front/public/json/apps.json',
+        // Last resort: a copy shipped inside the module itself
+        '/app/Modules/App/database/seeders/data/apps.json',
         '/database/seeders/data/apps.json',
     ];
 
@@ -95,11 +109,23 @@ class AppCatalogueSeeder extends Seeder
         foreach (self::CANDIDATES as $candidate) {
             $path = base_path() . $candidate;
 
-            if (is_file($path)) {
-                $decoded = json_decode((string) file_get_contents($path), true);
-
-                return is_array($decoded) ? $decoded : null;
+            if (! is_file($path)) {
+                continue;
             }
+
+            // A BOM or a truncated copy would make json_decode return null.
+            // Keep walking the candidates instead of giving up on the first
+            // file that merely exists, so one bad copy cannot mask a good one.
+            $raw = (string) file_get_contents($path);
+            $decoded = json_decode(preg_replace('/^ï»¿/', '', $raw), true);
+
+            if (is_array($decoded) && isset($decoded['apps'])) {
+                $this->command?->info('AppCatalogueSeeder: reading ' . $path);
+
+                return $decoded;
+            }
+
+            $this->command?->warn('AppCatalogueSeeder: ignoring unreadable catalogue at ' . $path);
         }
 
         return null;
