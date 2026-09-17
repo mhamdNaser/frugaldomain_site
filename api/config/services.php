@@ -35,4 +35,19 @@ return [
         ],
     ],
 
+    'hostinger' => [
+        // Personal Access Token for https://developers.hostinger.com.
+        // Never commit a real value - it belongs in .env only.
+        'token' => env('HOSTINGER_API_TOKEN'),
+
+        // The hosting domain subdomains are created under. Resolved from the
+        // API at runtime when possible; this is the fallback / filter.
+        'domain' => env('HOSTINGER_DOMAIN', 'frugaldomain.site'),
+
+        'base_url' => env('HOSTINGER_API_BASE_URL', 'https://developers.hostinger.com'),
+
+        // Seconds. Hostinger is rate limited to 90 req/min, so keep requests short.
+        'timeout' => (int) env('HOSTINGER_API_TIMEOUT', 20),
+    ],
+
 ];
