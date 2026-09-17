@@ -15,18 +15,20 @@ class DashboardStatisticsResource extends JsonResource
             'data' => [
                 'summary' => [
                     'total_users' => $this['summary']['total_users'] ?? 0,
-                    'users_with_stores' => $this['summary']['users_with_stores'] ?? 0,
-                    'total_stores' => $this['summary']['total_stores'] ?? 0,
                     'active_users' => $this['summary']['active_users'] ?? 0,
+                    'visits_today' => $this['summary']['visits_today'] ?? 0,
+                    'visits_total' => $this['summary']['visits_total'] ?? 0,
+                    'visitors_period' => $this['summary']['visitors_period'] ?? 0,
+                    'logins_period' => $this['summary']['logins_period'] ?? 0,
+                    'icon_interactions_period' => $this['summary']['icon_interactions_period'] ?? 0,
                 ],
                 'percentages' => [
-                    'users_with_stores' => ($this['percentages']['users_with_stores'] ?? 0) . '%',
                     'active_users' => ($this['percentages']['active_users'] ?? 0) . '%',
-                    'stores_to_users_ratio' => $this['percentages']['stores_to_users_ratio'] ?? 0,
+                    'registered_visitor_share' => ($this['percentages']['registered_visitor_share'] ?? 0) . '%',
                 ],
                 'charts' => [
                     'users_growth' => $this['charts']['users_growth'] ?? [],
-                    'stores_growth' => $this['charts']['stores_growth'] ?? [],
+                    'visits_timeline' => $this['charts']['visits_timeline'] ?? [],
                 ],
                 'last_updated' => $this['last_updated'] ?? null,
             ],

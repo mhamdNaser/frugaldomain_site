@@ -1,6 +1,7 @@
 <?php
 
 
+use App\Modules\Core\Controllers\AnalyticsController;
 use App\Modules\Core\Controllers\ImageController;
 use App\Modules\Core\Controllers\SiteContactController;
 use App\Modules\Core\Controllers\DashboardController;
@@ -15,6 +16,11 @@ use Illuminate\Support\Facades\Route;
 Route::post('/convert-image', [ImageController::class, 'convert']);
 Route::get('/download-image/{fileName}', [ImageController::class, 'download']);
 Route::post('/site/contact-us', [SiteContactController::class, 'store']);
+
+// Visitor tracking is deliberately public: anonymous visitors are precisely
+// what these endpoints exist to count. They return 204 and never a body.
+Route::post('/track/visit', [AnalyticsController::class, 'trackVisit']);
+Route::post('/track/icon', [AnalyticsController::class, 'trackIconEvent']);
 
 
 Route::prefix('admin')->group(function () {
@@ -42,6 +48,14 @@ Route::prefix('admin')->group(function () {
 
             Route::get('/icon-statistics', 'iconStatistics');
             Route::get('/icon-quick-stats', 'quickIconStats');
+        });
+
+        Route::controller(AnalyticsController::class)->prefix('analytics')->group(function () {
+            Route::get('overview', 'overview');
+            Route::get('icons', 'icons');
+            Route::get('logins', 'logins');
+            Route::get('active-users', 'activeUsers');
+            Route::get('pages', 'pages');
         });
     });
 });

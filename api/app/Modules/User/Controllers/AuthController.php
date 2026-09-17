@@ -14,6 +14,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use App\Modules\Core\Services\AnalyticsRecorder;
 use App\Modules\User\Models\User;
 use App\Modules\User\Resources\LoginResource;
 
@@ -76,6 +77,13 @@ class AuthController extends Controller
             ->first();
 
         if (!$user || !Hash::check($credentials['password'], $user->password)) {
+            app(AnalyticsRecorder::class)->recordLogin($request, [
+                'user_id' => $user?->id,
+                'email' => $credentials['email'],
+                'successful' => false,
+                'failure_reason' => 'Invalid credentials',
+            ]);
+
             return response()->json([
                 'message' => 'Invalid credentials'
             ], 401);
@@ -85,10 +93,23 @@ class AuthController extends Controller
         // $allowedRoles = ['admin', 'partner'];
 
         if (!$user->hasAnyRole($allowedRoles)) {
+            app(AnalyticsRecorder::class)->recordLogin($request, [
+                'user_id' => $user->id,
+                'email' => $user->email,
+                'successful' => false,
+                'failure_reason' => 'Role not permitted',
+            ]);
+
             return response()->json([
                 'message' => 'You are not authorized to access this panel'
             ], 403);
         }
+
+        app(AnalyticsRecorder::class)->recordLogin($request, [
+            'user_id' => $user->id,
+            'email' => $user->email,
+            'successful' => true,
+        ]);
 
         $user->tokens()->delete();
 

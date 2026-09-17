@@ -35,10 +35,12 @@ class DashboardController extends Controller
             'status' => 'success',
             'data' => [
                 'total_users' => $statistics['summary']['total_users'],
-                'users_with_stores' => $statistics['summary']['users_with_stores'],
-                'total_stores' => $statistics['summary']['total_stores'],
                 'active_users' => $statistics['summary']['active_users'],
-                'users_with_stores_percentage' => $statistics['percentages']['users_with_stores'],
+                'visits_today' => $statistics['summary']['visits_today'],
+                'visits_total' => $statistics['summary']['visits_total'],
+                'visitors_period' => $statistics['summary']['visitors_period'],
+                'logins_period' => $statistics['summary']['logins_period'],
+                'icon_interactions_period' => $statistics['summary']['icon_interactions_period'],
             ],
         ]);
     }
