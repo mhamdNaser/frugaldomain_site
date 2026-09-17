@@ -7,6 +7,10 @@ use App\Modules\Icon\Controllers\IconFavoriteController;
 use Illuminate\Support\Facades\Route;
 
 
+// Public paginated icon listing used by the gallery's infinite scroll.
+// Query params: page, per_page (max 60), search, category, style.
+Route::get('icons', [IconController::class, 'publicIndex'])->name('icons.public.index');
+
 Route::post('allicons/WithoutPagination', [IconController::class, 'allWithoutPagination'])->name('WithoutPagination');
 Route::get('icon-categories/WithoutPagination', [IconCategoriesController::class, 'allWithoutPagination'])->name('allWithoutPagination');
 

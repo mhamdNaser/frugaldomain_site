@@ -4,6 +4,7 @@ namespace Database\Seeders;
 
 use Illuminate\Database\Seeder;
 use App\Modules\Icon\database\seeders\IconSeeder;
+use App\Modules\Icon\database\seeders\IconV2Seeder;
 use App\Modules\Locale\database\seeders\LanguageSeeder;
 use App\Modules\User\database\seeders\AdminSeeder;
 use App\Modules\User\database\seeders\RolePermissionSeeder;
@@ -20,6 +21,7 @@ class DatabaseSeeder extends Seeder
             AdminSeeder::class,
             LanguageSeeder::class,
             IconSeeder::class,
+            IconV2Seeder::class,
         ]);
     }
 }

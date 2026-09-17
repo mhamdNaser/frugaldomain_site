@@ -15,6 +15,7 @@ class Icon extends Model
     protected $fillable = [
         'title',
         'description',
+        'style',
         'category_id',
         'user_id',
         'is_premium',

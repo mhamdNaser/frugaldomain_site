@@ -84,6 +84,7 @@ class IconSeeder extends Seeder
                     'is_premium' => false,
                     'is_active' => true,
                     'tags' => $tags,
+                    'style' => self::styleForSvg($svgPath),
                     'file_svg' => $svgPath,
                     'file_png' => $pngPath,
                 ]
@@ -92,6 +93,41 @@ class IconSeeder extends Seeder
             $this->seedFile($icon->id, $slug . '.svg', $svgPath, 'svg', $svgSize, null);
             $this->seedFile($icon->id, $slug . '.png', $pngPath, 'png', $pngSize, $dimensions);
         }
+    }
+
+    /**
+     * Derive an icon's style from its own artwork, reading the root <svg>
+     * element only: artwork declaring fill="none" together with a stroke is
+     * line art (outline), everything else paints with fills (solid).
+     *
+     * Nested elements are deliberately ignored — several flags carry a
+     * stroked detail path inside otherwise filled artwork and would be
+     * misread as outlines if inner nodes counted. Artwork missing from disk
+     * falls back to 'outline', which is also the column default.
+     *
+     * Kept in step with the add_style_to_icons_table migration's backfill.
+     */
+    private static function styleForSvg(string $relativePath): string
+    {
+        $absolute = public_path($relativePath);
+
+        if (!File::exists($absolute)) {
+            return 'outline';
+        }
+
+        // The root element is always in the first bytes of the document.
+        $head = (string) file_get_contents($absolute, false, null, 0, 2048);
+
+        if ($head === '' || !preg_match('/<svg\b[^>]*>/i', $head, $match)) {
+            return 'outline';
+        }
+
+        $root = $match[0];
+
+        $hasNoFill = (bool) preg_match('/\bfill\s*=\s*(["\'])\s*none\s*\1/i', $root);
+        $hasStroke = (bool) preg_match('/\bstroke\s*=\s*["\']/i', $root);
+
+        return ($hasNoFill && $hasStroke) ? 'outline' : 'solid';
     }
 
     private function seedFile(int $iconId, string $fileName, string $filePath, string $type, int $fallbackSize, ?string $dimensions): void

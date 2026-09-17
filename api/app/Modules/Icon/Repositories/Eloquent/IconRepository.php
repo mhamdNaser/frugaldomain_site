@@ -70,8 +70,15 @@ class IconRepository implements IconRepositoryInterface
         return $this->paginate($items, $rowsPerPage, $page);
     }
 
-    public function allWithoutPagination($search = null, $category = null)
+    /**
+     * Shared filter builder for the two public listing endpoints so that
+     * `allWithoutPagination` and `paginatePublic` can never drift apart in
+     * what they consider a match.
+     */
+    protected function publicQuery($search = null, $category = null, $style = null)
     {
+        // IconResource reads the SVG/PNG paths off the files relation, so it
+        // has to be eager loaded or every icon costs an extra query.
         $query = Icon::query()->with(['category', 'files']);
 
         // فلترة الكاتيجوري
@@ -79,6 +86,11 @@ class IconRepository implements IconRepositoryInterface
             $query->whereHas('category', function ($q) use ($category) {
                 $q->where('name', $category);
             });
+        }
+
+        // فلترة الستايل (outline / solid)
+        if ($style) {
+            $query->where('style', $style);
         }
 
         // فلترة البحث على النصوص
@@ -90,7 +102,37 @@ class IconRepository implements IconRepositoryInterface
             });
         }
 
-        return $query->orderBy('id', 'desc')->get();
+        return $query->orderBy('id', 'desc');
+    }
+
+    public function allWithoutPagination($search = null, $category = null, $style = null)
+    {
+        return $this->publicQuery($search, $category, $style)->get();
+    }
+
+    /**
+     * Paginated public listing. Unlike `all()` (which pulls every row and
+     * slices it in PHP via PaginatesCollection) this pages at the database
+     * level, so the gallery only ever transfers one page worth of rows.
+     *
+     * @return array{data:\Illuminate\Support\Collection,meta:array}
+     */
+    public function paginatePublic($search = null, $category = null, $style = null, $perPage = 60, $page = 1)
+    {
+        $paginator = $this->publicQuery($search, $category, $style)
+            ->paginate($perPage, ['*'], 'page', $page);
+
+        return [
+            'data' => $paginator->getCollection(),
+            'meta' => [
+                'current_page' => $paginator->currentPage(),
+                'last_page' => $paginator->lastPage(),
+                'per_page' => $paginator->perPage(),
+                'total' => $paginator->total(),
+                'from' => $paginator->firstItem(),
+                'to' => $paginator->lastItem(),
+            ],
+        ];
     }
 
     public function find(int $id)
