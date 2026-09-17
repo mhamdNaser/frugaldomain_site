@@ -1,7 +1,11 @@
-# Drawing editor — roadmap to a Canva-class tool
+# Drawer — roadmap to a Canva-class tool
 
 Target: turn `/Drower/Board` from an SVG shape editor into a real design
 surface — multi-element documents, images, templates, export presets.
+
+The tab is called **Drawer**, not "Icon Drawer": it is a general vector editor
+that happens to ship an icon library, not a tool for drawing icons. The route
+stays `/Drower/Board` so existing links and the sitemap keep working.
 
 Each phase is independently shippable: the editor keeps working after every
 one. **A phase is deleted from this file once it is finished**, so whatever
@@ -15,9 +19,17 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 
 **What already works**
 
-- 19 tools: select, pan, pen, line, arrow, curve, rect, circle, ellipse,
-  triangle, diamond, star, pentagon, hexagon, octagon, text, plus place-image,
+- 32 tools: select, pan, pen, line, arrow, curve, rect, circle, ellipse,
+  triangle, diamond, star, pentagon, hexagon, octagon, text, plus the vector
+  set — rounded rect, squircle, arc, pie, donut, burst, sparkle, speech
+  bubble, cross, heart, chevron, parallelogram, trapezoid — and place-image,
   the icon library, grouping and boolean ops
+- **Clip and mask**: stack a shape over artwork and clip it to that shape, or
+  mask it for a luminance fade. One-click crop to square, rounded, circle or
+  inset. Survives save/reload and exports losslessly (`utils/clipping.js`)
+- **Path operations**: convert a primitive to an editable path, outline a
+  stroke into a filled shape, simplify a dense freehand path, and grow/shrink
+  a shape by a fixed distance (`utils/pathOps.js`)
 - Raw `<svg>` canvas driven by React state, split across `utils/`, nine hooks
   and nineteen components
 - **Menu bar** (File / Edit / Insert / Arrange / View / Help) carrying every
@@ -69,7 +81,7 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 | Icons need the API | The library is fetched live, so the panel shows an error state offline. Placed icons are inlined and keep working |
 | No templates or server persistence | Every document starts blank, and autosave is per-browser |
 | Rotated shapes hit-test as unrotated | Selection uses the axis-aligned box, so a heavily rotated shape has a slightly off click target |
-| No image crop | Images can be resized, flipped and faded, but not cropped |
+| Rotated clip re-align | A clip follows its element through resize and move; rotating the element afterwards does not rotate the window with it |
 
 ---
 
@@ -117,7 +129,8 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 
 - [x] **Image support** - upload, drag-drop, paste from clipboard; opacity,
       flip and free resize
-- [ ] Image crop and corner radius
+- [x] **Image crop and corner radius** — via clip/mask: crop to square,
+      rounded, circle or inset, or clip to any shape on the canvas
 - [x] **Icon library integration** - all 324 icons from the gallery, searchable
       and filterable, inlined as editable vectors. Fetched through the API's
       `/download-icon/` route, which is the only one that answers with CORS
