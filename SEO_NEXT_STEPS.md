@@ -4,15 +4,16 @@ Written for: whoever picks up FrugalDomain's search work next (likely Muhammed).
 
 ## Where the site stands
 
-31 prerendered routes, all verified to have exactly one `<h1>`, one meta
-description, one self-referencing canonical, valid JSON-LD, and — where a page
-shows an FAQ — schema answers that match the visible copy word for word.
+43 prerendered routes, all verified to have exactly one `<h1>`, one meta
+description, one self-referencing canonical, valid JSON-LD, reciprocal
+hreflang, and — where a page shows an FAQ — schema answers that match the
+visible copy word for word.
 
 | | Before | Now |
 |---|---|---|
-| Indexable routes | 15 | 31 |
-| Arabic routes | 0 | 9 |
-| Pages with a tool/FAQ schema | 0 | 22 |
+| Indexable routes | 15 | 43 |
+| Arabic routes | 0 | 21 |
+| Pages with a tool/FAQ schema | 0 | 27 |
 | Thinnest tool page | 237 chars | 761 chars (`/Drower/Board`, an editor) |
 
 The technical layer is finished. Nothing further in metadata, structured data,
@@ -63,6 +64,11 @@ These pages are indexed and correct, but too thin to compete:
 | `/ar/ImageConvert` | 1,504 | Arabic equivalent of the same. |
 | `/About-Us` | 1,329 | Team and story; matters for E-E-A-T. |
 
+`/AudioConvert`, `/FileConvert`, `/Drower/TouchSimulator` and `/vector-editor`
+were the thin ones and have been expanded (roughly 750 chars each to
+2,300–3,600), each with an FAQ rendered on the page and mirrored as
+structured data.
+
 ### More conversion landing pages
 
 `src/data/conversions.js` is the only file to edit — a new entry generates the
@@ -83,32 +89,32 @@ would need a `tool` field on each entry to pick which converter to render.
 
 ---
 
-## 3. Arabic — 9 of 31 routes
+## 3. Arabic — 21 of 43 routes
 
-The Arabic site covers the home page, the icon library, the image converter and
-all six conversions. The other 13 routes are English-only:
+Every English route now has an Arabic counterpart except `/Drower/Board`, and
+that one is deliberate: the editor fills the viewport and has no room for copy,
+so `/ar/vector-editor` carries its Arabic text instead.
 
-`/documentation` · `/About-Us` · `/about-us/muhammed-nasser-edden` ·
-`/Contact-Us` · `/Faq` · `/AudioConvert` · `/FileConvert` · `/vector-editor` ·
-`/apps` · `/Drower/Board` · `/Drower/TouchSimulator` · `/Privacy-Policy` ·
-`/Terms-Of-Service`
+The Arabic pages carry copy rather than duplicating the tools. Each interactive
+tool is one shared component at its English URL; what ranks in Arabic is the
+explanatory text, and each Arabic page routes into the shared tool. That avoids
+a second copy of every converter.
 
-Worth doing in that order — the legal pages last, and `/Drower/Board` probably
-never, since `/vector-editor` is the page that carries its copy.
+To add or extend one: Arabic copy goes in `src/data/i18n/ar.js`, the page uses
+`ArabicPage.jsx` (header, sections, FAQ, related links), then a route in
+`router.jsx`, an entry in `scripts/routes.js`, and `altPath` on the English
+counterpart's `<Seo>` so the hreflang pair stays reciprocal — Google ignores a
+one-sided annotation entirely.
 
-Adding one means: Arabic copy in `src/data/i18n/ar.js`, a page component under
-`src/page/site/ar/`, a route in `router.jsx`, an entry in `scripts/routes.js`,
-and `altPath` on the English counterpart's `<Seo>` so the hreflang pair stays
-reciprocal — Google ignores a one-sided annotation entirely.
-
-Arabic technical content has far weaker competition than English. This is
-probably the best ratio of effort to traffic left on the site.
-
----
+Thinnest Arabic pages, if you want to go further: `/ar/documentation` (834),
+`/ar/Privacy-Policy` (1,038), `/ar/about-us/muhammed-nasser-edden` (1,077).
+The documentation page is a summary that routes to the full English reference;
+translating the whole technical reference is a much larger job and probably
+not worth it before the Arabic pages show traffic.
 
 ## 4. After deploying — do this
 
-1. **Search Console** — resubmit `sitemap.xml` (31 URLs now).
+1. **Search Console** — resubmit `sitemap.xml` (43 URLs now).
 2. **URL Inspection → Request Indexing** for the new pages. Cuts recrawl from
    weeks to days. Start with `/convert/jpg-to-png`, `/ar`, `/vector-editor`.
 3. **Rich Results Test** — check `/convert/jpg-to-png`, `/Faq` and
@@ -138,3 +144,8 @@ probably the best ratio of effort to traffic left on the site.
   plugin in `vite.config.js`. If you change the build, verify both still have
   zero NUL bytes before deploying — the files keep their correct size when
   corrupted, so the damage is invisible in a directory listing.
+- **`npm run build` returns before the prerenderer has written its files.**
+  The route directories under `dist/` appear a few minutes after the command
+  exits, and starting another build in the meantime wipes what was written. So
+  wait for every route directory to exist before copying `dist/` anywhere, and
+  never run two builds back to back.
