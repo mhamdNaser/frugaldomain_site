@@ -32,12 +32,54 @@ class IconDownloadCopyController extends Controller
         return (int) $accessToken->tokenable->getKey();
     }
 
+    /**
+     * Resolve an icon file name to its real path on disk.
+     *
+     * Icons are not all stored flat in public/icons: some live in
+     * subdirectories (icons/v2/...). Hardcoding public_path('icons/'.$name)
+     * made every one of those 404, so the recorded path is consulted first and
+     * the flat location is only the fallback.
+     *
+     * The name is taken as a basename so a crafted value such as
+     * "../../.env" cannot escape the icons directory.
+     */
+    private function resolveIconPath(string $fileName): ?string
+    {
+        $safeName = basename($fileName);
+
+        $recorded = IconFiles::where('file_name', $safeName)
+            ->orWhere('file_path', 'like', '%/' . $safeName)
+            ->value('file_path');
+
+        if (!$recorded) {
+            $recorded = Icon::where('file_svg', 'like', '%/' . $safeName)
+                ->orWhere('file_png', 'like', '%/' . $safeName)
+                ->value('file_svg');
+        }
+
+        foreach ([$recorded, 'icons/' . $safeName] as $candidate) {
+            if (!$candidate) {
+                continue;
+            }
+
+            $full = public_path($candidate);
+            $real = realpath($full);
+
+            // Never serve anything outside the icons directory.
+            $root = realpath(public_path('icons'));
+            if ($real && $root && str_starts_with($real, $root) && is_file($real)) {
+                return $real;
+            }
+        }
+
+        return null;
+    }
+
     public function download($fileName)
     {
+        $path = $this->resolveIconPath($fileName);
 
-        $path = public_path('icons/' . $fileName);
-
-        if (!file_exists($path)) {
+        if (!$path) {
             return response()->json([
                 'success' => false,
                 'message' => 'File not found.',
@@ -103,9 +145,9 @@ class IconDownloadCopyController extends Controller
 
     public function getIconCode($fileName)
     {
-        $path = public_path('icons/' . $fileName);
+        $path = $this->resolveIconPath($fileName);
 
-        if (!file_exists($path)) {
+        if (!$path) {
             return response()->json([
                 'success' => false,
                 'message' => 'File not found.'
@@ -136,9 +178,9 @@ class IconDownloadCopyController extends Controller
 
     public function getIconCodeJsx($fileName)
     {
-        $path = public_path('icons/' . $fileName);
+        $path = $this->resolveIconPath($fileName);
 
-        if (!file_exists($path)) {
+        if (!$path) {
             return response()->json([
                 'success' => false,
                 'message' => 'File not found.'

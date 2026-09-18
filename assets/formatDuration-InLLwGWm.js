@@ -1,0 +1,1 @@
+const a="—",m=(r,{fallback:n="—"}={})=>{if(r==null||r==="")return n;const o=Number(r);if(!Number.isFinite(o))return n;const t=Math.max(0,Math.round(o));if(t<60)return`${t}s`;if(t<3600)return`${Math.floor(t/60)}m ${t%60}s`;const u=Math.floor(t/3600),i=Math.floor(t%3600/60);return`${u}h ${String(i).padStart(2,"0")}m`};export{a as E,m as f};

@@ -56,6 +56,9 @@ Route::prefix('admin')->group(function () {
             Route::get('logins', 'logins');
             Route::get('active-users', 'activeUsers');
             Route::get('pages', 'pages');
+            Route::get('sessions', 'sessions');
+            Route::get('sessions/{sessionId}', 'sessionJourney');
+            Route::get('longest-stay-pages', 'longestStayPages');
         });
     });
 });

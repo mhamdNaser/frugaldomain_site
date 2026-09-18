@@ -68,6 +68,7 @@ class AnalyticsController extends Controller
                 // The statistics page shows only the top three; the dedicated
                 // icon page asks for the full list.
                 'top_icons' => $this->statistics->iconEngagement($days, 3),
+                'longest_stay_pages' => $this->statistics->longestStayPages($days, 5),
             ],
         ]);
     }
@@ -93,6 +94,30 @@ class AnalyticsController extends Controller
         return response()->json([
             'status' => 'success',
             'data' => $this->statistics->activeUsers($this->days($request), (int) $request->input('limit', 50)),
+        ]);
+    }
+
+    public function sessions(Request $request): JsonResponse
+    {
+        return response()->json([
+            'status' => 'success',
+            'data' => $this->statistics->visitorSessions($this->days($request), (int) $request->input('limit', 100)),
+        ]);
+    }
+
+    public function sessionJourney(Request $request, string $sessionId): JsonResponse
+    {
+        return response()->json([
+            'status' => 'success',
+            'data' => $this->statistics->sessionJourney($sessionId),
+        ]);
+    }
+
+    public function longestStayPages(Request $request): JsonResponse
+    {
+        return response()->json([
+            'status' => 'success',
+            'data' => $this->statistics->longestStayPages($this->days($request), (int) $request->input('limit', 20)),
         ]);
     }
 

@@ -178,6 +178,108 @@ class AnalyticsStatisticsService
             ->all();
     }
 
+    /**
+     * Pages ranked by how long visitors actually stay on them.
+     *
+     * Only views that reported a duration count towards the average: a page
+     * the visitor closed the tab on never sends one, and averaging those in as
+     * zero would punish exactly the pages people read to the end. `samples`
+     * is returned so a 200-second average taken from one visit is visibly
+     * weaker evidence than the same average over fifty.
+     */
+    public function longestStayPages(int $days = 30, int $limit = 10, int $minSamples = 1): array
+    {
+        return PageVisit::where('visited_at', '>=', Carbon::now()->subDays($days))
+            ->whereNotNull('duration_seconds')
+            ->selectRaw('path, COUNT(*) as samples, AVG(duration_seconds) as avg_duration, MAX(duration_seconds) as max_duration, SUM(duration_seconds) as total_duration')
+            ->groupBy('path')
+            ->havingRaw('COUNT(*) >= ?', [$minSamples])
+            ->orderByDesc('avg_duration')
+            ->limit($limit)
+            ->get()
+            ->map(fn ($row) => [
+                'path' => $row->path,
+                'samples' => (int) $row->samples,
+                'avg_duration' => round((float) $row->avg_duration),
+                'max_duration' => (int) $row->max_duration,
+                'total_duration' => (int) $row->total_duration,
+            ])
+            ->all();
+    }
+
+    /**
+     * One row per visitor session: who they are, their IP, how long they
+     * stayed and how many pages they moved through.
+     *
+     * Session length is the span from the first to the last page view, which
+     * also captures time on the final page even when no duration beacon
+     * arrived for it.
+     */
+    public function visitorSessions(int $days = 30, int $limit = 100): array
+    {
+        $sessions = PageVisit::where('visited_at', '>=', Carbon::now()->subDays($days))
+            ->selectRaw('session_id, MAX(user_id) as user_id, MAX(ip_address) as ip_address, MAX(country) as country, MAX(device_type) as device_type, MAX(browser) as browser, MAX(platform) as platform, COUNT(*) as page_views, COUNT(DISTINCT path) as unique_pages, MIN(visited_at) as started_at, MAX(visited_at) as last_seen, SUM(duration_seconds) as reported_duration')
+            ->groupBy('session_id')
+            ->orderByDesc('last_seen')
+            ->limit($limit)
+            ->get();
+
+        $userIds = $sessions->pluck('user_id')->filter()->unique();
+        $users = $userIds->isEmpty()
+            ? collect()
+            : DB::table('users')->whereIn('id', $userIds)->get(['id', 'name', 'email'])->keyBy('id');
+
+        return $sessions
+            ->map(function ($row) use ($users) {
+                $started = Carbon::parse($row->started_at);
+                $last = Carbon::parse($row->last_seen);
+                $span = $started->diffInSeconds($last);
+                $user = $row->user_id ? $users->get($row->user_id) : null;
+
+                return [
+                    'session_id' => $row->session_id,
+                    'user_id' => $row->user_id ? (int) $row->user_id : null,
+                    'name' => $user->name ?? null,
+                    'email' => $user->email ?? null,
+                    'is_registered' => (bool) $row->user_id,
+                    'ip_address' => $row->ip_address,
+                    'country' => $row->country,
+                    'device_type' => $row->device_type,
+                    'browser' => $row->browser,
+                    'platform' => $row->platform,
+                    'page_views' => (int) $row->page_views,
+                    'unique_pages' => (int) $row->unique_pages,
+                    // Prefer the wall-clock span; fall back to the summed
+                    // per-page durations for a single-page session.
+                    'session_duration' => $span > 0 ? $span : (int) ($row->reported_duration ?? 0),
+                    'started_at' => $started->toIso8601String(),
+                    'last_seen' => $last->toIso8601String(),
+                ];
+            })
+            ->all();
+    }
+
+    /** Every page one session visited, in order, with time spent on each. */
+    public function sessionJourney(string $sessionId, int $limit = 200): array
+    {
+        return PageVisit::where('session_id', $sessionId)
+            ->orderBy('visited_at')
+            ->limit($limit)
+            ->get(['id', 'path', 'page_title', 'referrer', 'duration_seconds', 'visited_at', 'ip_address', 'device_type', 'browser'])
+            ->map(fn ($row) => [
+                'id' => $row->id,
+                'path' => $row->path,
+                'title' => $row->page_title,
+                'referrer' => $row->referrer,
+                'duration' => $row->duration_seconds,
+                'visited_at' => $row->visited_at?->toIso8601String(),
+                'ip_address' => $row->ip_address,
+                'device_type' => $row->device_type,
+                'browser' => $row->browser,
+            ])
+            ->all();
+    }
+
     /** Recent sign-ins for the security log. */
     public function recentLogins(int $limit = 50): array
     {

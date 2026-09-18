@@ -40,9 +40,38 @@ class AnalyticsRecorder
      * `duration`. That MUST update the original row: inserting again would
      * count every page view twice and double every figure on the dashboard.
      */
+    /**
+     * Paths excluded from visitor analytics.
+     *
+     * The dashboard is the admin's own workspace, not public traffic: counting
+     * it would inflate every figure with the sessions of the person reading
+     * the report. Filtering here rather than in the queries means the rows are
+     * never written at all, so no later report can accidentally include them.
+     */
+    public const EXCLUDED_PATH_PREFIXES = ['/admin'];
+
+    public static function isExcludedPath(?string $path): bool
+    {
+        $normalised = '/' . ltrim(strtolower(trim((string) $path)), '/');
+
+        foreach (self::EXCLUDED_PATH_PREFIXES as $prefix) {
+            // Match the segment exactly: "/admin" and "/admin/..." are
+            // excluded, but a public page such as "/administrators" is not.
+            if ($normalised === $prefix || str_starts_with($normalised, $prefix . '/')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public function recordPageVisit(Request $request, array $payload): ?PageVisit
     {
         try {
+            if (self::isExcludedPath($payload['path'] ?? null)) {
+                return null;
+            }
+
             $visitId = isset($payload['visit_id']) ? (int) $payload['visit_id'] : null;
 
             if ($visitId && isset($payload['duration'])) {
