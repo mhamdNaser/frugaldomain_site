@@ -83,7 +83,7 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 | Rotated shapes hit-test as unrotated | Selection uses the axis-aligned box, so a heavily rotated shape has a slightly off click target |
 | Rotated clip re-align | A clip follows its element through resize and move; rotating the element afterwards does not rotate the window with it |
 | Points have no payout path | The ledger records what is earned; converting a balance into money still needs a rate, a minimum and a payout flow, tied into the existing Billing module |
-| Moderation has no admin UI | The queue is a working API (`/api/admin/drawings/*`); it still needs a screen in the dashboard |
+| Templates are seeded, not authored in-app | The admin screen curates (show / hide / delete); creating a new template means adding it to `DrawingTemplateSeeder` and re-seeding |
 
 ---
 
@@ -153,7 +153,12 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 
 ## Phase 4 — Templates & reuse
 
-- [ ] Template gallery, seeded with ~20 starters
+- [x] **Template gallery**, seeded with 15 starters across 6 categories
+      (Logos, Social, Badges, Frames, Diagrams, Basics). Every template is
+      built from native editable primitives - `rect`, `circle`, `polygon`,
+      `path`, `text` with full style attributes - never a flattened image, so
+      every tool, effect, clip and boolean op applies to what it places.
+      Managed from Dashboard > Drawings > Templates
 - [ ] "Save as template" for signed-in users
 - [ ] Brand kit: saved palettes, fonts, logos
 - [ ] Duplicate / version a document

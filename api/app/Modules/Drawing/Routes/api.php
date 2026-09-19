@@ -3,7 +3,9 @@
 use App\Modules\Drawing\Controllers\CreatorPointsController;
 use App\Modules\Drawing\Controllers\DrawingController;
 use App\Modules\Drawing\Controllers\DrawingGalleryController;
+use App\Modules\Drawing\Controllers\AdminTemplateController;
 use App\Modules\Drawing\Controllers\DrawingModerationController;
+use App\Modules\Drawing\Controllers\DrawingTemplateController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -17,6 +19,14 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('drawings')->group(function () {
     Route::get('/gallery', [DrawingGalleryController::class, 'index']);
     Route::get('/gallery/{slug}', [DrawingGalleryController::class, 'show']);
+});
+
+// ---- Public: the starter templates -------------------------------------- //
+// Open on purpose: a template is site-owned content, and requiring an account
+// before someone can start from one would defeat the point of shipping them.
+Route::prefix('drawing-templates')->group(function () {
+    Route::get('/', [DrawingTemplateController::class, 'index']);
+    Route::get('/{template}', [DrawingTemplateController::class, 'show']);
 });
 
 // ---- Signed in: a user's own drawings ----------------------------------- //
@@ -40,6 +50,16 @@ Route::middleware('auth:sanctum')->prefix('drawings')->group(function () {
 Route::middleware('auth:sanctum')->prefix('creator-points')->group(function () {
     Route::get('/', [CreatorPointsController::class, 'summary']);
     Route::get('/entries', [CreatorPointsController::class, 'entries']);
+});
+
+// ---- Admin: managing the starter templates ------------------------------ //
+Route::middleware(['auth:sanctum', 'role:admin'])->prefix('admin/drawing-templates')->group(function () {
+    Route::get('/', [AdminTemplateController::class, 'index']);
+    Route::post('/', [AdminTemplateController::class, 'store']);
+    Route::get('/{template}', [AdminTemplateController::class, 'show']);
+    Route::put('/{template}', [AdminTemplateController::class, 'update']);
+    Route::delete('/{template}', [AdminTemplateController::class, 'destroy']);
+    Route::post('/{template}/toggle', [AdminTemplateController::class, 'toggle']);
 });
 
 // ---- Admin: the review queue -------------------------------------------- //
