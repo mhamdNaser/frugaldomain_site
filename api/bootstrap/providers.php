@@ -6,6 +6,7 @@ return [
     App\Modules\Catalog\Providers\CatalogServiceProvider::class,
     App\Modules\CMS\Providers\CMSServiceProvider::class,
     App\Modules\Core\Providers\CoreServiceProvider::class,
+    App\Modules\Component\Providers\ComponentServiceProvider::class,
     App\Modules\Drawing\Providers\DrawingServiceProvider::class,
     App\Modules\Fulfillment\Providers\FulfillmentServiceProvider::class,
     App\Modules\Gesture\Providers\GestureServiceProvider::class,

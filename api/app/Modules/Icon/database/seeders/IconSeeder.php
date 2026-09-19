@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 
 /**
- * Seeds the whole icon library (519 icons across 17 categories).
+ * Seeds the whole icon library (546 icons across 17 categories).
  *
  * The SVG/PNG artwork itself lives in public/icons and is deployed with the
  * repository; this seeder only records the metadata rows that the gallery,
@@ -200,6 +200,33 @@ class IconSeeder extends Seeder
     private static function icons(): array
     {
         return [
+            ['flag-kurdistan', 'Flag Kurdistan', 'flags-and-countries', 1088, 10063, ['flag', 'community', 'people', 'ethnic', 'kurdistan'], '512x384', 'Red / white / green bands with the 21-rayed golden sun (Roj). Vector SVG and 512x384 PNG.'],
+            ['flag-druze', 'Flag Druze', 'flags-and-countries', 313, 1566, ['flag', 'community', 'people', 'ethnic', 'druze'], '512x384', 'The five-colour star: green, red, yellow, blue, white. Vector SVG and 512x384 PNG.'],
+            ['flag-alawite', 'Flag Alawite', 'flags-and-countries', 327, 5229, ['flag', 'community', 'people', 'ethnic', 'alawite'], '512x384', 'Historic Alawite State flag: white field between yellow bands with a red crescent. Vector SVG and 512x384 PNG.'],
+            ['flag-assyrian', 'Flag Assyrian', 'flags-and-countries', 667, 14184, ['flag', 'community', 'people', 'ethnic', 'assyrian'], '512x384', 'Four-pointed star with rays in red, white and blue. Vector SVG and 512x384 PNG.'],
+            ['flag-syriac', 'Flag Syriac', 'flags-and-countries', 1430, 10691, ['flag', 'community', 'people', 'ethnic', 'syriac'], '512x384', 'Red field with a golden radiant sun and four stars. The real emblem is a winged sun; this is a simplified radiant form. Vector SVG and 512x384 PNG.'],
+            ['flag-chaldean', 'Flag Chaldean', 'flags-and-countries', 539, 6468, ['flag', 'community', 'people', 'ethnic', 'chaldean'], '512x384', 'White field with a blue and gold star emblem. Vector SVG and 512x384 PNG.'],
+            ['flag-yazidi', 'Flag Yazidi', 'flags-and-countries', 1043, 13250, ['flag', 'community', 'people', 'ethnic', 'yazidi'], '512x384', 'White field, red sun disc with 21 rays and the peacock emblem simplified. Vector SVG and 512x384 PNG.'],
+            ['flag-amazigh', 'Flag Amazigh', 'flags-and-countries', 447, 4841, ['flag', 'community', 'people', 'ethnic', 'amazigh'], '512x384', 'Blue / green / yellow bands with the red yaz (ⵣ) character. Vector SVG and 512x384 PNG.'],
+            ['flag-turkmen', 'Flag Iraqi Turkmen', 'flags-and-countries', 438, 4303, ['flag', 'community', 'people', 'ethnic', 'iraqi', 'turkmen'], '512x384', 'Light blue field, white band, red crescent and star. Vector SVG and 512x384 PNG.'],
+            ['flag-chechen', 'Flag Chechen', 'flags-and-countries', 350, 2006, ['flag', 'community', 'people', 'ethnic', 'chechen'], '512x384', 'Green / white / red bands with a gold ornamental stripe at the hoist. Vector SVG and 512x384 PNG.'],
+            ['flag-kurdistan-region-iraq', 'Flag Kurdistan Region', 'flags-and-countries', 1095, 10063, ['flag', 'region', 'autonomous', 'territory', 'kurdistan'], '512x384', 'Same design as the Kurdish flag, used by the Kurdistan Region of Iraq. Vector SVG and 512x384 PNG.'],
+            ['flag-rojava', 'Flag Rojava', 'flags-and-countries', 386, 3440, ['flag', 'region', 'autonomous', 'territory', 'rojava'], '512x384', 'Yellow / red / green bands with a green star. Vector SVG and 512x384 PNG.'],
+            ['flag-scotland', 'Flag Scotland', 'flags-and-countries', 208, 3777, ['flag', 'region', 'autonomous', 'territory', 'scotland'], '512x384', 'The Saltire: white diagonal cross on blue. Vector SVG and 512x384 PNG.'],
+            ['flag-wales', 'Flag Wales', 'flags-and-countries', 639, 6952, ['flag', 'region', 'autonomous', 'territory', 'wales'], '512x384', 'White over green. The Welsh dragon is highly detailed; this is a simplified silhouette, not an exact reproduction. Vector SVG and 512x384 PNG.'],
+            ['flag-catalonia', 'Flag Catalonia', 'flags-and-countries', 231, 1472, ['flag', 'region', 'autonomous', 'territory', 'catalonia'], '512x384', 'The Senyera: four red stripes on gold. Vector SVG and 512x384 PNG.'],
+            ['flag-basque', 'Flag Basque Country', 'flags-and-countries', 297, 4578, ['flag', 'region', 'autonomous', 'territory', 'basque', 'country'], '512x384', 'The Ikurrina: red field, green saltire, white cross. Vector SVG and 512x384 PNG.'],
+            ['flag-hong-kong', 'Flag Hong Kong', 'flags-and-countries', 905, 7249, ['flag', 'region', 'autonomous', 'territory', 'hong', 'kong'], '512x384', 'Red field with a stylised five-petal bauhinia. Vector SVG and 512x384 PNG.'],
+            ['flag-united-nations', 'Flag United Nations', 'flags-and-countries', 535, 14052, ['flag', 'organisation', 'international', 'united', 'nations'], '512x384', 'UN blue with the world map and olive wreath, simplified. Vector SVG and 512x384 PNG.'],
+            ['flag-european-union', 'Flag European Union', 'flags-and-countries', 2026, 7936, ['flag', 'organisation', 'international', 'european', 'union'], '512x384', 'Twelve gold stars in a circle on blue. Vector SVG and 512x384 PNG.'],
+            ['flag-arab-league', 'Flag Arab League', 'flags-and-countries', 347, 10590, ['flag', 'organisation', 'international', 'arab', 'league'], '512x384', 'Green field with a chain wreath and crescent, simplified. Vector SVG and 512x384 PNG.'],
+            ['flag-nato', 'Flag NATO', 'flags-and-countries', 418, 9190, ['flag', 'organisation', 'international', 'nato'], '512x384', 'Dark blue field with the white compass rose. Vector SVG and 512x384 PNG.'],
+            ['flag-red-cross', 'Flag Red Cross', 'flags-and-countries', 235, 2127, ['flag', 'organisation', 'international', 'red', 'cross'], '512x384', 'White field with a red Greek cross. Vector SVG and 512x384 PNG.'],
+            ['flag-olympic', 'Flag Olympic', 'flags-and-countries', 453, 16936, ['flag', 'organisation', 'international', 'olympic'], '512x384', 'Five interlocking rings on white. Vector SVG and 512x384 PNG.'],
+            ['flag-racing-checkered', 'Flag Racing Checkered', 'flags-and-countries', 604, 4124, ['flag', 'signal', 'marker', 'racing', 'checkered'], '512x384', 'The chequered finish flag. Vector SVG and 512x384 PNG.'],
+            ['flag-white', 'Flag White', 'flags-and-countries', 207, 1517, ['flag', 'signal', 'marker', 'white'], '512x384', 'Plain white flag (truce / surrender). Vector SVG and 512x384 PNG.'],
+            ['flag-pirate', 'Flag Pirate', 'flags-and-countries', 541, 8687, ['flag', 'signal', 'marker', 'pirate'], '512x384', 'Jolly Roger: skull and crossbones on black. Vector SVG and 512x384 PNG.'],
+            ['flag-triangular', 'Flag Triangular', 'flags-and-countries', 193, 1856, ['flag', 'signal', 'marker', 'triangular'], '512x384', 'Generic pennant shape for map and UI markers. Vector SVG and 512x384 PNG.'],
             ['flag-afghanistan', 'Flag Afghanistan', 'flags-and-countries', 19189, 32835, ['flag', 'country', 'nation', 'afghanistan', 'af'], '512x384', 'Flag of Afghanistan. Vector SVG and 512x384 PNG.'],
             ['flag-albania', 'Flag Albania', 'flags-and-countries', 3123, 13104, ['flag', 'country', 'nation', 'albania', 'al'], '512x384', 'Flag of Albania. Vector SVG and 512x384 PNG.'],
             ['flag-algeria', 'Flag Algeria', 'flags-and-countries', 291, 8172, ['flag', 'country', 'nation', 'algeria', 'dz'], '512x384', 'Flag of Algeria. Vector SVG and 512x384 PNG.'],
