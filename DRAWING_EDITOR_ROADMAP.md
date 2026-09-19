@@ -82,6 +82,8 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 | No templates or server persistence | Every document starts blank, and autosave is per-browser |
 | Rotated shapes hit-test as unrotated | Selection uses the axis-aligned box, so a heavily rotated shape has a slightly off click target |
 | Rotated clip re-align | A clip follows its element through resize and move; rotating the element afterwards does not rotate the window with it |
+| Points have no payout path | The ledger records what is earned; converting a balance into money still needs a rate, a minimum and a payout flow, tied into the existing Billing module |
+| Moderation has no admin UI | The queue is a working API (`/api/admin/drawings/*`); it still needs a screen in the dashboard |
 
 ---
 
@@ -155,7 +157,15 @@ Audited `sydev-front/src/page/site/drower/` after the Phase 2 / Phase 3 pass.
 - [ ] "Save as template" for signed-in users
 - [ ] Brand kit: saved palettes, fonts, logos
 - [ ] Duplicate / version a document
-- [ ] Server-side persistence — new Laravel module, documents owned by a user
+- [x] **Server-side persistence** — the `Drawing` Laravel module: documents
+      owned by a user, saved from File > Save to my account, reopened from the
+      My drawings panel
+- [x] **Publish workflow with moderation** — private → pending → published or
+      rejected. Nothing reaches the gallery without an admin approving it, and
+      editing a published drawing sends it back for review
+- [x] **Creator points** — an append-only ledger. One point per *distinct*
+      user who reuses a drawing (enforced by a unique index, not by a PHP
+      check), plus a one-off publish bonus. Self-use earns nothing
 - [ ] Public share link (view-only)
 
 **Done when:** a user starts from a template instead of a blank canvas.
