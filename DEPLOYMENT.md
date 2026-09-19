@@ -109,7 +109,7 @@ chmod -R 775 api/storage api/bootstrap/cache cdn/storage cdn/bootstrap/cache
 
 ## Icons
 
-The artwork (324 SVG + 324 PNG) lives in `api/public/icons/` and is committed,
+The artwork (519 SVG + 519 PNG) lives in `api/public/icons/` and is committed,
 so it deploys with the repository. `IconSeeder` only records the metadata rows
 and is safe to re-run — it matches on the icon title and updates in place:
 
