@@ -92,7 +92,10 @@ class DrawingTemplateSeeder extends Seeder
     private function text(string $content, float $x, float $y, array $overrides = []): array
     {
         return array_merge([
-            'id' => Str::uuid()->toString(),
+            // Derived from the content and position rather than random: a
+            // random id would make every re-run rewrite every document, so
+            // re-seeding after a deploy would never settle.
+            'id' => 't' . substr(md5($content . '|' . $x . '|' . $y), 0, 16),
             'content' => $content,
             'x' => $x,
             'y' => $y,

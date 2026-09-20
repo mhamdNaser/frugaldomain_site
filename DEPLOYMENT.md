@@ -122,6 +122,43 @@ reads the artwork out of the API's public directory. If the two applications are
 ever deployed somewhere other than side by side, point `ICONS_PUBLIC_PATH` in
 `cdn/.env` at the API's `public` folder.
 
+## Components and drawing templates
+
+The catalogue ships as seeders, so it travels with the repository rather than
+being typed into the dashboard:
+
+| Seeder | What it creates |
+|:--|:--|
+| `ComponentCategorySeeder` | the four component categories |
+| `ComponentLibrarySeeder` | 216 components — 54 in each category |
+| `DrawingTemplateSeeder` | the original 15 starter templates |
+| `DrawingTemplateLibrarySeeder` | 332 templates — 51 to 62 in each of the six categories |
+
+All four run as part of `db:seed`, or individually:
+
+```bash
+php artisan db:seed --class="App\Modules\Component\database\seeders\ComponentLibrarySeeder" --force
+php artisan db:seed --class="App\Modules\Drawing\database\seeders\DrawingTemplateLibrarySeeder" --force
+```
+
+Every one of them matches on the slug and updates in place, and the content is
+derived rather than randomised — so **running them twice changes nothing**.
+That is what makes it safe to re-run them after any deploy.
+
+`ComponentLibrarySeeder` also writes each component's HTML to
+`api/public/components/<slug>/template.html`, which is what the gallery's
+preview frame and the download button serve. Those files are committed too, so
+they arrive with the repository; the seeder simply rewrites them byte for byte.
+To regenerate them without a database:
+
+```bash
+php scripts/build-component-files.php
+```
+
+Adding to the library means adding a definition to one of the four classes in
+`app/Modules/Component/database/seeders/Library/`, or to one of the six in
+`app/Modules/Drawing/database/seeders/Library/`, then running the seeder again.
+
 ## Subsequent deploys
 
 Pull the repository, then only when PHP dependencies changed:
@@ -130,4 +167,12 @@ Pull the repository, then only when PHP dependencies changed:
 composer install --no-dev --optimize-autoloader
 php artisan migrate --force
 php artisan config:cache && php artisan route:cache
+```
+
+If the catalogue seeders changed with the pull, re-run them — they are
+idempotent, so this can be part of every deploy:
+
+```bash
+php artisan db:seed --class="App\Modules\Component\database\seeders\ComponentLibrarySeeder" --force
+php artisan db:seed --class="App\Modules\Drawing\database\seeders\DrawingTemplateLibrarySeeder" --force
 ```
