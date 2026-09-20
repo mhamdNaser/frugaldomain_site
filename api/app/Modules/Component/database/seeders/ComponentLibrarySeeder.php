@@ -97,7 +97,14 @@ class ComponentLibrarySeeder extends Seeder
             'status' => 'published',
             'version' => $definition['version'] ?? '1.0.0',
             'accent' => $definition['accent'] ?? '#2563eb',
-            'tags' => $definition['tags'] ?? [],
+            // Two capabilities every seeded component now has, tagged so the
+            // gallery search can find them: the stylesheet is written with
+            // logical properties and mirrors under dir="rtl", and both themes
+            // come from the same four variables.
+            'tags' => array_values(array_unique(array_merge(
+                $definition['tags'] ?? [],
+                ['rtl', 'dark-mode'],
+            ))),
             'stack' => $definition['stack'] ?? ['HTML', 'CSS'],
             'file_path' => $directory . '/template.html',
             'file_name' => $slug . '.html',

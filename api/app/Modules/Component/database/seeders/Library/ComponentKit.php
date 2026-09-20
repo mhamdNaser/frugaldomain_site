@@ -22,8 +22,16 @@ namespace App\Modules\Component\database\seeders\Library;
  */
 final class ComponentKit
 {
-    /** Matches the dashboard's own stack, so previews look native on any OS. */
-    public const FONT = "system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans',sans-serif";
+    /**
+     * Matches the dashboard's own stack, so previews look native on any OS.
+     *
+     * The Arabic faces are listed after the Latin ones: a browser falls
+     * through the stack per character, so Arabic text picks up a face that
+     * actually has the glyphs instead of rendering in a fallback that breaks
+     * the joining.
+     */
+    public const FONT = "system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,"
+        . "'Noto Sans','Noto Sans Arabic','Segoe UI Historic','Geeza Pro','Dubai',Tahoma,sans-serif";
 
     /** Avatar and accent colours, picked to stay legible on both themes. */
     public const PALETTE = ['#2563eb', '#7c3aed', '#059669', '#d97706', '#db2777', '#0891b2', '#dc2626', '#4f46e5'];
@@ -84,17 +92,23 @@ final class ComponentKit
         $theme = $spec['theme'] ?? 'light';
         $max = (int) ($spec['max'] ?? 960);
 
-        $base = self::base($accent, $theme, $max);
-        $extra = trim($spec['css'] ?? '');
+        $base = self::logical(self::base($accent, $theme, $max));
+
+        // Per-component CSS goes through the same logical-property rewrite as
+        // the base sheet, so a template written with `padding-left` still
+        // mirrors correctly when the document direction is right-to-left.
+        $extra = self::logical(trim($spec['css'] ?? ''));
         $extra = $extra === '' ? '' : "\n" . $extra;
 
         $body = trim($spec['body']);
         $js = trim($spec['js'] ?? '');
         $script = $js === '' ? '' : "\n<script>\n" . $js . "\n</script>";
 
+        $bootstrap = self::bootstrap();
+
         return <<<HTML
 <!doctype html>
-<html lang="en">
+<html lang="en" dir="ltr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -104,11 +118,99 @@ final class ComponentKit
 </style>
 </head>
 <body>
-{$body}{$script}
+{$body}
+<script>
+{$bootstrap}
+</script>{$script}
 </body>
 </html>
 
 HTML;
+    }
+
+    /**
+     * Reads `?dir=rtl` and `?theme=dark` off the URL.
+     *
+     * Every template is a static file, so there is no server to negotiate
+     * with: this is what lets the gallery show the same component in Arabic
+     * and in English, and in either theme, without generating four copies of
+     * each file. Delete it if the template is being used in one direction.
+     */
+    private static function bootstrap(): string
+    {
+        return "(function(){\n"
+            . "  var q=new URLSearchParams(location.search);\n"
+            . "  var dir=q.get('dir');\n"
+            . "  if(dir==='rtl'||dir==='ltr')document.documentElement.dir=dir;\n"
+            . "  if(dir==='rtl')document.documentElement.lang='ar';\n"
+            . "  var theme=q.get('theme');\n"
+            . "  if(theme==='dark'||theme==='light')document.documentElement.dataset.theme=theme;\n"
+            . '})();';
+    }
+
+    /**
+     * Rewrites direction-bound CSS into its logical equivalent.
+     *
+     * Mechanical, and deliberately narrow. `padding-left` always means the
+     * same thing as `padding-inline-start` in a left-to-right document, so
+     * the rewrite is lossless there and correct in the other direction.
+     *
+     * Two cases need care rather than a blind substitution:
+     *
+     *  - `translateX` in pixels is almost always a slide - a switch knob, a
+     *    drawer - and has to flip. `translateX(-50%)` is almost always
+     *    centring and must not. So only pixel values are multiplied by the
+     *    direction sign.
+     *  - `border-radius` with four values names physical corners, which swap
+     *    in the mirror. Expanding it to the four logical corners keeps a
+     *    speech bubble's tail on the correct side.
+     */
+    private static function logical(string $css): string
+    {
+        if ($css === '') {
+            return '';
+        }
+
+        $map = [
+            '/\btext-align\s*:\s*left\b/i' => 'text-align:start',
+            '/\btext-align\s*:\s*right\b/i' => 'text-align:end',
+            '/\bpadding-left\s*:/i' => 'padding-inline-start:',
+            '/\bpadding-right\s*:/i' => 'padding-inline-end:',
+            '/\bmargin-left\s*:/i' => 'margin-inline-start:',
+            '/\bmargin-right\s*:/i' => 'margin-inline-end:',
+            '/\bborder-left\s*:/i' => 'border-inline-start:',
+            '/\bborder-right\s*:/i' => 'border-inline-end:',
+            '/\bborder-left-(color|width|style)\s*:/i' => 'border-inline-start-$1:',
+            '/\bborder-right-(color|width|style)\s*:/i' => 'border-inline-end-$1:',
+        ];
+
+        foreach ($map as $pattern => $replacement) {
+            $css = preg_replace($pattern, $replacement, $css);
+        }
+
+        // `left:`/`right:` only where they begin a declaration, so a value
+        // that merely contains the word is left alone.
+        $css = preg_replace('/(^|[{;\s])left\s*:/i', '$1inset-inline-start:', $css);
+        $css = preg_replace('/(^|[{;\s])right\s*:/i', '$1inset-inline-end:', $css);
+
+        // A pixel slide flips with the direction; a percentage one is centring.
+        $css = preg_replace_callback(
+            '/translateX\(\s*(-?[\d.]+)px\s*\)/i',
+            fn($m) => 'translateX(calc(' . $m[1] . 'px * var(--dir)))',
+            $css
+        );
+
+        // border-radius: TL TR BR BL  ->  the four logical corners.
+        $css = preg_replace_callback(
+            '/\bborder-radius\s*:\s*([\d.]+(?:px|%|em|rem))\s+([\d.]+(?:px|%|em|rem))\s+([\d.]+(?:px|%|em|rem))\s+([\d.]+(?:px|%|em|rem))/i',
+            fn($m) => 'border-start-start-radius:' . $m[1]
+                . ';border-start-end-radius:' . $m[2]
+                . ';border-end-end-radius:' . $m[3]
+                . ';border-end-start-radius:' . $m[4],
+            $css
+        );
+
+        return $css;
     }
 
     /* ------------------------------------------------------------------ */
@@ -136,8 +238,14 @@ HTML;
 
         $font = self::FONT;
 
+        // Everything below is written with logical properties, and `--dir`
+        // carries the direction sign for the few places that need it (a
+        // switch knob sliding, an arrow pointing). One file, both directions:
+        // add dir="rtl" to the html element, or open it with ?dir=rtl.
         return <<<CSS
 {$scheme}
+:root{--dir:1}
+[dir="rtl"]{--dir:-1}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;padding:26px 18px;background:var(--bg);color:var(--ink);font:14px/1.55 {$font};display:flex;justify-content:center;align-items:flex-start;-webkit-font-smoothing:antialiased}
 .wrap{width:100%;max-width:{$max}px}
@@ -178,7 +286,8 @@ p{margin:0}
 .in::placeholder{color:var(--faint)}
 .in:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-soft)}
 textarea.in{resize:vertical;min-height:88px}
-select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);background-position:calc(100% - 17px) 50%,calc(100% - 12px) 50%;background-size:5px 5px;background-repeat:no-repeat;padding-right:34px}
+select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);background-position:calc(100% - 17px) 50%,calc(100% - 12px) 50%;background-size:5px 5px;background-repeat:no-repeat;padding-inline-end:34px}
+[dir="rtl"] select.in{background-position:17px 50%,12px 50%}
 .lb{display:block;font-size:12.5px;font-weight:600;margin-bottom:6px}
 .hint{font-size:11.5px;color:var(--mut);margin-top:5px}
 .err{font-size:11.5px;color:var(--bad);margin-top:5px}
