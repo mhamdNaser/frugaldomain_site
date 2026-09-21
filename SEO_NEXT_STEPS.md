@@ -4,16 +4,17 @@ Written for: whoever picks up FrugalDomain's search work next (likely Muhammed).
 
 ## Where the site stands
 
-53 prerendered routes, all verified to have exactly one `<h1>`, one meta
+62 prerendered routes, all verified to have exactly one `<h1>`, one meta
 description, one self-referencing canonical, valid JSON-LD, reciprocal
 hreflang, and — where a page shows an FAQ — schema answers that match the
 visible copy word for word.
 
 | | Before | Now |
 |---|---|---|
-| Indexable routes | 15 | 53 |
-| Arabic routes | 0 | 21 |
-| Routes with a tool / FAQ / list schema | 0 | 36 |
+| Indexable routes | 15 | 62 |
+| Arabic routes | 0 | 30 |
+| Routes with a tool / FAQ / list schema | 0 | 54 |
+| Routes in a reciprocal hreflang cluster | 0 | 60 |
 | Thinnest tool page | 237 chars | 761 chars (`/Drower/Board`, an editor) |
 
 The technical layer is finished. Nothing further in metadata, structured data,
@@ -39,7 +40,7 @@ That was the whole gap, and it is closed:
 - The developer profile moved from `/about-us/muhammed-nasser-edden` to
   `/About-Us/muhammed-nasser-edden`, with a 301 from the old spelling. See the
   case-sensitivity note under "Things that will break" — this was live.
-- `sitemap.xml` now carries `xhtml:link` alternates on all 42 bilingual URLs,
+- `sitemap.xml` now carries `xhtml:link` alternates on all 60 bilingual URLs,
   and `generate-sitemap.js` fails the build if a listed path has no route in
   `router.jsx` behind it.
 - `robots.txt` gained `Disallow: /my-library` and the AI crawler tokens that
@@ -48,6 +49,13 @@ That was the whole gap, and it is closed:
   someone asks an assistant a question this site can answer.
 - `llms.txt` is new: a curated map of the site for answer engines, restored
   after prerendering alongside `sitemap.xml` and `robots.txt`.
+- The nine tools gained Arabic counterparts at `/ar/<slug>` — flat, mirroring
+  the English URLs, because `scripts/routes.js` derives the pair as `/ar` plus
+  the English path and a nested `/ar/tools/<slug>` would break that mapping.
+  One component, `ArabicToolPage.jsx`, renders all nine; the copy is the only
+  difference and it lives in `TOOLS_AR` in `src/data/i18n/ar.js`. Each one is
+  linked from the Arabic home page, generated from `TOOLS_AR` so a new tool
+  page can never become an orphan.
 
 ---
 
@@ -118,11 +126,14 @@ would need a `tool` field on each entry to pick which converter to render.
 
 ---
 
-## 3. Arabic — 21 of 43 routes
+## 3. Arabic — 30 of 62 routes
 
-Every English route now has an Arabic counterpart except `/Drower/Board`, and
-that one is deliberate: the editor fills the viewport and has no room for copy,
-so `/ar/vector-editor` carries its Arabic text instead.
+Every English route now has an Arabic counterpart except `/Drower/Board` and
+`/components`. The board is deliberate: the editor fills the viewport and has
+no room for copy, so `/ar/vector-editor` carries its Arabic text instead. The
+component gallery is simply not written yet — it is filled from the API, so an
+Arabic page for it needs a decision about what the prerendered snapshot should
+contain before it needs Arabic copy.
 
 The Arabic pages carry copy rather than duplicating the tools. Each interactive
 tool is one shared component at its English URL; what ranks in Arabic is the
@@ -136,14 +147,14 @@ counterpart's `<Seo>` so the hreflang pair stays reciprocal — Google ignores a
 one-sided annotation entirely.
 
 Thinnest Arabic pages, if you want to go further: `/ar/documentation` (834),
-`/ar/Privacy-Policy` (1,038), `/ar/about-us/muhammed-nasser-edden` (1,077).
+`/ar/Privacy-Policy` (1,038), `/ar/About-Us/muhammed-nasser-edden` (1,077).
 The documentation page is a summary that routes to the full English reference;
 translating the whole technical reference is a much larger job and probably
 not worth it before the Arabic pages show traffic.
 
 ## 4. After deploying — do this
 
-1. **Search Console** — resubmit `sitemap.xml` (53 URLs now).
+1. **Search Console** — resubmit `sitemap.xml` (62 URLs now).
 2. **URL Inspection → Request Indexing** for the new pages. Cuts recrawl from
    weeks to days. Start with `/token-calculator`, `/tools`, `/svg-toolkit` and
    `/About-Us/muhammed-nasser-edden`, which is a new URL rather than a changed
