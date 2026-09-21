@@ -4,21 +4,50 @@ Written for: whoever picks up FrugalDomain's search work next (likely Muhammed).
 
 ## Where the site stands
 
-43 prerendered routes, all verified to have exactly one `<h1>`, one meta
+53 prerendered routes, all verified to have exactly one `<h1>`, one meta
 description, one self-referencing canonical, valid JSON-LD, reciprocal
 hreflang, and — where a page shows an FAQ — schema answers that match the
 visible copy word for word.
 
 | | Before | Now |
 |---|---|---|
-| Indexable routes | 15 | 43 |
+| Indexable routes | 15 | 53 |
 | Arabic routes | 0 | 21 |
-| Pages with a tool/FAQ schema | 0 | 27 |
+| Routes with a tool / FAQ / list schema | 0 | 36 |
 | Thinnest tool page | 237 chars | 761 chars (`/Drower/Board`, an editor) |
 
 The technical layer is finished. Nothing further in metadata, structured data,
 prerendering or sitemap generation will move rankings much. What is left is
 content depth, and links from other sites.
+
+### The 2026-09-21 pass
+
+The nine developer tools added after the first pass had shipped with prose but
+no structured data — a visitor could read what each one did, and an answer
+engine could not tell the page *was* the tool rather than an article about it.
+That was the whole gap, and it is closed:
+
+- Each tool now emits `SoftwareApplication` and `FAQPage`, built from
+  `src/data/devToolSeo.js`. The same file feeds `<ToolFaq>` on the page, so the
+  schema cannot claim an answer a visitor cannot read.
+- `/tools` carries an `ItemList` generated from `TOOL_GROUPS` — the catalogue an
+  answer engine reads is the catalogue the page renders.
+- `/components` and the `/components/:slug`, `/apps/:slug` detail pages lost the
+  stale `Fruga -` title prefix and a `keywords` prop `SiteSeo` has never read,
+  and gained breadcrumbs plus `CollectionPage` / `SoftwareSourceCode` /
+  `SoftwareApplication` entities.
+- The developer profile moved from `/about-us/muhammed-nasser-edden` to
+  `/About-Us/muhammed-nasser-edden`, with a 301 from the old spelling. See the
+  case-sensitivity note under "Things that will break" — this was live.
+- `sitemap.xml` now carries `xhtml:link` alternates on all 42 bilingual URLs,
+  and `generate-sitemap.js` fails the build if a listed path has no route in
+  `router.jsx` behind it.
+- `robots.txt` gained `Disallow: /my-library` and the AI crawler tokens that
+  did not exist when it was written — including the user-triggered fetchers
+  (`Claude-User`, `Perplexity-User`, `MistralAI-User`), which are what run when
+  someone asks an assistant a question this site can answer.
+- `llms.txt` is new: a curated map of the site for answer engines, restored
+  after prerendering alongside `sitemap.xml` and `robots.txt`.
 
 ---
 
@@ -114,11 +143,15 @@ not worth it before the Arabic pages show traffic.
 
 ## 4. After deploying — do this
 
-1. **Search Console** — resubmit `sitemap.xml` (43 URLs now).
+1. **Search Console** — resubmit `sitemap.xml` (53 URLs now).
 2. **URL Inspection → Request Indexing** for the new pages. Cuts recrawl from
-   weeks to days. Start with `/convert/jpg-to-png`, `/ar`, `/vector-editor`.
+   weeks to days. Start with `/token-calculator`, `/tools`, `/svg-toolkit` and
+   `/About-Us/muhammed-nasser-edden`, which is a new URL rather than a changed
+   one. Check that the old lowercase spelling returns a 301 and not a 200.
 3. **Rich Results Test** — check `/convert/jpg-to-png`, `/Faq` and
    `/ar/IconsGalary`. FAQ rich results usually appear in one to two weeks.
+   Check `/token-calculator` and `/tools` too: they are the first pages on the
+   site carrying `SoftwareApplication` and `ItemList` respectively.
 4. **International Targeting** in Search Console — confirm no hreflang errors.
 5. **Two weeks later**, open the Performance report and filter to positions
    8–20. Those are queries already on the edge of page one; a paragraph or two
@@ -140,10 +173,17 @@ not worth it before the Arabic pages show traffic.
 - **Do not set `document.documentElement.lang` outside `/ar` handling.** It
   races Helmet and can mislabel an Arabic page as English. `TranslationProvider`
   now stands aside under `/ar` for exactly this reason.
-- **`sitemap.xml` and `robots.txt` are restored after prerendering** by a
-  plugin in `vite.config.js`. If you change the build, verify both still have
-  zero NUL bytes before deploying — the files keep their correct size when
-  corrupted, so the damage is invisible in a directory listing.
+- **`sitemap.xml`, `robots.txt` and `llms.txt` are restored after prerendering**
+  by a plugin in `vite.config.js`. If you change the build, verify all three
+  still have zero NUL bytes before deploying — the files keep their correct
+  size when corrupted, so the damage is invisible in a directory listing.
+- **A route's capitalisation is not cosmetic.** The prerenderer writes one
+  directory per route and Windows is case-insensitive, so building
+  `/about-us/x` when `About-Us/` already exists folds the snapshot into the
+  existing directory and the lowercase URL ships with no page behind it. The
+  host is case-sensitive, so it answers that URL 200 through the SPA fallback,
+  serving the home page's markup under the profile page's canonical. Keep a new
+  route's capitals identical to its parent directory's.
 - **`npm run build` returns before the prerenderer has written its files.**
   The route directories under `dist/` appear a few minutes after the command
   exits, and starting another build in the meantime wipes what was written. So
