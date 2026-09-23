@@ -35,8 +35,15 @@ class LocaleController extends Controller
             ]);
         });
 
+        // Access-Control-Allow-Origin differs per requesting origin, and is
+        // absent when a request carries none (a direct visit, a crawler). The
+        // Hostinger CDN cached this response as `public` without regard to
+        // Origin, so every visitor got whichever copy it stored first - often
+        // one with no CORS header, and the site's translations were blocked.
+        // `private` keeps it out of shared caches; Vary covers the browser's.
         return response()->json($payload)->withHeaders([
-            'Cache-Control' => 'public, max-age=3600',
+            'Cache-Control' => 'private, max-age=3600',
+            'Vary' => 'Origin',
             'X-Cache-Status' => Cache::has($cacheKey) ? 'HIT' : 'MISS',
         ]);
     }
