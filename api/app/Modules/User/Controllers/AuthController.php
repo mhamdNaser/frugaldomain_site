@@ -17,6 +17,7 @@ use Illuminate\Support\Str;
 use App\Modules\Core\Services\AnalyticsRecorder;
 use App\Modules\User\Models\User;
 use App\Modules\User\Resources\LoginResource;
+use App\Modules\Account\Support\PasswordResetService;
 
 class AuthController extends Controller
 {
@@ -169,80 +170,42 @@ class AuthController extends Controller
         ]);
     }
 
-    public function forgotPassword(ForgotPasswordRequest $request)
+    /**
+     * The panel's own "forgot password". It used to return the code in the
+     * response whenever the server was not in production mode (so anyone who
+     * knew an address could take the account), never actually sent it, and
+     * had no limit on guesses. It now goes through the same service as the
+     * public site: the code is only ever emailed, and the answer is the same
+     * whether or not the address exists.
+     */
+    public function forgotPassword(ForgotPasswordRequest $request, PasswordResetService $resets)
     {
-        $validated = $request->validated();
-        $email = strtolower((string) $validated['email']);
-
-        $user = User::where('email', $email)->first();
-        if (!$user) {
-            return response()->json([
-                'message' => 'If this email exists, a verification code has been sent.',
-            ]);
-        }
-
-        $code = (string) random_int(100000, 999999);
-
-        DB::table('password_reset_tokens')->updateOrInsert(
-            ['email' => $email],
-            [
-                'token' => Hash::make($code),
-                'created_at' => now(),
-            ]
+        $resets->sendCode(
+            (string) $request->validated()['email'],
+            $request->header('X-Language') === 'ar' ? 'ar' : 'en',
         );
 
-        // TODO: integrate Mail/SMS sender here.
         return response()->json([
-            'message' => 'Verification code generated successfully.',
-            'dev_code' => app()->environment('production') ? null : $code,
+            'message' => 'If an account uses this email, a code is on its way.',
         ]);
     }
 
-    public function resetPasswordWithCode(ResetPasswordWithCodeRequest $request)
+    public function resetPasswordWithCode(ResetPasswordWithCodeRequest $request, PasswordResetService $resets)
     {
         $validated = $request->validated();
-        $email = strtolower((string) $validated['email']);
-        $code = (string) $validated['code'];
 
-        $record = DB::table('password_reset_tokens')->where('email', $email)->first();
-        if (!$record) {
-            return response()->json([
-                'message' => 'Invalid verification code.',
-            ], 422);
+        $error = $resets->reset(
+            (string) $validated['email'],
+            (string) $validated['code'],
+            (string) $validated['new_password'],
+            $request->header('X-Language') === 'ar' ? 'ar' : 'en',
+            $request->ip(),
+        );
+
+        if ($error) {
+            return response()->json(['message' => $error, 'errors' => ['code' => [$error]]], 422);
         }
 
-        if (now()->diffInMinutes($record->created_at) > 15) {
-            DB::table('password_reset_tokens')->where('email', $email)->delete();
-            return response()->json([
-                'message' => 'Verification code expired.',
-            ], 422);
-        }
-
-        if (!Hash::check($code, $record->token)) {
-            return response()->json([
-                'message' => 'Invalid verification code.',
-                'errors' => [
-                    'code' => ['Invalid verification code.'],
-                ],
-            ], 422);
-        }
-
-        $user = User::where('email', $email)->first();
-        if (!$user) {
-            return response()->json([
-                'message' => 'User not found.',
-            ], 404);
-        }
-
-        $user->password = $validated['new_password'];
-        $user->setRememberToken(Str::random(60));
-        $user->save();
-        $user->tokens()->delete();
-
-        DB::table('password_reset_tokens')->where('email', $email)->delete();
-
-        return response()->json([
-            'message' => 'Password reset successfully.',
-        ]);
+        return response()->json(['message' => 'Password reset successfully.']);
     }
 }

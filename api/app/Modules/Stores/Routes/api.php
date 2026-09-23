@@ -18,7 +18,7 @@ Route::prefix('admin')->group(function () {
             Route::post('stores', 'index')->name('store');
             Route::post('store', 'store')->name('create-store');
             Route::put('store/{id}', 'update')->name('update-store');
-            Route::patch('store/{id}/status', 'changStatus')->name('changestatus-user');
+            Route::patch('store/{id}/status', 'changStatus')->name('changestatus-store');
             Route::delete('store/{id}', 'destroy')->name('delete-store');
         });
 

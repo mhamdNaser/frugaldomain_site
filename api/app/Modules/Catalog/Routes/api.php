@@ -16,7 +16,7 @@ Route::prefix('admin')->group(function () {
     Route::middleware(['auth:sanctum', 'role:partner'])->group(function () {
 
         Route::controller(ProductsDashboardController::class)->group(function () {
-            Route::get('/dashboard/statistics', 'statistics')->name('statistics');
+            Route::get('/dashboard/statistics', 'statistics')->name('catalog-statistics');
         });
         
         Route::controller(ProductController::class)->group(function () {

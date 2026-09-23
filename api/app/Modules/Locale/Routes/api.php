@@ -19,7 +19,7 @@ Route::get('cities/{id}', [CityController::class, 'index'])->name('cities-state-
 Route::prefix('admin')->group(function () {
 
     Route::controller(CountryController::class)->group(function () {
-        Route::post('countries', 'allCountry')->name('countries');
+        Route::post('countries', 'allCountry')->name('admin-countries');
     });
 
     Route::controller(StateController::class)->group(function () {

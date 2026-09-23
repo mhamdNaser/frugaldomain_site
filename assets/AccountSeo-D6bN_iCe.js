@@ -1,0 +1,1 @@
+import{e as r,j as c}from"./react-vendor-CTDTI649.js";import{S as p}from"./SiteSeo-DNYlFXqW.js";function a(n){const t=r.c(4),{title:o,path:s}=n,i=`${o} | Fruga`;let e;return t[0]!==s||t[1]!==i||t[2]!==o?(e=c.jsx(p,{title:i,description:o,path:s,robots:"noindex,nofollow"}),t[0]=s,t[1]=i,t[2]=o,t[3]=e):e=t[3],e}export{a as A};

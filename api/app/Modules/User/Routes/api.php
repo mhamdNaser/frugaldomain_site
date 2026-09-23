@@ -8,9 +8,12 @@ use App\Modules\User\Controllers\PermissionsController;
 use Illuminate\Support\Facades\Route;
 
 
-Route::post('login', [AuthController::class, 'userLogin'])->name('login');
-Route::post('admin/password/forgot', [AuthController::class, 'forgotPassword'])->name('password-forgot');
-Route::post('admin/password/reset-with-code', [AuthController::class, 'resetPasswordWithCode'])->name('password-reset-with-code');
+Route::post('login', [AuthController::class, 'userLogin'])->middleware('throttle:login')->name('login');
+// Both were unthrottled: a six-digit code could be guessed at leisure.
+Route::post('admin/password/forgot', [AuthController::class, 'forgotPassword'])
+    ->middleware('throttle:password-forgot')->name('password-forgot');
+Route::post('admin/password/reset-with-code', [AuthController::class, 'resetPasswordWithCode'])
+    ->middleware('throttle:password-reset')->name('password-reset-with-code');
 
 Route::prefix('admin')->group(function () {
 
@@ -19,7 +22,7 @@ Route::prefix('admin')->group(function () {
 
     Route::controller(AuthController::class)->group(function () {
         Route::post('adminregister', 'register')->name('adminregister');
-        Route::post('adminLogin', 'login')->name('adminLogin');
+        Route::post('adminLogin', 'login')->middleware('throttle:login')->name('adminLogin');
     });
 
     Route::middleware(['auth:sanctum', 'role:partner'])->group(function () {
@@ -59,6 +62,10 @@ Route::prefix('admin')->group(function () {
             Route::post('all-users', 'index')->name('users');
             Route::get('all-users', 'all')->name('all-users');
             Route::patch('users/{id}/status', 'changStatus')->name('changestatus-user');
+            Route::put('users/{id}/password', 'resetPassword')
+                ->whereNumber('id')
+                ->middleware('throttle:admin-reset-password')
+                ->name('reset-user-password');
             Route::get('user/{id}', 'show')->name('selected-user');
             Route::post('users', 'store')->name('store-user');
             Route::post('users/{id}', 'update')->name('update-user');

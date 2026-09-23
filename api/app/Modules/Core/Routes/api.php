@@ -43,7 +43,7 @@ Route::prefix('admin')->group(function () {
         Route::get('dashboard/admin-statistics', [DashboardStatisticsController::class, 'admin']);
 
         Route::controller(DashboardController::class)->group(function () {
-            Route::get('statistics', 'statistics')->name('statistics');
+            Route::get('statistics', 'statistics')->name('admin-statistics');
             Route::get('quick-stats', 'quickStats')->name('quick-stats');
 
             Route::get('/icon-statistics', 'iconStatistics');

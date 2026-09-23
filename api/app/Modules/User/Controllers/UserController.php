@@ -7,7 +7,12 @@ use App\Modules\User\Resources\UserResource;
 use App\Modules\User\Repositories\Interfaces\UserRepositoryInterface;
 use App\Modules\User\Requests\User\StoreUserRequest;
 use App\Modules\User\Requests\User\UpdateUserRequest;
+use App\Modules\User\Requests\User\AdminResetPasswordRequest;
+use App\Modules\User\Models\User;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class UserController extends Controller
 {
@@ -66,6 +71,39 @@ class UserController extends Controller
         }
 
         return response()->json(['message' => 'User not found'], 404);
+    }
+
+    /**
+     * Set a new password for a user who has lost theirs.
+     *
+     * The administrator chooses the password and passes it on; the user can
+     * change it from their account afterwards. The user's sessions are ended
+     * unless the administrator says otherwise, so whoever might have been
+     * signed in with the old password is signed out.
+     */
+    public function resetPassword(AdminResetPasswordRequest $request, $id)
+    {
+        $user = User::findOrFail($id);
+        $data = $request->validated();
+
+        // The model casts password as "hashed".
+        $user->password = $data['password'];
+        $user->setRememberToken(Str::random(60));
+        $user->save();
+
+        if ($data['revoke_sessions'] ?? true) {
+            $user->tokens()->delete();
+        }
+
+        // Password reset codes still pending for the old password are void.
+        DB::table('password_reset_tokens')->where('email', strtolower($user->email))->delete();
+
+        Log::info('Admin reset a user password', [
+            'admin_id' => $request->user()->id,
+            'user_id' => $user->id,
+        ]);
+
+        return response()->json(['message' => 'Password updated.']);
     }
 
     public function changStatus($id)
