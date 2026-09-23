@@ -24,7 +24,8 @@ class IconCategoryRepository implements IconCategoryRepositoryInterface
         // تطبيق الفلترة على الكولكشن
         if ($search) {
             $items = $items->filter(function ($item) use ($search) {
-                return stripos($item->name, $search) !== false;
+                return stripos($item->name, $search) !== false
+                    || ($item->name_ar && mb_stripos($item->name_ar, $search) !== false);
             });
         }
 
@@ -34,7 +35,7 @@ class IconCategoryRepository implements IconCategoryRepositoryInterface
 
     public function allWithoutPagination()
     {
-        return IconCategories::select('id', 'name')
+        return IconCategories::select('id', 'name', 'name_ar')
             ->where('is_active', true)
             ->orderBy('name', 'asc')
             ->get();

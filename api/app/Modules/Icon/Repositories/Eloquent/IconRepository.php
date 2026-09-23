@@ -98,7 +98,11 @@ class IconRepository implements IconRepositoryInterface
             $query->where(function ($q) use ($search) {
                 $q->where('title', 'like', "%{$search}%")
                     ->orWhere('description', 'like', "%{$search}%")
-                    ->orWhere('tags', 'like', "%{$search}%");
+                    ->orWhere('tags', 'like', "%{$search}%")
+                    // Lets an Arabic search on /ar find a whole category.
+                    ->orWhereHas('category', function ($c) use ($search) {
+                        $c->where('name_ar', 'like', "%{$search}%");
+                    });
             });
         }
 

@@ -50,7 +50,8 @@ class ComponentRepository implements ComponentRepositoryInterface
                 $q->where('name', 'like', "%{$search}%")
                     ->orWhere('name_ar', 'like', "%{$search}%")
                     ->orWhere('slug', 'like', "%{$search}%")
-                    ->orWhere('tagline', 'like', "%{$search}%");
+                    ->orWhere('tagline', 'like', "%{$search}%")
+                    ->orWhere('tagline_ar', 'like', "%{$search}%");
             });
         }
 
@@ -270,7 +271,8 @@ class ComponentRepository implements ComponentRepositoryInterface
     private function columns(array $data, ?Component $existing = null): array
     {
         $allowed = [
-            'slug', 'name', 'name_ar', 'tagline', 'summary', 'file_type',
+            'slug', 'name', 'name_ar', 'tagline', 'tagline_ar', 'summary',
+            'summary_ar', 'file_type',
             'status', 'version', 'accent', 'tags', 'stack', 'preview_theme',
             'preview_height', 'user_id', 'ordering',
         ];
@@ -320,8 +322,11 @@ class ComponentRepository implements ComponentRepositoryInterface
         $component->features()->delete();
 
         foreach (array_values($features) as $index => $feature) {
+            // A bullet is either a plain English string or
+            // ['label' => ..., 'label_ar' => ...] when the Arabic is edited too.
             $label = is_array($feature) ? ($feature['label'] ?? '') : $feature;
             $label = trim((string) $label);
+            $labelAr = is_array($feature) ? trim((string) ($feature['label_ar'] ?? '')) : '';
 
             if ($label === '') {
                 continue;
@@ -330,6 +335,7 @@ class ComponentRepository implements ComponentRepositoryInterface
             ComponentFeature::create([
                 'component_id' => $component->id,
                 'label' => $label,
+                'label_ar' => $labelAr === '' ? null : $labelAr,
                 'ordering' => $index,
             ]);
         }

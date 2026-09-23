@@ -11,6 +11,7 @@ class IconCategories extends Model
 
     protected $fillable = [
         'name',
+        'name_ar',
         'slug',
         'description',
         'parent_id',

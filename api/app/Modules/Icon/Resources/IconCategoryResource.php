@@ -11,6 +11,7 @@ class IconCategoryResource extends JsonResource
         return [
             'id' => $this->id,
             'name' => $this->name,
+            'name_ar' => $this->name_ar,
             'slug' => $this->slug,
             'description' => $this->description,
             'parent_id' => $this->parent_id,

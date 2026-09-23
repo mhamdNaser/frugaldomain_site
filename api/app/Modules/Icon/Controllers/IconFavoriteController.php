@@ -26,12 +26,17 @@ class IconFavoriteController extends Controller
     {
         $userId = $request->user()->id;
 
-        $favorite = IconFavorite::where('user_id', $userId)
+        // The table soft-deletes but also has unique(user_id, icon_id), and a
+        // soft-deleted row still holds its place in that index. So removing is
+        // a real delete, and re-adding an icon removed before this fix brings
+        // its old row back - inserting a second one failed on the index.
+        $favorite = IconFavorite::withTrashed()
+            ->where('user_id', $userId)
             ->where('icon_id', $iconId)
             ->first();
 
-        if ($favorite) {
-            $favorite->delete();
+        if ($favorite && !$favorite->trashed()) {
+            $favorite->forceDelete();
 
             return response()->json([
                 'success' => true,
@@ -40,10 +45,14 @@ class IconFavoriteController extends Controller
             ]);
         }
 
-        IconFavorite::create([
-            'user_id' => $userId,
-            'icon_id' => $iconId,
-        ]);
+        if ($favorite) {
+            $favorite->restore();
+        } else {
+            IconFavorite::create([
+                'user_id' => $userId,
+                'icon_id' => $iconId,
+            ]);
+        }
 
         return response()->json([
             'success' => true,

@@ -11,7 +11,7 @@ class ComponentFeature extends Model
 
     protected $table = 'component_features';
 
-    protected $fillable = ['component_id', 'label', 'ordering'];
+    protected $fillable = ['component_id', 'label', 'label_ar', 'ordering'];
 
     protected $casts = ['ordering' => 'integer'];
 

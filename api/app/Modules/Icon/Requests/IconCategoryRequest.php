@@ -15,6 +15,7 @@ class IconCategoryRequest extends FormRequest
     {
         $rules = [
             'name' => 'required|string|max:255',
+            'name_ar' => 'nullable|string|max:255',
             'slug' => 'required|string|max:255|unique:icon_categories,slug,' . $this->id,
             'description' => 'nullable|string',
             'parent_id' => 'nullable|exists:icon_categories,id',

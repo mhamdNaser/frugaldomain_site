@@ -1,6 +1,7 @@
 <?php
 
 return [
+    App\Modules\Account\Providers\AccountServiceProvider::class,
     App\Modules\App\Providers\AppCatalogueServiceProvider::class,
     App\Modules\Billing\Providers\BillingServiceProvider::class,
     App\Modules\Catalog\Providers\CatalogServiceProvider::class,

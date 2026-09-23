@@ -35,7 +35,9 @@ class ComponentResource extends JsonResource
             'name' => $this->name,
             'name_ar' => $this->name_ar,
             'tagline' => $this->tagline,
+            'tagline_ar' => $this->tagline_ar,
             'summary' => $this->summary,
+            'summary_ar' => $this->summary_ar,
 
             'type' => $this->file_type,
             'status' => $this->status,
@@ -48,6 +50,7 @@ class ComponentResource extends JsonResource
             'features' => $features->map(fn($f) => [
                 'id' => $f->id,
                 'label' => $f->label,
+                'label_ar' => $f->label_ar,
                 'ordering' => $f->ordering,
             ])->values(),
 

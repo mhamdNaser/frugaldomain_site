@@ -92,7 +92,9 @@ class ComponentLibrarySeeder extends Seeder
             'name' => $definition['name'],
             'name_ar' => $definition['name_ar'] ?? null,
             'tagline' => $definition['tagline'] ?? null,
+            'tagline_ar' => $definition['tagline_ar'] ?? null,
             'summary' => $definition['summary'] ?? null,
+            'summary_ar' => $definition['summary_ar'] ?? null,
             'file_type' => 'html',
             'status' => 'published',
             'version' => $definition['version'] ?? '1.0.0',
@@ -117,11 +119,14 @@ class ComponentLibrarySeeder extends Seeder
 
         // Rewritten wholesale: the bullets are part of the definition, and
         // matching them up one by one would only preserve ids nothing uses.
+        // `features_ar` runs parallel to `features`, bullet for bullet.
         ComponentFeature::where('component_id', $component->id)->delete();
+        $arabic = array_values($definition['features_ar'] ?? []);
         foreach (array_values($definition['features'] ?? []) as $order => $label) {
             ComponentFeature::create([
                 'component_id' => $component->id,
                 'label' => $label,
+                'label_ar' => $arabic[$order] ?? null,
                 'ordering' => $order + 1,
             ]);
         }
