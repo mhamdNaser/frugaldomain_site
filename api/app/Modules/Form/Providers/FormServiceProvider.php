@@ -2,6 +2,8 @@
 
 namespace App\Modules\Form\Providers;
 
+use App\Modules\Form\Console\SeedFormResponses;
+
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\RateLimiter;
@@ -12,6 +14,10 @@ class FormServiceProvider extends ServiceProvider
     public function boot(): void
     {
         $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
+
+        if ($this->app->runningInConsole()) {
+            $this->commands([SeedFormResponses::class]);
+        }
 
         /*
          * Named limiters, one counter each, so viewing a form does not spend

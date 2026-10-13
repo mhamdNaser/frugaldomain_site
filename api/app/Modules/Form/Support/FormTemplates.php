@@ -65,8 +65,11 @@ class FormTemplates
             'family-registration' => [
                 'title' => 'Family registration',
                 'title_ar' => 'استمارة تسجيل العائلات',
-                'description' => 'Household details, collected one family at a time.',
-                'description_ar' => 'تُعبّأ استمارة واحدة لكل عائلة. يرجى إدخال البيانات كما هي في الوثائق الرسمية.',
+                'description' => 'To help identify the families most in need of subsidised heating fuel, '
+                    . 'and to avoid registering on paper, the information below is collected through this link.',
+                'description_ar' => 'حرصاً على تسهيل عملية حصر الأسر الأشد فقراً والأكثر حاجة للاستفادة من مازوت '
+                    . 'التدفئة المدعوم، وتجنباً للتسجيل الورقي وتسهيل تنظيم البيانات، نضع بين أيديكم رابطاً '
+                    . 'إلكترونياً لتعبئة المعلومات المطلوبة.',
                 'settings' => [
                     // So the exported sheet's first column reads the way the
                     // sheet this form came from reads.
@@ -132,6 +135,22 @@ class FormTemplates
             self::field('select', 'Has a breadwinner', 'يوجد معيل للعائلة (نعم \\ لا)', required: true, options: self::YES_NO),
 
             self::field('textarea', 'Additional notes', 'معيار إضافي (نص)', rules: ['max_length' => 1000]),
+
+            /*
+             * Either document, in one field. Asking for the family book and
+             * the identity card as two questions would leave one of them
+             * permanently empty, and a household that has only the card would
+             * be unable to finish a form that demanded the book.
+             */
+            self::field(
+                'image',
+                'Family book photo, or personal ID',
+                'صورة دفتر العائلة، أو الهوية الشخصية',
+                required: true,
+                rules: ['max_size' => 3072],
+                help: 'Photograph the family book if you have one; otherwise the personal ID.',
+                helpAr: 'صوّر دفتر العائلة إن توفّر، وإن لم يتوفّر فصوّر الهوية الشخصية.'
+            ),
         ];
     }
 
@@ -152,12 +171,16 @@ class FormTemplates
         bool $required = false,
         bool $unique = false,
         array $rules = [],
-        array $options = []
+        array $options = [],
+        ?string $help = null,
+        ?string $helpAr = null
     ): array {
         return [
             'type' => $type,
             'label' => $label,
             'label_ar' => $labelAr,
+            'help' => $help,
+            'help_ar' => $helpAr,
             'required' => $required,
             'unique' => $unique,
             'rules' => $rules,
