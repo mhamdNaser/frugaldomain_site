@@ -48,7 +48,12 @@ class SaveFormRequest extends FormRequest
             'fields' => 'required|array|min:1|max:100',
             'fields.*.id' => 'nullable|integer',
             'fields.*.type' => ['required', 'string', Rule::in($types)],
-            'fields.*.label' => 'required|string|max:200',
+            /*
+             * One of the two is required, not both: a person building an
+             * Arabic form types the question in Arabic and should not have to
+             * invent an English version of it to be allowed to save.
+             */
+            'fields.*.label' => 'required_without:fields.*.label_ar|nullable|string|max:200',
             'fields.*.label_ar' => 'nullable|string|max:200',
             'fields.*.placeholder' => 'nullable|string|max:200',
             'fields.*.help' => 'nullable|string|max:300',

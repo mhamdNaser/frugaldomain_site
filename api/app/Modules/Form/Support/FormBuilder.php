@@ -66,8 +66,16 @@ class FormBuilder
             $id = $input['id'] ?? null;
             $current = $id ? $existing->get((int) $id) : null;
 
+            /*
+             * A question written only in Arabic still needs a label to show
+             * wherever the English one would appear - the export header in
+             * English, the validation message, the column of a csv - so the
+             * Arabic stands in for it rather than leaving a blank.
+             */
+            $label = ($input['label'] ?? '') ?: ($input['label_ar'] ?? '');
+
             $attributes = [
-                'label' => $input['label'],
+                'label' => $label,
                 'label_ar' => $input['label_ar'] ?? null,
                 'placeholder' => $input['placeholder'] ?? null,
                 'help' => $input['help'] ?? null,
@@ -96,7 +104,7 @@ class FormBuilder
                 continue;
             }
 
-            $key = FieldTypes::keyFrom($input['label'], $taken);
+            $key = FieldTypes::keyFrom($label, $taken);
             $taken[] = $key;
 
             $field = $form->fields()->create(array_merge($attributes, [
