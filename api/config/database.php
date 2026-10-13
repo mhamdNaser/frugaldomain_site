@@ -63,6 +63,38 @@ return [
             ]) : [],
         ],
 
+        /*
+         * Form submissions.
+         *
+         * The answers people type into a published form are kept apart from
+         * the site's own tables: a different database, with its own backup
+         * and its own credentials, so a mistake in the site cannot read or
+         * wipe them and a restore of one does not drag the other with it.
+         *
+         * Every value falls back to the main connection, so the feature runs
+         * on a single database until a second one is actually provisioned -
+         * nothing breaks on a fresh install or in local development.
+         */
+        'forms' => [
+            'driver' => env('FORMS_DB_DRIVER', env('DB_CONNECTION', 'mysql')) === 'sqlite' ? 'sqlite' : 'mysql',
+            'url' => env('FORMS_DB_URL'),
+            'host' => env('FORMS_DB_HOST', env('DB_HOST', '127.0.0.1')),
+            'port' => env('FORMS_DB_PORT', env('DB_PORT', '3306')),
+            'database' => env('FORMS_DB_DATABASE', env('DB_DATABASE', 'laravel')),
+            'username' => env('FORMS_DB_USERNAME', env('DB_USERNAME', 'root')),
+            'password' => env('FORMS_DB_PASSWORD', env('DB_PASSWORD', '')),
+            'unix_socket' => env('DB_SOCKET', ''),
+            'charset' => env('DB_CHARSET', 'utf8mb4'),
+            'collation' => env('DB_COLLATION', 'utf8mb4_unicode_ci'),
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'strict' => true,
+            'engine' => null,
+            'options' => extension_loaded('pdo_mysql') ? array_filter([
+                PDO::MYSQL_ATTR_SSL_CA => env('MYSQL_ATTR_SSL_CA'),
+            ]) : [],
+        ],
+
         'mariadb' => [
             'driver' => 'mariadb',
             'url' => env('DB_URL'),
