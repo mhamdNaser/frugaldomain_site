@@ -88,6 +88,16 @@ class FormField extends Model
             'rules' => $this->rules ?? [],
             'options' => $this->options ?? [],
             'default_value' => $this->default_value,
+
+            /*
+             * The dates an age range works out to today, computed here so the
+             * box a person types into and the rule that judges what they typed
+             * cannot drift apart - and so "over seventeen" still means that
+             * next year.
+             */
+            'bounds' => in_array($this->type, ['date', 'datetime'], true)
+                ? FieldTypes::dateBounds($this->rules ?? [])
+                : null,
         ];
     }
 }

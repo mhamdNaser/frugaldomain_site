@@ -124,17 +124,40 @@ class FormTemplates
 
             self::field('phone', 'Contact number', 'رقم التواصل', required: true),
             self::field('select', 'Place of birth', 'مكان الولادة', required: true, options: self::GOVERNORATES),
-            self::field('date', 'Date of birth', 'تاريخ الميلاد', required: true),
+            /*
+             * An age range rather than two fixed dates: a form left open for a
+             * year would otherwise start accepting people it was written to
+             * exclude. Seventeen at the youngest, ninety at the oldest - a
+             * household head outside that is almost always a typing slip, and
+             * a slip in a national id year is easy to make.
+             */
+            self::field('date', 'Date of birth', 'تاريخ الميلاد', required: true, rules: ['min_age' => 17, 'max_age' => 90]),
 
-            self::field('number', 'Number of children', 'عدد الأبناء', required: true, rules: ['integer' => true, 'min' => 0, 'max' => 40]),
-            self::field('number', 'Number of wives', 'عدد الزوجات', required: true, rules: ['integer' => true, 'min' => 0, 'max' => 10]),
+            // The form registers families, so a household with no children at
+            // all is a form somebody has not finished filling in.
+            self::field('number', 'Number of children', 'عدد الأبناء', required: true, rules: ['integer' => true, 'min' => 1, 'max' => 30]),
+            self::field('number', 'Number of wives', 'عدد الزوجات', required: true, rules: ['integer' => true, 'min' => 0, 'max' => 4]),
 
             self::field('select', 'Home ownership', 'نوع ملكية البيت (أجار | ملك)', required: true, options: ['آجار', 'ملك']),
             self::field('select', 'Father died in the revolution', 'الأب شهيد في الثورة (نعم \\ لا )', required: true, options: self::YES_NO),
             self::field('number', 'Family members with special needs', 'عدد أفراد العائلة من ذوي الاحتياجات الخاصة', required: true, rules: ['integer' => true, 'min' => 0, 'max' => 30]),
             self::field('select', 'Has a breadwinner', 'يوجد معيل للعائلة (نعم \\ لا)', required: true, options: self::YES_NO),
 
-            self::field('textarea', 'Additional notes', 'معيار إضافي (نص)', rules: ['max_length' => 1000]),
+            /*
+             * The one open question on the form. "Additional criteria" is a
+             * box nobody knows what to put in; asking the household to say why
+             * they need the fuel is a question they can answer, and the answer
+             * is the one thing on the sheet a person rather than a rule has to
+             * weigh.
+             */
+            self::field(
+                'textarea',
+                'Tell us about your family, and why you believe you should receive the subsidised fuel',
+                'اكتب شرحاً أوفى عن حالة عائلتك، ولماذا برأيك يجب أن تستحق المازوت المدعوم',
+                rules: ['max_length' => 1500],
+                help: 'Anything that helps whoever reads this understand your situation.',
+                helpAr: 'أي شيء يساعد من يقرأ الاستمارة على فهم وضعكم.'
+            ),
 
             /*
              * Either document, in one field. Asking for the family book and

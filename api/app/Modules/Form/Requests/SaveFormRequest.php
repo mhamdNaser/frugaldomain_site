@@ -73,6 +73,9 @@ class SaveFormRequest extends FormRequest
             'fields.*.rules.integer' => 'nullable|boolean',
             'fields.*.rules.min_date' => 'nullable|date',
             'fields.*.rules.max_date' => 'nullable|date',
+            // Ages, for a date that is somebody's birthday.
+            'fields.*.rules.min_age' => 'nullable|integer|min:0|max:130',
+            'fields.*.rules.max_age' => 'nullable|integer|min:0|max:130',
             'fields.*.rules.min_selected' => 'nullable|integer|min:1|max:100',
             'fields.*.rules.max_selected' => 'nullable|integer|min:1|max:100',
             'fields.*.rules.pattern' => 'nullable|string|max:200',
@@ -143,6 +146,12 @@ class SaveFormRequest extends FormRequest
                 $max = $field['rules']['max_length'] ?? null;
                 if ($min && $max && (int) $min > (int) $max) {
                     $validator->errors()->add("fields.{$i}.rules.min_length", 'The minimum cannot be greater than the maximum.');
+                }
+
+                $youngest = $field['rules']['min_age'] ?? null;
+                $oldest = $field['rules']['max_age'] ?? null;
+                if ($youngest !== null && $youngest !== '' && $oldest !== null && $oldest !== '' && (int) $youngest > (int) $oldest) {
+                    $validator->errors()->add("fields.{$i}.rules.min_age", 'The youngest age cannot be greater than the oldest.');
                 }
 
                 // A unique paragraph field is a trap: two people writing the

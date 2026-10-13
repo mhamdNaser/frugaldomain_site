@@ -85,7 +85,11 @@ class FieldTypes
         'date' => [
             'label' => 'Date',
             'group' => 'time',
-            'settings' => ['min_date', 'max_date'],
+            // An age is not a date. "Over seventeen" written as a fixed date
+            // is correct on the day it is typed and wrong every day after, so
+            // the ages are stored and the dates worked out at the moment the
+            // form is answered.
+            'settings' => ['min_date', 'max_date', 'min_age', 'max_age'],
             'indexes' => 'date',
         ],
         'time' => [
@@ -331,8 +335,19 @@ class FieldTypes
             case 'date':
             case 'datetime':
                 $out[] = 'date';
-                if (! empty($rules['min_date'])) $out[] = 'after_or_equal:' . $rules['min_date'];
-                if (! empty($rules['max_date'])) $out[] = 'before_or_equal:' . $rules['max_date'];
+
+                /*
+                 * The two kinds of bound meet here. An age reads backwards: a
+                 * youngest allowed age is the *latest* birth date somebody can
+                 * have, and an oldest allowed age is the earliest. Where both
+                 * a date and an age are set, the tighter of the two wins,
+                 * which is what somebody who set both would mean.
+                 */
+                $earliest = self::boundary($rules['min_date'] ?? null, $rules['max_age'] ?? null, 'max');
+                $latest = self::boundary($rules['max_date'] ?? null, $rules['min_age'] ?? null, 'min');
+
+                if ($earliest) $out[] = 'after_or_equal:' . $earliest;
+                if ($latest) $out[] = 'before_or_equal:' . $latest;
                 break;
 
             case 'time':
@@ -390,6 +405,43 @@ class FieldTypes
 
             return in_array((string) $parentValue, array_map('strval', $when), true);
         }));
+    }
+
+    /**
+     * One edge of an allowed date range, from a fixed date, an age, or both.
+     *
+     * `$keep` says which to take when both are given: 'max' for the earliest
+     * edge (the later of the two is the tighter one) and 'min' for the latest.
+     */
+    private static function boundary(?string $date, mixed $age, string $keep): ?string
+    {
+        $fromAge = ($age === null || $age === '')
+            ? null
+            : Carbon::today()->subYears((int) $age)->toDateString();
+
+        if (! $date) {
+            return $fromAge;
+        }
+
+        if (! $fromAge) {
+            return $date;
+        }
+
+        return $keep === 'max' ? max($date, $fromAge) : min($date, $fromAge);
+    }
+
+    /**
+     * The dates an age range allows, for the browser to put on the input.
+     *
+     * Returned rather than computed in two places, so the box a person types
+     * into and the rule that judges what they typed cannot drift apart.
+     */
+    public static function dateBounds(array $rules): array
+    {
+        return [
+            'min' => self::boundary($rules['min_date'] ?? null, $rules['max_age'] ?? null, 'max'),
+            'max' => self::boundary($rules['max_date'] ?? null, $rules['min_age'] ?? null, 'min'),
+        ];
     }
 
     /** Rules for the members of a multi-value field, or null when it has none. */
