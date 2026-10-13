@@ -26,5 +26,8 @@ return array (
   'not_yes' => 'Cancel',
   'yes_delete' => 'Delete',
   'Change All Words' => 'Change All Words',
-  'Developed_by' => 'Developed by'
+  'Developed_by' => 'Developed by',
+  'Forms' => 'Forms',
+  'My Forms' => 'My Forms',
+  'New Form' => 'New Form',
 );
