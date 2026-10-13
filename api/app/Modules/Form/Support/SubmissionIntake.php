@@ -8,6 +8,7 @@ use App\Modules\Form\Models\FormSubmission;
 use App\Modules\Form\Models\FormSubmissionValue;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -140,9 +141,25 @@ class SubmissionIntake
          * fail rules the answer actually satisfies.
          */
         $answers = (array) $request->input('answers', []);
+
+        /*
+         * A form with a picture on it is sent as multipart, so its files
+         * arrive beside the text rather than in it. They are picked up here
+         * and validated in the same pass, which is what keeps one answer one
+         * request - no upload step that can succeed while the answer fails.
+         */
+        $files = (array) $request->file('answers', []);
         $clean = [];
 
         foreach ($fields as $field) {
+            if (FieldTypes::isFile($field->type)) {
+                if (isset($files[$field->key])) {
+                    $clean[$field->key] = $files[$field->key];
+                }
+
+                continue;
+            }
+
             if (array_key_exists($field->key, $answers)) {
                 $clean[$field->key] = FieldTypes::normalise($field->type, $answers[$field->key]);
             }
@@ -252,9 +269,20 @@ class SubmissionIntake
     public static function store(Form $form, Request $request, array $answers): FormSubmission
     {
         $uniqueFields = $form->fields->where('unique', true);
+        $uuid = (string) Str::uuid();
+
+        /*
+         * The files go to disk before the row is written, because the row has
+         * to record where they are. If the write is then refused - a repeated
+         * unique answer - they are removed again below, so a refused response
+         * leaves nothing behind on disk either.
+         */
+        $uploads = array_filter($answers, fn ($value) => $value instanceof UploadedFile);
+        $stored = $uploads ? FormFiles::store($form, $uuid, $uploads) : [];
+        $answers = array_merge($answers, $stored);
 
         $submission = new FormSubmission([
-            'uuid' => (string) Str::uuid(),
+            'uuid' => $uuid,
             'form_id' => $form->id,
             'form_user_id' => $form->user_id,
             'submitted_by' => $request->user()?->id,
@@ -301,6 +329,8 @@ class SubmissionIntake
                 }
             });
         } catch (QueryException $e) {
+            FormFiles::forget($stored);
+
             if ($duplicateField) {
                 throw ValidationException::withMessages([
                     'answers.' . $duplicateField->key => 'This value has already been submitted.',

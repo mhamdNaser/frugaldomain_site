@@ -71,6 +71,10 @@ class SaveFormRequest extends FormRequest
             'fields.*.rules.min_selected' => 'nullable|integer|min:1|max:100',
             'fields.*.rules.max_selected' => 'nullable|integer|min:1|max:100',
             'fields.*.rules.pattern' => 'nullable|string|max:200',
+            // Kilobytes. Capped at 8 MB because the browser shrinks a photo
+            // before sending it, and because PHP's own upload limit is the
+            // real ceiling anyway.
+            'fields.*.rules.max_size' => 'nullable|integer|min:32|max:8192',
 
             'fields.*.options' => 'nullable|array|max:200',
             'fields.*.options.*.value' => 'required_with:fields.*.options|string|max:200',
@@ -110,7 +114,7 @@ class SaveFormRequest extends FormRequest
 
                 // A unique paragraph field is a trap: two people writing the
                 // same sentence would block each other for no reason.
-                if (! empty($field['unique']) && in_array($type, ['textarea', 'boolean', 'checkboxes'], true)) {
+                if (! empty($field['unique']) && in_array($type, ['textarea', 'boolean', 'checkboxes', 'image'], true)) {
                     $validator->errors()->add("fields.{$i}.unique", 'This kind of field cannot be made unique.');
                 }
             }

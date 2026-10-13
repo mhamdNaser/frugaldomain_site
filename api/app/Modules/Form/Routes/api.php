@@ -46,6 +46,12 @@ Route::middleware('auth:sanctum')->prefix('account')->group(function () {
             ->middleware('throttle:form-export');
         Route::delete('submissions/{submissionId}', [FormSubmissionController::class, 'destroy'])
             ->whereNumber('submissionId');
+
+        // A picture someone attached. Private: only the form's owner, and
+        // only through this route.
+        Route::get('submissions/{submissionId}/files/{key}', [FormSubmissionController::class, 'file'])
+            ->whereNumber('submissionId')
+            ->where('key', '[a-z0-9_]+');
     });
 });
 

@@ -6,8 +6,10 @@ use App\Http\Controllers\Controller;
 use App\Modules\Form\Models\Form;
 use App\Modules\Form\Models\FormSubmission;
 use App\Modules\Form\Resources\FormSubmissionResource;
+use App\Modules\Form\Support\FormFiles;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
@@ -86,6 +88,35 @@ class FormSubmissionController extends Controller
         ]);
     }
 
+    /**
+     * One picture attached to one response.
+     *
+     * Served through the application rather than from a public folder, so the
+     * only way to see it is to be the person whose form collected it. Three
+     * things are checked before a byte is read: the form is the caller's, the
+     * answer really is a stored file, and its path sits inside that form's
+     * own folder - because the path comes back out of a JSON column, and
+     * anything read back out is checked before it opens a file.
+     */
+    public function file(Request $request, int $formId, int $submissionId, string $key)
+    {
+        $form = $this->owned($request, $formId);
+
+        $submission = FormSubmission::where('form_id', $form->id)->whereKey($submissionId)->firstOrFail();
+
+        $answer = ($submission->data ?? [])[$key] ?? null;
+
+        abort_unless(FormFiles::isFile($answer), 404);
+        abort_unless(FormFiles::belongsTo($form, $answer['path']), 404);
+        abort_unless(Storage::disk(FormFiles::DISK)->exists($answer['path']), 404);
+
+        return Storage::disk(FormFiles::DISK)->response($answer['path'], $answer['name'], [
+            'Content-Type' => $answer['mime'] ?? 'application/octet-stream',
+            // Private: a shared cache must not keep somebody's identity photo.
+            'Cache-Control' => 'private, max-age=300',
+        ]);
+    }
+
     public function destroy(Request $request, int $formId, int $submissionId)
     {
         $form = $this->owned($request, $formId);
@@ -96,6 +127,12 @@ class FormSubmissionController extends Controller
         // claim it held - otherwise deleting a response would leave the
         // person who sent it unable to send another.
         $submission->values()->delete();
+
+        // And so do the pictures. Keeping somebody's photograph after their
+        // response has been deleted is not a tidy-up problem, it is holding
+        // personal data that nothing refers to any more.
+        FormFiles::forgetSubmission($form, $submission->uuid);
+
         $submission->delete();
 
         Form::whereKey($form->id)->where('submissions_count', '>', 0)->decrement('submissions_count');
@@ -213,6 +250,13 @@ class FormSubmissionController extends Controller
                             [$row->id, (string) $row->created_at],
                             $fields->map(function ($field) use ($answers) {
                                 $value = $answers[$field->key] ?? '';
+
+                                // A picture cannot go in a CSV, so its name
+                                // goes instead; the spreadsheet export is the
+                                // one that carries the image itself.
+                                if (FormFiles::isFile($value)) {
+                                    return self::csvCell((string) $value['name']);
+                                }
 
                                 return self::csvCell(is_array($value) ? implode(' | ', $value) : (string) $value);
                             })->all()

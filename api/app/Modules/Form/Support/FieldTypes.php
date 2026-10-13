@@ -2,6 +2,7 @@
 
 namespace App\Modules\Form\Support;
 
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
 
@@ -121,6 +122,16 @@ class FieldTypes
             'indexes' => 'text',
             'multiple' => true,
         ],
+        'image' => [
+            'label' => 'Image',
+            'group' => 'file',
+            'settings' => ['max_size'],
+            'indexes' => 'text',
+            // The picture is kept with the response and embedded in the
+            // spreadsheet export, not linked to from it.
+            'hint' => 'A photo or a scan, kept with the response.',
+            'file' => true,
+        ],
         'boolean' => [
             'label' => 'Yes or no',
             'group' => 'choice',
@@ -140,6 +151,7 @@ class FieldTypes
                 'settings' => $meta['settings'],
                 'options' => (bool) ($meta['options'] ?? false),
                 'multiple' => (bool) ($meta['multiple'] ?? false),
+                'file' => (bool) ($meta['file'] ?? false),
                 'hint' => $meta['hint'] ?? null,
             ])
             ->values()
@@ -149,6 +161,12 @@ class FieldTypes
     public static function exists(string $type): bool
     {
         return array_key_exists($type, self::TYPES);
+    }
+
+    /** Does an answer of this type arrive as an uploaded file? */
+    public static function isFile(string $type): bool
+    {
+        return (bool) (self::TYPES[$type]['file'] ?? false);
     }
 
     /**
@@ -197,6 +215,12 @@ class FieldTypes
      */
     public static function normalise(string $type, mixed $value): mixed
     {
+        // An uploaded file is not text and must reach the validator as it
+        // arrived; trimming would turn it into a string and lose it.
+        if ($value instanceof UploadedFile) {
+            return $value;
+        }
+
         if (is_array($value)) {
             return array_values(array_map(fn ($item) => self::normalise($type, $item), $value));
         }
@@ -325,6 +349,19 @@ class FieldTypes
                 if (! empty($rules['max_selected'])) $out[] = 'max:' . (int) $rules['max_selected'];
                 break;
 
+            case 'image':
+                /*
+                 * `image` is Laravel's own check that the bytes really are a
+                 * picture, which an extension does not prove. The cap is in
+                 * kilobytes and defaults to two megabytes: a photo from a
+                 * phone is larger, so the browser shrinks it before sending.
+                 */
+                $out[] = 'file';
+                $out[] = 'image';
+                $out[] = 'mimes:jpeg,jpg,png,webp';
+                $out[] = 'max:' . (int) ($rules['max_size'] ?? 2048);
+                break;
+
             case 'boolean':
                 $out[] = 'boolean';
                 break;
@@ -366,6 +403,12 @@ class FieldTypes
      */
     public static function indexValue(string $type, mixed $value): array
     {
+        // A stored file is an object: {path, name, size, mime}. What is worth
+        // searching for is the name the person's own file had.
+        if (is_array($value) && isset($value['path'])) {
+            $value = $value['name'] ?? $value['path'];
+        }
+
         $flat = is_array($value) ? implode(', ', $value) : (string) $value;
         $kind = self::TYPES[$type]['indexes'] ?? 'text';
 

@@ -1,1 +1,0 @@
-import{D as s}from"./devToolSeo-RfD2VyXQ.js";function r(n,o,e){const t=s[n]||{};return!o||!e?t:{...t,name:e.name||t.name,title:e.title,description:e.description||t.description,faq:e.faq||t.faq,features:e.features||t.features}}export{r as t};
