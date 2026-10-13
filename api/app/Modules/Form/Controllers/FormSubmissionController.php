@@ -104,6 +104,80 @@ class FormSubmissionController extends Controller
     }
 
     /**
+     * Every answer at once, for a spreadsheet built in the browser.
+     *
+     * The owner wants a real .xlsx whose columns match the sheet they already
+     * work with - typed cells, a right-to-left view, dates Excel recognises.
+     * Writing that server-side would mean a spreadsheet library and the zip
+     * extension on the host; the site already ships SheetJS for the dashboard
+     * tables, so the rows are handed over as JSON and the file is assembled
+     * where that library already lives.
+     *
+     * Read in chunks and capped: this is the one endpoint that returns a whole
+     * form at once, and a form with a hundred thousand answers must not be
+     * allowed to exhaust the worker's memory. Past the cap the client is told
+     * to use the streamed CSV instead, which has no such limit.
+     */
+    public const EXPORT_ROW_CAP = 20000;
+
+    public function rows(Request $request, int $formId)
+    {
+        $form = $this->owned($request, $formId);
+        $fields = $form->fields;
+
+        $rows = [];
+        $truncated = false;
+
+        FormSubmission::where('form_id', $form->id)
+            ->whereIn('status', [FormSubmission::STATUS_RECEIVED, FormSubmission::STATUS_INDEXED])
+            ->orderBy('id')
+            ->chunk(500, function ($chunk) use (&$rows, &$truncated, $fields) {
+                foreach ($chunk as $submission) {
+                    if (count($rows) >= self::EXPORT_ROW_CAP) {
+                        $truncated = true;
+
+                        return false;
+                    }
+
+                    $answers = $submission->data ?? [];
+                    $row = [];
+
+                    // Keyed by field, in the form's order, so the client does
+                    // not have to know anything about the storage shape.
+                    foreach ($fields as $field) {
+                        $row[$field->key] = $answers[$field->key] ?? null;
+                    }
+
+                    $rows[] = [
+                        'id' => $submission->id,
+                        'created_at' => (string) $submission->created_at,
+                        'answers' => $row,
+                    ];
+                }
+
+                return true;
+            });
+
+        return response()->json([
+            'form' => [
+                'id' => $form->id,
+                'title' => $form->title,
+                'title_ar' => $form->title_ar,
+                'serial_label' => $form->settingsWithDefaults()['serial_label'],
+            ],
+            'columns' => $fields->map(fn ($field) => [
+                'key' => $field->key,
+                'label' => $field->label,
+                'label_ar' => $field->label_ar,
+                'type' => $field->type,
+            ])->values(),
+            'rows' => $rows,
+            'truncated' => $truncated,
+            'cap' => self::EXPORT_ROW_CAP,
+        ]);
+    }
+
+    /**
      * CSV, streamed and chunked.
      *
      * A form with ten thousand responses must not be assembled in memory, so

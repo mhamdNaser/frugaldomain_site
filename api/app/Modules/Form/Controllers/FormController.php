@@ -8,6 +8,7 @@ use App\Modules\Form\Requests\SaveFormRequest;
 use App\Modules\Form\Resources\FormResource;
 use App\Modules\Form\Support\FieldTypes;
 use App\Modules\Form\Support\FormBuilder;
+use App\Modules\Form\Support\FormTemplates;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 
@@ -53,6 +54,39 @@ class FormController extends Controller
         ]);
 
         $form = FormBuilder::save($form, $request->validated());
+
+        return (new FormResource($form))->response()->setStatusCode(201);
+    }
+
+    /** The ready-made forms somebody can start from. */
+    public function templates()
+    {
+        return response()->json(['data' => FormTemplates::all()]);
+    }
+
+    /**
+     * Create a form from a template.
+     *
+     * It is an ordinary form the moment it exists - the template is only the
+     * starting point, and nothing afterwards remembers where it came from.
+     * It starts as a draft, so the fields can be checked before a link is
+     * handed out.
+     */
+    public function fromTemplate(Request $request, string $key)
+    {
+        if (! FormTemplates::exists($key)) {
+            return response()->json(['message' => 'That template does not exist.'], 404);
+        }
+
+        $payload = FormTemplates::payload($key);
+
+        $form = Form::create([
+            'user_id' => $request->user()->id,
+            'title' => $payload['title'],
+            'status' => Form::STATUS_DRAFT,
+        ]);
+
+        $form = FormBuilder::save($form, $payload);
 
         return (new FormResource($form))->response()->setStatusCode(201);
     }

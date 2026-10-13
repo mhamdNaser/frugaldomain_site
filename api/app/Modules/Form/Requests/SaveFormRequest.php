@@ -41,6 +41,7 @@ class SaveFormRequest extends FormRequest
             'settings.require_login' => 'nullable|boolean',
             'settings.max_submissions' => 'nullable|integer|min:1|max:1000000',
             'settings.collect_email_notifications' => 'nullable|boolean',
+            'settings.serial_label' => 'nullable|string|max:100',
 
             // A form with no fields is a page with a submit button, so the
             // builder is required to send at least one.

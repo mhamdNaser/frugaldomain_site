@@ -22,6 +22,12 @@ Route::middleware('auth:sanctum')->prefix('account')->group(function () {
     // builder can never offer a type the validator does not know.
     Route::get('form-field-types', [FormController::class, 'types']);
 
+    // Ready-made forms, and creating one from them.
+    Route::get('form-templates', [FormController::class, 'templates']);
+    Route::post('form-templates/{key}', [FormController::class, 'fromTemplate'])
+        ->middleware('throttle:form-write')
+        ->where('key', '[a-z0-9-]+');
+
     Route::get('forms', [FormController::class, 'index']);
     Route::post('forms', [FormController::class, 'store'])->middleware('throttle:form-write');
 
@@ -34,6 +40,9 @@ Route::middleware('auth:sanctum')->prefix('account')->group(function () {
         Route::get('submissions', [FormSubmissionController::class, 'index']);
         // Before the {submissionId} route, or "export" would be read as an id.
         Route::get('submissions/export', [FormSubmissionController::class, 'export'])
+            ->middleware('throttle:form-export');
+        // Every answer as JSON, for the spreadsheet the browser builds.
+        Route::get('submissions/rows', [FormSubmissionController::class, 'rows'])
             ->middleware('throttle:form-export');
         Route::delete('submissions/{submissionId}', [FormSubmissionController::class, 'destroy'])
             ->whereNumber('submissionId');

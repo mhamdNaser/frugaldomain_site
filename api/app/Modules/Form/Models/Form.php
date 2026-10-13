@@ -57,6 +57,13 @@ class Form extends Model
         'require_login' => false,
         'max_submissions' => null,
         'collect_email_notifications' => false,
+        /*
+         * The heading of the running-number column in an export. Sheets
+         * people already work with tend to have one under their own name -
+         * "تسلسل العائلة", "م", "No." - and an export that calls it something
+         * else is an export they have to edit before using.
+         */
+        'serial_label' => null,
     ];
 
     protected static function booted(): void
