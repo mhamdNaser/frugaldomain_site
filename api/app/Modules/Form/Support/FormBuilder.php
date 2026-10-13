@@ -115,11 +115,48 @@ class FormBuilder
             $keptIds[] = $field->id;
         }
 
+        /*
+         * Second pass: a question that follows another was saved pointing at
+         * that question's *position*, because a field created in this same
+         * request had no key until a moment ago. Now that every field has one,
+         * the pointer becomes the key - which survives reordering, renaming
+         * and everything else a position does not.
+         */
+        self::resolveDependencies($form, $incoming, $keptIds);
+
         $removed = $existing->reject(fn (FormField $field) => in_array($field->id, $keptIds, true));
 
         if ($removed->isNotEmpty()) {
             self::forgetIndexedValues($form, $removed->pluck('key')->all());
             FormField::whereIn('id', $removed->pluck('id'))->delete();
+        }
+    }
+
+    private static function resolveDependencies(Form $form, array $incoming, array $keptIds): void
+    {
+        $fields = FormField::whereIn('id', $keptIds)->orderBy('position')->get();
+        $keyAt = $fields->pluck('key')->values();
+
+        foreach ($fields as $position => $field) {
+            $rules = $field->rules ?? [];
+            $pointer = $rules['depends_on'] ?? null;
+
+            if ($pointer === null || $pointer === '') {
+                continue;
+            }
+
+            $parentKey = $keyAt[(int) $pointer] ?? null;
+
+            // A pointer at a question that no longer exists is dropped rather
+            // than kept as a rule nothing can satisfy.
+            if ($parentKey === null || $parentKey === $field->key) {
+                unset($rules['depends_on']);
+            } else {
+                $rules['depends_on'] = $parentKey;
+            }
+
+            $field->rules = $rules;
+            $field->save();
         }
     }
 
@@ -140,16 +177,38 @@ class FormBuilder
             return [];
         }
 
-        return collect($options)
-            ->map(fn ($option) => [
-                'value' => (string) ($option['value'] ?? ''),
-                'label' => (string) ($option['label'] ?? $option['value'] ?? ''),
+        $clean = [];
+
+        foreach ($options as $option) {
+            $value = (string) ($option['value'] ?? '');
+
+            if ($value === '') {
+                continue;
+            }
+
+            $when = array_values(array_unique(array_map('strval', (array) ($option['when'] ?? []))));
+
+            /*
+             * The same option can belong to more than one answer above - a
+             * town listed under two areas - so a repeat merges its `when`
+             * rather than replacing the first, which would silently drop one
+             * of the two places it should appear.
+             */
+            if (isset($clean[$value])) {
+                $clean[$value]['when'] = array_values(array_unique(array_merge($clean[$value]['when'], $when)));
+
+                continue;
+            }
+
+            $clean[$value] = [
+                'value' => $value,
+                'label' => (string) ($option['label'] ?? $value),
                 'label_ar' => $option['label_ar'] ?? null,
-            ])
-            ->filter(fn ($option) => $option['value'] !== '')
-            ->unique('value')
-            ->values()
-            ->all();
+                'when' => $when,
+            ];
+        }
+
+        return array_values($clean);
     }
 
     private static function hasAnswers(Form $form, string $key): bool

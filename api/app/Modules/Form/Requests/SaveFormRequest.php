@@ -85,6 +85,16 @@ class SaveFormRequest extends FormRequest
             'fields.*.options.*.value' => 'required_with:fields.*.options|string|max:200',
             'fields.*.options.*.label' => 'nullable|string|max:200',
             'fields.*.options.*.label_ar' => 'nullable|string|max:200',
+            // Which answers of the question above this option belongs to.
+            'fields.*.options.*.when' => 'nullable|array|max:200',
+            'fields.*.options.*.when.*' => 'string|max:200',
+
+            /*
+             * The position of the question this one follows, not its key: a
+             * question being created in the same request has no key yet. The
+             * builder resolves it to a key once every field has one.
+             */
+            'fields.*.rules.depends_on' => 'nullable|integer|min:0|max:99',
         ];
     }
 
@@ -103,6 +113,24 @@ class SaveFormRequest extends FormRequest
                 // the form, so it is caught here rather than at fill time.
                 if (($meta['options'] ?? false) && empty($field['options'])) {
                     $validator->errors()->add("fields.{$i}.options", 'Add at least one option for this field.');
+                }
+
+                /*
+                 * A question can only follow one that is asked before it: the
+                 * browser narrows the list as the earlier answer is given, and
+                 * a question depending on a later one could never be narrowed.
+                 * A chain that loops would hang the page, and the simplest way
+                 * to make one impossible is to allow only backward references.
+                 */
+                $dependsOn = $field['rules']['depends_on'] ?? null;
+
+                if ($dependsOn !== null && $dependsOn !== '') {
+                    if ((int) $dependsOn >= $i) {
+                        $validator->errors()->add(
+                            "fields.{$i}.rules.depends_on",
+                            'A question can only follow one that is asked before it.'
+                        );
+                    }
                 }
 
                 // "Digits of a fixed length" without the length is just "a

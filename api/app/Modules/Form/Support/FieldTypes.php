@@ -103,14 +103,16 @@ class FieldTypes
         'select' => [
             'label' => 'Dropdown',
             'group' => 'choice',
-            'settings' => [],
+            // `depends_on` names another choice question; this one then shows
+            // only the options that belong to the answer given there.
+            'settings' => ['depends_on'],
             'options' => true,
             'indexes' => 'text',
         ],
         'radio' => [
             'label' => 'One of several',
             'group' => 'choice',
-            'settings' => [],
+            'settings' => ['depends_on'],
             'options' => true,
             'indexes' => 'text',
         ],
@@ -368,6 +370,26 @@ class FieldTypes
         }
 
         return $out;
+    }
+
+    /**
+     * The options of a field, narrowed to what the answer above allows.
+     *
+     * An option with no `when` belongs to every answer - which is what every
+     * option of an ordinary dropdown looks like, so a form that uses no
+     * dependency behaves exactly as it did.
+     */
+    public static function optionsFor(array $options, mixed $parentValue): array
+    {
+        return array_values(array_filter($options, function ($option) use ($parentValue) {
+            $when = $option['when'] ?? [];
+
+            if (! is_array($when) || $when === []) {
+                return true;
+            }
+
+            return in_array((string) $parentValue, array_map('strval', $when), true);
+        }));
     }
 
     /** Rules for the members of a multi-value field, or null when it has none. */

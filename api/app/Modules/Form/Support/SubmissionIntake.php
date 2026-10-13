@@ -167,9 +167,65 @@ class SubmissionIntake
 
         validator(['answers' => $clean], $rules, $arabic ? self::arabicMessages($fields) : [], $attributes)->validate();
 
+        self::assertDependentAnswers($form, $clean, $arabic);
+
         // Only the form's own keys survive, so an extra key in the payload
         // cannot smuggle itself into storage.
         return $clean;
+    }
+
+    /**
+     * A question that follows another must be answered from that answer's own
+     * list.
+     *
+     * The browser already narrows the list, which is what makes the form
+     * usable; this is what makes it true. A request sent with a tool, or by a
+     * page left open while the form was edited, can carry any value the field
+     * has ever offered - and `in:` alone would accept it, because it checks
+     * the whole list rather than the part that belongs to the answer above.
+     */
+    private static function assertDependentAnswers(Form $form, array $answers, bool $arabic): void
+    {
+        $errors = [];
+
+        foreach ($form->fields as $field) {
+            $parentKey = $field->rules['depends_on'] ?? null;
+
+            if (! $parentKey) {
+                continue;
+            }
+
+            $value = $answers[$field->key] ?? null;
+
+            if ($value === null || $value === '' || $value === []) {
+                continue;
+            }
+
+            $parentValue = $answers[$parentKey] ?? null;
+            $allowed = FieldTypes::optionsFor($field->options ?? [], $parentValue);
+            $values = array_map(fn ($option) => (string) ($option['value'] ?? ''), $allowed);
+
+            foreach ((array) $value as $one) {
+                if (in_array((string) $one, $values, true)) {
+                    continue;
+                }
+
+                $parentField = $form->fields->firstWhere('key', $parentKey);
+                $parentLabel = $parentField
+                    ? ($arabic ? ($parentField->label_ar ?: $parentField->label) : $parentField->label)
+                    : $parentKey;
+
+                $errors['answers.' . $field->key] = $arabic
+                    ? 'الخيار المحدّد لا يتبع ما اخترته في «' . $parentLabel . '».'
+                    : 'That choice does not belong to the answer given in "' . $parentLabel . '".';
+
+                break;
+            }
+        }
+
+        if ($errors) {
+            throw ValidationException::withMessages($errors);
+        }
     }
 
     /**
