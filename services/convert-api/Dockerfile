@@ -58,9 +58,15 @@ RUN soffice --headless --norestore --nolockcheck --nodefault \
         --convert-to pdf --outdir /tmp/warmup /etc/hostname \
     || echo "warmup did not produce a file; the profile is still created"
 
+# Cloud Run tells the container which port to listen on and expects it to be
+# obeyed; 7860 is what a Hugging Face Space expects. Honouring $PORT with that
+# as the fallback runs unchanged on either.
+ENV PORT=7860
 EXPOSE 7860
 
-# One worker. Each conversion is a separate process of its own that does the
-# actual work, and the service's own concurrency limit is what decides how
-# many run at once.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]
+# One worker. Each conversion is a separate process of its own doing the actual
+# work, and the service's own limit decides how many run at once - a second
+# uvicorn worker would only double the memory for no more throughput.
+#
+# Shell form, so $PORT is read at start rather than baked in at build.
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-7860} --workers 1

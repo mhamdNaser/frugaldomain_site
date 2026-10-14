@@ -1,83 +1,98 @@
-# Putting this on Hugging Face, and wiring the site to it
+# Putting this on Google Cloud Run, and wiring the site to it
 
-Two sides. The Space runs the converters; the site holds the key and does the
-asking. Neither half is useful without the other, so both are below.
+Two sides. Cloud Run runs the converters; the site holds the key and does the
+asking. Both are below.
 
----
-
-## 1. What I need from you
-
-Four things. Nothing else.
-
-| | what | where it comes from |
-|---|---|---|
-| 1 | **Your Hugging Face username** (or the organisation's) | top right of huggingface.co once you are signed in |
-| 2 | **A name for the Space** | your choice. `fruga-convert` keeps it obvious |
-| 3 | **An access token with write permission** | huggingface.co → your avatar → Settings → **Access Tokens** → *Create new token* → type **Write** → copy the `hf_…` string |
-| 4 | **Say whether I generate the shared key** | if yes I make one and hand it to you to paste in; if you would rather choose it, send it instead |
-
-The token lets me push this folder to the Space. It is the only credential I
-need, and it should be deleted on that page once the Space is up — pushing
-again later is a matter of making another one.
-
-**Do not** put the token or the shared key in a message you would not want
-stored. Send them the way you sent the hosting password.
+> **Why not Hugging Face.** It was the plan, and it no longer works: Hugging
+> Face now requires a PRO subscription to host a Docker or Gradio Space, even
+> on the free `cpu-basic` hardware. Only Static Spaces are free, and a static
+> Space cannot run LibreOffice. Their own API says so in as many words — both
+> when creating a Docker Space and when asking an existing Space to move to
+> `cpu-basic`. Nothing in this folder changed because of the move: it is the
+> same `Dockerfile`, and it still runs on a Space unchanged if that ever
+> becomes free again.
 
 ---
 
-## 2. What I do with them
+## 1. Your side: five minutes in Cloud Shell
 
-- Create the Space (SDK **Docker**, visibility **Public**) or push to the one
-  you made.
-- Push this folder. Hugging Face reads the `Dockerfile` and builds it, which
-  takes about five to eight minutes the first time — it is installing
-  LibreOffice, ffmpeg and the Arabic fonts.
-- Check `https://<username>-<space>.hf.space/health` and show you it answering
-  `"ready": true` with both tools found.
-- Put the two settings into the hosting's `.env` over ssh, clear the config
-  cache, and convert one real file end to end.
+Cloud Shell is the terminal button at the top right of
+[console.cloud.google.com](https://console.cloud.google.com). It is free, it
+already has `gcloud`, `docker` and `git`, and using it means no cloud
+credential has to be handed to anybody.
+
+**Before the first run** you need a project with billing enabled. The free
+allowance is permanent, not a trial, but Google will not run anything without a
+card on file. [Create a project →](https://console.cloud.google.com/projectcreate)
+
+Then, in Cloud Shell:
+
+```bash
+# 1. the project this belongs to
+gcloud config set project YOUR_PROJECT_ID
+
+# 2. this folder
+git clone https://github.com/mhamdNaser/frugaldomain_site.git
+cd frugaldomain_site/services/convert-api
+
+# 3. the shared key (the one sent to you separately)
+export CONVERT_API_KEY='…'
+
+# 4. go
+bash deploy-cloudrun.sh
+```
+
+It prints the service's address at the end and checks that LibreOffice and
+ffmpeg are really inside the container. Send that address back and the site
+gets wired to it.
+
+Running it again later deploys a new revision and changes nothing else.
 
 ---
 
-## 3. What you set on the Space
+## 2. What it costs
 
-One secret, and it is the one that matters.
+Nothing, for this site's traffic.
 
-**Space → Settings → Variables and secrets → New secret**
+Cloud Run's permanent free allowance is **180,000 vCPU-seconds** and **360,000
+GiB-seconds of memory** a month, with **2 million requests**. A document
+conversion takes a few seconds of one core. Even at eight seconds each that is
+something like twenty thousand conversions a month inside the free allowance —
+far more than this site will do.
 
-| name | value |
+The script sets `--max-instances 3`, so there is a ceiling on what a strange
+day can cost even if something goes wrong.
+
+The service scales to zero when nobody is converting, which is why it is free
+and also why the first conversion after a quiet spell takes a few seconds
+longer while a container starts. The site treats that as a wait rather than an
+error.
+
+---
+
+## 3. What the script sets, and why
+
+| | |
 |---|---|
-| `CONVERT_API_KEY` | the shared key (a long random string) |
-
-With it unset the service answers `503` to every conversion. That is
-deliberate: a converter deployed without its secret is misconfigured, and a
-misconfigured service that works is a service anyone who finds the address can
-use for free.
-
-Optional, only if the defaults do not suit:
-
-| name | default | |
-|---|---|---|
-| `CONVERT_MAX_DOCUMENT_MB` | 30 | |
-| `CONVERT_MAX_AUDIO_MB` | 80 | |
-| `CONVERT_DOCUMENT_TIMEOUT` | 90 | seconds |
-| `CONVERT_AUDIO_TIMEOUT` | 180 | seconds |
-| `CONVERT_MAX_CONCURRENT` | 2 | the free Space has two cores |
-
-**Hardware**: *CPU basic* — the free one — is enough. LibreOffice needs about a
-gigabyte while it works and the Space has far more. There is no model here and
-nothing a GPU would help with.
+| `--memory 1Gi` | LibreOffice needs about a gigabyte while it works. The 512Mi default kills it half way through a conversion, which looks like a corrupt file rather than a memory limit |
+| `--cpu 1` | one core per instance, which is what one conversion uses |
+| `--concurrency 4` | a conversion is not a web request: it holds the cpu for seconds. Sending five to one instance makes all five slow, so Cloud Run starts another instead |
+| `--max-instances 3` | the ceiling on a bad day |
+| `--timeout 300s` | longer than the service's own 90s and 180s limits, so a stuck conversion is stopped by the service with a readable message rather than cut off by the platform |
+| `--allow-unauthenticated` | the service checks the shared key itself. Google's own IAM auth would mean the site had to carry a Google credential too, for no more safety |
+| `--set-secrets` | the key lives in Secret Manager, not in the service's environment where anyone who can read the service can read it |
 
 ---
 
-## 4. What goes in the hosting's `.env`
+## 4. The site's side
+
+Over ssh, in `api/.env`:
 
 ```ini
-CONVERT_SERVICE_URL=https://<username>-<space>.hf.space
-CONVERT_SERVICE_KEY=<the same key as the Space secret>
+CONVERT_SERVICE_URL=https://fruga-convert-xxxxx-ew.a.run.app
+CONVERT_SERVICE_KEY=…the same key…
 
-# Optional; these are the site's own limits, checked before anything is
-# uploaded to the Space.
+# Optional; the site's own limits, checked before anything is uploaded.
 CONVERT_MAX_DOCUMENT_MB=30
 CONVERT_MAX_AUDIO_MB=80
 ```
@@ -88,57 +103,52 @@ Then, because this host caches its configuration:
 cd ~/domains/frugaldomain.site/public_html/api && php artisan config:clear
 ```
 
-With these unset the site's conversion endpoints answer `503` and say the
-feature is not set up — they do not fail in a way that looks like a bug.
+With these unset the conversion endpoints answer `503` and say the feature is
+not set up — they do not fail in a way that looks like a bug. That is what they
+are doing right now.
 
 ---
 
 ## 5. How the two halves talk
 
 ```
-browser  ──►  frugaldomain.site/api/convert/document  ──►  <space>.hf.space/convert/document
+browser  ──►  frugaldomain.site/api/convert/document  ──►  <service>.run.app/convert/document
               (the site adds X-Convert-Key here)
 ```
 
-The browser never sees the key and never learns the Space's address. That is
-the whole reason for the middle step:
+The browser never sees the key and never learns the service's address:
 
 - a key in a page is a public key, and this one buys cpu time;
 - an address in a page is an address strangers will use;
-- and our own limits — how often, how large — belong on our side, where we can
-  change them without redeploying the Space.
+- and our own limits — how often, how large — belong on our side, where they
+  can change without redeploying anything.
 
 The uploaded file is streamed through. It is not written to the site's disk,
-and the Space deletes its working directory as it sends the result back,
+and the service removes its working directory as it sends the result back,
 including when the conversion fails. People convert identity documents through
 converters, and the safest place for one afterwards is nowhere.
 
 ---
 
-## 6. Things worth knowing before they surprise you
+## 6. What was tested, and what was not
 
-**A free Space sleeps when nobody uses it.** The first conversion after a quiet
-night takes thirty to sixty seconds while the container wakes. The site treats
-that as a wait rather than an error and says "the converter is waking up".
-If you would rather it stayed warm, a cron hitting `/health` every twenty
-minutes does it:
+This machine has no LibreOffice, no ffmpeg and no Docker, so the conversions
+themselves have not been run here. What has been tested is everything that
+decides whether a file ever reaches them:
 
-```
-*/20 * * * * curl -s -o /dev/null https://<username>-<space>.hf.space/health
-```
+- **21 checks** on the service — a request with no key, with the wrong key, a
+  service with no key configured at all, a file over the limit, an empty file,
+  a conversion that makes no sense, a converter with no tools behind it, and
+  the name a converted file comes back under.
+- **18 checks** on the chain from the site through to the service, with a real
+  one running: the key added on the server, the site's limits applied before
+  anything is forwarded, the service's own refusals arriving as readable
+  sentences, and a sleeping service treated as a wait.
 
-**The build is slow the first time, fast afterwards.** Hugging Face caches the
-image layers, so a change to the Python code rebuilds in under a minute; a
-change to the `Dockerfile` rebuilds everything.
+Two real faults were found that way and fixed: a filename arriving with a
+trailing space had its extension read as `docx ` and was refused, and a missing
+tool produced a 500 with a stack trace instead of a sentence saying the
+converter is unavailable.
 
-**What is not converted here.** Images stay in the browser, where they always
-were — there is no reason to upload somebody's photograph to convert it, and
-the browser does that job well.
-
-**What I could not test from here.** This machine has no LibreOffice, no
-ffmpeg and no Docker, so the conversions themselves have not been run. What has
-been tested is everything around them: 21 checks on the service's own
-behaviour, and 18 on the chain from the site through to it, including a file
-too large, a conversion that makes no sense, a request with no key, and a
-converter with no tools behind it. The first real conversion happens on the
-Space, and I will do it with you watching the output.
+The first real conversion happens on Cloud Run, and it is the first thing to do
+once the address comes back.

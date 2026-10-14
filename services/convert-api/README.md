@@ -42,17 +42,16 @@ sent, including when the conversion fails.
 
 The two conversion endpoints need the header `X-Convert-Key`. The site's own
 backend holds the key and proxies for the browser, so the key is never in a
-page and the Space's address is never in one either.
+page and the service's address is never in one either.
 
 ```bash
-curl -X POST https://<user>-<space>.hf.space/convert/document \
+curl -X POST https://<service>.run.app/convert/document \
   -H "X-Convert-Key: $CONVERT_API_KEY" \
   -F "file=@report.docx" -F "target=pdf" -o report.pdf
 ```
 
 ## Settings
 
-Set these as **Secrets** on the Space (Settings → Variables and secrets).
 `CONVERT_API_KEY` is the only one that is required — with it unset the service
 answers `503` to every conversion, because a service deployed without its
 secret is misconfigured, and the safe reading of a misconfiguration is to stop.
@@ -77,8 +76,14 @@ CONVERT_API_KEY=dev-key python -m app.main
 Without LibreOffice and ffmpeg on the machine, `/health` reports which one is
 missing and conversions fail with a clear message rather than a stack trace.
 
-## A note on sleeping
+## A note on starting
 
-A free Space stops after a period with no traffic and takes thirty to sixty
-seconds to come back. The first conversion after a quiet night is therefore
-slow, and the site says so rather than appearing to hang.
+The service scales to zero when nobody is converting, which is why it costs
+nothing and also why the first conversion after a quiet spell waits a few
+seconds for a container. The site treats that as a wait rather than an error.
+
+`DEPLOY.md` covers putting it on Cloud Run and wiring the site to it. The
+front-matter at the top of this file is for a Hugging Face Space, where this
+was going to live until Hugging Face made Docker Spaces a paid feature; it
+costs nothing to keep, and the same image runs there unchanged if that ever
+changes back.
