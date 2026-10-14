@@ -6,6 +6,7 @@ return [
     App\Modules\Billing\Providers\BillingServiceProvider::class,
     App\Modules\Catalog\Providers\CatalogServiceProvider::class,
     App\Modules\CMS\Providers\CMSServiceProvider::class,
+    App\Modules\Convert\Providers\ConvertServiceProvider::class,
     App\Modules\Core\Providers\CoreServiceProvider::class,
     App\Modules\Component\Providers\ComponentServiceProvider::class,
     App\Modules\Drawing\Providers\DrawingServiceProvider::class,
