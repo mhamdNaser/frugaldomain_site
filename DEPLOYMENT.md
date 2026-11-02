@@ -132,6 +132,35 @@ and that `upload_max_filesize` and `post_max_size` are high enough for the
 service's configured upload limits. Hostinger may enforce limits that cannot
 be raised on a shared plan.
 
+## Handwriting recognition
+
+The whiteboard calls Laravel at
+`POST /api/handwriting/recognize`; Laravel rate-limits the request and proxies
+the image to a separate Hugging Face Space. The shared key stays in server
+environment variables and is never included in the frontend.
+
+Create the new Space from the ignored local project in `handwriting-ai/`, select
+ZeroGPU, and set its Space secret `HANDWRITING_API_KEY`. Set the same key and
+the Space URL in `api/.env`:
+
+```env
+HANDWRITING_SERVICE_URL=https://<account>-<space-name>.hf.space
+HANDWRITING_SERVICE_KEY=<same-value-as-the-Space-secret>
+# Needed only if the Space visibility is Private; use a read-scoped HF token.
+HANDWRITING_SPACE_TOKEN=
+HANDWRITING_MAX_IMAGE_MB=8
+```
+
+Then run `php artisan config:clear && php artisan config:cache`. The UI waits
+and retries while Hugging Face starts the free Space; free GPU quota and
+startup time are controlled by Hugging Face. Ensure Hostinger's PHP request
+timeout permits a long model cold-start; shared-host limits may prevent that.
+The default recognition checkpoint is a community fine-tuned Arabic/English
+model. Its card lists a CC BY-NC-SA training dataset, so this configuration is
+for non-commercial use only unless separate dataset permissions are obtained.
+The private project's own README contains the full Space setup and model
+limitations.
+
 ## Icons
 
 The artwork (519 SVG + 519 PNG) lives in `api/public/icons/` and is committed,
