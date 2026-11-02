@@ -1,0 +1,1 @@
+import{_a as e,ca as t}from"./index-BuJX033E.js";import{n}from"./SiteSeo-CuhDk297-DYC_zDGi.js";function r(r){let i=t.c(4),{title:a,path:o}=r,s=`${a} | Fruga`,c;return i[0]!==o||i[1]!==s||i[2]!==a?(c=e.jsx(n,{title:s,description:a,path:o,robots:`noindex,nofollow`}),i[0]=o,i[1]=s,i[2]=a,i[3]=c):c=i[3],c}export{r as t};

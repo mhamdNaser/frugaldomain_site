@@ -1,0 +1,1 @@
+var e=(e,{fallback:t=`—`}={})=>{if(e==null||e===``)return t;let n=Number(e);if(!Number.isFinite(n))return t;let r=Math.max(0,Math.round(n));if(r<60)return`${r}s`;if(r<3600)return`${Math.floor(r/60)}m ${r%60}s`;let i=Math.floor(r/3600),a=Math.floor(r%3600/60);return`${i}h ${String(a).padStart(2,`0`)}m`};export{e as t};

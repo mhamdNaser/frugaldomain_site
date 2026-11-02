@@ -1,0 +1,1 @@
+function e(e){let t=e?.file_svg||e?.file_png||e?.icon_text;return t?`https://api.frugaldomain.site/${t}`:null}export{e as t};

@@ -1,0 +1,1 @@
+import{p as e}from"./devToolSeo-BoF0NuPx-CCND872S.js";function t(t,n,r){let i=e[t]||{};return!n||!r?i:{...i,name:r.name||i.name,title:r.title,description:r.description||i.description,faq:r.faq||i.faq,features:r.features||i.features}}export{t};
