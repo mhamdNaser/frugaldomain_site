@@ -10,6 +10,16 @@ public_html/
 └── cdn/                                   → cdn.frugaldomain.site  → cdn/public
 ```
 
+## Git repositories
+
+- `mhamdNaser/frugaldomain_site` is this deployment repository. It contains the
+  Laravel API, CDN and conversion service.
+- `mhamdNaser/sydev-front` is the separate React/Vite source repository. Build it
+  and copy `dist` into this repository before publishing the site.
+- `api/`, `cdn/` and `services/convert-api/` are folders in the deployment
+  repository, not separate Git repositories. The Hugging Face Space is separate
+  and must be created before it can be linked.
+
 The subdomain document roots are already configured in hPanel:
 
 | Subdomain               | Document root                          |
@@ -106,6 +116,21 @@ Writable directories:
 ```bash
 chmod -R 775 api/storage api/bootstrap/cache cdn/storage cdn/bootstrap/cache
 ```
+
+## Conversion service
+
+The conversion service runs on a free Hugging Face Gradio Space; its deployment
+and secret setup are documented in
+[`services/convert-api/DEPLOY-HUGGINGFACE.md`](./services/convert-api/DEPLOY-HUGGINGFACE.md).
+Set `CONVERT_SERVICE_URL` and `CONVERT_SERVICE_KEY` in `api/.env`, then run
+`php artisan config:clear && php artisan config:cache`. Do not put the shared
+key in the frontend or commit it to Git.
+
+The requests are synchronous while the Space wakes and converts. In hPanel,
+check that PHP execution/input timeouts permit requests of several minutes,
+and that `upload_max_filesize` and `post_max_size` are high enough for the
+service's configured upload limits. Hostinger may enforce limits that cannot
+be raised on a shared plan.
 
 ## Icons
 

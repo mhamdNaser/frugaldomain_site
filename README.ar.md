@@ -4,7 +4,7 @@
 
 # FrugalDomain
 
-**مكتبة أيقونات SVG مجانية، وأدوات تحويل تعمل في المتصفح، ومنصّة Laravel معيارية لإدارة الكتالوج والمخزون والمحتوى والطلبات.**
+**مكتبة أيقونات SVG مجانية، وتحويل صور في المتصفح ومستندات وصوت عبر خدمة معالجة مؤقتة، ومنصّة Laravel معيارية لإدارة الكتالوج والمخزون والمحتوى والطلبات.**
 
 [![Laravel](https://img.shields.io/badge/Laravel-12-FF2D20?logo=laravel&logoColor=white)](https://laravel.com)
 [![PHP](https://img.shields.io/badge/PHP-8.2-777BB4?logo=php&logoColor=white)](https://php.net)
@@ -62,8 +62,8 @@ public_html/
 | الأداة | الصيغ |
 |:--|:--|
 | [الصور](https://frugaldomain.site/ar/ImageConvert) | JPG · PNG · WebP · GIF |
-| [الصوت](https://frugaldomain.site/ar/AudioConvert) | MP3 · WAV · OGG · AAC |
-| [المستندات](https://frugaldomain.site/ar/FileConvert) | DOCX ← PDF · XLSX ← PDF |
+| [الصوت](https://frugaldomain.site/ar/AudioConvert) | MP3 · WAV · OGG · AAC · M4A · OPUS · FLAC |
+| [المستندات](https://frugaldomain.site/ar/FileConvert) | مستندات وملفات نصية ← PDF |
 
 ولكل تحويل شائع للصور صفحته الخاصة تحت `/convert/<from>-to-<to>` — المحوّل مع
 الصيغة الهدف محدَّدة مسبقاً، يليه شرح لأثر ذلك التحويل على الجودة وحجم الملف

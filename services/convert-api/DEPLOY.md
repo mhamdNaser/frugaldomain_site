@@ -1,16 +1,13 @@
-# Putting this on Google Cloud Run, and wiring the site to it
+# Optional deployment on Google Cloud Run
 
-Two sides. Cloud Run runs the converters; the site holds the key and does the
-asking. Both are below.
+The no-paid-compute Hugging Face setup is documented in
+[`DEPLOY-HUGGINGFACE.md`](./DEPLOY-HUGGINGFACE.md). This guide remains for
+projects that choose Google Cloud Run instead; that path requires a Google
+Cloud project with billing enabled.
 
-> **Why not Hugging Face.** It was the plan, and it no longer works: Hugging
-> Face now requires a PRO subscription to host a Docker or Gradio Space, even
-> on the free `cpu-basic` hardware. Only Static Spaces are free, and a static
-> Space cannot run LibreOffice. Their own API says so in as many words — both
-> when creating a Docker Space and when asking an existing Space to move to
-> `cpu-basic`. Nothing in this folder changed because of the move: it is the
-> same `Dockerfile`, and it still runs on a Space unchanged if that ever
-> becomes free again.
+The deployed Space uses Hugging Face's free ZeroGPU tier. Its readiness check
+is GPU-decorated for ZeroGPU compatibility; conversions use CPU tools. Free
+Spaces can sleep while idle.
 
 ---
 

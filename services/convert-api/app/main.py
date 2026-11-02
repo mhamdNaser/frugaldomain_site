@@ -1,21 +1,8 @@
-"""The conversion service.
+"""Convert documents and audio with LibreOffice and ffmpeg.
 
-The site converts files in the browser, which is the right default: nothing
-leaves the visitor's machine. But two jobs cannot be done there well.
-
-A document becomes a PDF by being re-typeset with jsPDF, so it comes out
-readable and nothing like the original - no images, no table borders, no
-styles, and only .docx and .xlsx at all. A real conversion needs a layout
-engine, and the site's host has no way to run one.
-
-Audio is converted with ffmpeg compiled to WebAssembly: a thirty megabyte
-download before anything starts, single threaded, and out of memory on a long
-recording or an older phone.
-
-So those two are done here instead, by the tools that do them properly, and
-nothing else moves off the browser. Files are held only while they are being
-converted: people put identity documents and recordings through a converter,
-and the safest place for them afterwards is nowhere.
+The website's Laravel API proxies files to this service so its shared secret
+never reaches the browser. Uploaded files live in a temporary directory only
+for the conversion and response.
 """
 
 from __future__ import annotations
@@ -32,6 +19,7 @@ from .formats import (
     AUDIO_INPUTS,
     AUDIO_OUTPUTS,
     DOCUMENT_INPUTS,
+    DOCUMENT_OUTPUTS,
     catalogue,
     document_targets,
 )
@@ -120,8 +108,29 @@ async def read_upload(file: UploadFile, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-@app.get("/")
-async def index() -> JSONResponse:
+def validate_upload_mime(file: UploadFile, expected: str) -> None:
+    """Reject a declared media type that contradicts the file extension."""
+    actual = (file.content_type or "").lower().strip()
+    if not actual or actual == "application/octet-stream":
+        return
+
+    aliases = {
+        "application/rtf": {"text/rtf", "application/x-rtf"},
+        "text/csv": {"application/csv", "application/vnd.ms-excel", "text/plain"},
+        "audio/mp4": {"audio/x-m4a", "audio/m4a"},
+        "audio/ogg": {"application/ogg"},
+        "audio/wav": {"audio/x-wav", "audio/vnd.wave"},
+    }
+
+    if actual != expected and actual not in aliases.get(expected, set()):
+        raise HTTPException(
+            status_code=415,
+            detail=f"The uploaded media type does not match the .{extension_of(file.filename)} file extension.",
+        )
+
+
+@app.get("/info")
+async def info() -> JSONResponse:
     """What this is, for anyone who opens the address in a browser."""
     return JSONResponse(
         {
@@ -181,6 +190,7 @@ async def convert_document(
             status_code=400,
             detail=f"This converter does not read .{source or '?'} files.",
         )
+    validate_upload_mime(file, DOCUMENT_INPUTS[source])
 
     allowed = document_targets(source)
 
@@ -203,7 +213,7 @@ async def convert_document(
     return FileResponse(
         path=result.path,
         filename=safe_name(file.filename, target),
-        media_type="application/octet-stream",
+        media_type=DOCUMENT_OUTPUTS[target],
         background=_cleanup(result),
     )
 
@@ -223,6 +233,7 @@ async def convert_audio(
             status_code=400,
             detail=f"This converter does not read .{source or '?'} files.",
         )
+    validate_upload_mime(file, AUDIO_INPUTS[source])
 
     if target not in AUDIO_OUTPUTS:
         raise HTTPException(

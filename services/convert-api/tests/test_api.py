@@ -57,8 +57,8 @@ def post_document(client, *, name="report.docx", target="pdf", body=b"x" * 64, k
 # ── what it says about itself ────────────────────────────────────────────
 
 
-def test_index_names_its_endpoints(client):
-    body = client.get("/").json()
+def test_info_names_its_endpoints(client):
+    body = client.get("/info").json()
 
     assert "/convert/document" in " ".join(body["endpoints"])
     assert "/convert/audio" in " ".join(body["endpoints"])
@@ -89,6 +89,7 @@ def test_formats_lists_what_each_document_can_become(client):
     audio = {entry["extension"]: entry for entry in body["audio"]["outputs"]}
     assert audio["wav"]["takes_bitrate"] is False
     assert audio["mp3"]["takes_bitrate"] is True
+    assert "aac" in audio
     assert 320 in body["audio"]["bitrates"]
 
 
@@ -126,7 +127,7 @@ def test_a_service_without_its_secret_refuses_everything(monkeypatch):
 
 def test_the_open_endpoints_stay_open(client):
     assert client.get("/formats").status_code == 200
-    assert client.get("/").status_code == 200
+    assert client.get("/info").status_code == 200
 
 
 # ── what it refuses before converting ────────────────────────────────────
@@ -137,6 +138,18 @@ def test_an_unreadable_extension_is_refused(client):
 
     assert response.status_code == 400
     assert ".zip" in response.json()["detail"]
+
+
+def test_a_mismatched_mime_type_is_refused(client):
+    response = client.post(
+        "/convert/document",
+        files={"file": ("report.docx", b"x" * 64, "image/png")},
+        data={"target": "pdf"},
+        headers={"X-Convert-Key": KEY},
+    )
+
+    assert response.status_code == 415
+    assert "media type" in response.json()["detail"]
 
 
 def test_a_conversion_that_makes_no_sense_is_refused(client):
@@ -216,6 +229,30 @@ def test_a_converter_failure_is_reported_as_the_reason_not_a_crash(client, app_m
 
     assert response.status_code == 422
     assert "password" in response.json()["detail"]
+
+
+def test_audio_conversion_returns_the_requested_format(client, app_module, tmp_path):
+    produced = tmp_path / "output.aac"
+    produced.write_bytes(b"aac-stub")
+
+    from app.runner import Converted
+
+    async def fake(data, source, target, bitrate):
+        assert source == "wav" and target == "aac"
+        return Converted(path=produced, directory=tmp_path)
+
+    app_module.to_audio = fake
+
+    response = client.post(
+        "/convert/audio",
+        files={"file": ("voice.wav", b"wav-stub", "audio/wav")},
+        data={"target": "aac"},
+        headers={"X-Convert-Key": KEY},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"aac-stub"
+    assert response.headers["content-type"] == "audio/aac"
 
 
 def test_a_conversion_that_hangs_is_reported_as_a_timeout(client, app_module):

@@ -29,7 +29,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class ConvertController extends Controller
 {
-    /** The service is asleep until something wakes it, and waking takes a while. */
+    /** A free Space may be asleep until a request wakes it. */
     private const WAKE_TIMEOUT = 90;
     private const CONVERT_TIMEOUT = 240;
 
@@ -102,6 +102,12 @@ class ConvertController extends Controller
 
         $file = $request->file('file');
 
+        if (! $this->wakeService()) {
+            return response()->json([
+                'message' => 'The converter is still starting. Please try again in a moment.',
+            ], 503);
+        }
+
         try {
             $pending = Http::timeout(self::CONVERT_TIMEOUT)
                 ->connectTimeout(self::WAKE_TIMEOUT)
@@ -145,6 +151,45 @@ class ConvertController extends Controller
             // Somebody's document: no shared cache may keep a copy.
             'Cache-Control' => 'private, no-store',
         ]);
+    }
+
+    private function wakeService(): bool
+    {
+        $deadline = microtime(true) + self::WAKE_TIMEOUT;
+        $lastError = null;
+
+        do {
+            try {
+                $response = Http::connectTimeout(5)
+                    ->timeout(15)
+                    ->get($this->base() . '/health');
+
+                if ($response->successful() && $response->json('ready') === true) {
+                    return true;
+                }
+
+                $health = $response->json();
+                if (is_array($health) && array_key_exists('ready', $health) && $health['ready'] === false) {
+                    Log::warning('The conversion service is awake but not ready', [
+                        'health' => $health,
+                    ]);
+
+                    return false;
+                }
+            } catch (\Throwable $e) {
+                $lastError = $e;
+            }
+
+            if (microtime(true) < $deadline) {
+                usleep(2_000_000);
+            }
+        } while (microtime(true) < $deadline);
+
+        Log::warning('The conversion service did not wake before the timeout', [
+            'error' => $lastError?->getMessage(),
+        ]);
+
+        return false;
     }
 
     private function configured(): bool

@@ -4,7 +4,7 @@
 
 # FrugalDomain
 
-**A free SVG icon library, browser-based conversion tools, and a modular Laravel platform for catalog, inventory, content and order operations.**
+**A free SVG icon library, browser and hosted file-conversion tools, and a modular Laravel platform for catalog, inventory, content and order operations.**
 
 [![Laravel](https://img.shields.io/badge/Laravel-12-FF2D20?logo=laravel&logoColor=white)](https://laravel.com)
 [![PHP](https://img.shields.io/badge/PHP-8.2-777BB4?logo=php&logoColor=white)](https://php.net)
@@ -63,8 +63,8 @@ up only adds favourites, download history and custom sets.
 | Tool | Formats |
 |:--|:--|
 | [Images](https://frugaldomain.site/ImageConvert) | JPG · PNG · WebP · GIF |
-| [Audio](https://frugaldomain.site/AudioConvert) | MP3 · WAV · OGG · AAC |
-| [Documents](https://frugaldomain.site/FileConvert) | DOCX → PDF · XLSX → PDF |
+| [Audio](https://frugaldomain.site/AudioConvert) | MP3 · WAV · OGG · AAC · M4A · OPUS · FLAC |
+| [Documents](https://frugaldomain.site/FileConvert) | Office and text formats → PDF |
 
 Each common image conversion also has its own page under
 `/convert/<from>-to-<to>` — the converter with the target format preselected,

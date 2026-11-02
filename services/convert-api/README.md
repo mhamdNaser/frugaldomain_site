@@ -3,25 +3,24 @@ title: Fruga Conversion Service
 emoji: 📄
 colorFrom: blue
 colorTo: indigo
-sdk: docker
-app_port: 7860
+sdk: gradio
+sdk_version: 6.31.0
+python_version: '3.12'
+app_file: app.py
 pinned: false
 short_description: Documents and audio converted with LibreOffice and ffmpeg
 ---
 
 # Fruga conversion service
 
-Two jobs the site cannot do well in a browser, done here by the tools that do
-them properly.
+Two jobs the site cannot do reliably in a browser, done here by the tools that
+do them properly.
 
-**Documents.** The browser converter re-typesets a `.docx` with jsPDF: the text
-survives, nothing else does — no images, no table borders, no styles, and only
-`.docx` and `.xlsx` are read at all. LibreOffice opens fifteen formats and lays
-them out the way the program that wrote them did.
+**Documents.** LibreOffice reads the supported office and text formats and
+preserves document layout, tables, images and Arabic text when producing PDFs.
 
-**Audio.** The browser runs ffmpeg compiled to WebAssembly: a thirty megabyte
-download before anything starts, single threaded, and out of memory on a long
-recording or an older phone. Here it is ffmpeg itself.
+**Audio.** Files are sent to ffmpeg on the conversion service instead of
+downloading and running ffmpeg in WebAssembly in each visitor's browser.
 
 Everything else the site converts stays in the browser, where it should: images
 never leave the visitor's machine.
@@ -35,17 +34,18 @@ sent, including when the conversion fails.
 
 | | |
 |---|---|
-| `GET /health` | whether this container really has LibreOffice and ffmpeg |
+| `GET /health` | whether this Space really has LibreOffice and ffmpeg |
+| `GET /info` | service information |
 | `GET /formats` | everything it converts, for the site to build its pages from |
 | `POST /convert/document` | `file`, `target` (pdf, docx, odt, xlsx, csv, html, txt) |
-| `POST /convert/audio` | `file`, `target` (mp3, m4a, ogg, opus, wav, flac), `bitrate` |
+| `POST /convert/audio` | `file`, `target` (mp3, m4a, ogg, opus, aac, wav, flac), `bitrate` |
 
 The two conversion endpoints need the header `X-Convert-Key`. The site's own
 backend holds the key and proxies for the browser, so the key is never in a
 page and the service's address is never in one either.
 
 ```bash
-curl -X POST https://<service>.run.app/convert/document \
+curl -X POST https://<space>.hf.space/convert/document \
   -H "X-Convert-Key: $CONVERT_API_KEY" \
   -F "file=@report.docx" -F "target=pdf" -o report.pdf
 ```
@@ -78,12 +78,11 @@ missing and conversions fail with a clear message rather than a stack trace.
 
 ## A note on starting
 
-The service scales to zero when nobody is converting, which is why it costs
-nothing and also why the first conversion after a quiet spell waits a few
-seconds for a container. The site treats that as a wait rather than an error.
+The free Space may sleep when nobody is converting. The first request after a
+quiet spell can wait up to 90 seconds for it to wake; the site shows a waiting
+message and retries the health check before forwarding the file.
 
-`DEPLOY.md` covers putting it on Cloud Run and wiring the site to it. The
-front-matter at the top of this file is for a Hugging Face Space, where this
-was going to live until Hugging Face made Docker Spaces a paid feature; it
-costs nothing to keep, and the same image runs there unchanged if that ever
-changes back.
+The deployed Space uses Hugging Face's free ZeroGPU tier. Its Gradio status
+check is the only GPU-decorated function, as required by ZeroGPU; actual
+document and audio conversions use LibreOffice and ffmpeg on CPU. The Space may
+sleep while idle; Laravel waits for it to wake before forwarding a conversion.

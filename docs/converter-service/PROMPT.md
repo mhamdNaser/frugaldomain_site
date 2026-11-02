@@ -1,5 +1,9 @@
 # برومبت: بناء خدمة تحويل الملفات على Hugging Face
 
+> هذه الوثيقة أُعدّت قبل تجهيز التكامل. المرجع التنفيذي الحالي هو
+> [`PLAN.md`](./PLAN.md) ودليل
+> [`DEPLOY-HUGGINGFACE.md`](../../services/convert-api/DEPLOY-HUGGINGFACE.md).
+
 > انسخ كل ما بين الأسطر الفاصلة أدناه والصقه في جلسة جديدة.
 > المعلومات التقنية فيه مُتحقَّق منها من توثيق Hugging Face الرسمي (سبتمبر 2026).
 
@@ -23,25 +27,21 @@
    ولدي Space يعمل بالفعل: 92naser92-arabic-gestures.hf.space
    أي أن نمط ربط Space بموقعي مُجرَّب وناجح.
 
-3. توثيق Hugging Face الرسمي ينص على:
-   - "Gradio and Docker Spaces run on compute and require a paid plan to
-     create: PRO for personal accounts."
-     => إن كان حسابي مجانياً فلا أستطيع إنشاء Docker Space.
-   - لكن Gradio Spaces تدعم حزم النظام:
+3. تسعير Hugging Face الحالي يعرض CPU Basic مجاناً. Gradio Spaces تدعم حزم
+   النظام:
      "Debian dependencies are also supported. Add a packages.txt file at the
       root of your repository... each line will be read and installed by
       apt-get install."
-     => أي أن libreoffice و ffmpeg قابلان للتثبيت على Gradio Space.
+     => نستخدم Gradio SDK مع `packages.txt` لتثبيت LibreOffice وffmpeg؛ لا
+     نستخدم Docker لهذا النشر.
    - "On free hardware, your Space will go to sleep after a period of time
       if unused."
    - العتاد المجاني: CPU Basic = 2 vCPU / 16 GB RAM / 50 GB قرص غير دائم.
    - الشبكة: المنافذ 80 و 443 و 8080 فقط.
 
-**اسألني أولاً: هل حسابي PRO أم مجاني؟** لأن الجواب يحدد SDK:
-- PRO    => استخدم Docker SDK (تحكّم أنظف بالصورة)
-- مجاني  => استخدم Gradio SDK مع packages.txt، وركّب FastAPI داخله عبر
-            gr.mount_gradio_app حتى أحصل على REST API حقيقي.
-لا تفترض الجواب.
+الحساب مجاني، لذا استخدم Gradio SDK مع `packages.txt` وركّب FastAPI عبر
+`gr.mount_gradio_app` للحصول على REST API. تحقق من ظهور CPU Basic مجاناً عند
+إنشاء Space ولا تختَر عتاداً مدفوعاً.
 
 ## المطلوب بناؤه
 
@@ -72,7 +72,7 @@
 لذلك ضع في packages.txt خطوطاً عربية إلزاماً:
     fonts-noto
     fonts-noto-core
-    fonts-amiri
+    fonts-hosny-amiri
     fonts-kacst
     fonts-hosny-amiri
 وبعد البناء نفّذ fc-cache -f إن لزم.
@@ -117,13 +117,13 @@
 
 ## ملاحظات لك قبل الإرسال
 
-**١. تأكّد من نوع حسابك أولاً**
-افتح <https://huggingface.co/settings/billing> — إن لم يكن PRO فالمسار هو
-Gradio + `packages.txt` لا Docker. البرومبت يطلب من النموذج أن يسألك، فلا
-تدعه يفترض.
+**١. اختر العتاد المجاني**
+اختر Gradio SDK وCPU Basic عند إنشاء Space. لا تشارك رمز الدخول أو المفاتيح
+السرية.
 
 **٢. الخطوط العربية هي بيت القصيد**
-دون `fonts-amiri` أو `fonts-noto` سيُخرج LibreOffice مربعات فارغة بدل الحروف.
+تضم Debian خط Amiri ضمن الحزمة `fonts-hosny-amiri`، ويُستخدم معه `fonts-noto`
+لإخراج العربية دون مربعات فارغة.
 هذه أكثر خطوة يُغفل عنها.
 
 **٣. لا ترفع ملفات حسّاسة**

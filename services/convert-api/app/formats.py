@@ -101,6 +101,7 @@ AUDIO_OUTPUTS: dict[str, AudioTarget] = {
     "m4a": AudioTarget("audio/mp4", "aac"),
     "ogg": AudioTarget("audio/ogg", "libvorbis"),
     "opus": AudioTarget("audio/opus", "libopus"),
+    "aac": AudioTarget("audio/aac", "aac"),
     "wav": AudioTarget("audio/wav", "pcm_s16le", takes_bitrate=False),
     "flac": AudioTarget("audio/flac", "flac", takes_bitrate=False),
 }
