@@ -11,6 +11,13 @@ php artisan queue:work database --queue=default,shopify-sync,shopify-fulfillment
 php artisan vendor:publish --provider="Webklex\IMAP\Providers\LaravelServiceProvider"
 
 
+## Desktop software downloads
+
+Manage desktop applications in the admin panel at `/admin/desktop-software`. Each entry includes its operating system, runtime environment, open-source status, README text, and one installer or archive (up to 200 MB). Configure PHP's `upload_max_filesize` and `post_max_size` to at least 200 MB on the server. Draft entries are private; publishing makes them available in the Downloads tab.
+
+The public API is available at `GET /api/desktop-apps`, `GET /api/desktop-apps/{slug}`, and `GET /api/desktop-apps/{slug}/download`.
+
+
 Files (global media)
 Orders
 Draft Orders
