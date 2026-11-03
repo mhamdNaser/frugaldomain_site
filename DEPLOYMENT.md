@@ -92,6 +92,17 @@ To serve an app from a subdomain instead, create it in hPanel, point its
 document root at `public_html/apps/<slug>`, build with base `/`, and set the
 entry's preview mode to *subdomain* with the full URL.
 
+## Desktop software downloads
+
+The public frontend build includes the **Downloads** page at `/desktop-apps`.
+Manage published installers from the API admin panel at
+`/admin/desktop-software`. Apply the new database table with
+`php artisan migrate --force` from `api/`.
+
+The API ships `public/.user.ini` with 200 MB upload and 210 MB request limits.
+The host's PHP-FPM/LSAPI settings must also permit those request sizes; allow
+PHP to reload per-directory settings after deployment.
+
 ## First-time server setup
 
 Both PHP applications ship without `vendor/`, so install dependencies over SSH:
