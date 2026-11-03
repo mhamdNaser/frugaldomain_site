@@ -13,10 +13,14 @@ Route::prefix('admin/desktop-apps')
         Route::delete('{id}', 'destroy');
         Route::post('{id}/file', 'uploadFile');
         Route::delete('{id}/file', 'deleteFile');
+        Route::post('{id}/image', 'uploadImage');
+        Route::delete('{id}/image', 'deleteImage');
+        Route::get('{id}/image', 'adminImage');
     });
 
 Route::prefix('desktop-apps')->controller(DesktopSoftwareController::class)->group(function () {
     Route::get('/', 'index')->name('desktop-apps.index');
     Route::get('{slug}', 'show')->name('desktop-apps.show');
     Route::get('{slug}/download', 'download')->name('desktop-apps.download');
+    Route::get('{slug}/image', 'image')->name('desktop-apps.image');
 });

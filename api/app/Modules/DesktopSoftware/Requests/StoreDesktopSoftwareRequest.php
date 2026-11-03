@@ -30,7 +30,7 @@ class StoreDesktopSoftwareRequest extends FormRequest
             ],
             'name' => 'required|string|max:255',
             'summary' => 'nullable|string',
-            'readme' => 'required|string',
+            'readme' => 'required|string|max:1048576',
             'platform' => ['required', 'string', Rule::in(['windows', 'linux', 'macos', 'other'])],
             'platform_name' => [
                 Rule::requiredIf($this->input('platform') === 'other'),
@@ -39,6 +39,7 @@ class StoreDesktopSoftwareRequest extends FormRequest
                 'max:120',
             ],
             'environment' => 'required|string|max:255',
+            'programming_language' => 'required|string|max:120',
             'is_open_source' => 'required|boolean',
             'version' => 'nullable|string|max:40',
             'status' => ['required', 'string', Rule::in(['draft', 'published'])],

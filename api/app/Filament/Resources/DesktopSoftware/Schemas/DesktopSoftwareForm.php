@@ -51,6 +51,11 @@ class DesktopSoftwareForm
                 ->placeholder('e.g. .NET 8, Java 21, Electron')
                 ->required()
                 ->maxLength(255),
+            TextInput::make('programming_language')
+                ->label('Programming language')
+                ->placeholder('e.g. C#, JavaScript, Python')
+                ->required()
+                ->maxLength(120),
             Toggle::make('is_open_source')
                 ->label('Open source')
                 ->default(false),
@@ -70,7 +75,7 @@ class DesktopSoftwareForm
                 ->columnSpanFull(),
             Textarea::make('readme')
                 ->label('README')
-                ->helperText('Shown below the download link as plain text.')
+                ->helperText('Paste the README text here; it is shown below the public download link.')
                 ->rows(12)
                 ->required()
                 ->columnSpanFull(),
@@ -95,6 +100,14 @@ class DesktopSoftwareForm
                 ->rules(['mimes:exe,zip,7z,tar,gz,msi,deb,rpm,appimage', 'max:204800'])
                 ->maxSize(204800)
                 ->required(fn (string $operation): bool => $operation === 'create')
+                ->columnSpanFull(),
+            FileUpload::make('image_path')
+                ->label('Application image')
+                ->image()
+                ->disk('local')
+                ->directory('desktop-software/images')
+                ->visibility('private')
+                ->maxSize(4096)
                 ->columnSpanFull(),
         ]);
     }

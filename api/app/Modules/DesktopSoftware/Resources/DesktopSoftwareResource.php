@@ -17,11 +17,17 @@ class DesktopSoftwareResource extends JsonResource
             'platform' => $this->platform,
             'platform_name' => $this->platform_name,
             'environment' => $this->environment,
+            'programming_language' => $this->programming_language,
             'is_open_source' => $this->is_open_source,
             'version' => $this->version,
             'status' => $this->status,
             'ordering' => $this->ordering,
             'file_name' => $this->file_path ? $this->downloadFilename() : null,
+            'has_image' => (bool) $this->image_path,
+            'image_url' => $this->image_path
+                && $this->status === 'published'
+                ? url('/api/desktop-apps/'.$this->slug.'/image')
+                : null,
             'download_url' => $this->file_path
                 ? url('/api/desktop-apps/'.$this->slug.'/download')
                 : null,

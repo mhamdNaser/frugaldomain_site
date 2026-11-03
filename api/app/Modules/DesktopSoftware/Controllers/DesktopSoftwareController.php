@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Modules\DesktopSoftware\Models\DesktopSoftware;
 use App\Modules\DesktopSoftware\Requests\StoreDesktopSoftwareRequest;
 use App\Modules\DesktopSoftware\Requests\UploadDesktopSoftwareFileRequest;
+use App\Modules\DesktopSoftware\Requests\UploadDesktopSoftwareImageRequest;
 use App\Modules\DesktopSoftware\Resources\DesktopSoftwareResource;
 use Illuminate\Support\Facades\Storage;
 
@@ -76,6 +77,49 @@ class DesktopSoftwareController extends Controller
         ]);
     }
 
+    public function uploadImage(UploadDesktopSoftwareImageRequest $request, int $id)
+    {
+        $software = DesktopSoftware::findOrFail($id);
+        $software->image_path = $request->file('image')->store('desktop-software/images', 'local');
+        $software->save();
+
+        return response()->json([
+            'success' => true,
+            'data' => (new DesktopSoftwareResource($software->fresh()))->resolve(),
+        ]);
+    }
+
+    public function deleteImage(int $id)
+    {
+        $software = DesktopSoftware::findOrFail($id);
+
+        if ($software->image_path) {
+            Storage::disk('local')->delete($software->image_path);
+            $software->image_path = null;
+            $software->save();
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => (new DesktopSoftwareResource($software->fresh()))->resolve(),
+        ]);
+    }
+
+    public function adminImage(int $id)
+    {
+        $software = DesktopSoftware::findOrFail($id);
+
+        abort_unless(
+            $software->image_path && Storage::disk('local')->exists($software->image_path),
+            404
+        );
+
+        return response()->file(
+            Storage::disk('local')->path($software->image_path),
+            ['Cache-Control' => 'private, max-age=300']
+        );
+    }
+
     public function index()
     {
         $software = DesktopSoftware::query()
@@ -119,6 +163,25 @@ class DesktopSoftwareController extends Controller
         return response()->download(
             Storage::disk('local')->path($software->file_path),
             $software->downloadFilename()
+        );
+    }
+
+    public function image(string $slug)
+    {
+        $software = DesktopSoftware::query()
+            ->where('status', 'published')
+            ->whereNotNull('file_path')
+            ->where('slug', $slug)
+            ->firstOrFail();
+
+        abort_unless(
+            $software->image_path && Storage::disk('local')->exists($software->image_path),
+            404
+        );
+
+        return response()->file(
+            Storage::disk('local')->path($software->image_path),
+            ['Cache-Control' => 'public, max-age=3600']
         );
     }
 }

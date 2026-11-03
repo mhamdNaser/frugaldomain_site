@@ -95,9 +95,17 @@ entry's preview mode to *subdomain* with the full URL.
 ## Desktop software downloads
 
 The public frontend build includes the **Downloads** page at `/desktop-apps`.
-Manage published installers from the API admin panel at
-`/admin/desktop-software`. Apply the new database table with
-`php artisan migrate --force` from `api/`.
+In the React admin dashboard, use **Downloadable Software** (`/admin/desktop-software`).
+This is separate from **Apps** (`/admin/apps`), which manages browser-previewable
+projects. Downloadable Software manages installer files, README text, operating
+system, runtime environment, programming language, and publication status.
+
+After uploading the API code, apply pending schema changes from `api/` with
+`php artisan migrate --force`. Build `sydev-front` and publish its `dist/`
+contents to the site document root to make the dashboard and public UI available.
+Each published software entry can optionally include a JPG, PNG, or WebP image,
+served through the published-app image endpoint, and its README is rendered as
+Markdown on `/desktop-apps/<slug>`.
 
 The API ships `public/.user.ini` with 200 MB upload and 210 MB request limits.
 The host's PHP-FPM/LSAPI settings must also permit those request sizes; allow

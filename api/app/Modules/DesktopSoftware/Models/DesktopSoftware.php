@@ -17,10 +17,12 @@ class DesktopSoftware extends Model
         'platform',
         'platform_name',
         'environment',
+        'programming_language',
         'is_open_source',
         'version',
         'status',
         'file_path',
+        'image_path',
         'ordering',
     ];
 
@@ -35,11 +37,19 @@ class DesktopSoftware extends Model
             if ($software->isDirty('file_path') && $software->getOriginal('file_path')) {
                 Storage::disk('local')->delete($software->getOriginal('file_path'));
             }
+
+            if ($software->isDirty('image_path') && $software->getOriginal('image_path')) {
+                Storage::disk('local')->delete($software->getOriginal('image_path'));
+            }
         });
 
         static::deleting(function (self $software): void {
             if ($software->file_path) {
                 Storage::disk('local')->delete($software->file_path);
+            }
+
+            if ($software->image_path) {
+                Storage::disk('local')->delete($software->image_path);
             }
         });
     }

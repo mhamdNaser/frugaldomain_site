@@ -22,6 +22,7 @@ class DesktopSoftwareApiTest extends TestCase
             ->assertJsonPath('data.0.slug', 'released-tool')
             ->assertJsonPath('data.0.platform', 'windows')
             ->assertJsonPath('data.0.environment', '.NET 8')
+            ->assertJsonPath('data.0.programming_language', 'C#')
             ->assertJsonPath('data.0.is_open_source', true);
 
         $this->assertStringEndsWith(
@@ -39,6 +40,35 @@ class DesktopSoftwareApiTest extends TestCase
         $this->get('/api/desktop-apps/released-tool/download')
             ->assertOk()
             ->assertHeader('content-disposition', 'attachment; filename=released-tool.zip');
+    }
+
+    public function test_published_software_image_is_available_and_listed_in_the_catalogue(): void
+    {
+        Storage::fake('local');
+        Storage::disk('local')->put('desktop-software/images/released-tool.png', 'fake image bytes');
+        DesktopSoftware::create($this->software('released-tool', [
+            'image_path' => 'desktop-software/images/released-tool.png',
+        ]));
+
+        $this->getJson('/api/desktop-apps')
+            ->assertOk()
+            ->assertJsonPath('data.0.image_url', url('/api/desktop-apps/released-tool/image'));
+
+        $this->get('/api/desktop-apps/released-tool/image')
+            ->assertOk()
+            ->assertHeader('content-type', 'image/png');
+    }
+
+    public function test_draft_software_image_is_not_publicly_accessible(): void
+    {
+        Storage::fake('local');
+        Storage::disk('local')->put('desktop-software/images/draft-tool.png', 'fake image bytes');
+        DesktopSoftware::create($this->software('draft-tool', [
+            'status' => 'draft',
+            'image_path' => 'desktop-software/images/draft-tool.png',
+        ]));
+
+        $this->get('/api/desktop-apps/draft-tool/image')->assertNotFound();
     }
 
     public function test_draft_downloads_are_not_publicly_accessible(): void
@@ -61,6 +91,7 @@ class DesktopSoftwareApiTest extends TestCase
             'platform' => 'windows',
             'platform_name' => null,
             'environment' => '.NET 8',
+            'programming_language' => 'C#',
             'is_open_source' => true,
             'version' => '1.0.0',
             'status' => 'published',
