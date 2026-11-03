@@ -9,6 +9,7 @@ class DesktopSoftwareResource extends JsonResource
     public function toArray($request): array
     {
         return [
+            'id' => $this->id,
             'slug' => $this->slug,
             'name' => $this->name,
             'summary' => $this->summary,
@@ -18,8 +19,12 @@ class DesktopSoftwareResource extends JsonResource
             'environment' => $this->environment,
             'is_open_source' => $this->is_open_source,
             'version' => $this->version,
-            'file_name' => $this->downloadFilename(),
-            'download_url' => url('/api/desktop-apps/'.$this->slug.'/download'),
+            'status' => $this->status,
+            'ordering' => $this->ordering,
+            'file_name' => $this->file_path ? $this->downloadFilename() : null,
+            'download_url' => $this->file_path
+                ? url('/api/desktop-apps/'.$this->slug.'/download')
+                : null,
         ];
     }
 }

@@ -90,7 +90,7 @@ class AuthController extends Controller
             ], 401);
         }
 
-        $allowedRoles = ['admin'];
+        $allowedRoles = ['admin', 'super-admin'];
         // $allowedRoles = ['admin', 'partner'];
 
         if (!$user->hasAnyRole($allowedRoles)) {
