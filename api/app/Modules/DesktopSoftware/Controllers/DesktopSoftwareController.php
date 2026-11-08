@@ -3,11 +3,13 @@
 namespace App\Modules\DesktopSoftware\Controllers;
 
 use App\Http\Controllers\Controller;
+use App\Modules\Core\Services\AnalyticsRecorder;
 use App\Modules\DesktopSoftware\Models\DesktopSoftware;
 use App\Modules\DesktopSoftware\Requests\StoreDesktopSoftwareRequest;
 use App\Modules\DesktopSoftware\Requests\UploadDesktopSoftwareFileRequest;
 use App\Modules\DesktopSoftware\Requests\UploadDesktopSoftwareImageRequest;
 use App\Modules\DesktopSoftware\Resources\DesktopSoftwareResource;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 
 class DesktopSoftwareController extends Controller
@@ -147,7 +149,7 @@ class DesktopSoftwareController extends Controller
         ]);
     }
 
-    public function download(string $slug)
+    public function download(Request $request, AnalyticsRecorder $recorder, string $slug)
     {
         $software = DesktopSoftware::query()
             ->where('status', 'published')
@@ -159,6 +161,9 @@ class DesktopSoftwareController extends Controller
             $software->file_path && Storage::disk('local')->exists($software->file_path),
             404
         );
+
+        // Counted for the dashboard's program downloads; never blocks the file.
+        $recorder->recordDownload($request, 'desktop', (int) $software->id, $software->slug, $software->name);
 
         return response()->download(
             Storage::disk('local')->path($software->file_path),

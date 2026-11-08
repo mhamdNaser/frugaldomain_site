@@ -58,18 +58,37 @@ class AnalyticsController extends Controller
     {
         $days = $this->days($request);
 
+        // The dashboard is only ever opened by staff, so the browser asking
+        // is staff too: remember it, and its visits to the public site stop
+        // counting even while signed out.
+        $this->recorder->rememberStaffRequest($request);
+
         return response()->json([
             'status' => 'success',
             'data' => [
                 'overview' => $this->statistics->overview($days),
                 'timeline' => $this->statistics->visitsTimeline($days),
-                'top_pages' => $this->statistics->topPages($days, 10),
+                'top_pages' => $this->statistics->topPages($days, 15),
+                'sections' => $this->statistics->sections($days),
+                'engagement' => $this->statistics->engagement($days),
+                'traffic_sources' => $this->statistics->trafficSources($days),
+                'entry_exit_pages' => $this->statistics->entryExitPages($days, 8),
+                'learning' => $this->statistics->learning($days, 8),
+                'downloads' => $this->statistics->downloads($days),
                 'audience' => $this->statistics->audience($days),
                 // The statistics page shows only the top three; the dedicated
                 // icon page asks for the full list.
                 'top_icons' => $this->statistics->iconEngagement($days, 3),
                 'longest_stay_pages' => $this->statistics->longestStayPages($days, 5),
             ],
+        ]);
+    }
+
+    public function downloads(Request $request): JsonResponse
+    {
+        return response()->json([
+            'status' => 'success',
+            'data' => $this->statistics->downloads($this->days($request), (int) $request->input('limit', 50)),
         ]);
     }
 

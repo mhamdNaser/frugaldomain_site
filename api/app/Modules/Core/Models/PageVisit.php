@@ -2,6 +2,7 @@
 
 namespace App\Modules\Core\Models;
 
+use App\Modules\Core\Models\Scopes\ExcludeStaffScope;
 use App\Modules\Core\Services\AnalyticsRecorder;
 use App\Modules\User\Models\User;
 use Illuminate\Database\Eloquent\Builder;
@@ -42,6 +43,9 @@ class PageVisit extends Model
      */
     protected static function booted(): void
     {
+        // The site's own staff are never counted (see ExcludeStaffScope).
+        static::addGlobalScope('excludeStaff', new ExcludeStaffScope());
+
         static::addGlobalScope('publicPaths', function (Builder $query) {
             foreach (AnalyticsRecorder::EXCLUDED_PATH_PREFIXES as $prefix) {
                 $query->where(function (Builder $inner) use ($prefix) {

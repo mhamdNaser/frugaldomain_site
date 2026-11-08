@@ -4,6 +4,7 @@ namespace App\Modules\Core\Models;
 
 use App\Modules\Icon\Models\Icon;
 use App\Modules\User\Models\User;
+use App\Modules\Core\Models\Scopes\ExcludeStaffScope;
 use Illuminate\Database\Eloquent\Model;
 
 class IconEvent extends Model
@@ -20,6 +21,12 @@ class IconEvent extends Model
         'device_type',
         'occurred_at',
     ];
+
+    protected static function booted(): void
+    {
+        // The site's own staff are never counted (see ExcludeStaffScope).
+        static::addGlobalScope('excludeStaff', new ExcludeStaffScope());
+    }
 
     protected $casts = [
         'occurred_at' => 'datetime',

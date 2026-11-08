@@ -2,10 +2,13 @@
 
 namespace App\Modules\Core\Services;
 
+use App\Modules\Core\Models\DownloadEvent;
 use App\Modules\Core\Models\IconEvent;
+use App\Modules\Core\Models\Scopes\ExcludeStaffScope;
 use App\Modules\Core\Models\LoginEvent;
 use App\Modules\Core\Models\PageVisit;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -65,10 +68,65 @@ class AnalyticsRecorder
         return false;
     }
 
+    // ------------------------------------------------------------ staff
+
+    /**
+     * Is this request from the site's own staff?
+     *
+     * A signed-in admin is staff, and so is any browser an admin has been
+     * seen on: once recognised, that browser stays excluded after sign-out.
+     * Recognising it here means the browser is remembered the first time an
+     * admin is seen on it, so its later anonymous visits are dropped too.
+     */
+    public function isStaff(Request $request, array $payload = []): bool
+    {
+        try {
+            $sessionId = $this->sessionId($request, $payload);
+            $user = $request->user('sanctum') ?? $request->user();
+
+            if ($user && method_exists($user, 'hasAnyRole') && $user->hasAnyRole(ExcludeStaffScope::STAFF_ROLES)) {
+                $this->rememberStaffBrowser($sessionId, (int) $user->getKey());
+                return true;
+            }
+
+            return DB::table('analytics_excluded_sessions')->where('session_id', $sessionId)->exists();
+        } catch (Throwable $e) {
+            Log::warning('Failed to check analytics staff exclusion.', ['error' => $e->getMessage()]);
+            return false;
+        }
+    }
+
+    /**
+     * Mark the browser behind an admin request as staff. Called by the
+     * dashboard's own requests, which always come from an admin.
+     */
+    public function rememberStaffRequest(Request $request): void
+    {
+        try {
+            $user = $request->user('sanctum') ?? $request->user();
+            $provided = $request->header('X-Session-Id');
+            if (is_string($provided) && $provided !== '') {
+                $this->rememberStaffBrowser(mb_substr($provided, 0, 64), $user ? (int) $user->getKey() : null);
+            }
+        } catch (Throwable $e) {
+            Log::warning('Failed to remember a staff browser.', ['error' => $e->getMessage()]);
+        }
+    }
+
+    private function rememberStaffBrowser(string $sessionId, ?int $userId): void
+    {
+        DB::table('analytics_excluded_sessions')->updateOrInsert(
+            ['session_id' => $sessionId],
+            ['user_id' => $userId, 'updated_at' => now(), 'created_at' => now()]
+        );
+    }
+
+    // ----------------------------------------------------------- recording
+
     public function recordPageVisit(Request $request, array $payload): ?PageVisit
     {
         try {
-            if (self::isExcludedPath($payload['path'] ?? null)) {
+            if (self::isExcludedPath($payload['path'] ?? null) || $this->isStaff($request, $payload)) {
                 return null;
             }
 
@@ -111,6 +169,10 @@ class AnalyticsRecorder
     public function recordIconEvent(Request $request, int $iconId, string $eventType = 'click'): ?IconEvent
     {
         try {
+            if ($this->isStaff($request)) {
+                return null;
+            }
+
             $context = $this->context($request);
 
             return IconEvent::create([
@@ -125,6 +187,45 @@ class AnalyticsRecorder
             ]);
         } catch (Throwable $e) {
             Log::warning('Failed to record icon event.', ['error' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    /**
+     * Record one download of a program. Called by the download endpoint
+     * itself, so a download is counted however the visitor reached the link.
+     * The page appends `sid` (the browser's analytics id) to the link, which
+     * ties the download to the visit and lets staff downloads be skipped.
+     */
+    public function recordDownload(Request $request, string $type, ?int $itemId, ?string $slug, ?string $name): ?DownloadEvent
+    {
+        try {
+            $payload = ['session_id' => $request->query('sid')];
+            if ($this->isStaff($request, $payload)) {
+                return null;
+            }
+
+            $context = $this->context($request);
+            if ($context['device_type'] === 'bot') {
+                return null;
+            }
+
+            return DownloadEvent::create([
+                'item_type' => mb_substr($type, 0, 32),
+                'item_id' => $itemId,
+                'item_slug' => $slug ? mb_substr($slug, 0, 191) : null,
+                'item_name' => $name ? mb_substr($name, 0, 255) : null,
+                'user_id' => $this->userId($request),
+                'session_id' => $this->sessionId($request, $payload),
+                'ip_address' => $context['ip_address'],
+                'country' => $context['country'],
+                'device_type' => $context['device_type'],
+                'platform' => $context['platform'],
+                'referrer' => ($ref = $request->headers->get('referer')) ? mb_substr($ref, 0, 512) : null,
+                'occurred_at' => now(),
+            ]);
+        } catch (Throwable $e) {
+            Log::warning('Failed to record download.', ['error' => $e->getMessage()]);
             return null;
         }
     }
