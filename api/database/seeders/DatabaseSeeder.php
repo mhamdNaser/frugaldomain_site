@@ -9,6 +9,7 @@ use App\Modules\Drawing\database\seeders\DrawingTemplateLibrarySeeder;
 use App\Modules\Drawing\database\seeders\DrawingTemplateSeeder;
 use App\Modules\Icon\database\seeders\IconSeeder;
 use App\Modules\Icon\database\seeders\IconV2Seeder;
+use App\Modules\Learning\database\seeders\LearningCurriculumSeeder;
 use App\Modules\Locale\database\seeders\LanguageSeeder;
 use App\Modules\User\database\seeders\AdminSeeder;
 use App\Modules\User\database\seeders\RolePermissionSeeder;
@@ -34,6 +35,10 @@ class DatabaseSeeder extends Seeder
             ComponentLibrarySeeder::class,
             DrawingTemplateSeeder::class,
             DrawingTemplateLibrarySeeder::class,
+
+            // The learning curriculum. Fill-only: it never overwrites a
+            // lesson that has been edited in the dashboard.
+            LearningCurriculumSeeder::class,
         ]);
     }
 }

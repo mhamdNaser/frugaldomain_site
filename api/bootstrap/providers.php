@@ -16,6 +16,7 @@ return [
     App\Modules\Gesture\Providers\GestureServiceProvider::class,
     App\Modules\Icon\Providers\IconeServiceProvider::class,
     App\Modules\Inventory\Providers\InventoryServiceProvider::class,
+    App\Modules\Learning\Providers\LearningServiceProvider::class,
     App\Modules\Locale\Providers\LocaleServiceProvider::class,
     App\Modules\Marketing\Providers\MarketingServiceProvider::class,
     App\Modules\MobileApp\Providers\MobileAppServiceProvider::class,
