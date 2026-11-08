@@ -49,6 +49,7 @@ Route::prefix('admin/learn')
     });
 
 Route::prefix('learn')->controller(LearnController::class)->group(function () {
+    Route::get('sitemap.xml', 'sitemap');
     Route::get('categories', 'categories');
     Route::get('courses', 'courses');
     Route::get('courses/{slug}', 'course');

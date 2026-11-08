@@ -30,6 +30,11 @@ Public: `GET /api/learn/categories`, `GET /api/learn/courses?category=`,
 `GET /api/learn/courses/{slug}`, `GET /api/learn/courses/{slug}/lessons/{lesson}`,
 `GET /api/learn/media/{id}.{ext}`, `GET /api/learn/courses/{slug}/cover`.
 
+`GET /api/learn/sitemap.xml` lists every public course and written lesson in
+both languages with hreflang pairs (review pointers and drafts are left out),
+cached for an hour. The site's `robots.txt` submits it, so new lessons reach
+search engines after the seeder runs, with no frontend build.
+
 Dashboard (`auth:sanctum`, role `admin|super-admin`), under `/api/admin/learn`:
 CRUD for `categories`, `courses`, `stages`, `units`, `lessons`; `POST reorder`
 (`{type, parent_id, ids}` – also moves items to a new parent);

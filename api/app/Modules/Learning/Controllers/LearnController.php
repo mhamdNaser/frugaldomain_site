@@ -105,6 +105,71 @@ class LearnController extends Controller
         ]);
     }
 
+    /**
+     * A sitemap of every public course and written lesson, in both languages,
+     * with the hreflang pairs. It is built from the database, so a new batch
+     * of lessons is listed as soon as the seeder runs, with no frontend
+     * build. robots.txt on the main site points crawlers here; a sitemap on
+     * another host is valid when robots.txt submits it.
+     *
+     * Review topics (a single pointer to the lesson that teaches them) are
+     * left out: they are thin by design and the page itself is noindex.
+     */
+    public function sitemap()
+    {
+        $xml = cache()->remember('learn:sitemap', now()->addHour(), function () {
+            // The public site, as in the frontend's SITE_ORIGIN. Not taken from
+            // FRONTEND_URL, which is a localhost address in development.
+            $origin = 'https://frugaldomain.site';
+
+            $courses = $this->publishedCourses()->get(['id', 'slug', 'updated_at']);
+            $lessons = LearningLesson::query()
+                ->whereIn('course_id', $courses->pluck('id'))
+                ->where('status', 'published')
+                ->where(fn ($q) => $q->whereNull('summary')->orWhere('summary', 'not like', 'A review topic:%'))
+                ->get(['course_id', 'slug', 'summary_ar', 'updated_at']);
+            $slugOf = $courses->pluck('slug', 'id');
+
+            $entries = [];
+            foreach ($courses as $course) {
+                $entries[] = ["/learn/{$course->slug}", $course->updated_at, true, '0.8'];
+            }
+            foreach ($lessons as $lesson) {
+                $entries[] = [
+                    "/learn/{$slugOf[$lesson->course_id]}/{$lesson->slug}",
+                    $lesson->updated_at,
+                    filled($lesson->summary_ar),
+                    '0.7',
+                ];
+            }
+
+            $e = fn (string $s) => htmlspecialchars($s, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+            $out = '<?xml version="1.0" encoding="UTF-8"?>'."\n"
+                .'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">'."\n";
+            foreach ($entries as [$path, $updated, $bilingual, $priority]) {
+                $en = $origin.$path;
+                $ar = $origin.'/ar'.$path;
+                $links = $bilingual
+                    ? '<xhtml:link rel="alternate" hreflang="en" href="'.$e($en).'"/>'
+                        .'<xhtml:link rel="alternate" hreflang="ar" href="'.$e($ar).'"/>'
+                        .'<xhtml:link rel="alternate" hreflang="x-default" href="'.$e($en).'"/>'
+                    : '';
+                $lastmod = $updated ? '<lastmod>'.$updated->toDateString().'</lastmod>' : '';
+                foreach ($bilingual ? [$en, $ar] : [$en] as $loc) {
+                    $out .= '<url><loc>'.$e($loc).'</loc>'.$lastmod.'<priority>'.$priority.'</priority>'.$links.'</url>'."\n";
+                }
+            }
+
+            return $out.'</urlset>'."\n";
+        });
+
+        return response($xml, 200, [
+            'Content-Type' => 'application/xml; charset=UTF-8',
+            'Cache-Control' => 'public, max-age=3600',
+            'X-Robots-Tag' => 'noindex',
+        ]);
+    }
+
     private function publishedCourses()
     {
         return LearningCourse::query()

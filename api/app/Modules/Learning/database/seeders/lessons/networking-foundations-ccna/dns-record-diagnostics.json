@@ -1,0 +1,796 @@
+{
+  "slug": "dns-record-diagnostics",
+  "title": "DNS Record Diagnostics",
+  "summary": "Follow a DNS query from stub resolver to authoritative server, learn the common record types and how TTL caching works, and diagnose real DNS faults with dig, nslookup, Resolve-DnsName and Cisco IOS.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Describe how stub, recursive, root, TLD and authoritative servers cooperate to resolve a name",
+    "Explain the purpose of A, AAAA, CNAME, MX, NS, PTR, TXT and SOA records",
+    "Explain how TTL and negative caching affect record changes",
+    "Diagnose stale caches, missing PTR records and wrong resolvers with dig, nslookup and Resolve-DnsName",
+    "Configure and verify DNS client settings on Cisco IOS",
+    "Describe the role of DNSSEC, DoT and DoH"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "On Friday evening the company portal `portal.example.com` moved to a new server. On Monday morning half the staff reach the new server and half still land on the old one, which is now switched off. Nothing is \"down\", yet the help desk is flooded. The cause is DNS: old answers are still cached, and nobody checked which server was giving which answer.\n\nThe **Domain Name System (DNS)** turns names into addresses and much more: it routes email, proves domain ownership and maps addresses back to names. This lesson walks through how resolution really works, what each record type does, and how to diagnose DNS faults with `dig`, `nslookup`, `Resolve-DnsName` and Cisco IOS. For the basics of names and addresses, see [Network Basics: IP Addressing and DNS](/learn/cisco-security-certification-track/network-basics-ip-addressing-and-dns)."
+    },
+    {
+      "id": "resolution",
+      "type": "text",
+      "markdown": "## How a name is resolved\n\nFour kinds of DNS participant cooperate to answer a single query:\n\n- **Stub resolver**: the small client built into the operating system. It asks one question and expects a final answer.\n- **Recursive resolver**: the server the client is configured to use (from DHCP or static settings). It does the legwork and caches the results.\n- **Root and TLD servers**: the root servers know who runs each top-level domain such as `.com`; the TLD servers know which name servers are authoritative for each domain.\n- **Authoritative server**: holds the zone file for `example.com` and gives the definitive answer, marked with the **AA** (authoritative answer) flag.\n\nThe stub sends a **recursive query** (\"give me the final answer\"). The resolver then sends **iterative queries**, following **referrals** down the tree. Queries normally use UDP port 53; large responses and zone transfers use TCP port 53."
+    },
+    {
+      "id": "resolve-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Resolving portal.example.com from an empty cache",
+      "caption": "One recursive query from the client becomes several iterative queries made by the resolver.",
+      "data": {
+        "actors": [
+          {
+            "id": "stub",
+            "label": "Laptop (stub)",
+            "sub": "192.168.10.21",
+            "icon": "laptop"
+          },
+          {
+            "id": "rr",
+            "label": "Recursive resolver",
+            "sub": "192.168.10.53",
+            "icon": "server"
+          },
+          {
+            "id": "root",
+            "label": "Root server",
+            "sub": ".",
+            "icon": "globe"
+          },
+          {
+            "id": "tld",
+            "label": "TLD server",
+            "sub": ".com",
+            "icon": "globe"
+          },
+          {
+            "id": "auth",
+            "label": "Authoritative",
+            "sub": "ns1.example.com",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "from": "stub",
+            "to": "rr",
+            "label": "Query A portal.example.com",
+            "detail": "UDP 53, RD=1",
+            "note": "The laptop's stub resolver asks its configured resolver and sets the Recursion Desired flag."
+          },
+          {
+            "from": "rr",
+            "to": "rr",
+            "label": "Check cache: miss",
+            "note": "Nothing is cached for this name, so the resolver starts at the top of the tree."
+          },
+          {
+            "from": "rr",
+            "to": "root",
+            "label": "Query portal.example.com",
+            "note": "The resolver asks a root server, whose addresses it knows from built-in root hints."
+          },
+          {
+            "from": "root",
+            "to": "rr",
+            "label": "Referral to .com",
+            "detail": "NS for com.",
+            "note": "The root does not know the answer; it refers the resolver to the .com TLD servers."
+          },
+          {
+            "from": "rr",
+            "to": "tld",
+            "label": "Query portal.example.com",
+            "note": "The resolver repeats the question to a .com server."
+          },
+          {
+            "from": "tld",
+            "to": "rr",
+            "label": "Referral to example.com",
+            "detail": "NS ns1.example.com + glue 203.0.113.53",
+            "note": "The TLD returns the domain's NS records plus glue addresses so the resolver can reach them."
+          },
+          {
+            "from": "rr",
+            "to": "auth",
+            "label": "Query portal.example.com",
+            "note": "The resolver finally asks the server that owns the zone."
+          },
+          {
+            "from": "auth",
+            "to": "rr",
+            "label": "Answer (AA)",
+            "detail": "CNAME web02 / A 203.0.113.81, TTL 3600",
+            "tone": "success",
+            "note": "The authoritative server answers with the AA flag set: a CNAME and the A record it points to."
+          },
+          {
+            "from": "rr",
+            "to": "rr",
+            "label": "Cache for 3600 s",
+            "note": "The resolver caches every record it learned, including the referrals, for their TTLs."
+          },
+          {
+            "from": "rr",
+            "to": "stub",
+            "label": "Answer 203.0.113.81",
+            "detail": "RA=1, not AA",
+            "tone": "success",
+            "note": "The laptop receives a non-authoritative answer and caches it too."
+          }
+        ]
+      }
+    },
+    {
+      "id": "records",
+      "type": "text",
+      "markdown": "## Common record types\n\n| Type | Purpose | Example |\n|:--|:--|:--|\n| **A** | Name to IPv4 address | `web01.example.com. A 203.0.113.80` |\n| **AAAA** | Name to IPv6 address | `web01.example.com. AAAA 2001:db8::80` |\n| **CNAME** | Alias to another name (the canonical name) | `portal.example.com. CNAME web02.example.com.` |\n| **MX** | Mail servers for a domain, with preference (lower wins) | `example.com. MX 10 mail.example.com.` |\n| **NS** | Name servers authoritative for a zone | `example.com. NS ns1.example.com.` |\n| **PTR** | Reverse lookup: address to name | `81.113.0.203.in-addr.arpa. PTR web02.example.com.` |\n| **TXT** | Free text: SPF, DKIM, DMARC, domain verification | `example.com. TXT \"v=spf1 mx -all\"` |\n| **SOA** | Start of authority: primary server, admin contact, serial number and timers | `example.com. SOA ns1.example.com. hostmaster.example.com. 2026110801 …` |\n\nA few rules catch people out. A CNAME cannot coexist with other records of the same name, so the zone apex (`example.com` itself) cannot be a CNAME. MX and NS records must point to names that have A or AAAA records, never directly to an IP address or to a CNAME. PTR records live in a separate reverse zone, usually managed by whoever owns the address block, often the ISP."
+    },
+    {
+      "id": "ttl",
+      "type": "text",
+      "markdown": "## TTL and caching\n\nEvery record carries a **time to live (TTL)** in seconds. A resolver that caches a record counts the TTL down and answers from cache until it reaches zero. That is why a record change is not \"instant\": clients keep the old answer for up to the old TTL. Failed lookups are cached too (**negative caching**), for a time set by the last field of the SOA record.\n\nCaches exist at several layers: the browser, the operating system's stub resolver, the recursive resolver and sometimes a forwarder in between. In the portal scenario, the old record had a TTL of 86,400 seconds (one day), so some resolvers kept answering with the old server long after the change.\n\nThe professional habit is to **lower the TTL** (for example to 300 seconds) a day or more before a planned change, make the change, verify it, then raise the TTL again."
+    },
+    {
+      "id": "tools",
+      "type": "text",
+      "markdown": "## Diagnostic tools\n\n| Tool | Platform | Strength |\n|:--|:--|:--|\n| `dig` | Linux, macOS | Full detail: flags, TTLs, sections; can query any server directly |\n| `nslookup` | Windows, Linux, macOS | Available everywhere; simple output |\n| `Resolve-DnsName` | Windows PowerShell | Returns objects you can filter; uses the Windows resolver |\n\nThe key diagnostic move is to **compare answers from different servers**. Ask the client's own resolver, then ask the authoritative server directly with `dig @ns1.example.com … +norecurse`. If they disagree, the problem is caching. If the authoritative server itself is wrong, the problem is the zone data.\n\nRead the response code as well as the answer: **NOERROR** with data is success; **NXDOMAIN** means the name does not exist; **NOERROR with no answer** means the name exists but has no record of that type; **SERVFAIL** means the resolver could not get a valid answer, often a broken delegation or a DNSSEC failure; a **timeout** points to reachability or a firewall blocking port 53."
+    },
+    {
+      "id": "dig",
+      "type": "terminal",
+      "title": "Diagnosing the portal migration",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "dig portal.example.com",
+          "output": "; <<>> DiG 9.18.28 <<>> portal.example.com\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 31744\n;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1\n\n;; QUESTION SECTION:\n;portal.example.com.            IN      A\n\n;; ANSWER SECTION:\nportal.example.com.     2875    IN      CNAME   web01.example.com.\nweb01.example.com.      2875    IN      A       203.0.113.80\n\n;; Query time: 1 msec\n;; SERVER: 192.168.10.53#53(192.168.10.53) (UDP)\n;; MSG SIZE  rcvd: 85"
+        },
+        {
+          "comment": "The company resolver answers from cache (flags qr rd ra, no aa). TTL 2875 is counting down, and it still points to the old server web01 at 203.0.113.80."
+        },
+        {
+          "cmd": "dig @ns1.example.com portal.example.com +norecurse",
+          "output": "; <<>> DiG 9.18.28 <<>> @ns1.example.com portal.example.com +norecurse\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 5120\n;; flags: qr aa; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1\n\n;; ANSWER SECTION:\nportal.example.com.     3600    IN      CNAME   web02.example.com.\nweb02.example.com.      3600    IN      A       203.0.113.81\n\n;; SERVER: 203.0.113.53#53(ns1.example.com) (UDP)"
+        },
+        {
+          "comment": "The authoritative server (flag aa) already has the new record: web02 at 203.0.113.81. Diagnosis: stale cache, not wrong zone data."
+        },
+        {
+          "cmd": "dig -x 203.0.113.81 +short",
+          "output": ""
+        },
+        {
+          "comment": "No output: there is no PTR record for the new server. Logs will show only its IP address, and some mail servers will reject its messages."
+        },
+        {
+          "cmd": "dig example.com MX +short",
+          "output": "10 mail.example.com.\n20 mail2.example.com."
+        },
+        {
+          "comment": "+short prints only the data. Mail goes to preference 10 first and falls back to 20."
+        }
+      ],
+      "caption": "Always compare the resolver's answer with the authoritative answer."
+    },
+    {
+      "id": "win",
+      "type": "terminal",
+      "title": "Windows: nslookup and Resolve-DnsName",
+      "prompt": "C:\\>",
+      "lines": [
+        {
+          "cmd": "nslookup portal.example.com",
+          "output": "Server:  dns1.corp.example.com\nAddress:  192.168.10.53\n\nNon-authoritative answer:\nName:    web01.example.com\nAddress:  203.0.113.80\nAliases:  portal.example.com"
+        },
+        {
+          "comment": "\"Server\" shows which resolver answered; a wrong value here is the classic wrong-resolver fault."
+        },
+        {
+          "cmd": "Resolve-DnsName -Name example.com -Type MX",
+          "prompt": "PS C:\\>",
+          "output": "Name                           Type   TTL   Section    NameExchange              Preference\n----                           ----   ---   -------    ------------              ----------\nexample.com                    MX     3600  Answer     mail.example.com          10\nexample.com                    MX     3600  Answer     mail2.example.com         20"
+        },
+        {
+          "cmd": "Clear-DnsClientCache",
+          "prompt": "PS C:\\>",
+          "output": ""
+        },
+        {
+          "comment": "Flushes only this PC's cache (same as ipconfig /flushdns). If the recursive resolver is stale, the next answer is still wrong."
+        }
+      ],
+      "caption": "Resolve-DnsName uses the Windows client resolver, including its cache and hosts file."
+    },
+    {
+      "id": "ios-section",
+      "type": "text",
+      "markdown": "## DNS on Cisco IOS\n\nA router or switch acts as a DNS **client** so you can `ping`, `traceroute`, `ssh` or `copy` using names. Three commands matter: `ip domain lookup` (on by default), `ip name-server` (up to six servers) and `ip domain name` (appended to unqualified names).\n\nMany lab guides add `no ip domain lookup` because IOS treats a mistyped command as a host name and tries to resolve and Telnet to it, hanging the console. That also disables every name lookup on the device. A better fix keeps DNS working: `transport preferred none` on the console and VTY lines."
+    },
+    {
+      "id": "ios",
+      "type": "code",
+      "language": "cisco",
+      "filename": "R1-dns.cfg",
+      "code": "! Let the router resolve names (enabled by default on IOS XE)\nip domain lookup\nip domain name corp.example.com\nip name-server 192.168.10.53 192.168.20.53\n!\n! Stop mistyped commands from being treated as Telnet host names,\n! without disabling DNS for the whole router\nline con 0\n transport preferred none\nline vty 0 4\n transport preferred none",
+      "highlight": [
+        2,
+        3,
+        4
+      ],
+      "caption": "Name resolution for the router itself; clients get their resolver from DHCP."
+    },
+    {
+      "id": "ios-verify",
+      "type": "terminal",
+      "title": "Verifying name resolution on R1",
+      "prompt": "R1#",
+      "lines": [
+        {
+          "cmd": "ping portal.example.com",
+          "output": "Translating \"portal.example.com\"...domain server (192.168.10.53) [OK]\nType escape sequence to abort.\nSending 5, 100-byte ICMP Echos to 203.0.113.81, timeout is 2 seconds:\n!!!!!\nSuccess rate is 100 percent (5/5), round-trip min/avg/max = 1/1/2 ms"
+        },
+        {
+          "comment": "The router queried 192.168.10.53 and got the new address."
+        },
+        {
+          "cmd": "show hosts",
+          "output": "Default domain is corp.example.com\nName/address lookup uses domain service\nName servers are 192.168.10.53, 192.168.20.53\n\nCodes: UN - unknown, EX - expired, OK - OK, ?? - revalidate\n       temp - temporary, perm - permanent\n       NA - Not Applicable None - Not defined\n\nHost                      Port  Flags      Age Type   Address(es)\nportal.example.com        None  (temp, OK)  0   IP    203.0.113.81"
+        },
+        {
+          "comment": "Shows the default domain, the configured name servers and the router's own cache. Clear it with clear host *."
+        }
+      ],
+      "caption": "If Translating shows 255.255.255.255, no name server is configured and IOS is broadcasting the query."
+    },
+    {
+      "id": "faults",
+      "type": "text",
+      "markdown": "## Common faults and how to spot them\n\n| Symptom | Likely cause | How to confirm | Fix |\n|:--|:--|:--|:--|\n| Some users get the old address | **Stale cache** | Resolver answer differs from `dig @authoritative`; TTL counting down | Wait out the TTL or flush the resolver cache; lower TTLs before future changes |\n| Logs and `traceroute` show IPs, not names; mail rejected as suspicious | **Missing PTR** | `dig -x <address>` returns nothing | Ask the address owner to add the PTR record |\n| Internal names fail, internet names work | **Wrong resolver** (public DNS handed out by DHCP) | `nslookup` shows an unexpected `Server`; `ipconfig /all` | Correct the DHCP scope's DNS option or the static settings |\n| Every lookup times out | Resolver unreachable or port 53 blocked | `ping` the resolver; test `dig @resolver` | Fix routing or ACLs to allow UDP and TCP 53 |\n| SERVFAIL for one domain only | Broken delegation or expired DNSSEC signatures | `dig +trace`; `dig +cd` succeeds when DNSSEC is the problem | Fix NS/glue records or re-sign the zone |\n\nWhen DHCP hands out the resolver, check the server side too: see [DHCPv4 Client, Server and Relay](/learn/networking-foundations-ccna/dhcpv4-client-server-and-relay)."
+    },
+    {
+      "id": "security",
+      "type": "text",
+      "markdown": "## DNS security in brief\n\nClassic DNS has no authentication or encryption. An attacker who can forge responses can poison a resolver's cache and send users to a fake site. Three technologies address this:\n\n- **DNSSEC** signs zone data (RRSIG records) and links each zone to its parent with a chain of trust (DNSKEY and DS records). A validating resolver sets the **ad** (authenticated data) flag on good answers and returns SERVFAIL for forged ones. DNSSEC proves integrity; it does not encrypt.\n- **DNS over TLS (DoT)** encrypts queries on TCP port 853.\n- **DNS over HTTPS (DoH)** encrypts queries inside HTTPS on port 443, where they blend in with web traffic.\n\nEncryption protects privacy, but DoH from a browser can bypass the company resolver and its security filtering and logging. Many organizations therefore require clients to use the internal resolver and block well-known external DoH services. DNS query logs are among the most valuable data a SOC collects; see [Security Monitoring Data Types](/learn/cisco-security-certification-track/security-monitoring-data-types)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where learners go wrong",
+      "markdown": "- **Flushing only the client.** `ipconfig /flushdns` clears the PC's cache, not the recursive resolver's. Check the resolver's answer before declaring victory.\n- **Testing from the wrong place.** `nslookup` on your admin workstation may use a different resolver than the user's laptop. Query the same server the user uses.\n- **Reading a non-authoritative answer as the truth.** Only an answer with the **aa** flag comes from the zone owner.\n- **`no ip domain lookup` everywhere.** It stops the typo hang, but the router can then no longer resolve NTP, syslog or AAA server names."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On your own computer (these queries are harmless):\n\n1. Run `dig example.com` twice, a few seconds apart. Watch the TTL decrease on the second answer, which comes from cache.\n2. Run `dig example.com NS +short`, then query one of those servers directly with `dig @<server> example.com +norecurse` and find the **aa** flag.\n3. Run `dig example.com SOA` and identify the serial number and the negative-caching TTL (the last number).\n4. Run `dig +trace example.com` to watch the root → TLD → authoritative referrals from the animation.\n5. On Windows, compare `Resolve-DnsName example.com` with `Resolve-DnsName example.com -DnsOnly` and `ipconfig /displaydns`."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Recursive resolver",
+          "definition": "A DNS server that accepts client queries, follows referrals from root to authoritative servers and caches the answers."
+        },
+        {
+          "term": "Authoritative server",
+          "definition": "A name server that holds a zone's data and answers with the AA flag set."
+        },
+        {
+          "term": "Referral",
+          "definition": "A response that names the servers to ask next instead of giving the final answer."
+        },
+        {
+          "term": "TTL",
+          "definition": "The number of seconds a resolver may cache a record before asking again."
+        },
+        {
+          "term": "CNAME",
+          "definition": "A record that makes one name an alias of another canonical name."
+        },
+        {
+          "term": "PTR record",
+          "definition": "A reverse-zone record that maps an IP address back to a host name."
+        },
+        {
+          "term": "SOA record",
+          "definition": "The start-of-authority record holding a zone's primary server, serial number and timers, including the negative-caching TTL."
+        },
+        {
+          "term": "NXDOMAIN",
+          "definition": "The response code meaning the queried name does not exist."
+        },
+        {
+          "term": "DNSSEC",
+          "definition": "Extensions that sign DNS data so validating resolvers can detect forged or altered answers."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "In normal resolution, which server sends iterative queries to the root, TLD and authoritative servers?",
+          "options": [
+            "The stub resolver on the laptop",
+            "The recursive resolver",
+            "The root server",
+            "The authoritative server"
+          ],
+          "answer": 1,
+          "explanation": "The stub sends one recursive query; the recursive resolver follows the referrals with iterative queries and caches the results."
+        },
+        {
+          "question": "Which record type tells other mail servers where to deliver email for example.com?",
+          "options": [
+            "PTR",
+            "TXT",
+            "MX",
+            "NS"
+          ],
+          "answer": 2,
+          "explanation": "MX records list a domain's mail servers with a preference value; the lowest value is tried first."
+        },
+        {
+          "question": "After a record change, dig against the company resolver returns the old address with a decreasing TTL, while dig @ns1.example.com returns the new one with the aa flag. What is the problem?",
+          "options": [
+            "Wrong zone data on the authoritative server",
+            "A stale cached answer on the resolver",
+            "A missing PTR record",
+            "The resolver is unreachable"
+          ],
+          "answer": 1,
+          "explanation": "The authoritative data is correct; the resolver will keep the old answer until its TTL expires unless its cache is flushed."
+        },
+        {
+          "question": "Which commands make a Cisco IOS router resolve names through 192.168.10.53? (Choose all that apply.)",
+          "options": [
+            "ip domain lookup",
+            "ip name-server 192.168.10.53",
+            "ip dhcp excluded-address 192.168.10.53",
+            "no ip domain lookup"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "Lookups must be enabled (the default) and a name server configured. no ip domain lookup disables resolution, and the DHCP command is unrelated."
+        },
+        {
+          "question": "Which statements about DNS security are true? (Choose all that apply.)",
+          "options": [
+            "DNSSEC encrypts DNS queries",
+            "DNSSEC lets resolvers detect forged answers",
+            "DoT uses TCP port 853",
+            "DoH can bypass an organization's internal resolver"
+          ],
+          "answer": [
+            1,
+            2,
+            3
+          ],
+          "explanation": "DNSSEC provides integrity and authenticity through signatures, not confidentiality. DoT and DoH add encryption; DoH inside HTTPS can bypass internal controls."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A **stub resolver** asks a **recursive resolver**, which follows referrals from the **root** to the **TLD** to the **authoritative** server and caches every answer.\n- Know the record types: **A**, **AAAA**, **CNAME**, **MX**, **NS**, **PTR**, **TXT** and **SOA**.\n- **TTL** controls caching; lower it before planned changes. Failed lookups are cached too.\n- Diagnose by comparing the resolver's answer with `dig @authoritative +norecurse`, and read the response code: NOERROR, NXDOMAIN, SERVFAIL or timeout.\n- On IOS, use `ip domain lookup`, `ip name-server` and `ip domain name`; stop typo hangs with `transport preferred none`.\n- **DNSSEC** adds integrity; **DoT** and **DoH** add privacy but can bypass enterprise controls.\n\nNext: [Network Management: SNMP and Syslog](/learn/networking-foundations-ccna/network-management-snmp-and-syslog)."
+    }
+  ],
+  "ar": {
+    "title": "تشخيص سجلات DNS",
+    "summary": "تتبّع استعلام DNS من المحلِّل الطرفي إلى الخادم الموثوق، وتعرّف أنواع السجلات الشائعة وآلية التخزين المؤقت بحسب TTL، وشخّص أعطال DNS الحقيقية بالأدوات dig وnslookup وResolve-DnsName وبنظام Cisco IOS.",
+    "objectives": [
+      "وصف تعاون المحلِّل الطرفي والمحلِّل التكراري وخوادم الجذر والنطاقات العليا والخادم الموثوق في حلّ الاسم",
+      "شرح الغرض من سجلات A وAAAA وCNAME وMX وNS وPTR وTXT وSOA",
+      "شرح أثر TTL والتخزين المؤقت السلبي في تغييرات السجلات",
+      "تشخيص الذاكرة المؤقتة القديمة وغياب سجلات PTR والمحلِّلات الخاطئة بالأدوات dig وnslookup وResolve-DnsName",
+      "ضبط إعدادات عميل DNS على Cisco IOS والتحقق منها",
+      "وصف دور DNSSEC وDoT وDoH"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "انتقلت بوابة الشركة `portal.example.com` إلى خادم جديد مساء الجمعة. وفي صباح الاثنين وصل نصف الموظفين إلى الخادم الجديد، بينما ظل النصف الآخر يصل إلى الخادم القديم الذي أُطفئ. لا شيء «معطّل»، ومع ذلك يغرق مكتب الدعم بالبلاغات. السبب هو DNS: فالإجابات القديمة ما زالت مخزّنة مؤقتًا، ولم يتحقق أحد من الخادم الذي يقدّم كل إجابة.\n\nيحوّل **نظام أسماء النطاقات (DNS)** الأسماء إلى عناوين، ويفعل أكثر من ذلك بكثير: فهو يوجّه البريد الإلكتروني، ويُثبت ملكية النطاقات، ويربط العناوين بالأسماء عكسيًا. يشرح هذا الدرس كيف تجري عملية الحل فعلًا، وما وظيفة كل نوع من السجلات، وكيف تشخّص أعطال DNS بالأدوات `dig` و`nslookup` و`Resolve-DnsName` وبنظام Cisco IOS. ولأساسيات الأسماء والعناوين راجع درس [أساسيات الشبكات: عنونة IP وDNS](/learn/cisco-security-certification-track/network-basics-ip-addressing-and-dns)."
+      },
+      {
+        "id": "resolution",
+        "type": "text",
+        "markdown": "## كيف يُحلّ الاسم؟\n\nتتعاون أربعة أنواع من مكوّنات DNS للإجابة عن استعلام واحد:\n\n- **المحلِّل الطرفي (Stub resolver)**: العميل الصغير المدمج في نظام التشغيل، يطرح سؤالًا واحدًا وينتظر إجابة نهائية.\n- **المحلِّل التكراري (Recursive resolver)**: الخادم المضبوط على العميل استخدامه (عبر DHCP أو يدويًا)، وهو من يقوم بالعمل الفعلي ويخزّن النتائج مؤقتًا.\n- **خوادم الجذر والنطاقات العليا (Root / TLD)**: تعرف خوادم الجذر من يدير كل نطاق علوي مثل `.com`، وتعرف خوادم النطاقات العليا خوادم الأسماء الموثوقة لكل نطاق.\n- **الخادم الموثوق (Authoritative server)**: يحتفظ بملف المنطقة (Zone file) للنطاق `example.com` ويقدّم الإجابة القاطعة، مُعلَّمة بالعلم **AA** (إجابة موثوقة).\n\nيرسل المحلِّل الطرفي **استعلامًا تكراريًا (Recursive query)** يطلب فيه الإجابة النهائية، ثم يرسل المحلِّل التكراري **استعلامات تتابعية (Iterative queries)** متتبّعًا **الإحالات (Referrals)** نزولًا في الشجرة. تستخدم الاستعلامات عادةً المنفذ UDP 53، أما الردود الكبيرة ونقل المناطق فتستخدم المنفذ TCP 53."
+      },
+      {
+        "id": "resolve-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "حلّ الاسم portal.example.com بذاكرة مؤقتة فارغة",
+        "caption": "يتحول استعلام تكراري واحد من العميل إلى عدة استعلامات تتابعية يجريها المحلِّل.",
+        "data": {
+          "actors": [
+            {
+              "id": "stub",
+              "label": "الحاسوب (المحلِّل الطرفي)",
+              "sub": "192.168.10.21",
+              "icon": "laptop"
+            },
+            {
+              "id": "rr",
+              "label": "المحلِّل التكراري",
+              "sub": "192.168.10.53",
+              "icon": "server"
+            },
+            {
+              "id": "root",
+              "label": "خادم الجذر",
+              "sub": ".",
+              "icon": "globe"
+            },
+            {
+              "id": "tld",
+              "label": "خادم النطاق العلوي",
+              "sub": ".com",
+              "icon": "globe"
+            },
+            {
+              "id": "auth",
+              "label": "الخادم الموثوق",
+              "sub": "ns1.example.com",
+              "icon": "database"
+            }
+          ],
+          "steps": [
+            {
+              "from": "stub",
+              "to": "rr",
+              "label": "استعلام A عن portal.example.com",
+              "detail": "UDP 53, RD=1",
+              "note": "يسأل المحلِّل الطرفي في الحاسوب المحلِّلَ المضبوط عليه، ويضبط العلم RD (طلب التكرار)."
+            },
+            {
+              "from": "rr",
+              "to": "rr",
+              "label": "فحص الذاكرة المؤقتة: لا توجد إجابة",
+              "note": "لا شيء مخزّن لهذا الاسم، فيبدأ المحلِّل من قمة الشجرة."
+            },
+            {
+              "from": "rr",
+              "to": "root",
+              "label": "استعلام عن portal.example.com",
+              "note": "يسأل المحلِّل خادم جذر يعرف عناوينه من تلميحات الجذر (Root hints) المدمجة."
+            },
+            {
+              "from": "root",
+              "to": "rr",
+              "label": "إحالة إلى .com",
+              "detail": "NS for com.",
+              "note": "لا يعرف الجذر الإجابة، فيحيل المحلِّل إلى خوادم النطاق العلوي .com."
+            },
+            {
+              "from": "rr",
+              "to": "tld",
+              "label": "استعلام عن portal.example.com",
+              "note": "يكرر المحلِّل السؤال على أحد خوادم .com."
+            },
+            {
+              "from": "tld",
+              "to": "rr",
+              "label": "إحالة إلى example.com",
+              "detail": "NS ns1.example.com + glue 203.0.113.53",
+              "note": "يعيد خادم النطاق العلوي سجلات NS للنطاق مع عناوين لاصقة (Glue) ليتمكن المحلِّل من الوصول إليها."
+            },
+            {
+              "from": "rr",
+              "to": "auth",
+              "label": "استعلام عن portal.example.com",
+              "note": "يسأل المحلِّل أخيرًا الخادم الذي يملك المنطقة."
+            },
+            {
+              "from": "auth",
+              "to": "rr",
+              "label": "إجابة موثوقة (AA)",
+              "detail": "CNAME web02 / A 203.0.113.81, TTL 3600",
+              "tone": "success",
+              "note": "يجيب الخادم الموثوق مع ضبط العلم AA: سجل CNAME وسجل A الذي يشير إليه."
+            },
+            {
+              "from": "rr",
+              "to": "rr",
+              "label": "تخزين مؤقت لمدة 3600 ثانية",
+              "note": "يخزّن المحلِّل كل سجل تعلّمه، بما فيه الإحالات، طوال مدة TTL الخاصة بكل منها."
+            },
+            {
+              "from": "rr",
+              "to": "stub",
+              "label": "الإجابة 203.0.113.81",
+              "detail": "RA=1, not AA",
+              "tone": "success",
+              "note": "يتلقى الحاسوب إجابة غير موثوقة (Non-authoritative) من المحلِّل، ويخزّنها مؤقتًا هو الآخر."
+            }
+          ]
+        }
+      },
+      {
+        "id": "records",
+        "type": "text",
+        "markdown": "## أنواع السجلات الشائعة\n\n| النوع | الغرض | مثال |\n|:--|:--|:--|\n| **A** | من الاسم إلى عنوان IPv4 | `web01.example.com. A 203.0.113.80` |\n| **AAAA** | من الاسم إلى عنوان IPv6 | `web01.example.com. AAAA 2001:db8::80` |\n| **CNAME** | اسم مستعار يشير إلى اسم آخر (الاسم القانوني) | `portal.example.com. CNAME web02.example.com.` |\n| **MX** | خوادم البريد للنطاق مع أولوية (الأقل يفوز) | `example.com. MX 10 mail.example.com.` |\n| **NS** | خوادم الأسماء الموثوقة للمنطقة | `example.com. NS ns1.example.com.` |\n| **PTR** | البحث العكسي: من العنوان إلى الاسم | `81.113.0.203.in-addr.arpa. PTR web02.example.com.` |\n| **TXT** | نص حر: SPF وDKIM وDMARC والتحقق من ملكية النطاق | `example.com. TXT \"v=spf1 mx -all\"` |\n| **SOA** | بداية السلطة (Start of authority): الخادم الأساسي، وجهة الاتصال الإدارية، والرقم التسلسلي، والمؤقّتات | `example.com. SOA ns1.example.com. hostmaster.example.com. 2026110801 …` |\n\nثمة قواعد يقع فيها كثيرون. فسجل CNAME لا يجتمع مع سجلات أخرى للاسم نفسه، ولذلك لا يمكن أن تكون قمة المنطقة (`example.com` نفسها) سجل CNAME. ويجب أن تشير سجلات MX وNS إلى أسماء لها سجلات A أو AAAA، لا إلى عنوان IP مباشرة ولا إلى CNAME. أما سجلات PTR فتقع في منطقة عكسية مستقلة يديرها عادةً مالك كتلة العناوين، وكثيرًا ما يكون مزوّد الخدمة."
+      },
+      {
+        "id": "ttl",
+        "type": "text",
+        "markdown": "## مدة البقاء (TTL) والتخزين المؤقت\n\nيحمل كل سجل **مدة بقاء (TTL)** بالثواني. والمحلِّل الذي يخزّن سجلًا يعدّ هذه المدة تنازليًا ويجيب من ذاكرته المؤقتة حتى تبلغ الصفر. لذلك لا يكون تغيير السجل «فوريًا»: إذ يحتفظ العملاء بالإجابة القديمة مدةً تصل إلى قيمة TTL القديمة. وتُخزَّن الاستعلامات الفاشلة أيضًا (**التخزين المؤقت السلبي (Negative caching)**) مدةً يحددها الحقل الأخير في سجل SOA.\n\nتوجد الذاكرة المؤقتة في عدة طبقات: المتصفح، والمحلِّل الطرفي في نظام التشغيل، والمحلِّل التكراري، وأحيانًا خادم إعادة توجيه (Forwarder) بينهما. وفي مثال البوابة كانت قيمة TTL للسجل القديم 86,400 ثانية (يومًا كاملًا)، فظلت بعض المحلِّلات تجيب بالخادم القديم طويلًا بعد التغيير.\n\nوالعادة المهنية هي **خفض قيمة TTL** (إلى 300 ثانية مثلًا) قبل التغيير المخطط بيوم أو أكثر، ثم إجراء التغيير والتحقق منه، ثم رفع القيمة مجددًا."
+      },
+      {
+        "id": "tools",
+        "type": "text",
+        "markdown": "## أدوات التشخيص\n\n| الأداة | المنصة | ميزتها |\n|:--|:--|:--|\n| `dig` | Linux وmacOS | تفاصيل كاملة: الأعلام وقيم TTL والأقسام، ويمكنها مساءلة أيّ خادم مباشرة |\n| `nslookup` | Windows وLinux وmacOS | متاحة في كل مكان ومخرجاتها بسيطة |\n| `Resolve-DnsName` | Windows PowerShell | تعيد كائنات يمكن ترشيحها، وتستخدم محلِّل Windows |\n\nالخطوة التشخيصية الأهم هي **مقارنة الإجابات من خوادم مختلفة**. اسأل المحلِّل الخاص بالعميل، ثم اسأل الخادم الموثوق مباشرة بالأمر `dig @ns1.example.com … +norecurse`. فإن اختلفت الإجابتان فالمشكلة في التخزين المؤقت، وإن كان الخادم الموثوق نفسه مخطئًا فالمشكلة في بيانات المنطقة.\n\nاقرأ رمز الاستجابة إلى جانب الإجابة: **NOERROR** مع بيانات يعني النجاح، و**NXDOMAIN** يعني أن الاسم غير موجود، و**NOERROR دون إجابة** يعني أن الاسم موجود لكن لا سجل له من هذا النوع، و**SERVFAIL** يعني أن المحلِّل عجز عن الحصول على إجابة صالحة، وكثيرًا ما يكون السبب تفويضًا معطوبًا أو فشلًا في DNSSEC، أما **انتهاء المهلة (Timeout)** فيشير إلى مشكلة في الوصول أو جدار حماية يحجب المنفذ 53."
+      },
+      {
+        "id": "dig",
+        "type": "terminal",
+        "title": "تشخيص ترحيل البوابة",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "dig portal.example.com",
+            "output": "; <<>> DiG 9.18.28 <<>> portal.example.com\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 31744\n;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1\n\n;; QUESTION SECTION:\n;portal.example.com.            IN      A\n\n;; ANSWER SECTION:\nportal.example.com.     2875    IN      CNAME   web01.example.com.\nweb01.example.com.      2875    IN      A       203.0.113.80\n\n;; Query time: 1 msec\n;; SERVER: 192.168.10.53#53(192.168.10.53) (UDP)\n;; MSG SIZE  rcvd: 85"
+          },
+          {
+            "comment": "يجيب محلِّل الشركة من ذاكرته المؤقتة (الأعلام qr rd ra دون aa). قيمة TTL البالغة 2875 تتناقص، وما زالت الإجابة تشير إلى الخادم القديم web01 على 203.0.113.80."
+          },
+          {
+            "cmd": "dig @ns1.example.com portal.example.com +norecurse",
+            "output": "; <<>> DiG 9.18.28 <<>> @ns1.example.com portal.example.com +norecurse\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 5120\n;; flags: qr aa; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1\n\n;; ANSWER SECTION:\nportal.example.com.     3600    IN      CNAME   web02.example.com.\nweb02.example.com.      3600    IN      A       203.0.113.81\n\n;; SERVER: 203.0.113.53#53(ns1.example.com) (UDP)"
+          },
+          {
+            "comment": "لدى الخادم الموثوق (العلم aa) السجل الجديد بالفعل: web02 على 203.0.113.81. التشخيص: ذاكرة مؤقتة قديمة، لا بيانات منطقة خاطئة."
+          },
+          {
+            "cmd": "dig -x 203.0.113.81 +short",
+            "output": ""
+          },
+          {
+            "comment": "لا مخرجات: لا يوجد سجل PTR للخادم الجديد، فستُظهر السجلات عنوانه فقط، وقد ترفض بعض خوادم البريد رسائله."
+          },
+          {
+            "cmd": "dig example.com MX +short",
+            "output": "10 mail.example.com.\n20 mail2.example.com."
+          },
+          {
+            "comment": "يطبع الخيار +short البيانات فقط. يذهب البريد أولًا إلى الأولوية 10 ثم يرجع إلى 20 عند تعذّرها."
+          }
+        ],
+        "caption": "قارن دائمًا إجابة المحلِّل بإجابة الخادم الموثوق."
+      },
+      {
+        "id": "win",
+        "type": "terminal",
+        "title": "Windows: الأداتان nslookup وResolve-DnsName",
+        "prompt": "C:\\>",
+        "lines": [
+          {
+            "cmd": "nslookup portal.example.com",
+            "output": "Server:  dns1.corp.example.com\nAddress:  192.168.10.53\n\nNon-authoritative answer:\nName:    web01.example.com\nAddress:  203.0.113.80\nAliases:  portal.example.com"
+          },
+          {
+            "comment": "يبيّن الحقل «Server» المحلِّل الذي أجاب، والقيمة الخاطئة هنا هي العطل الكلاسيكي لاستخدام محلِّل خاطئ."
+          },
+          {
+            "cmd": "Resolve-DnsName -Name example.com -Type MX",
+            "prompt": "PS C:\\>",
+            "output": "Name                           Type   TTL   Section    NameExchange              Preference\n----                           ----   ---   -------    ------------              ----------\nexample.com                    MX     3600  Answer     mail.example.com          10\nexample.com                    MX     3600  Answer     mail2.example.com         20"
+          },
+          {
+            "cmd": "Clear-DnsClientCache",
+            "prompt": "PS C:\\>",
+            "output": ""
+          },
+          {
+            "comment": "يمسح الذاكرة المؤقتة لهذا الحاسوب فقط (مثل ipconfig /flushdns). فإن كانت ذاكرة المحلِّل التكراري قديمة فستبقى الإجابة التالية خاطئة."
+          }
+        ],
+        "caption": "تستخدم Resolve-DnsName محلِّل عميل Windows، بما في ذلك ذاكرته المؤقتة وملف hosts."
+      },
+      {
+        "id": "ios-section",
+        "type": "text",
+        "markdown": "## DNS على Cisco IOS\n\nيعمل الموجّه أو المبدّل **عميلًا** لـ DNS، فيمكنك استخدام الأسماء مع `ping` و`traceroute` و`ssh` و`copy`. وتهمّ هنا ثلاثة أوامر: `ip domain lookup` (مفعّل افتراضيًا)، و`ip name-server` (حتى ستة خوادم)، و`ip domain name` (يُلحَق بالأسماء غير المكتملة).\n\nتضيف أدلة مختبرات كثيرة الأمر `no ip domain lookup`، لأن IOS يعامل الأمر المكتوب خطأً على أنه اسم مضيف فيحاول حلّه والاتصال به عبر Telnet، فتتجمّد وحدة التحكم. لكن هذا يعطّل أيضًا كل عمليات حلّ الأسماء على الجهاز. والحل الأفضل يُبقي DNS عاملًا: الأمر `transport preferred none` على خطوط وحدة التحكم وVTY."
+      },
+      {
+        "id": "ios",
+        "type": "code",
+        "language": "cisco",
+        "filename": "R1-dns.cfg",
+        "code": "! Let the router resolve names (enabled by default on IOS XE)\nip domain lookup\nip domain name corp.example.com\nip name-server 192.168.10.53 192.168.20.53\n!\n! Stop mistyped commands from being treated as Telnet host names,\n! without disabling DNS for the whole router\nline con 0\n transport preferred none\nline vty 0 4\n transport preferred none",
+        "highlight": [
+          2,
+          3,
+          4
+        ],
+        "caption": "حلّ الأسماء للموجّه نفسه، أما العملاء فيحصلون على المحلِّل عبر DHCP."
+      },
+      {
+        "id": "ios-verify",
+        "type": "terminal",
+        "title": "التحقق من حلّ الأسماء على R1",
+        "prompt": "R1#",
+        "lines": [
+          {
+            "cmd": "ping portal.example.com",
+            "output": "Translating \"portal.example.com\"...domain server (192.168.10.53) [OK]\nType escape sequence to abort.\nSending 5, 100-byte ICMP Echos to 203.0.113.81, timeout is 2 seconds:\n!!!!!\nSuccess rate is 100 percent (5/5), round-trip min/avg/max = 1/1/2 ms"
+          },
+          {
+            "comment": "استعلم الموجّه من 192.168.10.53 وحصل على العنوان الجديد."
+          },
+          {
+            "cmd": "show hosts",
+            "output": "Default domain is corp.example.com\nName/address lookup uses domain service\nName servers are 192.168.10.53, 192.168.20.53\n\nCodes: UN - unknown, EX - expired, OK - OK, ?? - revalidate\n       temp - temporary, perm - permanent\n       NA - Not Applicable None - Not defined\n\nHost                      Port  Flags      Age Type   Address(es)\nportal.example.com        None  (temp, OK)  0   IP    203.0.113.81"
+          },
+          {
+            "comment": "يعرض النطاق الافتراضي وخوادم الأسماء المضبوطة والذاكرة المؤقتة للموجّه نفسه، ويمكن مسحها بالأمر clear host *."
+          }
+        ],
+        "caption": "إذا ظهر 255.255.255.255 بعد Translating فلا يوجد خادم أسماء مضبوط، ويبثّ IOS الاستعلام بثًّا عامًا."
+      },
+      {
+        "id": "faults",
+        "type": "text",
+        "markdown": "## الأعطال الشائعة وكيف تكتشفها\n\n| العَرَض | السبب المرجّح | كيف تتأكد | الإصلاح |\n|:--|:--|:--|:--|\n| بعض المستخدمين يحصلون على العنوان القديم | **ذاكرة مؤقتة قديمة (Stale cache)** | إجابة المحلِّل تختلف عن `dig @authoritative`، وقيمة TTL تتناقص | انتظر انقضاء TTL أو امسح ذاكرة المحلِّل، واخفض قيم TTL قبل التغييرات المقبلة |\n| السجلات و`traceroute` تُظهر عناوين لا أسماء، والبريد يُرفض بوصفه مريبًا | **غياب سجل PTR** | الأمر `dig -x <address>` لا يعيد شيئًا | اطلب من مالك العنوان إضافة سجل PTR |\n| الأسماء الداخلية تفشل وأسماء الإنترنت تعمل | **محلِّل خاطئ** (DHCP يوزّع محلِّلًا عامًا) | `nslookup` يُظهر `Server` غير متوقع، و`ipconfig /all` | صحّح خيار DNS في نطاق DHCP أو الإعدادات اليدوية |\n| كل الاستعلامات تنتهي مهلتها | تعذّر الوصول إلى المحلِّل أو حجب المنفذ 53 | `ping` إلى المحلِّل، واختبار `dig @resolver` | أصلح التوجيه أو قوائم ACL للسماح بالمنفذين UDP وTCP 53 |\n| SERVFAIL لنطاق واحد فقط | تفويض معطوب أو تواقيع DNSSEC منتهية | `dig +trace`، وينجح `dig +cd` إذا كانت المشكلة في DNSSEC | أصلح سجلات NS والعناوين اللاصقة أو أعد توقيع المنطقة |\n\nوحين يوزّع DHCP عنوان المحلِّل افحص جهة الخادم أيضًا: راجع درس [عميل DHCPv4 وخادمه ووكيل الترحيل](/learn/networking-foundations-ccna/dhcpv4-client-server-and-relay)."
+      },
+      {
+        "id": "security",
+        "type": "text",
+        "markdown": "## لمحة عن أمن DNS\n\nلا يوفّر DNS التقليدي مصادقة ولا تشفيرًا. فالمهاجم القادر على تزوير الردود يستطيع تسميم الذاكرة المؤقتة للمحلِّل (Cache poisoning) وتوجيه المستخدمين إلى موقع مزيّف. وتعالج ذلك ثلاث تقنيات:\n\n- **امتدادات أمان DNS (DNSSEC)** توقّع بيانات المنطقة (سجلات RRSIG) وتربط كل منطقة بالمنطقة الأم عبر سلسلة ثقة (سجلات DNSKEY وDS). ويضبط المحلِّل المتحقِّق العلم **ad** (بيانات مصادَق عليها) على الإجابات السليمة، ويعيد SERVFAIL للإجابات المزوّرة. تُثبت DNSSEC سلامة البيانات لكنها لا تشفّرها.\n- **DNS عبر TLS (DoT)** يشفّر الاستعلامات على المنفذ TCP 853.\n- **DNS عبر HTTPS (DoH)** يشفّر الاستعلامات داخل HTTPS على المنفذ 443، فتختلط بحركة الويب.\n\nيحمي التشفير الخصوصية، لكن استخدام DoH من المتصفح قد يتجاوز محلِّل الشركة وما فيه من ترشيح أمني وتسجيل. لذا تُلزم مؤسسات كثيرة العملاء باستخدام المحلِّل الداخلي وتحجب خدمات DoH الخارجية المعروفة. وتُعدّ سجلات استعلامات DNS من أثمن البيانات التي يجمعها مركز العمليات الأمنية (SOC)؛ راجع درس [أنواع بيانات المراقبة الأمنية](/learn/cisco-security-certification-track/security-monitoring-data-types)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة لدى المتعلمين",
+        "markdown": "- **مسح ذاكرة العميل وحده.** يمسح `ipconfig /flushdns` ذاكرة الحاسوب لا ذاكرة المحلِّل التكراري، فتحقق من إجابة المحلِّل قبل إعلان حلّ المشكلة.\n- **الاختبار من المكان الخطأ.** قد يستخدم `nslookup` على محطة الإدارة محلِّلًا غير الذي يستخدمه حاسوب المستخدم، فاستعلم من الخادم نفسه الذي يستخدمه المستخدم.\n- **عدّ الإجابة غير الموثوقة حقيقة نهائية.** وحدها الإجابة المُعلَّمة بالعلم **aa** تأتي من مالك المنطقة.\n- **تطبيق `no ip domain lookup` في كل مكان.** يمنع هذا الأمر تجمّد وحدة التحكم عند الخطأ في الكتابة، لكن الموجّه يعجز بعده عن حلّ أسماء خوادم NTP وSyslog وAAA."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على حاسوبك الخاص (هذه الاستعلامات غير ضارة):\n\n1. شغّل `dig example.com` مرتين بفاصل ثوانٍ، ولاحظ تناقص قيمة TTL في الإجابة الثانية القادمة من الذاكرة المؤقتة.\n2. شغّل `dig example.com NS +short`، ثم استعلم من أحد هذه الخوادم مباشرة بالأمر `dig @<server> example.com +norecurse` وابحث عن العلم **aa**.\n3. شغّل `dig example.com SOA` وحدّد الرقم التسلسلي وقيمة TTL للتخزين المؤقت السلبي (الرقم الأخير).\n4. شغّل `dig +trace example.com` لتشاهد إحالات الجذر ثم النطاق العلوي ثم الخادم الموثوق كما في الرسم المتحرك.\n5. على Windows قارن مخرجات `Resolve-DnsName example.com` بمخرجات `Resolve-DnsName example.com -DnsOnly` و`ipconfig /displaydns`."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "المحلِّل التكراري (Recursive resolver)",
+            "definition": "خادم DNS يستقبل استعلامات العملاء ويتتبّع الإحالات من الجذر إلى الخوادم الموثوقة ويخزّن الإجابات مؤقتًا."
+          },
+          {
+            "term": "الخادم الموثوق (Authoritative server)",
+            "definition": "خادم أسماء يحتفظ ببيانات المنطقة ويجيب مع ضبط العلم AA."
+          },
+          {
+            "term": "الإحالة (Referral)",
+            "definition": "رد يسمّي الخوادم التي يجب سؤالها تاليًا بدل تقديم الإجابة النهائية."
+          },
+          {
+            "term": "مدة البقاء (TTL)",
+            "definition": "عدد الثواني التي يجوز للمحلِّل فيها تخزين السجل مؤقتًا قبل أن يسأل عنه مجددًا."
+          },
+          {
+            "term": "CNAME",
+            "definition": "سجل يجعل اسمًا ما اسمًا مستعارًا لاسم قانوني آخر."
+          },
+          {
+            "term": "سجل PTR",
+            "definition": "سجل في المنطقة العكسية يربط عنوان IP باسم مضيف."
+          },
+          {
+            "term": "سجل SOA",
+            "definition": "سجل بداية السلطة الذي يحمل الخادم الأساسي للمنطقة ورقمها التسلسلي ومؤقّتاتها، ومنها مدة التخزين المؤقت السلبي."
+          },
+          {
+            "term": "NXDOMAIN",
+            "definition": "رمز الاستجابة الذي يعني أن الاسم المطلوب غير موجود."
+          },
+          {
+            "term": "امتدادات أمان DNS (DNSSEC)",
+            "definition": "امتدادات توقّع بيانات DNS حتى تكتشف المحلِّلات المتحقِّقة الإجابات المزوّرة أو المعدّلة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "في عملية الحل المعتادة، أيّ خادم يرسل الاستعلامات التتابعية إلى خوادم الجذر والنطاق العلوي والخادم الموثوق؟",
+            "options": [
+              "المحلِّل الطرفي على الحاسوب",
+              "المحلِّل التكراري",
+              "خادم الجذر",
+              "الخادم الموثوق"
+            ],
+            "answer": 1,
+            "explanation": "يرسل المحلِّل الطرفي استعلامًا تكراريًا واحدًا، ويتتبّع المحلِّل التكراري الإحالات باستعلامات تتابعية ويخزّن النتائج."
+          },
+          {
+            "question": "أيّ نوع من السجلات يخبر خوادم البريد الأخرى أين تسلّم بريد النطاق example.com؟",
+            "options": [
+              "PTR",
+              "TXT",
+              "MX",
+              "NS"
+            ],
+            "answer": 2,
+            "explanation": "تسرد سجلات MX خوادم البريد للنطاق مع قيمة أولوية، وتُجرَّب القيمة الأقل أولًا."
+          },
+          {
+            "question": "بعد تغيير سجل، يعيد dig على محلِّل الشركة العنوان القديم بقيمة TTL متناقصة، بينما يعيد dig @ns1.example.com العنوان الجديد مع العلم aa. ما المشكلة؟",
+            "options": [
+              "بيانات منطقة خاطئة على الخادم الموثوق",
+              "إجابة قديمة مخزّنة مؤقتًا على المحلِّل",
+              "غياب سجل PTR",
+              "تعذّر الوصول إلى المحلِّل"
+            ],
+            "answer": 1,
+            "explanation": "البيانات الموثوقة صحيحة، وسيحتفظ المحلِّل بالإجابة القديمة حتى تنقضي مدة TTL ما لم تُمسح ذاكرته المؤقتة."
+          },
+          {
+            "question": "ما الأوامر التي تجعل موجّه Cisco IOS يحلّ الأسماء عبر 192.168.10.53؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "ip domain lookup",
+              "ip name-server 192.168.10.53",
+              "ip dhcp excluded-address 192.168.10.53",
+              "no ip domain lookup"
+            ],
+            "answer": [
+              0,
+              1
+            ],
+            "explanation": "يجب أن يكون الحل مفعّلًا (وهو الافتراضي) وأن يُضبط خادم أسماء. أما no ip domain lookup فيعطّل الحل، وأمر DHCP لا علاقة له بذلك."
+          },
+          {
+            "question": "ما العبارات الصحيحة عن أمن DNS؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تشفّر DNSSEC استعلامات DNS",
+              "تتيح DNSSEC للمحلِّلات اكتشاف الإجابات المزوّرة",
+              "يستخدم DoT المنفذ TCP 853",
+              "قد يتجاوز DoH المحلِّل الداخلي للمؤسسة"
+            ],
+            "answer": [
+              1,
+              2,
+              3
+            ],
+            "explanation": "توفّر DNSSEC السلامة والأصالة عبر التواقيع لا السرية. أما DoT وDoH فيضيفان التشفير، وقد يتجاوز DoH داخل HTTPS الضوابط الداخلية."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يسأل **المحلِّل الطرفي** **المحلِّلَ التكراري**، الذي يتتبّع الإحالات من **الجذر** إلى **النطاق العلوي** إلى **الخادم الموثوق**، ويخزّن كل إجابة مؤقتًا.\n- اعرف أنواع السجلات: **A** و**AAAA** و**CNAME** و**MX** و**NS** و**PTR** و**TXT** و**SOA**.\n- تتحكم **مدة البقاء (TTL)** في التخزين المؤقت، فاخفضها قبل التغييرات المخطط لها. وتُخزَّن الاستعلامات الفاشلة أيضًا.\n- شخّص بمقارنة إجابة المحلِّل بإجابة `dig @authoritative +norecurse`، واقرأ رمز الاستجابة: NOERROR أو NXDOMAIN أو SERVFAIL أو انتهاء المهلة.\n- على IOS استخدم `ip domain lookup` و`ip name-server` و`ip domain name`، وامنع التجمّد عند أخطاء الكتابة بالأمر `transport preferred none`.\n- تضيف **DNSSEC** السلامة، ويضيف **DoT** و**DoH** الخصوصية، لكنهما قد يتجاوزان ضوابط المؤسسة.\n\nالدرس التالي: [إدارة الشبكة: SNMP وSyslog](/learn/networking-foundations-ccna/network-management-snmp-and-syslog)."
+      }
+    ]
+  }
+}

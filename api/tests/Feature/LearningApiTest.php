@@ -193,4 +193,27 @@ class LearningApiTest extends TestCase
         $this->seed(LearningCurriculumSeeder::class);
         $this->assertSame($lessons, LearningLesson::count());
     }
+
+    public function test_the_sitemap_lists_written_lessons_in_both_languages_only(): void
+    {
+        $this->seed(LearningCurriculumSeeder::class);
+
+        $response = $this->get('/api/learn/sitemap.xml');
+        $response->assertOk();
+        $this->assertStringStartsWith('application/xml', $response->headers->get('Content-Type'));
+        $xml = $response->getContent();
+
+        $site = 'https://frugaldomain.site';
+        // A course, and a written lesson with its Arabic twin and hreflang pair.
+        $this->assertStringContainsString("<loc>{$site}/learn/networking-foundations-ccna</loc>", $xml);
+        $this->assertStringContainsString("<loc>{$site}/learn/networking-foundations-ccna/tcp-udp-icmp-and-arp</loc>", $xml);
+        $this->assertStringContainsString("<loc>{$site}/ar/learn/networking-foundations-ccna/tcp-udp-icmp-and-arp</loc>", $xml);
+        $this->assertStringContainsString('hreflang="x-default"', $xml);
+        // A review pointer (published, but thin) and an unwritten lesson are left out.
+        $this->assertStringNotContainsString('/learn/networking-foundations-ccna/networking-fundamentals<', $xml);
+        $draft = LearningLesson::where('status', 'draft')->firstOrFail();
+        $this->assertStringNotContainsString("/{$draft->slug}<", $xml);
+
+        $this->assertNotFalse(simplexml_load_string($xml));
+    }
 }
