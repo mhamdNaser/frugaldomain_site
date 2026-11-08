@@ -66,6 +66,33 @@ class ConvertController extends Controller
         return response()->json($formats);
     }
 
+    /**
+     * Start a sleeping Space when somebody opens a converter page, so its
+     * startup happens while they choose a file rather than after they press
+     * Convert. Any request to the Space starts it; this one does not wait.
+     */
+    public function wake()
+    {
+        if (! $this->configured()) {
+            return response()->json(['ready' => false], 503);
+        }
+
+        // One nudge a minute starts the Space; one per page view adds nothing.
+        if (! Cache::add('convert:wake', true, 60)) {
+            return response()->json(['ready' => null], 202);
+        }
+
+        try {
+            $ready = Http::connectTimeout(5)->timeout(10)
+                ->get($this->base() . '/health')
+                ->json('ready') === true;
+        } catch (\Throwable) {
+            $ready = false;
+        }
+
+        return response()->json(['ready' => $ready], $ready ? 200 : 202);
+    }
+
     public function document(Request $request)
     {
         return $this->send($request, 'document', [
@@ -101,6 +128,13 @@ class ConvertController extends Controller
         ]));
 
         $file = $request->file('file');
+
+        Log::info('Conversion request received', [
+            'kind' => $kind,
+            'filename' => $file->getClientOriginalName(),
+            'size' => $file->getSize(),
+            'target' => $data['target'],
+        ]);
 
         if (! $this->wakeService()) {
             return response()->json([
@@ -164,28 +198,34 @@ class ConvertController extends Controller
                     ->timeout(15)
                     ->get($this->base() . '/health');
 
-                if ($response->successful() && $response->json('ready') === true) {
-                    return true;
-                }
+                if ($response->successful()) {
+                    $health = $response->json();
 
-                $health = $response->json();
-                if (is_array($health) && array_key_exists('ready', $health) && $health['ready'] === false) {
-                    Log::warning('The conversion service is awake but not ready', [
+                    if (is_array($health) && ($health['ready'] ?? false) === true) {
+                        Log::info('Conversion service is ready');
+
+                        return true;
+                    }
+
+                    Log::info('Conversion service is still initializing', [
                         'health' => $health,
                     ]);
-
-                    return false;
+                } else {
+                    Log::info('Conversion service health check returned', [
+                        'status' => $response->status(),
+                        'body' => $response->body(),
+                    ]);
                 }
             } catch (\Throwable $e) {
                 $lastError = $e;
             }
 
             if (microtime(true) < $deadline) {
-                usleep(2_000_000);
+                sleep(2);
             }
         } while (microtime(true) < $deadline);
 
-        Log::warning('The conversion service did not wake before the timeout', [
+        Log::error('Conversion service startup timeout', [
             'error' => $lastError?->getMessage(),
         ]);
 

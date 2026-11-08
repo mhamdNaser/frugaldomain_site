@@ -38,3 +38,20 @@ test('document conversion retries a waking service and forwards the shared key',
         && $request->hasHeader('X-Convert-Key', 'test-convert-key'));
     Http::assertSentCount(3);
 });
+
+test('opening a converter page wakes the service once a minute', function () {
+    config([
+        'cache.default' => 'array',
+        'convert.url' => 'https://converter.test',
+        'convert.key' => 'test-convert-key',
+    ]);
+
+    Http::fake([
+        'https://converter.test/health' => Http::response('Space is starting', 503),
+    ]);
+
+    $this->post('/api/convert/wake')->assertStatus(202)->assertJson(['ready' => false]);
+    $this->post('/api/convert/wake')->assertStatus(202)->assertJson(['ready' => null]);
+
+    Http::assertSentCount(1);
+});

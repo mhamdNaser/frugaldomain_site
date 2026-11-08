@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Route;
  */
 Route::prefix('convert')->controller(ConvertController::class)->group(function () {
     Route::get('formats', 'formats');
+    Route::post('wake', 'wake')->middleware('throttle:20,1');
     Route::post('document', 'document')->middleware('throttle:convert');
     Route::post('audio', 'audio')->middleware('throttle:convert');
 });
