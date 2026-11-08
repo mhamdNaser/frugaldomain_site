@@ -60,6 +60,11 @@ Export, import and the seeder all use one JSON shape:
 
 ## Shipped curriculum
 
+The plan for writing the remaining lessons, batch by batch, is in
+[LESSONS_PLAN.md](LESSONS_PLAN.md); writers follow [tools/WRITER_BRIEF.md](tools/WRITER_BRIEF.md)
+and check their work with `python -I app/Modules/Learning/tools/validate_lessons.py`.
+
+
 `database/seeders/curriculum/*.json` is the syllabus generated from
 `Cybersecurity_Roadmap.pptx` (30 phases, 643 topics, 12 career paths) split
 into 10 courses across three categories. `database/seeders/lessons/<course>/<lesson>.json`
