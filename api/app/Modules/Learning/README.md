@@ -75,6 +75,34 @@ The seeder only adds what is missing and fills lessons that are still empty,
 so it is safe to re-run after editing lessons in the dashboard. To ship a new
 lesson, add its content file and run it again.
 
+## Two languages
+
+Every course is bilingual. English fields are the primary ones; each has an
+Arabic twin with an `_ar` suffix, and the API serves the language the page
+asks for (`X-Language: ar` on `/ar/...`), falling back to English for any
+field that has no Arabic yet.
+
+| Level | Arabic fields |
+|:--|:--|
+| category | `name_ar`, `description_ar` |
+| course | `title_ar`, `subtitle_ar`, `description_ar`, `outcomes_ar`, `prerequisites_ar` |
+| stage, unit | `title_ar`, `summary_ar` |
+| lesson | `title_ar`, `summary_ar`, `objectives_ar`, `blocks_ar` |
+
+`blocks_ar` mirrors `blocks`: the same block order, types and ids, with every
+visible string translated (prose, callout titles, captions, animation labels,
+captions and notes, quiz questions, options and explanations, key terms).
+Code, commands, command output, file names, ids, icons and tones stay as they
+are; technical terms keep the English in parentheses the first time, e.g.
+"جدار الحماية (Firewall)". Arabic is Modern Standard Arabic (فصحى).
+
+A lesson content file carries its Arabic in an `ar` object:
+
+```json
+{ "slug": "…", "title": "…", "summary": "…", "duration_minutes": 25, "objectives": ["…"], "blocks": [ … ],
+  "ar": { "title": "…", "summary": "…", "objectives": ["…"], "blocks": [ … ] } }
+```
+
 ## Lesson blocks
 
 Every block has `type` and an optional stable `id`. Unknown fields are dropped

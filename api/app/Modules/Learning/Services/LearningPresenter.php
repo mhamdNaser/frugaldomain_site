@@ -8,13 +8,48 @@ use App\Modules\Learning\Models\LearningLesson;
 use App\Modules\Learning\Models\LearningMedia;
 use App\Modules\Learning\Models\LearningStage;
 use App\Modules\Learning\Models\LearningUnit;
+use Illuminate\Support\Facades\DB;
 
 /**
- * The JSON shapes the API returns. Public and dashboard responses share them;
- * `$admin` adds the ids and drafts only the dashboard needs.
+ * The JSON shapes the API returns.
+ *
+ * Public responses are in one language: the one the page asks for with
+ * `X-Language` (or `?lang=`). Each Arabic field falls back to its English
+ * twin when it is empty, so a half-translated course still reads in full.
+ * Dashboard responses (`$admin`) carry both languages side by side instead.
  */
 class LearningPresenter
 {
+    /**
+     * Read from the current request every time: the router keeps controller
+     * instances (and so this presenter) alive across requests.
+     */
+    public function isArabic(): bool
+    {
+        $request = request();
+        $lang = $request?->query('lang') ?: $request?->header('X-Language');
+
+        return strtolower((string) $lang) === 'ar';
+    }
+
+    /** `$model->field` in the requested language, falling back to English. */
+    private function tr($model, string $field)
+    {
+        if ($this->isArabic()) {
+            $value = $model->{$field.'_ar'} ?? null;
+            if ($value !== null && $value !== '' && $value !== []) {
+                return $value;
+            }
+        }
+
+        return $model->{$field};
+    }
+
+    private function hasArabicContent(LearningLesson $lesson): bool
+    {
+        return ! empty($lesson->blocks_ar);
+    }
+
     public function category(LearningCategory $category, bool $admin = false): array
     {
         $data = [
@@ -43,8 +78,8 @@ class LearningPresenter
     {
         $data = [
             'slug' => $course->slug,
-            'title' => $course->title,
-            'subtitle' => $course->subtitle,
+            'title' => $admin ? $course->title : $this->tr($course, 'title'),
+            'subtitle' => $admin ? $course->subtitle : $this->tr($course, 'subtitle'),
             'level' => $course->level,
             'language' => $course->language,
             'estimated_hours' => $course->estimated_hours,
@@ -66,6 +101,8 @@ class LearningPresenter
 
         if ($admin) {
             $data = ['id' => $course->id, 'category_id' => $course->category_id] + $data + [
+                'title_ar' => $course->title_ar,
+                'subtitle_ar' => $course->subtitle_ar,
                 'status' => $course->status,
                 'ordering' => $course->ordering,
                 'updated_at' => $course->updated_at?->toIso8601String(),
@@ -80,8 +117,10 @@ class LearningPresenter
     {
         $course->loadMissing(['category', 'stages.units.lessons' => function ($query) {
             $query->select([
-                'id', 'unit_id', 'course_id', 'slug', 'title', 'summary',
+                'id', 'unit_id', 'course_id', 'slug', 'title', 'title_ar', 'summary', 'summary_ar',
                 'duration_minutes', 'status', 'ordering',
+                // Only whether Arabic content exists is needed here, not the content.
+                DB::raw("CASE WHEN blocks_ar IS NULL OR JSON_LENGTH(blocks_ar) = 0 THEN 0 ELSE 1 END as has_ar"),
             ]);
         }]);
 
@@ -89,39 +128,41 @@ class LearningPresenter
         $publishedCount = 0;
         $minutes = 0;
 
-        $stages = $course->stages->map(function (LearningStage $stage) use ($admin, &$lessonsCount, &$publishedCount, &$minutes) {
-            return [
-                'slug' => $stage->slug,
-                'title' => $stage->title,
-                'code' => $stage->code,
-                'summary' => $stage->summary,
-                'units' => $stage->units->map(function (LearningUnit $unit) use ($admin, &$lessonsCount, &$publishedCount, &$minutes) {
-                    return [
-                        'slug' => $unit->slug,
-                        'title' => $unit->title,
-                        'summary' => $unit->summary,
-                        'lessons' => $unit->lessons->map(function (LearningLesson $lesson) use ($admin, &$lessonsCount, &$publishedCount, &$minutes) {
-                            $lessonsCount++;
-                            if ($lesson->isPublished()) {
-                                $publishedCount++;
-                                $minutes += (int) $lesson->duration_minutes;
-                            }
+        $node = function ($model, array $extra) use ($admin) {
+            $row = [
+                'slug' => $model->slug,
+                'title' => $admin ? $model->title : $this->tr($model, 'title'),
+                'summary' => $admin ? $model->summary : $this->tr($model, 'summary'),
+            ];
+            if ($admin) {
+                $row += ['title_ar' => $model->title_ar, 'summary_ar' => $model->summary_ar];
+            }
 
-                            $row = [
-                                'slug' => $lesson->slug,
-                                'title' => $lesson->title,
-                                'summary' => $lesson->summary,
-                                'duration_minutes' => $lesson->duration_minutes,
-                                'available' => $lesson->isPublished(),
-                            ];
+            return $row + $extra;
+        };
 
-                            return $admin
-                                ? ['id' => $lesson->id, 'unit_id' => $lesson->unit_id, 'status' => $lesson->status, 'ordering' => $lesson->ordering] + $row
-                                : $row;
-                        })->values()->all(),
-                    ] + ($admin ? ['id' => $unit->id, 'stage_id' => $unit->stage_id, 'ordering' => $unit->ordering] : []);
-                })->values()->all(),
-            ] + ($admin ? ['id' => $stage->id, 'ordering' => $stage->ordering] : []);
+        $stages = $course->stages->map(function (LearningStage $stage) use ($admin, $node, &$lessonsCount, &$publishedCount, &$minutes) {
+            $units = $stage->units->map(function (LearningUnit $unit) use ($admin, $node, &$lessonsCount, &$publishedCount, &$minutes) {
+                $lessons = $unit->lessons->map(function (LearningLesson $lesson) use ($admin, $node, &$lessonsCount, &$publishedCount, &$minutes) {
+                    $lessonsCount++;
+                    if ($lesson->isPublished()) {
+                        $publishedCount++;
+                        $minutes += (int) $lesson->duration_minutes;
+                    }
+
+                    return $node($lesson, [
+                        'duration_minutes' => $lesson->duration_minutes,
+                        'available' => $lesson->isPublished(),
+                        'has_ar' => (bool) ($lesson->has_ar ?? false),
+                    ] + ($admin ? ['id' => $lesson->id, 'unit_id' => $lesson->unit_id, 'status' => $lesson->status, 'ordering' => $lesson->ordering] : []));
+                })->values()->all();
+
+                return $node($unit, ['lessons' => $lessons]
+                    + ($admin ? ['id' => $unit->id, 'stage_id' => $unit->stage_id, 'ordering' => $unit->ordering] : []));
+            })->values()->all();
+
+            return $node($stage, ['code' => $stage->code, 'units' => $units]
+                + ($admin ? ['id' => $stage->id, 'ordering' => $stage->ordering] : []));
         })->values()->all();
 
         $card = $this->courseCard($course, $admin);
@@ -129,10 +170,22 @@ class LearningPresenter
         $card['lessons_count'] = $lessonsCount;
         $card['published_lessons_count'] = $publishedCount;
 
-        return $card + [
-            'description' => $course->description,
-            'outcomes' => $course->outcomes ?? [],
-            'prerequisites' => $course->prerequisites ?? [],
+        $details = $admin
+            ? [
+                'description' => $course->description,
+                'description_ar' => $course->description_ar,
+                'outcomes' => $course->outcomes ?? [],
+                'outcomes_ar' => $course->outcomes_ar ?? [],
+                'prerequisites' => $course->prerequisites ?? [],
+                'prerequisites_ar' => $course->prerequisites_ar ?? [],
+            ]
+            : [
+                'description' => $this->tr($course, 'description'),
+                'outcomes' => $this->tr($course, 'outcomes') ?? [],
+                'prerequisites' => $this->tr($course, 'prerequisites') ?? [],
+            ];
+
+        return $card + $details + [
             'total_minutes' => $minutes,
             'stages' => $stages,
         ];
@@ -142,7 +195,7 @@ class LearningPresenter
     public function lesson(LearningLesson $lesson, LearningCourse $course, bool $admin = false): array
     {
         $course->loadMissing(['category', 'stages.units.lessons' => function ($query) {
-            $query->select(['id', 'unit_id', 'course_id', 'slug', 'title', 'status', 'ordering']);
+            $query->select(['id', 'unit_id', 'course_id', 'slug', 'title', 'title_ar', 'status', 'ordering']);
         }]);
 
         // The course order, flattened: stage → unit → lesson.
@@ -165,21 +218,25 @@ class LearningPresenter
         }
 
         $position = collect($sequence)->search(fn ($l) => $l->id === $lesson->id);
-        $neighbour = function ($l) {
-            return $l ? ['slug' => $l->slug, 'title' => $l->title] : null;
-        };
+        $neighbour = fn ($l) => $l ? ['slug' => $l->slug, 'title' => $this->tr($l, 'title')] : null;
+
+        // Arabic content is served whole or not at all: mixing languages
+        // block by block would read worse than either.
+        $arabicContent = $this->isArabic() && $this->hasArabicContent($lesson);
 
         $data = [
             'slug' => $lesson->slug,
-            'title' => $lesson->title,
-            'summary' => $lesson->summary,
+            'title' => $this->tr($lesson, 'title'),
+            'summary' => $arabicContent ? ($lesson->summary_ar ?: $lesson->summary) : $lesson->summary,
             'duration_minutes' => $lesson->duration_minutes,
-            'objectives' => $lesson->objectives ?? [],
-            'blocks' => $this->resolveMedia($lesson->blocks ?? []),
+            'objectives' => $arabicContent ? ($lesson->objectives_ar ?: $lesson->objectives ?? []) : ($lesson->objectives ?? []),
+            'blocks' => $this->resolveMedia(($arabicContent ? $lesson->blocks_ar : $lesson->blocks) ?? []),
+            'content_language' => $arabicContent ? 'ar' : 'en',
+            'has_ar' => $this->hasArabicContent($lesson),
             'updated_at' => $lesson->updated_at?->toIso8601String(),
             'course' => [
                 'slug' => $course->slug,
-                'title' => $course->title,
+                'title' => $this->tr($course, 'title'),
                 'language' => $course->language,
                 'accent_color' => $course->accent_color ?: $course->category?->color,
                 'category' => $course->category ? [
@@ -188,8 +245,8 @@ class LearningPresenter
                     'name_ar' => $course->category->name_ar,
                 ] : null,
             ],
-            'stage' => $stage ? ['slug' => $stage->slug, 'title' => $stage->title, 'code' => $stage->code] : null,
-            'unit' => $unit ? ['slug' => $unit->slug, 'title' => $unit->title] : null,
+            'stage' => $stage ? ['slug' => $stage->slug, 'title' => $this->tr($stage, 'title'), 'code' => $stage->code] : null,
+            'unit' => $unit ? ['slug' => $unit->slug, 'title' => $this->tr($unit, 'title')] : null,
             'position' => $position === false ? null : $position + 1,
             'total' => count($sequence),
             'previous' => $position ? $neighbour($sequence[$position - 1] ?? null) : null,
@@ -203,7 +260,18 @@ class LearningPresenter
                 'course_id' => $lesson->course_id,
                 'status' => $lesson->status,
                 'ordering' => $lesson->ordering,
-                'raw_blocks' => $lesson->blocks ?? [],
+                'en' => [
+                    'title' => $lesson->title,
+                    'summary' => $lesson->summary,
+                    'objectives' => $lesson->objectives ?? [],
+                    'blocks' => $lesson->blocks ?? [],
+                ],
+                'ar' => [
+                    'title' => $lesson->title_ar,
+                    'summary' => $lesson->summary_ar,
+                    'objectives' => $lesson->objectives_ar ?? [],
+                    'blocks' => $lesson->blocks_ar ?? [],
+                ],
             ] + $data;
         }
 

@@ -42,6 +42,12 @@ class CourseTransfer
 
     public const MODES = ['replace', 'merge', 'fill'];
 
+    private const COURSE_FIELDS = [
+        'slug', 'title', 'title_ar', 'subtitle', 'subtitle_ar', 'description', 'description_ar',
+        'level', 'language', 'estimated_hours', 'outcomes', 'outcomes_ar', 'prerequisites',
+        'prerequisites_ar', 'tags', 'accent_color', 'is_featured', 'status', 'ordering',
+    ];
+
     public function import(array $document, string $mode = 'merge'): LearningCourse
     {
         if (! in_array($mode, self::MODES, true)) {
@@ -69,8 +75,10 @@ class CourseTransfer
                     new LearningStage(['course_id' => $course->id, 'slug' => $stageSlug]),
                     [
                         'title' => $stageData['title'],
+                        'title_ar' => $stageData['title_ar'] ?? null,
                         'code' => $stageData['code'] ?? null,
                         'summary' => $stageData['summary'] ?? null,
+                        'summary_ar' => $stageData['summary_ar'] ?? null,
                         'ordering' => $stageIndex + 1,
                     ],
                     $mode
@@ -84,7 +92,9 @@ class CourseTransfer
                         [
                             'stage_id' => $stage->id,
                             'title' => $unitData['title'],
+                            'title_ar' => $unitData['title_ar'] ?? null,
                             'summary' => $unitData['summary'] ?? null,
+                            'summary_ar' => $unitData['summary_ar'] ?? null,
                             'ordering' => $unitIndex + 1,
                         ],
                         $mode
@@ -111,19 +121,20 @@ class CourseTransfer
             'category' => Arr::only($course->category->toArray(), [
                 'slug', 'name', 'name_ar', 'description', 'description_ar', 'icon', 'color', 'ordering',
             ]),
-            'course' => Arr::only($course->toArray(), [
-                'slug', 'title', 'subtitle', 'description', 'level', 'language', 'estimated_hours',
-                'outcomes', 'prerequisites', 'tags', 'accent_color', 'is_featured', 'status', 'ordering',
-            ]),
+            'course' => Arr::only($course->toArray(), self::COURSE_FIELDS),
             'stages' => $course->stages->map(fn (LearningStage $stage) => [
                 'slug' => $stage->slug,
                 'title' => $stage->title,
+                'title_ar' => $stage->title_ar,
                 'code' => $stage->code,
                 'summary' => $stage->summary,
+                'summary_ar' => $stage->summary_ar,
                 'units' => $stage->units->map(fn (LearningUnit $unit) => [
                     'slug' => $unit->slug,
                     'title' => $unit->title,
+                    'title_ar' => $unit->title_ar,
                     'summary' => $unit->summary,
+                    'summary_ar' => $unit->summary_ar,
                     'lessons' => $unit->lessons->map(fn (LearningLesson $lesson) => [
                         'slug' => $lesson->slug,
                         'title' => $lesson->title,
@@ -132,6 +143,10 @@ class CourseTransfer
                         'objectives' => $lesson->objectives ?? [],
                         'status' => $lesson->status,
                         'blocks' => $lesson->blocks ?? [],
+                        'title_ar' => $lesson->title_ar,
+                        'summary_ar' => $lesson->summary_ar,
+                        'objectives_ar' => $lesson->objectives_ar ?? [],
+                        'blocks_ar' => $lesson->blocks_ar ?? [],
                     ])->values()->all(),
                 ])->values()->all(),
             ])->values()->all(),
@@ -155,10 +170,7 @@ class CourseTransfer
     private function importCourse(LearningCategory $category, array $data, string $mode): LearningCourse
     {
         $slug = Str::slug($data['slug'] ?? $data['title']);
-        $fields = Arr::only($data, [
-            'title', 'subtitle', 'description', 'level', 'language', 'estimated_hours',
-            'outcomes', 'prerequisites', 'tags', 'accent_color', 'is_featured', 'status', 'ordering',
-        ]);
+        $fields = Arr::only($data, array_diff(self::COURSE_FIELDS, ['slug']));
         $fields['category_id'] = $category->id;
 
         return $this->upsert(
@@ -178,6 +190,13 @@ class CourseTransfer
         string $mode
     ): void {
         $blocks = LessonBlocks::sanitize($data['blocks'] ?? [], "lesson[{$slug}].blocks");
+        $blocksAr = LessonBlocks::sanitize($data['blocks_ar'] ?? [], "lesson[{$slug}].blocks_ar");
+        $arabic = [
+            'title_ar' => $data['title_ar'] ?? null,
+            'summary_ar' => $data['summary_ar'] ?? null,
+            'objectives_ar' => array_values($data['objectives_ar'] ?? []),
+            'blocks_ar' => $blocksAr,
+        ];
         $content = [
             'summary' => $data['summary'] ?? null,
             'duration_minutes' => $data['duration_minutes'] ?? null,
@@ -195,7 +214,8 @@ class CourseTransfer
             LearningLesson::create(array_merge(
                 ['course_id' => $course->id, 'slug' => $slug],
                 $placement,
-                $content
+                $content,
+                $arabic
             ));
 
             return;
@@ -204,14 +224,22 @@ class CourseTransfer
         if ($mode === 'fill') {
             // Never overwrite work done in the dashboard: an existing lesson
             // only receives content while it has none of its own.
+            // The same for each language, and for a missing Arabic title.
             if (empty($existing->blocks) && $blocks) {
-                $existing->fill($content)->save();
+                $existing->fill($content);
             }
+            if (empty($existing->blocks_ar) && $blocksAr) {
+                $existing->fill(Arr::except($arabic, ['title_ar']));
+            }
+            if (empty($existing->title_ar) && $arabic['title_ar']) {
+                $existing->title_ar = $arabic['title_ar'];
+            }
+            $existing->save();
 
             return;
         }
 
-        $existing->fill(array_merge($placement, $content))->save();
+        $existing->fill(array_merge($placement, $content, $arabic))->save();
     }
 
     /**
@@ -223,6 +251,20 @@ class CourseTransfer
         if ($existing) {
             if ($mode !== 'fill') {
                 $existing->fill($fields)->save();
+
+                return $existing;
+            }
+
+            // Fill mode: only fields that are still empty - typically the
+            // Arabic twins added after the course was first loaded.
+            foreach ($fields as $key => $value) {
+                $current = $existing->{$key};
+                if (($current === null || $current === '' || $current === []) && $value !== null && $value !== '' && $value !== []) {
+                    $existing->{$key} = $value;
+                }
+            }
+            if ($existing->isDirty()) {
+                $existing->save();
             }
 
             return $existing;

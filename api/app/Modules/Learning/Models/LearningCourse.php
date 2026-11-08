@@ -12,13 +12,16 @@ class LearningCourse extends Model
     protected $table = 'learning_courses';
 
     protected $fillable = [
-        'category_id', 'slug', 'title', 'subtitle', 'description', 'level', 'language',
+        'category_id', 'slug', 'title', 'title_ar', 'subtitle', 'subtitle_ar', 'description', 'description_ar', 'level', 'language',
+        'outcomes_ar', 'prerequisites_ar',
         'estimated_hours', 'outcomes', 'prerequisites', 'tags', 'cover_path',
         'accent_color', 'is_featured', 'status', 'ordering',
     ];
 
     protected $casts = [
         'outcomes' => 'array',
+        'outcomes_ar' => 'array',
+        'prerequisites_ar' => 'array',
         'prerequisites' => 'array',
         'tags' => 'array',
         'is_featured' => 'boolean',

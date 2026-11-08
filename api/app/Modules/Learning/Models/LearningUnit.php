@@ -10,7 +10,7 @@ class LearningUnit extends Model
 {
     protected $table = 'learning_units';
 
-    protected $fillable = ['stage_id', 'course_id', 'slug', 'title', 'summary', 'ordering'];
+    protected $fillable = ['stage_id', 'course_id', 'slug', 'title', 'title_ar', 'summary', 'summary_ar', 'ordering'];
 
     protected $casts = ['ordering' => 'integer'];
 

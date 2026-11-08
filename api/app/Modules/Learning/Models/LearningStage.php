@@ -10,7 +10,7 @@ class LearningStage extends Model
 {
     protected $table = 'learning_stages';
 
-    protected $fillable = ['course_id', 'slug', 'title', 'code', 'summary', 'ordering'];
+    protected $fillable = ['course_id', 'slug', 'title', 'title_ar', 'code', 'summary', 'summary_ar', 'ordering'];
 
     protected $casts = ['ordering' => 'integer'];
 

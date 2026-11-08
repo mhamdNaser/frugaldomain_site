@@ -201,8 +201,15 @@ class LearningAdminController extends Controller
             'category_id' => ['required', 'integer', 'exists:learning_categories,id'],
             'slug' => ['required', 'string', 'max:120', self::SLUG, Rule::unique('learning_courses', 'slug')->ignore($ignoreId)],
             'title' => ['required', 'string', 'max:255'],
+            'title_ar' => ['nullable', 'string', 'max:255'],
             'subtitle' => ['nullable', 'string', 'max:255'],
+            'subtitle_ar' => ['nullable', 'string', 'max:255'],
             'description' => ['nullable', 'string', 'max:100000'],
+            'description_ar' => ['nullable', 'string', 'max:100000'],
+            'outcomes_ar' => ['nullable', 'array', 'max:40'],
+            'outcomes_ar.*' => ['nullable', 'string', 'max:500'],
+            'prerequisites_ar' => ['nullable', 'array', 'max:40'],
+            'prerequisites_ar.*' => ['nullable', 'string', 'max:500'],
             'level' => ['required', Rule::in(['beginner', 'intermediate', 'advanced', 'expert'])],
             'language' => ['required', Rule::in(['en', 'ar'])],
             'estimated_hours' => ['nullable', 'integer', 'min:0', 'max:10000'],
@@ -218,7 +225,7 @@ class LearningAdminController extends Controller
             'ordering' => ['nullable', 'integer', 'min:0'],
         ]);
 
-        foreach (['outcomes', 'prerequisites', 'tags'] as $list) {
+        foreach (['outcomes', 'prerequisites', 'tags', 'outcomes_ar', 'prerequisites_ar'] as $list) {
             $data[$list] = array_values(array_filter(array_map('trim', $data[$list] ?? []), 'strlen'));
         }
         $data['is_featured'] = (bool) ($data['is_featured'] ?? false);
@@ -236,6 +243,8 @@ class LearningAdminController extends Controller
             'title' => ['required', 'string', 'max:255'],
             'code' => ['nullable', 'string', 'max:120'],
             'summary' => ['nullable', 'string', 'max:5000'],
+            'title_ar' => ['nullable', 'string', 'max:255'],
+            'summary_ar' => ['nullable', 'string', 'max:5000'],
         ]);
 
         $stage = LearningStage::create($data + [
@@ -253,6 +262,8 @@ class LearningAdminController extends Controller
             'title' => ['required', 'string', 'max:255'],
             'code' => ['nullable', 'string', 'max:120'],
             'summary' => ['nullable', 'string', 'max:5000'],
+            'title_ar' => ['nullable', 'string', 'max:255'],
+            'summary_ar' => ['nullable', 'string', 'max:5000'],
             'slug' => ['nullable', 'string', 'max:120', self::SLUG,
                 Rule::unique('learning_stages', 'slug')->where('course_id', $stage->course_id)->ignore($stage->id)],
         ])));
@@ -277,6 +288,8 @@ class LearningAdminController extends Controller
             'stage_id' => ['required', 'integer', 'exists:learning_stages,id'],
             'title' => ['required', 'string', 'max:255'],
             'summary' => ['nullable', 'string', 'max:5000'],
+            'title_ar' => ['nullable', 'string', 'max:255'],
+            'summary_ar' => ['nullable', 'string', 'max:5000'],
         ]);
         $stage = LearningStage::findOrFail($data['stage_id']);
 
@@ -295,6 +308,8 @@ class LearningAdminController extends Controller
         $unit->update($this->withoutEmptySlug($request->validate([
             'title' => ['required', 'string', 'max:255'],
             'summary' => ['nullable', 'string', 'max:5000'],
+            'title_ar' => ['nullable', 'string', 'max:255'],
+            'summary_ar' => ['nullable', 'string', 'max:5000'],
             'slug' => ['nullable', 'string', 'max:120', self::SLUG,
                 Rule::unique('learning_units', 'slug')->where('course_id', $unit->course_id)->ignore($unit->id)],
         ])));
@@ -392,18 +407,28 @@ class LearningAdminController extends Controller
                 Rule::unique('learning_lessons', 'slug')->where('course_id', $courseId)->ignore($ignoreId)],
             'title' => ['required', 'string', 'max:255'],
             'summary' => ['nullable', 'string', 'max:5000'],
+            'title_ar' => ['nullable', 'string', 'max:255'],
+            'summary_ar' => ['nullable', 'string', 'max:5000'],
             'duration_minutes' => ['nullable', 'integer', 'min:0', 'max:1000'],
             'objectives' => ['nullable', 'array', 'max:30'],
             'objectives.*' => ['string', 'max:500'],
             'status' => ['nullable', Rule::in(['draft', 'published'])],
             'blocks' => ['nullable', 'array', 'max:400'],
+            'objectives_ar' => ['nullable', 'array', 'max:30'],
+            'objectives_ar.*' => ['nullable', 'string', 'max:500'],
+            'blocks_ar' => ['nullable', 'array', 'max:400'],
         ]);
 
         if ($request->has('blocks')) {
             $data['blocks'] = LessonBlocks::sanitize($request->input('blocks', []));
         }
-        if (array_key_exists('objectives', $data)) {
-            $data['objectives'] = array_values(array_filter(array_map('trim', $data['objectives'] ?? []), 'strlen'));
+        if ($request->has('blocks_ar')) {
+            $data['blocks_ar'] = LessonBlocks::sanitize($request->input('blocks_ar', []), 'blocks_ar');
+        }
+        foreach (['objectives', 'objectives_ar'] as $list) {
+            if (array_key_exists($list, $data)) {
+                $data[$list] = array_values(array_filter(array_map('trim', $data[$list] ?? []), 'strlen'));
+            }
         }
         if (empty($data['slug'])) {
             unset($data['slug']);

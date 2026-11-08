@@ -1,0 +1,704 @@
+{
+  "slug": "identifying-malicious-activity-in-logs-and-traffic",
+  "title": "Identifying Malicious Activity in Logs and Traffic",
+  "summary": "Recognise the log and traffic patterns of brute-force attacks, C2 beaconing and DNS tunnelling, and hunt for them with grep, awk, Windows event 4625 and a SIEM query.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain why a baseline is needed and compare signature-based and anomaly-based detection",
+    "Distinguish brute-force and password-spraying attacks using Linux auth.log and Windows Event ID 4625",
+    "Use grep and awk to summarise authentication failures by source and account",
+    "Recognise the timing and size patterns of command-and-control beaconing",
+    "Identify the indicators of DNS tunnelling in DNS logs"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Monday, 08:00. The overnight queue holds 2,300 events. Most are noise: users mistyping passwords, a backup job hitting a locked file, a scanner from a security vendor. Somewhere in there may be three things that matter: an attacker guessing SSH passwords, a laptop quietly calling home every minute, and data leaving the network hidden inside DNS queries.\n\nFinding them is not luck. Each attack leaves a **pattern** in logs and traffic, and an analyst who knows the patterns can write a filter, a query or a rule to surface them. This lesson uses the tools from [Monitoring Tools: SIEM, NetFlow and Full Packet Capture](/learn/cisco-security-certification-track/monitoring-tools-siem-netflow-and-full-packet-capture) to hunt for three classic behaviours. The attack types themselves are introduced in [Common Threats, Vulnerabilities and Attacks](/learn/cisco-security-certification-track/common-threats-vulnerabilities-and-attacks)."
+    },
+    {
+      "id": "baseline",
+      "type": "text",
+      "markdown": "## Start from normal\n\nYou cannot spot *abnormal* until you know *normal*. A **baseline** describes typical behaviour: how many failed logins a server sees per hour, which countries users connect from, how much DNS traffic a workstation generates and which hours people work.\n\nThere are two broad ways to detect malicious activity:\n\n| Approach | How it works | Strength | Weakness |\n|:--|:--|:--|:--|\n| **Signature-based** | Matches a known bad value or pattern (an IP on a blocklist, a malware hash) | Precise, few false positives | Misses new or changed attacks |\n| **Anomaly-based** | Flags deviation from the baseline (10 times the usual DNS volume) | Finds unknown attacks | More false positives; needs tuning |\n\nGood SOCs combine both. Whatever triggered the alert, the analyst then does the same thing: read the raw evidence, confirm or dismiss, and look for related activity."
+    },
+    {
+      "id": "brute",
+      "type": "text",
+      "markdown": "## Brute force and password spraying\n\nA **brute-force** attack tries many passwords against one account. **Password spraying** tries one or two common passwords against many accounts, staying under the lockout threshold of each.\n\n### Indicators\n\n- Many failures from one source in a short time (brute force).\n- One source failing against many *different* usernames (spraying), often including accounts that do not exist.\n- Failures at a slow, steady rate designed to avoid lockout (\"low and slow\").\n- **The decisive indicator: a success from the same source after the failures.**\n\n### Where to look\n\nOn Linux, SSH writes to `/var/log/auth.log` (Debian/Ubuntu) or `/var/log/secure` (RHEL family). On Windows, the Security log records **Event ID 4625** for each failed logon and **4624** for each success. Two fields in 4625 make it far more useful:\n\n| Field | Value | Meaning |\n|:--|:--|:--|\n| Logon Type | 3 / 10 | Network (SMB, for example) / Remote Desktop |\n| Status / Sub Status | `0xC000006A` | Correct username, wrong password |\n| | `0xC0000064` | Username does not exist |\n| | `0xC0000234` | Account is locked out |\n\nMany `0xC0000064` codes suggest an attacker is guessing usernames. A run of `0xC000006A` against one account is a targeted password attack. For the PowerShell way to list these events, see [Incident Response Procedures]({C}incident-response-procedures)."
+    },
+    {
+      "id": "auth-terminal",
+      "type": "terminal",
+      "title": "Hunting an SSH brute force in auth.log with grep and awk",
+      "prompt": "analyst@bastion01:~$",
+      "lines": [
+        {
+          "comment": "Look at the raw lines first. 'invalid user' means the account does not exist: a sign of guessing."
+        },
+        {
+          "cmd": "grep 'Failed password' /var/log/auth.log | tail -2",
+          "output": "Nov  8 03:12:41 bastion01 sshd[40211]: Failed password for root from 198.51.100.23 port 52814 ssh2\nNov  8 03:12:43 bastion01 sshd[40213]: Failed password for invalid user oracle from 198.51.100.23 port 52830 ssh2"
+        },
+        {
+          "comment": "Count failures per source IP. $(NF-3) is the fourth field from the end, which is the IP in this message format."
+        },
+        {
+          "cmd": "grep 'Failed password' /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn | head -3",
+          "output": "   1874 198.51.100.23\n     41 192.0.2.77\n      2 10.0.5.12"
+        },
+        {
+          "comment": "Which accounts were targeted? Common names such as root, admin and oracle point to an automated wordlist."
+        },
+        {
+          "cmd": "grep 'Failed password' /var/log/auth.log | grep -oP 'for (invalid user )?\\K\\S+' | sort | uniq -c | sort -rn | head -4",
+          "output": "    912 root\n    388 admin\n    201 ubuntu\n     97 oracle"
+        },
+        {
+          "comment": "The critical question: did any attacking address succeed? 192.0.2.77 did, as 'deploy'. Escalate now."
+        },
+        {
+          "cmd": "grep 'Accepted' /var/log/auth.log | grep -E '198.51.100.23|192.0.2.77'",
+          "output": "Nov  8 03:41:09 bastion01 sshd[41877]: Accepted password for deploy from 192.0.2.77 port 61022 ssh2"
+        },
+        {
+          "comment": "192.0.2.77 tried slowly (about 14 failures per 10 minutes) to stay under lockout thresholds, then succeeded."
+        },
+        {
+          "cmd": "awk '/192.0.2.77/ && /Failed password/ {print $3}' /var/log/auth.log | cut -c1-5 | uniq -c",
+          "output": "     12 03:20\n     15 03:30\n     14 03:40"
+        }
+      ],
+      "caption": "Addresses are from documentation ranges. The field position used by awk depends on the exact log format, so always check a raw line first."
+    },
+    {
+      "id": "siem-query",
+      "type": "code",
+      "language": "plain",
+      "filename": "brute-force-then-success.spl",
+      "caption": "A Splunk SPL search that finds sources with more than 20 failed Windows logons in an hour, labels them as brute force or spraying, and keeps only those that also logged on successfully. Field names vary with your add-on and data model.",
+      "code": "index=wineventlog EventCode=4625 earliest=-1h\n| stats count AS failures, dc(TargetUserName) AS accounts,\n        values(TargetUserName) AS tried BY IpAddress\n| where failures > 20\n| join type=inner IpAddress\n    [ search index=wineventlog EventCode=4624 Logon_Type IN (3, 10) earliest=-1h\n      | stats latest(_time) AS success_time, values(TargetUserName) AS success_user BY IpAddress ]\n| eval pattern=if(accounts > 10, \"password spraying\", \"brute force\")\n| convert ctime(success_time)\n| table IpAddress pattern failures accounts success_user success_time\n"
+    },
+    {
+      "id": "beaconing",
+      "type": "text",
+      "markdown": "## Beaconing to command and control\n\nOnce malware is installed, it needs instructions. It periodically contacts a **command-and-control (C2)** server, a behaviour called **beaconing**. Each check-in looks like ordinary HTTPS, so signatures rarely help. The pattern does.\n\n### Indicators\n\n- **Regular intervals**: connections every 60 seconds, or every 4 hours, with only small random variation (**jitter**).\n- **Consistent sizes**: requests and responses of nearly identical byte counts.\n- **Rare destination**: an address or domain contacted by only one or two hosts in the organisation, often recently registered.\n- **Persistence**: the pattern continues at night and at weekends, when no user is active.\n- **Odd metadata**: an unusual User-Agent, a self-signed certificate or a TLS fingerprint (JA3/JA4) linked to known malware.\n\nNetFlow and proxy logs are the best sources, because beacons are found by looking at *many* connections over time, not at one packet."
+    },
+    {
+      "id": "beacon-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "What beaconing looks like, and how it is caught",
+      "caption": "No single connection is malicious on its own. The pattern over time is the indicator.",
+      "data": {
+        "actors": [
+          {
+            "id": "host",
+            "label": "Infected PC",
+            "sub": "10.0.30.47",
+            "icon": "laptop"
+          },
+          {
+            "id": "fw",
+            "label": "Firewall / proxy",
+            "sub": "Logs + NetFlow",
+            "icon": "firewall"
+          },
+          {
+            "id": "c2",
+            "label": "C2 server",
+            "sub": "203.0.113.50",
+            "icon": "attacker"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "Beacon analytics",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "from": "host",
+            "to": "c2",
+            "label": "Beacon #1",
+            "detail": "HTTPS 09:00:00, 412 bytes",
+            "note": "Malware on the PC checks in with its C2 server: a small HTTPS request asking 'any tasks for me?'.",
+            "tone": "attack"
+          },
+          {
+            "from": "c2",
+            "to": "host",
+            "label": "Nothing to do",
+            "detail": "180 bytes",
+            "note": "The server has no tasks yet, so it answers with a tiny, fixed-size response."
+          },
+          {
+            "from": "host",
+            "to": "c2",
+            "label": "Beacon #2",
+            "detail": "09:01:02, 412 bytes",
+            "note": "62 seconds later, the same request. Malware adds a little random 'jitter' to avoid perfectly regular timing.",
+            "tone": "attack"
+          },
+          {
+            "from": "host",
+            "to": "c2",
+            "label": "Beacon #3 ... #60",
+            "detail": "every 58-62 s",
+            "note": "The pattern repeats all hour, even when nobody is using the PC.",
+            "tone": "attack"
+          },
+          {
+            "from": "fw",
+            "to": "siem",
+            "label": "60 flows to one rare IP",
+            "detail": "same size, steady interval",
+            "note": "Each connection is allowed, but the firewall logs it and exports a flow record to the SIEM.",
+            "tone": "warning"
+          },
+          {
+            "from": "siem",
+            "to": "siem",
+            "label": "Beaconing score: high",
+            "detail": "low interval variance, rare destination",
+            "note": "Analytics notice low variance in time and size, a destination no other host uses, and activity outside working hours.",
+            "tone": "danger"
+          },
+          {
+            "from": "fw",
+            "to": "c2",
+            "label": "Block 203.0.113.50",
+            "detail": "after analyst approval",
+            "note": "After triage, the analyst blocks the address and isolates the PC for host-based analysis.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dns",
+      "type": "text",
+      "markdown": "## DNS tunnelling\n\nDNS is allowed out of almost every network, which makes it attractive for C2 and for **exfiltration**. In **DNS tunnelling**, malware encodes data inside the labels of a query, such as `<encoded-data>.t.attacker-domain.example`. The attacker runs the authoritative name server for that domain, so every query delivers a piece of the data, and the answers (often TXT records) can carry commands back.\n\n### Indicators\n\n| Indicator | Normal | Suspicious |\n|:--|:--|:--|\n| Query length | Usually under 40 characters | 50 to 250 characters |\n| Subdomain content | Readable words | Long hex or Base32 strings (high **entropy**) |\n| Unique subdomains per domain | A handful | Thousands, each queried once |\n| Record types | Mostly A, AAAA, CNAME | Many TXT, NULL or CNAME responses |\n| Volume per host | Steady | One host far above its baseline |\n\nA defensive control is to force all clients to use internal resolvers, block direct outbound DNS (UDP and TCP port 53) and log every query. DNS over HTTPS (DoH) to external providers can bypass this, so many organisations block or manage it."
+    },
+    {
+      "id": "dns-terminal",
+      "type": "terminal",
+      "title": "Spotting DNS tunnelling in Zeek DNS logs",
+      "prompt": "analyst@sensor01:~/zeek/2026-11-08$",
+      "lines": [
+        {
+          "comment": "Zeek's dns.log has one line per query. Sort by query length: legitimate names are rarely longer than 30 to 40 characters."
+        },
+        {
+          "cmd": "zeek-cut query qtype_name < dns.log | awk '{print length($1), $2, $1}' | sort -rn | head -3",
+          "output": "73 TXT 51335f506179726f6c6c5f4578706f72742e786c73783b73.0031.t.example-files.net\n73 TXT 697a653d34383231333b706172743d303033312d6f662d32.0032.t.example-files.net\n73 TXT 437573746f6d6572735f323032362e6373763b73697a653d.0108.t.example-files.net"
+        },
+        {
+          "comment": "Group by registered domain. One unknown domain with more queries than microsoft.com is a red flag."
+        },
+        {
+          "cmd": "zeek-cut query < dns.log | awk -F. '{print $(NF-1)\".\"$NF}' | sort | uniq -c | sort -rn | head -3",
+          "output": "  14882 example-files.net\n    911 microsoft.com\n    403 google.com"
+        },
+        {
+          "comment": "Every query came from one host. That host is the next thing to examine."
+        },
+        {
+          "cmd": "zeek-cut id.orig_h query < dns.log | grep example-files.net | awk '{print $1}' | sort | uniq -c",
+          "output": "  14882 10.0.30.47"
+        }
+      ],
+      "caption": "zeek-cut extracts named columns from Zeek logs. The hex labels decode to file-name fragments, which confirms data is leaving through DNS."
+    },
+    {
+      "id": "warn-context",
+      "type": "callout",
+      "variant": "warning",
+      "title": "An indicator is not a verdict",
+      "markdown": "Legitimate software beacons too: update agents, monitoring tools and chat clients check in on a schedule. Antivirus and CDN services use long, random-looking DNS names. Before you escalate, check whether the destination belongs to a known product, whether other hosts behave the same way, and whether the asset owner can explain it. Then record why you closed or escalated the alert."
+    },
+    {
+      "id": "tip-success",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Always pivot to the success",
+      "markdown": "A thousand failed logins is noise on any internet-facing server. One successful login from the same source is an incident. Build every brute-force search so that it ends with the question *did any of these sources succeed?*, as the SPL example does."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use **your own** Linux VM.\n\n1. From the same VM, run `ssh wronguser@localhost` three times and type wrong passwords.\n2. Run `sudo grep 'Failed password' /var/log/auth.log | tail` (or `journalctl -u ssh` on systems without auth.log) and find your attempts.\n3. Adapt the awk pipeline from this lesson to count failures per username.\n4. Capture your own DNS with `sudo tcpdump -i any -nn -l udp port 53 | awk '{print $(NF-1)}'` while browsing. Compare the length of normal names with the encoded names in the Zeek example.\n5. Write one sentence describing what 'normal' looks like on your machine. That is your first baseline."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Baseline",
+          "definition": "A description of normal behaviour for a system, user or network, used to recognise anomalies."
+        },
+        {
+          "term": "Brute-force attack",
+          "definition": "Trying many passwords against one account until one works."
+        },
+        {
+          "term": "Password spraying",
+          "definition": "Trying a few common passwords against many accounts to avoid account lockout."
+        },
+        {
+          "term": "Event ID 4625",
+          "definition": "The Windows Security event for a failed logon; its Logon Type and Status fields explain how and why it failed."
+        },
+        {
+          "term": "Beaconing",
+          "definition": "Regular, automated check-ins from malware to its command-and-control server."
+        },
+        {
+          "term": "Jitter",
+          "definition": "Random variation added to beacon intervals so the timing looks less regular."
+        },
+        {
+          "term": "DNS tunnelling",
+          "definition": "Encoding data or commands inside DNS queries and responses to bypass network controls."
+        },
+        {
+          "term": "Entropy",
+          "definition": "A measure of randomness; high-entropy domain labels suggest encoded or generated data."
+        },
+        {
+          "term": "Exfiltration",
+          "definition": "Unauthorised transfer of data out of an organisation."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "A domain controller logs 300 failed logons in ten minutes, each against a different username, all from one IP address. What is this most likely to be?",
+          "options": [
+            "Beaconing",
+            "Password spraying",
+            "DNS tunnelling",
+            "A single user who forgot a password"
+          ],
+          "answer": 1,
+          "explanation": "Few attempts per account across many accounts from one source is the signature of password spraying, which avoids per-account lockout."
+        },
+        {
+          "question": "In Windows Event ID 4625, what does Sub Status 0xC0000064 indicate?",
+          "options": [
+            "The password was wrong",
+            "The account is locked out",
+            "The username does not exist",
+            "The logon was successful"
+          ],
+          "answer": 2,
+          "explanation": "0xC0000064 means the user name does not exist; 0xC000006A is a wrong password and 0xC0000234 a locked account. Many 0xC0000064 codes suggest username guessing."
+        },
+        {
+          "question": "Which observations are indicators of beaconing? (Choose all that apply.)",
+          "options": [
+            "Connections at nearly constant intervals",
+            "Requests of almost identical size",
+            "A destination contacted by hundreds of hosts every day",
+            "Activity that continues overnight when no one is logged in"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Beacons are regular, similar in size and persistent. A destination used by hundreds of hosts is usually a popular legitimate service, not a rare C2 server."
+        },
+        {
+          "question": "Which DNS observations suggest tunnelling? (Choose all that apply.)",
+          "options": [
+            "Thousands of unique subdomains under one domain",
+            "Query names of 60 or more characters made of hex strings",
+            "Many TXT record queries from one workstation",
+            "A few A-record lookups for a company intranet site"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Long, high-entropy labels, many unique subdomains and unusual record types from one host are classic tunnelling indicators. A few A lookups for an intranet site are normal."
+        },
+        {
+          "question": "After counting thousands of SSH failures from one address, what is the most important next step?",
+          "options": [
+            "Check whether any login from that address succeeded",
+            "Delete the auth.log file to save space",
+            "Scan the attacker's address in return",
+            "Close the alert because failures are normal"
+          ],
+          "answer": 0,
+          "explanation": "A success after many failures turns noise into a compromise. Never attack the source back, and never delete evidence."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Detection starts with a **baseline**. Signature-based detection finds the known; anomaly-based detection finds the unusual.\n- **Brute force** hits one account with many passwords; **spraying** hits many accounts with few. Check Windows **4625** Logon Type and Status codes, and always pivot to a matching **4624** or SSH `Accepted` line.\n- **Beaconing** is regular, same-sized, persistent traffic to a rare destination. Find it in NetFlow and proxy logs over time.\n- **DNS tunnelling** shows long, high-entropy queries, many unique subdomains and unusual record types from one host.\n- Every indicator needs context before it becomes a verdict.\n\nNext, move from the network to the endpoint in [Host-Based Analysis: Endpoint Telemetry and Artifacts](/learn/cisco-security-certification-track/host-based-analysis-endpoint-telemetry-and-artifacts)."
+    }
+  ],
+  "ar": {
+    "title": "تحديد النشاط الخبيث في السجلات والحركة",
+    "summary": "تعرّف على أنماط هجمات القوة الغاشمة والإشارات الدورية إلى خوادم القيادة والتحكم والأنفاق عبر DNS في السجلات وحركة الشبكة، وتعقّبها باستخدام grep وawk والحدث 4625 في Windows واستعلام SIEM.",
+    "objectives": [
+      "شرح الحاجة إلى خط الأساس والمقارنة بين الاكتشاف القائم على التواقيع والقائم على الشذوذ",
+      "التمييز بين هجمات القوة الغاشمة ورشّ كلمات المرور باستخدام auth.log في Linux والحدث 4625 في Windows",
+      "استخدام grep وawk لتلخيص إخفاقات المصادقة حسب المصدر والحساب",
+      "التعرّف على أنماط التوقيت والحجم في الإشارات الدورية إلى خوادم القيادة والتحكم",
+      "تحديد مؤشرات الأنفاق عبر DNS في سجلات DNS"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "صباح الاثنين، الساعة 08:00. يحتوي طابور الليلة الماضية على 2,300 حدث، معظمها ضجيج: مستخدمون أخطؤوا في كتابة كلمات المرور، ومهمة نسخ احتياطي اصطدمت بملف مقفل، وماسح ضوئي تابع لمورّد أمني. لكن قد تختبئ بينها ثلاثة أمور مهمة: مهاجم يخمّن كلمات مرور SSH، وحاسوب محمول يتصل بمشغّله بهدوء كل دقيقة، وبيانات تغادر الشبكة مخبّأة داخل استعلامات DNS.\n\nالعثور عليها ليس مسألة حظ؛ فكل هجوم يترك **نمطًا** في السجلات والحركة، والمحلل الذي يعرف هذه الأنماط يستطيع كتابة مرشّح أو استعلام أو قاعدة لإظهارها. يستخدم هذا الدرس الأدوات الواردة في درس [أدوات المراقبة: SIEM وNetFlow والالتقاط الكامل للحزم](/learn/cisco-security-certification-track/monitoring-tools-siem-netflow-and-full-packet-capture) لتعقّب ثلاثة سلوكيات كلاسيكية، أما أنواع الهجمات نفسها فقد قُدّمت في درس [التهديدات والثغرات والهجمات الشائعة](/learn/cisco-security-certification-track/common-threats-vulnerabilities-and-attacks)."
+      },
+      {
+        "id": "baseline",
+        "type": "text",
+        "markdown": "## ابدأ من الوضع الطبيعي\n\nلا يمكنك رصد *غير الطبيعي* قبل أن تعرف *الطبيعي*. يصف **خط الأساس (Baseline)** السلوك المعتاد: عدد محاولات الدخول الفاشلة التي يشهدها الخادم في الساعة، والدول التي يتصل منها المستخدمون، وحجم حركة DNS التي تولّدها محطة العمل، وساعات عمل الموظفين.\n\nهناك أسلوبان رئيسيان لاكتشاف النشاط الخبيث:\n\n| الأسلوب | آلية العمل | نقطة القوة | نقطة الضعف |\n|:--|:--|:--|:--|\n| **القائم على التواقيع (Signature-based)** | يطابق قيمة أو نمطًا خبيثًا معروفًا (عنوان IP في قائمة حظر، أو بصمة برمجية خبيثة) | دقيق، وإنذاراته الكاذبة قليلة | تفوته الهجمات الجديدة أو المعدّلة |\n| **القائم على الشذوذ (Anomaly-based)** | ينبّه عند الانحراف عن خط الأساس (عشرة أضعاف حجم DNS المعتاد) | يكتشف هجمات غير معروفة | إنذارات كاذبة أكثر؛ ويحتاج إلى ضبط |\n\nتجمع مراكز العمليات الجيدة بين الأسلوبين. وأيًّا كان مصدر التنبيه، يفعل المحلل الشيء نفسه بعده: يقرأ الأدلة الخام، فيؤكد التنبيه أو يستبعده، ثم يبحث عن نشاط مرتبط به."
+      },
+      {
+        "id": "brute",
+        "type": "text",
+        "markdown": "## هجمات القوة الغاشمة ورشّ كلمات المرور\n\nيجرّب **هجوم القوة الغاشمة (Brute Force)** كلمات مرور كثيرة على حساب واحد، بينما يجرّب **رشّ كلمات المرور (Password Spraying)** كلمة أو كلمتين شائعتين على حسابات كثيرة، ليبقى دون عتبة القفل في كل منها.\n\n### المؤشرات\n\n- إخفاقات كثيرة من مصدر واحد في وقت قصير (قوة غاشمة).\n- مصدر واحد يفشل مع أسماء مستخدمين *مختلفة* كثيرة (رشّ)، وغالبًا ما تشمل حسابات غير موجودة.\n- إخفاقات بمعدل بطيء وثابت مصمَّم لتجنّب القفل («بطيء ومنخفض - Low and Slow»).\n- **المؤشر الحاسم: نجاح الدخول من المصدر نفسه بعد الإخفاقات.**\n\n### أين تبحث؟\n\nعلى Linux، يكتب SSH في الملف `/var/log/auth.log` (توزيعات Debian وUbuntu) أو `/var/log/secure` (عائلة RHEL). وعلى Windows، يسجّل سجل الأمان (Security) **الحدث رقم 4625** لكل محاولة دخول فاشلة، و**4624** لكل نجاح. ويجعل حقلان في الحدث 4625 منه أكثر فائدة بكثير:\n\n| الحقل | القيمة | المعنى |\n|:--|:--|:--|\n| نوع الدخول (Logon Type) | 3 / 10 | دخول عبر الشبكة (مثل SMB) / سطح المكتب البعيد |\n| الحالة / الحالة الفرعية (Status / Sub Status) | `0xC000006A` | اسم المستخدم صحيح وكلمة المرور خاطئة |\n| | `0xC0000064` | اسم المستخدم غير موجود |\n| | `0xC0000234` | الحساب مقفل |\n\nيدل تكرار الرمز `0xC0000064` على أن المهاجم يخمّن أسماء المستخدمين، أما سلسلة من `0xC000006A` على حساب واحد فهي هجوم موجَّه على كلمة المرور. ولمعرفة طريقة عرض هذه الأحداث عبر PowerShell، راجع درس [إجراءات الاستجابة للحوادث](/learn/cisco-security-certification-track/incident-response-procedures)."
+      },
+      {
+        "id": "auth-terminal",
+        "type": "terminal",
+        "title": "تعقّب هجوم قوة غاشمة على SSH في auth.log باستخدام grep وawk",
+        "prompt": "analyst@bastion01:~$",
+        "lines": [
+          {
+            "comment": "انظر إلى الأسطر الخام أولًا. تعني عبارة `invalid user` أن الحساب غير موجود، وهذه علامة على التخمين."
+          },
+          {
+            "cmd": "grep 'Failed password' /var/log/auth.log | tail -2",
+            "output": "Nov  8 03:12:41 bastion01 sshd[40211]: Failed password for root from 198.51.100.23 port 52814 ssh2\nNov  8 03:12:43 bastion01 sshd[40213]: Failed password for invalid user oracle from 198.51.100.23 port 52830 ssh2"
+          },
+          {
+            "comment": "عُدّ الإخفاقات لكل عنوان IP مصدر. يشير `$(NF-3)` إلى الحقل الرابع من النهاية، وهو عنوان IP في صيغة هذه الرسالة."
+          },
+          {
+            "cmd": "grep 'Failed password' /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn | head -3",
+            "output": "   1874 198.51.100.23\n     41 192.0.2.77\n      2 10.0.5.12"
+          },
+          {
+            "comment": "ما الحسابات المستهدفة؟ أسماء شائعة مثل `root` و`admin` و`oracle` تدل على قائمة كلمات (Wordlist) مؤتمتة."
+          },
+          {
+            "cmd": "grep 'Failed password' /var/log/auth.log | grep -oP 'for (invalid user )?\\K\\S+' | sort | uniq -c | sort -rn | head -4",
+            "output": "    912 root\n    388 admin\n    201 ubuntu\n     97 oracle"
+          },
+          {
+            "comment": "السؤال الحاسم: هل نجح أيّ عنوان مهاجم؟ نعم، نجح 192.0.2.77 بالحساب `deploy`. صعّد الحالة فورًا."
+          },
+          {
+            "cmd": "grep 'Accepted' /var/log/auth.log | grep -E '198.51.100.23|192.0.2.77'",
+            "output": "Nov  8 03:41:09 bastion01 sshd[41877]: Accepted password for deploy from 192.0.2.77 port 61022 ssh2"
+          },
+          {
+            "comment": "حاول 192.0.2.77 ببطء (نحو 14 إخفاقًا كل 10 دقائق) ليبقى دون عتبة قفل الحساب، ثم نجح."
+          },
+          {
+            "cmd": "awk '/192.0.2.77/ && /Failed password/ {print $3}' /var/log/auth.log | cut -c1-5 | uniq -c",
+            "output": "     12 03:20\n     15 03:30\n     14 03:40"
+          }
+        ],
+        "caption": "العناوين من نطاقات التوثيق. يعتمد موضع الحقل الذي يستخدمه awk على صيغة السجل بالضبط، لذا افحص سطرًا خامًا أولًا دائمًا."
+      },
+      {
+        "id": "siem-query",
+        "type": "code",
+        "language": "plain",
+        "filename": "brute-force-then-success.spl",
+        "caption": "بحث بلغة SPL في Splunk يعثر على المصادر التي تجاوزت 20 محاولة دخول فاشلة إلى Windows خلال ساعة، ويصنّفها قوةً غاشمة أو رشًّا، ولا يُبقي إلا تلك التي نجحت في الدخول أيضًا. تختلف أسماء الحقول بحسب الإضافة ونموذج البيانات لديك.",
+        "code": "index=wineventlog EventCode=4625 earliest=-1h\n| stats count AS failures, dc(TargetUserName) AS accounts,\n        values(TargetUserName) AS tried BY IpAddress\n| where failures > 20\n| join type=inner IpAddress\n    [ search index=wineventlog EventCode=4624 Logon_Type IN (3, 10) earliest=-1h\n      | stats latest(_time) AS success_time, values(TargetUserName) AS success_user BY IpAddress ]\n| eval pattern=if(accounts > 10, \"password spraying\", \"brute force\")\n| convert ctime(success_time)\n| table IpAddress pattern failures accounts success_user success_time\n"
+      },
+      {
+        "id": "beaconing",
+        "type": "text",
+        "markdown": "## الإشارات الدورية إلى خادم القيادة والتحكم\n\nبعد تثبيت البرمجية الخبيثة تحتاج إلى تعليمات، فتتصل دوريًا بخادم **القيادة والتحكم (C2)**، ويُسمّى هذا السلوك **الإشارات الدورية (Beaconing)**. يبدو كل اتصال كأنه HTTPS عادي، لذا نادرًا ما تفيد التواقيع، لكن النمط يكشفه.\n\n### المؤشرات\n\n- **فواصل منتظمة**: اتصالات كل 60 ثانية أو كل 4 ساعات، مع تفاوت عشوائي طفيف فقط (**الارتعاش - Jitter**).\n- **أحجام متسقة**: طلبات واستجابات بأعداد بايتات شبه متطابقة.\n- **وجهة نادرة**: عنوان أو نطاق لا يتصل به إلا مضيف أو اثنان في المؤسسة، وغالبًا ما يكون مسجَّلًا حديثًا.\n- **الاستمرارية**: يستمر النمط ليلًا وفي العطلات حين لا يكون أي مستخدم نشطًا.\n- **بيانات وصفية غريبة**: قيمة User-Agent غير مألوفة، أو شهادة موقَّعة ذاتيًا، أو بصمة TLS (‏JA3/JA4) مرتبطة ببرمجية خبيثة معروفة.\n\nسجلات NetFlow والوكيل (Proxy) هي أفضل المصادر، لأن الإشارات الدورية تُكتشف بالنظر إلى اتصالات *كثيرة* عبر الزمن، لا إلى حزمة واحدة."
+      },
+      {
+        "id": "beacon-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "كيف تبدو الإشارات الدورية (Beaconing) وكيف تُكتشف",
+        "caption": "لا يبدو أيّ اتصال منفرد خبيثًا بذاته؛ النمط عبر الزمن هو المؤشر.",
+        "data": {
+          "actors": [
+            {
+              "id": "host",
+              "label": "حاسوب مصاب",
+              "sub": "10.0.30.47",
+              "icon": "laptop"
+            },
+            {
+              "id": "fw",
+              "label": "جدار الحماية / الوكيل",
+              "sub": "سجلات + NetFlow",
+              "icon": "firewall"
+            },
+            {
+              "id": "c2",
+              "label": "خادم C2",
+              "sub": "203.0.113.50",
+              "icon": "attacker"
+            },
+            {
+              "id": "siem",
+              "label": "SIEM",
+              "sub": "تحليل الإشارات الدورية",
+              "icon": "log"
+            }
+          ],
+          "steps": [
+            {
+              "from": "host",
+              "to": "c2",
+              "label": "إشارة #1",
+              "detail": "HTTPS عند 09:00:00، ‏412 بايت",
+              "note": "تتصل البرمجية الخبيثة على الحاسوب بخادم C2 الخاص بها: طلب HTTPS صغير يسأل «هل من مهام لي؟».",
+              "tone": "attack"
+            },
+            {
+              "from": "c2",
+              "to": "host",
+              "label": "لا مهام",
+              "detail": "‏180 بايت",
+              "note": "ليس لدى الخادم مهام بعد، فيردّ باستجابة صغيرة ثابتة الحجم."
+            },
+            {
+              "from": "host",
+              "to": "c2",
+              "label": "إشارة #2",
+              "detail": "عند 09:01:02، ‏412 بايت",
+              "note": "بعد 62 ثانية يتكرّر الطلب نفسه. تضيف البرمجية الخبيثة قليلًا من «الارتعاش (Jitter)» العشوائي لتتجنّب انتظامًا تامًا في التوقيت.",
+              "tone": "attack"
+            },
+            {
+              "from": "host",
+              "to": "c2",
+              "label": "الإشارات #3 ... #60",
+              "detail": "كل 58 إلى 62 ثانية",
+              "note": "يتكرر النمط طوال الساعة، حتى عندما لا يستخدم أحد الحاسوب.",
+              "tone": "attack"
+            },
+            {
+              "from": "fw",
+              "to": "siem",
+              "label": "‏60 تدفقًا إلى عنوان نادر",
+              "detail": "الحجم نفسه، وفاصل ثابت",
+              "note": "يُسمح بكل اتصال، لكن جدار الحماية يسجّله ويُصدِّر سجل تدفق إلى SIEM.",
+              "tone": "warning"
+            },
+            {
+              "from": "siem",
+              "to": "siem",
+              "label": "درجة الإشارات الدورية: مرتفعة",
+              "detail": "تباين منخفض في الفاصل، ووجهة نادرة",
+              "note": "تلاحظ التحليلات تباينًا منخفضًا في الوقت والحجم، ووجهةً لا يستخدمها أي مضيف آخر، ونشاطًا خارج ساعات العمل.",
+              "tone": "danger"
+            },
+            {
+              "from": "fw",
+              "to": "c2",
+              "label": "حظر 203.0.113.50",
+              "detail": "بعد موافقة المحلل",
+              "note": "بعد الفرز يحظر المحلل العنوان ويعزل الحاسوب لإجراء التحليل على مستوى المضيف.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "dns",
+        "type": "text",
+        "markdown": "## الأنفاق عبر DNS\n\nيُسمح بحركة DNS بالخروج من كل شبكة تقريبًا، مما يجعله جذّابًا لقنوات القيادة والتحكم و**تسريب البيانات (Exfiltration)**. ففي **الأنفاق عبر DNS (DNS Tunnelling)** ترمّز البرمجية الخبيثة البيانات داخل مقاطع اسم الاستعلام، مثل `<encoded-data>.t.attacker-domain.example`. ويدير المهاجم خادم الأسماء الموثوق (Authoritative) لذلك النطاق، فيوصل كل استعلام جزءًا من البيانات، ويمكن للإجابات (وغالبًا ما تكون سجلات TXT) أن تحمل الأوامر في الاتجاه المعاكس.\n\n### المؤشرات\n\n| المؤشر | الطبيعي | المشبوه |\n|:--|:--|:--|\n| طول الاستعلام | عادةً أقل من 40 حرفًا | من 50 إلى 250 حرفًا |\n| محتوى النطاق الفرعي | كلمات مقروءة | سلاسل طويلة بترميز Hex أو Base32 (**إنتروبيا (Entropy)** مرتفعة) |\n| النطاقات الفرعية الفريدة لكل نطاق | عدد قليل | الآلاف، يُستعلم عن كل منها مرة واحدة |\n| أنواع السجلات | غالبًا A وAAAA وCNAME | كثير من استجابات TXT أو NULL أو CNAME |\n| الحجم لكل مضيف | ثابت | مضيف واحد يتجاوز خط أساسه بكثير |\n\nمن الضوابط الدفاعية إلزام جميع الأجهزة باستخدام المحلِّلات (Resolvers) الداخلية، وحظر حركة DNS الخارجة مباشرةً (المنفذ 53 عبر UDP وTCP)، وتسجيل كل استعلام. وقد يتجاوز بروتوكول DNS عبر HTTPS (‏DoH) إلى مزوّدين خارجيين هذه الضوابط، لذا تحظره مؤسسات كثيرة أو تديره."
+      },
+      {
+        "id": "dns-terminal",
+        "type": "terminal",
+        "title": "رصد الأنفاق عبر DNS في سجلات Zeek",
+        "prompt": "analyst@sensor01:~/zeek/2026-11-08$",
+        "lines": [
+          {
+            "comment": "يحتوي الملف `dns.log` من Zeek على سطر لكل استعلام. رتّب حسب طول الاستعلام: نادرًا ما يزيد طول الأسماء المشروعة على 30 إلى 40 حرفًا."
+          },
+          {
+            "cmd": "zeek-cut query qtype_name < dns.log | awk '{print length($1), $2, $1}' | sort -rn | head -3",
+            "output": "73 TXT 51335f506179726f6c6c5f4578706f72742e786c73783b73.0031.t.example-files.net\n73 TXT 697a653d34383231333b706172743d303033312d6f662d32.0032.t.example-files.net\n73 TXT 437573746f6d6572735f323032362e6373763b73697a653d.0108.t.example-files.net"
+          },
+          {
+            "comment": "اجمع حسب النطاق المسجَّل. نطاقٌ مجهول تفوق استعلاماته استعلامات `microsoft.com` علامةُ خطر."
+          },
+          {
+            "cmd": "zeek-cut query < dns.log | awk -F. '{print $(NF-1)\".\"$NF}' | sort | uniq -c | sort -rn | head -3",
+            "output": "  14882 example-files.net\n    911 microsoft.com\n    403 google.com"
+          },
+          {
+            "comment": "جاءت جميع الاستعلامات من مضيف واحد، وهو ما يجب فحصه تاليًا."
+          },
+          {
+            "cmd": "zeek-cut id.orig_h query < dns.log | grep example-files.net | awk '{print $1}' | sort | uniq -c",
+            "output": "  14882 10.0.30.47"
+          }
+        ],
+        "caption": "تستخرج الأداة `zeek-cut` أعمدة مسمّاة من سجلات Zeek. وتُفكّ مقاطع Hex إلى أجزاء من أسماء ملفات، مما يؤكد أن البيانات تغادر عبر DNS."
+      },
+      {
+        "id": "warn-context",
+        "type": "callout",
+        "variant": "warning",
+        "title": "المؤشر ليس حكمًا نهائيًا",
+        "markdown": "البرمجيات المشروعة ترسل إشارات دورية أيضًا: وكلاء التحديث وأدوات المراقبة وتطبيقات المحادثة تتصل وفق جدول زمني، وتستخدم خدمات مكافحة الفيروسات وشبكات توصيل المحتوى (CDN) أسماء DNS طويلة تبدو عشوائية. قبل التصعيد تحقّق: هل تعود الوجهة إلى منتج معروف؟ وهل تتصرف مضيفات أخرى بالطريقة نفسها؟ وهل يستطيع مالك الأصل تفسير ذلك؟ ثم دوّن سبب إغلاق التنبيه أو تصعيده."
+      },
+      {
+        "id": "tip-success",
+        "type": "callout",
+        "variant": "tip",
+        "title": "انتقل دائمًا إلى محاولة النجاح",
+        "markdown": "ألف محاولة دخول فاشلة مجرد ضجيج على أي خادم مكشوف للإنترنت، لكن دخولًا ناجحًا واحدًا من المصدر نفسه حادثةٌ أمنية. صمّم كل بحث عن القوة الغاشمة بحيث ينتهي بسؤال: *هل نجح أيّ من هذه المصادر؟* كما يفعل مثال SPL."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم آلة Linux افتراضية **تملكها**.\n\n1. من الآلة نفسها، نفّذ `ssh wronguser@localhost` ثلاث مرات واكتب كلمات مرور خاطئة.\n2. نفّذ `sudo grep 'Failed password' /var/log/auth.log | tail` (أو `journalctl -u ssh` على الأنظمة التي لا تحتوي على auth.log) وابحث عن محاولاتك.\n3. عدّل سلسلة أوامر awk الواردة في هذا الدرس لعدّ الإخفاقات لكل اسم مستخدم.\n4. التقط حركة DNS الخاصة بك بالأمر `sudo tcpdump -i any -nn -l udp port 53 | awk '{print $(NF-1)}'` أثناء التصفح، وقارن طول الأسماء العادية بالأسماء المرمّزة في مثال Zeek.\n5. اكتب جملة واحدة تصف شكل «الطبيعي» على جهازك؛ فهذا هو خط أساسك الأول."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "خط الأساس (Baseline)",
+            "definition": "وصف للسلوك الطبيعي لنظام أو مستخدم أو شبكة، يُستخدم للتعرّف على حالات الشذوذ."
+          },
+          {
+            "term": "هجوم القوة الغاشمة (Brute Force)",
+            "definition": "تجربة كلمات مرور كثيرة على حساب واحد حتى تنجح إحداها."
+          },
+          {
+            "term": "رشّ كلمات المرور (Password Spraying)",
+            "definition": "تجربة عدد قليل من كلمات المرور الشائعة على حسابات كثيرة لتجنّب قفل الحسابات."
+          },
+          {
+            "term": "الحدث رقم 4625",
+            "definition": "حدث الأمان في Windows الخاص بمحاولة دخول فاشلة، ويوضّح حقلا نوع الدخول والحالة فيه كيف فشلت المحاولة ولماذا."
+          },
+          {
+            "term": "الإشارات الدورية (Beaconing)",
+            "definition": "اتصالات تلقائية منتظمة من البرمجية الخبيثة إلى خادم القيادة والتحكم الخاص بها."
+          },
+          {
+            "term": "الارتعاش (Jitter)",
+            "definition": "تفاوت عشوائي يُضاف إلى فواصل الإشارات الدورية ليبدو توقيتها أقل انتظامًا."
+          },
+          {
+            "term": "الأنفاق عبر DNS (DNS Tunnelling)",
+            "definition": "ترميز البيانات أو الأوامر داخل استعلامات DNS واستجاباته لتجاوز ضوابط الشبكة."
+          },
+          {
+            "term": "الإنتروبيا (Entropy)",
+            "definition": "مقياس للعشوائية؛ ومقاطع أسماء النطاقات ذات الإنتروبيا المرتفعة توحي ببيانات مرمّزة أو مولَّدة آليًا."
+          },
+          {
+            "term": "تسريب البيانات (Exfiltration)",
+            "definition": "نقل البيانات إلى خارج المؤسسة دون تصريح."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "تسجّل وحدة تحكم المجال (Domain Controller) 300 محاولة دخول فاشلة في عشر دقائق، كلٌّ منها باسم مستخدم مختلف، وجميعها من عنوان IP واحد. ما الأرجح أن يكون ذلك؟",
+            "options": [
+              "إشارات دورية",
+              "رشّ كلمات المرور",
+              "أنفاق عبر DNS",
+              "مستخدم واحد نسي كلمة مروره"
+            ],
+            "answer": 1,
+            "explanation": "قلة المحاولات لكل حساب عبر حسابات كثيرة من مصدر واحد هي السمة المميزة لرشّ كلمات المرور، الذي يتجنّب قفل كل حساب على حدة."
+          },
+          {
+            "question": "في الحدث رقم 4625 في Windows، علامَ تدل الحالة الفرعية 0xC0000064؟",
+            "options": [
+              "كلمة المرور خاطئة",
+              "الحساب مقفل",
+              "اسم المستخدم غير موجود",
+              "نجح الدخول"
+            ],
+            "answer": 2,
+            "explanation": "يعني الرمز 0xC0000064 أن اسم المستخدم غير موجود، بينما يعني 0xC000006A كلمة مرور خاطئة، و0xC0000234 حسابًا مقفلًا. وتكرار 0xC0000064 يوحي بتخمين أسماء المستخدمين."
+          },
+          {
+            "question": "أيّ الملاحظات الآتية مؤشرات على الإشارات الدورية؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "اتصالات بفواصل شبه ثابتة",
+              "طلبات بأحجام شبه متطابقة",
+              "وجهة يتصل بها مئات المضيفات يوميًا",
+              "نشاط يستمر ليلًا دون أن يكون أحد مسجّلًا للدخول"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الإشارات الدورية منتظمة ومتشابهة الحجم ومستمرة. أما الوجهة التي يستخدمها مئات المضيفات فهي في العادة خدمة مشروعة شائعة، لا خادم C2 نادرًا."
+          },
+          {
+            "question": "أيّ ملاحظات DNS الآتية توحي بوجود نفق؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "آلاف النطاقات الفرعية الفريدة تحت نطاق واحد",
+              "أسماء استعلامات من 60 حرفًا أو أكثر مكوّنة من سلاسل Hex",
+              "استعلامات كثيرة عن سجلات TXT من محطة عمل واحدة",
+              "بضعة استعلامات عن سجلات A لموقع الشبكة الداخلية للشركة"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "المقاطع الطويلة ذات الإنتروبيا المرتفعة، والنطاقات الفرعية الفريدة الكثيرة، وأنواع السجلات غير المعتادة من مضيف واحد مؤشرات كلاسيكية على الأنفاق. أما بضعة استعلامات A لموقع داخلي فأمر طبيعي."
+          },
+          {
+            "question": "بعد عدّ آلاف الإخفاقات في SSH من عنوان واحد، ما أهم خطوة تالية؟",
+            "options": [
+              "التحقق مما إذا نجح أيّ دخول من ذلك العنوان",
+              "حذف الملف auth.log لتوفير المساحة",
+              "مسح عنوان المهاجم ردًّا عليه",
+              "إغلاق التنبيه لأن الإخفاقات أمر طبيعي"
+            ],
+            "answer": 0,
+            "explanation": "النجاح بعد إخفاقات كثيرة يحوّل الضجيج إلى اختراق. لا تهاجم المصدر ردًّا عليه أبدًا، ولا تحذف الأدلة أبدًا."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يبدأ الاكتشاف من **خط الأساس**؛ فالاكتشاف القائم على التواقيع يجد المعروف، والقائم على الشذوذ يجد غير المألوف.\n- تستهدف **القوة الغاشمة** حسابًا واحدًا بكلمات مرور كثيرة، ويستهدف **الرشّ** حسابات كثيرة بكلمات قليلة. افحص نوع الدخول ورموز الحالة في الحدث **4625** في Windows، وانتقل دائمًا إلى حدث **4624** مطابق أو سطر `Accepted` في SSH.\n- **الإشارات الدورية** حركة منتظمة متشابهة الحجم ومستمرة نحو وجهة نادرة، وتُكتشف في سجلات NetFlow والوكيل عبر الزمن.\n- تظهر **الأنفاق عبر DNS** في استعلامات طويلة ذات إنتروبيا مرتفعة، ونطاقات فرعية فريدة كثيرة، وأنواع سجلات غير معتادة من مضيف واحد.\n- يحتاج كل مؤشر إلى سياق قبل أن يصبح حكمًا.\n\nانتقل بعد ذلك من الشبكة إلى نقطة النهاية في درس [التحليل على مستوى المضيف: قياسات نقاط النهاية وآثارها](/learn/cisco-security-certification-track/host-based-analysis-endpoint-telemetry-and-artifacts)."
+      }
+    ]
+  }
+}

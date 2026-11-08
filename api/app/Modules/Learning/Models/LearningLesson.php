@@ -10,13 +10,15 @@ class LearningLesson extends Model
     protected $table = 'learning_lessons';
 
     protected $fillable = [
-        'unit_id', 'course_id', 'slug', 'title', 'summary', 'duration_minutes',
-        'objectives', 'blocks', 'status', 'ordering',
+        'unit_id', 'course_id', 'slug', 'title', 'title_ar', 'summary', 'summary_ar', 'duration_minutes',
+        'objectives', 'objectives_ar', 'blocks', 'blocks_ar', 'status', 'ordering',
     ];
 
     protected $casts = [
         'objectives' => 'array',
         'blocks' => 'array',
+        'objectives_ar' => 'array',
+        'blocks_ar' => 'array',
         'duration_minutes' => 'integer',
         'ordering' => 'integer',
     ];

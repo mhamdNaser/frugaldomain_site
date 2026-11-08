@@ -1,0 +1,680 @@
+{
+  "slug": "interpreting-ids-ips-alerts",
+  "title": "Interpreting IDS/IPS Alerts",
+  "summary": "Read Snort and Suricata rules and the alerts they generate, triage alerts to a true or false positive verdict using payload, response and context, and tune noisy rules without creating blind spots.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Compare IDS and IPS deployments and signature, anomaly and protocol-based detection",
+    "Identify the header and option fields of a Snort/Suricata rule",
+    "Follow an alert to its underlying evidence in Suricata eve.json",
+    "Classify alerts as true positive, false positive, false negative or true negative",
+    "Apply narrow, documented tuning with suppressions and thresholds"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Monday, 08:00. The intrusion detection queue holds 412 new alerts from the weekend. Most of them are noise, a few are interesting, and perhaps one matters a great deal. Nobody can investigate all of them in depth, so the analyst's real skill is **deciding quickly and correctly** which is which.\n\nThis lesson explains how IDS and IPS engines such as Snort and Suricata detect attacks, how to read a rule and the alert it produces, how to reach a true or false positive verdict, and how to tune noisy rules without going blind. It builds on [Firewalls and Network Filtering](/learn/cisco-security-certification-track/firewalls-and-network-filtering) and on the previous lesson, [Network Intrusion Analysis: Packet and Protocol Analysis](/learn/cisco-security-certification-track/network-intrusion-analysis-packet-and-protocol-analysis)."
+    },
+    {
+      "id": "ids-ips",
+      "type": "text",
+      "markdown": "## IDS, IPS and detection methods\n\nAn **intrusion detection system (IDS)** receives a copy of traffic from a SPAN port or network TAP and raises alerts; it cannot stop anything. An **intrusion prevention system (IPS)** sits **inline**, so every packet passes through it and it can drop, reset or block malicious traffic in real time. The price of an IPS is risk: a bad rule in prevention mode can block legitimate business traffic.\n\n| Method | How it works | Strength | Weakness |\n|:--|:--|:--|:--|\n| **Signature-based** | Matches traffic against known patterns (rules) | Precise, explainable, low false positives for known threats | Misses new attacks without a signature |\n| **Anomaly-based** | Learns a baseline and alerts on deviation | Can detect unknown attacks | More false positives; needs a stable baseline |\n| **Protocol / policy analysis** | Checks traffic against protocol standards and local policy | Catches malformed or forbidden traffic | Limited to what the decoders understand |\n\n**Snort** (developed by Cisco and the engine inside Cisco Secure Firewall Threat Defense) and **Suricata** are the two most widely used open signature engines; both use very similar rule languages. Cisco Talos publishes and maintains the main Snort rule sets."
+    },
+    {
+      "id": "anatomy",
+      "type": "text",
+      "markdown": "## Anatomy of a rule\n\nA rule has a **header**, which says *which traffic* to inspect, and **options** in parentheses, which say *what to look for* and *how to report it*.\n\n| Part | Example | Meaning |\n|:--|:--|:--|\n| Action | `alert` | What to do on a match: `alert`, `drop`, `reject` or `pass` (drop and reject need inline mode) |\n| Protocol | `http` | `tcp`, `udp`, `icmp`, `ip`, or an application protocol such as `http`, `dns`, `tls` |\n| Source and port | `$EXTERNAL_NET any` | Variables defined in the engine configuration |\n| Direction | `->` | From source to destination (`<>` means either way) |\n| Destination and port | `$HTTP_SERVERS any` | Who is being protected |\n| `msg` | `\"LOCAL WEB Directory traversal...\"` | The text the analyst sees in the alert |\n| `flow` | `established,to_server` | Only match inside an established session, client-to-server |\n| `http.uri` + `content` | `\"../\"` | A sticky buffer selects the normalised URI, and content searches it |\n| `classtype` | `web-application-attack` | Category that sets the default priority |\n| `sid` / `rev` | `1000101` / `2` | Unique signature ID and its revision; local rules use sid 1000000 and above |\n| `detection_filter` / `threshold` | `count 20, seconds 60` | Rate conditions to cut noise or detect brute force |\n\nRead the options as a checklist: the alert is only as good as the match. A rule that searches the whole packet for `../` will fire far more often than one restricted to the normalised URI of an established HTTP request."
+    },
+    {
+      "id": "rules",
+      "type": "code",
+      "language": "plain",
+      "filename": "local.rules",
+      "caption": "Two local rules. The first inspects only the normalised HTTP URI of established sessions; the second fires when one source opens more than 20 SSH connections in 60 seconds.",
+      "highlight": [
+        5,
+        6,
+        13
+      ],
+      "code": "# local.rules  (Suricata 7)  -  sid 1000000+ is reserved for local signatures\n\nalert http $EXTERNAL_NET any -> $HTTP_SERVERS any ( \\\n    msg:\"LOCAL WEB Directory traversal attempt in URI\"; \\\n    flow:established,to_server; \\\n    http.uri; content:\"../\"; fast_pattern; \\\n    classtype:web-application-attack; \\\n    sid:1000101; rev:2;)\n\nalert tcp $EXTERNAL_NET any -> $HOME_NET 22 ( \\\n    msg:\"LOCAL SCAN Possible SSH brute force\"; \\\n    flow:to_server; flags:S; \\\n    detection_filter:track by_src, count 20, seconds 60; \\\n    classtype:attempted-recon; \\\n    sid:1000102; rev:1;)"
+    },
+    {
+      "id": "reading",
+      "type": "text",
+      "markdown": "## Reading an alert\n\nA well-formed alert gives you the *who*, *what* and *when*: timestamp, signature ID and message, classification and priority, source and destination address and port, protocol, and the action taken (`allowed` for IDS, `blocked` for IPS). Suricata writes these as JSON lines to `eve.json`, together with protocol records (HTTP, DNS, TLS) that share the same `flow_id`. That shared identifier is what lets you jump from an alert to the request and response that triggered it.\n\nThe alert message is a hypothesis, not a conclusion. Always look at the evidence behind it: the payload, the server's response and what happened next."
+    },
+    {
+      "id": "eve-term",
+      "type": "terminal",
+      "title": "Triage of two directory traversal alerts in Suricata's eve.json",
+      "prompt": "analyst@sensor01:~$",
+      "lines": [
+        {
+          "comment": "List the latest alerts in compact form."
+        },
+        {
+          "cmd": "jq -c 'select(.event_type==\"alert\") | {ts:.timestamp, flow:.flow_id, src:.src_ip, dst:.dest_ip, sid:.alert.signature_id, action:.alert.action}' /var/log/suricata/eve.json | tail -2",
+          "output": "{\"ts\":\"2026-11-07T22:14:09.118+0000\",\"flow\":1184529033712214,\"src\":\"10.0.5.40\",\"dst\":\"10.0.20.15\",\"sid\":1000101,\"action\":\"allowed\"}\n{\"ts\":\"2026-11-08T03:51:44.602+0000\",\"flow\":2290417765104338,\"src\":\"198.51.100.23\",\"dst\":\"10.0.20.15\",\"sid\":1000101,\"action\":\"allowed\"}"
+        },
+        {
+          "comment": "Same rule, two sources. Follow each flow_id to the HTTP record to see the request and the server's answer."
+        },
+        {
+          "cmd": "jq -c 'select(.event_type==\"http\" and .flow_id==1184529033712214) | {url:.http.url, ua:.http.http_user_agent, status:.http.status}' /var/log/suricata/eve.json",
+          "output": "{\"url\":\"/index.php?page=../../../../etc/passwd\",\"ua\":\"Mozilla/5.0 (compatible; Nessus SOAP)\",\"status\":404}"
+        },
+        {
+          "comment": "10.0.5.40 is the authorised vulnerability scanner, and the server answered 404: a benign, expected alert. Candidate for narrow tuning."
+        },
+        {
+          "cmd": "jq -c 'select(.event_type==\"http\" and .flow_id==2290417765104338) | {url:.http.url, ua:.http.http_user_agent, status:.http.status, bytes:.http.length}' /var/log/suricata/eve.json",
+          "output": "{\"url\":\"/download.php?file=../../../../etc/passwd\",\"ua\":\"curl/8.5.0\",\"status\":200,\"bytes\":1834}"
+        },
+        {
+          "comment": "An unknown external host, a vulnerable-looking parameter, HTTP 200 and 1,834 bytes returned: the attack probably succeeded. True positive, escalate now."
+        }
+      ],
+      "caption": "Fictional sensor data using documentation address ranges."
+    },
+    {
+      "id": "triage-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Triage path for an IDS alert",
+      "caption": "Every alert ends in a decision: escalate, close with a reason, or tune, and every decision is documented.",
+      "data": {
+        "token": "sid 1000101",
+        "nodes": [
+          {
+            "id": "queue",
+            "label": "Alert queue",
+            "sub": "SIEM / FMC",
+            "icon": "alert"
+          },
+          {
+            "id": "rule",
+            "label": "Read the rule",
+            "sub": "What did it match?",
+            "icon": "file"
+          },
+          {
+            "id": "evid",
+            "label": "Check the evidence",
+            "sub": "Payload, response, PCAP",
+            "icon": "eye"
+          },
+          {
+            "id": "ctx",
+            "label": "Add context",
+            "sub": "Asset, owner, scanner list",
+            "icon": "database"
+          },
+          {
+            "id": "verdict",
+            "label": "Verdict",
+            "sub": "TP / FP",
+            "icon": "shield"
+          },
+          {
+            "id": "esc",
+            "label": "Escalate",
+            "sub": "Incident ticket",
+            "icon": "user"
+          },
+          {
+            "id": "tune",
+            "label": "Tune",
+            "sub": "Suppress / threshold",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "queue",
+            "caption": "An alert arrives: directory traversal against the public web server from 198.51.100.23.",
+            "tone": "warning"
+          },
+          {
+            "at": "rule",
+            "caption": "The analyst reads the rule: it matched '../' in the normalised URI of an established HTTP session."
+          },
+          {
+            "at": "evid",
+            "caption": "The HTTP record shows /etc/passwd requested, status 200 and 1,834 bytes returned.",
+            "tone": "attack"
+          },
+          {
+            "at": "ctx",
+            "caption": "The source is unknown and the server is internet-facing and in scope for customer data."
+          },
+          {
+            "at": "verdict",
+            "caption": "Verdict: true positive with likely impact.",
+            "tone": "danger"
+          },
+          {
+            "at": "esc",
+            "caption": "The analyst opens a high-priority incident with the alert, HTTP record and PCAP attached.",
+            "tone": "success"
+          },
+          {
+            "at": "queue",
+            "token": "sid 1000101 (scanner)",
+            "caption": "A second alert from the same rule comes from 10.0.5.40."
+          },
+          {
+            "at": "ctx",
+            "token": "sid 1000101 (scanner)",
+            "caption": "Context: 10.0.5.40 is the approved vulnerability scanner and the server returned 404."
+          },
+          {
+            "at": "tune",
+            "token": "sid 1000101 (scanner)",
+            "caption": "Benign and expected: suppress this sid for this one source only, and record the change.",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "verdicts",
+      "type": "text",
+      "markdown": "## True positives, false positives and the verdict\n\n| | Malicious activity happened | No malicious activity |\n|:--|:--|:--|\n| **Alert fired** | **True positive (TP)**: escalate | **False positive (FP)**: close with a reason, consider tuning |\n| **No alert** | **False negative (FN)**: the dangerous blind spot | **True negative (TN)**: correct silence |\n\nMany SOCs also use **benign true positive** for alerts that correctly detect real behaviour that turns out to be authorised, such as a penetration test or a vulnerability scanner. To reach a verdict, work through five questions:\n\n1. **Did the rule match what it claims?** Look at the actual payload, not just the message.\n2. **Is the target relevant?** An exploit for IIS against a Linux Apache server cannot succeed, though it still shows hostile intent.\n3. **Did it succeed?** Check response codes, response sizes and follow-up traffic, such as the target connecting outbound shortly afterwards.\n4. **Who is the source?** A known scanner, a partner, a cloud provider or an unknown host?\n5. **Is it part of a pattern?** Correlate with other alerts, flow records and endpoint telemetry.\n\nWrite the verdict and the evidence in the ticket. A closed alert with \"FP\" and no reasoning is useless to the next analyst; for the full escalation process see [Incident Handling and SOC Playbooks](/learn/cisco-security-certification-track/incident-handling-and-soc-playbooks)."
+    },
+    {
+      "id": "tuning",
+      "type": "text",
+      "markdown": "## Tuning without going blind\n\nAlert fatigue is a real security risk: when analysts drown in noise, they miss the alert that matters. Tuning reduces noise, but every change also reduces visibility, so make the **narrowest change that solves the problem**:\n\n1. **Fix the variables first.** Wrong `$HOME_NET` or `$HTTP_SERVERS` values cause many false positives and false negatives.\n2. **Suppress for a specific source or destination**, such as the approved scanner, rather than for everyone.\n3. **Threshold or rate-limit** rules that are useful but chatty.\n4. **Modify the rule**, for example by adding `flow` or a sticky buffer, and increase `rev`.\n5. **Disable a rule** only when it cannot apply to your environment, such as a signature for software you do not run.\n\nRecord who changed what, when and why, and review suppressions regularly; scanners get new addresses and \"temporary\" exceptions tend to become permanent. Advanced tuning is covered later in [Rule, Filter and Policy Tuning](/learn/cisco-security-certification-track/rule-filter-and-policy-tuning)."
+    },
+    {
+      "id": "threshold",
+      "type": "code",
+      "language": "plain",
+      "filename": "threshold.config",
+      "caption": "Narrow tuning: the suppression applies to one rule and one address, and carries a change reference and review date.",
+      "highlight": [
+        5,
+        8
+      ],
+      "code": "# threshold.config  (Suricata)\n\n# Approved vulnerability scanner: suppress sid 1000101 for this source only\n# Change CHG-2291, approved by SOC lead, review 2027-02-01\nsuppress gen_id 1, sig_id 1000101, track by_src, ip 10.0.5.40\n\n# Useful but noisy: alert at most once per source every 10 minutes\nthreshold gen_id 1, sig_id 1000102, type limit, track by_src, count 1, seconds 600"
+    },
+    {
+      "id": "warn-disable",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Never \"fix\" noise by disabling a whole rule category",
+      "markdown": "Turning off all `web-application-attack` rules because one scanner is noisy creates a false-negative blind spot that attackers will happily use. Suppress by source, document the change, and set a review date."
+    },
+    {
+      "id": "tip-response",
+      "type": "callout",
+      "variant": "tip",
+      "title": "The response tells you more than the request",
+      "markdown": "Attack attempts are constant on any internet-facing server. What changes the priority is the outcome: HTTP 200 with an unusual response size, a new outbound connection from the target, or a second-stage download. Check these before you decide."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a Linux VM that **you own**; everything stays on the loopback interface.\n\n1. Install Suricata from your distribution's packages and add this line to a local rules file referenced in `suricata.yaml`:\n   `alert http any any -> any any (msg:\"LOCAL LAB marker\"; http.uri; content:\"/lab-marker-1142\"; sid:1000999; rev:1;)`\n2. Start `python3 -m http.server 8080` in one terminal and `sudo suricata -i lo` in another.\n3. Run `curl http://127.0.0.1:8080/lab-marker-1142`, then find the alert with `jq 'select(.event_type==\"alert\")' /var/log/suricata/eve.json`.\n4. Use the alert's `flow_id` to find the matching `http` record and its status code.\n5. Add a `suppress` line for 127.0.0.1 to `threshold.config`, restart Suricata, repeat the request and confirm that no new alert appears."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "IDS",
+          "definition": "Intrusion detection system: inspects a copy of traffic and raises alerts but cannot block."
+        },
+        {
+          "term": "IPS",
+          "definition": "Intrusion prevention system: sits inline and can drop, reset or block malicious traffic."
+        },
+        {
+          "term": "Signature (rule)",
+          "definition": "A pattern with conditions that an IDS/IPS matches against traffic, identified by a sid."
+        },
+        {
+          "term": "sid / rev",
+          "definition": "The unique signature identifier and its revision number; local rules use sid 1000000 and above."
+        },
+        {
+          "term": "True positive",
+          "definition": "An alert that correctly identifies malicious activity."
+        },
+        {
+          "term": "False positive",
+          "definition": "An alert that fires on benign activity."
+        },
+        {
+          "term": "False negative",
+          "definition": "Malicious activity that produced no alert; the most dangerous outcome."
+        },
+        {
+          "term": "Suppression",
+          "definition": "A tuning entry that silences a specific rule for a specific source or destination."
+        },
+        {
+          "term": "Alert fatigue",
+          "definition": "Desensitisation caused by excessive alerts, leading analysts to miss real threats."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which device can drop a malicious packet before it reaches the server?",
+          "options": [
+            "An IDS connected to a SPAN port",
+            "An IPS deployed inline",
+            "A NetFlow collector",
+            "A SIEM"
+          ],
+          "answer": 1,
+          "explanation": "Only an inline device sees packets before they are forwarded and can drop them. An IDS on a SPAN port receives a copy and can only alert."
+        },
+        {
+          "question": "In the rule option flow:established,to_server, what does to_server mean?",
+          "options": [
+            "Match only packets travelling from the client to the server",
+            "Send the alert to the management server",
+            "Block the server's response",
+            "Match traffic in both directions"
+          ],
+          "answer": 0,
+          "explanation": "flow restricts matching to a session state and direction. established,to_server means inside an established session, client-to-server."
+        },
+        {
+          "question": "A traversal alert fires from an unknown external IP, and the HTTP record shows status 200 with an unusually large response. What is the best verdict?",
+          "options": [
+            "False positive: close it",
+            "True positive with likely impact: escalate",
+            "True negative",
+            "Disable the rule because it is noisy"
+          ],
+          "answer": 1,
+          "explanation": "The payload matches, the source is unknown and the response suggests success. That is a true positive with impact and needs escalation."
+        },
+        {
+          "question": "Which tuning actions are appropriate for alerts caused by the approved vulnerability scanner? (Choose all that apply.)",
+          "options": [
+            "Suppress the specific sid for the scanner's IP address only",
+            "Disable every web-attack rule on the sensor",
+            "Document the change with a reason and a review date",
+            "Delete the alerts from the SIEM so the dashboard looks clean"
+          ],
+          "answer": [
+            0,
+            2
+          ],
+          "explanation": "Make the narrowest change and document it. Disabling whole categories creates blind spots, and deleting alerts destroys evidence."
+        },
+        {
+          "question": "Which questions help decide whether an IDS alert is a true positive? (Choose all that apply.)",
+          "options": [
+            "Does the payload actually contain what the rule describes?",
+            "Is the targeted software actually running on the destination?",
+            "Did the server's response or follow-up traffic indicate success?",
+            "Is the alert message written in capital letters?"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Verify the match, the relevance of the target and the outcome. The formatting of the message tells you nothing about the traffic."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- An **IDS** watches a copy of traffic and alerts; an **IPS** sits inline and can block. Signature engines such as Snort and Suricata are precise for known threats; anomaly detection adds coverage at the cost of more noise.\n- A rule has a **header** (action, protocol, addresses, ports, direction) and **options** (`msg`, `flow`, `content` with sticky buffers, `classtype`, `sid`, `rev`, thresholds). The tighter the match, the better the alert.\n- Treat the alert message as a hypothesis: check the payload, the relevance of the target, the response and the context, then record a **TP / FP** verdict with evidence.\n- Tune narrowly: fix variables, suppress by source, threshold noisy rules, document every change and review it. Never trade away visibility to make the queue look clean."
+    }
+  ],
+  "ar": {
+    "title": "تفسير تنبيهات أنظمة IDS/IPS",
+    "summary": "اقرأ قواعد Snort وSuricata والتنبيهات الناتجة عنها، وافرز التنبيهات وصولًا إلى حكم بأنها إيجابية صحيحة أو كاذبة بالاستناد إلى الحمولة والاستجابة والسياق، واضبط القواعد كثيرة الضجيج دون أن تصنع نقاطًا عمياء.",
+    "objectives": [
+      "المقارنة بين نشر IDS ونشر IPS، وبين الكشف القائم على التواقيع والشذوذ وتحليل البروتوكولات",
+      "تحديد حقول الترويسة والخيارات في قاعدة Snort/Suricata",
+      "تتبّع التنبيه وصولًا إلى أدلته في الملف eve.json الخاص بـSuricata",
+      "تصنيف التنبيهات إلى إيجابي صحيح وإيجابي كاذب وسلبي كاذب وسلبي صحيح",
+      "تطبيق ضبط محدود النطاق وموثَّق باستخدام الكتم والعتبات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "صباح الاثنين، الساعة الثامنة. تضمّ قائمة انتظار نظام كشف التسلل 412 تنبيهًا جديدًا من عطلة نهاية الأسبوع؛ معظمها ضجيج، وقليل منها مثير للاهتمام، وربما واحد منها بالغ الأهمية. ولا يستطيع أحد التحقيق فيها كلها بعمق، ولذا فإن المهارة الحقيقية للمحلّل هي أن **يقرّر بسرعة وبدقة** أيّها هو أيّها.\n\nيشرح هذا الدرس كيف تكشف محركات IDS وIPS، مثل Snort وSuricata، الهجمات، وكيف تقرأ القاعدة والتنبيه الناتج عنها، وكيف تصل إلى حكم بأن التنبيه إيجابي صحيح أو إيجابي كاذب، وكيف تضبط القواعد كثيرة الضجيج دون أن تفقد الرؤية. ويبني على درس [جدران الحماية وترشيح الشبكات](/learn/cisco-security-certification-track/firewalls-and-network-filtering) وعلى الدرس السابق [تحليل التسلل الشبكي: تحليل الحزم والبروتوكولات](/learn/cisco-security-certification-track/network-intrusion-analysis-packet-and-protocol-analysis)."
+      },
+      {
+        "id": "ids-ips",
+        "type": "text",
+        "markdown": "## أنظمة IDS وIPS وأساليب الكشف\n\nيتلقى **نظام كشف التسلل (IDS)** نسخة من الحركة عبر منفذ SPAN أو جهاز TAP، ويُطلق التنبيهات، لكنه لا يستطيع إيقاف أي شيء. أما **نظام منع التسلل (IPS)** فيوضع **على خط الحركة (Inline)**، فتمرّ كل حزمة من خلاله، ويستطيع إسقاط الحركة الخبيثة أو إعادة ضبطها أو حظرها في الوقت الفعلي. وثمن نظام IPS هو المخاطرة؛ إذ قد تحجب قاعدةٌ سيئة في وضع المنع حركةً مشروعة للأعمال.\n\n| الأسلوب | آلية العمل | نقطة القوة | نقطة الضعف |\n|:--|:--|:--|:--|\n| **القائم على التواقيع (Signature-based)** | يطابق الحركة مع أنماط معروفة (قواعد) | دقيق وقابل للتفسير، وإيجابياته الكاذبة قليلة مع التهديدات المعروفة | يُفلت الهجمات الجديدة التي لا توقيع لها |\n| **القائم على الشذوذ (Anomaly-based)** | يتعلم خطًّا أساسيًا ويُنبّه عند الانحراف عنه | قد يكشف هجمات مجهولة | إيجابيات كاذبة أكثر، ويحتاج إلى خط أساس مستقر |\n| **تحليل البروتوكول أو السياسة** | يفحص الحركة وفق معايير البروتوكولات والسياسة المحلية | يلتقط الحركة المشوّهة أو المحظورة | يقتصر على ما تفهمه وحدات فك الترميز |\n\nويُعدّ **Snort** (الذي تطوّره Cisco، وهو المحرك المدمج في Cisco Secure Firewall Threat Defense) و**Suricata** أكثر محركات التواقيع المفتوحة انتشارًا، ويستخدم كلاهما لغتَي قواعد متقاربتين جدًا. وتتولى Cisco Talos نشر مجموعات قواعد Snort الرئيسية وصيانتها."
+      },
+      {
+        "id": "anatomy",
+        "type": "text",
+        "markdown": "## تشريح القاعدة\n\nتتكون القاعدة من **ترويسة (Header)** تحدّد *أيّ حركة* تُفحص، ومن **خيارات (Options)** بين قوسين تحدّد *عمّا يُبحث* و*كيف يُبلَّغ عنه*.\n\n| الجزء | مثال | المعنى |\n|:--|:--|:--|\n| الإجراء (Action) | `alert` | ما يُفعل عند المطابقة: `alert` أو `drop` أو `reject` أو `pass` (ويتطلب الإسقاط والرفض وضع التشغيل على خط الحركة) |\n| البروتوكول | `http` | `tcp` أو `udp` أو `icmp` أو `ip`، أو بروتوكول تطبيقات مثل `http` و`dns` و`tls` |\n| المصدر والمنفذ | `$EXTERNAL_NET any` | متغيرات معرّفة في إعدادات المحرك |\n| الاتجاه | `->` | من المصدر إلى الوجهة (و`<>` تعني الاتجاهين) |\n| الوجهة والمنفذ | `$HTTP_SERVERS any` | الجهة المحمية |\n| `msg` | `\"LOCAL WEB Directory traversal...\"` | النص الذي يراه المحلّل في التنبيه |\n| `flow` | `established,to_server` | المطابقة داخل جلسة قائمة فقط، ومن العميل إلى الخادم |\n| `http.uri` مع `content` | `\"../\"` | المخزن اللاصق (Sticky Buffer) يختار عنوان URI بعد تطبيعه، و`content` يبحث فيه |\n| `classtype` | `web-application-attack` | الفئة التي تحدّد الأولوية الافتراضية |\n| `sid` و`rev` | `1000101` و`2` | المعرّف الفريد للتوقيع ورقم مراجعته، والقواعد المحلية تستخدم sid من 1000000 فما فوق |\n| `detection_filter` و`threshold` | `count 20, seconds 60` | شروط معدّلية لتقليل الضجيج أو لكشف هجمات التخمين |\n\nاقرأ الخيارات بوصفها قائمة تحقّق؛ فجودة التنبيه من جودة المطابقة. والقاعدة التي تبحث عن `../` في الحزمة كلها ستُطلق التنبيه أكثر بكثير من قاعدة مقيّدة بعنوان URI المطبَّع في طلب HTTP ضمن جلسة قائمة."
+      },
+      {
+        "id": "rules",
+        "type": "code",
+        "language": "plain",
+        "filename": "local.rules",
+        "caption": "قاعدتان محليتان: الأولى تفحص عنوان URI المطبَّع لطلبات HTTP في الجلسات القائمة فقط، والثانية تُطلق التنبيه حين يفتح مصدر واحد أكثر من 20 اتصال SSH خلال 60 ثانية.",
+        "highlight": [
+          5,
+          6,
+          13
+        ],
+        "code": "# local.rules  (Suricata 7)  -  sid 1000000+ is reserved for local signatures\n\nalert http $EXTERNAL_NET any -> $HTTP_SERVERS any ( \\\n    msg:\"LOCAL WEB Directory traversal attempt in URI\"; \\\n    flow:established,to_server; \\\n    http.uri; content:\"../\"; fast_pattern; \\\n    classtype:web-application-attack; \\\n    sid:1000101; rev:2;)\n\nalert tcp $EXTERNAL_NET any -> $HOME_NET 22 ( \\\n    msg:\"LOCAL SCAN Possible SSH brute force\"; \\\n    flow:to_server; flags:S; \\\n    detection_filter:track by_src, count 20, seconds 60; \\\n    classtype:attempted-recon; \\\n    sid:1000102; rev:1;)"
+      },
+      {
+        "id": "reading",
+        "type": "text",
+        "markdown": "## قراءة التنبيه\n\nيمنحك التنبيه الجيد الصياغة إجابات *من* و*ماذا* و*متى*: الطابع الزمني، ومعرّف التوقيع ورسالته، والتصنيف والأولوية، وعنوانَي المصدر والوجهة ومنفذيهما، والبروتوكول، والإجراء المتخذ (`allowed` في IDS و`blocked` في IPS). ويكتب Suricata هذه البيانات أسطرَ JSON في الملف `eve.json`، مع سجلات البروتوكولات (HTTP وDNS وTLS) التي تتشارك المعرّف `flow_id` نفسه. وهذا المعرّف المشترك هو ما يتيح لك الانتقال من التنبيه إلى الطلب والاستجابة اللذين تسبّبا فيه.\n\nرسالة التنبيه فرضية لا استنتاج؛ فانظر دائمًا إلى الأدلة التي تقف خلفها: الحمولة، واستجابة الخادم، وما حدث بعد ذلك."
+      },
+      {
+        "id": "eve-term",
+        "type": "terminal",
+        "title": "فرز تنبيهين لاجتياز المجلدات في الملف eve.json الخاص بـSuricata",
+        "prompt": "analyst@sensor01:~$",
+        "lines": [
+          {
+            "comment": "اعرض أحدث التنبيهات بصيغة مختصرة."
+          },
+          {
+            "cmd": "jq -c 'select(.event_type==\"alert\") | {ts:.timestamp, flow:.flow_id, src:.src_ip, dst:.dest_ip, sid:.alert.signature_id, action:.alert.action}' /var/log/suricata/eve.json | tail -2",
+            "output": "{\"ts\":\"2026-11-07T22:14:09.118+0000\",\"flow\":1184529033712214,\"src\":\"10.0.5.40\",\"dst\":\"10.0.20.15\",\"sid\":1000101,\"action\":\"allowed\"}\n{\"ts\":\"2026-11-08T03:51:44.602+0000\",\"flow\":2290417765104338,\"src\":\"198.51.100.23\",\"dst\":\"10.0.20.15\",\"sid\":1000101,\"action\":\"allowed\"}"
+          },
+          {
+            "comment": "القاعدة نفسها من مصدرين. تتبّع كل flow_id إلى سجل HTTP لترى الطلب وجواب الخادم."
+          },
+          {
+            "cmd": "jq -c 'select(.event_type==\"http\" and .flow_id==1184529033712214) | {url:.http.url, ua:.http.http_user_agent, status:.http.status}' /var/log/suricata/eve.json",
+            "output": "{\"url\":\"/index.php?page=../../../../etc/passwd\",\"ua\":\"Mozilla/5.0 (compatible; Nessus SOAP)\",\"status\":404}"
+          },
+          {
+            "comment": "العنوان 10.0.5.40 هو ماسح الثغرات المُصرَّح به، وقد ردّ الخادم بـ404: تنبيه بريء ومتوقَّع، ومرشّح لضبط محدود النطاق."
+          },
+          {
+            "cmd": "jq -c 'select(.event_type==\"http\" and .flow_id==2290417765104338) | {url:.http.url, ua:.http.http_user_agent, status:.http.status, bytes:.http.length}' /var/log/suricata/eve.json",
+            "output": "{\"url\":\"/download.php?file=../../../../etc/passwd\",\"ua\":\"curl/8.5.0\",\"status\":200,\"bytes\":1834}"
+          },
+          {
+            "comment": "مضيف خارجي مجهول، ومعامل يبدو قابلًا للاستغلال، واستجابة HTTP 200 مع 1834 بايت: الأرجح أن الهجوم نجح. إيجابي صحيح، صعِّد فورًا."
+          }
+        ],
+        "caption": "بيانات مستشعر افتراضية تستخدم نطاقات العناوين المخصّصة للتوثيق."
+      },
+      {
+        "id": "triage-flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "مسار فرز تنبيه IDS",
+        "caption": "ينتهي كل تنبيه بقرار: التصعيد، أو الإغلاق مع ذكر السبب، أو الضبط، ويوثَّق كل قرار.",
+        "data": {
+          "token": "sid 1000101",
+          "nodes": [
+            {
+              "id": "queue",
+              "label": "قائمة التنبيهات",
+              "sub": "SIEM / FMC",
+              "icon": "alert"
+            },
+            {
+              "id": "rule",
+              "label": "قراءة القاعدة",
+              "sub": "ماذا طابقت؟",
+              "icon": "file"
+            },
+            {
+              "id": "evid",
+              "label": "فحص الأدلة",
+              "sub": "الحمولة والاستجابة وPCAP",
+              "icon": "eye"
+            },
+            {
+              "id": "ctx",
+              "label": "إضافة السياق",
+              "sub": "الأصل والمالك وقائمة الماسحات",
+              "icon": "database"
+            },
+            {
+              "id": "verdict",
+              "label": "الحكم",
+              "sub": "إيجابي صحيح / كاذب",
+              "icon": "shield"
+            },
+            {
+              "id": "esc",
+              "label": "التصعيد",
+              "sub": "تذكرة حادث",
+              "icon": "user"
+            },
+            {
+              "id": "tune",
+              "label": "الضبط",
+              "sub": "الكتم / العتبة",
+              "icon": "log"
+            }
+          ],
+          "steps": [
+            {
+              "at": "queue",
+              "caption": "يصل تنبيه: محاولة اجتياز مجلدات ضد خادم الويب العام من العنوان 198.51.100.23.",
+              "tone": "warning"
+            },
+            {
+              "at": "rule",
+              "caption": "يقرأ المحلّل القاعدة: لقد طابقت ‎'../'‎ في عنوان URI المطبَّع ضمن جلسة HTTP قائمة."
+            },
+            {
+              "at": "evid",
+              "caption": "يُظهر سجل HTTP طلب ‎/etc/passwd‎، وحالة 200، وإعادة 1834 بايت.",
+              "tone": "attack"
+            },
+            {
+              "at": "ctx",
+              "caption": "المصدر مجهول، والخادم مكشوف للإنترنت ويقع ضمن نطاق بيانات العملاء."
+            },
+            {
+              "at": "verdict",
+              "caption": "الحكم: إيجابي صحيح مع أثر مرجَّح.",
+              "tone": "danger"
+            },
+            {
+              "at": "esc",
+              "caption": "يفتح المحلّل حادثًا عالي الأولوية ويُرفق به التنبيه وسجل HTTP وملف PCAP.",
+              "tone": "success"
+            },
+            {
+              "at": "queue",
+              "token": "sid 1000101 (الماسح)",
+              "caption": "يصل تنبيه ثانٍ من القاعدة نفسها، مصدره العنوان 10.0.5.40."
+            },
+            {
+              "at": "ctx",
+              "token": "sid 1000101 (الماسح)",
+              "caption": "السياق: العنوان 10.0.5.40 هو ماسح الثغرات المعتمد، وقد ردّ الخادم بـ404."
+            },
+            {
+              "at": "tune",
+              "token": "sid 1000101 (الماسح)",
+              "caption": "بريء ومتوقَّع: يُكتم هذا التوقيع لهذا المصدر وحده، ويُسجَّل التغيير.",
+              "tone": "secure"
+            }
+          ]
+        }
+      },
+      {
+        "id": "verdicts",
+        "type": "text",
+        "markdown": "## الإيجابي الصحيح والإيجابي الكاذب والحكم\n\n| | وقع نشاط خبيث | لم يقع نشاط خبيث |\n|:--|:--|:--|\n| **أُطلق تنبيه** | **إيجابي صحيح (True Positive)**: صعِّد | **إيجابي كاذب (False Positive)**: أغلقه مع ذكر السبب، وفكّر في الضبط |\n| **لم يُطلق تنبيه** | **سلبي كاذب (False Negative)**: النقطة العمياء الخطرة | **سلبي صحيح (True Negative)**: صمتٌ في محلّه |\n\nوتستخدم مراكز عمليات أمنية كثيرة أيضًا مصطلح **الإيجابي الصحيح البريء (Benign True Positive)** للتنبيهات التي تكشف بدقة سلوكًا حقيقيًا يتبيّن أنه مُصرَّح به، كاختبار الاختراق أو ماسح الثغرات. وللوصول إلى الحكم، أجب عن خمسة أسئلة:\n\n1. **هل طابقت القاعدة ما تدّعيه؟** انظر إلى الحمولة الفعلية، لا إلى الرسالة وحدها.\n2. **هل الهدف معنيّ بالهجوم؟** فاستغلالٌ موجّه إلى IIS لا يمكن أن ينجح ضد خادم Apache على Linux، وإن ظل دليلًا على نية عدائية.\n3. **هل نجح الهجوم؟** افحص رموز الاستجابة وأحجامها والحركة اللاحقة، كأن يتصل الهدف بجهة خارجية بعد قليل.\n4. **من المصدر؟** ماسح معروف، أم شريك، أم مزوّد سحابي، أم مضيف مجهول؟\n5. **هل هو جزء من نمط أوسع؟** اربطه بالتنبيهات الأخرى وسجلات التدفق وبيانات النقاط الطرفية.\n\nاكتب الحكم والأدلة في التذكرة؛ فالتنبيه المغلق بكلمة «FP» دون تعليل لا يفيد المحلّل التالي. وللاطلاع على عملية التصعيد كاملةً راجع درس [معالجة الحوادث وأدلة تشغيل مركز العمليات الأمنية](/learn/cisco-security-certification-track/incident-handling-and-soc-playbooks)."
+      },
+      {
+        "id": "tuning",
+        "type": "text",
+        "markdown": "## الضبط دون فقدان الرؤية\n\nإن إرهاق التنبيهات (Alert Fatigue) خطر أمني حقيقي؛ فحين يغرق المحلّلون في الضجيج يفوتهم التنبيه المهم. والضبط (Tuning) يقلّل الضجيج، لكن كل تغيير يقلّل الرؤية أيضًا، ولذا أجرِ **أضيق تغيير يحلّ المشكلة**:\n\n1. **أصلح المتغيرات أولًا.** فالقيم الخاطئة في `$HOME_NET` أو `$HTTP_SERVERS` تسبّب كثيرًا من الإيجابيات الكاذبة والسلبيات الكاذبة.\n2. **اكتم التنبيه لمصدر أو وجهة بعينها**، كالماسح المعتمد، لا للجميع.\n3. **ضع عتبة أو حدًّا للمعدّل** في القواعد المفيدة لكنها كثيرة التنبيه.\n4. **عدّل القاعدة**، كأن تضيف `flow` أو مخزنًا لاصقًا، وارفع قيمة `rev`.\n5. **عطّل القاعدة** فقط حين يستحيل انطباقها على بيئتك، كتوقيع لبرنامج لا تستخدمه.\n\nسجّل من غيّر ماذا، ومتى، ولماذا، وراجع حالات الكتم بانتظام؛ فالماسحات تتغيّر عناوينها، والاستثناءات «المؤقتة» تميل إلى أن تصبح دائمة. ويُتناول الضبط المتقدم لاحقًا في درس [ضبط القواعد والمرشّحات والسياسات](/learn/cisco-security-certification-track/rule-filter-and-policy-tuning)."
+      },
+      {
+        "id": "threshold",
+        "type": "code",
+        "language": "plain",
+        "filename": "threshold.config",
+        "caption": "ضبط محدود النطاق: الكتم يقتصر على قاعدة واحدة وعنوان واحد، ويحمل مرجع تغيير وتاريخ مراجعة.",
+        "highlight": [
+          5,
+          8
+        ],
+        "code": "# threshold.config  (Suricata)\n\n# Approved vulnerability scanner: suppress sid 1000101 for this source only\n# Change CHG-2291, approved by SOC lead, review 2027-02-01\nsuppress gen_id 1, sig_id 1000101, track by_src, ip 10.0.5.40\n\n# Useful but noisy: alert at most once per source every 10 minutes\nthreshold gen_id 1, sig_id 1000102, type limit, track by_src, count 1, seconds 600"
+      },
+      {
+        "id": "warn-disable",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا «تعالج» الضجيج بتعطيل فئة قواعد كاملة",
+        "markdown": "إن إيقاف جميع قواعد `web-application-attack` لأن ماسحًا واحدًا كثير الضجيج يصنع نقطة عمياء من السلبيات الكاذبة سيستغلها المهاجمون بسرور. اكتم التنبيه حسب المصدر، ووثّق التغيير، وحدّد تاريخًا للمراجعة."
+      },
+      {
+        "id": "tip-response",
+        "type": "callout",
+        "variant": "tip",
+        "title": "الاستجابة تخبرك أكثر من الطلب",
+        "markdown": "محاولات الهجوم مستمرة على أي خادم مكشوف للإنترنت، وما يغيّر الأولوية هو النتيجة: استجابة HTTP 200 بحجم غير معتاد، أو اتصال صادر جديد من الهدف، أو تنزيل لمرحلة ثانية. افحص هذه الأمور قبل أن تقرّر."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم آلة Linux افتراضية **تملكها**، وكل شيء سيبقى على واجهة الاسترجاع (Loopback).\n\n1. ثبّت Suricata من حزم توزيعتك، وأضف هذا السطر إلى ملف قواعد محلي مُشار إليه في `suricata.yaml`:\n   `alert http any any -> any any (msg:\"LOCAL LAB marker\"; http.uri; content:\"/lab-marker-1142\"; sid:1000999; rev:1;)`\n2. شغّل `python3 -m http.server 8080` في طرفية، و`sudo suricata -i lo` في طرفية أخرى.\n3. نفّذ `curl http://127.0.0.1:8080/lab-marker-1142`، ثم اعثر على التنبيه بالأمر `jq 'select(.event_type==\"alert\")' /var/log/suricata/eve.json`.\n4. استخدم قيمة `flow_id` في التنبيه للعثور على سجل `http` المقابل ورمز حالته.\n5. أضف سطر `suppress` للعنوان 127.0.0.1 في `threshold.config`، وأعد تشغيل Suricata، وكرّر الطلب، وتحقّق من عدم ظهور تنبيه جديد."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "نظام كشف التسلل (IDS)",
+            "definition": "يفحص نسخة من الحركة ويُطلق التنبيهات، لكنه لا يستطيع الحظر."
+          },
+          {
+            "term": "نظام منع التسلل (IPS)",
+            "definition": "يوضع على خط الحركة، ويستطيع إسقاط الحركة الخبيثة أو إعادة ضبطها أو حظرها."
+          },
+          {
+            "term": "التوقيع أو القاعدة (Signature)",
+            "definition": "نمط مع شروط يطابقه نظام IDS/IPS مع الحركة، ويُعرَّف بمعرّف sid."
+          },
+          {
+            "term": "sid و rev",
+            "definition": "المعرّف الفريد للتوقيع ورقم مراجعته، والقواعد المحلية تستخدم sid من 1000000 فما فوق."
+          },
+          {
+            "term": "الإيجابي الصحيح (True Positive)",
+            "definition": "تنبيه يحدّد نشاطًا خبيثًا تحديدًا صحيحًا."
+          },
+          {
+            "term": "الإيجابي الكاذب (False Positive)",
+            "definition": "تنبيه يُطلَق على نشاط بريء."
+          },
+          {
+            "term": "السلبي الكاذب (False Negative)",
+            "definition": "نشاط خبيث لم يُطلَق له أي تنبيه، وهو أخطر النتائج."
+          },
+          {
+            "term": "الكتم (Suppression)",
+            "definition": "مُدخَل ضبط يُسكت قاعدة محددة لمصدر أو وجهة بعينها."
+          },
+          {
+            "term": "إرهاق التنبيهات (Alert Fatigue)",
+            "definition": "تبلّد ناجم عن كثرة التنبيهات، يجعل المحلّلين يُغفلون تهديدات حقيقية."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أيّ الأجهزة الآتية يستطيع إسقاط حزمة خبيثة قبل وصولها إلى الخادم؟",
+            "options": [
+              "نظام IDS موصول بمنفذ SPAN",
+              "نظام IPS منشور على خط الحركة",
+              "مُجمِّع NetFlow",
+              "نظام SIEM"
+            ],
+            "answer": 1,
+            "explanation": "لا يرى الحزم قبل تمريرها ويستطيع إسقاطها إلا جهاز على خط الحركة، أما IDS الموصول بمنفذ SPAN فيتلقى نسخة ولا يملك إلا التنبيه."
+          },
+          {
+            "question": "في خيار القاعدة flow:established,to_server، ماذا تعني to_server؟",
+            "options": [
+              "طابِق الحزم المتجهة من العميل إلى الخادم فقط",
+              "أرسل التنبيه إلى خادم الإدارة",
+              "احجب استجابة الخادم",
+              "طابِق الحركة في الاتجاهين"
+            ],
+            "answer": 0,
+            "explanation": "يقيّد الخيار flow المطابقة بحالة الجلسة واتجاهها، وتعني established,to_server داخل جلسة قائمة ومن العميل إلى الخادم."
+          },
+          {
+            "question": "يُطلَق تنبيه اجتياز مجلدات من عنوان IP خارجي مجهول، ويُظهر سجل HTTP الحالة 200 مع استجابة كبيرة على نحو غير معتاد. ما أفضل حكم؟",
+            "options": [
+              "إيجابي كاذب: أغلقه",
+              "إيجابي صحيح مع أثر مرجَّح: صعِّد",
+              "سلبي صحيح",
+              "عطّل القاعدة لأنها كثيرة الضجيج"
+            ],
+            "answer": 1,
+            "explanation": "الحمولة مطابقة، والمصدر مجهول، والاستجابة توحي بالنجاح؛ فهو إيجابي صحيح ذو أثر ويستوجب التصعيد."
+          },
+          {
+            "question": "أيّ إجراءات الضبط مناسبة للتنبيهات التي يسبّبها ماسح الثغرات المعتمد؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "كتم التوقيع المحدد لعنوان IP الخاص بالماسح فقط",
+              "تعطيل كل قواعد هجمات الويب على المستشعر",
+              "توثيق التغيير مع السبب وتاريخ المراجعة",
+              "حذف التنبيهات من SIEM كي تبدو لوحة المعلومات نظيفة"
+            ],
+            "answer": [
+              0,
+              2
+            ],
+            "explanation": "أجرِ أضيق تغيير ووثّقه؛ فتعطيل فئات كاملة يصنع نقاطًا عمياء، وحذف التنبيهات يُتلف الأدلة."
+          },
+          {
+            "question": "أيّ الأسئلة الآتية تساعد على تقرير ما إذا كان تنبيه IDS إيجابيًا صحيحًا؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "هل تحتوي الحمولة فعلًا على ما تصفه القاعدة؟",
+              "هل البرنامج المستهدف يعمل فعلًا على الوجهة؟",
+              "هل تشير استجابة الخادم أو الحركة اللاحقة إلى النجاح؟",
+              "هل رسالة التنبيه مكتوبة بأحرف كبيرة؟"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "تحقّق من المطابقة ومن صلة الهدف بالهجوم ومن النتيجة، أما تنسيق الرسالة فلا يخبرك شيئًا عن الحركة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يراقب **نظام IDS** نسخة من الحركة ويُنبّه، أما **نظام IPS** فيوضع على خط الحركة ويستطيع الحظر. ومحركات التواقيع مثل Snort وSuricata دقيقة في التهديدات المعروفة، ويضيف كشف الشذوذ تغطية أوسع على حساب ضجيج أكثر.\n- تتكون القاعدة من **ترويسة** (الإجراء والبروتوكول والعناوين والمنافذ والاتجاه) و**خيارات** (`msg` و`flow` و`content` مع المخازن اللاصقة و`classtype` و`sid` و`rev` والعتبات). وكلما كانت المطابقة أدق كان التنبيه أجود.\n- تعامَل مع رسالة التنبيه بوصفها فرضية: افحص الحمولة، وصلة الهدف بالهجوم، والاستجابة، والسياق، ثم سجّل حكمًا **إيجابيًا صحيحًا أو كاذبًا** مع الأدلة.\n- اضبط في أضيق نطاق: أصلح المتغيرات، واكتم حسب المصدر، وضع عتبات للقواعد كثيرة الضجيج، ووثّق كل تغيير وراجعه. ولا تقايض الرؤية أبدًا بقائمة انتظار تبدو نظيفة."
+      }
+    ]
+  }
+}

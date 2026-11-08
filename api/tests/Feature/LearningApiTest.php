@@ -126,6 +126,54 @@ class LearningApiTest extends TestCase
         $this->assertSame(3, LearningLesson::count());
     }
 
+    public function test_arabic_is_served_when_asked_for_and_falls_back_to_english(): void
+    {
+        $document = $this->document([
+            'title_ar' => 'الدرس الأول',
+            'summary_ar' => 'ملخص',
+            'blocks_ar' => [['id' => 'a', 'type' => 'text', 'markdown' => '## مرحبا']],
+        ]);
+        $document['course']['title_ar'] = 'دورة تجريبية';
+        app(CourseTransfer::class)->import($document);
+
+        $this->getJson('/api/learn/courses/demo/lessons/first', ['X-Language' => 'ar'])
+            ->assertOk()
+            ->assertJsonPath('data.title', 'الدرس الأول')
+            ->assertJsonPath('data.content_language', 'ar')
+            ->assertJsonPath('data.blocks.0.markdown', '## مرحبا')
+            ->assertJsonPath('data.course.title', 'دورة تجريبية')
+            ->assertJsonPath('data.next.title', 'Third lesson');
+
+        // No Arabic content: the English lesson is served, and said to be.
+        $this->getJson('/api/learn/courses/demo/lessons/third', ['X-Language' => 'ar'])
+            ->assertOk()
+            ->assertJsonPath('data.content_language', 'en')
+            ->assertJsonPath('data.title', 'Third lesson');
+
+        $this->getJson('/api/learn/courses/demo/lessons/first')
+            ->assertJsonPath('data.title', 'First lesson')
+            ->assertJsonPath('data.content_language', 'en');
+
+        $this->getJson('/api/learn/courses/demo', ['X-Language' => 'ar'])
+            ->assertJsonPath('data.stages.0.units.0.lessons.0.has_ar', true)
+            ->assertJsonPath('data.stages.0.units.0.lessons.2.has_ar', false);
+    }
+
+    public function test_fill_mode_adds_arabic_to_existing_lessons(): void
+    {
+        $transfer = app(CourseTransfer::class);
+        $transfer->import($this->document());
+
+        $transfer->import($this->document([
+            'title_ar' => 'الدرس الأول',
+            'blocks_ar' => [['id' => 'a', 'type' => 'text', 'markdown' => 'نص']],
+        ]), 'fill');
+
+        $lesson = LearningLesson::where('slug', 'first')->first();
+        $this->assertSame('الدرس الأول', $lesson->title_ar);
+        $this->assertSame('نص', $lesson->blocks_ar[0]['markdown']);
+    }
+
     public function test_admin_routes_require_authentication(): void
     {
         $this->getJson('/api/admin/learn/courses')->assertUnauthorized();
