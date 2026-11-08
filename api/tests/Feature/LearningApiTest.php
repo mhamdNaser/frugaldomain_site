@@ -1,0 +1,148 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Modules\Learning\database\seeders\LearningCurriculumSeeder;
+use App\Modules\Learning\Models\LearningCourse;
+use App\Modules\Learning\Models\LearningLesson;
+use App\Modules\Learning\Services\CourseTransfer;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Validation\ValidationException;
+use Tests\TestCase;
+
+class LearningApiTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private function document(array $lessonOverrides = []): array
+    {
+        return [
+            'format' => 'frugal-course@1',
+            'category' => ['slug' => 'cybersecurity', 'name' => 'Cybersecurity', 'color' => '#0891b2'],
+            'course' => ['slug' => 'demo', 'title' => 'Demo course', 'level' => 'beginner', 'language' => 'en', 'status' => 'published'],
+            'stages' => [[
+                'slug' => 'stage-one', 'title' => 'Stage one', 'code' => '100-160',
+                'units' => [[
+                    'slug' => 'unit-one', 'title' => 'Unit one',
+                    'lessons' => [
+                        array_merge([
+                            'slug' => 'first', 'title' => 'First lesson', 'status' => 'published',
+                            'blocks' => [
+                                ['type' => 'text', 'markdown' => '## Hello'],
+                                ['type' => 'animation', 'kind' => 'flow', 'data' => [
+                                    'nodes' => [['id' => 'a', 'label' => 'A']],
+                                    'steps' => [['at' => 'a', 'caption' => 'Here']],
+                                ], 'unknown_field' => 'dropped'],
+                            ],
+                        ], $lessonOverrides),
+                        ['slug' => 'second', 'title' => 'Second lesson', 'status' => 'draft'],
+                        ['slug' => 'third', 'title' => 'Third lesson', 'status' => 'published', 'blocks' => [['type' => 'divider']]],
+                    ],
+                ]],
+            ]],
+        ];
+    }
+
+    public function test_import_builds_the_tree_and_the_public_api_serves_it(): void
+    {
+        app(CourseTransfer::class)->import($this->document());
+
+        $this->getJson('/api/learn/categories')
+            ->assertOk()
+            ->assertJsonPath('data.0.slug', 'cybersecurity')
+            ->assertJsonPath('data.0.courses_count', 1);
+
+        $this->getJson('/api/learn/courses?category=cybersecurity')
+            ->assertOk()
+            ->assertJsonPath('data.0.slug', 'demo')
+            ->assertJsonPath('data.0.lessons_count', 3)
+            ->assertJsonPath('data.0.published_lessons_count', 2);
+
+        $this->getJson('/api/learn/courses/demo')
+            ->assertOk()
+            ->assertJsonPath('data.stages.0.code', '100-160')
+            ->assertJsonPath('data.stages.0.units.0.lessons.1.available', false);
+    }
+
+    public function test_lessons_link_to_published_neighbours_and_drafts_are_hidden(): void
+    {
+        app(CourseTransfer::class)->import($this->document());
+
+        $lesson = $this->getJson('/api/learn/courses/demo/lessons/first')
+            ->assertOk()
+            ->assertJsonPath('data.previous', null)
+            ->assertJsonPath('data.next.slug', 'third')
+            ->assertJsonPath('data.total', 2)
+            ->json('data');
+
+        $this->assertArrayNotHasKey('unknown_field', $lesson['blocks'][1]);
+        $this->getJson('/api/learn/courses/demo/lessons/second')->assertNotFound();
+    }
+
+    public function test_draft_courses_are_not_public(): void
+    {
+        $document = $this->document();
+        $document['course']['status'] = 'draft';
+        app(CourseTransfer::class)->import($document);
+
+        $this->getJson('/api/learn/courses')->assertOk()->assertJsonCount(0, 'data');
+        $this->getJson('/api/learn/courses/demo')->assertNotFound();
+    }
+
+    public function test_invalid_blocks_are_rejected(): void
+    {
+        $this->expectException(ValidationException::class);
+
+        app(CourseTransfer::class)->import($this->document([
+            'blocks' => [['type' => 'quiz', 'questions' => [['question' => 'Q?', 'options' => ['only one']]]]],
+        ]));
+    }
+
+    public function test_fill_mode_never_overwrites_edited_lessons(): void
+    {
+        $transfer = app(CourseTransfer::class);
+        $transfer->import($this->document());
+
+        LearningLesson::where('slug', 'first')->first()->update([
+            'blocks' => [['id' => 'x', 'type' => 'text', 'markdown' => 'Edited in the dashboard']],
+        ]);
+
+        $transfer->import($this->document(), 'fill');
+
+        $this->assertSame('Edited in the dashboard', LearningLesson::where('slug', 'first')->first()->blocks[0]['markdown']);
+        $this->assertSame(1, LearningCourse::count());
+    }
+
+    public function test_export_round_trips(): void
+    {
+        $transfer = app(CourseTransfer::class);
+        $course = $transfer->import($this->document());
+        $exported = $transfer->export($course);
+
+        $this->assertSame('frugal-course@1', $exported['format']);
+        $this->assertCount(3, $exported['stages'][0]['units'][0]['lessons']);
+
+        $transfer->import($exported, 'replace');
+        $this->assertSame(3, LearningLesson::count());
+    }
+
+    public function test_admin_routes_require_authentication(): void
+    {
+        $this->getJson('/api/admin/learn/courses')->assertUnauthorized();
+        $this->postJson('/api/admin/learn/import', [])->assertUnauthorized();
+    }
+
+    public function test_the_shipped_curriculum_seeds_and_is_idempotent(): void
+    {
+        $this->seed(LearningCurriculumSeeder::class);
+        $courses = LearningCourse::count();
+        $lessons = LearningLesson::count();
+
+        $this->assertSame(10, $courses);
+        $this->assertSame(655, $lessons);
+        $this->assertGreaterThan(0, LearningLesson::where('status', 'published')->count());
+
+        $this->seed(LearningCurriculumSeeder::class);
+        $this->assertSame($lessons, LearningLesson::count());
+    }
+}

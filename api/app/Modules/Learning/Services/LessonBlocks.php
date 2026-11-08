@@ -50,8 +50,10 @@ class LessonBlocks
         $blocks = array_values($blocks ?? []);
         $rules = [];
 
+        // Validated under a plain "blocks" key: the caller's attribute name
+        // may contain dots, which the validator would read as nesting.
         foreach ($blocks as $index => $block) {
-            $prefix = "{$attribute}.{$index}";
+            $prefix = "blocks.{$index}";
             $rules["{$prefix}.type"] = ['required', 'string', Rule::in(self::TYPES)];
             $type = is_array($block) ? ($block['type'] ?? null) : null;
 
@@ -60,15 +62,22 @@ class LessonBlocks
             }
         }
 
-        $validator = Validator::make([$attribute => $blocks], $rules);
-        $validator->after(function ($validator) use ($blocks, $attribute): void {
+        $validator = Validator::make(['blocks' => $blocks], $rules);
+        $validator->after(function ($validator) use ($blocks): void {
             foreach ($blocks as $index => $block) {
                 if (($block['type'] ?? null) === 'image' && empty($block['url']) && empty($block['media_id'])) {
-                    $validator->errors()->add("{$attribute}.{$index}.url", 'An image block needs an uploaded image or an image URL.');
+                    $validator->errors()->add("blocks.{$index}.url", 'An image block needs an uploaded image or an image URL.');
                 }
             }
         });
-        $validator->validate();
+
+        if ($validator->fails()) {
+            $messages = [];
+            foreach ($validator->errors()->toArray() as $key => $list) {
+                $messages[$attribute.substr($key, strlen('blocks'))] = $list;
+            }
+            throw ValidationException::withMessages($messages);
+        }
 
         return array_map(function (array $block, int $index): array {
             $clean = [
