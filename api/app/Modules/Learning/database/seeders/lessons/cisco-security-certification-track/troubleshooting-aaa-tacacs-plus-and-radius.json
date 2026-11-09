@@ -1,0 +1,352 @@
+{
+  "slug": "troubleshooting-aaa-tacacs-plus-and-radius",
+  "title": "Troubleshooting AAA: TACACS+ and RADIUS",
+  "summary": "Compare TACACS+ and RADIUS, configure IOS XE device administration and network access against Cisco ISE, and follow a structured workflow to find out why an AAA login or authorization fails.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Compare TACACS+ and RADIUS in transport, encryption, AAA separation and typical use",
+    "Configure IOS XE AAA method lists for TACACS+ device administration with a local fallback",
+    "Configure RADIUS servers, dead detection and automated testing on IOS XE",
+    "Use test aaa, show and debug commands together with ISE live logs to isolate AAA failures",
+    "Recognize the common causes of AAA failures: reachability, shared secrets, source interfaces, policy and authorization"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 02:00 an on-call engineer tries to SSH to a core switch during an outage and gets `% Authentication failed`. The password is correct. After twenty minutes she finds the cause: the switch sends TACACS+ from a new loopback address that ISE does not recognize, and the local fallback account was removed months ago.\n\nAAA (authentication, authorization and accounting) centralizes who may log in, what they may do and what they did. When it works, it is invisible. When it breaks, it can lock every administrator out of the network or block every user from the LAN. SCOR 350-701 expects you to configure and verify AAA for device management and network access. This lesson focuses on **why it fails** and how to prove it quickly."
+    },
+    {
+      "id": "compare",
+      "type": "text",
+      "markdown": "## TACACS+ versus RADIUS\n\nBoth protocols carry AAA between a network device (the client, or network access device, NAD) and a server such as **Cisco ISE**. They are built for different jobs:\n\n| Feature | TACACS+ | RADIUS |\n|:--|:--|:--|\n| Transport | TCP 49 | UDP 1812 (auth), 1813 (accounting); legacy 1645/1646 |\n| Encryption | Entire packet body encrypted with the shared secret | Only the password attribute is hidden; other attributes are visible |\n| AAA separation | Authentication, authorization and accounting are separate exchanges | Authentication and authorization are combined in Access-Accept |\n| Command authorization | Per-command, per-privilege | Not supported natively |\n| Typical use | **Device administration** (who can run which CLI commands) | **Network access** (802.1X, MAB, VPN, wireless) |\n| Standard | Cisco-originated, documented in RFC 8907 | IETF standard (RFC 2865/2866), many vendor-specific attributes |\n\nIn ISE, TACACS+ is handled by **Device Administration** policy sets and RADIUS by **Network Access** policy sets. Device Administration must also be explicitly enabled on each Policy Service Node (PSN) that should answer TACACS+, which is a frequent cause of silent failures in new deployments."
+    },
+    {
+      "id": "tacacs-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "A TACACS+ administrative login with command authorization",
+      "caption": "TACACS+ keeps authentication, authorization and accounting as separate exchanges, so each one can fail on its own.",
+      "data": {
+        "actors": [
+          { "id": "adm", "label": "Administrator", "sub": "10.10.99.25", "icon": "user" },
+          { "id": "sw", "label": "Core switch", "sub": "Loopback0 10.255.0.1", "icon": "switch" },
+          { "id": "ise", "label": "Cisco ISE PSN", "sub": "10.10.20.11 TCP/49", "icon": "server" }
+        ],
+        "steps": [
+          { "from": "adm", "to": "sw", "label": "SSH login", "detail": "user netadmin", "note": "The VTY line uses method list VTY-AUTH: group ISE-TACACS first, then local." },
+          { "from": "sw", "to": "ise", "label": "Authentication START", "detail": "encrypted with the shared secret", "tone": "secure", "note": "ISE first checks that 10.255.0.1 is a known network device with a matching TACACS+ secret." },
+          { "from": "ise", "to": "sw", "label": "REPLY: PASS", "tone": "success", "note": "The Device Admin policy set authenticates the user against Active Directory." },
+          { "from": "sw", "to": "ise", "label": "Authorization REQUEST", "detail": "service=shell", "note": "A separate exchange asks which shell profile applies." },
+          { "from": "ise", "to": "sw", "label": "PASS_ADD", "detail": "priv-lvl=15", "tone": "success", "note": "The shell profile returns the privilege level; the user lands in privileged EXEC mode." },
+          { "from": "adm", "to": "sw", "label": "reload", "tone": "warning", "note": "The administrator types a command that the command set does not permit." },
+          { "from": "sw", "to": "ise", "label": "Authorization REQUEST", "detail": "cmd=reload", "note": "Every level-15 command is sent for authorization before it runs." },
+          { "from": "ise", "to": "sw", "label": "FAIL", "tone": "blocked", "note": "The command set denies reload; the switch prints Command authorization failed." },
+          { "from": "sw", "to": "ise", "label": "Accounting START/STOP", "detail": "cmd, user, time", "tone": "secure", "note": "Accounting records give an audit trail of every session and command." }
+        ]
+      }
+    },
+    {
+      "id": "tacacs-config",
+      "type": "code",
+      "language": "cisco",
+      "filename": "core-sw-aaa-tacacs.cfg",
+      "caption": "TACACS+ device administration with a local fallback. Configure and test the local user before you apply the method lists to the VTY lines.",
+      "highlight": [3, 5, 10, 12, 13, 14],
+      "code": "username breakglass privilege 15 algorithm-type scrypt secret <LOCAL-FALLBACK-SECRET>\naaa new-model\ntacacs server ISE-1\n address ipv4 10.10.20.11\n key <TACACS-SHARED-SECRET>\n single-connection\n!\naaa group server tacacs+ ISE-TACACS\n server name ISE-1\n ip tacacs source-interface Loopback0\n!\naaa authentication login VTY-AUTH group ISE-TACACS local\naaa authorization exec VTY-AUTH group ISE-TACACS local if-authenticated\naaa authorization commands 15 VTY-AUTH group ISE-TACACS local if-authenticated\naaa accounting exec VTY-AUTH start-stop group ISE-TACACS\naaa accounting commands 15 VTY-AUTH start-stop group ISE-TACACS\n!\nline vty 0 15\n login authentication VTY-AUTH\n authorization exec VTY-AUTH\n authorization commands 15 VTY-AUTH\n accounting exec VTY-AUTH\n accounting commands 15 VTY-AUTH"
+    },
+    {
+      "id": "fallback",
+      "type": "text",
+      "markdown": "## How method lists fall back\n\nA method list is tried left to right, but the next method is used **only when the previous one gives no answer** (an error or timeout). A REJECT from ISE is an answer: the switch will not try the local database after a reject. This is why a wrong password fails even when the same password exists locally, and why the local account only helps when ISE is unreachable.\n\nThe `if-authenticated` keyword on authorization lets an already authenticated user continue if the server cannot be reached for authorization. Use it carefully: it keeps you working during an outage, but it also bypasses command restrictions while the server is down."
+    },
+    {
+      "id": "radius",
+      "type": "text",
+      "markdown": "## RADIUS for network access\n\nFor 802.1X and MAB the switch is a RADIUS client. Three settings decide how it behaves when a server misbehaves:\n\n- **Dead criteria** (`radius-server dead-criteria time 5 tries 3`) define when a server is marked dead.\n- **Deadtime** (`radius-server deadtime 15`) keeps a dead server out of rotation for 15 minutes so every request does not wait for a timeout.\n- **Automated tester** (`automate-tester username ... probe-on`) sends periodic test requests, so the switch notices recovery without waiting for real users.\n\nRADIUS authorization arrives in the Access-Accept as attributes: a VLAN, a downloadable ACL, a Security Group Tag. If authentication passes but the port does not get the right access, the problem is authorization, not credentials. The full 802.1X flow is covered in [Cisco ISE: 802.1X, MAB, Profiling and CoA](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-profiling-and-coa)."
+    },
+    {
+      "id": "radius-config",
+      "type": "code",
+      "language": "cisco",
+      "filename": "access-sw-aaa-radius.cfg",
+      "caption": "Two ISE PSNs with dead detection and probing. The probe user should exist in ISE with no network access rights.",
+      "code": "radius server ISE-1\n address ipv4 10.10.20.11 auth-port 1812 acct-port 1813\n key <RADIUS-SHARED-SECRET>\n automate-tester username probe-user probe-on\n!\nradius server ISE-2\n address ipv4 10.10.20.12 auth-port 1812 acct-port 1813\n key <RADIUS-SHARED-SECRET>\n automate-tester username probe-user probe-on\n!\naaa group server radius ISE-RADIUS\n server name ISE-1\n server name ISE-2\n ip radius source-interface Vlan99\n!\naaa authentication dot1x default group ISE-RADIUS\naaa authorization network default group ISE-RADIUS\naaa accounting dot1x default start-stop group ISE-RADIUS\nradius-server dead-criteria time 5 tries 3\nradius-server deadtime 15"
+    },
+    {
+      "id": "workflow",
+      "type": "text",
+      "markdown": "## A troubleshooting workflow\n\nWork from the bottom up and prove each layer before moving on:\n\n1. **Reachability.** Can the device reach the server from the configured source interface? Use `ping 10.10.20.11 source Loopback0`, then check firewalls for TCP 49 or UDP 1812/1813.\n2. **Server side: is the request seen?** In ISE, open **Operations > TACACS > Live Logs** or **Operations > RADIUS > Live Logs**. No entry at all points to reachability, a wrong server address, or Device Administration not enabled on the PSN.\n3. **Network device definition.** ISE identifies a NAD by the **source IP** of the request. A request from an unknown address fails with *11007 Could not locate Network Device or AAA Client*.\n4. **Shared secret.** A mismatch shows as *13036 Invalid TACACS+ request packet - possibly mismatched Shared Secrets* for TACACS+, or as a Message-Authenticator error (*11036*) for RADIUS.\n5. **Identity and policy.** Was the user found in the identity store (*22056 Subject not found*) and was the right policy set and rule matched?\n6. **Authorization.** For TACACS+, check the shell profile and command set; for RADIUS, check the returned attributes against what the switch applied.\n\n| Symptom | Most likely cause |\n|:--|:--|\n| Nothing in ISE live logs | Routing, firewall, wrong source interface, Device Admin service off |\n| 11007 in ISE | Request source IP not defined as a network device |\n| Secret mismatch error | Key differs between device and ISE |\n| Login works, but user stays at privilege 1 | Shell profile missing priv-lvl, or `aaa authorization exec` not configured |\n| `Command authorization failed` | Command set denies it, or the server is unreachable without `if-authenticated` |"
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Proving each layer from the device",
+      "prompt": "core-sw#",
+      "lines": [
+        { "cmd": "test aaa group ISE-TACACS netadmin <PASSWORD> new-code", "output": "Sending password\nUser successfully authenticated\n\nUSER ATTRIBUTES\n\npriv-lvl             0   \"15\"" },
+        { "comment": "Tests authentication against the group without logging out. The returned attributes show what authorization will grant." },
+        { "cmd": "show tacacs", "output": "Tacacs+ Server -  public  :\n               Server name: ISE-1\n            Server address: 10.10.20.11\n               Server port: 49\n              Socket opens:         42\n             Socket closes:         42\n             Socket aborts:          0\n             Socket errors:          0\n           Socket Timeouts:          0\n   Failed Connect Attempts:          0\n        Total Packets Sent:        126\n        Total Packets Recv:        126" },
+        { "comment": "Rising Socket Timeouts or Failed Connect Attempts point to reachability, not credentials." },
+        { "cmd": "show aaa servers | include RADIUS|State|Authen|Response", "output": "RADIUS: id 1, priority 1, host 10.10.20.11, auth-port 1812, acct-port 1813, hostname ISE-1\n     State: current UP, duration 604800s, previous duration 0s\n     Authen: request 2210, timeouts 3, failover 0, retransmission 3\n             Response: accept 2150, reject 57, challenge 0\nRADIUS: id 2, priority 2, host 10.10.20.12, auth-port 1812, acct-port 1813, hostname ISE-2\n     State: current DEAD, duration 420s, previous duration 604380s" },
+        { "comment": "ISE-1 answers; ISE-2 is marked DEAD by the dead criteria, and the automated tester will bring it back when it responds." },
+        { "cmd": "debug tacacs authentication", "output": "TPLUS: Queuing AAA Authentication request 61 for processing\nTPLUS: Authentication start packet created for 61(netadmin)\nTPLUS: Using server 10.10.20.11\nTPLUS(0000003D)/0/NB_WAIT: socket event 2\nTPLUS(0000003D)/0/READ: Error reading response; encryption key mismatch?" },
+        { "comment": "A classic hint: the server closed or garbled the response, which usually means the shared secrets differ. Turn debugs off with undebug all." }
+      ],
+      "caption": "Run debugs only in a maintenance window or with conditional debugging on busy devices; they can consume a lot of CPU."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Protect your way back in",
+      "markdown": "- Keep a strong local **break-glass** account and test it regularly, but store its secret in a vault and alert on its use.\n- Apply method lists to the **console** carefully. Many teams keep the console on `local` only so an AAA outage never blocks physical recovery.\n- Never paste real shared secrets into tickets or chat. Rotate them if they leak, on the device and in ISE at the same time."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Exam tip",
+      "markdown": "If a question asks which protocol encrypts the **whole payload**, supports **per-command authorization** or uses **TCP 49**, the answer is **TACACS+**. If it mentions **802.1X**, **UDP 1812/1813**, **CoA** or an open standard, the answer is **RADIUS**."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab ISE (evaluation license) and a lab switch or Catalyst 8000V that you own.\n\n1. Add the device in ISE as a network device with a TACACS+ secret, and enable Device Administration on the PSN.\n2. Apply the TACACS+ configuration above, keeping a console session open.\n3. Log in over SSH and run `show privilege`, then check **TACACS Live Logs** in ISE.\n4. Change the secret on the device only, try again, and record the exact error in ISE and in `debug tacacs`.\n5. Restore the secret, then remove the device from ISE and observe the 11007 failure.\n6. Shut the route to ISE and confirm the break-glass account works because the server gives no answer."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        { "term": "AAA", "definition": "Authentication, authorization and accounting: who you are, what you may do and what you did." },
+        { "term": "TACACS+", "definition": "A TCP-based AAA protocol on port 49 that encrypts the full payload and separates authentication, authorization and accounting; used for device administration." },
+        { "term": "RADIUS", "definition": "A UDP-based AAA standard that combines authentication and authorization and hides only the password; used for network access." },
+        { "term": "Method list", "definition": "An ordered list of AAA methods; the next method is tried only when the previous one returns an error, not a reject." },
+        { "term": "Shared secret", "definition": "The key configured on both the NAD and the AAA server to protect the exchange; a mismatch breaks every request." },
+        { "term": "Network access device (NAD)", "definition": "The switch, router, firewall or WLC that acts as the AAA client; ISE identifies it by the source IP of its requests." },
+        { "term": "Shell profile and command set", "definition": "ISE TACACS+ authorization results that set the privilege level and permitted CLI commands." },
+        { "term": "Deadtime", "definition": "The period during which a RADIUS server marked dead is skipped before it is tried again." }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which statements correctly describe TACACS+ compared with RADIUS? (Choose all that apply.)",
+          "options": ["It uses TCP port 49", "It encrypts the entire packet body", "It is the protocol used for 802.1X port authentication", "It supports per-command authorization"],
+          "answer": [0, 1, 3],
+          "explanation": "TACACS+ runs over TCP 49, encrypts the full body and supports command authorization. 802.1X uses RADIUS between the switch and the server."
+        },
+        {
+          "question": "A method list is 'group ISE-TACACS local'. ISE is reachable and rejects the user's password. What happens?",
+          "options": ["The switch tries the local database next", "The login fails because a reject is a final answer", "The switch retries ISE indefinitely", "The user is logged in at privilege level 1"],
+          "answer": 1,
+          "explanation": "The next method is used only when the previous one returns an error or timeout. A REJECT from the server ends the attempt."
+        },
+        {
+          "question": "No entry appears in ISE TACACS Live Logs when an administrator tries to log in. Which causes are plausible? (Choose all that apply.)",
+          "options": ["A firewall blocks TCP 49 between the device and the PSN", "Device Administration is not enabled on the PSN", "The user typed the wrong password", "The device sends from a source interface whose route to ISE is broken"],
+          "answer": [0, 1, 3],
+          "explanation": "A wrong password would still produce a failed authentication entry in the live log. No entry means the request never reached or was not processed by the TACACS+ service."
+        },
+        {
+          "question": "ISE logs '11007 Could not locate Network Device or AAA Client'. What is the most likely fix?",
+          "options": ["Reset the user's Active Directory password", "Add the request's source IP as a network device, or fix the device's source interface", "Change RADIUS to UDP 1645", "Enable command accounting"],
+          "answer": 1,
+          "explanation": "ISE matches requests to network devices by source IP. Either the device is not defined, or it is sending from a different interface than the one registered."
+        },
+        {
+          "question": "An administrator authenticates successfully via TACACS+ but lands at privilege level 1 instead of 15. What should you check first?",
+          "options": ["The shared secret", "That aaa authorization exec is configured and applied, and that the shell profile returns priv-lvl 15", "The RADIUS deadtime", "The SSH key length"],
+          "answer": 1,
+          "explanation": "Authentication already worked, so the secret is fine. The privilege level comes from exec authorization and the shell profile in ISE."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- **TACACS+** (TCP 49, full encryption, separate AAA, command authorization) suits device administration; **RADIUS** (UDP 1812/1813, combined authn/authz) suits network access.\n- Method lists fall back only on **errors**, never on a reject. Keep a tested local break-glass account.\n- RADIUS resilience depends on **dead criteria**, **deadtime** and the **automated tester**.\n- Troubleshoot bottom up: reachability, request seen in ISE, network device by **source IP**, **shared secret**, identity and policy, then **authorization**.\n- Use `test aaa`, `show tacacs`, `show aaa servers`, targeted debugs and ISE live logs together.\n\nNext, secure the other management services in [Secure Management: SNMPv3, Syslog and NTP](/learn/cisco-security-certification-track/secure-management-snmpv3-syslog-and-ntp), and add a second factor for administrators in [Cisco Duo and MFA in Zero Trust](/learn/cisco-security-certification-track/cisco-duo-and-mfa-in-zero-trust)."
+    }
+  ],
+  "ar": {
+    "title": "استكشاف أعطال AAA وإصلاحها: TACACS+ وRADIUS",
+    "summary": "قارن بين TACACS+ وRADIUS، واضبط إدارة الأجهزة والوصول إلى الشبكة في IOS XE مقابل Cisco ISE، واتّبع منهجية منظمة لمعرفة سبب فشل تسجيل الدخول أو التفويض في AAA.",
+    "objectives": [
+      "المقارنة بين TACACS+ وRADIUS من حيث النقل والتشفير والفصل بين وظائف AAA والاستخدام المعتاد",
+      "ضبط قوائم أساليب AAA في IOS XE لإدارة الأجهزة عبر TACACS+ مع حساب محلي احتياطي",
+      "ضبط خوادم RADIUS وكشف الخوادم المعطّلة والاختبار المؤتمت في IOS XE",
+      "استخدام أوامر test aaa وshow وdebug مع السجلات الحية في ISE لعزل أعطال AAA",
+      "تمييز الأسباب الشائعة لأعطال AAA: الوصولية، والأسرار المشتركة، وواجهات المصدر، والسياسة، والتفويض"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الثانية فجرًا تحاول مهندسة مناوِبة الدخول عبر SSH إلى مبدّل في نواة الشبكة أثناء انقطاع، فتظهر لها الرسالة `% Authentication failed` مع أن كلمة المرور صحيحة. وبعد عشرين دقيقة تكتشف السبب: يرسل المبدّل طلبات TACACS+ من عنوان Loopback جديد لا يعرفه ISE، وقد حُذف الحساب المحلي الاحتياطي قبل أشهر.\n\nتجمع **AAA** (المصادقة Authentication، والتفويض Authorization، والمحاسبة Accounting) مركزيًا الإجابةَ عن ثلاثة أسئلة: من يحق له الدخول، وماذا يحق له أن يفعل، وماذا فعل. وحين تعمل لا يلحظها أحد، أما حين تتعطل فقد تُغلق الشبكة في وجه جميع المسؤولين أو تمنع كل المستخدمين من الوصول إلى الشبكة المحلية. ويُنتظر منك في امتحان SCOR 350-701 أن تضبط AAA لإدارة الأجهزة وللوصول إلى الشبكة وأن تتحقّق منها. ويركّز هذا الدرس على **أسباب فشلها** وكيف تثبت السبب بسرعة."
+      },
+      {
+        "id": "compare",
+        "type": "text",
+        "markdown": "## TACACS+ مقابل RADIUS\n\nينقل كلا البروتوكولين رسائل AAA بين جهاز الشبكة (العميل، أو جهاز الوصول إلى الشبكة Network Access Device - NAD) وخادم مثل **Cisco ISE**، لكنهما صُمّما لمهمّتين مختلفتين:\n\n| الميزة | TACACS+ | RADIUS |\n|:--|:--|:--|\n| النقل | TCP 49 | UDP 1812 (المصادقة) و1813 (المحاسبة)؛ والمنفذان القديمان 1645/1646 |\n| التشفير | يُشفَّر جسم الحزمة كاملًا بالسرّ المشترك | تُخفى سمة كلمة المرور فقط وتبقى السمات الأخرى مكشوفة |\n| الفصل بين وظائف AAA | المصادقة والتفويض والمحاسبة تبادلات مستقلة | المصادقة والتفويض مدمجان في رسالة Access-Accept |\n| تفويض الأوامر | لكل أمر ولكل مستوى صلاحية | غير مدعوم أصلًا |\n| الاستخدام المعتاد | **إدارة الأجهزة** (من يستطيع تنفيذ أي أوامر CLI) | **الوصول إلى الشبكة** (802.1X وMAB وVPN والشبكات اللاسلكية) |\n| المعيار | نشأ في Cisco، وموثَّق في RFC 8907 | معيار من IETF (RFC 2865/2866) مع سمات كثيرة خاصة بالمصنّعين |\n\nفي ISE تُعالَج طلبات TACACS+ عبر مجموعات سياسات **إدارة الأجهزة (Device Administration)**، وطلبات RADIUS عبر مجموعات سياسات **الوصول إلى الشبكة (Network Access)**. ويجب أيضًا تفعيل خدمة Device Administration صراحةً على كل عقدة خدمة سياسات (PSN) يُراد أن تجيب على TACACS+، وإغفال ذلك سبب متكرر للأعطال الصامتة في عمليات النشر الجديدة."
+      },
+      {
+        "id": "tacacs-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "دخول إداري عبر TACACS+ مع تفويض الأوامر",
+        "caption": "يُبقي TACACS+ المصادقة والتفويض والمحاسبة تبادلات منفصلة، لذا قد يفشل كلٌّ منها وحده.",
+        "data": {
+          "actors": [
+            { "id": "adm", "label": "المسؤول", "sub": "10.10.99.25", "icon": "user" },
+            { "id": "sw", "label": "مبدّل النواة", "sub": "Loopback0 10.255.0.1", "icon": "switch" },
+            { "id": "ise", "label": "عقدة Cisco ISE PSN", "sub": "10.10.20.11 TCP/49", "icon": "server" }
+          ],
+          "steps": [
+            { "from": "adm", "to": "sw", "label": "دخول عبر SSH", "detail": "user netadmin", "note": "يستخدم خط VTY قائمة الأساليب VTY-AUTH: المجموعة ISE-TACACS أولًا، ثم القاعدة المحلية." },
+            { "from": "sw", "to": "ise", "label": "Authentication START", "detail": "مشفّرة بالسرّ المشترك", "tone": "secure", "note": "يتحقّق ISE أولًا من أن 10.255.0.1 جهاز شبكة معروف وأن سرّ TACACS+ مطابق." },
+            { "from": "ise", "to": "sw", "label": "REPLY: PASS", "tone": "success", "note": "تصادق مجموعة سياسات Device Admin المستخدمَ مقابل Active Directory." },
+            { "from": "sw", "to": "ise", "label": "Authorization REQUEST", "detail": "service=shell", "note": "تبادلٌ مستقل يسأل عن ملف الصدفة (Shell Profile) المنطبق." },
+            { "from": "ise", "to": "sw", "label": "PASS_ADD", "detail": "priv-lvl=15", "tone": "success", "note": "يعيد ملف الصدفة مستوى الصلاحية، فيدخل المستخدم إلى وضع EXEC المميّز." },
+            { "from": "adm", "to": "sw", "label": "reload", "tone": "warning", "note": "يكتب المسؤول أمرًا لا تسمح به مجموعة الأوامر (Command Set)." },
+            { "from": "sw", "to": "ise", "label": "Authorization REQUEST", "detail": "cmd=reload", "note": "يُرسَل كل أمر من المستوى 15 للتفويض قبل تنفيذه." },
+            { "from": "ise", "to": "sw", "label": "FAIL", "tone": "blocked", "note": "ترفض مجموعة الأوامر الأمر reload، فيطبع المبدّل Command authorization failed." },
+            { "from": "sw", "to": "ise", "label": "Accounting START/STOP", "detail": "الأمر والمستخدم والوقت", "tone": "secure", "note": "توفّر سجلات المحاسبة أثرًا تدقيقيًا لكل جلسة وكل أمر." }
+          ]
+        }
+      },
+      {
+        "id": "tacacs-config",
+        "type": "code",
+        "language": "cisco",
+        "filename": "core-sw-aaa-tacacs.cfg",
+        "caption": "إدارة الأجهزة عبر TACACS+ مع حساب محلي احتياطي. اضبط المستخدم المحلي واختبره قبل تطبيق قوائم الأساليب على خطوط VTY.",
+        "highlight": [3, 5, 10, 12, 13, 14],
+        "code": "username breakglass privilege 15 algorithm-type scrypt secret <LOCAL-FALLBACK-SECRET>\naaa new-model\ntacacs server ISE-1\n address ipv4 10.10.20.11\n key <TACACS-SHARED-SECRET>\n single-connection\n!\naaa group server tacacs+ ISE-TACACS\n server name ISE-1\n ip tacacs source-interface Loopback0\n!\naaa authentication login VTY-AUTH group ISE-TACACS local\naaa authorization exec VTY-AUTH group ISE-TACACS local if-authenticated\naaa authorization commands 15 VTY-AUTH group ISE-TACACS local if-authenticated\naaa accounting exec VTY-AUTH start-stop group ISE-TACACS\naaa accounting commands 15 VTY-AUTH start-stop group ISE-TACACS\n!\nline vty 0 15\n login authentication VTY-AUTH\n authorization exec VTY-AUTH\n authorization commands 15 VTY-AUTH\n accounting exec VTY-AUTH\n accounting commands 15 VTY-AUTH"
+      },
+      {
+        "id": "fallback",
+        "type": "text",
+        "markdown": "## كيف تنتقل قوائم الأساليب إلى البديل\n\nتُجرَّب قائمة الأساليب (Method List) من اليسار إلى اليمين، لكن الأسلوب التالي لا يُستخدم **إلا إذا لم يُعطِ الأسلوب السابق جوابًا** (خطأ أو انتهاء مهلة). والرفض (REJECT) من ISE جوابٌ بحد ذاته، فلن يجرّب المبدّل القاعدة المحلية بعده. ولهذا تفشل كلمة المرور الخاطئة حتى لو كانت الكلمة نفسها موجودة محليًا، ولا يفيد الحساب المحلي إلا حين يتعذّر الوصول إلى ISE.\n\nتسمح الكلمة المفتاحية `if-authenticated` في التفويض للمستخدم الذي صودق مسبقًا بمواصلة العمل إن تعذّر الوصول إلى الخادم لأجل التفويض. استخدمها بحذر: فهي تتيح لك العمل أثناء الانقطاع، لكنها تتجاوز أيضًا قيود الأوامر ما دام الخادم معطّلًا."
+      },
+      {
+        "id": "radius",
+        "type": "text",
+        "markdown": "## RADIUS للوصول إلى الشبكة\n\nفي 802.1X وMAB يكون المبدّل عميلَ RADIUS، وتحدّد ثلاثة إعدادات سلوكه حين يسيء الخادم التصرّف:\n\n- **معايير التعطّل (Dead Criteria)**: يحدّد `radius-server dead-criteria time 5 tries 3` متى يُعَدّ الخادم معطّلًا.\n- **مدة الاستبعاد (Deadtime)**: يُبقي `radius-server deadtime 15` الخادمَ المعطّل خارج التناوب خمس عشرة دقيقة، كي لا ينتظر كل طلب انتهاء المهلة.\n- **المختبِر المؤتمت (Automated Tester)**: يرسل `automate-tester username ... probe-on` طلبات اختبار دورية، فيلاحظ المبدّل عودة الخادم دون انتظار المستخدمين الفعليين.\n\nيصل تفويض RADIUS ضمن رسالة Access-Accept في صورة سمات: شبكة VLAN، أو قائمة ACL قابلة للتنزيل، أو وسم مجموعة أمنية (SGT). فإن نجحت المصادقة ولم يحصل المنفذ على الوصول الصحيح، فالمشكلة في التفويض لا في بيانات الاعتماد. ويشرح درس [Cisco ISE: معيار 802.1X وMAB والتنميط وCoA](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-profiling-and-coa) تدفّق 802.1X كاملًا."
+      },
+      {
+        "id": "radius-config",
+        "type": "code",
+        "language": "cisco",
+        "filename": "access-sw-aaa-radius.cfg",
+        "caption": "عقدتا PSN في ISE مع كشف التعطّل والاختبار الدوري. ينبغي أن يوجد مستخدم الاختبار في ISE دون أي صلاحيات وصول إلى الشبكة.",
+        "code": "radius server ISE-1\n address ipv4 10.10.20.11 auth-port 1812 acct-port 1813\n key <RADIUS-SHARED-SECRET>\n automate-tester username probe-user probe-on\n!\nradius server ISE-2\n address ipv4 10.10.20.12 auth-port 1812 acct-port 1813\n key <RADIUS-SHARED-SECRET>\n automate-tester username probe-user probe-on\n!\naaa group server radius ISE-RADIUS\n server name ISE-1\n server name ISE-2\n ip radius source-interface Vlan99\n!\naaa authentication dot1x default group ISE-RADIUS\naaa authorization network default group ISE-RADIUS\naaa accounting dot1x default start-stop group ISE-RADIUS\nradius-server dead-criteria time 5 tries 3\nradius-server deadtime 15"
+      },
+      {
+        "id": "workflow",
+        "type": "text",
+        "markdown": "## منهجية استكشاف الأعطال\n\nاعمل من الأسفل إلى الأعلى، وأثبت سلامة كل طبقة قبل الانتقال إلى التي تليها:\n\n1. **الوصولية.** هل يصل الجهاز إلى الخادم من واجهة المصدر المضبوطة؟ استخدم `ping 10.10.20.11 source Loopback0`، ثم افحص جدران الحماية بحثًا عن حجب TCP 49 أو UDP 1812/1813.\n2. **جهة الخادم: هل وصل الطلب؟** افتح في ISE **Operations > TACACS > Live Logs** أو **Operations > RADIUS > Live Logs**. وغياب أي سجل يشير إلى مشكلة وصولية، أو عنوان خادم خاطئ، أو عدم تفعيل Device Administration على عقدة PSN.\n3. **تعريف جهاز الشبكة.** يتعرّف ISE على جهاز NAD من **عنوان IP المصدر** للطلب، والطلب القادم من عنوان مجهول يفشل بالرسالة *11007 Could not locate Network Device or AAA Client*.\n4. **السرّ المشترك.** يظهر عدم التطابق في TACACS+ بالرسالة *13036 Invalid TACACS+ request packet - possibly mismatched Shared Secrets*، وفي RADIUS بخطأ في سمة Message-Authenticator (*11036*).\n5. **الهوية والسياسة.** هل وُجد المستخدم في مخزن الهويات (*22056 Subject not found*)؟ وهل طابق الطلبُ مجموعة السياسات والقاعدة الصحيحتين؟\n6. **التفويض.** في TACACS+ افحص ملف الصدفة ومجموعة الأوامر، وفي RADIUS قارن السمات المعادة بما طبّقه المبدّل فعلًا.\n\n| العَرَض | السبب الأرجح |\n|:--|:--|\n| لا شيء في السجلات الحية لـISE | التوجيه، أو جدار حماية، أو واجهة مصدر خاطئة، أو خدمة Device Admin غير مفعّلة |\n| الرسالة 11007 في ISE | عنوان IP المصدر للطلب غير معرَّف جهازَ شبكة |\n| خطأ عدم تطابق السرّ | المفتاح مختلف بين الجهاز وISE |\n| ينجح الدخول لكن يبقى المستخدم في الصلاحية 1 | ملف الصدفة لا يتضمن priv-lvl، أو `aaa authorization exec` غير مضبوط |\n| `Command authorization failed` | مجموعة الأوامر ترفض الأمر، أو الخادم غير متاح دون `if-authenticated` |"
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "إثبات سلامة كل طبقة من الجهاز",
+        "prompt": "core-sw#",
+        "lines": [
+          { "cmd": "test aaa group ISE-TACACS netadmin <PASSWORD> new-code", "output": "Sending password\nUser successfully authenticated\n\nUSER ATTRIBUTES\n\npriv-lvl             0   \"15\"" },
+          { "comment": "يختبر المصادقة مقابل المجموعة دون الخروج من الجلسة، وتُظهر السمات المعادة ما سيمنحه التفويض." },
+          { "cmd": "show tacacs", "output": "Tacacs+ Server -  public  :\n               Server name: ISE-1\n            Server address: 10.10.20.11\n               Server port: 49\n              Socket opens:         42\n             Socket closes:         42\n             Socket aborts:          0\n             Socket errors:          0\n           Socket Timeouts:          0\n   Failed Connect Attempts:          0\n        Total Packets Sent:        126\n        Total Packets Recv:        126" },
+          { "comment": "ازدياد Socket Timeouts أو Failed Connect Attempts يشير إلى مشكلة وصولية، لا إلى بيانات الاعتماد." },
+          { "cmd": "show aaa servers | include RADIUS|State|Authen|Response", "output": "RADIUS: id 1, priority 1, host 10.10.20.11, auth-port 1812, acct-port 1813, hostname ISE-1\n     State: current UP, duration 604800s, previous duration 0s\n     Authen: request 2210, timeouts 3, failover 0, retransmission 3\n             Response: accept 2150, reject 57, challenge 0\nRADIUS: id 2, priority 2, host 10.10.20.12, auth-port 1812, acct-port 1813, hostname ISE-2\n     State: current DEAD, duration 420s, previous duration 604380s" },
+          { "comment": "يجيب ISE-1، أما ISE-2 فمعلَّم DEAD وفق معايير التعطّل، وسيعيده المختبِر المؤتمت إلى الخدمة حين يستجيب." },
+          { "cmd": "debug tacacs authentication", "output": "TPLUS: Queuing AAA Authentication request 61 for processing\nTPLUS: Authentication start packet created for 61(netadmin)\nTPLUS: Using server 10.10.20.11\nTPLUS(0000003D)/0/NB_WAIT: socket event 2\nTPLUS(0000003D)/0/READ: Error reading response; encryption key mismatch?" },
+          { "comment": "مؤشر كلاسيكي: أغلق الخادم الاستجابة أو وصلت مشوّهة، وهذا يعني غالبًا اختلاف الأسرار المشتركة. أوقف التتبّع بالأمر undebug all." }
+        ],
+        "caption": "لا تشغّل أوامر debug إلا في نافذة صيانة أو مع التتبّع المشروط على الأجهزة المزدحمة، فقد تستهلك قدرًا كبيرًا من المعالج."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "احمِ طريق عودتك",
+        "markdown": "- احتفظ بحساب محلي قوي **لحالات الطوارئ (Break-Glass)** واختبره دوريًا، لكن احفظ سرّه في خزنة وأطلق تنبيهًا عند استخدامه.\n- طبّق قوائم الأساليب على **منفذ Console** بحذر؛ إذ تُبقي فرق كثيرة الـConsole على `local` فقط كي لا يمنع انقطاعُ AAA الاستعادةَ المادية أبدًا.\n- لا تلصق الأسرار المشتركة الحقيقية في التذاكر أو المحادثات، وإن تسرّبت فغيّرها على الجهاز وفي ISE في الوقت نفسه."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "نصيحة للامتحان",
+        "markdown": "إذا سألك السؤال عن البروتوكول الذي يشفّر **الحمولة كاملة**، أو يدعم **تفويض كل أمر على حدة**، أو يستخدم **TCP 49**، فالجواب **TACACS+**. وإذا ذكر **802.1X** أو **UDP 1812/1813** أو **CoA** أو معيارًا مفتوحًا، فالجواب **RADIUS**."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم ISE مختبريًا (برخصة تقييم) ومبدّلًا مختبريًا أو Catalyst 8000V تملكه.\n\n1. أضف الجهاز في ISE جهازَ شبكة مع سرّ TACACS+، وفعّل Device Administration على عقدة PSN.\n2. طبّق إعدادات TACACS+ السابقة مع إبقاء جلسة Console مفتوحة.\n3. ادخل عبر SSH ونفّذ `show privilege`، ثم افحص **TACACS Live Logs** في ISE.\n4. غيّر السرّ على الجهاز وحده، وأعد المحاولة، ودوّن الخطأ الدقيق في ISE وفي `debug tacacs`.\n5. أعد السرّ، ثم احذف الجهاز من ISE ولاحظ الفشل 11007.\n6. اقطع المسار إلى ISE، وتأكّد أن حساب الطوارئ يعمل لأن الخادم لا يعطي أي جواب."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          { "term": "AAA", "definition": "المصادقة والتفويض والمحاسبة: من أنت، وماذا يحق لك أن تفعل، وماذا فعلت." },
+          { "term": "TACACS+", "definition": "بروتوكول AAA يعمل فوق TCP على المنفذ 49، يشفّر الحمولة كاملة ويفصل بين المصادقة والتفويض والمحاسبة؛ يُستخدم لإدارة الأجهزة." },
+          { "term": "RADIUS", "definition": "معيار AAA يعمل فوق UDP، يدمج المصادقة والتفويض ولا يخفي إلا كلمة المرور؛ يُستخدم للوصول إلى الشبكة." },
+          { "term": "قائمة الأساليب (Method List)", "definition": "قائمة مرتّبة من أساليب AAA، لا يُجرَّب الأسلوب التالي فيها إلا إذا أعاد السابق خطأً لا رفضًا." },
+          { "term": "السرّ المشترك (Shared Secret)", "definition": "المفتاح المضبوط على جهاز NAD وخادم AAA معًا لحماية التبادل؛ وعدم تطابقه يُفشل كل الطلبات." },
+          { "term": "جهاز الوصول إلى الشبكة (NAD)", "definition": "المبدّل أو الموجّه أو جدار الحماية أو وحدة التحكم اللاسلكية التي تعمل عميلَ AAA، ويتعرّف عليها ISE من عنوان IP المصدر لطلباتها." },
+          { "term": "ملف الصدفة ومجموعة الأوامر (Shell Profile / Command Set)", "definition": "نتائج تفويض TACACS+ في ISE التي تحدّد مستوى الصلاحية وأوامر CLI المسموح بها." },
+          { "term": "مدة الاستبعاد (Deadtime)", "definition": "الفترة التي يُتجاوَز فيها خادم RADIUS المعلَّم معطّلًا قبل تجربته مجددًا." }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي العبارات التالية تصف TACACS+ وصفًا صحيحًا مقارنةً بـRADIUS؟ (اختر كل ما ينطبق.)",
+            "options": ["يستخدم منفذ TCP 49", "يشفّر جسم الحزمة كاملًا", "هو البروتوكول المستخدم لمصادقة المنافذ بمعيار 802.1X", "يدعم تفويض كل أمر على حدة"],
+            "answer": [0, 1, 3],
+            "explanation": "يعمل TACACS+ فوق TCP 49، ويشفّر الجسم كاملًا، ويدعم تفويض الأوامر. أما 802.1X فيستخدم RADIUS بين المبدّل والخادم."
+          },
+          {
+            "question": "قائمة الأساليب هي 'group ISE-TACACS local'، وISE متاح ورفض كلمة مرور المستخدم. ماذا يحدث؟",
+            "options": ["يجرّب المبدّل القاعدة المحلية بعد ذلك", "يفشل الدخول لأن الرفض جواب نهائي", "يعيد المبدّل محاولة ISE إلى ما لا نهاية", "يدخل المستخدم بمستوى الصلاحية 1"],
+            "answer": 1,
+            "explanation": "لا يُستخدم الأسلوب التالي إلا حين يعيد السابق خطأً أو تنتهي مهلته. والرفض من الخادم ينهي المحاولة."
+          },
+          {
+            "question": "لا يظهر أي سجل في TACACS Live Logs في ISE حين يحاول مسؤول الدخول. أي الأسباب التالية محتملة؟ (اختر كل ما ينطبق.)",
+            "options": ["جدار حماية يحجب TCP 49 بين الجهاز وعقدة PSN", "خدمة Device Administration غير مفعّلة على عقدة PSN", "كتب المستخدم كلمة مرور خاطئة", "يرسل الجهاز من واجهة مصدر مسارها إلى ISE معطّل"],
+            "answer": [0, 1, 3],
+            "explanation": "كلمة المرور الخاطئة تُنتج مع ذلك سجلَّ مصادقة فاشلة في السجل الحي. أما غياب أي سجل فيعني أن الطلب لم يصل إلى خدمة TACACS+ أو لم تعالجه."
+          },
+          {
+            "question": "يسجّل ISE الرسالة '11007 Could not locate Network Device or AAA Client'. ما الإصلاح الأرجح؟",
+            "options": ["إعادة تعيين كلمة مرور المستخدم في Active Directory", "إضافة عنوان IP المصدر للطلب جهازَ شبكة، أو تصحيح واجهة المصدر في الجهاز", "تغيير RADIUS إلى UDP 1645", "تفعيل محاسبة الأوامر"],
+            "answer": 1,
+            "explanation": "يطابق ISE الطلبات مع أجهزة الشبكة حسب عنوان IP المصدر؛ فإما أن الجهاز غير معرَّف، وإما أنه يرسل من واجهة غير المسجّلة."
+          },
+          {
+            "question": "صودق مسؤول بنجاح عبر TACACS+ لكنه دخل بمستوى الصلاحية 1 بدلًا من 15. ما الذي تفحصه أولًا؟",
+            "options": ["السرّ المشترك", "أن aaa authorization exec مضبوط ومطبَّق، وأن ملف الصدفة يعيد priv-lvl 15", "مدة الاستبعاد في RADIUS", "طول مفتاح SSH"],
+            "answer": 1,
+            "explanation": "نجحت المصادقة، فالسرّ سليم. ومستوى الصلاحية يأتي من تفويض EXEC ومن ملف الصدفة في ISE."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يناسب **TACACS+** (TCP 49، وتشفير كامل، وفصل وظائف AAA، وتفويض الأوامر) إدارةَ الأجهزة، ويناسب **RADIUS** (UDP 1812/1813، ودمج المصادقة والتفويض) الوصولَ إلى الشبكة.\n- لا تنتقل قوائم الأساليب إلى البديل إلا عند **الخطأ**، لا عند الرفض أبدًا. احتفظ بحساب طوارئ محلي مختبَر.\n- تعتمد مرونة RADIUS على **معايير التعطّل** و**مدة الاستبعاد** و**المختبِر المؤتمت**.\n- استكشف الأعطال من الأسفل إلى الأعلى: الوصولية، ثم وصول الطلب إلى ISE، ثم تعريف الجهاز حسب **عنوان IP المصدر**، ثم **السرّ المشترك**، ثم الهوية والسياسة، ثم **التفويض**.\n- استخدم `test aaa` و`show tacacs` و`show aaa servers` وأوامر debug الموجّهة والسجلات الحية في ISE معًا.\n\nبعد ذلك، أمّن خدمات الإدارة الأخرى في درس [الإدارة الآمنة: SNMPv3 وSyslog وNTP](/learn/cisco-security-certification-track/secure-management-snmpv3-syslog-and-ntp)، وأضف عاملًا ثانيًا للمسؤولين في درس [Cisco Duo والمصادقة متعددة العوامل في الثقة المعدومة](/learn/cisco-security-certification-track/cisco-duo-and-mfa-in-zero-trust)."
+      }
+    ]
+  }
+}

@@ -65,7 +65,7 @@ class LearnController extends Controller
         return response()->json(['data' => $this->presenter->courseDetail($course)]);
     }
 
-    public function lesson(string $slug, string $lessonSlug)
+    public function lesson(Request $request, string $slug, string $lessonSlug)
     {
         $course = $this->publishedCourses()->where('slug', $slug)->firstOrFail();
         $lesson = LearningLesson::query()
@@ -74,7 +74,18 @@ class LearnController extends Controller
             ->where('status', 'published')
             ->firstOrFail();
 
-        return response()->json(['data' => $this->presenter->lesson($lesson, $course)]);
+        $data = $this->presenter->lesson($lesson, $course);
+
+        // Courses and their syllabi are public; a lesson's content is for
+        // signed-in members. A visitor (and a search engine) still gets the
+        // title, summary, objectives and the place in the course, so the page
+        // can show what the lesson teaches and ask them to sign in.
+        $data['locked'] = ! $request->user('sanctum');
+        if ($data['locked']) {
+            $data['blocks'] = [];
+        }
+
+        return response()->json(['data' => $data]);
     }
 
     public function cover(string $slug)

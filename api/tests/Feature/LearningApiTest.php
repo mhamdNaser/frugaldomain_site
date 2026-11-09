@@ -8,11 +8,21 @@ use App\Modules\Learning\Models\LearningLesson;
 use App\Modules\Learning\Services\CourseTransfer;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Validation\ValidationException;
+use Laravel\Sanctum\Sanctum;
+use App\Modules\User\Models\User;
 use Tests\TestCase;
 
 class LearningApiTest extends TestCase
 {
     use RefreshDatabase;
+
+    /** Lesson content is for signed-in members only. */
+    private function signIn(): void
+    {
+        Sanctum::actingAs(User::unguarded(fn () => User::create([
+            'name' => 'Member', 'first_name' => 'Member', 'email' => 'member@example.com', 'password' => bcrypt('secret-password'),
+        ])));
+    }
 
     private function document(array $lessonOverrides = []): array
     {
@@ -64,9 +74,32 @@ class LearningApiTest extends TestCase
             ->assertJsonPath('data.stages.0.units.0.lessons.1.available', false);
     }
 
+    public function test_visitors_see_a_lesson_preview_but_not_its_content(): void
+    {
+        app(CourseTransfer::class)->import($this->document(['summary' => 'What it teaches', 'objectives' => ['Explain things']]));
+
+        // Courses and the syllabus stay public.
+        $this->getJson('/api/learn/courses/demo')->assertOk();
+
+        $this->getJson('/api/learn/courses/demo/lessons/first')
+            ->assertOk()
+            ->assertJsonPath('data.locked', true)
+            ->assertJsonPath('data.title', 'First lesson')
+            ->assertJsonPath('data.summary', 'What it teaches')
+            ->assertJsonPath('data.objectives.0', 'Explain things')
+            ->assertJsonPath('data.blocks', []);
+
+        $this->signIn();
+        $this->getJson('/api/learn/courses/demo/lessons/first')
+            ->assertOk()
+            ->assertJsonPath('data.locked', false)
+            ->assertJsonCount(2, 'data.blocks');
+    }
+
     public function test_lessons_link_to_published_neighbours_and_drafts_are_hidden(): void
     {
         app(CourseTransfer::class)->import($this->document());
+        $this->signIn();
 
         $lesson = $this->getJson('/api/learn/courses/demo/lessons/first')
             ->assertOk()
@@ -135,6 +168,7 @@ class LearningApiTest extends TestCase
         ]);
         $document['course']['title_ar'] = 'دورة تجريبية';
         app(CourseTransfer::class)->import($document);
+        $this->signIn();
 
         $this->getJson('/api/learn/courses/demo/lessons/first', ['X-Language' => 'ar'])
             ->assertOk()

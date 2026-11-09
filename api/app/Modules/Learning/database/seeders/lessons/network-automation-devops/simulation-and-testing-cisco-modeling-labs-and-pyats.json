@@ -1,0 +1,600 @@
+{
+ "slug": "simulation-and-testing-cisco-modeling-labs-and-pyats",
+ "title": "Simulation and Testing: Cisco Modeling Labs and pyATS",
+ "summary": "Use Cisco Modeling Labs to build realistic virtual networks and pyATS to test them, so network changes are verified in a lab and a pipeline before they reach production.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Describe the capabilities of Cisco Modeling Labs and how its REST API supports automation",
+  "Explain the roles of the pyATS testbed file, Unicon, Genie parsers and AEtest",
+  "Use pyats learn and pyats diff to compare network state before and after a change",
+  "Describe how CML and pyATS fit into a test-driven CI/CD workflow for network changes"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A network engineer writes a Python script that changes OSPF costs on 40 routers. It works on her laptop, the syntax is correct, and the unit tests pass. But will traffic still flow the way the business expects after the change? Testing that on the production network is how outages happen.\n\nThis lesson covers two Cisco tools that make network changes testable. **Cisco Modeling Labs (CML)** gives you a realistic virtual network to try changes on. **pyATS** is a Python test framework that connects to devices, turns CLI output into structured data, and tells you exactly what changed."
+  },
+  {
+   "id": "cml",
+   "type": "text",
+   "markdown": "## Cisco Modeling Labs: a network you are allowed to break\n\n**Cisco Modeling Labs (CML)** is a network simulation platform. Unlike a simplified simulator, CML boots **real Cisco operating system images** as virtual machines, so commands, parsers and APIs behave as they do on hardware.\n\nTypical node types include:\n\n| Node definition | What it runs |\n|:--|:--|\n| `iosv`, `iosvl2` | Classic IOS router and Layer 2 switch |\n| `cat8000v`, `csr1000v` | IOS XE routers, with NETCONF and RESTCONF |\n| `nxosv9000` | NX-OS data center switch |\n| `iosxrv9000` | IOS XR service provider router |\n| `asav` | ASA virtual firewall |\n| `ubuntu`, `alpine` | Linux hosts to generate and test traffic |\n\nCML is available as **CML-Free** (a small node limit), **CML-Personal** and **CML-Enterprise** for teams. It runs on a bare-metal server or as a VM, and you can also reach hosted CML instances through the Cisco DevNet Sandbox.\n\n### Built for automation\n\nEverything you do in the CML web UI is also available through its **REST API** (`/api/v0/`), secured with a bearer token from `POST /api/v0/authenticate`. Cisco publishes the `virl2_client` Python library on top of that API. Labs can be exported and imported as **YAML topology files**, so a test topology can live in Git next to the automation code that it tests. An **external connector** node can bridge a lab to a real network, for example to reach a lab device from your CI runner."
+  },
+  {
+   "id": "cml-code",
+   "type": "code",
+   "language": "python",
+   "filename": "build_lab.py",
+   "caption": "Building and starting a two-router lab with the virl2_client library.",
+   "code": "import os\nfrom virl2_client import ClientLibrary\n\n# Credentials come from environment variables, not from the script\nclient = ClientLibrary(\"https://cml.example.com\",\n                       os.environ[\"CML_USERNAME\"], os.environ[\"CML_PASSWORD\"],\n                       ssl_verify=\"ca-bundle.pem\")\n\nlab = client.create_lab(\"ospf-change-test\")\nr1 = lab.create_node(\"R1\", \"cat8000v\", 0, 0)\nr2 = lab.create_node(\"R2\", \"cat8000v\", 200, 0)\nlab.connect_two_nodes(r1, r2)          # creates interfaces and a link\n\nlab.start()                            # boots both virtual routers\nprint(lab.id, lab.state())             # e.g. 7f3c... STARTED\n"
+  },
+  {
+   "id": "pyats",
+   "type": "text",
+   "markdown": "## pyATS: Python test automation for networks\n\n**pyATS** (Python Automated Test Systems) began as Cisco's internal test framework and is now free to use. It is installed with `pip install \"pyats[full]\"` and has several layers:\n\n- **Testbed file**: a YAML inventory of devices, their OS and how to connect to them.\n- **Unicon**: the connection library. It handles SSH or Telnet, prompts, `enable` and pagination for you.\n- **Genie**: more than 2,000 **parsers** that turn `show` command output into Python dictionaries, plus `learn`, which builds a full feature model (for example `ospf`, `bgp` or `interface`) from several commands.\n- **AEtest**: the test harness. A script has a `CommonSetup`, one or more `Testcase` classes and a `CommonCleanup`. Each test reports `passed`, `failed`, `errored` or `skipped`.\n- **Easypy**: the job runner (`pyats run job`) that runs many scripts and produces logs and an HTML report.\n\n### Why parsers matter\n\nScreen-scraping text with regular expressions is fragile: one extra column after an upgrade breaks your script. A Genie parser returns the same **schema** across IOS, IOS XE, NX-OS and IOS XR wherever possible, so your test checks `intf[\"protocol\"] == \"up\"` instead of hunting for the fourth word on a line. To see the structure of a parser's output without a script, run `pyats parse \"show ip interface brief\" --testbed-file testbed.yaml`."
+  },
+  {
+   "id": "testbed",
+   "type": "code",
+   "language": "yaml",
+   "filename": "testbed.yaml",
+   "caption": "A pyATS testbed for two CML routers. %ENV{} pulls the credentials from environment variables.",
+   "code": "testbed:\n  name: cml-ospf-lab\n  credentials:\n    default:\n      username: \"%ENV{PYATS_USERNAME}\"   # read from the environment\n      password: \"%ENV{PYATS_PASSWORD}\"   # never hard-code secrets\n\ndevices:\n  R1:\n    os: iosxe\n    type: router\n    platform: cat8k\n    connections:\n      cli:\n        protocol: ssh\n        ip: 192.0.2.11\n  R2:\n    os: iosxe\n    type: router\n    platform: cat8k\n    connections:\n      cli:\n        protocol: ssh\n        ip: 192.0.2.12\n",
+   "highlight": [
+    5,
+    6
+   ]
+  },
+  {
+   "id": "aetest",
+   "type": "code",
+   "language": "python",
+   "filename": "check_interfaces.py",
+   "caption": "An AEtest script: connect, verify that every addressed interface is up/up, disconnect.",
+   "code": "from pyats import aetest\nfrom pyats.topology import loader\n\n\nclass CommonSetup(aetest.CommonSetup):\n    @aetest.subsection\n    def connect(self, testbed):\n        testbed.connect(log_stdout=False)      # SSH to every device\n\n\nclass InterfacesUp(aetest.Testcase):\n    @aetest.test\n    def all_configured_interfaces_up(self, testbed):\n        down = []\n        for device in testbed.devices.values():\n            parsed = device.parse(\"show ip interface brief\")   # Genie parser\n            for name, intf in parsed[\"interface\"].items():\n                if intf[\"ip_address\"] != \"unassigned\" and intf[\"protocol\"] != \"up\":\n                    down.append(f\"{device.name} {name}\")\n        if down:\n            self.failed(f\"Interfaces down: {down}\")\n        else:\n            self.passed(\"All addressed interfaces are up/up\")\n\n\nclass CommonCleanup(aetest.CommonCleanup):\n    @aetest.subsection\n    def disconnect(self, testbed):\n        testbed.disconnect()\n\n\nif __name__ == \"__main__\":\n    aetest.main(testbed=loader.load(\"testbed.yaml\"))\n"
+  },
+  {
+   "id": "workflow",
+   "type": "text",
+   "markdown": "## A test-driven change workflow\n\nCML and pyATS are most useful together, inside a CI/CD pipeline (see [CI/CD Pipeline Components](/learn/network-automation-devops/ci-cd-pipeline-components)). The idea mirrors [test-driven development](/learn/network-automation-devops/test-driven-development-and-development-methods): define what \"correct\" looks like first, then prove the change achieves it.\n\n1. **Build** a lab in CML from a topology file stored in Git.\n2. **Snapshot** the operational state with `pyats learn`.\n3. **Apply** the proposed change with your automation tool (Python, Ansible or Terraform).\n4. **Snapshot again** and run `pyats diff` to see every difference.\n5. **Run AEtest checks** for the expected end state, such as neighbors up and routes present.\n6. **Pass or fail** the pipeline. Only a passing change is promoted toward production, where the same pyATS tests run again as post-change validation.\n\nThe value of the diff is that it shows **unexpected** changes as clearly as intended ones. If you changed one OSPF cost and the diff also shows a neighbor that went from `FULL` to missing, the pipeline should stop."
+  },
+  {
+   "id": "flow-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Testing a change before production",
+   "caption": "The same pyATS checks run in the lab and again after the production change.",
+   "data": {
+    "token": "Change",
+    "nodes": [
+     {
+      "id": "git",
+      "label": "Git",
+      "sub": "merge request",
+      "icon": "file"
+     },
+     {
+      "id": "ci",
+      "label": "CI runner",
+      "sub": "pipeline job",
+      "icon": "server"
+     },
+     {
+      "id": "cml",
+      "label": "CML lab",
+      "sub": "virtual routers",
+      "icon": "router"
+     },
+     {
+      "id": "pyats",
+      "label": "pyATS",
+      "sub": "learn / diff / AEtest",
+      "icon": "eye"
+     },
+     {
+      "id": "prod",
+      "label": "Production",
+      "sub": "real routers",
+      "icon": "router"
+     }
+    ],
+    "steps": [
+     {
+      "at": "git",
+      "caption": "An engineer opens a merge request that changes OSPF costs."
+     },
+     {
+      "at": "ci",
+      "caption": "The pipeline starts and uses the CML API to build the lab from a topology file."
+     },
+     {
+      "at": "pyats",
+      "token": "Snapshot",
+      "caption": "pyats learn records OSPF and interface state before the change."
+     },
+     {
+      "at": "cml",
+      "caption": "The automation pushes the proposed configuration to the lab routers."
+     },
+     {
+      "at": "pyats",
+      "token": "Diff",
+      "caption": "A second snapshot and pyats diff show exactly what changed."
+     },
+     {
+      "at": "pyats",
+      "token": "AEtest",
+      "caption": "AEtest checks pass: all neighbors are FULL and only the intended cost changed.",
+      "tone": "success"
+     },
+     {
+      "at": "prod",
+      "caption": "After approval, the change is deployed and the same tests validate production.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "id": "run",
+   "type": "terminal",
+   "title": "Before-and-after snapshots with pyats learn and pyats diff",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "pyats learn ospf interface --testbed-file testbed.yaml --output before",
+     "output": "Learning '['ospf', 'interface']' on devices '['R1', 'R2']'\n100%|##########| 2/2\n+==============================================================================+\n| Genie Learn Summary for device R1                                            |\n+==============================================================================+\n|  Connected to R1                                                             |\n|  Learnt feature 'ospf'                                                       |\n|  -  Ops structure:  before/ospf_iosxe_R1_ops.txt                             |\n|  Learnt feature 'interface'                                                  |\n|  -  Ops structure:  before/interface_iosxe_R1_ops.txt                        |\n..."
+    },
+    {
+     "comment": "Snapshot 1: the structured operational state of OSPF and interfaces before the change."
+    },
+    {
+     "cmd": "pyats learn ospf interface --testbed-file testbed.yaml --output after",
+     "output": "Learning '['ospf', 'interface']' on devices '['R1', 'R2']'\n..."
+    },
+    {
+     "comment": "Snapshot 2, taken after the change was pushed to the CML lab."
+    },
+    {
+     "cmd": "pyats diff before after --output diff_dir",
+     "output": "+==============================================================================+\n| Genie Diff Summary between directories before/ and after/                    |\n+==============================================================================+\n|  File: ospf_iosxe_R1_ops.txt                                                 |\n|   - Diff can be found at diff_dir/diff_ospf_iosxe_R1_ops.txt                 |\n|  File: interface_iosxe_R1_ops.txt                                            |\n|   - Identical                                                                |\n..."
+    },
+    {
+     "cmd": "cat diff_dir/diff_ospf_iosxe_R1_ops.txt",
+     "output": "--- before/ospf_iosxe_R1_ops.txt\n+++ after/ospf_iosxe_R1_ops.txt\n info:\n  vrf:\n   default:\n    ...\n          interfaces:\n           GigabitEthernet2:\n-           cost: 1\n+           cost: 10"
+    },
+    {
+     "comment": "Only the intended change appears: the OSPF cost on Gi2. Anything else in the diff would be an unexpected side effect."
+    }
+   ],
+   "caption": "Output abbreviated. Run these against your own CML lab or a DevNet Sandbox."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Where learners go wrong",
+   "markdown": "- **Treating CML as a traffic-performance lab.** CML is for control-plane and configuration behavior. Virtual data planes are rate-limited, so do not use it to measure throughput.\n- **Hard-coding passwords in testbed files.** Use `%ENV{}`, the pyATS secret strings feature or your CI system's secret store, and keep testbed files with real credentials out of Git.\n- **Confusing pyATS with unit tests.** `unittest` and `pytest` test your Python code; pyATS tests the **network's state**. A mature pipeline uses both (see [Python Unit Testing](/learn/network-automation-devops/python-unit-testing)).\n- **Ignoring the diff.** A passing AEtest check does not mean nothing else changed. Read the `pyats diff` output."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use CML-Free on your own computer or reserve a free CML sandbox in Cisco DevNet.\n\n1. Build two `iosv` or `cat8000v` routers connected by one link, address the link and enable OSPF.\n2. Create a virtual environment and run `pip install \"pyats[full]\"`.\n3. Write a `testbed.yaml` for both routers, with credentials in environment variables.\n4. Run `pyats parse \"show ip ospf neighbor\" --testbed-file testbed.yaml` and inspect the dictionary.\n5. Run `pyats learn ospf --testbed-file testbed.yaml --output before`, change the OSPF cost on one interface, learn again into `after`, and run `pyats diff before after`.\n6. Shut down the link on one router, run the AEtest script from this lesson and confirm that it fails with a clear message."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Cisco Modeling Labs (CML)",
+     "definition": "A network simulation platform that runs real Cisco OS images as virtual nodes and exposes a REST API for automation."
+    },
+    {
+     "term": "Node definition",
+     "definition": "A CML template for a node type, such as iosv, cat8000v or nxosv9000."
+    },
+    {
+     "term": "virl2_client",
+     "definition": "Cisco's Python client library for the CML REST API, used to build, start and stop labs from code."
+    },
+    {
+     "term": "pyATS",
+     "definition": "Python Automated Test Systems: Cisco's free framework for testing network devices and their state."
+    },
+    {
+     "term": "Testbed file",
+     "definition": "A YAML file that lists devices, their operating systems, connection details and credentials for pyATS."
+    },
+    {
+     "term": "Genie parser",
+     "definition": "A pyATS library component that converts show command output into a structured Python dictionary."
+    },
+    {
+     "term": "pyats learn / pyats diff",
+     "definition": "Commands that capture a feature's full operational state and compare two snapshots to show what changed."
+    },
+    {
+     "term": "AEtest",
+     "definition": "The pyATS test harness, organized into CommonSetup, Testcase and CommonCleanup sections with pass or fail results."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What makes Cisco Modeling Labs more realistic than a simplified network simulator?",
+     "options": [
+      "It emulates only Layer 2 switching",
+      "It boots real Cisco operating system images as virtual machines",
+      "It connects only to physical hardware",
+      "It replaces device CLI with a graphical editor"
+     ],
+     "answer": 1,
+     "explanation": "CML runs real IOS, IOS XE, NX-OS, IOS XR and ASA images, so commands, parsers and APIs behave as they would on real devices."
+    },
+    {
+     "question": "Which components belong to the pyATS ecosystem? (Choose all that apply.)",
+     "options": [
+      "Genie parsers",
+      "AEtest",
+      "Unicon",
+      "Catalyst Center Assurance"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Genie (parsers and learn), AEtest (test harness) and Unicon (connections) are part of pyATS. Assurance is a feature of the Catalyst Center controller."
+    },
+    {
+     "question": "An engineer wants to confirm that a change modified only the intended OSPF setting. Which approach is best?",
+     "options": [
+      "Compare two pyats learn snapshots with pyats diff",
+      "Run ping from the CI runner",
+      "Check that the Python script has no syntax errors",
+      "Read the running configuration by eye"
+     ],
+     "answer": 0,
+     "explanation": "pyats learn captures structured operational state, and pyats diff shows every difference, including unexpected side effects."
+    },
+    {
+     "question": "Why are Genie parsers preferred over regular expressions on raw CLI output?",
+     "options": [
+      "They make commands run faster on the device",
+      "They return structured data with a consistent schema that does not break when spacing changes",
+      "They encrypt the SSH session",
+      "They are required to use SSH"
+     ],
+     "answer": 1,
+     "explanation": "Parsers return dictionaries with stable keys, so tests are readable and robust against small formatting changes."
+    },
+    {
+     "question": "Which statements about using CML in a CI/CD pipeline are true? (Choose all that apply.)",
+     "options": [
+      "Labs can be created and started through the CML REST API",
+      "Topologies can be stored as YAML files in Git",
+      "CML is the right place to measure production throughput",
+      "The same pyATS tests can validate the lab and production"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "CML is fully API-driven and topologies are YAML, so labs fit pipelines. Its virtual data plane is rate-limited, so it is not suitable for throughput testing."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- **CML** runs real Cisco OS images in a virtual lab and is fully automatable through its REST API, the `virl2_client` library and YAML topology files.\n- **pyATS** tests networks: a **testbed** YAML describes the devices, **Unicon** connects, **Genie** parses `show` output into dictionaries, and **AEtest** turns checks into pass or fail results.\n- `pyats learn` and `pyats diff` capture state before and after a change and reveal unexpected side effects.\n- Together they let you test a network change in a pipeline before it reaches production, then validate production with the same tests.\n- Keep credentials in environment variables or a secret store, never in the testbed file.\n\nNext, see how controllers change the way you manage devices in [Controller-Level vs Device-Level Management](/learn/network-automation-devops/controller-level-vs-device-level-management)."
+  }
+ ],
+ "ar": {
+  "title": "المحاكاة والاختبار: Cisco Modeling Labs وpyATS",
+  "summary": "استخدم Cisco Modeling Labs لبناء شبكات افتراضية واقعية وpyATS لاختبارها، حتى يُتحقَّق من تغييرات الشبكة في المختبر وفي خط CI/CD قبل وصولها إلى الإنتاج.",
+  "objectives": [
+   "وصف قدرات Cisco Modeling Labs وكيف تدعم واجهتها البرمجية الأتمتة",
+   "شرح أدوار ملف منصة الاختبار في pyATS وUnicon ومحلِّلات Genie وAEtest",
+   "استخدام pyats learn وpyats diff لمقارنة حالة الشبكة قبل التغيير وبعده",
+   "وصف موقع CML وpyATS في سير عمل CI/CD قائم على الاختبار لتغييرات الشبكة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "تكتب مهندسة شبكات سكربت Python يغيّر كلفة OSPF على 40 موجّهًا. يعمل السكربت على حاسوبها، وصياغته سليمة، واختبارات الوحدات ناجحة. لكن هل ستتدفق الحركة كما يتوقع العمل بعد التغيير؟ إنّ اختبار ذلك على شبكة الإنتاج هو بالضبط ما يؤدي إلى الأعطال.\n\nيتناول هذا الدرس أداتين من Cisco تجعلان تغييرات الشبكة قابلة للاختبار: **Cisco Modeling Labs (CML)** التي تمنحك شبكة افتراضية واقعية تجرّب عليها التغييرات، و**pyATS** وهو إطار اختبار بلغة Python يتصل بالأجهزة، ويحوّل مخرجات سطر الأوامر إلى بيانات منظَّمة، ويخبرك بدقة بما تغيّر."
+   },
+   {
+    "id": "cml",
+    "type": "text",
+    "markdown": "## Cisco Modeling Labs: شبكة يُسمح لك بكسرها\n\n**Cisco Modeling Labs (CML)** منصة لمحاكاة الشبكات. وخلافًا للمحاكيات المبسَّطة، تُقلع CML **صور أنظمة تشغيل Cisco الحقيقية** بوصفها أجهزة افتراضية (Virtual machines)، فتتصرف الأوامر والمحلِّلات وواجهات البرمجة كما تتصرف على العتاد الفعلي.\n\nمن أنواع العُقد الشائعة:\n\n| تعريف العقدة (Node definition) | ما الذي تشغّله |\n|:--|:--|\n| `iosv`، `iosvl2` | موجّه IOS الكلاسيكي ومحوّل الطبقة الثانية |\n| `cat8000v`، `csr1000v` | موجّهات IOS XE مع NETCONF وRESTCONF |\n| `nxosv9000` | محوّل مراكز البيانات NX-OS |\n| `iosxrv9000` | موجّه IOS XR لمزوّدي الخدمة |\n| `asav` | جدار الحماية الافتراضي ASA |\n| `ubuntu`، `alpine` | مضيفات Linux لتوليد الحركة واختبارها |\n\nتتوفر CML بإصدارات **CML-Free** (بحدّ صغير لعدد العقد)، و**CML-Personal**، و**CML-Enterprise** للفرق. وتعمل على خادم مادي أو بوصفها جهازًا افتراضيًا، ويمكنك كذلك الوصول إلى نسخ مستضافة منها عبر Cisco DevNet Sandbox.\n\n### مصمَّمة للأتمتة\n\nكل ما تفعله في واجهة الويب الخاصة بـ CML متاح أيضًا عبر **واجهة REST البرمجية** (`/api/v0/`)، المحميّة برمز حامل (Bearer token) يُحصَل عليه من `POST /api/v0/authenticate`. وتنشر Cisco مكتبة Python باسم `virl2_client` مبنيّة فوق هذه الواجهة. ويمكن تصدير المختبرات واستيرادها **ملفاتِ طوبولوجيا بصيغة YAML**، فيبقى مخطط الاختبار في Git بجوار شيفرة الأتمتة التي يختبرها. أمّا عقدة **الموصل الخارجي (External connector)** فتربط المختبر بشبكة حقيقية، مثلًا للوصول إلى جهاز في المختبر من مشغّل التكامل المستمر."
+   },
+   {
+    "id": "cml-code",
+    "type": "code",
+    "language": "python",
+    "filename": "build_lab.py",
+    "caption": "بناء مختبر من موجّهين وتشغيله بمكتبة virl2_client.",
+    "code": "import os\nfrom virl2_client import ClientLibrary\n\n# Credentials come from environment variables, not from the script\nclient = ClientLibrary(\"https://cml.example.com\",\n                       os.environ[\"CML_USERNAME\"], os.environ[\"CML_PASSWORD\"],\n                       ssl_verify=\"ca-bundle.pem\")\n\nlab = client.create_lab(\"ospf-change-test\")\nr1 = lab.create_node(\"R1\", \"cat8000v\", 0, 0)\nr2 = lab.create_node(\"R2\", \"cat8000v\", 200, 0)\nlab.connect_two_nodes(r1, r2)          # creates interfaces and a link\n\nlab.start()                            # boots both virtual routers\nprint(lab.id, lab.state())             # e.g. 7f3c... STARTED\n"
+   },
+   {
+    "id": "pyats",
+    "type": "text",
+    "markdown": "## pyATS: أتمتة اختبار الشبكات بلغة Python\n\nبدأ **pyATS** (Python Automated Test Systems) إطارَ اختبار داخليًا في Cisco، وأصبح الآن مجانيّ الاستخدام. يُثبَّت بالأمر `pip install \"pyats[full]\"`، ويتكوّن من عدة طبقات:\n\n- **ملف منصة الاختبار (Testbed file)**: قائمة جرد بصيغة YAML للأجهزة ونظام تشغيل كلٍّ منها وطريقة الاتصال به.\n- **Unicon**: مكتبة الاتصال، تتولى عنك SSH أو Telnet والمحثّات (Prompts) والأمر `enable` وتقسيم المخرجات إلى صفحات.\n- **Genie**: أكثر من 2000 **محلِّل (Parser)** يحوّل مخرجات أوامر `show` إلى قواميس Python، إضافةً إلى `learn` الذي يبني نموذجًا كاملًا لميزة ما (مثل `ospf` أو `bgp` أو `interface`) من عدة أوامر.\n- **AEtest**: أداة تشغيل الاختبارات. يتألف السكربت من قسم `CommonSetup`، وصنف `Testcase` واحد أو أكثر، وقسم `CommonCleanup`. ويُبلغ كل اختبار بنتيجة `passed` أو `failed` أو `errored` أو `skipped`.\n- **Easypy**: مشغّل المهام (`pyats run job`) الذي ينفّذ سكربتات عديدة وينتج السجلات وتقريرًا بصيغة HTML.\n\n### لماذا تهمّ المحلِّلات؟\n\nاستخلاص النص بالتعابير النمطية (Regular expressions) هشّ: يكفي عمود إضافي بعد ترقية ما لكسر السكربت. أمّا محلِّل Genie فيُعيد **المخطط (Schema)** نفسه عبر IOS وIOS XE وNX-OS وIOS XR قدر الإمكان، فيتحقق اختبارك من `intf[\"protocol\"] == \"up\"` بدلًا من البحث عن الكلمة الرابعة في السطر. ولرؤية بنية مخرجات محلِّل ما دون كتابة سكربت، نفّذ `pyats parse \"show ip interface brief\" --testbed-file testbed.yaml`."
+   },
+   {
+    "id": "testbed",
+    "type": "code",
+    "language": "yaml",
+    "filename": "testbed.yaml",
+    "caption": "منصة اختبار pyATS لموجّهَين في CML. تسحب %ENV{} بيانات الاعتماد من متغيرات البيئة.",
+    "code": "testbed:\n  name: cml-ospf-lab\n  credentials:\n    default:\n      username: \"%ENV{PYATS_USERNAME}\"   # read from the environment\n      password: \"%ENV{PYATS_PASSWORD}\"   # never hard-code secrets\n\ndevices:\n  R1:\n    os: iosxe\n    type: router\n    platform: cat8k\n    connections:\n      cli:\n        protocol: ssh\n        ip: 192.0.2.11\n  R2:\n    os: iosxe\n    type: router\n    platform: cat8k\n    connections:\n      cli:\n        protocol: ssh\n        ip: 192.0.2.12\n",
+    "highlight": [
+     5,
+     6
+    ]
+   },
+   {
+    "id": "aetest",
+    "type": "code",
+    "language": "python",
+    "filename": "check_interfaces.py",
+    "caption": "سكربت AEtest: الاتصال، ثم التحقق من أنّ كل واجهة لها عنوان في حالة up/up، ثم قطع الاتصال.",
+    "code": "from pyats import aetest\nfrom pyats.topology import loader\n\n\nclass CommonSetup(aetest.CommonSetup):\n    @aetest.subsection\n    def connect(self, testbed):\n        testbed.connect(log_stdout=False)      # SSH to every device\n\n\nclass InterfacesUp(aetest.Testcase):\n    @aetest.test\n    def all_configured_interfaces_up(self, testbed):\n        down = []\n        for device in testbed.devices.values():\n            parsed = device.parse(\"show ip interface brief\")   # Genie parser\n            for name, intf in parsed[\"interface\"].items():\n                if intf[\"ip_address\"] != \"unassigned\" and intf[\"protocol\"] != \"up\":\n                    down.append(f\"{device.name} {name}\")\n        if down:\n            self.failed(f\"Interfaces down: {down}\")\n        else:\n            self.passed(\"All addressed interfaces are up/up\")\n\n\nclass CommonCleanup(aetest.CommonCleanup):\n    @aetest.subsection\n    def disconnect(self, testbed):\n        testbed.disconnect()\n\n\nif __name__ == \"__main__\":\n    aetest.main(testbed=loader.load(\"testbed.yaml\"))\n"
+   },
+   {
+    "id": "workflow",
+    "type": "text",
+    "markdown": "## سير عمل للتغيير قائم على الاختبار\n\nتبلغ CML وpyATS أقصى فائدتهما معًا داخل خط تكامل ونشر مستمرَّين (CI/CD) (راجع درس [مكوّنات خط CI/CD](/learn/network-automation-devops/ci-cd-pipeline-components)). والفكرة تحاكي [التطوير المقود بالاختبار](/learn/network-automation-devops/test-driven-development-and-development-methods): حدِّد أولًا شكل الحالة «الصحيحة»، ثم أثبت أنّ التغيير يحققها.\n\n1. **ابنِ** مختبرًا في CML من ملف طوبولوجيا محفوظ في Git.\n2. **التقط** الحالة التشغيلية بالأمر `pyats learn`.\n3. **طبّق** التغيير المقترح بأداة الأتمتة لديك (Python أو Ansible أو Terraform).\n4. **التقط مجددًا** ونفّذ `pyats diff` لرؤية كل فرق.\n5. **شغّل فحوص AEtest** على الحالة النهائية المتوقعة، كأن تكون الجيرة قائمة والمسارات موجودة.\n6. **أنجِح الخط أو أفشِله**. لا يُرقّى نحو الإنتاج إلا التغيير الناجح، وهناك تُشغَّل اختبارات pyATS نفسها مرة أخرى للتحقق بعد التغيير.\n\nوتكمن قيمة الفرق في أنه يُظهر التغييرات **غير المتوقعة** بالوضوح نفسه الذي يُظهر به التغييرات المقصودة. فإن غيّرت كلفة OSPF واحدة وأظهر الفرق أيضًا جارًا انتقل من `FULL` إلى الاختفاء، فيجب أن يتوقف الخط."
+   },
+   {
+    "id": "flow-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "اختبار التغيير قبل الإنتاج",
+    "caption": "تُشغَّل فحوص pyATS نفسها في المختبر ثم مجددًا بعد تغيير الإنتاج.",
+    "data": {
+     "token": "تغيير",
+     "nodes": [
+      {
+       "id": "git",
+       "label": "Git",
+       "sub": "طلب دمج",
+       "icon": "file"
+      },
+      {
+       "id": "ci",
+       "label": "مشغّل CI",
+       "sub": "مهمة في الخط",
+       "icon": "server"
+      },
+      {
+       "id": "cml",
+       "label": "مختبر CML",
+       "sub": "موجّهات افتراضية",
+       "icon": "router"
+      },
+      {
+       "id": "pyats",
+       "label": "pyATS",
+       "sub": "learn / diff / AEtest",
+       "icon": "eye"
+      },
+      {
+       "id": "prod",
+       "label": "الإنتاج",
+       "sub": "موجّهات حقيقية",
+       "icon": "router"
+      }
+     ],
+     "steps": [
+      {
+       "at": "git",
+       "caption": "يفتح مهندس طلب دمج يغيّر كلفة OSPF."
+      },
+      {
+       "at": "ci",
+       "caption": "يبدأ الخط ويستخدم واجهة CML البرمجية لبناء المختبر من ملف طوبولوجيا."
+      },
+      {
+       "at": "pyats",
+       "token": "لقطة",
+       "caption": "يسجّل pyats learn حالة OSPF والواجهات قبل التغيير."
+      },
+      {
+       "at": "cml",
+       "caption": "تدفع الأتمتة الإعداد المقترح إلى موجّهات المختبر."
+      },
+      {
+       "at": "pyats",
+       "token": "فرق",
+       "caption": "تُظهر لقطة ثانية مع pyats diff ما تغيّر بالضبط."
+      },
+      {
+       "at": "pyats",
+       "token": "AEtest",
+       "caption": "تنجح فحوص AEtest: كل الجيران في حالة FULL ولم تتغير إلا الكلفة المقصودة.",
+       "tone": "success"
+      },
+      {
+       "at": "prod",
+       "caption": "بعد الموافقة يُنشَر التغيير، وتتحقق الاختبارات نفسها من الإنتاج.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "id": "run",
+    "type": "terminal",
+    "title": "لقطات قبل التغيير وبعده بالأمرين pyats learn وpyats diff",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "pyats learn ospf interface --testbed-file testbed.yaml --output before",
+      "output": "Learning '['ospf', 'interface']' on devices '['R1', 'R2']'\n100%|##########| 2/2\n+==============================================================================+\n| Genie Learn Summary for device R1                                            |\n+==============================================================================+\n|  Connected to R1                                                             |\n|  Learnt feature 'ospf'                                                       |\n|  -  Ops structure:  before/ospf_iosxe_R1_ops.txt                             |\n|  Learnt feature 'interface'                                                  |\n|  -  Ops structure:  before/interface_iosxe_R1_ops.txt                        |\n..."
+     },
+     {
+      "comment": "اللقطة الأولى: الحالة التشغيلية المنظَّمة لـ OSPF والواجهات قبل التغيير."
+     },
+     {
+      "cmd": "pyats learn ospf interface --testbed-file testbed.yaml --output after",
+      "output": "Learning '['ospf', 'interface']' on devices '['R1', 'R2']'\n..."
+     },
+     {
+      "comment": "اللقطة الثانية، تُؤخذ بعد دفع التغيير إلى مختبر CML."
+     },
+     {
+      "cmd": "pyats diff before after --output diff_dir",
+      "output": "+==============================================================================+\n| Genie Diff Summary between directories before/ and after/                    |\n+==============================================================================+\n|  File: ospf_iosxe_R1_ops.txt                                                 |\n|   - Diff can be found at diff_dir/diff_ospf_iosxe_R1_ops.txt                 |\n|  File: interface_iosxe_R1_ops.txt                                            |\n|   - Identical                                                                |\n..."
+     },
+     {
+      "cmd": "cat diff_dir/diff_ospf_iosxe_R1_ops.txt",
+      "output": "--- before/ospf_iosxe_R1_ops.txt\n+++ after/ospf_iosxe_R1_ops.txt\n info:\n  vrf:\n   default:\n    ...\n          interfaces:\n           GigabitEthernet2:\n-           cost: 1\n+           cost: 10"
+     },
+     {
+      "comment": "لا يظهر إلا التغيير المقصود: كلفة OSPF على Gi2. وأيّ شيء آخر في الفرق سيكون أثرًا جانبيًا غير متوقَّع."
+     }
+    ],
+    "caption": "المخرجات مختصرة. نفّذ هذه الأوامر على مختبر CML خاص بك أو على DevNet Sandbox."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة لدى المتعلّمين",
+    "markdown": "- **معاملة CML مختبرًا لقياس أداء الحركة.** CML مخصّصة لسلوك مستوى التحكم والإعدادات، ومستويات البيانات الافتراضية فيها محدودة المعدّل، فلا تستخدمها لقياس الإنتاجية.\n- **كتابة كلمات المرور مباشرةً في ملفات منصة الاختبار.** استخدم `%ENV{}` أو ميزة السلاسل السرية في pyATS أو مخزن الأسرار في نظام CI، وأبقِ ملفات منصة الاختبار التي تحوي بيانات اعتماد حقيقية خارج Git.\n- **الخلط بين pyATS واختبارات الوحدات.** تختبر `unittest` و`pytest` شيفرة Python الخاصة بك، أمّا pyATS فيختبر **حالة الشبكة**. والخط الناضج يستخدم الاثنين معًا (راجع درس [اختبار الوحدات في Python](/learn/network-automation-devops/python-unit-testing)).\n- **تجاهل الفرق.** نجاح فحص AEtest لا يعني أنّ شيئًا آخر لم يتغير، فاقرأ مخرجات `pyats diff`."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم CML-Free على حاسوبك أو احجز بيئة CML مجانية في Cisco DevNet.\n\n1. ابنِ موجّهَين من نوع `iosv` أو `cat8000v` تربطهما وصلة واحدة، وأسند عناوين للوصلة وفعّل OSPF.\n2. أنشئ بيئة افتراضية ونفّذ `pip install \"pyats[full]\"`.\n3. اكتب ملف `testbed.yaml` للموجّهَين، مع وضع بيانات الاعتماد في متغيرات البيئة.\n4. نفّذ `pyats parse \"show ip ospf neighbor\" --testbed-file testbed.yaml` وافحص القاموس الناتج.\n5. نفّذ `pyats learn ospf --testbed-file testbed.yaml --output before`، ثم غيّر كلفة OSPF على إحدى الواجهات، وأعد التعلّم إلى المجلد `after`، ثم نفّذ `pyats diff before after`.\n6. أوقف الوصلة على أحد الموجّهَين، وشغّل سكربت AEtest من هذا الدرس، وتأكد من أنه يفشل برسالة واضحة."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "Cisco Modeling Labs (CML)",
+      "definition": "منصة لمحاكاة الشبكات تشغّل صور أنظمة Cisco الحقيقية عقدًا افتراضية، وتوفّر واجهة REST برمجية للأتمتة."
+     },
+     {
+      "term": "تعريف العقدة (Node definition)",
+      "definition": "قالب في CML لنوع من العقد، مثل iosv أو cat8000v أو nxosv9000."
+     },
+     {
+      "term": "virl2_client",
+      "definition": "مكتبة Python من Cisco للتعامل مع واجهة CML البرمجية، تُستخدم لبناء المختبرات وتشغيلها وإيقافها بالشيفرة."
+     },
+     {
+      "term": "pyATS",
+      "definition": "Python Automated Test Systems: إطار مجاني من Cisco لاختبار أجهزة الشبكة وحالتها."
+     },
+     {
+      "term": "ملف منصة الاختبار (Testbed file)",
+      "definition": "ملف YAML يسرد الأجهزة وأنظمة تشغيلها وتفاصيل الاتصال بها وبيانات الاعتماد لـ pyATS."
+     },
+     {
+      "term": "محلِّل Genie (Genie parser)",
+      "definition": "مكوّن في pyATS يحوّل مخرجات أوامر show إلى قاموس Python منظَّم."
+     },
+     {
+      "term": "pyats learn / pyats diff",
+      "definition": "أمران يلتقطان الحالة التشغيلية الكاملة لميزة ما، ويقارنان لقطتين لإظهار ما تغيّر."
+     },
+     {
+      "term": "AEtest",
+      "definition": "أداة تشغيل الاختبارات في pyATS، منظَّمة في أقسام CommonSetup وTestcase وCommonCleanup، بنتائج نجاح أو فشل."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما الذي يجعل Cisco Modeling Labs أكثر واقعية من محاكٍ مبسَّط للشبكات؟",
+      "options": [
+       "أنها تحاكي تبديل الطبقة الثانية فقط",
+       "أنها تُقلع صور أنظمة تشغيل Cisco الحقيقية أجهزةً افتراضية",
+       "أنها تتصل بالعتاد المادي فقط",
+       "أنها تستبدل بسطر أوامر الجهاز محررًا رسوميًا"
+      ],
+      "answer": 1,
+      "explanation": "تشغّل CML صور IOS وIOS XE وNX-OS وIOS XR وASA الحقيقية، فتتصرف الأوامر والمحلِّلات وواجهات البرمجة كما على الأجهزة الفعلية."
+     },
+     {
+      "question": "أيّ المكوّنات الآتية تنتمي إلى منظومة pyATS؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "محلِّلات Genie",
+       "AEtest",
+       "Unicon",
+       "Catalyst Center Assurance"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "إنّ Genie (المحلِّلات وlearn) وAEtest (أداة تشغيل الاختبارات) وUnicon (الاتصالات) جزء من pyATS، أمّا Assurance فميزة في وحدة التحكم Catalyst Center."
+     },
+     {
+      "question": "يريد مهندس التأكد من أنّ تغييرًا ما عدّل إعداد OSPF المقصود فقط. ما أفضل نهج؟",
+      "options": [
+       "مقارنة لقطتين من pyats learn باستخدام pyats diff",
+       "تنفيذ ping من مشغّل CI",
+       "التحقق من خلوّ سكربت Python من الأخطاء النحوية",
+       "قراءة الإعداد الجاري بالعين"
+      ],
+      "answer": 0,
+      "explanation": "يلتقط pyats learn حالة تشغيلية منظَّمة، ويُظهر pyats diff كل فرق، بما في ذلك الآثار الجانبية غير المتوقعة."
+     },
+     {
+      "question": "لماذا تُفضَّل محلِّلات Genie على التعابير النمطية المطبَّقة على مخرجات سطر الأوامر الخام؟",
+      "options": [
+       "لأنها تجعل الأوامر تُنفَّذ أسرع على الجهاز",
+       "لأنها تُعيد بيانات منظَّمة بمخطط ثابت لا ينكسر عند تغيّر المسافات",
+       "لأنها تشفّر جلسة SSH",
+       "لأنها شرط لاستخدام SSH"
+      ],
+      "answer": 1,
+      "explanation": "تُعيد المحلِّلات قواميس بمفاتيح ثابتة، فتصبح الاختبارات مقروءة ومتينة أمام التغييرات الطفيفة في التنسيق."
+     },
+     {
+      "question": "أيّ العبارات الآتية عن استخدام CML في خط CI/CD صحيحة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "يمكن إنشاء المختبرات وتشغيلها عبر واجهة CML البرمجية",
+       "يمكن حفظ الطوبولوجيات ملفاتِ YAML في Git",
+       "CML هي المكان المناسب لقياس إنتاجية الإنتاج",
+       "يمكن لاختبارات pyATS نفسها التحقق من المختبر ومن الإنتاج"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تُدار CML بالكامل عبر واجهتها البرمجية، وطوبولوجياتها بصيغة YAML، فتلائم خطوط CI/CD. لكنّ مستوى بياناتها الافتراضي محدود المعدّل، فلا تصلح لاختبار الإنتاجية."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تشغّل **CML** صور أنظمة Cisco الحقيقية في مختبر افتراضي، ويمكن أتمتتها كليًا عبر واجهتها البرمجية ومكتبة `virl2_client` وملفات الطوبولوجيا بصيغة YAML.\n- يختبر **pyATS** الشبكات: يصف ملف **منصة الاختبار** الأجهزة، ويتولى **Unicon** الاتصال، ويحلّل **Genie** مخرجات `show` إلى قواميس، ويحوّل **AEtest** الفحوص إلى نتائج نجاح أو فشل.\n- يلتقط `pyats learn` و`pyats diff` الحالة قبل التغيير وبعده، ويكشفان الآثار الجانبية غير المتوقعة.\n- معًا يتيحان لك اختبار تغيير الشبكة داخل خط CI/CD قبل وصوله إلى الإنتاج، ثم التحقق من الإنتاج بالاختبارات نفسها.\n- احفظ بيانات الاعتماد في متغيرات البيئة أو مخزن الأسرار، لا في ملف منصة الاختبار.\n\nتابع لترى كيف تغيّر وحدات التحكم طريقة إدارة الأجهزة في درس [الإدارة على مستوى وحدة التحكم مقابل الإدارة على مستوى الجهاز](/learn/network-automation-devops/controller-level-vs-device-level-management)."
+   }
+  ]
+ }
+}
