@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Modules\Account\Repositories\Interfaces\AccountRepositoryInterface;
 use App\Modules\Account\Requests\RegisterAccountRequest;
 use App\Modules\Account\Resources\AccountUserResource;
+use App\Modules\Account\Support\EmailVerificationService;
 use App\Modules\Core\Services\AnalyticsRecorder;
 use Illuminate\Http\Request;
 use Laravel\Sanctum\PersonalAccessToken;
@@ -33,6 +34,10 @@ class AccountAuthController extends Controller
             'successful' => true,
             'provider' => 'register',
         ]);
+
+        // The first confirmation code goes out with the sign-up; a failure
+        // here must not fail the sign-up, the person can ask for another.
+        app(EmailVerificationService::class)->sendCode($user, $request->header('X-Language', 'en'));
 
         $token = $user->createToken('api_token')->plainTextToken;
 

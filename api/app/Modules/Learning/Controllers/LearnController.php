@@ -9,6 +9,7 @@ use App\Modules\Learning\Models\LearningLesson;
 use App\Modules\Learning\Models\LearningMedia;
 use App\Modules\Learning\Services\LearningPresenter;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 
 /**
@@ -80,12 +81,67 @@ class LearnController extends Controller
         // signed-in members. A visitor (and a search engine) still gets the
         // title, summary, objectives and the place in the course, so the page
         // can show what the lesson teaches and ask them to sign in.
-        $data['locked'] = ! $request->user('sanctum');
+        // A member must also have confirmed their email with the code.
+        $user = $request->user('sanctum');
+        $data['lock_reason'] = ! $user ? 'sign_in' : ($user->email_verified_at ? null : 'verify_email');
+        $data['locked'] = $data['lock_reason'] !== null;
+        $data['completed'] = $user && DB::table('learning_lesson_progress')
+            ->where('user_id', $user->id)->where('lesson_id', $lesson->id)->exists();
         if ($data['locked']) {
             $data['blocks'] = [];
         }
 
         return response()->json(['data' => $data]);
+    }
+
+    /** The slugs of the lessons the member has completed in a course. */
+    public function progress(Request $request, string $slug)
+    {
+        $course = $this->publishedCourses()->where('slug', $slug)->firstOrFail();
+
+        return response()->json(['data' => ['completed' => $this->completedSlugs($request->user()->id, $course->id)]]);
+    }
+
+    /**
+     * Marks lessons complete (or not). Takes several slugs at once so the
+     * progress a browser kept before it was signed in can be uploaded in one go.
+     */
+    public function updateProgress(Request $request, string $slug)
+    {
+        $course = $this->publishedCourses()->where('slug', $slug)->firstOrFail();
+        $input = $request->validate([
+            'lessons' => 'required|array|max:500',
+            'lessons.*' => 'string|max:190',
+            'done' => 'required|boolean',
+        ]);
+        $userId = $request->user()->id;
+
+        $ids = LearningLesson::query()
+            ->where('course_id', $course->id)
+            ->where('status', 'published')
+            ->whereIn('slug', $input['lessons'])
+            ->pluck('id');
+
+        if ($input['done']) {
+            DB::table('learning_lesson_progress')->insertOrIgnore(
+                $ids->map(fn ($id) => ['user_id' => $userId, 'lesson_id' => $id, 'completed_at' => now()])->all()
+            );
+        } else {
+            DB::table('learning_lesson_progress')->where('user_id', $userId)->whereIn('lesson_id', $ids)->delete();
+        }
+
+        return response()->json(['data' => ['completed' => $this->completedSlugs($userId, $course->id)]]);
+    }
+
+    private function completedSlugs(int $userId, int $courseId): array
+    {
+        return DB::table('learning_lesson_progress as p')
+            ->join('learning_lessons as l', 'l.id', '=', 'p.lesson_id')
+            ->where('p.user_id', $userId)
+            ->where('l.course_id', $courseId)
+            ->where('l.status', 'published')
+            ->pluck('l.slug')
+            ->all();
     }
 
     public function cover(string $slug)

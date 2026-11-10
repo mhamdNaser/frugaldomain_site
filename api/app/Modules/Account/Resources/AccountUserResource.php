@@ -23,6 +23,7 @@ class AccountUserResource extends JsonResource
             'first_name' => $this->first_name,
             'last_name' => $this->last_name,
             'email' => $this->email,
+            'email_verified' => $this->email_verified_at !== null,
             'image' => $this->image,
             'roles' => $roles->values(),
             // The dashboard link is offered on these; the API still checks

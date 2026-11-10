@@ -9,6 +9,8 @@ use App\Modules\Learning\Services\CourseTransfer;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Validation\ValidationException;
 use Laravel\Sanctum\Sanctum;
+use Illuminate\Support\Facades\Mail;
+use App\Modules\Account\Mail\EmailVerificationCode;
 use App\Modules\User\Models\User;
 use Tests\TestCase;
 
@@ -16,12 +18,16 @@ class LearningApiTest extends TestCase
 {
     use RefreshDatabase;
 
-    /** Lesson content is for signed-in members only. */
-    private function signIn(): void
+    /** Lesson content is for signed-in members who confirmed their email. */
+    private function signIn(bool $verified = true): User
     {
-        Sanctum::actingAs(User::unguarded(fn () => User::create([
+        $user = User::unguarded(fn () => User::create([
             'name' => 'Member', 'first_name' => 'Member', 'email' => 'member@example.com', 'password' => bcrypt('secret-password'),
-        ])));
+            'email_verified_at' => $verified ? now() : null,
+        ]));
+        Sanctum::actingAs($user);
+
+        return $user;
     }
 
     private function document(array $lessonOverrides = []): array
@@ -94,6 +100,50 @@ class LearningApiTest extends TestCase
             ->assertOk()
             ->assertJsonPath('data.locked', false)
             ->assertJsonCount(2, 'data.blocks');
+    }
+
+    public function test_an_unconfirmed_email_keeps_the_lesson_locked_until_the_code_is_entered(): void
+    {
+        Mail::fake();
+        app(CourseTransfer::class)->import($this->document());
+        $this->signIn(verified: false);
+
+        $this->getJson('/api/learn/courses/demo/lessons/first')
+            ->assertJsonPath('data.locked', true)
+            ->assertJsonPath('data.lock_reason', 'verify_email')
+            ->assertJsonPath('data.blocks', []);
+
+        $this->postJson('/api/account/email/send-code')->assertOk();
+        $code = null;
+        Mail::assertSent(EmailVerificationCode::class, function ($mail) use (&$code) {
+            $code = $mail->code;
+
+            return true;
+        });
+
+        $wrong = $code === '000000' ? '111111' : '000000';
+        $this->postJson('/api/account/email/verify', ['code' => $wrong])->assertStatus(422);
+        $this->postJson('/api/account/email/verify', ['code' => $code])->assertOk()->assertJsonPath('email_verified', true);
+
+        $this->getJson('/api/learn/courses/demo/lessons/first')
+            ->assertJsonPath('data.locked', false)
+            ->assertJsonCount(2, 'data.blocks');
+    }
+
+    public function test_members_progress_is_kept_per_course(): void
+    {
+        app(CourseTransfer::class)->import($this->document());
+        $this->getJson('/api/learn/courses/demo/progress')->assertUnauthorized();
+        $this->signIn();
+
+        // A draft or unknown slug is ignored; marking twice is harmless.
+        $this->postJson('/api/learn/courses/demo/progress', ['lessons' => ['first', 'third', 'second', 'nope'], 'done' => true])
+            ->assertOk()->assertJsonCount(2, 'data.completed');
+        $this->postJson('/api/learn/courses/demo/progress', ['lessons' => ['first'], 'done' => true])->assertOk();
+        $this->getJson('/api/learn/courses/demo/lessons/first')->assertJsonPath('data.completed', true);
+
+        $this->postJson('/api/learn/courses/demo/progress', ['lessons' => ['first'], 'done' => false])
+            ->assertOk()->assertJsonPath('data.completed', ['third']);
     }
 
     public function test_lessons_link_to_published_neighbours_and_drafts_are_hidden(): void

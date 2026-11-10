@@ -3,6 +3,7 @@
 use App\Modules\Account\Controllers\AccountAuthController;
 use App\Modules\Account\Controllers\AccountLibraryController;
 use App\Modules\Account\Controllers\AccountProfileController;
+use App\Modules\Account\Controllers\EmailVerificationController;
 use App\Modules\Account\Controllers\PasswordResetController;
 use Illuminate\Support\Facades\Route;
 
@@ -30,6 +31,10 @@ Route::prefix('account/password')->controller(PasswordResetController::class)->g
 
 Route::middleware('auth:sanctum')->prefix('account')->group(function () {
     Route::post('logout', [AccountAuthController::class, 'logout']);
+
+    // Confirming the email with a code (lessons are for verified accounts).
+    Route::post('email/send-code', [EmailVerificationController::class, 'send'])->middleware('throttle:6,15');
+    Route::post('email/verify', [EmailVerificationController::class, 'verify'])->middleware('throttle:10,1');
 
     Route::get('me', [AccountProfileController::class, 'me']);
     Route::get('overview', [AccountProfileController::class, 'overview']);

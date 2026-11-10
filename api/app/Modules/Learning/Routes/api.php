@@ -56,4 +56,10 @@ Route::prefix('learn')->controller(LearnController::class)->group(function () {
     Route::get('courses/{slug}/cover', 'cover');
     Route::get('courses/{slug}/lessons/{lesson}', 'lesson');
     Route::get('media/{file}', 'media')->where('file', '[0-9]+(\.[a-z0-9]+)?');
+
+    // A member's own progress through a course.
+    Route::middleware('auth:sanctum')->group(function () {
+        Route::get('courses/{slug}/progress', 'progress');
+        Route::post('courses/{slug}/progress', 'updateProgress')->middleware('throttle:60,1');
+    });
 });
