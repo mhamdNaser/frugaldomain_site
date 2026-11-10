@@ -1,0 +1,524 @@
+{
+ "slug": "telemetry-span-erspan-snmp-and-syslog",
+ "title": "Telemetry, SPAN / ERSPAN, SNMP and Syslog",
+ "summary": "Mirror, poll, log and stream data from Nexus 9000 switches, and choose the right visibility tool for each problem.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Configure local SPAN and routed ERSPAN sessions with filters",
+  "Secure SNMP with SNMPv3 authPriv and informs",
+  "Send timestamped, NTP-aligned syslog messages from the management VRF",
+  "Build a model-driven telemetry subscription with gRPC"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "When an application slows down at 2 a.m., the first question is always the same: what is the network actually doing? A data center answers with four kinds of visibility. Packet capture shows exactly what crossed a link. Streaming telemetry shows how counters and state change second by second. SNMP gives the long-standing polling and trap interface that every monitoring system speaks. Syslog records what the device decided and why.\n\nThis lesson covers all four on Nexus 9000 switches: local SPAN, remote ERSPAN, SNMPv3, syslog, and model-driven telemetry with gRPC. You will learn when to use each, how to configure them safely, and how to verify the result. The ACI equivalents are in [ACI Fabric Monitoring and Health](/learn/enterprise-datacenter-networking/aci-fabric-monitoring-and-health), and the analytics platform that consumes this data is described in [Nexus Dashboard: Orchestrator, Fabric Controller, Insights](/learn/enterprise-datacenter-networking/nexus-dashboard-orchestrator-fabric-controller-insights)."
+  },
+  {
+   "type": "text",
+   "id": "span",
+   "markdown": "## SPAN and ERSPAN\n\n**SPAN** copies traffic from source ports or VLANs to a destination port where an analyzer is attached. The copy is made in hardware, so it does not slow the production traffic, but the destination port can drop copies if the sources together exceed its bandwidth.\n\nImportant rules on Nexus:\n\n- A source can be an interface, port channel or VLAN, with direction `rx`, `tx` or `both`.\n- The destination port must be set to `switchport monitor`. It stops being a normal access port and does not take part in STP.\n- A port can be a destination for only one session, and each platform limits how many sessions run at once.\n\n**ERSPAN** wraps the mirrored frame in GRE and routes it across the fabric to an analyzer anywhere in the IP network. That is what you need in a leaf-spine design, where the collector sits behind a different leaf. The Nexus 9000 sends ERSPAN type III. The packet carries a session ID so a collector can separate sessions, and the outer header can include a DSCP value so the mirrored traffic does not hurt production queues. Account for the extra GRE overhead: a full 1500-byte frame becomes larger, so the path MTU must allow it, otherwise copies are truncated or dropped.\n\nUse filters. Mirroring an entire 100 Gbps uplink to a 10 Gbps collector hides the problem you wanted to see. Narrow the capture with an ACL filter, a VLAN filter or a single host."
+  },
+  {
+   "type": "animation",
+   "id": "erspan-anim",
+   "kind": "flow",
+   "title": "An ERSPAN session from a leaf to a remote collector",
+   "data": {
+    "token": "Frame",
+    "nodes": [
+     {
+      "id": "srv",
+      "label": "Server",
+      "sub": "Eth1/1 source",
+      "icon": "server"
+     },
+     {
+      "id": "leaf",
+      "label": "Leaf-1",
+      "sub": "ERSPAN source",
+      "icon": "switch"
+     },
+     {
+      "id": "spine",
+      "label": "Spine",
+      "sub": "routes GRE",
+      "icon": "router"
+     },
+     {
+      "id": "col",
+      "label": "Collector",
+      "sub": "198.51.100.50",
+      "icon": "desktop"
+     }
+    ],
+    "steps": [
+     {
+      "at": "srv",
+      "caption": "A server sends a frame on the monitored interface Ethernet1/1."
+     },
+     {
+      "at": "leaf",
+      "caption": "The ASIC copies the frame in hardware. The original continues unchanged.",
+      "tone": "success"
+     },
+     {
+      "at": "leaf",
+      "token": "GRE copy",
+      "caption": "The copy is wrapped in GRE with the ERSPAN header, session ID 10 and the origin IP in the outer header.",
+      "tone": "secure"
+     },
+     {
+      "at": "spine",
+      "token": "GRE copy",
+      "caption": "The spine routes the packet like any IP traffic. Its path MTU must carry the added overhead."
+     },
+     {
+      "at": "col",
+      "token": "GRE copy",
+      "caption": "The collector decapsulates GRE and reads the original frame for analysis.",
+      "tone": "success"
+     },
+     {
+      "at": "col",
+      "token": "Truncated",
+      "caption": "If the path MTU is too small, the copy is cut short or dropped. The production flow is unaffected.",
+      "tone": "warning"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "snmp",
+   "markdown": "## SNMP and syslog\n\n**SNMP** is still the default for inventory, interface counters and threshold traps. Use **SNMPv3 with authPriv**: SHA authentication and AES-128 privacy. Versions 1 and 2c send the community string in clear text and should be disabled or limited with an ACL and read-only access. Configure *informs* instead of traps when possible, because an inform is acknowledged and retransmitted. Keep polling intervals reasonable, since a monitoring system that walks full tables every ten seconds can load the supervisor CPU.\n\n**Syslog** carries events with a severity from 0 (emergency) to 7 (debug). Set the remote server at level 5 (notifications) or 6 for normal operations, and raise the level temporarily when troubleshooting. Use millisecond timestamps and synchronize time with NTP, because logs from different switches are useless if the clocks disagree. Choose a facility such as `local6` so the collector can route messages, and send from the management VRF.\n\nBoth SNMP and syslog are *event* tools. They tell you something happened. They are poor at showing how the state evolves, which is the job of telemetry."
+  },
+  {
+   "type": "text",
+   "id": "telemetry",
+   "markdown": "## Model-driven telemetry\n\nPolling asks, \"what is the value now?\" at a fixed interval. **Model-driven telemetry (MDT)** reverses this: the switch pushes data to a collector on a schedule or when it changes. The data comes from a YANG or DME path, such as `sys/intf/phys-items/phys-if-list` for physical interfaces. A subscription ties together three parts:\n\n| Part | Purpose |\n|:--|:--|\n| Sensor group | Which paths to stream, and which data source (DME, NX-API or YANG) |\n| Destination group | The collector IP, port, transport (gRPC) and encoding (GPB or JSON) |\n| Subscription | Links the groups and sets the sample interval in milliseconds |\n\nPush is better than pull for three reasons. The switch does the work once, with no per-request overhead. Sample intervals can be a few seconds, which exposes microbursts that five-minute SNMP graphs hide. And collectors such as a Telegraf, Prometheus or Nexus Dashboard Insights pipeline receive structured data without parsing CLI text.\n\nChoose the transport with care. gRPC with TLS is preferred; unencrypted dial-out is acceptable only in a closed lab. Start with a few sensor paths and a 10 second interval, check the CPU, then widen. Remember that streaming everything at 1 second to a weak collector only moves the problem."
+  },
+  {
+   "type": "code",
+   "id": "mon-cfg",
+   "language": "cisco",
+   "filename": "LEAF-1.cfg",
+   "caption": "SPAN, ERSPAN, SNMPv3, syslog and gRPC telemetry on a Nexus 9000 leaf.",
+   "code": "interface Ethernet1/48\n  description SPAN-DESTINATION\n  switchport\n  switchport monitor\n  no shutdown\n!\nmonitor session 1\n  source interface Ethernet1/1 both\n  destination interface Ethernet1/48\n  no shut\n!\nmonitor erspan origin ip-address 10.255.0.11 global\nmonitor session 2 type erspan-source\n  erspan-id 10\n  vrf default\n  destination ip 198.51.100.50\n  ip dscp 8\n  source interface Ethernet1/2 rx\n  no shut\n!\nsnmp-server user dcmon network-operator auth sha <PLACEHOLDER> priv aes-128 <PLACEHOLDER>\nsnmp-server host 192.0.2.50 informs version 3 priv dcmon\nsnmp-server enable traps link\n!\nlogging timestamp milliseconds\nlogging source-interface mgmt0\nlogging server 192.0.2.60 5 use-vrf management facility local6\n!\nfeature telemetry\ntelemetry\n  destination-group 100\n    ip address 192.0.2.70 port 50001 protocol gRPC encoding GPB\n  sensor-group 200\n    data-source DME\n    path sys/intf/phys-items/phys-if-list depth 0\n  subscription 300\n    dst-grp 100\n    snsr-grp 200 sample-interval 10000"
+  },
+  {
+   "type": "terminal",
+   "id": "mon-verify",
+   "title": "Verifying sessions and telemetry",
+   "prompt": "LEAF-1#",
+   "lines": [
+    {
+     "cmd": "show monitor session all",
+     "output": "session 1\n---------------\ntype              : local\nstate             : up\nsource intf       :\n    rx            : Eth1/1\n    tx            : Eth1/1\n    both          : Eth1/1\ndestination ports : Eth1/48\n\nsession 2\n---------------\ntype              : erspan-source\nstate             : up\nerspan-id         : 10\ndestination ip    : 198.51.100.50",
+     "comment": "State up for both sessions. A session in error often means a bad destination mode or an unreachable ERSPAN IP."
+    },
+    {
+     "cmd": "show snmp user dcmon",
+     "output": "User Auth Priv(enforce) Groups\n____ ____ _____________ ______\ndcmon sha aes-128(no) network-operator",
+     "comment": "The user uses SHA and AES-128. Add `enforce` to require privacy for the user."
+    },
+    {
+     "cmd": "show logging server",
+     "output": "Logging server:  enabled\n{192.0.2.60}\n  server severity:   notifications\n  server facility:   local6\n  server VRF:        management",
+     "comment": "Confirms the server, severity, facility and VRF."
+    },
+    {
+     "cmd": "show telemetry transport 0 stats",
+     "output": "Session Id: 0\nConnect Status: Connected\nLast Connected: Mon Nov 10 02:14:09 2026\nTx Count: 1842",
+     "comment": "Connected status with a growing Tx count shows data is flowing to the collector."
+    }
+   ]
+  },
+  {
+   "type": "callout",
+   "id": "pitfall",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Mirroring more traffic than the destination can carry, so the analyzer sees gaps and the investigator blames the wrong device.\n- Forgetting `switchport monitor` on the SPAN destination, or leaving a production port as the destination.\n- Ignoring GRE overhead, which makes ERSPAN copies larger than the path MTU.\n- Running SNMPv2c with a default community string and no ACL.\n- Sending logs without NTP, which makes events across switches impossible to correlate.\n- Streaming too many paths too quickly and overloading the switch or the collector."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a Nexus 9000v lab you own, with a Linux host as the collector:\n\n1. Configure a local SPAN session from one host port to the collector port, and capture with `tcpdump`. Ping between two hosts and confirm you see both directions.\n2. Create an ERSPAN source session to the collector's address. Confirm the collector receives GRE (IP protocol 47).\n3. Add the SNMPv3 user and query it from the collector with `snmpwalk`, using the placeholder credentials you set.\n4. Send syslog to the collector and shut an interface. Find the `%ETHPORT` link-down message with its millisecond timestamp.\n5. Enable a telemetry subscription at 10 seconds and compare the counter graph with a 5 minute SNMP poll during a short traffic burst."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "SPAN",
+     "definition": "Local port mirroring to an analyzer port."
+    },
+    {
+     "term": "ERSPAN",
+     "definition": "Mirroring encapsulated in GRE and routed across IP."
+    },
+    {
+     "term": "SNMPv3 authPriv",
+     "definition": "SNMP with authentication and encryption."
+    },
+    {
+     "term": "Inform",
+     "definition": "An acknowledged SNMP notification."
+    },
+    {
+     "term": "Syslog severity",
+     "definition": "A level from 0 (emergency) to 7 (debug)."
+    },
+    {
+     "term": "MDT",
+     "definition": "Model-driven telemetry: the switch streams data to a collector."
+    },
+    {
+     "term": "Sensor group",
+     "definition": "The set of paths a telemetry subscription streams."
+    },
+    {
+     "term": "gRPC",
+     "definition": "The HTTP/2 transport commonly used for streaming telemetry."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What must you configure on a SPAN destination port on NX-OS?",
+     "options": [
+      "switchport mode trunk",
+      "switchport monitor",
+      "spanning-tree portfast",
+      "ip address"
+     ],
+     "answer": 1,
+     "explanation": "`switchport monitor` makes the port a dedicated destination that does not forward normal traffic."
+    },
+    {
+     "question": "Why is ERSPAN used in a leaf-spine fabric?",
+     "options": [
+      "The collector can be anywhere in the routed network",
+      "It encrypts the mirrored traffic",
+      "It needs no MTU planning",
+      "It replaces NetFlow"
+     ],
+     "answer": 0,
+     "explanation": "GRE encapsulation allows mirrored frames to cross L3 hops. MTU planning is still required."
+    },
+    {
+     "question": "Which are advantages of model-driven telemetry over SNMP polling? (Choose all that apply.)",
+     "options": [
+      "The switch pushes data without per-request polling",
+      "Short sample intervals reveal microbursts",
+      "Data is structured and needs no CLI parsing",
+      "It needs no collector"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Telemetry still needs a collector, but the push model and structured encoding are its strengths."
+    },
+    {
+     "question": "Which SNMP security level provides both authentication and encryption?",
+     "options": [
+      "noAuthNoPriv",
+      "authNoPriv",
+      "authPriv",
+      "community"
+     ],
+     "answer": 2,
+     "explanation": "authPriv combines authentication (SHA) and privacy (AES)."
+    },
+    {
+     "question": "A syslog server receives events from many switches but they cannot be ordered. What is the most likely missing piece?",
+     "options": [
+      "Time synchronization with NTP",
+      "A larger MTU",
+      "PFC",
+      "A private VLAN"
+     ],
+     "answer": 0,
+     "explanation": "Without synchronized clocks, timestamps from different devices cannot be correlated."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nUse each visibility tool for what it does best. SPAN and ERSPAN give packet-level truth, with ERSPAN crossing the routed fabric when you plan for GRE overhead and filter the traffic. SNMPv3 authPriv and informs remain the compatible baseline for inventory and alarms. Syslog explains device events and needs NTP and a sensible severity. Model-driven telemetry streams structured data over gRPC and shows fast changes that polling misses.\n\nVerify with `show monitor session all`, `show snmp user`, `show logging server` and `show telemetry transport`. Always start small, check the CPU, and secure the transport."
+  }
+ ],
+ "ar": {
+  "title": "القياس عن بُعد وSPAN / ERSPAN وSNMP وSyslog",
+  "summary": "نسخ البيانات واستعلامها وتسجيلها وبثها من مفاتيح Nexus 9000 واختيار أداة الرؤية المناسبة لكل مشكلة.",
+  "objectives": [
+   "إعداد جلسات SPAN المحلية وERSPAN الموجَّهة مع المرشحات",
+   "تأمين SNMP باستخدام SNMPv3 بوضع authPriv وinforms",
+   "إرسال رسائل syslog بطوابع زمنية ومتزامنة عبر NTP من VRF الإدارة",
+   "بناء اشتراك قياس عن بُعد مبني على النماذج عبر gRPC"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "حين يتباطأ تطبيق في الثانية فجراً يكون السؤال الأول دائماً واحداً: ماذا تفعل الشبكة فعلاً؟ يجيب مركز البيانات بأربعة أنواع من الرؤية. التقاط الحزم يُظهر بالضبط ما عبر الوصلة. والقياس عن بُعد المتدفق يُظهر كيف تتغير العدّادات والحالة ثانيةً بثانية. وSNMP هو واجهة الاستعلام والتنبيهات القديمة التي تتكلمها كل أنظمة المراقبة. وSyslog يسجّل ما قرره الجهاز ولماذا.\n\nيغطي هذا الدرس الأربعة على مفاتيح Nexus 9000: SPAN المحلي وERSPAN البعيد وSNMPv3 وsyslog والقياس عن بُعد المبني على النماذج عبر gRPC. ستعرف متى تستخدم كلاً منها وكيف تعدّه بأمان وكيف تتحقق من النتيجة. ومكافئات ACI في [ACI Fabric Monitoring and Health](/learn/enterprise-datacenter-networking/aci-fabric-monitoring-and-health)، ومنصة التحليل التي تستهلك هذه البيانات موصوفة في [Nexus Dashboard: Orchestrator, Fabric Controller, Insights](/learn/enterprise-datacenter-networking/nexus-dashboard-orchestrator-fabric-controller-insights)."
+   },
+   {
+    "type": "text",
+    "id": "span",
+    "markdown": "## SPAN وERSPAN\n\nينسخ **SPAN** الحركة من منافذ أو VLAN مصدر إلى منفذ وجهة يتصل به المحلل. يُنفَّذ النسخ في العتاد فلا يبطئ الحركة الإنتاجية، لكن منفذ الوجهة قد يُسقِط النسخ إذا تجاوز مجموع المصادر عرض نطاقه.\n\nقواعد مهمة على Nexus:\n\n- يمكن أن يكون المصدر واجهة أو port channel أو VLAN، بالاتجاه `rx` أو `tx` أو `both`.\n- يجب ضبط منفذ الوجهة بالأمر `switchport monitor`. فيتوقف عن كونه منفذ وصول عادياً ولا يشارك في STP.\n- يمكن أن يكون المنفذ وجهة لجلسة واحدة فقط، وتحدّد كل منصة عدد الجلسات التي تعمل معاً.\n\nويغلّف **ERSPAN** الإطار المنسوخ داخل GRE ويوجّهه عبر النسيج إلى محلل في أي مكان من شبكة IP. وهذا ما تحتاجه في تصميم leaf-spine حيث يقع المجمّع خلف leaf آخر. يرسل Nexus 9000 النوع ERSPAN type III. تحمل الحزمة معرّف جلسة ليفصل المجمّع بين الجلسات، ويمكن أن تحمل الترويسة الخارجية قيمة DSCP كي لا تضر الحركة المنسوخة بطوابير الإنتاج. وراعِ عبء GRE الإضافي: إطار كامل من 1500 بايت يصبح أكبر، فيجب أن يسمح MTU المسار بذلك وإلا قُصّت النسخ أو أُسقطت.\n\nواستخدم المرشحات. نسخ وصلة علوية كاملة بسرعة 100 غيغابت إلى مجمّع بسرعة 10 غيغابت يخفي المشكلة التي أردت رؤيتها. ضيّق الالتقاط بمرشّح ACL أو VLAN أو مضيف واحد."
+   },
+   {
+    "type": "animation",
+    "id": "erspan-anim",
+    "kind": "flow",
+    "title": "جلسة ERSPAN من leaf إلى مجمّع بعيد",
+    "data": {
+     "token": "إطار",
+     "nodes": [
+      {
+       "id": "srv",
+       "label": "الخادم",
+       "sub": "المصدر Eth1/1",
+       "icon": "server"
+      },
+      {
+       "id": "leaf",
+       "label": "Leaf-1",
+       "sub": "مصدر ERSPAN",
+       "icon": "switch"
+      },
+      {
+       "id": "spine",
+       "label": "Spine",
+       "sub": "يوجّه GRE",
+       "icon": "router"
+      },
+      {
+       "id": "col",
+       "label": "المجمّع",
+       "sub": "198.51.100.50",
+       "icon": "desktop"
+      }
+     ],
+     "steps": [
+      {
+       "at": "srv",
+       "caption": "يرسل الخادم إطاراً على الواجهة المراقَبة Ethernet1/1."
+      },
+      {
+       "at": "leaf",
+       "caption": "تنسخ الشريحة (ASIC) الإطار في العتاد ويتابع الأصلي دون تغيير.",
+       "tone": "success"
+      },
+      {
+       "at": "leaf",
+       "token": "نسخة GRE",
+       "caption": "تُغلَّف النسخة في GRE مع ترويسة ERSPAN ومعرّف الجلسة 10 وعنوان المنشأ في الترويسة الخارجية.",
+       "tone": "secure"
+      },
+      {
+       "at": "spine",
+       "token": "نسخة GRE",
+       "caption": "يوجّه الـ spine الحزمة كأي حركة IP. ويجب أن يتسع MTU المسار للعبء الإضافي."
+      },
+      {
+       "at": "col",
+       "token": "نسخة GRE",
+       "caption": "يفك المجمّع تغليف GRE ويقرأ الإطار الأصلي للتحليل.",
+       "tone": "success"
+      },
+      {
+       "at": "col",
+       "token": "مقطوعة",
+       "caption": "إذا كان MTU المسار صغيراً قُصّت النسخة أو أُسقطت، ولا تتأثر الحركة الإنتاجية.",
+       "tone": "warning"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "snmp",
+    "markdown": "## SNMP وSyslog\n\nلا يزال **SNMP** الخيار الافتراضي للجرد وعدّادات الواجهات وتنبيهات العتبات. استخدم **SNMPv3 بوضع authPriv**: مصادقة SHA وخصوصية AES-128. أما الإصداران 1 و2c فيرسلان سلسلة المجتمع (community) نصاً صريحاً، ويجب تعطيلهما أو تقييدهما بقائمة وصول وصلاحية قراءة فقط. وفضّل إعداد *informs* على traps متى أمكن، لأن الـ inform يُقَرّ باستلامه ويُعاد إرساله. وأبقِ فترات الاستعلام معقولة، فنظام مراقبة يجتاز الجداول الكاملة كل عشر ثوانٍ قد يثقل معالج المشرف.\n\nويحمل **Syslog** الأحداث بخطورة من 0 (طوارئ) إلى 7 (تصحيح). اضبط الخادم البعيد على المستوى 5 (إشعارات) أو 6 في التشغيل العادي، وارفع المستوى مؤقتاً عند استكشاف الأعطال. استخدم طوابع زمنية بالميلي ثانية وزامن الوقت عبر NTP، فسجلات المفاتيح المختلفة عديمة الفائدة إن اختلفت ساعاتها. واختر منشأً (facility) مثل `local6` ليوجّه المجمّع الرسائل، وأرسل من VRF الإدارة.\n\nوكلا SNMP وsyslog أداتا *أحداث*؛ تخبرانك أن شيئاً حدث، لكنهما ضعيفتان في إظهار تطور الحالة، وتلك مهمة القياس عن بُعد."
+   },
+   {
+    "type": "text",
+    "id": "telemetry",
+    "markdown": "## القياس عن بُعد المبني على النماذج\n\nيسأل الاستعلام الدوري \"ما القيمة الآن؟\" كل فترة ثابتة. أما **القياس عن بُعد المبني على النماذج (MDT)** فيعكس ذلك: يدفع المفتاح البيانات إلى المجمّع وفق جدول أو عند تغيّرها. وتأتي البيانات من مسار YANG أو DME مثل `sys/intf/phys-items/phys-if-list` للواجهات الفيزيائية. ويربط الاشتراك ثلاثة أجزاء:\n\n| الجزء | الغرض |\n|:--|:--|\n| Sensor group | أي المسارات تُبثّ، وأي مصدر بيانات (DME أو NX-API أو YANG) |\n| Destination group | عنوان المجمّع ومنفذه والنقل (gRPC) والترميز (GPB أو JSON) |\n| Subscription | يربط المجموعتين ويحدد فترة العينة بالميلي ثانية |\n\nالدفع أفضل من الاستعلام لثلاثة أسباب. يؤدي المفتاح العمل مرة واحدة دون عبء لكل طلب. ويمكن أن تكون فترات العينة بضع ثوانٍ فتكشف الاندفاعات القصيرة (microbursts) التي تخفيها رسوم SNMP كل خمس دقائق. وتستقبل مجمّعات مثل Telegraf أو Prometheus أو خط Nexus Dashboard Insights بيانات مهيكلة دون تحليل نص CLI.\n\nاختر النقل بعناية. يُفضَّل gRPC مع TLS، ولا يُقبل البث غير المشفر إلا في مختبر مغلق. ابدأ بمسارات قليلة وفترة 10 ثوانٍ، وراقب المعالج، ثم وسّع. وتذكّر أن بث كل شيء كل ثانية إلى مجمّع ضعيف ينقل المشكلة فقط."
+   },
+   {
+    "type": "code",
+    "id": "mon-cfg",
+    "language": "cisco",
+    "filename": "LEAF-1.cfg",
+    "caption": "SPAN وERSPAN وSNMPv3 وsyslog وقياس gRPC عن بُعد على leaf من Nexus 9000.",
+    "code": "interface Ethernet1/48\n  description SPAN-DESTINATION\n  switchport\n  switchport monitor\n  no shutdown\n!\nmonitor session 1\n  source interface Ethernet1/1 both\n  destination interface Ethernet1/48\n  no shut\n!\nmonitor erspan origin ip-address 10.255.0.11 global\nmonitor session 2 type erspan-source\n  erspan-id 10\n  vrf default\n  destination ip 198.51.100.50\n  ip dscp 8\n  source interface Ethernet1/2 rx\n  no shut\n!\nsnmp-server user dcmon network-operator auth sha <PLACEHOLDER> priv aes-128 <PLACEHOLDER>\nsnmp-server host 192.0.2.50 informs version 3 priv dcmon\nsnmp-server enable traps link\n!\nlogging timestamp milliseconds\nlogging source-interface mgmt0\nlogging server 192.0.2.60 5 use-vrf management facility local6\n!\nfeature telemetry\ntelemetry\n  destination-group 100\n    ip address 192.0.2.70 port 50001 protocol gRPC encoding GPB\n  sensor-group 200\n    data-source DME\n    path sys/intf/phys-items/phys-if-list depth 0\n  subscription 300\n    dst-grp 100\n    snsr-grp 200 sample-interval 10000"
+   },
+   {
+    "type": "terminal",
+    "id": "mon-verify",
+    "title": "التحقق من الجلسات والقياس عن بُعد",
+    "prompt": "LEAF-1#",
+    "lines": [
+     {
+      "cmd": "show monitor session all",
+      "output": "session 1\n---------------\ntype              : local\nstate             : up\nsource intf       :\n    rx            : Eth1/1\n    tx            : Eth1/1\n    both          : Eth1/1\ndestination ports : Eth1/48\n\nsession 2\n---------------\ntype              : erspan-source\nstate             : up\nerspan-id         : 10\ndestination ip    : 198.51.100.50",
+      "comment": "الحالة up للجلستين. الجلسة في حالة خطأ تعني غالباً وضع وجهة خاطئاً أو عنوان ERSPAN غير قابل للوصول."
+     },
+     {
+      "cmd": "show snmp user dcmon",
+      "output": "User Auth Priv(enforce) Groups\n____ ____ _____________ ______\ndcmon sha aes-128(no) network-operator",
+      "comment": "يستخدم المستخدم SHA وAES-128. أضف `enforce` لفرض الخصوصية على المستخدم."
+     },
+     {
+      "cmd": "show logging server",
+      "output": "Logging server:  enabled\n{192.0.2.60}\n  server severity:   notifications\n  server facility:   local6\n  server VRF:        management",
+      "comment": "يؤكد الخادم والخطورة والمنشأ وVRF."
+     },
+     {
+      "cmd": "show telemetry transport 0 stats",
+      "output": "Session Id: 0\nConnect Status: Connected\nLast Connected: Mon Nov 10 02:14:09 2026\nTx Count: 1842",
+      "comment": "حالة Connected مع زيادة Tx Count تعني أن البيانات تتدفق إلى المجمّع."
+     }
+    ]
+   },
+   {
+    "type": "callout",
+    "id": "pitfall",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- نسخ حركة أكبر مما تتحمله الوجهة، فيرى المحلل فجوات ويلوم المحقق جهازاً خاطئاً.\n- نسيان `switchport monitor` على وجهة SPAN، أو ترك منفذ إنتاجي وجهةً.\n- إهمال عبء GRE الذي يجعل نسخ ERSPAN أكبر من MTU المسار.\n- تشغيل SNMPv2c بسلسلة مجتمع افتراضية ودون ACL.\n- إرسال السجلات دون NTP، فيستحيل ربط الأحداث بين المفاتيح.\n- بث مسارات كثيرة بسرعة كبيرة وإثقال المفتاح أو المجمّع."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر Nexus 9000v تملكه، مع مضيف Linux مجمِّعاً:\n\n1. أعدّ جلسة SPAN محلية من منفذ مضيف إلى منفذ المجمّع والتقط بـ `tcpdump`. نفّذ ping بين مضيفين وتأكد أنك ترى الاتجاهين.\n2. أنشئ جلسة مصدر ERSPAN إلى عنوان المجمّع، وتأكد أنه يستقبل GRE (بروتوكول IP رقم 47).\n3. أضف مستخدم SNMPv3 واستعلم عنه من المجمّع باستخدام `snmpwalk` وبيانات الاعتماد النائبة التي ضبطتها.\n4. أرسل syslog إلى المجمّع وأوقف واجهة. ابحث عن رسالة `%ETHPORT` لانقطاع الوصلة بطابعها الزمني بالميلي ثانية.\n5. فعّل اشتراك قياس عن بُعد بفترة 10 ثوانٍ وقارن رسم العدّاد باستعلام SNMP كل 5 دقائق أثناء اندفاع قصير للحركة."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "SPAN",
+      "definition": "نسخ محلي للمنافذ إلى منفذ محلل."
+     },
+     {
+      "term": "ERSPAN",
+      "definition": "نسخ مغلَّف في GRE يُوجَّه عبر IP."
+     },
+     {
+      "term": "SNMPv3 authPriv",
+      "definition": "SNMP مع مصادقة وتشفير."
+     },
+     {
+      "term": "Inform",
+      "definition": "إشعار SNMP يُقَرّ باستلامه."
+     },
+     {
+      "term": "خطورة Syslog",
+      "definition": "مستوى من 0 (طوارئ) إلى 7 (تصحيح)."
+     },
+     {
+      "term": "MDT",
+      "definition": "القياس عن بُعد المبني على النماذج: يبث المفتاح البيانات إلى مجمّع."
+     },
+     {
+      "term": "Sensor group",
+      "definition": "مجموعة المسارات التي يبثها اشتراك القياس عن بُعد."
+     },
+     {
+      "term": "gRPC",
+      "definition": "نقل فوق HTTP/2 يُستخدم عادةً في بث القياس عن بُعد."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ماذا يجب ضبطه على منفذ وجهة SPAN في NX-OS؟",
+      "options": [
+       "switchport mode trunk",
+       "switchport monitor",
+       "spanning-tree portfast",
+       "ip address"
+      ],
+      "answer": 1,
+      "explanation": "يجعل `switchport monitor` المنفذ وجهة مخصصة لا تمرّر الحركة العادية."
+     },
+     {
+      "question": "لماذا يُستخدم ERSPAN في نسيج leaf-spine؟",
+      "options": [
+       "يمكن أن يكون المجمّع في أي مكان من الشبكة الموجَّهة",
+       "يشفّر الحركة المنسوخة",
+       "لا يحتاج إلى تخطيط MTU",
+       "يحل محل NetFlow"
+      ],
+      "answer": 0,
+      "explanation": "يتيح تغليف GRE عبور الإطارات المنسوخة قفزات الطبقة الثالثة، ويبقى تخطيط MTU مطلوباً."
+     },
+     {
+      "question": "أي مما يلي من مزايا القياس عن بُعد المبني على النماذج مقارنة باستعلام SNMP؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "يدفع المفتاح البيانات دون استعلام لكل طلب",
+       "فترات العينة القصيرة تكشف الاندفاعات",
+       "البيانات مهيكلة ولا تحتاج تحليل CLI",
+       "لا يحتاج إلى مجمّع"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "ما زال القياس عن بُعد يحتاج مجمّعاً، لكن نموذج الدفع والترميز المهيكل هما نقطة قوته."
+     },
+     {
+      "question": "أي مستوى أمان SNMP يوفر المصادقة والتشفير معاً؟",
+      "options": [
+       "noAuthNoPriv",
+       "authNoPriv",
+       "authPriv",
+       "community"
+      ],
+      "answer": 2,
+      "explanation": "يجمع authPriv بين المصادقة (SHA) والخصوصية (AES)."
+     },
+     {
+      "question": "يستقبل خادم syslog أحداثاً من مفاتيح كثيرة لكن لا يمكن ترتيبها. ما الناقص غالباً؟",
+      "options": [
+       "مزامنة الوقت عبر NTP",
+       "MTU أكبر",
+       "PFC",
+       "VLAN خاصة"
+      ],
+      "answer": 0,
+      "explanation": "دون ساعات متزامنة لا يمكن ربط الطوابع الزمنية من أجهزة مختلفة."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nاستخدم كل أداة رؤية فيما تتقنه. يمنحك SPAN وERSPAN حقيقة مستوى الحزمة، ويعبر ERSPAN النسيج الموجَّه إذا خططت لعبء GRE ورشّحت الحركة. ويبقى SNMPv3 بوضع authPriv مع informs الخط الأساسي المتوافق للجرد والتنبيهات. ويشرح Syslog أحداث الجهاز ويحتاج NTP وخطورة معقولة. ويبث القياس عن بُعد المبني على النماذج بيانات مهيكلة عبر gRPC ويُظهر التغيرات السريعة التي يفوّتها الاستعلام.\n\nتحقق عبر `show monitor session all` و`show snmp user` و`show logging server` و`show telemetry transport`. وابدأ دائماً بقدر صغير وراقب المعالج وأمّن النقل."
+   }
+  ]
+ }
+}

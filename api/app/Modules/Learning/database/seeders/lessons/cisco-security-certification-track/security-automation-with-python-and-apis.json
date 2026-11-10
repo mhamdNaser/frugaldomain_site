@@ -1,0 +1,682 @@
+{
+  "slug": "security-automation-with-python-and-apis",
+  "title": "Security Automation with Python and APIs",
+  "summary": "Write safe, idempotent Python against Cisco security APIs such as FMC and ISE, and connect products so detection triggers containment.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Compare the API styles of Cisco security platforms",
+    "Authenticate and call FMC and ISE from Python",
+    "Write idempotent, paginated, rate-limit-aware scripts",
+    "Build detect-then-contain workflows across products",
+    "Choose between REST scripts, Ansible, Terraform and RESTCONF"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 2 a.m. a threat feed lists 300 malicious addresses. Your team can paste them into the firewall by hand, in forty minutes and with three typos, or a script can create the objects, add them to a block group, and request a deployment in thirty seconds. Security automation is not about replacing engineers. It is about making repeatable changes fast, identical and auditable.\n\nThe CCIE Security v6.1 blueprint expects you to read and write simple Python, understand REST and model-driven APIs, and use them against Cisco security platforms. In the lab you may be asked to fix a broken script, or to write a short one that reads a value from one product and writes it to another. This lesson builds the habits that make such scripts safe and reliable. For the platforms behind the examples see [Secure Firewall Threat Defense and Management Center](/learn/cisco-security-certification-track/secure-firewall-threat-defense-and-management-center) and [Cisco ISE: 802.1X, MAB and Guest Access](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-and-guest-access)."
+    },
+    {
+      "id": "apis",
+      "type": "text",
+      "markdown": "## The API landscape\n\nMost Cisco security products offer a REST API over HTTPS with JSON bodies. The details differ, so learn the pattern first and the product second.\n\n| Platform | API style | Authentication | Notes |\n|:--|:--|:--|:--|\n| Secure Firewall (FMC) | REST, `/api/fmc_config/v1/domain/{uuid}/...` | POST to `generatetoken` with basic auth, then `X-auth-access-token` | Token lasts 30 minutes, refreshable; changes need a deploy |\n| Secure Firewall (FDM) | REST, `/api/fdm/latest/...` | OAuth-style token | Local management of one device |\n| ASA | REST API agent or CLI over SSH | Basic auth | Limited object coverage |\n| ISE | ERS (port 9060) and OpenAPI | Basic auth, enabled by an admin | Endpoints, groups, policy sets |\n| IOS XE | RESTCONF/NETCONF with YANG | Basic auth or tokens | Model-driven, see the automation tracks |\n| Secure Endpoint, XDR, Umbrella | Cloud REST | OAuth2 client credentials | Region-specific base URLs |\n\nThree ideas apply everywhere: **authenticate**, **call with the right method**, and **handle the result**. `GET` reads, `POST` creates, `PUT` replaces, `PATCH` changes part of an object, and `DELETE` removes. Status codes tell you what happened: `200`/`201` success, `400` bad payload, `401` expired token, `403` no permission, `404` wrong ID, `409` conflict or duplicate, `422` validation error, and `429` rate limit."
+    },
+    {
+      "id": "fmc-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Script changing the firewall through FMC",
+      "data": {
+        "actors": [
+          {
+            "id": "s",
+            "label": "Python script",
+            "sub": "automation host",
+            "icon": "cpu"
+          },
+          {
+            "id": "f",
+            "label": "FMC",
+            "sub": "fmc.example.com",
+            "icon": "server"
+          },
+          {
+            "id": "d",
+            "label": "FTD",
+            "sub": "managed device",
+            "icon": "firewall"
+          }
+        ],
+        "steps": [
+          {
+            "from": "s",
+            "to": "f",
+            "label": "POST generatetoken",
+            "detail": "basic auth",
+            "note": "The script authenticates with credentials from the environment."
+          },
+          {
+            "from": "f",
+            "to": "s",
+            "label": "200 + token + DOMAIN_UUID",
+            "tone": "secure",
+            "note": "The token and the domain UUID come back in response headers, not in the JSON body."
+          },
+          {
+            "from": "s",
+            "to": "f",
+            "label": "GET hosts?filter=",
+            "note": "Check whether the object already exists so the script is idempotent."
+          },
+          {
+            "from": "s",
+            "to": "f",
+            "label": "POST hosts",
+            "detail": "H-BLOCK-001",
+            "tone": "success",
+            "note": "Create the object only when it is missing."
+          },
+          {
+            "from": "s",
+            "to": "f",
+            "label": "POST deploymentrequests",
+            "note": "Changes sit in FMC until a deployment is requested."
+          },
+          {
+            "from": "f",
+            "to": "d",
+            "label": "Push policy",
+            "tone": "success",
+            "note": "FMC deploys the configuration to the device."
+          },
+          {
+            "from": "f",
+            "to": "s",
+            "label": "Task status",
+            "note": "Poll the task until it finishes, then log the result."
+          }
+        ]
+      }
+    },
+    {
+      "id": "py",
+      "type": "text",
+      "markdown": "## Writing scripts that survive production\n\nA script that works once is a demo. A script that works every time is a tool. Build in these habits from the first line.\n\n- **Never hard-code secrets.** Read credentials from environment variables or a vault. Do not commit them.\n- **Verify TLS.** Point `verify` at your lab CA bundle. Turning it off hides man-in-the-middle attacks.\n- **Set timeouts.** A request without a timeout can hang forever.\n- **Be idempotent.** Check before you create, so running the script twice leaves the same result.\n- **Paginate.** Lists return a page at a time. Follow `paging.next` or step the `offset` until the list is exhausted, or you will silently miss objects.\n- **Handle errors by class.** Retry `429` and `5xx` with backoff. Refresh on `401`. Do not retry `400` or `422`, because the data is wrong.\n- **Log what changed**, not the secrets.\n\nThe next listing follows these rules."
+    },
+    {
+      "id": "code-fmc",
+      "type": "code",
+      "language": "python",
+      "filename": "ensure_host.py",
+      "code": "import os, time, requests\n\nFMC = \"https://fmc.example.com\"\nCA = \"/etc/ssl/certs/lab-ca.pem\"          # verify TLS, never verify=False\n\ndef login():\n    r = requests.post(f\"{FMC}/api/fmc_platform/v1/auth/generatetoken\",\n                      auth=(os.environ[\"FMC_USER\"], os.environ[\"FMC_PASS\"]),\n                      verify=CA, timeout=15)\n    r.raise_for_status()\n    return r.headers[\"X-auth-access-token\"], r.headers[\"DOMAIN_UUID\"]\n\ndef call(method, path, token, **kw):\n    for attempt in range(4):\n        r = requests.request(method, FMC + path, verify=CA, timeout=30,\n                             headers={\"X-auth-access-token\": token}, **kw)\n        if r.status_code == 429:               # rate limited\n            time.sleep(2 ** attempt)\n            continue\n        r.raise_for_status()\n        return r.json() if r.content else {}\n    raise RuntimeError(\"rate limit not cleared\")\n\ndef host_exists(token, dom, name):\n    page = call(\"GET\", f\"/api/fmc_config/v1/domain/{dom}/object/hosts\",\n                token, params={\"filter\": f\"nameOrValue:{name}\", \"limit\": 25})\n    return any(i[\"name\"] == name for i in page.get(\"items\", []))\n\ndef ensure_host(token, dom, name, ip):\n    if host_exists(token, dom, name):          # idempotent: safe to rerun\n        return \"unchanged\"\n    call(\"POST\", f\"/api/fmc_config/v1/domain/{dom}/object/hosts\", token,\n         json={\"name\": name, \"type\": \"Host\", \"value\": ip})\n    return \"created\"\n\nif __name__ == \"__main__\":\n    tok, dom = login()\n    print(ensure_host(tok, dom, \"H-BLOCK-001\", \"198.51.100.77\"))",
+      "highlight": [
+        6,
+        15,
+        17,
+        26
+      ],
+      "caption": "Idempotent host-object creation with TLS verification, timeouts and rate-limit backoff. The deploy call is left out on purpose."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Automation multiplies mistakes",
+      "markdown": "A typo in a manual change affects one rule. The same typo in a loop affects every device. Test against a lab or a single device first, add a dry-run flag that prints the planned changes, and keep the deploy step separate so that a human can review the pending changes before they reach production."
+    },
+    {
+      "id": "flows",
+      "type": "text",
+      "markdown": "## Event-driven patterns across products\n\nThe highest-value scripts connect products. A typical lab pattern is: **detect in one place, contain in another**.\n\n- A Secure Endpoint or XDR event names a compromised host. The script calls **ISE ERS** to change that endpoint's identity group, and ISE sends a change of authorization so the switch moves the host to a quarantine SGT. See [pxGrid and Context Sharing](/learn/cisco-security-certification-track/pxgrid-and-context-sharing) for the supported way to share such context without polling.\n- A threat feed produces addresses. The script updates a **network object group** or a [dynamic object](/learn/cisco-security-certification-track/dynamic-objects-and-security-intelligence) on the firewall.\n- A change ticket is approved. The script pushes device configuration through RESTCONF, then reads it back and compares it with the intended state.\n\nTwo design rules matter. First, prefer **push notifications and webhooks** over tight polling loops, because they reduce load and delay. Second, make every action **reversible and logged**: record who or what triggered it, the object changed and the time, so an analyst can undo it. For device-level automation with templates and inventories, the Ansible and Terraform approach scales better than a pile of one-off scripts. For step-by-step orchestration and approvals, use a SOAR playbook that calls the same APIs."
+    },
+    {
+      "id": "cont-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Detect in one product, contain in another",
+      "data": {
+        "token": "Alert",
+        "nodes": [
+          {
+            "id": "ep",
+            "label": "Secure Endpoint",
+            "sub": "malicious file",
+            "icon": "bug"
+          },
+          {
+            "id": "pl",
+            "label": "Playbook",
+            "sub": "Python / SOAR",
+            "icon": "cpu"
+          },
+          {
+            "id": "ise",
+            "label": "ISE",
+            "sub": "ERS API",
+            "icon": "key"
+          },
+          {
+            "id": "sw",
+            "label": "Access switch",
+            "sub": "CoA",
+            "icon": "switch"
+          },
+          {
+            "id": "q",
+            "label": "Quarantine",
+            "sub": "SGT 255",
+            "icon": "lock"
+          }
+        ],
+        "steps": [
+          {
+            "at": "ep",
+            "tone": "danger",
+            "caption": "A retrospective detection names host 192.0.2.44."
+          },
+          {
+            "at": "pl",
+            "caption": "The playbook enriches the alert and checks that the host is not on a protected list."
+          },
+          {
+            "at": "ise",
+            "caption": "A PUT to the ERS endpoint API moves the endpoint into the Quarantine identity group."
+          },
+          {
+            "at": "sw",
+            "caption": "ISE sends a change of authorization to the switch port."
+          },
+          {
+            "at": "q",
+            "tone": "blocked",
+            "caption": "The port is re-authorized with the quarantine SGT, and the host loses access to servers."
+          }
+        ]
+      }
+    },
+    {
+      "id": "lab-tips",
+      "type": "text",
+      "markdown": "## Lab strategy for automation tasks\n\nIn the exam, automation questions are usually small and focused. You may be given a script with one bug, a failing API call, or a request to extract one field from a JSON reply. Practice a fixed routine. First read the error text and the status code, because they usually name the problem. Then print the raw response body, since APIs often explain a `400` in a message field. Next compare the request with the product documentation, paying attention to the content type, the URL path and the required fields. Finally, make one change at a time and test again.\n\nKeep a short snippet library for the lab: token request, a paginated GET, a POST with a JSON body, and a retry wrapper. Typing them from memory is faster than searching, and the time you save goes to the configuration tasks that carry most of the points."
+    },
+    {
+      "id": "tools",
+      "type": "text",
+      "markdown": "## Model-driven and infrastructure-as-code options\n\nREST scripts are one tool. Know the others and when each fits.\n\n- **RESTCONF and NETCONF** read and write YANG models on IOS XE and NX-OS. They return structured data, so you never parse `show` text with regular expressions.\n- **Ansible** modules for ASA, FTD and ISE describe the desired state in YAML and are naturally idempotent.\n- **Terraform** providers for FMC and ISE track state and show a plan before changing anything, which suits reviewed change pipelines.\n- **pyATS and Genie** parse `show` output into structured data and test the network before and after a change.\n- **Postman and the product's API explorer** (FMC has one under the help menu) are the fastest way to see a request before you script it.\n\nChoose the simplest tool that gives repeatable, reviewable results. A ten-line Python script is often better than a framework, until you manage fifty devices."
+    },
+    {
+      "id": "ise-term",
+      "type": "terminal",
+      "title": "ISE ERS: find an endpoint",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -k -u \"$ISE_USER:$ISE_PASS\" -H \"Accept: application/json\" \"https://ise.example.com:9060/ers/config/endpoint?filter=mac.EQ.00:11:22:33:44:55\" | jq '.SearchResult.resources[0]'",
+          "output": "{\n  \"id\": \"6f3c1d20-0000-0000-0000-aabbccddeeff\",\n  \"name\": \"00:11:22:33:44:55\",\n  \"link\": { \"href\": \"https://ise.example.com:9060/ers/config/endpoint/6f3c1d20-...\" }\n}",
+          "comment": "The -k flag is for a throwaway lab only. In production, trust the ISE certificate chain. ERS must be enabled under Administration > Settings."
+        }
+      ],
+      "caption": "Illustrative output with placeholder values."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab FMC or the DevNet sandbox you are authorized to use.\n\n1. Set `FMC_USER` and `FMC_PASS` as environment variables and run the script to create `H-BLOCK-001`.\n2. Run it again. It must print `unchanged` and create nothing.\n3. Add a loop that reads a text file of documentation-range addresses (198.51.100.0/24) and creates one host object per line.\n4. Add a `--dry-run` option that only prints what would be created.\n5. Deliberately use a wrong password and confirm the script stops with a clear message and does not retry forever.\n\nWrite down which status code each failure produced."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "REST API",
+          "definition": "An HTTP interface that uses methods such as GET and POST on resource URLs."
+        },
+        {
+          "term": "Idempotent",
+          "definition": "Safe to run repeatedly with the same end result."
+        },
+        {
+          "term": "Pagination",
+          "definition": "Returning a long list in pages that the client must follow."
+        },
+        {
+          "term": "Exponential backoff",
+          "definition": "Waiting longer after each failed retry, such as 1, 2, 4 seconds."
+        },
+        {
+          "term": "ERS",
+          "definition": "ISE's External RESTful Services API on port 9060."
+        },
+        {
+          "term": "RESTCONF",
+          "definition": "A REST-style protocol that reads and writes YANG-modeled data."
+        },
+        {
+          "term": "Webhook",
+          "definition": "An HTTP callback a product sends when an event occurs."
+        },
+        {
+          "term": "Dry run",
+          "definition": "A mode that shows planned changes without applying them."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Where does FMC return the access token and domain UUID after generatetoken?",
+          "options": [
+            "In the JSON body",
+            "In response headers",
+            "In a cookie only",
+            "In the URL"
+          ],
+          "answer": 1,
+          "explanation": "The values arrive as X-auth-access-token and DOMAIN_UUID headers."
+        },
+        {
+          "question": "Which status codes are reasonable to retry with backoff? Choose all that apply.",
+          "options": [
+            "429",
+            "503",
+            "422",
+            "400"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "429 and 5xx are temporary conditions. 400 and 422 mean the request itself is invalid, so retrying repeats the failure."
+        },
+        {
+          "question": "Why does the script check for an existing host before the POST?",
+          "options": [
+            "To make it idempotent",
+            "To speed up TLS",
+            "To avoid authentication",
+            "Because POST cannot create hosts"
+          ],
+          "answer": 0,
+          "explanation": "Checking first means a rerun makes no duplicates and returns the same state."
+        },
+        {
+          "question": "Which practices make an automation script safer? Choose all that apply.",
+          "options": [
+            "Read secrets from the environment",
+            "Use verify=False to avoid certificate errors",
+            "Set request timeouts",
+            "Provide a dry-run option"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "Disabling TLS verification removes protection against interception, so it is not a safe practice."
+        },
+        {
+          "question": "After a script creates objects in FMC, why are the changes not yet active on the firewall?",
+          "options": [
+            "The token expired",
+            "A deployment request is still required",
+            "FMC ignores API changes",
+            "The objects are read-only"
+          ],
+          "answer": 1,
+          "explanation": "FMC stores changes as pending until they are deployed to the managed device."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nSecurity automation is repeatable change done safely. Learn the common API pattern: authenticate, call the right method, check the status code. Build scripts that are idempotent, paginated, rate-limit aware, TLS-verified and logged. Connect products so that detection in one triggers containment in another, and keep a human review step before production deploys. Pick Python, Ansible, Terraform or RESTCONF by the size of the job, not by habit."
+    }
+  ],
+  "ar": {
+    "title": "أتمتة الأمن باستخدام Python وواجهات API",
+    "summary": "اكتب سكربتات Python آمنة ومتكافئة التنفيذ ضد واجهات Cisco الأمنية مثل FMC وISE، واربط المنتجات ليؤدي الاكتشاف إلى الاحتواء.",
+    "objectives": [
+      "قارن أنماط واجهات API في منصات Cisco الأمنية",
+      "صادق واستدعِ FMC وISE من Python",
+      "اكتب سكربتات متكافئة التنفيذ تدعم الصفحات وتراعي حدود الطلبات",
+      "ابنِ مسارات اكتشاف ثم احتواء عبر المنتجات",
+      "اختر بين سكربتات REST وAnsible وTerraform وRESTCONF"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الثانية صباحًا تُدرج خلاصة تهديدات 300 عنوان خبيث. يمكن لفريقك لصقها في الجدار الناري يدويًا خلال أربعين دقيقة وبثلاثة أخطاء إملائية، أو يستطيع سكربت إنشاء الكائنات وإضافتها إلى مجموعة حجب وطلب النشر في ثلاثين ثانية. ليست الأتمتة الأمنية استبدالًا للمهندسين، بل جعلًا للتغييرات المتكررة سريعة ومتطابقة وقابلة للتدقيق.\n\nتتوقع خطة CCIE Security v6.1 أن تقرأ Python البسيطة وتكتبها، وأن تفهم واجهات REST والواجهات المبنية على النماذج، وتستخدمها مع منصات Cisco الأمنية. وقد يُطلب منك في المختبر إصلاح سكربت معطّل، أو كتابة سكربت قصير يقرأ قيمة من منتج ويكتبها في آخر. يبني هذا الدرس العادات التي تجعل هذه السكربتات آمنة وموثوقة. وللمنصات الواردة في الأمثلة راجع [Secure Firewall Threat Defense وManagement Center](/learn/cisco-security-certification-track/secure-firewall-threat-defense-and-management-center) و[Cisco ISE: 802.1X وMAB والوصول للضيوف](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-and-guest-access)."
+      },
+      {
+        "id": "apis",
+        "type": "text",
+        "markdown": "## مشهد واجهات API\n\nتوفر معظم منتجات Cisco الأمنية واجهة REST عبر HTTPS بجسم JSON. تختلف التفاصيل، فتعلّم النمط أولًا ثم المنتج.\n\n| المنصة | النمط | المصادقة | ملاحظات |\n|:--|:--|:--|:--|\n| Secure Firewall (FMC) | REST، `/api/fmc_config/v1/domain/{uuid}/...` | POST إلى `generatetoken` بمصادقة أساسية ثم `X-auth-access-token` | الرمز يدوم 30 دقيقة وقابل للتجديد؛ والتغييرات تحتاج نشرًا |\n| Secure Firewall (FDM) | REST، `/api/fdm/latest/...` | رمز بنمط OAuth | إدارة محلية لجهاز واحد |\n| ASA | وكيل REST أو سطر الأوامر عبر SSH | مصادقة أساسية | تغطية محدودة للكائنات |\n| ISE | ERS (المنفذ 9060) وOpenAPI | مصادقة أساسية يفعّلها المسؤول | النقاط الطرفية والمجموعات ومجموعات السياسات |\n| IOS XE | RESTCONF/NETCONF مع YANG | مصادقة أساسية أو رموز | مبني على النماذج، راجع مسارات الأتمتة |\n| Secure Endpoint وXDR وUmbrella | REST سحابية | OAuth2 ببيانات اعتماد العميل | عناوين أساسية تختلف بحسب المنطقة |\n\nثلاث أفكار تنطبق في كل مكان: **المصادقة**، و**استدعاء الطريقة الصحيحة**، و**معالجة النتيجة**. تقرأ `GET`، وتنشئ `POST`، وتستبدل `PUT`، وتغيّر `PATCH` جزءًا من الكائن، وتحذف `DELETE`. وتخبرك رموز الحالة بما جرى: `200` و`201` نجاح، و`400` حمولة خاطئة، و`401` انتهاء الرمز، و`403` غياب الصلاحية، و`404` معرّف خاطئ، و`409` تعارض أو تكرار، و`422` خطأ تحقق، و`429` تجاوز حد الطلبات."
+      },
+      {
+        "id": "fmc-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "سكربت يغيّر الجدار الناري عبر FMC",
+        "data": {
+          "actors": [
+            {
+              "id": "s",
+              "label": "Python script",
+              "sub": "automation host",
+              "icon": "cpu"
+            },
+            {
+              "id": "f",
+              "label": "FMC",
+              "sub": "fmc.example.com",
+              "icon": "server"
+            },
+            {
+              "id": "d",
+              "label": "FTD",
+              "sub": "managed device",
+              "icon": "firewall"
+            }
+          ],
+          "steps": [
+            {
+              "from": "s",
+              "to": "f",
+              "label": "POST generatetoken",
+              "detail": "basic auth",
+              "note": "يصادق السكربت ببيانات اعتماد من متغيرات البيئة."
+            },
+            {
+              "from": "f",
+              "to": "s",
+              "label": "200 + token + DOMAIN_UUID",
+              "tone": "secure",
+              "note": "يعود الرمز ومعرّف النطاق في ترويسات الاستجابة لا في جسم JSON."
+            },
+            {
+              "from": "s",
+              "to": "f",
+              "label": "GET hosts?filter=",
+              "note": "يتحقق السكربت من وجود الكائن مسبقًا ليبقى متكافئ التنفيذ (Idempotent)."
+            },
+            {
+              "from": "s",
+              "to": "f",
+              "label": "POST hosts",
+              "detail": "H-BLOCK-001",
+              "tone": "success",
+              "note": "ينشئ الكائن فقط عند غيابه."
+            },
+            {
+              "from": "s",
+              "to": "f",
+              "label": "POST deploymentrequests",
+              "note": "تبقى التغييرات في FMC إلى أن يُطلب النشر."
+            },
+            {
+              "from": "f",
+              "to": "d",
+              "label": "Push policy",
+              "tone": "success",
+              "note": "ينشر FMC الإعدادات على الجهاز."
+            },
+            {
+              "from": "f",
+              "to": "s",
+              "label": "Task status",
+              "note": "يستعلم السكربت عن المهمة حتى تنتهي ثم يسجل النتيجة."
+            }
+          ]
+        }
+      },
+      {
+        "id": "py",
+        "type": "text",
+        "markdown": "## كتابة سكربتات تصمد في الإنتاج\n\nالسكربت الذي يعمل مرة واحدة عرضٌ تجريبي، والذي يعمل في كل مرة أداة. ابنِ هذه العادات منذ السطر الأول.\n\n- **لا تكتب الأسرار داخل الشيفرة.** اقرأ بيانات الاعتماد من متغيرات البيئة أو من خزنة أسرار، ولا ترفعها إلى المستودع.\n- **تحقق من TLS.** وجّه `verify` إلى حزمة شهادات مختبرك. تعطيله يخفي هجمات الرجل في المنتصف.\n- **حدّد مهلات.** الطلب بلا مهلة قد يعلق إلى الأبد.\n- **اجعله متكافئ التنفيذ.** افحص قبل الإنشاء، حتى يترك تشغيل السكربت مرتين النتيجة نفسها.\n- **تعامل مع الصفحات.** تعيد القوائم صفحة في كل مرة. اتبع `paging.next` أو زد `offset` حتى تنتهي القائمة، وإلا فستفوتك كائنات بصمت.\n- **عالج الأخطاء بحسب فئتها.** أعد المحاولة عند `429` و`5xx` مع تأخير متزايد. جدّد الرمز عند `401`. ولا تعد المحاولة عند `400` أو `422` لأن البيانات نفسها خاطئة.\n- **سجّل ما تغيّر** لا الأسرار.\n\nيتبع المثال التالي هذه القواعد."
+      },
+      {
+        "id": "code-fmc",
+        "type": "code",
+        "language": "python",
+        "filename": "ensure_host.py",
+        "code": "import os, time, requests\n\nFMC = \"https://fmc.example.com\"\nCA = \"/etc/ssl/certs/lab-ca.pem\"          # verify TLS, never verify=False\n\ndef login():\n    r = requests.post(f\"{FMC}/api/fmc_platform/v1/auth/generatetoken\",\n                      auth=(os.environ[\"FMC_USER\"], os.environ[\"FMC_PASS\"]),\n                      verify=CA, timeout=15)\n    r.raise_for_status()\n    return r.headers[\"X-auth-access-token\"], r.headers[\"DOMAIN_UUID\"]\n\ndef call(method, path, token, **kw):\n    for attempt in range(4):\n        r = requests.request(method, FMC + path, verify=CA, timeout=30,\n                             headers={\"X-auth-access-token\": token}, **kw)\n        if r.status_code == 429:               # rate limited\n            time.sleep(2 ** attempt)\n            continue\n        r.raise_for_status()\n        return r.json() if r.content else {}\n    raise RuntimeError(\"rate limit not cleared\")\n\ndef host_exists(token, dom, name):\n    page = call(\"GET\", f\"/api/fmc_config/v1/domain/{dom}/object/hosts\",\n                token, params={\"filter\": f\"nameOrValue:{name}\", \"limit\": 25})\n    return any(i[\"name\"] == name for i in page.get(\"items\", []))\n\ndef ensure_host(token, dom, name, ip):\n    if host_exists(token, dom, name):          # idempotent: safe to rerun\n        return \"unchanged\"\n    call(\"POST\", f\"/api/fmc_config/v1/domain/{dom}/object/hosts\", token,\n         json={\"name\": name, \"type\": \"Host\", \"value\": ip})\n    return \"created\"\n\nif __name__ == \"__main__\":\n    tok, dom = login()\n    print(ensure_host(tok, dom, \"H-BLOCK-001\", \"198.51.100.77\"))",
+        "highlight": [
+          6,
+          15,
+          17,
+          26
+        ],
+        "caption": "إنشاء كائن مضيف متكافئ التنفيذ مع التحقق من TLS والمهلات والتراجع عند تجاوز الحد. تُرك طلب النشر عمدًا."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "الأتمتة تضاعف الأخطاء",
+        "markdown": "الخطأ الإملائي في تغيير يدوي يؤثر في قاعدة واحدة، أما في حلقة تكرار فيؤثر في كل جهاز. اختبر أولًا في المختبر أو على جهاز واحد، وأضف خيار تجربة جافة يطبع التغييرات المخططة، وأبقِ خطوة النشر منفصلة ليراجع إنسانٌ التغييرات المعلقة قبل وصولها إلى الإنتاج."
+      },
+      {
+        "id": "flows",
+        "type": "text",
+        "markdown": "## أنماط مدفوعة بالأحداث عبر المنتجات\n\nأعلى السكربتات قيمةً هي التي تربط المنتجات. والنمط المعتاد في المختبر: **اكتشف في مكان واحتوِ في آخر**.\n\n- يسمّي حدثٌ في Secure Endpoint أو XDR جهازًا مخترقًا. يستدعي السكربت **ISE ERS** لتغيير مجموعة هوية ذلك الجهاز، فيرسل ISE تغيير تفويض (CoA) ليُنقل الجهاز إلى SGT للحجر. راجع [pxGrid ومشاركة السياق](/learn/cisco-security-certification-track/pxgrid-and-context-sharing) للطريقة المدعومة لمشاركة هذا السياق دون استعلام متكرر.\n- تنتج خلاصة تهديدات عناوين. يحدّث السكربت **مجموعة كائنات شبكة** أو [كائنًا ديناميكيًا](/learn/cisco-security-certification-track/dynamic-objects-and-security-intelligence) في الجدار الناري.\n- تُعتمد تذكرة تغيير. يدفع السكربت إعدادات الجهاز عبر RESTCONF، ثم يقرؤها ويقارنها بالحالة المقصودة.\n\nتهمّ قاعدتان في التصميم. الأولى: فضّل **الإشعارات وخطافات الويب (Webhooks)** على حلقات الاستعلام المتكررة لأنها تقلل الحمل والتأخير. الثانية: اجعل كل إجراء **قابلًا للتراجع ومسجلًا**، فدوّن من أو ما الذي أطلقه، والكائن الذي تغيّر، والوقت، حتى يتمكن المحلل من التراجع. أما أتمتة مستوى الأجهزة بالقوالب والجرد فيتوسع فيها Ansible وTerraform أفضل من كومة سكربتات منفردة. وللتنسيق خطوة بخطوة والموافقات استخدم كتيب SOAR يستدعي الواجهات نفسها."
+      },
+      {
+        "id": "cont-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "اكتشاف في منتج واحتواء في آخر",
+        "data": {
+          "token": "Alert",
+          "nodes": [
+            {
+              "id": "ep",
+              "label": "Secure Endpoint",
+              "sub": "malicious file",
+              "icon": "bug"
+            },
+            {
+              "id": "pl",
+              "label": "Playbook",
+              "sub": "Python / SOAR",
+              "icon": "cpu"
+            },
+            {
+              "id": "ise",
+              "label": "ISE",
+              "sub": "ERS API",
+              "icon": "key"
+            },
+            {
+              "id": "sw",
+              "label": "Access switch",
+              "sub": "CoA",
+              "icon": "switch"
+            },
+            {
+              "id": "q",
+              "label": "الحجر",
+              "sub": "SGT 255",
+              "icon": "lock"
+            }
+          ],
+          "steps": [
+            {
+              "at": "ep",
+              "tone": "danger",
+              "caption": "كشف استرجاعي يسمّي المضيف 192.0.2.44."
+            },
+            {
+              "at": "pl",
+              "caption": "يثري الكتيب التنبيه ويتحقق من أن المضيف ليس في قائمة محمية."
+            },
+            {
+              "at": "ise",
+              "caption": "طلب PUT إلى واجهة ERS ينقل الجهاز إلى مجموعة هوية الحجر."
+            },
+            {
+              "at": "sw",
+              "caption": "يرسل ISE تغيير تفويض إلى منفذ المحوّل."
+            },
+            {
+              "at": "q",
+              "tone": "blocked",
+              "caption": "يُعاد تفويض المنفذ بوسم SGT للحجر، ويفقد المضيف الوصول إلى الخوادم."
+            }
+          ]
+        }
+      },
+      {
+        "id": "lab-tips",
+        "type": "text",
+        "markdown": "## استراتيجية المختبر لمهام الأتمتة\n\nفي الاختبار تكون أسئلة الأتمتة عادةً صغيرة ومركّزة. قد تُعطى سكربتًا فيه خطأ واحد، أو استدعاء API فاشلًا، أو طلبًا باستخراج حقل واحد من رد JSON. تدرّب على روتين ثابت. اقرأ أولًا نص الخطأ ورمز الحالة لأنهما يسمّيان المشكلة غالبًا. ثم اطبع جسم الاستجابة الخام، فالواجهات كثيرًا ما تشرح `400` في حقل الرسالة. بعد ذلك قارن الطلب بوثائق المنتج مع الانتباه إلى نوع المحتوى ومسار العنوان والحقول المطلوبة. وأخيرًا غيّر شيئًا واحدًا في كل مرة واختبر من جديد.\n\nاحتفظ بمكتبة مقتطفات قصيرة للمختبر: طلب الرمز، وGET مع الصفحات، وPOST بجسم JSON، وغلاف إعادة المحاولة. كتابتها من الذاكرة أسرع من البحث، والوقت الذي توفره يذهب إلى مهام الإعداد التي تحمل معظم الدرجات."
+      },
+      {
+        "id": "tools",
+        "type": "text",
+        "markdown": "## الخيارات المبنية على النماذج والبنية كشيفرة\n\nسكربتات REST أداة واحدة. اعرف غيرها ومتى تناسب.\n\n- **RESTCONF وNETCONF** يقرآن نماذج YANG ويكتبانها على IOS XE وNX-OS. يعيدان بيانات مهيكلة فلا تحتاج إلى تحليل نص `show` بالتعابير النمطية.\n- وحدات **Ansible** لـ ASA وFTD وISE تصف الحالة المطلوبة بـ YAML وهي متكافئة التنفيذ بطبيعتها.\n- مزودو **Terraform** لـ FMC وISE يتتبعون الحالة ويعرضون خطة قبل أي تغيير، وهذا يناسب مسارات التغيير الخاضعة للمراجعة.\n- **pyATS وGenie** يحوّلان مخرجات `show` إلى بيانات مهيكلة ويختبران الشبكة قبل التغيير وبعده.\n- **Postman ومستكشف API في المنتج** (في FMC واحد تحت قائمة المساعدة) أسرع طريقة لرؤية الطلب قبل برمجته.\n\nاختر أبسط أداة تعطي نتائج قابلة للتكرار والمراجعة. وسكربت Python من عشرة أسطر أفضل غالبًا من إطار عمل كامل، إلى أن تدير خمسين جهازًا."
+      },
+      {
+        "id": "ise-term",
+        "type": "terminal",
+        "title": "ISE ERS: find an endpoint",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "curl -s -k -u \"$ISE_USER:$ISE_PASS\" -H \"Accept: application/json\" \"https://ise.example.com:9060/ers/config/endpoint?filter=mac.EQ.00:11:22:33:44:55\" | jq '.SearchResult.resources[0]'",
+            "output": "{\n  \"id\": \"6f3c1d20-0000-0000-0000-aabbccddeeff\",\n  \"name\": \"00:11:22:33:44:55\",\n  \"link\": { \"href\": \"https://ise.example.com:9060/ers/config/endpoint/6f3c1d20-...\" }\n}",
+            "comment": "العلم -k لمختبر مؤقت فقط. في الإنتاج ثق بسلسلة شهادات ISE. يجب تفعيل ERS من Administration > Settings."
+          }
+        ],
+        "caption": "مخرجات توضيحية بقيم نائبة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم FMC مخبريًا أو بيئة DevNet التجريبية المصرّح لك باستخدامها.\n\n1. اضبط `FMC_USER` و`FMC_PASS` متغيرين للبيئة وشغّل السكربت لإنشاء `H-BLOCK-001`.\n2. شغّله مرة أخرى. يجب أن يطبع `unchanged` ولا ينشئ شيئًا.\n3. أضف حلقة تقرأ ملفًا نصيًا لعناوين من النطاق التوثيقي (198.51.100.0/24) وتنشئ كائن مضيف لكل سطر.\n4. أضف خيار `--dry-run` يطبع ما كان سيُنشأ فقط.\n5. استخدم كلمة مرور خاطئة عمدًا وتأكد من أن السكربت يتوقف برسالة واضحة ولا يعيد المحاولة إلى ما لا نهاية.\n\nدوّن رمز الحالة الذي أنتجه كل فشل."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "REST API",
+            "definition": "واجهة HTTP تستخدم طرقًا مثل GET وPOST على عناوين الموارد."
+          },
+          {
+            "term": "Idempotent",
+            "definition": "آمن للتشغيل المتكرر بالنتيجة النهائية نفسها."
+          },
+          {
+            "term": "Pagination",
+            "definition": "إعادة قائمة طويلة على صفحات يجب أن يتتبعها العميل."
+          },
+          {
+            "term": "Exponential backoff",
+            "definition": "الانتظار مدة أطول بعد كل محاولة فاشلة، كـ 1 ثم 2 ثم 4 ثوانٍ."
+          },
+          {
+            "term": "ERS",
+            "definition": "واجهة ISE الخارجية RESTful على المنفذ 9060."
+          },
+          {
+            "term": "RESTCONF",
+            "definition": "بروتوكول بنمط REST لقراءة بيانات YANG وكتابتها."
+          },
+          {
+            "term": "Webhook",
+            "definition": "استدعاء HTTP يرسله المنتج عند وقوع حدث."
+          },
+          {
+            "term": "Dry run",
+            "definition": "وضع يعرض التغييرات المخططة دون تطبيقها."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أين يعيد FMC رمز الوصول ومعرّف النطاق بعد generatetoken؟",
+            "options": [
+              "في جسم JSON",
+              "في ترويسات الاستجابة",
+              "في ملف تعريف ارتباط فقط",
+              "في العنوان"
+            ],
+            "answer": 1,
+            "explanation": "تصل القيم في الترويستين X-auth-access-token وDOMAIN_UUID."
+          },
+          {
+            "question": "أيّ رموز الحالة يصح إعادة المحاولة عندها مع التأخير؟ اختر كل ما ينطبق.",
+            "options": [
+              "429",
+              "503",
+              "422",
+              "400"
+            ],
+            "answer": [
+              0,
+              1
+            ],
+            "explanation": "429 و5xx حالتان مؤقتتان. أما 400 و422 فتعنيان أن الطلب نفسه غير صالح، فتكرار المحاولة يكرر الفشل."
+          },
+          {
+            "question": "لماذا يفحص السكربت وجود المضيف قبل POST؟",
+            "options": [
+              "ليكون متكافئ التنفيذ",
+              "لتسريع TLS",
+              "لتجنب المصادقة",
+              "لأن POST لا ينشئ مضيفين"
+            ],
+            "answer": 0,
+            "explanation": "الفحص أولًا يعني ألا ينتج التشغيل المتكرر نسخًا مكررة وأن تبقى الحالة نفسها."
+          },
+          {
+            "question": "أيّ الممارسات تجعل سكربت الأتمتة أكثر أمانًا؟ اختر كل ما ينطبق.",
+            "options": [
+              "Read secrets from the environment",
+              "Use verify=False to avoid certificate errors",
+              "Set request timeouts",
+              "Provide a dry-run option"
+            ],
+            "answer": [
+              0,
+              2,
+              3
+            ],
+            "explanation": "تعطيل التحقق من TLS يزيل الحماية من الاعتراض، فهو ليس ممارسة آمنة."
+          },
+          {
+            "question": "بعد أن ينشئ السكربت كائنات في FMC، لماذا لا تكون التغييرات فعّالة بعد على الجدار الناري؟",
+            "options": [
+              "انتهى الرمز",
+              "ما زال مطلوبًا طلب نشر",
+              "يتجاهل FMC تغييرات API",
+              "الكائنات للقراءة فقط"
+            ],
+            "answer": 1,
+            "explanation": "يحتفظ FMC بالتغييرات معلّقة حتى تُنشر على الجهاز المُدار."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nالأتمتة الأمنية هي تغيير متكرر يُنفَّذ بأمان. تعلّم نمط الواجهات المشترك: صادق، ثم استدعِ الطريقة الصحيحة، ثم افحص رمز الحالة. ابنِ سكربتات متكافئة التنفيذ تدعم الصفحات وتراعي حدود الطلبات وتتحقق من TLS وتسجل ما تفعل. اربط المنتجات ليؤدي الاكتشاف في أحدها إلى الاحتواء في آخر، وأبقِ خطوة مراجعة بشرية قبل النشر في الإنتاج. واختر Python أو Ansible أو Terraform أو RESTCONF بحسب حجم المهمة لا بحسب العادة."
+      }
+    ]
+  }
+}

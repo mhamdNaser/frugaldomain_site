@@ -1,0 +1,532 @@
+{
+ "slug": "data-center-security-acls-rbac-and-aaa",
+ "title": "Data Center Security: ACLs, RBAC and AAA",
+ "summary": "Filter traffic with ACLs, limit administrators with RBAC, and control and audit access with TACACS+ AAA on Nexus and ACI.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Configure and verify an ACL on NX-OS and distinguish RACL, PACL and VACL",
+  "Explain how ACI contracts differ from ACLs",
+  "Build a least-privilege RBAC role",
+  "Configure TACACS+ AAA with a local fallback",
+  "Combine controls into a layered design"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "Two incidents show why this lesson matters. In the first, a contractor's laptop in the server VLAN scans the whole subnet and finds an unprotected management service. In the second, a junior engineer who only needed to add a VLAN runs `write erase` on a production leaf, because the shared admin account could do anything.\n\nBoth are failures of **control**: traffic that should have been filtered, and administrators who held more power than their job required. Data center security answers with three tools. **Access control lists (ACLs)** filter packets. **Role-based access control (RBAC)** limits what each administrator may do. **AAA** (authentication, authorization, accounting) proves who is connecting, decides what they may do, and records it. This lesson covers all three on NX-OS and notes how ACI handles the same ideas. Compute-level protection is covered in [Compute Security and Secure Boot](/learn/enterprise-datacenter-networking/compute-security-and-secure-boot)."
+  },
+  {
+   "id": "acl",
+   "type": "text",
+   "markdown": "## ACLs on Nexus switches\n\nAn ACL is an ordered list of permit and deny entries. The switch checks packets against entries from the lowest sequence number up, and the first match wins. Every ACL ends with an **implicit deny**, so a list that only contains permits blocks everything else. NX-OS applies ACLs in hardware (TCAM), so filtering does not slow forwarding, but TCAM space is finite.\n\nWhere you apply an ACL changes its name and its reach:\n\n- **Router ACL (RACL):** applied to a Layer 3 interface or SVI with `ip access-group NAME in|out`.\n- **Port ACL (PACL):** applied to a Layer 2 switchport to filter before VLAN processing.\n- **VLAN ACL (VACL):** a `vlan access-map` that can forward, drop or redirect traffic inside a VLAN, including traffic between hosts in the same subnet that never crosses a router.\n\nGood practice is to number entries in steps of 10 so you can insert lines later, use `object-group` for sets of addresses and ports, add `log` only on deny entries you actually watch, and test with `show ip access-lists` counters. Leaf-spine fabrics add a twist: with an anycast gateway, every leaf is the default gateway, so a RACL on the SVI is enforced where the server connects, which is a strong place for east-west control.\n\nIn **ACI**, you do not write ACLs on each switch. Endpoint groups are isolated by default, and a **contract** with filters explicitly permits communication between them. The model is allow-list by design. Read more in [Cisco ACI Fabric Concepts](/learn/enterprise-datacenter-networking/cisco-aci-fabric-concepts)."
+  },
+  {
+   "id": "acl-cfg",
+   "type": "code",
+   "language": "cisco",
+   "code": "leaf01(config)# ip access-list WEB-IN\nleaf01(config-acl)# 10 permit tcp any 198.51.100.0/24 eq 443\nleaf01(config-acl)# 20 permit tcp any 198.51.100.0/24 eq 80\nleaf01(config-acl)# 30 permit icmp any 198.51.100.0/24 echo\nleaf01(config-acl)# 40 deny ip any any log\nleaf01(config-acl)# exit\n\nleaf01(config)# interface ethernet 1/10\nleaf01(config-if)# ip access-group WEB-IN in\n\nleaf01# show ip access-lists WEB-IN\nIP access list WEB-IN\n        10 permit tcp any 198.51.100.0/24 eq 443 [match=18423]\n        20 permit tcp any 198.51.100.0/24 eq 80 [match=311]\n        30 permit icmp any 198.51.100.0/24 echo [match=12]\n        40 deny ip any any log [match=57]\n",
+   "filename": "web-acl.txt",
+   "caption": "An ACL permitting HTTPS, HTTP and ping to a web subnet. The match counters prove which entries are used."
+  },
+  {
+   "id": "rbac",
+   "type": "text",
+   "markdown": "## RBAC: least privilege for administrators\n\nRole-based access control assigns permissions to **roles**, and users receive roles. This keeps rights consistent and auditable.\n\nNX-OS ships default roles. `network-admin` has full read-write access. `network-operator` has read-only access and cannot change configuration. You create custom roles with **rules**, evaluated from the highest number down, which permit or deny `read` or `read-write` access to a **command**, **feature**, **feature-group** or **OID**. You can also limit a role to specific VLANs, VRFs or interfaces.\n\nIn ACI, RBAC combines three ideas. A **role** is a set of privileges (such as `tenant-admin` or `fabric-admin`). A **security domain** is a scope that groups objects, such as a tenant. A user's **domain assignment** pairs a security domain with roles. A user can therefore be an administrator of tenant PROD and read-only everywhere else.\n\nPlan roles around jobs, not people: network engineer, security auditor, storage administrator, application owner. Review them regularly, remove accounts when people change jobs, and avoid shared accounts, because shared accounts destroy accountability."
+  },
+  {
+   "id": "rbac-cfg",
+   "type": "code",
+   "language": "cisco",
+   "code": "leaf01(config)# role name vlan-admin\nleaf01(config-role)# description Manage VLANs only\nleaf01(config-role)# rule 10 permit read-write feature vlan\nleaf01(config-role)# rule 20 permit read feature interface\nleaf01(config-role)# exit\n\nleaf01(config)# username alice role vlan-admin\nleaf01(config)# username alice password <placeholder-password>\n\nleaf01# show role name vlan-admin\nRole: vlan-admin\n  Description: Manage VLANs only\n  Vlan policy: permit (default)\n  Interface policy: permit (default)\n  -------------------------------------------------------------------\n  Rule    Perm    Type        Scope               Entity\n  -------------------------------------------------------------------\n  20      permit  read        feature             interface\n  10      permit  read-write  feature             vlan\n",
+   "filename": "rbac.txt",
+   "caption": "A custom NX-OS role: read-write on VLANs, read-only on interfaces. The password is a placeholder."
+  },
+  {
+   "id": "aaa",
+   "type": "text",
+   "markdown": "## AAA with TACACS+\n\nAAA separates three questions.\n\n1. **Authentication:** who are you? (username with a password or key)\n2. **Authorization:** what may you do? (role, privilege level, permitted commands)\n3. **Accounting:** what did you do? (a log of logins and commands)\n\nCisco devices commonly use **TACACS+** for device administration. It runs over TCP/49, encrypts the whole body of the packet, and keeps authentication, authorization and accounting separate, so you can authorize each command. **RADIUS** is common for network access (802.1X, VPN), but it combines authentication and authorization and encrypts only the password. Both can also back **LDAP** or Active Directory identities through a server such as Cisco ISE.\n\nOn a Nexus switch you define the server, group servers into an AAA group, and then point each AAA function to the group, with `local` as a fallback. The fallback is critical: if the TACACS+ server is unreachable and no local account exists, you lock yourself out. Keep one local emergency account with a long, vaulted password. Use the management VRF for AAA traffic, and always test from a second open session before closing the first."
+  },
+  {
+   "id": "aaa-cfg",
+   "type": "code",
+   "language": "cisco",
+   "code": "leaf01(config)# feature tacacs+\nleaf01(config)# tacacs-server host 192.0.2.80 key 0 <shared-secret>\nleaf01(config)# aaa group server tacacs+ TACGRP\nleaf01(config-tacacs+)# server 192.0.2.80\nleaf01(config-tacacs+)# use-vrf management\nleaf01(config-tacacs+)# source-interface mgmt0\nleaf01(config-tacacs+)# exit\n\n! Group first, local second: local is used only if no server responds\nleaf01(config)# aaa authentication login default group TACGRP local\nleaf01(config)# aaa authorization commands default group TACGRP local\nleaf01(config)# aaa accounting default group TACGRP\n\nleaf01# show aaa authentication\n        default: group TACGRP local\n        console: local\n",
+   "filename": "tacacs-aaa.txt",
+   "caption": "TACACS+ for login, command authorization and accounting, with local fallback. The key is a placeholder."
+  },
+  {
+   "id": "auth",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "An administrator login with AAA",
+   "caption": "Authentication, authorization and accounting are separate steps.",
+   "data": {
+    "actors": [
+     {
+      "id": "adm",
+      "label": "Administrator",
+      "sub": "alice",
+      "icon": "user"
+     },
+     {
+      "id": "sw",
+      "label": "Leaf01",
+      "sub": "NX-OS",
+      "icon": "switch"
+     },
+     {
+      "id": "tac",
+      "label": "TACACS+ server",
+      "sub": "192.0.2.80",
+      "icon": "key"
+     }
+    ],
+    "steps": [
+     {
+      "from": "adm",
+      "to": "sw",
+      "label": "SSH login",
+      "detail": "alice",
+      "note": "The administrator opens an SSH session to the management address."
+     },
+     {
+      "from": "sw",
+      "to": "tac",
+      "label": "Authentication request",
+      "detail": "TCP/49",
+      "note": "The switch forwards the credentials to the server in the management VRF."
+     },
+     {
+      "from": "tac",
+      "to": "sw",
+      "label": "ACCEPT + role vlan-admin",
+      "note": "The server confirms the identity and returns the role attribute.",
+      "tone": "success"
+     },
+     {
+      "from": "adm",
+      "to": "sw",
+      "label": "Command: show vlan",
+      "note": "The user types a command."
+     },
+     {
+      "from": "sw",
+      "to": "tac",
+      "label": "Authorization request",
+      "note": "If command authorization is enabled, each command is checked.",
+      "tone": "secure"
+     },
+     {
+      "from": "tac",
+      "to": "sw",
+      "label": "PASS",
+      "note": "The command is permitted for this role."
+     },
+     {
+      "from": "sw",
+      "to": "tac",
+      "label": "Accounting record",
+      "detail": "alice, show vlan",
+      "note": "The switch logs the command with time and source for audit.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "harden",
+   "type": "text",
+   "markdown": "## Putting it together\n\nLayered controls work best when they reinforce each other.\n\n- Management access: allow SSH only, from a management subnet, using an ACL on the management interface or VTY lines. Disable Telnet and unused features with `no feature telnet`.\n- Identity: TACACS+ for people, with roles that match jobs, plus a vaulted local break-glass account.\n- Data plane: RACLs or ACI contracts that allow only known flows, and [Private VLANs and First Hop Security](/learn/enterprise-datacenter-networking/private-vlans-and-first-hop-security) to limit what a compromised host can reach.\n- Control plane: CoPP limits packets sent to the CPU.\n- Evidence: accounting and syslog to central storage, as in [Data Center Monitoring: SPAN, NetFlow and Syslog](/learn/enterprise-datacenter-networking/data-center-monitoring-span-netflow-and-syslog).\n\nAutomation should follow the same rules. A pipeline account that can change every switch deserves its own narrow role, its own audit trail and short-lived credentials."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Do not lock yourself out",
+   "markdown": "Applying an ACL to the interface you are connected through, or enabling AAA with an unreachable server and no local fallback, can cut off your own access. Keep a second session open, use `configure session` or a scheduled `reload` safeguard where available, and test the exact login path before you disconnect."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab Nexus switch, create the `vlan-admin` role and a user `alice` that uses it. Log in as alice and try `vlan 130` (it should work) and `interface ethernet 1/1` followed by `shutdown` (it should be refused). Then apply the WEB-IN ACL to a test SVI, send HTTPS and Telnet traffic from a host, and read the counters with `show ip access-lists WEB-IN`. Remove the ACL when finished."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "ACL",
+     "definition": "Ordered permit and deny list evaluated top-down with an implicit deny at the end."
+    },
+    {
+     "term": "RACL / PACL / VACL",
+     "definition": "ACLs applied to a routed interface, a Layer 2 port or inside a VLAN."
+    },
+    {
+     "term": "RBAC",
+     "definition": "Permissions assigned to roles, and roles assigned to users."
+    },
+    {
+     "term": "Least privilege",
+     "definition": "Giving only the access a job requires."
+    },
+    {
+     "term": "AAA",
+     "definition": "Authentication, authorization and accounting."
+    },
+    {
+     "term": "TACACS+",
+     "definition": "TCP-based AAA protocol with per-command authorization."
+    },
+    {
+     "term": "Security domain",
+     "definition": "An ACI scope that limits what a role can see and change."
+    },
+    {
+     "term": "Contract",
+     "definition": "An ACI object that permits traffic between EPGs."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "A packet matches no entry in an ACL. What happens?",
+     "options": [
+      "It is permitted",
+      "It is denied by the implicit deny",
+      "It is sent to the CPU",
+      "It is logged and permitted"
+     ],
+     "answer": 1,
+     "explanation": "Every ACL ends with an implicit deny, so unmatched packets are dropped."
+    },
+    {
+     "question": "Which ACL type can filter traffic between two hosts in the same VLAN?",
+     "options": [
+      "RACL on a routed interface",
+      "VACL",
+      "Management ACL",
+      "Prefix list"
+     ],
+     "answer": 1,
+     "explanation": "A VACL is applied inside the VLAN, so it sees traffic that never crosses a router."
+    },
+    {
+     "question": "Which are advantages of TACACS+ over RADIUS for device administration? (Choose all that apply.)",
+     "options": [
+      "Separate authorization, enabling per-command control",
+      "Encrypts the full packet body",
+      "Uses UDP/1812 only",
+      "Keeps AAA functions separate"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "TACACS+ uses TCP/49, encrypts the whole body and separates the three AAA functions. UDP/1812 is RADIUS authentication."
+    },
+    {
+     "question": "Why should you keep a local fallback in the AAA configuration?",
+     "options": [
+      "To speed up logins",
+      "To keep access if the TACACS+ servers are unreachable",
+      "To disable accounting",
+      "To raise privilege levels"
+     ],
+     "answer": 1,
+     "explanation": "Without a fallback, a server outage can lock all administrators out of the device."
+    },
+    {
+     "question": "In ACI, what does a contract do?",
+     "options": [
+      "Encrypts the fabric",
+      "Explicitly permits communication between EPGs",
+      "Assigns IP addresses",
+      "Creates local users"
+     ],
+     "answer": 1,
+     "explanation": "EPGs are isolated by default. Contracts with filters allow specific traffic between them."
+    }
+   ]
+  },
+  {
+   "id": "sum",
+   "type": "text",
+   "markdown": "## Summary\n\n- ACLs are ordered, end with an implicit deny, and run in hardware; RACL, PACL and VACL differ by where they apply.\n- ACI uses contracts as an allow-list model between EPGs.\n- RBAC grants least privilege through roles; ACI adds security domains.\n- AAA with TACACS+ authenticates, authorizes each command and records activity, with a local fallback.\n- Layer the controls, keep evidence, and never test an access change without a second session.\n\nThe next lesson is [Private VLANs and First Hop Security](/learn/enterprise-datacenter-networking/private-vlans-and-first-hop-security), which limits what a host can do on the wire."
+  }
+ ],
+ "ar": {
+  "title": "أمن مراكز البيانات: ACLs وRBAC وAAA",
+  "summary": "رشّح الحركة بقوائم ACL، وقيّد المسؤولين بـ RBAC، وتحكّم في الوصول ودقّقه بـ AAA مع TACACS+ على Nexus وACI.",
+  "objectives": [
+   "إعداد قائمة ACL على NX-OS والتحقق منها والتمييز بين RACL وPACL وVACL",
+   "شرح اختلاف عقود ACI عن قوائم ACL",
+   "بناء دور RBAC بأقل الصلاحيات",
+   "إعداد AAA مع TACACS+ واحتياط محلي",
+   "الجمع بين الضوابط في تصميم متعدد الطبقات"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يوضح حادثان لماذا يهمّ هذا الدرس. في الأول يفحص حاسوب محمول لمتعاقد في VLAN الخوادم الشبكة الفرعية كلها ويعثر على خدمة إدارة غير محمية. وفي الثاني ينفّذ مهندس مبتدئ كان يحتاج فقط إلى إضافة VLAN الأمر `write erase` على مبدّل إنتاج، لأن حساب المسؤول المشترك يستطيع فعل كل شيء.\n\nكلاهما إخفاق في **التحكم**: حركة كان ينبغي ترشيحها، ومسؤولون يملكون صلاحيات أكبر مما تتطلبه وظيفتهم. ويجيب أمن مراكز البيانات بثلاث أدوات. **قوائم التحكم بالوصول (ACLs)** ترشّح الحزم. و**التحكم بالوصول المبني على الأدوار (RBAC)** يحدّد ما يجوز لكل مسؤول فعله. و**AAA** (المصادقة والتفويض والمحاسبة) يثبت هوية المتصل ويقرّر ما يجوز له ويسجّله. يغطي هذا الدرس الثلاثة على NX-OS ويشير إلى معالجة ACI للأفكار نفسها. وتُشرح حماية طبقة الحوسبة في درس [أمن الحوسبة والإقلاع الآمن](/learn/enterprise-datacenter-networking/compute-security-and-secure-boot)."
+   },
+   {
+    "id": "acl",
+    "type": "text",
+    "markdown": "## قوائم ACL على مبدّلات Nexus\n\nقائمة ACL هي قائمة مرتبة من مدخلات السماح والمنع. يفحص المبدّل الحزم مقابل المدخلات بدءاً من أصغر رقم تسلسل، وتفوز أول مطابقة. وتنتهي كل قائمة بـ **منع ضمني (Implicit deny)**، فالقائمة التي تحوي مدخلات سماح فقط تحجب كل ما سواها. ويطبّق NX-OS القوائم في العتاد (TCAM) فلا يبطئ الترشيح التمرير، لكن مساحة TCAM محدودة.\n\nيغيّر موضع تطبيق القائمة اسمها ومداها:\n\n- **ACL الموجِّه (RACL):** تُطبَّق على واجهة من الطبقة الثالثة أو SVI بالأمر `ip access-group NAME in|out`.\n- **ACL المنفذ (PACL):** تُطبَّق على منفذ من الطبقة الثانية لترشيح الحركة قبل معالجة VLAN.\n- **ACL الـ VLAN (VACL):** خريطة `vlan access-map` يمكنها تمرير الحركة أو إسقاطها أو إعادة توجيهها داخل VLAN، بما فيها الحركة بين مضيفين في الشبكة الفرعية نفسها دون أن تمر بموجِّه.\n\nومن الممارسات الجيدة ترقيم المدخلات بخطوات من 10 لتتمكن من إدراج أسطر لاحقاً، واستخدام `object-group` لمجموعات العناوين والمنافذ، وإضافة `log` فقط إلى مدخلات المنع التي تراقبها فعلاً، والاختبار بعدّادات `show ip access-lists`. وتضيف أنسجة Leaf-Spine ميزة: مع بوابة Anycast يكون كل Leaf هو البوابة الافتراضية، فتُطبَّق RACL على SVI حيث يتصل الخادم، وهذا موضع قوي للتحكم في حركة شرق-غرب.\n\nوفي **ACI** لا تكتب قوائم ACL على كل مبدّل. فمجموعات النقاط الطرفية (EPGs) معزولة افتراضياً، ويسمح **العقد (Contract)** ذو المرشحات بالتواصل بينها صراحةً. فالنموذج قائمة سماح بطبيعته. للمزيد راجع [مفاهيم نسيج Cisco ACI](/learn/enterprise-datacenter-networking/cisco-aci-fabric-concepts)."
+   },
+   {
+    "id": "acl-cfg",
+    "type": "code",
+    "language": "cisco",
+    "code": "leaf01(config)# ip access-list WEB-IN\nleaf01(config-acl)# 10 permit tcp any 198.51.100.0/24 eq 443\nleaf01(config-acl)# 20 permit tcp any 198.51.100.0/24 eq 80\nleaf01(config-acl)# 30 permit icmp any 198.51.100.0/24 echo\nleaf01(config-acl)# 40 deny ip any any log\nleaf01(config-acl)# exit\n\nleaf01(config)# interface ethernet 1/10\nleaf01(config-if)# ip access-group WEB-IN in\n\nleaf01# show ip access-lists WEB-IN\nIP access list WEB-IN\n        10 permit tcp any 198.51.100.0/24 eq 443 [match=18423]\n        20 permit tcp any 198.51.100.0/24 eq 80 [match=311]\n        30 permit icmp any 198.51.100.0/24 echo [match=12]\n        40 deny ip any any log [match=57]\n",
+    "filename": "web-acl.txt",
+    "caption": "قائمة ACL تسمح بـ HTTPS وHTTP وping إلى شبكة الويب الفرعية. تُظهر عدّادات المطابقة المدخلات المستخدمة."
+   },
+   {
+    "id": "rbac",
+    "type": "text",
+    "markdown": "## RBAC: أقل الصلاحيات للمسؤولين\n\nيُسند التحكم المبني على الأدوار الأذونات إلى **أدوار (Roles)**، ويحصل المستخدمون على الأدوار. وهذا يحافظ على اتساق الصلاحيات وقابليتها للتدقيق.\n\nيأتي NX-OS بأدوار افتراضية. فالدور `network-admin` له وصول كامل بقراءة وكتابة، والدور `network-operator` له وصول للقراءة فقط ولا يغيّر الإعداد. وتنشئ أدواراً مخصصة بـ **قواعد (Rules)** تُقيَّم من الرقم الأعلى نزولاً، وتسمح بوصول `read` أو `read-write` إلى **أمر** أو **ميزة (feature)** أو **مجموعة ميزات** أو **OID** أو تمنعه. ويمكنك أيضاً حصر الدور في VLAN أو VRF أو واجهات محددة.\n\nوفي ACI يجمع RBAC بين ثلاث أفكار. **الدور** مجموعة امتيازات (مثل `tenant-admin` أو `fabric-admin`). و**نطاق الأمان (Security domain)** نطاق يجمع كائنات مثل المستأجر. و**إسناد النطاق** للمستخدم يقرن نطاق أمان بأدوار. فيمكن أن يكون المستخدم مسؤولاً عن المستأجر PROD وقارئاً فقط في ما عداه.\n\nخطط الأدوار حول الوظائف لا الأشخاص: مهندس شبكات ومدقق أمني ومسؤول تخزين ومالك تطبيق. وراجعها دورياً، وأزل الحسابات عند تغيّر وظائف أصحابها، وتجنب الحسابات المشتركة لأنها تهدم المساءلة."
+   },
+   {
+    "id": "rbac-cfg",
+    "type": "code",
+    "language": "cisco",
+    "code": "leaf01(config)# role name vlan-admin\nleaf01(config-role)# description Manage VLANs only\nleaf01(config-role)# rule 10 permit read-write feature vlan\nleaf01(config-role)# rule 20 permit read feature interface\nleaf01(config-role)# exit\n\nleaf01(config)# username alice role vlan-admin\nleaf01(config)# username alice password <placeholder-password>\n\nleaf01# show role name vlan-admin\nRole: vlan-admin\n  Description: Manage VLANs only\n  Vlan policy: permit (default)\n  Interface policy: permit (default)\n  -------------------------------------------------------------------\n  Rule    Perm    Type        Scope               Entity\n  -------------------------------------------------------------------\n  20      permit  read        feature             interface\n  10      permit  read-write  feature             vlan\n",
+    "filename": "rbac.txt",
+    "caption": "دور مخصص في NX-OS: قراءة وكتابة على VLAN وقراءة فقط على الواجهات. كلمة المرور نص بديل."
+   },
+   {
+    "id": "aaa",
+    "type": "text",
+    "markdown": "## AAA مع TACACS+\n\nيفصل AAA بين ثلاثة أسئلة.\n\n1. **المصادقة (Authentication):** من أنت؟ (اسم مستخدم مع كلمة مرور أو مفتاح)\n2. **التفويض (Authorization):** ماذا يجوز لك أن تفعل؟ (الدور ومستوى الامتياز والأوامر المسموحة)\n3. **المحاسبة (Accounting):** ماذا فعلت؟ (سجل لعمليات الدخول والأوامر)\n\nتستخدم أجهزة Cisco عادةً **TACACS+** لإدارة الأجهزة. يعمل عبر TCP/49 ويشفّر جسم الحزمة كاملاً ويفصل بين المصادقة والتفويض والمحاسبة، فيمكنك تفويض كل أمر على حدة. أما **RADIUS** فشائع لوصول الشبكة (802.1X وVPN) لكنه يدمج المصادقة والتفويض ويشفّر كلمة المرور فقط. ويمكن للاثنين الاستناد إلى هويات **LDAP** أو Active Directory عبر خادم مثل Cisco ISE.\n\nفي مبدّل Nexus تعرّف الخادم، وتجمع الخوادم في مجموعة AAA، ثم توجّه كل وظيفة AAA إلى المجموعة، مع `local` احتياطاً. والاحتياط حاسم: إذا تعذّر الوصول إلى خادم TACACS+ ولم يوجد حساب محلي، تقفل على نفسك. احتفظ بحساب طوارئ محلي واحد بكلمة مرور طويلة محفوظة في خزنة. واستخدم VRF الإدارة لحركة AAA، واختبر دائماً من جلسة ثانية مفتوحة قبل إغلاق الأولى."
+   },
+   {
+    "id": "aaa-cfg",
+    "type": "code",
+    "language": "cisco",
+    "code": "leaf01(config)# feature tacacs+\nleaf01(config)# tacacs-server host 192.0.2.80 key 0 <shared-secret>\nleaf01(config)# aaa group server tacacs+ TACGRP\nleaf01(config-tacacs+)# server 192.0.2.80\nleaf01(config-tacacs+)# use-vrf management\nleaf01(config-tacacs+)# source-interface mgmt0\nleaf01(config-tacacs+)# exit\n\n! Group first, local second: local is used only if no server responds\nleaf01(config)# aaa authentication login default group TACGRP local\nleaf01(config)# aaa authorization commands default group TACGRP local\nleaf01(config)# aaa accounting default group TACGRP\n\nleaf01# show aaa authentication\n        default: group TACGRP local\n        console: local\n",
+    "filename": "tacacs-aaa.txt",
+    "caption": "TACACS+ لتسجيل الدخول وتفويض الأوامر والمحاسبة مع احتياط محلي. المفتاح نص بديل."
+   },
+   {
+    "id": "auth",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "تسجيل دخول مسؤول مع AAA",
+    "caption": "المصادقة والتفويض والمحاسبة خطوات منفصلة.",
+    "data": {
+     "actors": [
+      {
+       "id": "adm",
+       "label": "المسؤول",
+       "sub": "alice",
+       "icon": "user"
+      },
+      {
+       "id": "sw",
+       "label": "Leaf01",
+       "sub": "NX-OS",
+       "icon": "switch"
+      },
+      {
+       "id": "tac",
+       "label": "خادم TACACS+",
+       "sub": "192.0.2.80",
+       "icon": "key"
+      }
+     ],
+     "steps": [
+      {
+       "from": "adm",
+       "to": "sw",
+       "label": "دخول SSH",
+       "detail": "alice",
+       "note": "يفتح المسؤول جلسة SSH إلى عنوان الإدارة."
+      },
+      {
+       "from": "sw",
+       "to": "tac",
+       "label": "طلب مصادقة",
+       "detail": "TCP/49",
+       "note": "يمرّر المبدّل الاعتمادات إلى الخادم عبر VRF الإدارة."
+      },
+      {
+       "from": "tac",
+       "to": "sw",
+       "label": "ACCEPT + الدور vlan-admin",
+       "note": "يؤكد الخادم الهوية ويعيد سمة الدور.",
+       "tone": "success"
+      },
+      {
+       "from": "adm",
+       "to": "sw",
+       "label": "الأمر: show vlan",
+       "note": "يكتب المستخدم أمراً."
+      },
+      {
+       "from": "sw",
+       "to": "tac",
+       "label": "طلب تفويض",
+       "note": "إذا فُعّل تفويض الأوامر يُفحص كل أمر.",
+       "tone": "secure"
+      },
+      {
+       "from": "tac",
+       "to": "sw",
+       "label": "PASS",
+       "note": "الأمر مسموح لهذا الدور."
+      },
+      {
+       "from": "sw",
+       "to": "tac",
+       "label": "سجل محاسبة",
+       "detail": "alice, show vlan",
+       "note": "يسجل المبدّل الأمر مع الوقت والمصدر للتدقيق.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "harden",
+    "type": "text",
+    "markdown": "## جمع الأجزاء معاً\n\nتعمل الضوابط المتعددة الطبقات أفضل ما تكون حين يعزّز بعضها بعضاً.\n\n- **الوصول الإداري:** اسمح بـ SSH فقط، من شبكة إدارة فرعية، بقائمة ACL على واجهة الإدارة أو خطوط VTY. وعطّل Telnet والميزات غير المستخدمة بالأمر `no feature telnet`.\n- **الهوية:** TACACS+ للأشخاص مع أدوار تطابق الوظائف، إضافة إلى حساب طوارئ محلي محفوظ في خزنة.\n- **مستوى البيانات:** قوائم RACL أو عقود ACI التي تسمح بالتدفقات المعروفة فقط، و[الشبكات المحلية الخاصة وأمن القفزة الأولى](/learn/enterprise-datacenter-networking/private-vlans-and-first-hop-security) لتقييد ما يصل إليه مضيف مخترَق.\n- **مستوى التحكم:** يحدّ CoPP من الحزم المرسلة إلى المعالج.\n- **الأدلة:** المحاسبة وSyslog إلى تخزين مركزي، كما في [مراقبة مراكز البيانات: SPAN وNetFlow وSyslog](/learn/enterprise-datacenter-networking/data-center-monitoring-span-netflow-and-syslog).\n\nوينبغي أن تتبع الأتمتة القواعد نفسها. فحساب المسار الآلي الذي يستطيع تغيير كل مبدّل يستحق دوراً ضيقاً خاصاً به، وسجل تدقيق خاصاً به، واعتمادات قصيرة العمر."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تقفل على نفسك",
+    "markdown": "قد يقطع تطبيق قائمة ACL على الواجهة التي تتصل عبرها، أو تفعيل AAA مع خادم لا يمكن الوصول إليه ودون احتياط محلي، وصولك أنت. أبقِ جلسة ثانية مفتوحة، واستخدم `configure session` أو احتياط إعادة تشغيل مجدولاً حيثما توفر، واختبر مسار الدخول نفسه قبل أن تفصل."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على مبدّل Nexus في المختبر أنشئ الدور `vlan-admin` والمستخدم `alice` الذي يستخدمه. سجّل الدخول بصفة alice وجرّب `vlan 130` (يجب أن ينجح) ثم `interface ethernet 1/1` يليه `shutdown` (يجب أن يُرفض). بعد ذلك طبّق قائمة WEB-IN على SVI تجريبية، وأرسل حركة HTTPS وTelnet من مضيف، واقرأ العدّادات بالأمر `show ip access-lists WEB-IN`. وأزل القائمة عند الانتهاء."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "ACL",
+      "definition": "قائمة سماح ومنع مرتبة تُقيَّم من الأعلى وتنتهي بمنع ضمني."
+     },
+     {
+      "term": "RACL / PACL / VACL",
+      "definition": "قوائم ACL تُطبَّق على واجهة موجَّهة أو منفذ طبقة ثانية أو داخل VLAN."
+     },
+     {
+      "term": "RBAC",
+      "definition": "أذونات تُسند إلى أدوار وأدوار تُسند إلى مستخدمين."
+     },
+     {
+      "term": "Least privilege (أقل الصلاحيات)",
+      "definition": "منح الوصول الذي تتطلبه الوظيفة فقط."
+     },
+     {
+      "term": "AAA",
+      "definition": "المصادقة والتفويض والمحاسبة."
+     },
+     {
+      "term": "TACACS+",
+      "definition": "بروتوكول AAA قائم على TCP يدعم التفويض لكل أمر."
+     },
+     {
+      "term": "Security domain (نطاق الأمان)",
+      "definition": "نطاق في ACI يحدد ما يراه الدور وما يغيّره."
+     },
+     {
+      "term": "Contract (العقد)",
+      "definition": "كائن في ACI يسمح بالحركة بين EPGs."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "حزمة لا تطابق أي مدخل في ACL. ماذا يحدث لها؟",
+      "options": [
+       "تُسمح",
+       "تُمنع بالمنع الضمني",
+       "تُرسل إلى المعالج",
+       "تُسجَّل وتُسمح"
+      ],
+      "answer": 1,
+      "explanation": "تنتهي كل قائمة بمنع ضمني، فتُسقط الحزم غير المطابقة."
+     },
+     {
+      "question": "أي نوع من ACL يرشّح الحركة بين مضيفين في VLAN واحدة؟",
+      "options": [
+       "RACL على واجهة موجَّهة",
+       "VACL",
+       "ACL الإدارة",
+       "قائمة بادئات"
+      ],
+      "answer": 1,
+      "explanation": "تُطبَّق VACL داخل VLAN فترى الحركة التي لا تمر بموجِّه."
+     },
+     {
+      "question": "ما مزايا TACACS+ مقارنة بـ RADIUS لإدارة الأجهزة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "تفويض منفصل يتيح التحكم لكل أمر",
+       "يشفّر جسم الحزمة كاملاً",
+       "يستخدم UDP/1812 فقط",
+       "يفصل بين وظائف AAA"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يستخدم TACACS+ المنفذ TCP/49 ويشفّر الجسم كاملاً ويفصل وظائف AAA الثلاث. أما UDP/1812 فهو لمصادقة RADIUS."
+     },
+     {
+      "question": "لماذا تُبقي احتياطاً محلياً في إعداد AAA؟",
+      "options": [
+       "لتسريع الدخول",
+       "للحفاظ على الوصول إذا تعذّر الوصول إلى خوادم TACACS+",
+       "لتعطيل المحاسبة",
+       "لرفع مستويات الامتياز"
+      ],
+      "answer": 1,
+      "explanation": "من دون احتياط قد يقفل انقطاع الخادم جميع المسؤولين خارج الجهاز."
+     },
+     {
+      "question": "ماذا يفعل العقد (Contract) في ACI؟",
+      "options": [
+       "يشفّر النسيج",
+       "يسمح صراحةً بالتواصل بين EPGs",
+       "يعيّن عناوين IP",
+       "ينشئ مستخدمين محليين"
+      ],
+      "answer": 1,
+      "explanation": "EPGs معزولة افتراضياً، وتسمح العقود ذات المرشحات بحركة محددة بينها."
+     }
+    ]
+   },
+   {
+    "id": "sum",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- قوائم ACL مرتبة وتنتهي بمنع ضمني وتعمل في العتاد، وتختلف RACL وPACL وVACL بموضع التطبيق.\n- يستخدم ACI العقود نموذج قائمة سماح بين EPGs.\n- يمنح RBAC أقل الصلاحيات عبر الأدوار، ويضيف ACI نطاقات الأمان.\n- يصادق AAA مع TACACS+ ويفوّض كل أمر ويسجّل النشاط، مع احتياط محلي.\n- اجمع الضوابط في طبقات، واحتفظ بالأدلة، ولا تختبر تغيير وصول دون جلسة ثانية.\n\nالدرس التالي هو [الشبكات المحلية الخاصة وأمن القفزة الأولى](/learn/enterprise-datacenter-networking/private-vlans-and-first-hop-security) الذي يحدّ مما يستطيع المضيف فعله على الوصلة."
+   }
+  ]
+ }
+}

@@ -1,0 +1,562 @@
+{
+ "slug": "multicast-pim-anycast-rp-msdp-and-igmp",
+ "title": "Multicast: PIM, Anycast-RP, MSDP and IGMP",
+ "summary": "Build a resilient PIM sparse-mode design with Anycast-RP, understand MSDP and IGMP snooping, and troubleshoot RPF and mroute state.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Explain how PIM sparse mode builds shared and shortest-path trees",
+  "Configure a static RP with Anycast-RP and share sources",
+  "Describe IGMP, snooping and querier behavior",
+  "Use RPF and mroute output to find multicast faults",
+  "Relate underlay multicast to VXLAN BUM traffic"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Multicast in a data center carries market data feeds, storage and cluster heartbeats, software distribution, and, inside a VXLAN fabric, the BUM traffic (broadcast, unknown unicast and multicast) of every VNI. When multicast fails, the symptoms are odd: ARP works for some hosts and not for others, or a feed reaches one rack only. The CCIE Data Center lab expects you to build a working PIM design with a redundant rendezvous point and to read the state tables when it does not.\n\nThis lesson covers PIM sparse mode, Anycast-RP with MSDP, IGMP snooping and querier behavior, and the verification commands that matter. The routed underlay it depends on is in [OSPF, IS-IS, BGP and BFD](/learn/enterprise-datacenter-networking/ospf-is-is-bgp-and-bfd), and the overlay use is in [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+  },
+  {
+   "type": "text",
+   "id": "pim",
+   "markdown": "## PIM sparse mode in brief\n\nProtocol Independent Multicast (PIM) builds distribution trees using the unicast routing table for reverse path forwarding (RPF). In sparse mode, receivers must ask for traffic, so nothing floods.\n\n1. A receiver joins group G through IGMP. Its last-hop router sends a PIM `(*,G)` join toward the **rendezvous point (RP)**, building the shared tree.\n2. A source sends traffic. Its first-hop router encapsulates it in PIM Register messages and unicasts them to the RP.\n3. The RP forwards the traffic down the shared tree and sends an `(S,G)` join toward the source, so the source starts sending natively.\n4. The last-hop router sees the source address and switches to the shortest-path tree (SPT) with an `(S,G)` join. NX-OS switches immediately by default.\n\nEvery step relies on **RPF**: a multicast packet is accepted only if it arrives on the interface the unicast table would use to reach the source (or the RP, for shared-tree traffic). RPF failure is the single most common multicast fault. If `show ip mroute` shows an empty outgoing interface list or an incoming interface of \"Null\", check `show ip rpf <source>` first.\n\n### RP discovery choices\n\n| Method | Notes |\n|:--|:--|\n| Static RP | Simple and deterministic. Configure the same RP on every router. |\n| Auto-RP | Cisco proprietary; needs sparse-dense handling for its own groups. |\n| BSR | Standards-based and dynamic; candidate RPs advertise through the bootstrap router. |\n| Anycast-RP | Several routers share one RP address. Used with static RP for resilience. |\n\nStatic RP with Anycast-RP is the usual data center choice because it is predictable and converges as fast as unicast routing."
+  },
+  {
+   "type": "animation",
+   "id": "pim-anim",
+   "kind": "sequence",
+   "title": "Source registration and the shortest-path switchover",
+   "data": {
+    "actors": [
+     {
+      "id": "src",
+      "label": "Source",
+      "sub": "198.51.100.10",
+      "icon": "server"
+     },
+     {
+      "id": "fh",
+      "label": "FHR",
+      "sub": "first hop",
+      "icon": "switch"
+     },
+     {
+      "id": "rp",
+      "label": "RP",
+      "sub": "10.255.255.1",
+      "icon": "router"
+     },
+     {
+      "id": "lh",
+      "label": "LHR",
+      "sub": "last hop",
+      "icon": "switch"
+     },
+     {
+      "id": "rx",
+      "label": "Receiver",
+      "sub": "192.0.2.50",
+      "icon": "laptop"
+     }
+    ],
+    "steps": [
+     {
+      "from": "rx",
+      "to": "lh",
+      "label": "IGMP join",
+      "detail": "239.1.1.1",
+      "note": "The receiver reports interest in group 239.1.1.1."
+     },
+     {
+      "from": "lh",
+      "to": "rp",
+      "label": "(*,G) join",
+      "note": "The last-hop router builds the shared tree toward the RP.",
+      "tone": "secure"
+     },
+     {
+      "from": "src",
+      "to": "fh",
+      "label": "Multicast data",
+      "note": "The source starts sending to 239.1.1.1."
+     },
+     {
+      "from": "fh",
+      "to": "rp",
+      "label": "PIM Register",
+      "note": "The first hop unicasts the data to the RP inside a Register."
+     },
+     {
+      "from": "rp",
+      "to": "src",
+      "label": "(S,G) join",
+      "note": "The RP joins toward the source and the data now flows natively.",
+      "tone": "secure"
+     },
+     {
+      "from": "rp",
+      "to": "lh",
+      "label": "Data via shared tree",
+      "note": "The receiver gets traffic through the RP."
+     },
+     {
+      "from": "lh",
+      "to": "fh",
+      "label": "(S,G) join",
+      "note": "The last hop switches to the shortest-path tree.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "anycast",
+   "markdown": "## Anycast-RP with MSDP\n\nA single RP is a single point of failure. In **Anycast-RP**, two or more routers carry the *same* RP address on a loopback and advertise it in the IGP. Each source and receiver uses the topologically nearest RP, and a failure simply moves the traffic to the next nearest RP at IGP speed.\n\nThe catch is that a source registered with RP-A is unknown to RP-B, so a receiver joined at RP-B would not get the traffic. The RPs must share source information. There are two methods:\n\n- **MSDP (Multicast Source Discovery Protocol):** RPs form TCP peerings and exchange Source-Active (SA) messages. It works across domains and is the long-standing method.\n- **PIM Anycast-RP (RFC 4610):** the RPs list each other (`ip pim anycast-rp`) and forward Register messages directly. There is no MSDP peering to maintain and it is the usual choice inside one fabric.\n\nWhichever you pick, give each RP a unique loopback for its peering and a shared loopback for the RP address.\n\nBetween domains, such as a WAN to another data center, MSDP is the standard way to exchange sources, with SA filters to limit what leaks. Remember that the shared RP loopback must use the same address everywhere, but the router ID and peer addresses must differ."
+  },
+  {
+   "type": "code",
+   "id": "mc-cfg",
+   "language": "cisco",
+   "filename": "SPINE-1.cfg",
+   "caption": "Anycast-RP on two spines using PIM Anycast-RP (RFC 4610). SPINE-2 uses 10.255.0.2 as its own address.",
+   "code": "feature pim\n!\ninterface loopback0\n  ip address 10.255.0.1/32\n  ip router ospf UNDERLAY area 0.0.0.0\n  ip pim sparse-mode\n!\ninterface loopback100\n  description Anycast RP address\n  ip address 10.255.255.1/32\n  ip router ospf UNDERLAY area 0.0.0.0\n  ip pim sparse-mode\n!\nip pim rp-address 10.255.255.1 group-list 224.0.0.0/4\nip pim anycast-rp 10.255.255.1 10.255.0.1\nip pim anycast-rp 10.255.255.1 10.255.0.2\n!\ninterface Ethernet1/1\n  no switchport\n  ip address 10.1.1.0/31\n  ip router ospf UNDERLAY area 0.0.0.0\n  ip pim sparse-mode"
+  },
+  {
+   "type": "terminal",
+   "id": "mc-verify",
+   "title": "Verifying multicast state",
+   "prompt": "LEAF-1#",
+   "lines": [
+    {
+     "cmd": "show ip pim rp",
+     "output": "PIM RP Status Information for VRF \"default\"\nRP: 10.255.255.1, (0), uptime: 02:14:08   priority: 255,\n  RP-source: (local), group ranges:\n      224.0.0.0/4",
+     "comment": "The same RP address must appear on every router."
+    },
+    {
+     "cmd": "show ip mroute 239.1.1.1",
+     "output": "(*, 239.1.1.1/32), uptime: 00:03:11, igmp ip pim\n  Incoming interface: Ethernet1/49, RPF nbr: 10.1.1.0\n  Outgoing interface list: (count: 1)\n    Vlan10, uptime: 00:03:11, igmp\n\n(198.51.100.10/32, 239.1.1.1/32), uptime: 00:01:02, ip mrib pim\n  Incoming interface: Ethernet1/49, RPF nbr: 10.1.1.0\n  Outgoing interface list: (count: 1)\n    Vlan10, uptime: 00:01:02, mrib",
+     "comment": "A (*,G) and an (S,G) entry with a populated OIL mean the tree is built."
+    },
+    {
+     "cmd": "show ip igmp snooping groups vlan 10",
+     "output": "Vlan  Group Address      Ver  Type  Port list\n10    239.1.1.1          v2   D     Eth1/10",
+     "comment": "Snooping lets the switch send the group only to port Eth1/10."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "igmp",
+   "markdown": "## IGMP and snooping at Layer 2\n\nIGMP lets hosts join groups. IGMPv2 uses group-specific reports; IGMPv3 adds source filtering, which supports source-specific multicast (SSM) in the 232.0.0.0/8 range and removes the need for an RP for those groups.\n\nOn a switch without a multicast router in the VLAN, IGMP snooping needs a **querier**; otherwise, membership entries age out and traffic stops after about three minutes. Configure `ip igmp snooping querier 192.0.2.1` under the VLAN, or let the SVI with `ip pim sparse-mode` serve as the querier. In a vPC pair, both peers must run the same IGMP snooping configuration, and the state synchronizes across the peer link.\n\nUseful points:\n\n- Without snooping, a switch floods multicast to every port in the VLAN, which is the same as broadcast.\n- Multicast MAC addresses map the low 23 bits of the group address into 01:00:5e, so 32 groups share one MAC. Be careful with overlapping groups.\n- In VXLAN, BUM traffic uses either **ingress replication** (unicast copies to each remote VTEP) or **underlay multicast** (one group per VNI or shared). The multicast option scales better and needs everything in this lesson to work."
+  },
+  {
+   "type": "text",
+   "id": "tshoot",
+   "markdown": "## A troubleshooting sequence for the lab\n\nMulticast faults are easy to find if you follow the path of the first packet. Work from the receiver toward the source and stop at the first broken step.\n\n1. **Receiver side.** Confirm the host joined: `show ip igmp snooping groups` on the access switch and `show ip igmp groups` on the SVI. No entry means the host, the VLAN or the querier is at fault.\n2. **Last-hop router.** Look for the `(*,G)` entry. If it is missing, check that the SVI runs `ip pim sparse-mode` and that the router knows the RP with `show ip pim rp`.\n3. **Path to the RP.** Run `show ip rpf <rp-address>`. The RPF interface must be the one that faces the RP, and PIM must be enabled on it.\n4. **Source side.** On the first-hop router, `show ip mroute <group>` should show an `(S,G)` entry with a register flag. If the entry exists but the RP never sees it, check unicast reachability from the first hop to the RP address.\n5. **Anycast-RP.** If one RP works and the other does not, check the `ip pim anycast-rp` list on both and confirm each member address is reachable.\n\nIf you use MSDP between sites, add `show ip msdp peer` and `show ip msdp sa-cache`. A peer stuck in the Listen or Connect state points to reachability on the peering loopbacks, and an empty SA cache while sources are active points to a missing `ip msdp originator-id` or a filter that is too strict.\n\nFinally, protect the control plane. Multicast control packets are punted to the CPU, so verify that CoPP does not rate-limit PIM and IGMP so aggressively that joins are lost during a burst."
+  },
+  {
+   "type": "callout",
+   "id": "pitfall",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Enabling `ip pim sparse-mode` on some interfaces but not on the loopback used for the RP or on every transit link.\n- Configuring different RP addresses on different routers, which splits the trees.\n- Forgetting an IGMP querier, so traffic dies after roughly three minutes.\n- Troubleshooting with `show ip mroute` before checking unicast reachability and RPF to the source."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a Nexus 9000v lab you own with a working OSPF underlay:\n\n1. Enable `feature pim` and `ip pim sparse-mode` on every routed link and loopback.\n2. Configure an Anycast-RP address on two spines with `ip pim anycast-rp` and a static `ip pim rp-address` on all switches.\n3. Join group 239.1.1.1 from a test host and send traffic from another host (a simple UDP generator you control).\n4. Confirm `show ip pim rp`, `show ip mroute` and `show ip igmp snooping groups`.\n5. Shut the loopback on the first spine and confirm the group keeps working through the second."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "PIM sparse mode",
+     "definition": "Builds trees only where receivers have joined."
+    },
+    {
+     "term": "RP (rendezvous point)",
+     "definition": "The root of the shared tree where sources and receivers meet."
+    },
+    {
+     "term": "RPF",
+     "definition": "Reverse path forwarding: accept multicast only on the interface toward the source."
+    },
+    {
+     "term": "Anycast-RP",
+     "definition": "Several routers sharing one RP address for redundancy."
+    },
+    {
+     "term": "MSDP",
+     "definition": "Exchanges active source information between RPs."
+    },
+    {
+     "term": "IGMP snooping",
+     "definition": "A switch feature that limits multicast to ports with members."
+    },
+    {
+     "term": "Querier",
+     "definition": "The device that sends periodic IGMP queries in a VLAN."
+    },
+    {
+     "term": "SSM",
+     "definition": "Source-specific multicast, which needs no RP."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What is the most common cause of multicast failure in a routed fabric?",
+     "options": [
+      "RPF failure",
+      "Wrong VLAN name",
+      "Too many groups",
+      "Small MTU"
+     ],
+     "answer": 0,
+     "explanation": "Packets are dropped when they arrive on an interface that is not the unicast path to the source or RP."
+    },
+    {
+     "question": "How do the RPs in Anycast-RP learn about sources registered with the other RP? (Choose all that apply.)",
+     "options": [
+      "MSDP Source-Active messages",
+      "PIM Anycast-RP forwarding of Register messages",
+      "IGMP general queries",
+      "CDP"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "Either MSDP or RFC 4610 PIM Anycast-RP shares source information. IGMP and CDP do not."
+    },
+    {
+     "question": "Without an IGMP querier in a VLAN with snooping enabled, what happens?",
+     "options": [
+      "Membership entries age out and traffic stops",
+      "Traffic floods forever",
+      "PIM fails over",
+      "Nothing changes"
+     ],
+     "answer": 0,
+     "explanation": "Hosts only reply to queries; with none, snooping state expires."
+    },
+    {
+     "question": "Which command defines the PIM Anycast-RP members on NX-OS?",
+     "options": [
+      "ip pim anycast-rp",
+      "ip msdp peer",
+      "ip igmp version 3",
+      "ip pim ssm"
+     ],
+     "answer": 0,
+     "explanation": "`ip pim anycast-rp <rp> <member>` lists each set member."
+    },
+    {
+     "question": "Which range is the default SSM range?",
+     "options": [
+      "232.0.0.0/8",
+      "224.0.0.0/24",
+      "239.0.0.0/8",
+      "233.0.0.0/8"
+     ],
+     "answer": 0,
+     "explanation": "SSM uses 232.0.0.0/8 and needs IGMPv3 with no RP."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nPIM sparse mode builds shared and shortest-path trees using RPF against the unicast table. Use a static RP with Anycast-RP for resilience, and share sources with PIM Anycast-RP or MSDP. IGMP snooping with a querier keeps multicast off ports without members. When multicast fails, verify unicast reachability, RPF, the RP address and the mroute table, in that order. To see how this supports overlay BUM traffic, continue to [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+  }
+ ],
+ "ar": {
+  "title": "البث المتعدد: PIM وAnycast-RP وMSDP وIGMP",
+  "summary": "ابنِ تصميم PIM بالوضع المتناثر مع Anycast-RP، وافهم MSDP وIGMP snooping، واستكشف أعطال RPF وجدول mroute.",
+  "objectives": [
+   "شرح كيفية بناء PIM بالوضع المتناثر للأشجار المشتركة وأشجار أقصر مسار",
+   "إعداد RP ثابتة مع Anycast-RP ومشاركة المصادر",
+   "وصف IGMP وsnooping وسلوك المستعلم",
+   "استخدام RPF ومخرجات mroute لإيجاد أعطال البث المتعدد",
+   "ربط البث المتعدد في الشبكة السفلية بحركة BUM في VXLAN"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "ينقل البث المتعدد في مركز البيانات تدفقات بيانات الأسواق، ونبضات التخزين والعناقيد، وتوزيع البرمجيات، وداخل شبكة VXLAN حركةَ BUM (البث وأحادي الإرسال المجهول والبث المتعدد) لكل VNI. وعندما يفشل البث المتعدد تكون الأعراض غريبة: يعمل ARP لبعض المضيفات دون بعض، أو يصل التدفق إلى رف واحد فقط. ويتوقع مختبر CCIE Data Center أن تبني تصميم PIM يعمل مع نقطة التقاء (RP) احتياطية وأن تقرأ جداول الحالة حين لا يعمل.\n\nيغطي هذا الدرس PIM بالوضع المتناثر (sparse mode) وAnycast-RP مع MSDP وسلوك IGMP snooping والمستعلم (querier) وأوامر التحقق المهمة. أما الشبكة السفلية الموجّهة التي يعتمد عليها فهي في [OSPF وIS-IS وBGP وBFD](/learn/enterprise-datacenter-networking/ospf-is-is-bgp-and-bfd)، وأما استخدامه في الشبكة العلوية ففي [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+   },
+   {
+    "type": "text",
+    "id": "pim",
+    "markdown": "## PIM بالوضع المتناثر باختصار\n\nيبني بروتوكول PIM (Protocol Independent Multicast) أشجار التوزيع بالاستناد إلى جدول التوجيه أحادي الإرسال من أجل التمرير بالمسار العكسي (RPF). وفي الوضع المتناثر يجب على المستقبلات أن تطلب الحركة، فلا يحدث فيضان.\n\n1. ينضم مستقبل إلى المجموعة G عبر IGMP. فيرسل الموجّه الأخير الانضمام `(*,G)` من PIM نحو **نقطة الالتقاء (RP)** فتُبنى الشجرة المشتركة.\n2. يرسل مصدر حركته. فيغلّفها موجّهه الأول في رسائل PIM Register ويرسلها أحادية الإرسال إلى RP.\n3. تمرّر RP الحركة عبر الشجرة المشتركة وترسل انضمام `(S,G)` نحو المصدر فيبدأ المصدر الإرسال أصيلاً.\n4. يرى الموجّه الأخير عنوان المصدر فينتقل إلى شجرة أقصر مسار (SPT) بانضمام `(S,G)`. وينتقل NX-OS فوراً افتراضياً.\n\nوتعتمد كل خطوة على **RPF**: لا تُقبل حزمة البث المتعدد إلا إذا وصلت على الواجهة التي يستخدمها جدول أحادي الإرسال للوصول إلى المصدر (أو إلى RP لحركة الشجرة المشتركة). وفشل RPF هو العطل الأكثر شيوعاً في البث المتعدد. فإذا أظهر `show ip mroute` قائمة واجهات خارجة فارغة أو واجهة واردة «Null» فافحص `show ip rpf <source>` أولاً.\n\n### خيارات اكتشاف RP\n\n| الطريقة | ملاحظات |\n|:--|:--|\n| RP ثابتة | بسيطة وحتمية. اضبط RP نفسها على كل موجّه. |\n| Auto-RP | خاصة بـ Cisco؛ تحتاج معالجة sparse-dense لمجموعاتها. |\n| BSR | قياسية وديناميكية؛ تعلن RP المرشحة عبر موجّه الإقلاع. |\n| Anycast-RP | عدة موجّهات تتشارك عنوان RP واحداً. تُستخدم مع RP ثابتة للمرونة. |\n\nوالخيار المعتاد في مراكز البيانات هو RP ثابتة مع Anycast-RP لأنه متوقع ويتقارب بسرعة التوجيه أحادي الإرسال."
+   },
+   {
+    "type": "animation",
+    "id": "pim-anim",
+    "kind": "sequence",
+    "title": "تسجيل المصدر والانتقال إلى أقصر مسار",
+    "data": {
+     "actors": [
+      {
+       "id": "src",
+       "label": "Source",
+       "sub": "198.51.100.10",
+       "icon": "server"
+      },
+      {
+       "id": "fh",
+       "label": "FHR",
+       "sub": "القفزة الأولى",
+       "icon": "switch"
+      },
+      {
+       "id": "rp",
+       "label": "RP",
+       "sub": "10.255.255.1",
+       "icon": "router"
+      },
+      {
+       "id": "lh",
+       "label": "LHR",
+       "sub": "القفزة الأخيرة",
+       "icon": "switch"
+      },
+      {
+       "id": "rx",
+       "label": "Receiver",
+       "sub": "192.0.2.50",
+       "icon": "laptop"
+      }
+     ],
+     "steps": [
+      {
+       "from": "rx",
+       "to": "lh",
+       "label": "IGMP join",
+       "detail": "239.1.1.1",
+       "note": "يبلغ المستقبل عن اهتمامه بالمجموعة 239.1.1.1."
+      },
+      {
+       "from": "lh",
+       "to": "rp",
+       "label": "(*,G) join",
+       "note": "يبني الموجّه الأخير الشجرة المشتركة نحو RP.",
+       "tone": "secure"
+      },
+      {
+       "from": "src",
+       "to": "fh",
+       "label": "بيانات بث متعدد",
+       "note": "يبدأ المصدر الإرسال إلى 239.1.1.1."
+      },
+      {
+       "from": "fh",
+       "to": "rp",
+       "label": "PIM Register",
+       "note": "يرسل الموجّه الأول البيانات أحادية الإرسال إلى RP داخل Register."
+      },
+      {
+       "from": "rp",
+       "to": "src",
+       "label": "(S,G) join",
+       "note": "تنضم RP نحو المصدر وتتدفق البيانات أصيلة.",
+       "tone": "secure"
+      },
+      {
+       "from": "rp",
+       "to": "lh",
+       "label": "بيانات عبر الشجرة المشتركة",
+       "note": "يستلم المستقبل الحركة عبر RP."
+      },
+      {
+       "from": "lh",
+       "to": "fh",
+       "label": "(S,G) join",
+       "note": "ينتقل الموجّه الأخير إلى شجرة أقصر مسار.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "anycast",
+    "markdown": "## Anycast-RP مع MSDP\n\nRP وحيدة نقطة فشل وحيدة. وفي **Anycast-RP** يحمل موجّهان أو أكثر عنوان RP *نفسه* على loopback ويعلنانه في IGP. ويستخدم كل مصدر ومستقبل أقرب RP طوبولوجياً، وعند الفشل تنتقل الحركة إلى أقرب RP تالية بسرعة IGP.\n\nوالمشكلة أن مصدراً سُجّل عند RP-A غير معروف لـ RP-B، فلا يستلم مستقبل انضم عند RP-B الحركة. لذا يجب أن تتشارك الـ RP معلومات المصادر، وهناك طريقتان:\n\n- **MSDP (بروتوكول اكتشاف مصادر البث المتعدد):** تُكوّن الـ RP علاقات TCP وتتبادل رسائل Source-Active (SA). ويعمل عبر النطاقات وهو الطريقة القديمة المعتمدة.\n- **PIM Anycast-RP (RFC 4610):** تسرد الـ RP بعضها بعضاً (`ip pim anycast-rp`) وتمرّر رسائل Register مباشرة. ولا توجد علاقات MSDP لصيانتها، وهو الخيار المعتاد داخل شبكة واحدة.\n\nوأياً كان اختيارك، أعطِ كل RP عنوان loopback فريداً لعلاقتها وعنوان loopback مشتركاً لعنوان RP.\n\nوبين النطاقات، كشبكة واسعة إلى مركز بيانات آخر، يبقى MSDP الطريقة القياسية لتبادل المصادر، مع مرشحات SA لتحديد ما يتسرب. وتذكّر أن loopback الـ RP المشترك يجب أن يحمل العنوان نفسه في كل مكان، أما معرّف الموجّه وعناوين النظراء فيجب أن تختلف."
+   },
+   {
+    "type": "code",
+    "id": "mc-cfg",
+    "language": "cisco",
+    "filename": "SPINE-1.cfg",
+    "caption": "Anycast-RP على spine باستخدام PIM Anycast-RP (RFC 4610). يستخدم SPINE-2 العنوان 10.255.0.2 لنفسه.",
+    "code": "feature pim\n!\ninterface loopback0\n  ip address 10.255.0.1/32\n  ip router ospf UNDERLAY area 0.0.0.0\n  ip pim sparse-mode\n!\ninterface loopback100\n  description Anycast RP address\n  ip address 10.255.255.1/32\n  ip router ospf UNDERLAY area 0.0.0.0\n  ip pim sparse-mode\n!\nip pim rp-address 10.255.255.1 group-list 224.0.0.0/4\nip pim anycast-rp 10.255.255.1 10.255.0.1\nip pim anycast-rp 10.255.255.1 10.255.0.2\n!\ninterface Ethernet1/1\n  no switchport\n  ip address 10.1.1.0/31\n  ip router ospf UNDERLAY area 0.0.0.0\n  ip pim sparse-mode"
+   },
+   {
+    "type": "terminal",
+    "id": "mc-verify",
+    "title": "التحقق من حالة البث المتعدد",
+    "prompt": "LEAF-1#",
+    "lines": [
+     {
+      "cmd": "show ip pim rp",
+      "output": "PIM RP Status Information for VRF \"default\"\nRP: 10.255.255.1, (0), uptime: 02:14:08   priority: 255,\n  RP-source: (local), group ranges:\n      224.0.0.0/4",
+      "comment": "يجب أن يظهر عنوان RP نفسه على كل موجّه."
+     },
+     {
+      "cmd": "show ip mroute 239.1.1.1",
+      "output": "(*, 239.1.1.1/32), uptime: 00:03:11, igmp ip pim\n  Incoming interface: Ethernet1/49, RPF nbr: 10.1.1.0\n  Outgoing interface list: (count: 1)\n    Vlan10, uptime: 00:03:11, igmp\n\n(198.51.100.10/32, 239.1.1.1/32), uptime: 00:01:02, ip mrib pim\n  Incoming interface: Ethernet1/49, RPF nbr: 10.1.1.0\n  Outgoing interface list: (count: 1)\n    Vlan10, uptime: 00:01:02, mrib",
+      "comment": "وجود مدخل (*,G) ومدخل (S,G) مع OIL غير فارغة يعني أن الشجرة بُنيت."
+     },
+     {
+      "cmd": "show ip igmp snooping groups vlan 10",
+      "output": "Vlan  Group Address      Ver  Type  Port list\n10    239.1.1.1          v2   D     Eth1/10",
+      "comment": "يتيح snooping للمبدّل إرسال المجموعة إلى المنفذ Eth1/10 فقط."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "igmp",
+    "markdown": "## IGMP وsnooping في الطبقة الثانية\n\nيتيح IGMP للمضيفات الانضمام إلى المجموعات. يستخدم IGMPv2 تقارير خاصة بالمجموعة؛ ويضيف IGMPv3 ترشيح المصدر، وهو ما يدعم البث المتعدد الخاص بالمصدر (SSM) في النطاق 232.0.0.0/8 ويزيل الحاجة إلى RP لتلك المجموعات.\n\nوعلى مبدّل لا يوجد فيه موجّه بث متعدد في الـ VLAN يحتاج IGMP snooping إلى **مستعلم (querier)**؛ وإلا انتهت مدخلات العضوية وتوقفت الحركة بعد نحو ثلاث دقائق. اضبط `ip igmp snooping querier 192.0.2.1` تحت الـ VLAN، أو دع واجهة SVI المفعّل عليها `ip pim sparse-mode` تعمل مستعلماً. وفي زوج vPC يجب أن يشغّل النظيران إعداد IGMP snooping نفسه وتتزامن الحالة عبر وصلة النظير.\n\nنقاط مفيدة:\n\n- من دون snooping يغمر المبدّل البث المتعدد إلى كل منفذ في الـ VLAN، وهو كالبث العام.\n- تُحوَّل عناوين MAC للبث المتعدد بنقل أدنى 23 بتاً من عنوان المجموعة إلى 01:00:5e، فتتشارك 32 مجموعة عنوان MAC واحداً. احذر من تداخل المجموعات.\n- في VXLAN تستخدم حركة BUM إما **النسخ عند المدخل (ingress replication)** أي نسخاً أحادية الإرسال إلى كل VTEP بعيد، وإما **البث المتعدد في الشبكة السفلية** أي مجموعة لكل VNI أو مجموعة مشتركة. ويتوسع خيار البث المتعدد أفضل ويحتاج إلى كل ما في هذا الدرس."
+   },
+   {
+    "type": "text",
+    "id": "tshoot",
+    "markdown": "## تسلسل استكشاف الأعطال في المختبر\n\nيسهل إيجاد أعطال البث المتعدد إذا اتبعت مسار أول حزمة. اعمل من المستقبل نحو المصدر وتوقف عند أول خطوة معطوبة.\n\n1. **جهة المستقبل.** تأكد من أن المضيف انضم: `show ip igmp snooping groups` على مبدّل الوصول و`show ip igmp groups` على SVI. وغياب المدخل يعني أن العطل في المضيف أو الـ VLAN أو المستعلم.\n2. **الموجّه الأخير.** ابحث عن المدخل `(*,G)`. فإن غاب فتأكد أن SVI يشغّل `ip pim sparse-mode` وأن الموجّه يعرف RP بـ `show ip pim rp`.\n3. **المسار إلى RP.** نفّذ `show ip rpf <rp-address>`. يجب أن تكون واجهة RPF هي المواجهة لـ RP، وأن يكون PIM مفعّلاً عليها.\n4. **جهة المصدر.** على الموجّه الأول يجب أن يُظهر `show ip mroute <group>` مدخل `(S,G)` بعلم register. فإن وُجد المدخل ولم تره RP فافحص الوصول أحادي الإرسال من القفزة الأولى إلى عنوان RP.\n5. **Anycast-RP.** إذا عملت إحدى RP ولم تعمل الأخرى فافحص قائمة `ip pim anycast-rp` على كلتيهما وتأكد من إمكان الوصول إلى عنوان كل عضو.\n\nوإذا استخدمت MSDP بين المواقع فأضف `show ip msdp peer` و`show ip msdp sa-cache`. فعلاقة عالقة في حالة Listen أو Connect تشير إلى مشكلة وصول على loopback العلاقة، وذاكرة SA فارغة مع مصادر نشطة تشير إلى غياب `ip msdp originator-id` أو مرشح صارم أكثر من اللازم.\n\nوأخيراً احمِ مستوى التحكم. تُرسَل حزم تحكم البث المتعدد إلى المعالج، فتحقق من أن CoPP لا يحدّ PIM وIGMP بشدة تضيع معها الانضمامات أثناء الذروة."
+   },
+   {
+    "type": "callout",
+    "id": "pitfall",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- تفعيل `ip pim sparse-mode` على بعض الواجهات دون loopback المستخدمة لـ RP أو دون كل وصلة عبور.\n- ضبط عناوين RP مختلفة على موجّهات مختلفة، فتنقسم الأشجار.\n- نسيان مستعلم IGMP، فتموت الحركة بعد نحو ثلاث دقائق.\n- استكشاف العطل بـ `show ip mroute` قبل فحص الوصول أحادي الإرسال وRPF إلى المصدر."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر Nexus 9000v تملكه مع شبكة سفلية OSPF تعمل:\n\n1. فعّل `feature pim` و`ip pim sparse-mode` على كل وصلة موجّهة وكل loopback.\n2. اضبط عنوان Anycast-RP على spine بأمر `ip pim anycast-rp` وأمر ثابت `ip pim rp-address` على كل المبدّلات.\n3. انضم إلى المجموعة 239.1.1.1 من مضيف اختبار وأرسل حركة من مضيف آخر (مولّد UDP بسيط تتحكم فيه).\n4. تأكد من `show ip pim rp` و`show ip mroute` و`show ip igmp snooping groups`.\n5. أغلق loopback على أول spine وتأكد أن المجموعة تواصل العمل عبر الثاني."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "PIM بالوضع المتناثر",
+      "definition": "يبني الأشجار حيث انضمت المستقبلات فقط."
+     },
+     {
+      "term": "نقطة الالتقاء (RP)",
+      "definition": "جذر الشجرة المشتركة حيث تلتقي المصادر والمستقبلات."
+     },
+     {
+      "term": "RPF",
+      "definition": "التمرير بالمسار العكسي: لا تُقبل حزمة بث متعدد إلا على الواجهة المتجهة إلى المصدر."
+     },
+     {
+      "term": "Anycast-RP",
+      "definition": "عدة موجّهات تتشارك عنوان RP واحداً للمرونة."
+     },
+     {
+      "term": "MSDP",
+      "definition": "يتبادل معلومات المصادر النشطة بين نقاط الالتقاء."
+     },
+     {
+      "term": "IGMP snooping",
+      "definition": "ميزة في المبدّل تحصر البث المتعدد في المنافذ التي فيها أعضاء."
+     },
+     {
+      "term": "المستعلم",
+      "definition": "الجهاز الذي يرسل استعلامات IGMP دورية في VLAN."
+     },
+     {
+      "term": "SSM",
+      "definition": "البث المتعدد الخاص بالمصدر، ولا يحتاج إلى RP."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما السبب الأكثر شيوعاً لفشل البث المتعدد في شبكة موجّهة؟",
+      "options": [
+       "فشل RPF",
+       "اسم VLAN خاطئ",
+       "عدد مجموعات كبير",
+       "MTU صغير"
+      ],
+      "answer": 0,
+      "explanation": "تُسقَط الحزم حين تصل على واجهة ليست المسار أحادي الإرسال إلى المصدر أو RP."
+     },
+     {
+      "question": "كيف تعرف الـ RP في Anycast-RP المصادر المسجّلة عند الـ RP الأخرى؟ (اختر كل ما ينطبق)",
+      "options": [
+       "رسائل MSDP Source-Active",
+       "تمرير PIM Anycast-RP لرسائل Register",
+       "استعلامات IGMP العامة",
+       "CDP"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "يشارك MSDP أو PIM Anycast-RP (RFC 4610) معلومات المصدر. ولا يفعل ذلك IGMP أو CDP."
+     },
+     {
+      "question": "ماذا يحدث من دون مستعلم IGMP في VLAN مفعّل فيها snooping؟",
+      "options": [
+       "تنتهي مدخلات العضوية وتتوقف الحركة",
+       "تُغمر الحركة إلى الأبد",
+       "ينتقل PIM إلى بديل",
+       "لا يتغير شيء"
+      ],
+      "answer": 0,
+      "explanation": "لا ترد المضيفات إلا على الاستعلامات؛ ومن دونها تنتهي حالة snooping."
+     },
+     {
+      "question": "أي أمر يحدد أعضاء PIM Anycast-RP على NX-OS؟",
+      "options": [
+       "ip pim anycast-rp",
+       "ip msdp peer",
+       "ip igmp version 3",
+       "ip pim ssm"
+      ],
+      "answer": 0,
+      "explanation": "يسرد `ip pim anycast-rp <rp> <member>` كل عضو في المجموعة."
+     },
+     {
+      "question": "ما النطاق الافتراضي لـ SSM؟",
+      "options": [
+       "232.0.0.0/8",
+       "224.0.0.0/24",
+       "239.0.0.0/8",
+       "233.0.0.0/8"
+      ],
+      "answer": 0,
+      "explanation": "يستخدم SSM النطاق 232.0.0.0/8 ويحتاج IGMPv3 من دون RP."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nيبني PIM بالوضع المتناثر أشجاراً مشتركة وأشجار أقصر مسار باستخدام RPF مقابل جدول التوجيه أحادي الإرسال. استخدم RP ثابتة مع Anycast-RP للمرونة، وشارك المصادر بـ PIM Anycast-RP أو MSDP. ويُبقي IGMP snooping مع المستعلم البث المتعدد بعيداً عن المنافذ التي لا أعضاء فيها. وعند فشل البث المتعدد تحقق من الوصول أحادي الإرسال ثم RPF ثم عنوان RP ثم جدول mroute بهذا الترتيب. ولمعرفة كيف يدعم هذا حركة BUM في الشبكة العلوية تابع إلى [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+   }
+  ]
+ }
+}

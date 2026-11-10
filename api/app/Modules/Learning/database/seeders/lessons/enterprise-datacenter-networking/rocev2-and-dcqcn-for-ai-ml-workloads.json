@@ -1,0 +1,546 @@
+{
+ "slug": "rocev2-and-dcqcn-for-ai-ml-workloads",
+ "title": "RoCEv2 and DCQCN for AI / ML Workloads",
+ "summary": "Build a lossless Ethernet class for RDMA traffic using PFC, ECN and DCQCN, and verify it on Nexus 9000 switches.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Explain why RoCEv2 needs a lossless or near-lossless fabric",
+  "Describe the CP, NP and RP roles in DCQCN",
+  "Configure classification, no-drop network-qos and ECN queuing on NX-OS",
+  "Verify PFC and ECN counters and troubleshoot drops"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Distributed AI training is a communication problem. Hundreds of GPUs exchange gradients after every step, and a single slow or lost packet stalls the whole job. Ordinary TCP over a best-effort fabric wastes CPU cycles and adds latency, so AI clusters use RDMA over Converged Ethernet version 2 (RoCEv2), which lets one server write directly into the memory of another with almost no CPU involvement.\n\nRoCEv2 has no built-in recovery that tolerates loss well, so the network must behave as if it were lossless. The CCIE Data Center lab expects you to build that behavior on Nexus 9000 switches with Priority Flow Control (PFC) and Explicit Congestion Notification (ECN), and to explain how the sender-side algorithm DCQCN ties them together. This lesson builds on [QoS and CoPP in the Data Center](/learn/enterprise-datacenter-networking/qos-and-copp-in-the-data-center) and runs over a routed fabric such as the one in [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+  },
+  {
+   "type": "text",
+   "id": "why",
+   "markdown": "## Why RoCEv2 needs a special network\n\nRoCEv2 carries InfiniBand transport packets inside UDP datagrams with destination port 4791. Because it is routable IP, it works across a leaf-spine fabric, unlike RoCEv1, which was limited to one Layer 2 domain. The NIC implements reliable delivery in hardware, but its default recovery is go-back-N: after one drop, the sender retransmits everything from the lost packet onward. A loss rate of even 0.01 percent can cut throughput sharply.\n\nTwo failure modes matter:\n\n- **Drops from buffer overflow.** Many workers send to one receiver at once (incast), and the egress queue fills.\n- **Uneven load balancing.** RDMA flows are few and large. ECMP hashing on the five-tuple can place several elephant flows on the same uplink while others sit idle.\n\nThe design answer has three layers. Mark RoCE traffic with a DSCP value and map it to its own queue. Use ECN so switches ask senders to slow down before queues overflow. Use PFC as a safety net that pauses the upstream port only when ECN was too slow. Treat PFC as the last resort, not the main tool."
+  },
+  {
+   "type": "text",
+   "id": "pfcecn",
+   "markdown": "## PFC and ECN\n\n**Priority Flow Control (IEEE 802.1Qbb)** extends 802.3x pause to one of the eight CoS priorities. When the receive buffer for priority 3 crosses its XOFF threshold, the switch sends a PFC pause frame for priority 3 only. Other classes keep flowing. The upstream port stops sending that class until the buffer drains below XON or the pause quanta expire. The space reserved to absorb packets still in flight after XOFF is called headroom. It grows with cable length and link speed, so a wrong cable-length assumption causes drops even with PFC on.\n\n**ECN** is an end-to-end signal in the two low bits of the IP ToS byte. A sender sets ECT, and a congested switch rewrites it to CE (congestion experienced) instead of dropping. On Nexus switches you enable it by adding the `ecn` keyword to a WRED profile (`random-detect`) in the egress queuing policy. Marking starts at the minimum threshold and rises to the maximum threshold, where every packet is marked.\n\nSet the ECN minimum threshold well below the PFC XOFF threshold. If PFC fires first, the fabric pauses without giving DCQCN a chance, and you risk head-of-line blocking, PFC storms and even deadlock in loops of pausing switches. A PFC watchdog detects a queue stuck in a paused state and takes a recovery action."
+  },
+  {
+   "type": "animation",
+   "id": "dcqcn-anim",
+   "kind": "sequence",
+   "title": "DCQCN: from congestion to rate recovery",
+   "data": {
+    "actors": [
+     {
+      "id": "tx",
+      "label": "Sender NIC",
+      "sub": "Reaction point",
+      "icon": "server"
+     },
+     {
+      "id": "sw",
+      "label": "Leaf switch",
+      "sub": "Congestion point",
+      "icon": "switch"
+     },
+     {
+      "id": "rx",
+      "label": "Receiver NIC",
+      "sub": "Notification point",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "tx",
+      "to": "sw",
+      "label": "RoCEv2 data",
+      "detail": "DSCP 26, ECT(0)",
+      "note": "The sender transmits at line rate in the no-drop class."
+     },
+     {
+      "from": "sw",
+      "to": "rx",
+      "label": "Marked CE",
+      "detail": "queue above min threshold",
+      "note": "The egress queue exceeds the WRED minimum, so the switch marks packets CE instead of dropping.",
+      "tone": "warning"
+     },
+     {
+      "from": "rx",
+      "to": "tx",
+      "label": "CNP",
+      "detail": "DSCP 48, strict priority",
+      "note": "The receiver sees CE and returns a Congestion Notification Packet in a separate high-priority class."
+     },
+     {
+      "from": "tx",
+      "to": "tx",
+      "label": "Cut rate",
+      "detail": "alpha rises",
+      "note": "The reaction point multiplies its rate down, scaled by its congestion estimate alpha.",
+      "tone": "danger"
+     },
+     {
+      "from": "sw",
+      "to": "tx",
+      "label": "Queue drains",
+      "detail": "no PFC needed",
+      "note": "Because ECN acted early, the queue never reached the PFC XOFF threshold.",
+      "tone": "success"
+     },
+     {
+      "from": "tx",
+      "to": "tx",
+      "label": "Rate recovery",
+      "detail": "fast, additive, hyper increase",
+      "note": "With no CNPs for a timer period, the sender raises its rate in stages back toward line rate.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "dcqcn",
+   "markdown": "## How DCQCN works\n\nData Center Quantized Congestion Notification (DCQCN) combines ECN marking in the switch with rate control in the NIC. It has three roles:\n\n- **Congestion point (CP):** the switch. It marks packets with CE using WRED and ECN.\n- **Notification point (NP):** the receiving NIC. It sees CE and sends a CNP back to the sender, at most once per time window per flow.\n- **Reaction point (RP):** the sending NIC. On each CNP it cuts its rate and updates alpha, a running estimate of congestion. With no CNPs it recovers through fast recovery, additive increase and hyper increase.\n\nThe CNP must not queue behind the congested data. Give it its own class, typically DSCP 48, in a strict-priority queue. The NIC parameters (timers, rate-reduce factor, CNP interval) are set in the host driver, so the network team and the server team must agree on one profile.\n\n### Fabric design points\n\n| Topic | Recommendation |\n|:--|:--|\n| Queue mapping | RoCE on qos-group 3, CNP on qos-group 6, everything else default |\n| MTU | 9216 on every fabric link; RoCE payloads are 1024 to 4096 bytes |\n| Load balancing | Include UDP source port in the hash; consider dynamic load balancing or flowlet switching |\n| Buffers | Tune the ECN min and max so marking starts early and reaches 100 percent before XOFF |\n| Safety | Enable the PFC watchdog on all access and fabric ports |"
+  },
+  {
+   "type": "code",
+   "id": "roce-cfg",
+   "language": "cisco",
+   "filename": "LEAF-1.cfg",
+   "caption": "Lossless RoCEv2 class on a Nexus 9300-FX leaf: classification, no-drop network-qos, ECN queuing and port settings.",
+   "code": "class-map type qos match-all ROCE\n  match dscp 26\nclass-map type qos match-all CNP\n  match dscp 48\n!\npolicy-map type qos QOS-IN\n  class ROCE\n    set qos-group 3\n  class CNP\n    set qos-group 6\n!\npolicy-map type network-qos NQ-ROCE\n  class type network-qos c-8q-nq3\n    mtu 9216\n    pause pfc-cos 3\n  class type network-qos c-8q-nq-default\n    mtu 9216\n!\npolicy-map type queuing QOS-OUT\n  class type queuing c-out-8q-q6\n    priority level 1\n  class type queuing c-out-8q-q3\n    bandwidth remaining percent 60\n    random-detect minimum-threshold 500 kbytes maximum-threshold 1500 kbytes drop-probability 100 weight 0 ecn\n  class type queuing c-out-8q-q-default\n    bandwidth remaining percent 40\n!\nsystem qos\n  service-policy type network-qos NQ-ROCE\n  service-policy type queuing output QOS-OUT\n!\ninterface Ethernet1/1\n  description GPU-SERVER-01\n  priority-flow-control mode on\n  priority-flow-control watch-dog\n  service-policy type qos input QOS-IN\n  no shutdown"
+  },
+  {
+   "type": "terminal",
+   "id": "roce-verify",
+   "title": "Verifying PFC and ECN counters",
+   "prompt": "LEAF-1#",
+   "lines": [
+    {
+     "cmd": "show interface ethernet 1/1 priority-flow-control",
+     "output": "============================================================\nPort               Mode Oper(VL bmap)  RxPPP        TxPPP\n============================================================\nEthernet1/1        On   On (8)         0            1184",
+     "comment": "Mode On and Oper On with VL bitmap 8 means priority 3 is lossless. TxPPP counts pause frames this switch sent to the server."
+    },
+    {
+     "cmd": "show queuing interface ethernet 1/1",
+     "output": "slot  1\n=======\nEgress Queuing for Ethernet1/1 [System]\nQ Group  Bandwidth%  PrioLevel  Shape\n   6     -           1          -\n   3     60          -          -\n   0     40          -          -\nECN Statistics:\n  Qos-group 3  ECN marked packets: 482910\n  Qos-group 3  WRED drops: 0",
+     "comment": "Marked packets with zero WRED drops means ECN is doing the work before drops occur."
+    },
+    {
+     "cmd": "show interface ethernet 1/1 counters errors | include Discard",
+     "output": "Eth1/1   Discard: 0   Out-Discard: 0",
+     "comment": "Zero discards in the RoCE class confirms the no-drop behavior."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "trouble",
+   "markdown": "## Troubleshooting workflow\n\nWork from the application down:\n\n1. **Symptom.** Job throughput collapses or NCCL logs show retries. Check the NIC counters first (out-of-sequence, CNP sent and received).\n2. **Marking.** Confirm the NIC marks DSCP 26 and the switch classifies it into qos-group 3. A mismatch of DSCP versus CoS trust is the most common cause.\n3. **Queue state.** Compare ECN marks, WRED drops and PFC pause counts. Many pauses and few ECN marks mean the ECN thresholds are too high.\n4. **Headroom and MTU.** Drops on a PFC class despite pauses point to wrong headroom or an MTU mismatch on one link.\n5. **Storms.** A port that keeps receiving pauses for minutes is a candidate for the watchdog. Find the slow or faulty NIC, not the switch.\n\nAlso verify symmetric configuration. One leaf missing `pause pfc-cos 3` silently converts a lossless path into a lossy one, and the failure appears only under load."
+  },
+  {
+   "type": "callout",
+   "id": "pitfall",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Enabling PFC on all eight priorities. One stuck class then pauses unrelated traffic.\n- Setting ECN thresholds above the PFC XOFF level, so PFC fires first and DCQCN never helps.\n- Forgetting the CNP class, so notifications queue behind congested data and reaction is late.\n- Using the default MTU on a single link, which fragments or drops RoCE packets.\n- Treating RoCE as a one-time configuration: firmware, NIC profile and switch thresholds must be validated together."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a Nexus 9000v or hardware lab you own, build a two-leaf, one-spine fabric.\n\n1. Apply the classification, network-qos and queuing policies from this lesson on both leaves.\n2. Enable `priority-flow-control mode on` on the host-facing and uplink ports.\n3. Generate congestion with `iperf3` from two hosts to one receiver, using DSCP 26.\n4. Run `show queuing interface` and `show interface priority-flow-control` and record ECN marks and pause counts.\n5. Lower the ECN maximum threshold and repeat. Describe how the ratio of ECN marks to pauses changes."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "RoCEv2",
+     "definition": "RDMA over Converged Ethernet v2: RDMA carried in routable UDP port 4791."
+    },
+    {
+     "term": "PFC",
+     "definition": "Priority Flow Control: per-priority pause that makes one class lossless."
+    },
+    {
+     "term": "ECN",
+     "definition": "Explicit Congestion Notification: CE marking in the IP header instead of dropping."
+    },
+    {
+     "term": "DCQCN",
+     "definition": "The congestion control that reduces NIC send rate on receiving CNPs."
+    },
+    {
+     "term": "CNP",
+     "definition": "Congestion Notification Packet sent by the receiver NIC to the sender."
+    },
+    {
+     "term": "Headroom",
+     "definition": "Buffer reserved to absorb in-flight packets after a pause is sent."
+    },
+    {
+     "term": "Incast",
+     "definition": "Many senders targeting one receiver at the same time."
+    },
+    {
+     "term": "PFC watchdog",
+     "definition": "Feature that detects a stuck paused queue and recovers it."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which UDP destination port identifies RoCEv2?",
+     "options": [
+      "4789",
+      "4791",
+      "3260",
+      "5001"
+     ],
+     "answer": 1,
+     "explanation": "RoCEv2 uses UDP 4791. Port 4789 is VXLAN."
+    },
+    {
+     "question": "Which statements about the roles in DCQCN are true? (Choose all that apply.)",
+     "options": [
+      "The switch marks packets with CE",
+      "The receiver NIC sends the CNP",
+      "The sending NIC reduces its rate",
+      "The switch lowers the sender rate directly"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The switch only marks. Rate control lives in the sender NIC, triggered by CNPs from the receiver."
+    },
+    {
+     "question": "Where should the ECN minimum threshold sit relative to PFC XOFF?",
+     "options": [
+      "Well below it",
+      "Equal to it",
+      "Above it",
+      "Unrelated"
+     ],
+     "answer": 0,
+     "explanation": "ECN must act first so DCQCN slows senders before PFC pauses the link."
+    },
+    {
+     "question": "Which are common causes of drops in a PFC-enabled RoCE class? (Choose all that apply.)",
+     "options": [
+      "Insufficient headroom",
+      "MTU mismatch on one link",
+      "Missing pause configuration on one switch",
+      "A DSCP value of 26"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "DSCP 26 is the normal marking. The other three break the lossless guarantee."
+    },
+    {
+     "question": "Why does the CNP get its own strict-priority class?",
+     "options": [
+      "So notifications are not delayed behind congested data",
+      "To encrypt it",
+      "To raise the MTU",
+      "To avoid ECN"
+     ],
+     "answer": 0,
+     "explanation": "A late CNP means a late rate cut and deeper queues."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nRoCEv2 gives AI clusters low-latency memory-to-memory transfers over routed Ethernet, but it demands a nearly lossless fabric. Build it in layers: classify RoCE by DSCP into its own queue, mark with ECN early, give CNPs strict priority, and keep PFC as a safety net with correct headroom and a watchdog. DCQCN closes the loop, with the switch as congestion point, the receiver as notification point and the sender as reaction point.\n\nVerify with `show queuing interface` and `show interface priority-flow-control`, and troubleshoot from the NIC counters down. Keep the configuration symmetric on every hop."
+  }
+ ],
+ "ar": {
+  "title": "RoCEv2 وDCQCN لأحمال عمل الذكاء الاصطناعي وتعلّم الآلة",
+  "summary": "بناء فئة إيثرنت عديمة الفقد لحركة RDMA باستخدام PFC وECN وDCQCN والتحقق منها على مفاتيح Nexus 9000.",
+  "objectives": [
+   "شرح سبب حاجة RoCEv2 إلى نسيج عديم الفقد أو شبه عديمه",
+   "وصف أدوار CP وNP وRP في DCQCN",
+   "إعداد التصنيف وnetwork-qos عديم الإسقاط وطوابير ECN على NX-OS",
+   "التحقق من عدّادات PFC وECN واستكشاف أسباب الإسقاط"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "التدريب الموزّع للذكاء الاصطناعي هو في جوهره مسألة اتصال. تتبادل مئات وحدات المعالجة الرسومية (GPUs) التدرّجات بعد كل خطوة، وحزمة واحدة بطيئة أو مفقودة توقف المهمة كلها. بروتوكول TCP على نسيج شبكي بلا ضمانات يهدر دورات المعالج ويضيف زمن تأخير، لذلك تستخدم عناقيد الذكاء الاصطناعي تقنية RDMA عبر إيثرنت المتقارب الإصدار الثاني (RoCEv2) التي تتيح لخادم أن يكتب مباشرة في ذاكرة خادم آخر دون تدخّل يُذكر من المعالج.\n\nلا يتحمّل RoCEv2 الفقدان جيداً، فيجب أن تتصرّف الشبكة كأنها خالية من الفقد. ويتوقع منك امتحان CCIE Data Center بناء هذا السلوك على مفاتيح Nexus 9000 باستخدام التحكم في التدفق حسب الأولوية (PFC) والإشعار الصريح بالازدحام (ECN)، وشرح كيف تربطهما خوارزمية المرسل DCQCN. يعتمد هذا الدرس على [QoS and CoPP in the Data Center](/learn/enterprise-datacenter-networking/qos-and-copp-in-the-data-center) ويعمل فوق نسيج مُوجَّه كالمشروح في [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+   },
+   {
+    "type": "text",
+    "id": "why",
+    "markdown": "## لماذا يحتاج RoCEv2 إلى شبكة خاصة\n\nيحمل RoCEv2 حزم نقل InfiniBand داخل مخططات بيانات UDP بمنفذ وجهة 4791. وبما أنه بروتوكول IP قابل للتوجيه، فهو يعمل عبر نسيج leaf-spine بخلاف RoCEv1 الذي اقتصر على نطاق من الطبقة الثانية. تنفّذ بطاقة الشبكة (NIC) التسليم الموثوق في العتاد، لكن استردادها الافتراضي هو go-back-N: بعد فقدان حزمة واحدة يعيد المرسل إرسال كل شيء بدءاً من الحزمة المفقودة. ومعدّل فقدان لا يتجاوز 0.01 بالمئة قد يخفض الإنتاجية بحدّة.\n\nهناك نمطان للإخفاق:\n\n- **الفقدان بسبب امتلاء المخزن المؤقت.** يرسل عدّة عمّال إلى مستقبِل واحد في وقت واحد (incast) فيمتلئ طابور الخروج.\n- **عدم توازن توزيع الحمل.** تدفقات RDMA قليلة وكبيرة، وقد يضع تجزئة ECMP على الخمسية عدة تدفقات ضخمة على الوصلة العلوية نفسها بينما تبقى غيرها خاملة.\n\nوالجواب التصميمي من ثلاث طبقات. علّم حركة RoCE بقيمة DSCP وخصّص لها طابوراً مستقلاً. استخدم ECN كي تطلب المفاتيح من المرسلين الإبطاء قبل أن تفيض الطوابير. واستخدم PFC شبكة أمان توقف المنفذ السابق فقط حين يتأخر ECN. اعتبر PFC ملاذاً أخيراً لا الأداة الأساسية."
+   },
+   {
+    "type": "text",
+    "id": "pfcecn",
+    "markdown": "## PFC وECN\n\n**التحكم في التدفق حسب الأولوية (PFC، المعيار IEEE 802.1Qbb)** يوسّع إيقاف 802.3x ليشمل إحدى أولويات CoS الثماني. حين يتجاوز مخزن الاستقبال للأولوية 3 عتبة XOFF يرسل المفتاح إطار إيقاف PFC للأولوية 3 وحدها، فتستمر بقية الفئات في التدفق. يتوقف المنفذ السابق عن إرسال تلك الفئة حتى يهبط المخزن دون XON أو تنتهي مدة الإيقاف. وتُسمّى المساحة المحجوزة لاستيعاب الحزم العالقة في المسار بعد XOFF بالمساحة الاحتياطية (headroom). تكبر مع طول الكبل وسرعة الوصلة، لذا يسبب افتراض طول كبل خاطئ فقداناً للحزم حتى مع تفعيل PFC.\n\n**ECN** إشارة طرف إلى طرف في البتّين المنخفضتين من بايت ToS في ترويسة IP. يضع المرسل القيمة ECT، ويعيد المفتاح المزدحم كتابتها إلى CE (حدث ازدحام) بدلاً من إسقاط الحزمة. على مفاتيح Nexus تفعّله بإضافة الكلمة `ecn` إلى ملف WRED (`random-detect`) في سياسة الطوابير الخارجة. يبدأ الوسم عند العتبة الدنيا ويزداد حتى العتبة العليا التي تُوسَم عندها كل الحزم.\n\nاجعل عتبة ECN الدنيا أقل بكثير من عتبة XOFF الخاصة بـ PFC. فإن عمل PFC أولاً أوقف النسيج دون أن تتاح لـ DCQCN فرصة، وظهرت مخاطر الحجب في رأس الطابور (head-of-line blocking) وعواصف PFC وحتى الجمود في حلقات المفاتيح الموقِفة. ويكتشف حارس PFC (watchdog) الطابور العالق في حالة إيقاف وينفّذ إجراء تعافٍ."
+   },
+   {
+    "type": "animation",
+    "id": "dcqcn-anim",
+    "kind": "sequence",
+    "title": "DCQCN: من الازدحام إلى استعادة المعدّل",
+    "data": {
+     "actors": [
+      {
+       "id": "tx",
+       "label": "NIC المرسل",
+       "sub": "نقطة التفاعل",
+       "icon": "server"
+      },
+      {
+       "id": "sw",
+       "label": "مفتاح Leaf",
+       "sub": "نقطة الازدحام",
+       "icon": "switch"
+      },
+      {
+       "id": "rx",
+       "label": "NIC المستقبل",
+       "sub": "نقطة الإشعار",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "tx",
+       "to": "sw",
+       "label": "بيانات RoCEv2",
+       "detail": "DSCP 26, ECT(0)",
+       "note": "يرسل المرسل بسرعة الوصلة في الفئة عديمة الإسقاط."
+      },
+      {
+       "from": "sw",
+       "to": "rx",
+       "label": "وسم CE",
+       "detail": "الطابور فوق العتبة الدنيا",
+       "note": "يتجاوز طابور الخروج الحد الأدنى لـ WRED، فيوسم المفتاح الحزم بـ CE بدلاً من إسقاطها.",
+       "tone": "warning"
+      },
+      {
+       "from": "rx",
+       "to": "tx",
+       "label": "CNP",
+       "detail": "DSCP 48, أولوية صارمة",
+       "note": "يرصد المستقبل وسم CE فيعيد حزمة إشعار بالازدحام (CNP) في فئة مستقلة عالية الأولوية."
+      },
+      {
+       "from": "tx",
+       "to": "tx",
+       "label": "خفض المعدّل",
+       "detail": "ارتفاع alpha",
+       "note": "تخفض نقطة التفاعل معدّلها بضربه في عامل يتناسب مع تقدير الازدحام alpha.",
+       "tone": "danger"
+      },
+      {
+       "from": "sw",
+       "to": "tx",
+       "label": "تفرغ الطوابير",
+       "detail": "لا حاجة إلى PFC",
+       "note": "لأن ECN تدخّل مبكراً، لم يبلغ الطابور عتبة XOFF الخاصة بـ PFC.",
+       "tone": "success"
+      },
+      {
+       "from": "tx",
+       "to": "tx",
+       "label": "استعادة المعدّل",
+       "detail": "زيادة سريعة ثم تراكمية ثم فائقة",
+       "note": "إذا لم تصل CNP خلال فترة المؤقت، يرفع المرسل معدّله على مراحل نحو سرعة الوصلة.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "dcqcn",
+    "markdown": "## كيف تعمل DCQCN\n\nتجمع خوارزمية الإشعار الكمّي بالازدحام لمراكز البيانات (DCQCN) بين وسم ECN في المفتاح والتحكم بالمعدّل في بطاقة الشبكة. ولها ثلاثة أدوار:\n\n- **نقطة الازدحام (CP):** المفتاح. يوسم الحزم بـ CE باستخدام WRED وECN.\n- **نقطة الإشعار (NP):** بطاقة الشبكة المستقبِلة. ترصد CE وترسل CNP إلى المرسل، مرة واحدة على الأكثر في كل نافذة زمنية لكل تدفق.\n- **نقطة التفاعل (RP):** بطاقة الشبكة المرسِلة. تخفض معدّلها عند كل CNP وتحدّث alpha وهو تقدير متحرك للازدحام. وعند غياب CNP تتعافى بالاسترداد السريع ثم الزيادة التراكمية ثم الزيادة الفائقة.\n\nيجب ألا تنتظر CNP خلف البيانات المزدحمة. خصّص لها فئة مستقلة، وغالباً DSCP 48، في طابور ذي أولوية صارمة. وتُضبط معاملات البطاقة (المؤقتات وعامل الخفض وفاصل CNP) في مشغّل الخادم، لذا يجب أن يتفق فريقا الشبكة والخوادم على ملف واحد.\n\n### نقاط تصميم النسيج\n\n| الموضوع | التوصية |\n|:--|:--|\n| ربط الطوابير | RoCE على qos-group 3 وCNP على qos-group 6 والباقي افتراضي |\n| MTU | 9216 على كل وصلة في النسيج؛ حمولة RoCE بين 1024 و4096 بايت |\n| توزيع الحمل | أدخل منفذ مصدر UDP في التجزئة؛ فكّر في التوزيع الديناميكي أو flowlet |\n| المخازن المؤقتة | اضبط حدّي ECN الأدنى والأقصى ليبدأ الوسم مبكراً ويبلغ 100 بالمئة قبل XOFF |\n| الأمان | فعّل حارس PFC على كل منافذ الوصول والنسيج |"
+   },
+   {
+    "type": "code",
+    "id": "roce-cfg",
+    "language": "cisco",
+    "filename": "LEAF-1.cfg",
+    "caption": "فئة RoCEv2 عديمة الفقد على leaf من طراز Nexus 9300-FX: التصنيف وnetwork-qos عديم الإسقاط وطوابير ECN وإعدادات المنفذ.",
+    "code": "class-map type qos match-all ROCE\n  match dscp 26\nclass-map type qos match-all CNP\n  match dscp 48\n!\npolicy-map type qos QOS-IN\n  class ROCE\n    set qos-group 3\n  class CNP\n    set qos-group 6\n!\npolicy-map type network-qos NQ-ROCE\n  class type network-qos c-8q-nq3\n    mtu 9216\n    pause pfc-cos 3\n  class type network-qos c-8q-nq-default\n    mtu 9216\n!\npolicy-map type queuing QOS-OUT\n  class type queuing c-out-8q-q6\n    priority level 1\n  class type queuing c-out-8q-q3\n    bandwidth remaining percent 60\n    random-detect minimum-threshold 500 kbytes maximum-threshold 1500 kbytes drop-probability 100 weight 0 ecn\n  class type queuing c-out-8q-q-default\n    bandwidth remaining percent 40\n!\nsystem qos\n  service-policy type network-qos NQ-ROCE\n  service-policy type queuing output QOS-OUT\n!\ninterface Ethernet1/1\n  description GPU-SERVER-01\n  priority-flow-control mode on\n  priority-flow-control watch-dog\n  service-policy type qos input QOS-IN\n  no shutdown"
+   },
+   {
+    "type": "terminal",
+    "id": "roce-verify",
+    "title": "التحقق من عدّادات PFC وECN",
+    "prompt": "LEAF-1#",
+    "lines": [
+     {
+      "cmd": "show interface ethernet 1/1 priority-flow-control",
+      "output": "============================================================\nPort               Mode Oper(VL bmap)  RxPPP        TxPPP\n============================================================\nEthernet1/1        On   On (8)         0            1184",
+      "comment": "القيمة On في Mode وOper مع VL bitmap تساوي 8 تعني أن الأولوية 3 عديمة الفقد. يعدّ TxPPP إطارات الإيقاف التي أرسلها هذا المفتاح إلى الخادم."
+     },
+     {
+      "cmd": "show queuing interface ethernet 1/1",
+      "output": "slot  1\n=======\nEgress Queuing for Ethernet1/1 [System]\nQ Group  Bandwidth%  PrioLevel  Shape\n   6     -           1          -\n   3     60          -          -\n   0     40          -          -\nECN Statistics:\n  Qos-group 3  ECN marked packets: 482910\n  Qos-group 3  WRED drops: 0",
+      "comment": "وجود حزم موسومة مع صفر إسقاط من WRED يعني أن ECN تؤدي العمل قبل حدوث الإسقاط."
+     },
+     {
+      "cmd": "show interface ethernet 1/1 counters errors | include Discard",
+      "output": "Eth1/1   Discard: 0   Out-Discard: 0",
+      "comment": "صفر إسقاط في فئة RoCE يؤكد سلوك عدم الإسقاط."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "trouble",
+    "markdown": "## منهجية استكشاف الأعطال\n\nاعمل من التطبيق نحو الأسفل:\n\n1. **العَرَض.** تنهار إنتاجية المهمة أو تُظهر سجلات NCCL إعادة محاولات. افحص عدّادات بطاقة الشبكة أولاً (الحزم خارج التسلسل وCNP المرسلة والمستلمة).\n2. **الوسم.** تأكد أن البطاقة تضع DSCP 26 وأن المفتاح يصنّفه في qos-group 3. وعدم التطابق بين الوثوق بـ DSCP وCoS هو السبب الأشيع.\n3. **حالة الطابور.** قارن علامات ECN وإسقاطات WRED وعدد إطارات PFC. كثرة الإيقاف وقلة وسوم ECN تعنيان أن عتبات ECN مرتفعة.\n4. **المساحة الاحتياطية وMTU.** الإسقاط في فئة PFC رغم الإيقاف يشير إلى headroom خاطئ أو عدم تطابق MTU على وصلة واحدة.\n5. **العواصف.** المنفذ الذي يستقبل إيقافاً متواصلاً لدقائق مرشّح لحارس watchdog. ابحث عن بطاقة الشبكة البطيئة أو المعطوبة لا عن المفتاح.\n\nوتحقق كذلك من تماثل الإعداد. غياب `pause pfc-cos 3` عن leaf واحد يحوّل مساراً عديم الفقد إلى مسار يفقد الحزم بصمت، ولا يظهر العطل إلا تحت الحمل."
+   },
+   {
+    "type": "callout",
+    "id": "pitfall",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- تفعيل PFC على كل الأولويات الثماني؛ فتوقف فئة عالقة واحدة حركة لا علاقة لها بها.\n- وضع عتبات ECN فوق مستوى XOFF الخاص بـ PFC، فيعمل PFC أولاً ولا تفيد DCQCN.\n- نسيان فئة CNP، فتنتظر الإشعارات خلف بيانات مزدحمة ويتأخر التفاعل.\n- ترك MTU الافتراضي على وصلة واحدة، فتُجزَّأ حزم RoCE أو تُسقَط.\n- اعتبار RoCE إعداداً يُنجَز مرة واحدة؛ فيجب التحقق من البرنامج الثابت وملف البطاقة وعتبات المفتاح معاً."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر Nexus 9000v أو عتاد تملكه، ابنِ نسيجاً من مفتاحَي leaf ومفتاح spine واحد.\n\n1. طبّق سياسات التصنيف وnetwork-qos والطوابير من هذا الدرس على الـ leaf كليهما.\n2. فعّل `priority-flow-control mode on` على منافذ الخوادم والوصلات العلوية.\n3. ولّد ازدحاماً باستخدام `iperf3` من مضيفين إلى مستقبِل واحد بقيمة DSCP 26.\n4. نفّذ `show queuing interface` و`show interface priority-flow-control` وسجّل وسوم ECN وعدد إطارات الإيقاف.\n5. اخفض العتبة العليا لـ ECN وكرّر التجربة، ثم صِف كيف تغيّرت النسبة بين وسوم ECN وإطارات الإيقاف."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "RoCEv2",
+      "definition": "RDMA عبر إيثرنت المتقارب الإصدار 2: يُحمَل داخل UDP بالمنفذ 4791 وقابل للتوجيه."
+     },
+     {
+      "term": "PFC",
+      "definition": "التحكم في التدفق حسب الأولوية: إيقاف لكل أولوية يجعل فئة واحدة عديمة الفقد."
+     },
+     {
+      "term": "ECN",
+      "definition": "الإشعار الصريح بالازدحام: وسم CE في ترويسة IP بدلاً من الإسقاط."
+     },
+     {
+      "term": "DCQCN",
+      "definition": "خوارزمية التحكم في الازدحام التي تخفض معدّل إرسال البطاقة عند استلام CNP."
+     },
+     {
+      "term": "CNP",
+      "definition": "حزمة إشعار الازدحام التي ترسلها بطاقة المستقبل إلى المرسل."
+     },
+     {
+      "term": "المساحة الاحتياطية",
+      "definition": "مخزن محجوز لاستيعاب الحزم العالقة بعد إرسال إطار الإيقاف."
+     },
+     {
+      "term": "Incast",
+      "definition": "عدة مرسلين يستهدفون مستقبِلاً واحداً في الوقت نفسه."
+     },
+     {
+      "term": "حارس PFC",
+      "definition": "ميزة تكتشف طابوراً عالقاً في حالة إيقاف وتستعيده."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما منفذ وجهة UDP الذي يعرّف RoCEv2؟",
+      "options": [
+       "4789",
+       "4791",
+       "3260",
+       "5001"
+      ],
+      "answer": 1,
+      "explanation": "يستخدم RoCEv2 المنفذ UDP 4791 بينما المنفذ 4789 لـ VXLAN."
+     },
+     {
+      "question": "أي العبارات الآتية صحيحة عن أدوار DCQCN؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "المفتاح يوسم الحزم بـ CE",
+       "بطاقة المستقبل ترسل CNP",
+       "بطاقة المرسل تخفض معدّلها",
+       "المفتاح يخفض معدّل المرسل مباشرة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يكتفي المفتاح بالوسم، أما التحكم بالمعدّل فتقوم به بطاقة المرسل عند وصول CNP من المستقبل."
+     },
+     {
+      "question": "أين ينبغي أن تكون عتبة ECN الدنيا بالنسبة إلى XOFF الخاص بـ PFC؟",
+      "options": [
+       "أقل بكثير منها",
+       "مساوية لها",
+       "أعلى منها",
+       "لا علاقة بينهما"
+      ],
+      "answer": 0,
+      "explanation": "يجب أن تعمل ECN أولاً لتُبطئ DCQCN المرسلين قبل أن يوقف PFC الوصلة."
+     },
+     {
+      "question": "أي مما يلي أسباب شائعة للإسقاط في فئة RoCE المفعّل عليها PFC؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "مساحة احتياطية غير كافية",
+       "عدم تطابق MTU على وصلة",
+       "غياب إعداد الإيقاف عن مفتاح واحد",
+       "قيمة DSCP تساوي 26"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "القيمة 26 هي الوسم المعتاد، أما الثلاثة الأخرى فتكسر ضمان عدم الفقد."
+     },
+     {
+      "question": "لماذا تحصل CNP على فئة مستقلة ذات أولوية صارمة؟",
+      "options": [
+       "كي لا تتأخر الإشعارات خلف البيانات المزدحمة",
+       "لتشفيرها",
+       "لرفع MTU",
+       "لتجنب ECN"
+      ],
+      "answer": 0,
+      "explanation": "تأخّر CNP يعني تأخّر خفض المعدّل وعمق أكبر للطوابير."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nيمنح RoCEv2 عناقيد الذكاء الاصطناعي نقلاً من ذاكرة إلى ذاكرة بزمن تأخير منخفض عبر إيثرنت موجَّه، لكنه يتطلب نسيجاً شبه خالٍ من الفقد. ابنِه على طبقات: صنّف RoCE بحسب DSCP في طابور مستقل، ووسم بـ ECN مبكراً، وامنح CNP أولوية صارمة، وأبقِ PFC شبكة أمان بمساحة احتياطية صحيحة وحارس watchdog. وتُكمل DCQCN الحلقة، فالمفتاح نقطة الازدحام والمستقبِل نقطة الإشعار والمرسل نقطة التفاعل.\n\nتحقق باستخدام `show queuing interface` و`show interface priority-flow-control`، واستكشف الأعطال من عدّادات بطاقة الشبكة نزولاً. وأبقِ الإعداد متماثلاً على كل قفزة."
+   }
+  ]
+ }
+}

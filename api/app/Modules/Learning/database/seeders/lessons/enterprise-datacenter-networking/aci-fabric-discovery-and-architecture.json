@@ -1,0 +1,584 @@
+{
+  "slug": "aci-fabric-discovery-and-architecture",
+  "title": "ACI Fabric Discovery and Architecture",
+  "summary": "Understand ACI spine-leaf architecture, the APIC cluster, the discovery and registration sequence, the infrastructure protocols and the object model.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Describe ACI spine-leaf rules and the role of APIC, spines and leaves",
+    "Walk through fabric discovery and node registration",
+    "Explain IS-IS, COOP and MP-BGP in overlay-1",
+    "Query the MIT with moquery and REST",
+    "Troubleshoot a node that fails to join the fabric"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Your team has racked two spines, four leaf switches and three APIC controllers. Nobody logs in to a switch to configure it. Yet an hour later all seven devices are part of one fabric, with addresses assigned, routing running and a single management point. How did that happen without a line of CLI on the switches?\n\nThis is **Cisco ACI** fabric discovery. ACI treats the whole fabric as one policy-driven system managed by the **APIC** (Application Policy Infrastructure Controller). On the CCIE Data Center lab you must bring up a fabric, register nodes, understand the infrastructure protocols and read the object model when something goes wrong. This lesson covers the architecture and the discovery sequence."
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## Architecture\n\nACI uses a two-tier **spine-leaf** topology with strict rules:\n\n- Every leaf connects to every spine. Leaves never connect to leaves, and spines never connect to spines (Multi-Pod uses the IPN instead, see [Multi-Site, Multi-Pod and Remote Leaf](/learn/enterprise-datacenter-networking/multi-site-multi-pod-and-remote-leaf)).\n- Endpoints, servers, firewalls and routers connect only to **leaves**. APICs also connect to leaves.\n- **Spines** forward between leaves and hold the **endpoint mapping database** (COOP). They never hold hosts.\n- The fabric uses **IS-IS** for the infrastructure underlay and **MP-BGP** with the spines as route reflectors for external routes. Tenant traffic is carried in **iVXLAN**, an enhanced VXLAN that also carries the source group (policy tag).\n\nThe **APIC cluster** is not in the data path. It is a policy and configuration store of three or more nodes (up to seven). Data is split into **shards**, with three replicas of each shard spread across controllers, so losing one APIC leaves the cluster read-write while losing two leaves it read-only. If all APICs are down, the fabric keeps forwarding using policy already programmed on the leaves."
+    },
+    {
+      "id": "discovery",
+      "type": "text",
+      "markdown": "## The discovery sequence\n\nDiscovery is a chain in which each step depends on the previous one:\n\n1. **APIC1 setup.** During the initial script you set the fabric name, the number of controllers, the **TEP pool** (for example 10.0.0.0/16), the **infra VLAN** (default 3967) and the out-of-band management address.\n2. **LLDP.** APIC1 sends LLDP frames on its fabric ports. The first leaf learns that a controller is attached.\n3. **Leaf DHCP.** The leaf sends DHCP requests on the infra VLAN and APIC1 answers with a TEP address from the pool.\n4. **Registration.** The leaf appears in **Fabric > Inventory > Fabric Membership** as an unregistered node identified by its **serial number**. The administrator assigns a **node ID** (101 and up for leaves, 201 and up for spines) and a name. Nothing joins automatically.\n5. **Spreading.** The registered leaf gets a firmware image and policy, brings up IS-IS on its fabric uplinks, and discovers the spines. The spines then discover the remaining leaves, and each is registered in turn.\n6. **Cluster formation.** Additional APICs attach to leaves, are discovered over the infra VLAN and join the cluster.\n\nOn a rebuilt lab, remember that APIC does not accept a node whose serial number was already registered under another node ID until you decommission it."
+    },
+    {
+      "id": "disc-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "ACI fabric discovery",
+      "caption": "From a lone APIC to a registered leaf and spine.",
+      "data": {
+        "actors": [
+          {
+            "id": "apic",
+            "label": "APIC1",
+            "sub": "TEP pool 10.0.0.0/16",
+            "icon": "server"
+          },
+          {
+            "id": "leaf",
+            "label": "Leaf (unregistered)",
+            "sub": "serial FDO12345AB",
+            "icon": "switch"
+          },
+          {
+            "id": "spine",
+            "label": "Spine",
+            "sub": "serial FDO67890CD",
+            "icon": "router"
+          },
+          {
+            "id": "adm",
+            "label": "Administrator",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "from": "apic",
+            "to": "leaf",
+            "label": "LLDP",
+            "note": "APIC1 advertises itself on the leaf port; the leaf recognizes an APIC.",
+            "tone": "secure"
+          },
+          {
+            "from": "leaf",
+            "to": "apic",
+            "label": "DHCP Discover",
+            "detail": "infra VLAN 3967",
+            "note": "The leaf asks for a TEP address on the infra VLAN."
+          },
+          {
+            "from": "apic",
+            "to": "leaf",
+            "label": "DHCP Offer",
+            "detail": "10.0.88.95/32",
+            "note": "APIC1 answers from the TEP pool, but the node is not yet a fabric member."
+          },
+          {
+            "from": "adm",
+            "to": "apic",
+            "label": "Register node",
+            "detail": "ID 101, name leaf101",
+            "note": "The administrator assigns a node ID in Fabric Membership.",
+            "tone": "success"
+          },
+          {
+            "from": "apic",
+            "to": "leaf",
+            "label": "Policy + firmware",
+            "note": "The leaf downloads its configuration and starts IS-IS on the uplinks."
+          },
+          {
+            "from": "leaf",
+            "to": "spine",
+            "label": "IS-IS hello",
+            "detail": "overlay-1",
+            "note": "The leaf discovers the spine and forms an adjacency in the overlay-1 VRF.",
+            "tone": "secure"
+          },
+          {
+            "from": "leaf",
+            "to": "leaf",
+            "label": "Fabric member",
+            "note": "The process repeats for every spine and leaf until the fabric is complete.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "planes",
+      "type": "text",
+      "markdown": "## Infrastructure protocols\n\nThree control planes work together inside the fabric, all in the infrastructure VRF named **overlay-1**:\n\n| Protocol | Role |\n|:--|:--|\n| IS-IS | Underlay routing of TEP addresses between leaves and spines |\n| COOP | Spines hold the endpoint database; leaves report local endpoints with ZeroMQ |\n| MP-BGP | Spines are route reflectors for VPNv4/VPNv6 and EVPN for external routes |\n\nA leaf forwards unknown-unicast traffic to the **proxy TEP** addresses of the spines (anycast), which look up the endpoint in COOP and forward to the right leaf. That is why ACI can keep ARP flooding off by default in a bridge domain.\n\nThe **MIT** (management information tree) holds every configuration and runtime object. Each object has a class (`fvTenant`, `fabricNode`) and a **distinguished name** such as `uni/tn-Prod`. The GUI, REST API, CLI and Python SDK are all views of the same tree, which is why you can click in the GUI and then inspect the same object with `moquery`."
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "APIC# and leaf verification",
+      "lines": [
+        {
+          "cmd": "acidiag avread",
+          "output": "Local appliance ID=1 ADDRESS=10.0.0.1 TEP ADDRESS=10.0.0.0/16 ROUTABLE IP ADDRESS=0.0.0.0\nChassis ID=3b2a5c4e-... \nCluster of 3 lm(t):1(...) appliances (out of targeted 3 lm(t):3(...)) with FABRIC_DOMAIN name=Fab1 HEALTH=fully-fit"
+        },
+        {
+          "cmd": "acidiag fnvread",
+          "output": "ID  Pod ID  Name     Serial Number  IP Address      Role   State   LastUpdMsgId\n101 1       leaf101  FDO12345AB     10.0.88.95/32   leaf   active  0\n201 1       spine201 FDO67890CD     10.0.88.65/32   spine  active  0"
+        },
+        {
+          "cmd": "moquery -c fabricNode | grep -E \"^(name|role|fabricSt)\"",
+          "output": "name         : leaf101\nrole         : leaf\nfabricSt     : active"
+        },
+        {
+          "comment": "On leaf101:"
+        },
+        {
+          "cmd": "show isis adjacency vrf overlay-1",
+          "output": "System ID       SNPA   Level State Hold Time Interface\nspine201        N/A    1     UP    00:00:27  Ethernet1/49.2"
+        }
+      ],
+      "caption": "Cluster health fully-fit, nodes active and IS-IS adjacencies up confirm a healthy fabric."
+    },
+    {
+      "id": "rest",
+      "type": "code",
+      "language": "bash",
+      "code": "# Read the same object through the REST API (authenticate first; token omitted)\ncurl -sk -b cookie.txt https://apic.example.com/api/node/class/fabricNode.json \\\n  | python -m json.tool | grep -E '\"(name|role|fabricSt|serial)\"'",
+      "caption": "Every fabric member is an object of class fabricNode; the GUI, moquery and REST show the same data."
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## Design decisions worth knowing\n\nSeveral choices are made once at setup and are very hard to change later, so lab tasks often test them:\n\n- **TEP pool size.** The pool must be large enough for every APIC, leaf, spine and virtual TEP in the fabric, including every future pod. A /16 is the common choice, and it must not overlap any address range that the fabric will need to reach, such as the management or VMM networks.\n- **Infra VLAN.** It must not be used by any server VLAN on a port that connects to the fabric, because the fabric reserves it for infrastructure traffic. Choosing a value that the hypervisor team already uses is a classic mistake.\n- **Controller count.** Three APICs are the normal minimum for production. A single APIC is accepted in a lab, but any maintenance then interrupts configuration changes.\n- **Out-of-band management.** Keep APIC and node management on a separate network so that you can still reach the controllers when the fabric itself is broken."
+    },
+    {
+      "id": "trouble",
+      "type": "text",
+      "markdown": "## Troubleshooting discovery\n\nWhen a node does not appear or stays inactive, ask where the chain broke:\n\n- **Leaf not visible in Fabric Membership.** Check the cabling to the APIC, that the APIC port is on the correct infra VLAN, and the LLDP neighbor with `show lldp neighbors` on the leaf. A mismatched infra VLAN or TEP pool prevents all later steps.\n- **Visible but stays \"discovering\" after registration.** The leaf cannot reach the APIC or its firmware version is incompatible. Verify `show isis adjacency vrf overlay-1` and the image on the leaf.\n- **Spine not discovered.** A spine can only be found through a registered leaf, so register leaves first, and check that the IS-IS adjacency on the spine port is up.\n- **APIC shows partially-fit or not-fit.** Check `acidiag avread` for the missing member and its infra reachability. Never reload all controllers at once.\n\nFor monitoring and health scores after the build, continue with [ACI Fabric Monitoring and Health](/learn/enterprise-datacenter-networking/aci-fabric-monitoring-and-health)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not wipe casually",
+      "markdown": "Commands such as `acidiag touch clean` and `setup-clean-config.sh` erase a node. On an APIC in a live cluster this removes it from the shards. Decommission it from the GUI first and never clean more than one APIC at a time."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In an ACI simulator or a virtual ACI lab, bring up a fresh fabric.\n\n1. Run the APIC setup script with TEP pool 10.0.0.0/16 and infra VLAN 3967.\n2. Open Fabric Membership and register the first leaf as node 101. Watch it change from discovering to active.\n3. Register the spine as 201 and the second leaf as 102.\n4. On the APIC run `acidiag fnvread`, then `moquery -c fabricNode`, and compare the two outputs.\n5. On a leaf, run `show isis adjacency vrf overlay-1` and explain which VRF you are looking at and why it is not a tenant VRF."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "APIC",
+          "definition": "The controller cluster that stores policy and pushes it to the fabric; not in the data path."
+        },
+        {
+          "term": "TEP pool",
+          "definition": "The address range from which the APIC assigns tunnel endpoint addresses to nodes."
+        },
+        {
+          "term": "Infra VLAN",
+          "definition": "The VLAN used between APIC and leaves for discovery and infrastructure traffic."
+        },
+        {
+          "term": "Fabric Membership",
+          "definition": "The inventory where an administrator registers nodes by serial number."
+        },
+        {
+          "term": "COOP",
+          "definition": "Council of Oracles Protocol: the spine endpoint database that leaves report to."
+        },
+        {
+          "term": "Proxy TEP",
+          "definition": "Anycast spine address that handles unknown destinations."
+        },
+        {
+          "term": "overlay-1",
+          "definition": "The infrastructure VRF in which IS-IS, COOP and MP-BGP run."
+        },
+        {
+          "term": "MIT / DN",
+          "definition": "The object tree and the unique path of each object in it."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What assigns a node ID to a newly discovered leaf?",
+          "options": [
+            "It is assigned automatically by DHCP",
+            "The administrator registers it in Fabric Membership",
+            "The spine chooses it from the TEP pool",
+            "It is the last octet of the management IP"
+          ],
+          "answer": 1,
+          "explanation": "Discovery gives the leaf a TEP address, but it joins only after the administrator assigns a node ID and name."
+        },
+        {
+          "question": "Which devices may connect to a leaf? Choose all that apply.",
+          "options": [
+            "APIC",
+            "Servers and hypervisors",
+            "A spine",
+            "Another leaf"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Leaves connect to spines, APICs and endpoints. Leaf-to-leaf links are not supported in a single pod."
+        },
+        {
+          "question": "What happens to traffic if all APICs fail?",
+          "options": [
+            "The fabric stops forwarding",
+            "Forwarding continues with the policy already on the leaves",
+            "Only inter-tenant traffic stops",
+            "Leaves reload"
+          ],
+          "answer": 1,
+          "explanation": "The APIC is a management and policy plane, not part of the data path."
+        },
+        {
+          "question": "Which protocols run in the overlay-1 infrastructure VRF? Choose all that apply.",
+          "options": [
+            "IS-IS",
+            "COOP",
+            "MP-BGP",
+            "Spanning Tree"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "IS-IS for the underlay, COOP for endpoint mapping and MP-BGP for external routes. ACI does not use STP inside the fabric."
+        },
+        {
+          "question": "A leaf is registered but never leaves the discovering state. Which check is most useful first?",
+          "options": [
+            "show vlan brief on the spine",
+            "show isis adjacency vrf overlay-1 on the leaf",
+            "show ip bgp summary in a tenant",
+            "show spanning-tree"
+          ],
+          "answer": 1,
+          "explanation": "The leaf must form IS-IS adjacencies in overlay-1 to reach the APIC and the rest of the fabric."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- ACI is a spine-leaf fabric managed by an APIC cluster that stays out of the data path.\n- Discovery runs LLDP, then DHCP on the infra VLAN, then manual registration by serial number.\n- IS-IS, COOP and MP-BGP form the infrastructure in the overlay-1 VRF.\n- Everything is an object in the MIT, reachable by GUI, REST, `moquery` and Python.\n- Troubleshoot discovery in order: cabling, infra VLAN, DHCP, registration, IS-IS.\n\nNext, learn how to attach servers and carve the fabric into tenants in [ACI Access, Fabric and Tenant Policies](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies)."
+    }
+  ],
+  "ar": {
+    "title": "اكتشاف النسيج الشبكي وبنيته في ACI",
+    "summary": "افهم بنية ACI من أوراق وأعمدة فقرية، وعنقود APIC، وتسلسل الاكتشاف والتسجيل، وبروتوكولات البنية التحتية، ونموذج الكائنات.",
+    "objectives": [
+      "صِف قواعد الأوراق والأعمدة الفقرية في ACI ودور APIC والأعمدة والأوراق",
+      "اشرح خطوات اكتشاف النسيج وتسجيل العقد",
+      "اشرح IS-IS وCOOP وMP-BGP في overlay-1",
+      "استعلم عن MIT بـ moquery وREST",
+      "استكشف عطل عقدة لا تنضم إلى النسيج"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "رصّ فريقك مفتاحين للعمود الفقري وأربعة مفاتيح أوراق وثلاثة متحكمات APIC. لا أحد يدخل إلى أي مفتاح ليضبطه، ومع ذلك أصبحت الأجهزة السبعة بعد ساعة جزءاً من نسيج واحد، بعناوين موزَّعة وتوجيه يعمل ونقطة إدارة واحدة. كيف حدث ذلك دون سطر واحد من واجهة الأوامر على المفاتيح؟\n\nهذا هو اكتشاف النسيج في **Cisco ACI**. تعامل ACI النسيج كله منظومةً واحدة تحكمها السياسات ويديرها **APIC** (متحكم البنية التحتية لسياسات التطبيقات). في اختبار CCIE Data Center المعملي يجب أن تُقلع نسيجاً وتسجّل العقد وتفهم بروتوكولات البنية التحتية وتقرأ نموذج الكائنات حين يحدث عطل. يغطي هذا الدرس البنية ومسار الاكتشاف."
+      },
+      {
+        "id": "arch",
+        "type": "text",
+        "markdown": "## البنية\n\nتعتمد ACI طوبولوجيا **الأوراق والعمود الفقري (Spine-leaf)** من طبقتين بقواعد صارمة:\n\n- ترتبط كل ورقة بكل عمود فقري. لا ترتبط الأوراق ببعضها ولا الأعمدة الفقرية ببعضها (يستخدم Multi-Pod شبكة IPN بدلاً من ذلك، راجع [Multi-Site, Multi-Pod and Remote Leaf](/learn/enterprise-datacenter-networking/multi-site-multi-pod-and-remote-leaf)).\n- لا تتصل النقاط الطرفية والخوادم وجدران الحماية والموجّهات إلا بـ**الأوراق**. وكذلك تتصل متحكمات APIC بالأوراق.\n- تمرّر **الأعمدة الفقرية** الحركة بين الأوراق وتحتفظ بـ**قاعدة بيانات ربط النقاط الطرفية** (COOP)، ولا تستضيف مضيفين أبداً.\n- يستخدم النسيج **IS-IS** للشبكة السفلية للبنية التحتية، و**MP-BGP** مع الأعمدة الفقرية عاكسات مسارات للمسارات الخارجية. وتُحمل حركة المستأجرين في **iVXLAN** وهو VXLAN محسَّن يحمل أيضاً مجموعة المصدر (وسم السياسة).\n\n**عنقود APIC** ليس في مسار البيانات. هو مخزن للسياسات والضبط من ثلاث عقد أو أكثر (حتى سبع). تُقسَّم البيانات إلى **أجزاء (Shards)** لكل جزء ثلاث نسخ موزعة على المتحكمات، فإذا فُقد APIC واحد بقي العنقود للقراءة والكتابة، وإذا فُقد اثنان صار للقراءة فقط. وإذا تعطلت المتحكمات كلها واصل النسيج إعادة التوجيه بالسياسات المبرمجة أصلاً على الأوراق."
+      },
+      {
+        "id": "discovery",
+        "type": "text",
+        "markdown": "## مسار الاكتشاف\n\nالاكتشاف سلسلة تعتمد كل خطوة فيها على سابقتها:\n\n1. **إعداد APIC1.** أثناء النص الأولي تحدد اسم النسيج وعدد المتحكمات و**مجمع TEP** (مثلاً 10.0.0.0/16) و**شبكة VLAN للبنية التحتية** (الافتراضية 3967) وعنوان الإدارة خارج النطاق.\n2. **LLDP.** يرسل APIC1 إطارات LLDP على منافذ النسيج، فتعلم أول ورقة أن متحكماً متصل بها.\n3. **DHCP للورقة.** ترسل الورقة طلبات DHCP على VLAN البنية التحتية ويردّ APIC1 بعنوان TEP من المجمع.\n4. **التسجيل.** تظهر الورقة في **Fabric > Inventory > Fabric Membership** عقدةً غير مسجّلة تُعرَّف برقمها التسلسلي (Serial number). يعيّن المسؤول **معرّف العقدة (Node ID)** (من 101 للأوراق ومن 201 للأعمدة الفقرية) واسماً. لا ينضم شيء تلقائياً.\n5. **الانتشار.** تتلقى الورقة المسجّلة صورة البرنامج الثابت والسياسات، وتشغّل IS-IS على وصلاتها الصاعدة، وتكتشف الأعمدة الفقرية. ثم تكتشف الأعمدة بقية الأوراق وتُسجَّل كل منها بدورها.\n6. **تكوين العنقود.** تتصل متحكمات APIC الإضافية بالأوراق وتُكتشف عبر VLAN البنية التحتية وتنضم إلى العنقود.\n\nفي مختبر أُعيد بناؤه تذكّر أن APIC لا يقبل عقدة سبق تسجيل رقمها التسلسلي تحت معرّف آخر حتى تُلغى خدمتها (Decommission)."
+      },
+      {
+        "id": "disc-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "اكتشاف نسيج ACI",
+        "caption": "من متحكم APIC وحيد إلى ورقة وعمود فقري مسجّلين.",
+        "data": {
+          "actors": [
+            {
+              "id": "apic",
+              "label": "APIC1",
+              "sub": "TEP pool 10.0.0.0/16",
+              "icon": "server"
+            },
+            {
+              "id": "leaf",
+              "label": "Leaf (unregistered)",
+              "sub": "serial FDO12345AB",
+              "icon": "switch"
+            },
+            {
+              "id": "spine",
+              "label": "Spine",
+              "sub": "serial FDO67890CD",
+              "icon": "router"
+            },
+            {
+              "id": "adm",
+              "label": "المسؤول",
+              "icon": "user"
+            }
+          ],
+          "steps": [
+            {
+              "from": "apic",
+              "to": "leaf",
+              "label": "LLDP",
+              "note": "يعلن APIC1 عن نفسه على منفذ الورقة فتتعرّف الورقة إلى متحكم.",
+              "tone": "secure"
+            },
+            {
+              "from": "leaf",
+              "to": "apic",
+              "label": "DHCP Discover",
+              "detail": "infra VLAN 3967",
+              "note": "تطلب الورقة عنوان TEP على VLAN البنية التحتية."
+            },
+            {
+              "from": "apic",
+              "to": "leaf",
+              "label": "DHCP Offer",
+              "detail": "10.0.88.95/32",
+              "note": "يردّ APIC1 من المجمع لكن العقدة ليست عضواً في النسيج بعد."
+            },
+            {
+              "from": "adm",
+              "to": "apic",
+              "label": "تسجيل العقدة",
+              "detail": "ID 101, name leaf101",
+              "note": "يعيّن المسؤول معرّف العقدة في Fabric Membership.",
+              "tone": "success"
+            },
+            {
+              "from": "apic",
+              "to": "leaf",
+              "label": "السياسات والبرنامج",
+              "note": "تنزّل الورقة ضبطها وتبدأ IS-IS على الوصلات الصاعدة."
+            },
+            {
+              "from": "leaf",
+              "to": "spine",
+              "label": "IS-IS hello",
+              "detail": "overlay-1",
+              "note": "تكتشف الورقة العمود الفقري وتُكوّن جواراً في VRF اسمه overlay-1.",
+              "tone": "secure"
+            },
+            {
+              "from": "leaf",
+              "to": "leaf",
+              "label": "عضو في النسيج",
+              "note": "تتكرر العملية لكل عمود فقري وورقة حتى يكتمل النسيج.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "planes",
+        "type": "text",
+        "markdown": "## بروتوكولات البنية التحتية\n\nتعمل ثلاثة مستويات تحكم معاً داخل النسيج، وكلها في VRF البنية التحتية المسمّى **overlay-1**:\n\n| البروتوكول | الدور |\n|:--|:--|\n| IS-IS | توجيه الشبكة السفلية لعناوين TEP بين الأوراق والأعمدة |\n| COOP | تحتفظ الأعمدة الفقرية بقاعدة بيانات النقاط الطرفية، وتبلّغ الأوراق عن نقاطها المحلية |\n| MP-BGP | الأعمدة الفقرية عاكسات مسارات لـ VPNv4/VPNv6 وEVPN للمسارات الخارجية |\n\nتمرّر الورقة الحركة الأحادية المجهولة إلى عناوين **Proxy TEP** للأعمدة الفقرية (متعددة العناوين)، فتبحث عن النقطة الطرفية في COOP وتوجّه الإطار إلى الورقة الصحيحة. لهذا تستطيع ACI إبقاء غمر ARP معطّلاً افتراضياً في نطاق الجسر (Bridge domain).\n\nتحتفظ **MIT** (شجرة معلومات الإدارة) بكل كائنات الضبط والتشغيل. لكل كائن فئة (`fvTenant` أو `fabricNode`) و**اسم مميَّز (Distinguished name)** مثل `uni/tn-Prod`. وواجهة الرسوم وواجهة REST وسطر الأوامر ومكتبة Python كلها عروض للشجرة نفسها، ولذلك يمكنك النقر في الواجهة ثم فحص الكائن ذاته بالأمر `moquery`."
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "APIC# and leaf verification",
+        "lines": [
+          {
+            "cmd": "acidiag avread",
+            "output": "Local appliance ID=1 ADDRESS=10.0.0.1 TEP ADDRESS=10.0.0.0/16 ROUTABLE IP ADDRESS=0.0.0.0\nChassis ID=3b2a5c4e-... \nCluster of 3 lm(t):1(...) appliances (out of targeted 3 lm(t):3(...)) with FABRIC_DOMAIN name=Fab1 HEALTH=fully-fit"
+          },
+          {
+            "cmd": "acidiag fnvread",
+            "output": "ID  Pod ID  Name     Serial Number  IP Address      Role   State   LastUpdMsgId\n101 1       leaf101  FDO12345AB     10.0.88.95/32   leaf   active  0\n201 1       spine201 FDO67890CD     10.0.88.65/32   spine  active  0"
+          },
+          {
+            "cmd": "moquery -c fabricNode | grep -E \"^(name|role|fabricSt)\"",
+            "output": "name         : leaf101\nrole         : leaf\nfabricSt     : active"
+          },
+          {
+            "comment": "On leaf101:"
+          },
+          {
+            "cmd": "show isis adjacency vrf overlay-1",
+            "output": "System ID       SNPA   Level State Hold Time Interface\nspine201        N/A    1     UP    00:00:27  Ethernet1/49.2"
+          }
+        ],
+        "caption": "تؤكد حالة العنقود fully-fit والعقد active وجوارات IS-IS القائمة سلامة النسيج."
+      },
+      {
+        "id": "rest",
+        "type": "code",
+        "language": "bash",
+        "code": "# Read the same object through the REST API (authenticate first; token omitted)\ncurl -sk -b cookie.txt https://apic.example.com/api/node/class/fabricNode.json \\\n  | python -m json.tool | grep -E '\"(name|role|fabricSt|serial)\"'",
+        "caption": "كل عضو في النسيج كائن من الفئة fabricNode، وتعرض الواجهة وmoquery وREST البيانات نفسها."
+      },
+      {
+        "id": "design",
+        "type": "text",
+        "markdown": "## قرارات تصميم يجدر بك معرفتها\n\nتُتَّخذ عدة قرارات مرة واحدة عند الإعداد ويصعب تغييرها لاحقاً، ولذلك تختبرها مهام المختبر كثيراً:\n\n- **حجم مجمع TEP.** يجب أن يتسع المجمع لكل APIC وورقة وعمود فقري ونقطة TEP افتراضية في النسيج، بما في ذلك كل Pod مستقبلي. الخيار الشائع هو /16، ويجب ألا يتداخل مع أي نطاق عناوين يحتاج النسيج إلى بلوغه مثل شبكات الإدارة أو VMM.\n- **VLAN البنية التحتية.** يجب ألا تستخدمها أي VLAN للخوادم على منفذ متصل بالنسيج، لأن النسيج يحجزها لحركة البنية التحتية. واختيار قيمة يستخدمها فريق المحاكاة الافتراضية خطأ كلاسيكي.\n- **عدد المتحكمات.** الحد الأدنى المعتاد للإنتاج ثلاثة متحكمات APIC. يُقبل متحكم واحد في المختبر، لكن أي صيانة تقطع حينها تغييرات الضبط.\n- **الإدارة خارج النطاق.** أبقِ إدارة APIC والعقد على شبكة منفصلة لتتمكن من بلوغ المتحكمات حتى حين ينكسر النسيج نفسه."
+      },
+      {
+        "id": "trouble",
+        "type": "text",
+        "markdown": "## استكشاف أعطال الاكتشاف\n\nحين لا تظهر عقدة أو تبقى غير نشطة اسأل أين انكسرت السلسلة:\n\n- **ورقة لا تظهر في Fabric Membership.** افحص التوصيل بـ APIC وأن منفذه على VLAN البنية التحتية الصحيحة، وافحص جار LLDP بالأمر `show lldp neighbors` على الورقة. فعدم تطابق VLAN البنية التحتية أو مجمع TEP يمنع كل الخطوات اللاحقة.\n- **ظاهرة لكنها تبقى «قيد الاكتشاف» بعد التسجيل.** لا تستطيع الورقة الوصول إلى APIC أو أن إصدار البرنامج الثابت غير متوافق. تحقّق من `show isis adjacency vrf overlay-1` ومن الصورة على الورقة.\n- **عمود فقري لم يُكتشف.** لا يمكن العثور على العمود الفقري إلا عبر ورقة مسجّلة، فسجّل الأوراق أولاً وتأكد أن جوار IS-IS على منفذ العمود قائم.\n- **APIC يُظهر partially-fit أو not-fit.** افحص `acidiag avread` لمعرفة العضو المفقود وإمكان وصوله عبر البنية التحتية. ولا تعد تشغيل المتحكمات كلها معاً أبداً.\n\nلمراقبة النسيج ودرجات الصحة بعد البناء تابع درس [ACI Fabric Monitoring and Health](/learn/enterprise-datacenter-networking/aci-fabric-monitoring-and-health)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تمسح الضبط باستخفاف",
+        "markdown": "تمسح أوامر مثل `acidiag touch clean` و`setup-clean-config.sh` ضبط العقدة. وعلى APIC في عنقود حيّ يؤدي ذلك إلى إخراجه من الأجزاء (Shards). أوقف خدمته من الواجهة أولاً ولا تمسح أكثر من APIC واحد في كل مرة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في محاكي ACI أو مختبر ACI افتراضي، أقلِع نسيجاً جديداً.\n\n1. شغّل نص إعداد APIC بمجمع TEP هو 10.0.0.0/16 وVLAN للبنية التحتية 3967.\n2. افتح Fabric Membership وسجّل أول ورقة بالمعرّف 101. راقب تحولها من discovering إلى active.\n3. سجّل العمود الفقري بالمعرّف 201 والورقة الثانية بالمعرّف 102.\n4. على APIC نفّذ `acidiag fnvread` ثم `moquery -c fabricNode` وقارن الناتجين.\n5. على ورقة نفّذ `show isis adjacency vrf overlay-1` واشرح أي VRF تنظر إليه ولماذا ليس VRF مستأجر."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "APIC",
+            "definition": "عنقود المتحكمات الذي يخزّن السياسات ويدفعها إلى النسيج وليس في مسار البيانات."
+          },
+          {
+            "term": "مجمع TEP",
+            "definition": "نطاق العناوين الذي يوزّع منه APIC عناوين نقاط نهاية الأنفاق على العقد."
+          },
+          {
+            "term": "VLAN البنية التحتية",
+            "definition": "شبكة VLAN المستخدمة بين APIC والأوراق للاكتشاف وحركة البنية التحتية."
+          },
+          {
+            "term": "عضوية النسيج",
+            "definition": "قائمة الجرد التي يسجّل فيها المسؤول العقد بحسب الرقم التسلسلي."
+          },
+          {
+            "term": "COOP",
+            "definition": "بروتوكول تحتفظ به الأعمدة الفقرية كقاعدة بيانات للنقاط الطرفية تبلّغها الأوراق."
+          },
+          {
+            "term": "Proxy TEP",
+            "definition": "عنوان متعدد العناوين للعمود الفقري يعالج الوجهات المجهولة."
+          },
+          {
+            "term": "overlay-1",
+            "definition": "VRF البنية التحتية الذي تعمل فيه IS-IS وCOOP وMP-BGP."
+          },
+          {
+            "term": "MIT / DN",
+            "definition": "شجرة الكائنات والمسار الفريد لكل كائن فيها."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما الذي يعيّن معرّف العقدة لورقة جديدة تم اكتشافها؟",
+            "options": [
+              "يُعيَّن تلقائياً عبر DHCP",
+              "يسجّلها المسؤول في Fabric Membership",
+              "يختاره العمود الفقري من مجمع TEP",
+              "هو آخر ثمانية من عنوان الإدارة"
+            ],
+            "answer": 1,
+            "explanation": "يمنح الاكتشاف الورقة عنوان TEP لكنها لا تنضم إلا بعد أن يعيّن المسؤول معرّف العقدة والاسم."
+          },
+          {
+            "question": "أي الأجهزة يجوز توصيلها بورقة؟ اختر كل ما ينطبق.",
+            "options": [
+              "APIC",
+              "الخوادم ومضيفات المحاكاة",
+              "عمود فقري",
+              "ورقة أخرى"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "ترتبط الأوراق بالأعمدة الفقرية وAPIC والنقاط الطرفية، ولا تُدعم وصلات ورقة بورقة في Pod واحد."
+          },
+          {
+            "question": "ماذا يحدث للحركة إذا تعطلت متحكمات APIC كلها؟",
+            "options": [
+              "يتوقف النسيج عن التمرير",
+              "يستمر التمرير بالسياسات الموجودة أصلاً على الأوراق",
+              "تتوقف الحركة بين المستأجرين وحدها",
+              "تعيد الأوراق التشغيل"
+            ],
+            "answer": 1,
+            "explanation": "APIC مستوى إدارة وسياسات وليس جزءاً من مسار البيانات."
+          },
+          {
+            "question": "أي البروتوكولات تعمل في VRF البنية التحتية overlay-1؟ اختر كل ما ينطبق.",
+            "options": [
+              "IS-IS",
+              "COOP",
+              "MP-BGP",
+              "Spanning Tree"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "IS-IS للشبكة السفلية وCOOP لربط النقاط الطرفية وMP-BGP للمسارات الخارجية. ولا تستخدم ACI بروتوكول STP داخل النسيج."
+          },
+          {
+            "question": "ورقة مسجّلة لكنها لا تغادر حالة discovering. أي فحص هو الأنفع أولاً؟",
+            "options": [
+              "show vlan brief على العمود الفقري",
+              "show isis adjacency vrf overlay-1 على الورقة",
+              "show ip bgp summary في مستأجر",
+              "show spanning-tree"
+            ],
+            "answer": 1,
+            "explanation": "يجب أن تُكوّن الورقة جوارات IS-IS في overlay-1 لتصل إلى APIC وبقية النسيج."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- ACI نسيج أوراق وأعمدة فقرية يديره عنقود APIC الذي يبقى خارج مسار البيانات.\n- يجري الاكتشاف بـ LLDP ثم DHCP على VLAN البنية التحتية ثم التسجيل اليدوي بالرقم التسلسلي.\n- تشكّل IS-IS وCOOP وMP-BGP البنية التحتية في overlay-1.\n- كل شيء كائن في MIT يمكن بلوغه بالواجهة وREST وmoquery وPython.\n- استكشف أعطال الاكتشاف بالترتيب: التوصيل ثم VLAN البنية التحتية ثم DHCP ثم التسجيل ثم IS-IS.\n\nتعلّم بعد ذلك كيف توصل الخوادم وتقسّم النسيج إلى مستأجرين في درس [ACI Access, Fabric and Tenant Policies](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies)."
+      }
+    ]
+  }
+}

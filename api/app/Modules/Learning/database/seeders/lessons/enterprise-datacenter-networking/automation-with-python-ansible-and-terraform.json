@@ -1,0 +1,590 @@
+{
+ "slug": "automation-with-python-ansible-and-terraform",
+ "title": "Automation with Python, Ansible and Terraform",
+ "summary": "Automate Nexus and ACI with the right tool: Python for APIs, Ansible for idempotent device changes, and Terraform for planned, stateful objects.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Describe NX-API and APIC REST managed objects and distinguished names",
+  "Authenticate to the APIC and create objects with Python",
+  "Write idempotent Ansible tasks for NX-OS and ACI",
+  "Read a Terraform plan and explain state and drift",
+  "Choose the right tool and apply safe automation practices"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Your team must add forty VLANs, forty bridge domains and the matching SVIs to a fabric before Monday. Doing it by hand through a GUI takes a day and leaves no record. Doing it with a script takes minutes, can be reviewed in a pull request, and can be repeated in the test fabric first. This is why the CCIE Data Center lab includes an automation section: you must read an API, send a request, and pick the right tool for the job.\n\nThis lesson compares three tools that solve different problems. **Python** is a general language for calling APIs and parsing replies. **Ansible** applies a described state to many devices and reports what changed. **Terraform** keeps a state file and plans changes before applying them. All three talk to the same programmable interfaces: NX-API on Nexus and the REST API of the ACI APIC. For the controller layer on top of these, see [Nexus Dashboard: Orchestrator, Fabric Controller, Insights](/learn/enterprise-datacenter-networking/nexus-dashboard-orchestrator-fabric-controller-insights)."
+  },
+  {
+   "type": "text",
+   "id": "apis",
+   "markdown": "## The programmable interfaces\n\nAutomation depends on the interface, not the tool.\n\n| Platform | Interface | Data model | Typical use |\n|:--|:--|:--|:--|\n| NX-OS | NX-API CLI | CLI commands in JSON or XML | Run `show` and config commands remotely |\n| NX-OS | NX-API REST | Object tree under `/api/mo/sys` | Read and write configuration as objects |\n| NX-OS | NETCONF, gNMI | YANG | Model-driven config and streaming telemetry |\n| ACI | APIC REST | Managed Information Tree (MIT) under `uni` | Everything in the fabric |\n\nBoth REST APIs use managed objects. Each object has a distinguished name (DN), such as `uni/tn-Prod/BD-web`. A POST to the DN creates or updates the object and its children. A GET reads it. A DELETE removes it. This is the same model the GUI uses, so anything you can click you can script.\n\nAuthentication differs. NX-API takes basic authentication or a login to `/api/aaaLogin.json`. On the APIC you POST credentials to `/api/aaaLogin.json`, receive a token in a cookie named `APIC-cookie`, and send it on every later call. Tokens expire (by default after 10 minutes), so long scripts must refresh.\n\nA useful lab habit is the APIC GUI **API Inspector** and the **Save As** option on any object. Both show the exact JSON the GUI sends, which is the fastest way to learn a payload."
+  },
+  {
+   "type": "code",
+   "id": "py",
+   "language": "python",
+   "filename": "create_tenant.py",
+   "caption": "Log in to the APIC and create a tenant and VRF. Credentials come from the environment, never from the file.",
+   "code": "import os\nimport requests\n\nAPIC = \"https://apic1.example.com\"\ns = requests.Session()\ns.verify = \"/etc/ssl/certs/lab-ca.pem\"  # never disable verification outside a throwaway lab\n\nlogin = {\"aaaUser\": {\"attributes\": {\n    \"name\": os.environ[\"APIC_USER\"], \"pwd\": os.environ[\"APIC_PASS\"]}}}\nr = s.post(f\"{APIC}/api/aaaLogin.json\", json=login, timeout=10)\nr.raise_for_status()\n\npayload = {\"fvTenant\": {\"attributes\": {\"name\": \"Prod\"},\n    \"children\": [{\"fvCtx\": {\"attributes\": {\"name\": \"vrf1\"}}}]}}\nr = s.post(f\"{APIC}/api/mo/uni.json\", json=payload, timeout=10)\nr.raise_for_status()\nprint(r.json())  # an empty imdata list means success"
+  },
+  {
+   "type": "text",
+   "id": "ansible",
+   "markdown": "## Ansible: declare state, report change\n\nAnsible reads a **playbook** (YAML) and runs **modules** against an **inventory**. Collections supply the modules: `cisco.nxos` for Nexus and `cisco.aci` for the APIC. A module compares the desired state with the current state and changes only what differs. That property is called **idempotence**. Run a playbook twice and the second run reports `changed=0`.\n\nTwo habits matter on the lab. Use `state: present` or `state: absent` explicitly. And use `--check` to preview. For NX-OS you set `ansible_connection=ansible.netcommon.network_cli` (or `httpapi` for NX-API) in the inventory. For ACI, the modules call the APIC directly from the control node with `connection: local`-style parameters (host, user, password), so there is no SSH to the fabric.\n\nAnsible is strongest when many devices need the same change in a controlled order, such as pushing a VLAN to forty leaves. It is weaker at tracking what exists, because it does not keep state. It will not delete a resource you simply removed from the playbook."
+  },
+  {
+   "type": "code",
+   "id": "yml",
+   "language": "yaml",
+   "filename": "fabric.yml",
+   "caption": "Idempotent VLAN push on Nexus plus a bridge domain on ACI. Passwords come from Ansible Vault.",
+   "code": "- name: Nexus leaf VLANs\n  hosts: leafs\n  gather_facts: false\n  tasks:\n    - name: Ensure VLAN 110 exists\n      cisco.nxos.nxos_vlans:\n        config:\n          - vlan_id: 110\n            name: WEB\n        state: merged\n\n- name: ACI bridge domain\n  hosts: localhost\n  gather_facts: false\n  tasks:\n    - name: Ensure BD web exists\n      cisco.aci.aci_bd:\n        host: apic1.example.com\n        username: \"{{ apic_user }}\"\n        password: \"{{ apic_pass }}\"\n        validate_certs: true\n        tenant: Prod\n        bd: web\n        vrf: vrf1\n        state: present"
+  },
+  {
+   "type": "text",
+   "id": "tf",
+   "markdown": "## Terraform: plan before you apply\n\nTerraform describes infrastructure in HCL and stores what it created in a **state file**. The `terraform plan` command compares configuration, state and reality, then lists what will be added, changed or destroyed. `terraform apply` executes that plan. The CiscoDevNet `aci` provider exposes ACI objects as resources, and a `nxos` provider exists for NX-API REST.\n\nThe state file is the key difference from Ansible. Because Terraform remembers what it owns, deleting a resource from the configuration deletes the object from the fabric. That is powerful and dangerous. Store state in a remote backend with locking, never in a laptop folder, and review every plan.\n\nTerraform fits tenant-level objects that have a clear lifecycle (tenants, VRFs, bridge domains, EPGs). It fits device-level, ordered tasks less well. Also be careful with drift: a change made in the GUI is not in the state, and the next `plan` will want to undo it. Use `terraform import` to adopt existing objects rather than recreating them."
+  },
+  {
+   "type": "code",
+   "id": "hcl",
+   "language": "hcl",
+   "filename": "main.tf",
+   "caption": "A tenant and VRF. The password is a sensitive variable supplied at run time.",
+   "code": "terraform {\n  required_providers {\n    aci = { source = \"CiscoDevNet/aci\" }\n  }\n}\n\nvariable \"apic_pass\" {\n  type      = string\n  sensitive = true\n}\n\nprovider \"aci\" {\n  username = \"admin\"\n  password = var.apic_pass\n  url      = \"https://apic1.example.com\"\n}\n\nresource \"aci_tenant\" \"prod\" {\n  name = \"Prod\"\n}\n\nresource \"aci_vrf\" \"vrf1\" {\n  tenant_dn = aci_tenant.prod.id\n  name      = \"vrf1\"\n}"
+  },
+  {
+   "type": "animation",
+   "id": "auto-anim",
+   "kind": "sequence",
+   "title": "A change request through the automation pipeline",
+   "data": {
+    "actors": [
+     {
+      "id": "eng",
+      "label": "Engineer",
+      "sub": "Git commit",
+      "icon": "user"
+     },
+     {
+      "id": "ci",
+      "label": "CI runner",
+      "sub": "plan / check",
+      "icon": "cpu"
+     },
+     {
+      "id": "apic",
+      "label": "APIC",
+      "sub": "REST API",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "eng",
+      "to": "ci",
+      "label": "Push change",
+      "detail": "pull request",
+      "note": "The engineer changes the desired state in code and opens a pull request."
+     },
+     {
+      "from": "ci",
+      "to": "ci",
+      "label": "Lint and plan",
+      "note": "The runner validates syntax and produces a plan or an Ansible check-mode result.",
+      "tone": "secure"
+     },
+     {
+      "from": "ci",
+      "to": "eng",
+      "label": "Plan output",
+      "detail": "+2 ~1 -0",
+      "note": "A reviewer reads exactly what will be added, changed or destroyed."
+     },
+     {
+      "from": "eng",
+      "to": "ci",
+      "label": "Approve and merge",
+      "note": "Only after review does the pipeline continue."
+     },
+     {
+      "from": "ci",
+      "to": "apic",
+      "label": "POST /api/mo/uni.json",
+      "detail": "APIC-cookie",
+      "note": "The tool authenticates and sends the objects as JSON."
+     },
+     {
+      "from": "apic",
+      "to": "ci",
+      "label": "200 OK",
+      "detail": "imdata []",
+      "note": "The APIC applies the change atomically and returns success.",
+      "tone": "success"
+     },
+     {
+      "from": "ci",
+      "to": "ci",
+      "label": "Verify",
+      "note": "A post-check reads the objects back and compares them with the intent.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "type": "terminal",
+   "id": "verify",
+   "title": "Reading the result",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "ansible-playbook -i inventory.ini fabric.yml --check",
+     "output": "PLAY RECAP *********************************************\nleaf101  : ok=1  changed=1  unreachable=0  failed=0\nleaf102  : ok=1  changed=0  unreachable=0  failed=0\nlocalhost: ok=1  changed=0  unreachable=0  failed=0",
+     "comment": "Check mode: only leaf101 would change. leaf102 already matches."
+    },
+    {
+     "cmd": "terraform plan",
+     "output": "Terraform will perform the following actions:\n\n  # aci_vrf.vrf1 will be created\n  + resource \"aci_vrf\" \"vrf1\" {\n      + name      = \"vrf1\"\n      + tenant_dn = \"uni/tn-Prod\"\n    }\n\nPlan: 1 to add, 0 to change, 0 to destroy.",
+     "comment": "Always read the destroy count before applying."
+    }
+   ]
+  },
+  {
+   "type": "callout",
+   "id": "cmp",
+   "variant": "tip",
+   "title": "Choosing the tool",
+   "markdown": "Use Python when you need logic, loops or custom reports. Use Ansible for ordered, per-device changes and for quick operational tasks. Use Terraform for long-lived objects whose lifecycle you want tracked. In large teams these combine: Terraform builds tenants, Ansible configures devices, and Python glues the checks together."
+  },
+  {
+   "type": "callout",
+   "id": "warn",
+   "variant": "warning",
+   "title": "Safety rules",
+   "markdown": "- Never put passwords or tokens in a playbook, a `.tf` file or a repository. Use Ansible Vault, environment variables or a secrets manager.\n- Never disable certificate verification outside a throwaway lab.\n- Test in a lab fabric first. A bad `terraform apply` or a wrong `state: absent` can delete a tenant and every EPG in it.\n- Refresh the APIC token for scripts that run longer than its lifetime."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a Cisco DevNet sandbox, a simulator or your own lab APIC.\n\n1. Export `APIC_USER` and `APIC_PASS` as environment variables and run the Python script to create tenant `Prod` and VRF `vrf1`.\n2. Run the script a second time. Note that it succeeds without creating duplicates because POST to a DN is an update.\n3. Write the Ansible `aci_bd` task and run it once, then again. The second run should report `changed=0`.\n4. Create the Terraform files, run `terraform plan`, and read the counts before `apply`.\n\nExpected result: one tenant, one VRF and one bridge domain, and no duplicates after repeated runs."
+  },
+  {
+   "type": "text",
+   "id": "links",
+   "markdown": "## Where automation meets the rest of the fabric\n\nAutomation reuses the objects you already know. The tenant and VRF here become the containers for the policies in [ACI Access, Fabric and Tenant Policies](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies) and [EPGs, ESGs, Contracts and vzAny](/learn/enterprise-datacenter-networking/epgs-esgs-contracts-and-vzany). On the UCS side the same approach applies: Intersight and UCS Manager expose APIs that tools can drive, as shown in [UCS Manager and Intersight Management](/learn/enterprise-datacenter-networking/ucs-manager-and-intersight-management).\n\nA reliable automation workflow has five parts: a source of truth (variables or YAML files in Git), a validation step, a preview, a controlled apply, and a verification. On the lab, if you skip the preview or the verification you will not notice a payload that silently did nothing. The APIC returns HTTP 400 with a text error for most bad payloads, so always print or log the response body, not only the status code.\n\nWhen an API call fails, work through the same short list. Is the token valid? Does the DN's parent exist (a bridge domain needs its tenant)? Is the class name and attribute spelled exactly as the model defines it? Does the account's role allow writes to this tenant? Reading the error text usually answers one of these."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "NX-API",
+     "definition": "HTTP/HTTPS interface on Nexus for CLI commands or REST objects."
+    },
+    {
+     "term": "Managed object (MO)",
+     "definition": "An object in the ACI or NX-OS tree, addressed by a distinguished name."
+    },
+    {
+     "term": "DN",
+     "definition": "Distinguished name, the unique path of an object, such as uni/tn-Prod."
+    },
+    {
+     "term": "Idempotence",
+     "definition": "Running the same task repeatedly gives the same result with no extra change."
+    },
+    {
+     "term": "Playbook",
+     "definition": "An Ansible YAML file listing tasks to run against an inventory."
+    },
+    {
+     "term": "State file",
+     "definition": "Terraform's record of the resources it manages."
+    },
+    {
+     "term": "Drift",
+     "definition": "Difference between real infrastructure and its recorded or declared state."
+    },
+    {
+     "term": "Source of truth",
+     "definition": "The versioned data that defines the intended configuration."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "You run the same Ansible playbook twice. What should the second run report if the modules are idempotent?",
+     "options": [
+      "changed=0",
+      "Every task changed",
+      "A duplicate object per task",
+      "A failed state file"
+     ],
+     "answer": 0,
+     "explanation": "Idempotent modules compare desired and current state and change nothing if they already match."
+    },
+    {
+     "question": "Which statements about Terraform are correct? Choose all that apply.",
+     "options": [
+      "It stores managed resources in a state file",
+      "terraform plan previews additions, changes and destroys",
+      "Removing a resource from the configuration can delete it from the fabric",
+      "It never needs a remote backend"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "State, plan and destroy-on-removal are core behaviors. A remote locked backend is the recommended practice for teams."
+    },
+    {
+     "question": "How does a Python script authenticate to the APIC REST API?",
+     "options": [
+      "POST credentials to /api/aaaLogin.json and reuse the APIC-cookie",
+      "Send an SNMP community string",
+      "Use a Telnet banner",
+      "Open an SSH tunnel to every leaf"
+     ],
+     "answer": 0,
+     "explanation": "The APIC returns a token cookie after a successful login and expects it on later calls."
+    },
+    {
+     "question": "Which practices keep automation safe? Choose all that apply.",
+     "options": [
+      "Store secrets in Ansible Vault or the environment",
+      "Preview with --check or terraform plan",
+      "Test in a lab fabric first",
+      "Hard-code the admin password in the repository"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Secrets management, previews and lab testing reduce risk. Hard-coded passwords leak through version control."
+    },
+    {
+     "question": "A colleague changes a bridge domain in the GUI. What will the next terraform plan most likely show?",
+     "options": [
+      "A change to revert the drift",
+      "Nothing, because Terraform ignores the fabric",
+      "A new tenant",
+      "An SNMP trap"
+     ],
+     "answer": 0,
+     "explanation": "Terraform compares real objects with its configuration and plans to restore the declared values."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nAutomation on Nexus and ACI rests on programmable interfaces: NX-API and the APIC REST API with its managed objects and distinguished names. Python gives you flexibility, Ansible gives idempotent per-device changes, and Terraform gives plan-and-state management for long-lived objects. Keep secrets out of code, verify certificates, preview every change, test in a lab, and always check the response body. On the exam, pick the smallest tool that does the job and prove the result with a read-back."
+  }
+ ],
+ "ar": {
+  "title": "الأتمتة باستخدام Python وAnsible وTerraform",
+  "summary": "أتمتة Nexus وACI بالأداة المناسبة: Python لواجهات API، وAnsible لتغييرات الأجهزة غير المتأثرة بالتكرار، وTerraform للكائنات المخطَّطة ذات الحالة.",
+  "objectives": [
+   "وصف NX-API وكائنات APIC REST المُدارة وأسمائها المميِّزة",
+   "المصادقة إلى APIC وإنشاء الكائنات بـ Python",
+   "كتابة مهام Ansible غير متأثرة بالتكرار لـ NX-OS وACI",
+   "قراءة خطة Terraform وشرح الحالة والانحراف",
+   "اختيار الأداة المناسبة وتطبيق ممارسات أتمتة آمنة"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "عليك إضافة أربعين شبكة VLAN وأربعين نطاق جسر (bridge domains) وواجهات SVI المقابلة إلى النسيج قبل يوم الاثنين. تنفيذ ذلك يدوياً عبر الواجهة الرسومية يستغرق يوماً ولا يترك سجلاً. أما بالنص البرمجي فيستغرق دقائق، ويمكن مراجعته في طلب دمج، ويُجرَّب أولاً في نسيج الاختبار. لهذا يتضمن اختبار CCIE Data Center العملي قسماً للأتمتة: عليك قراءة واجهة API وإرسال طلب واختيار الأداة المناسبة.\n\nيقارن الدرس ثلاث أدوات تحل مشكلات مختلفة. **Python** لغة عامة لاستدعاء واجهات API وتحليل الردود. **Ansible** يطبّق حالة موصوفة على أجهزة كثيرة ويُبلغ عمّا تغيّر. **Terraform** يحتفظ بملف حالة ويخطّط التغييرات قبل تطبيقها. وتتحدث الثلاث مع الواجهات القابلة للبرمجة نفسها: NX-API في Nexus وواجهة REST الخاصة بـ APIC في ACI. وللطبقة الأعلى من المتحكمات انظر [Nexus Dashboard: Orchestrator وFabric Controller وInsights](/learn/enterprise-datacenter-networking/nexus-dashboard-orchestrator-fabric-controller-insights)."
+   },
+   {
+    "type": "text",
+    "id": "apis",
+    "markdown": "## الواجهات القابلة للبرمجة\n\nتعتمد الأتمتة على الواجهة لا على الأداة.\n\n| المنصة | الواجهة | نموذج البيانات | الاستخدام المعتاد |\n|:--|:--|:--|:--|\n| NX-OS | NX-API CLI | أوامر CLI بصيغة JSON أو XML | تنفيذ أوامر `show` والإعداد عن بُعد |\n| NX-OS | NX-API REST | شجرة كائنات تحت `/api/mo/sys` | قراءة الإعداد وكتابته ككائنات |\n| NX-OS | NETCONF وgNMI | YANG | إعداد قائم على النماذج وقياس عن بُعد متدفق |\n| ACI | APIC REST | شجرة المعلومات المُدارة (MIT) تحت `uni` | كل شيء في النسيج |\n\nتستخدم واجهتا REST كائنات مُدارة. لكل كائن اسم مميِّز (DN) مثل `uni/tn-Prod/BD-web`. يُنشئ طلب POST إلى الاسم المميِّز الكائن وأبناءه أو يحدّثهم، ويقرؤه GET، ويحذفه DELETE. وهذا النموذج نفسه الذي تستخدمه الواجهة الرسومية، فكل ما تنقر عليه يمكنك برمجته.\n\nتختلف المصادقة. يقبل NX-API مصادقة أساسية أو تسجيل دخول إلى `/api/aaaLogin.json`. وفي APIC ترسل بيانات الاعتماد بـ POST إلى `/api/aaaLogin.json` فتستلم رمزاً في ملف تعريف باسم `APIC-cookie` وترسله مع كل طلب لاحق. تنتهي صلاحية الرموز (بعد 10 دقائق افتراضياً)، فعلى النصوص الطويلة أن تجدّد الرمز.\n\nعادة مفيدة في المختبر استخدام **API Inspector** في واجهة APIC وخيار **Save As** على أي كائن، فكلاهما يعرض JSON الذي ترسله الواجهة بدقة، وهو أسرع طريق لتعلّم الحمولة."
+   },
+   {
+    "type": "code",
+    "id": "py",
+    "language": "python",
+    "filename": "create_tenant.py",
+    "caption": "تسجيل الدخول إلى APIC وإنشاء مستأجر وVRF. تأتي بيانات الاعتماد من البيئة لا من الملف.",
+    "code": "import os\nimport requests\n\nAPIC = \"https://apic1.example.com\"\ns = requests.Session()\ns.verify = \"/etc/ssl/certs/lab-ca.pem\"  # never disable verification outside a throwaway lab\n\nlogin = {\"aaaUser\": {\"attributes\": {\n    \"name\": os.environ[\"APIC_USER\"], \"pwd\": os.environ[\"APIC_PASS\"]}}}\nr = s.post(f\"{APIC}/api/aaaLogin.json\", json=login, timeout=10)\nr.raise_for_status()\n\npayload = {\"fvTenant\": {\"attributes\": {\"name\": \"Prod\"},\n    \"children\": [{\"fvCtx\": {\"attributes\": {\"name\": \"vrf1\"}}}]}}\nr = s.post(f\"{APIC}/api/mo/uni.json\", json=payload, timeout=10)\nr.raise_for_status()\nprint(r.json())  # an empty imdata list means success"
+   },
+   {
+    "type": "text",
+    "id": "ansible",
+    "markdown": "## Ansible: تعريف الحالة والإبلاغ عن التغيير\n\nيقرأ Ansible **دفتر تشغيل** (playbook) بصيغة YAML وينفّذ **وحدات** (modules) على **قائمة جرد** (inventory). تأتي الوحدات في مجموعات: `cisco.nxos` لـ Nexus و`cisco.aci` لـ APIC. تقارن الوحدة الحالة المطلوبة بالحالة الراهنة وتغيّر ما يختلف فقط، وتسمى هذه الخاصية **عدم التأثر بالتكرار (idempotence)**. إذا شغّلت الدفتر مرتين أبلغ التشغيل الثاني بـ `changed=0`.\n\nعادتان مهمتان في المختبر. استخدم `state: present` أو `state: absent` صراحةً، واستخدم `--check` للمعاينة. في NX-OS تضبط `ansible_connection=ansible.netcommon.network_cli` (أو `httpapi` لـ NX-API) في قائمة الجرد. وفي ACI تستدعي الوحدات APIC مباشرة من عقدة التحكم بمعاملات (المضيف والمستخدم وكلمة المرور)، فلا يوجد SSH إلى النسيج.\n\nيتفوق Ansible حين تحتاج أجهزة كثيرة إلى التغيير نفسه بترتيب منضبط، مثل دفع VLAN إلى أربعين ورقة (leaf). ويضعف في تتبّع الموجود لأنه لا يحتفظ بحالة، فلن يحذف مورداً أزلته ببساطة من الدفتر."
+   },
+   {
+    "type": "code",
+    "id": "yml",
+    "language": "yaml",
+    "filename": "fabric.yml",
+    "caption": "دفع VLAN غير متأثر بالتكرار على Nexus وbridge domain على ACI. تأتي كلمات المرور من Ansible Vault.",
+    "code": "- name: Nexus leaf VLANs\n  hosts: leafs\n  gather_facts: false\n  tasks:\n    - name: Ensure VLAN 110 exists\n      cisco.nxos.nxos_vlans:\n        config:\n          - vlan_id: 110\n            name: WEB\n        state: merged\n\n- name: ACI bridge domain\n  hosts: localhost\n  gather_facts: false\n  tasks:\n    - name: Ensure BD web exists\n      cisco.aci.aci_bd:\n        host: apic1.example.com\n        username: \"{{ apic_user }}\"\n        password: \"{{ apic_pass }}\"\n        validate_certs: true\n        tenant: Prod\n        bd: web\n        vrf: vrf1\n        state: present"
+   },
+   {
+    "type": "text",
+    "id": "tf",
+    "markdown": "## Terraform: خطّط قبل أن تطبّق\n\nيصف Terraform البنية التحتية بلغة HCL ويخزن ما أنشأه في **ملف حالة (state)**. يقارن الأمر `terraform plan` الإعداد والحالة والواقع ثم يسرد ما سيُضاف أو يتغيّر أو يُدمَّر، وينفّذ `terraform apply` تلك الخطة. يعرض المزود `aci` من CiscoDevNet كائنات ACI كموارد، ويوجد مزود `nxos` لـ NX-API REST.\n\nملف الحالة هو الفرق الجوهري عن Ansible. فلأن Terraform يتذكر ما يملكه، فإن حذف مورد من الإعداد يحذف الكائن من النسيج. وهذا قوي وخطر في آن. خزّن الحالة في خلفية بعيدة مع قفل ولا تتركها في مجلد حاسوب محمول، وراجع كل خطة.\n\nيناسب Terraform كائنات مستوى المستأجر ذات دورة الحياة الواضحة (المستأجرون وVRF وbridge domains وEPG)، ويناسب أقل المهام الترتيبية على مستوى الجهاز. وانتبه للانحراف (drift): التغيير الذي يجرى في الواجهة الرسومية غير موجود في الحالة، وسيحاول `plan` التالي التراجع عنه. استخدم `terraform import` لتبنّي الكائنات الموجودة بدل إعادة إنشائها."
+   },
+   {
+    "type": "code",
+    "id": "hcl",
+    "language": "hcl",
+    "filename": "main.tf",
+    "caption": "مستأجر وVRF. كلمة المرور متغير حساس يُمرَّر وقت التشغيل.",
+    "code": "terraform {\n  required_providers {\n    aci = { source = \"CiscoDevNet/aci\" }\n  }\n}\n\nvariable \"apic_pass\" {\n  type      = string\n  sensitive = true\n}\n\nprovider \"aci\" {\n  username = \"admin\"\n  password = var.apic_pass\n  url      = \"https://apic1.example.com\"\n}\n\nresource \"aci_tenant\" \"prod\" {\n  name = \"Prod\"\n}\n\nresource \"aci_vrf\" \"vrf1\" {\n  tenant_dn = aci_tenant.prod.id\n  name      = \"vrf1\"\n}"
+   },
+   {
+    "type": "animation",
+    "id": "auto-anim",
+    "kind": "sequence",
+    "title": "طلب تغيير عبر مسار الأتمتة",
+    "data": {
+     "actors": [
+      {
+       "id": "eng",
+       "label": "Engineer",
+       "sub": "Git commit",
+       "icon": "user"
+      },
+      {
+       "id": "ci",
+       "label": "CI runner",
+       "sub": "plan / check",
+       "icon": "cpu"
+      },
+      {
+       "id": "apic",
+       "label": "APIC",
+       "sub": "REST API",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "eng",
+       "to": "ci",
+       "label": "Push change",
+       "detail": "pull request",
+       "note": "The engineer changes the desired state in code and opens a pull request."
+      },
+      {
+       "from": "ci",
+       "to": "ci",
+       "label": "Lint and plan",
+       "note": "The runner validates syntax and produces a plan or an Ansible check-mode result.",
+       "tone": "secure"
+      },
+      {
+       "from": "ci",
+       "to": "eng",
+       "label": "Plan output",
+       "detail": "+2 ~1 -0",
+       "note": "A reviewer reads exactly what will be added, changed or destroyed."
+      },
+      {
+       "from": "eng",
+       "to": "ci",
+       "label": "Approve and merge",
+       "note": "Only after review does the pipeline continue."
+      },
+      {
+       "from": "ci",
+       "to": "apic",
+       "label": "POST /api/mo/uni.json",
+       "detail": "APIC-cookie",
+       "note": "The tool authenticates and sends the objects as JSON."
+      },
+      {
+       "from": "apic",
+       "to": "ci",
+       "label": "200 OK",
+       "detail": "imdata []",
+       "note": "The APIC applies the change atomically and returns success.",
+       "tone": "success"
+      },
+      {
+       "from": "ci",
+       "to": "ci",
+       "label": "Verify",
+       "note": "A post-check reads the objects back and compares them with the intent.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "type": "terminal",
+    "id": "verify",
+    "title": "قراءة النتيجة",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "ansible-playbook -i inventory.ini fabric.yml --check",
+      "output": "PLAY RECAP *********************************************\nleaf101  : ok=1  changed=1  unreachable=0  failed=0\nleaf102  : ok=1  changed=0  unreachable=0  failed=0\nlocalhost: ok=1  changed=0  unreachable=0  failed=0",
+      "comment": "وضع الفحص: leaf101 فقط سيتغير، أما leaf102 فمطابق مسبقاً."
+     },
+     {
+      "cmd": "terraform plan",
+      "output": "Terraform will perform the following actions:\n\n  # aci_vrf.vrf1 will be created\n  + resource \"aci_vrf\" \"vrf1\" {\n      + name      = \"vrf1\"\n      + tenant_dn = \"uni/tn-Prod\"\n    }\n\nPlan: 1 to add, 0 to change, 0 to destroy.",
+      "comment": "اقرأ دائماً عدد عمليات الحذف قبل التطبيق."
+     }
+    ]
+   },
+   {
+    "type": "callout",
+    "id": "cmp",
+    "variant": "tip",
+    "title": "اختيار الأداة",
+    "markdown": "استخدم Python حين تحتاج منطقاً أو حلقات أو تقارير مخصصة. واستخدم Ansible للتغييرات المرتبة لكل جهاز وللمهام التشغيلية السريعة. واستخدم Terraform للكائنات طويلة العمر التي تريد تتبّع دورة حياتها. وفي الفرق الكبيرة تجتمع هذه: Terraform يبني المستأجرين وAnsible يضبط الأجهزة وPython يربط الفحوص."
+   },
+   {
+    "type": "callout",
+    "id": "warn",
+    "variant": "warning",
+    "title": "قواعد السلامة",
+    "markdown": "- لا تضع كلمات مرور أو رموزاً في دفتر تشغيل أو ملف `.tf` أو مستودع. استخدم Ansible Vault أو متغيرات البيئة أو مدير أسرار.\n- لا تعطّل التحقق من الشهادات خارج مختبر مؤقت.\n- جرّب في نسيج مخبري أولاً. قد يحذف `terraform apply` سيئ أو `state: absent` خاطئ مستأجراً وكل EPG فيه.\n- جدّد رمز APIC في النصوص التي تتجاوز مدة صلاحيته."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم بيئة DevNet التجريبية أو محاكياً أو APIC مخبرياً خاصاً بك.\n\n1. صدّر `APIC_USER` و`APIC_PASS` كمتغيرات بيئة ثم شغّل نص Python لإنشاء المستأجر `Prod` وVRF باسم `vrf1`.\n2. شغّل النص مرة ثانية ولاحظ نجاحه دون تكرار، لأن POST إلى DN تحديث للكائن.\n3. اكتب مهمة Ansible `aci_bd` وشغّلها مرة ثم مرة أخرى. يجب أن يُبلغ التشغيل الثاني بـ `changed=0`.\n4. أنشئ ملفات Terraform ثم شغّل `terraform plan` واقرأ الأعداد قبل `apply`.\n\nالنتيجة المتوقعة: مستأجر واحد وVRF واحد وbridge domain واحد دون تكرار بعد التشغيل المتكرر."
+   },
+   {
+    "type": "text",
+    "id": "links",
+    "markdown": "## حيث تلتقي الأتمتة ببقية النسيج\n\nتعيد الأتمتة استخدام الكائنات التي تعرفها. يصبح المستأجر وVRF هنا حاويتين لسياسات [سياسات ACI للوصول والنسيج والمستأجر](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies) و[EPG وESG والعقود وvzAny](/learn/enterprise-datacenter-networking/epgs-esgs-contracts-and-vzany). وفي جانب UCS ينطبق النهج نفسه: يتيح Intersight وUCS Manager واجهات API تقودها الأدوات، كما في [UCS Manager وإدارة Intersight](/learn/enterprise-datacenter-networking/ucs-manager-and-intersight-management).\n\nلسير عمل أتمتة موثوق خمسة أجزاء: مصدر للحقيقة (متغيرات أو ملفات YAML في Git)، وخطوة تحقق، ومعاينة، وتطبيق منضبط، وفحص لاحق. إن تخطيت المعاينة أو الفحص في الاختبار فلن تلاحظ حمولة لم تفعل شيئاً بصمت. يعيد APIC الرمز HTTP 400 مع نص خطأ لمعظم الحمولات السيئة، فاطبع أو سجّل جسم الرد دائماً لا رمز الحالة فقط.\n\nعندما يفشل استدعاء API اتبع القائمة القصيرة نفسها. هل الرمز صالح؟ هل الأب في الاسم المميِّز موجود (يحتاج الـ bridge domain إلى مستأجره)؟ هل اسم الفئة والخاصية مكتوبان كما يعرّفهما النموذج بالضبط؟ وهل يسمح دور الحساب بالكتابة في هذا المستأجر؟ وقراءة نص الخطأ تجيب عادةً عن أحدها."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "NX-API",
+      "definition": "واجهة HTTP/HTTPS على Nexus لأوامر CLI أو كائنات REST."
+     },
+     {
+      "term": "Managed object (MO)",
+      "definition": "كائن في شجرة ACI أو NX-OS يُعنوَن باسم مميِّز."
+     },
+     {
+      "term": "DN",
+      "definition": "الاسم المميِّز: المسار الفريد للكائن مثل uni/tn-Prod."
+     },
+     {
+      "term": "Idempotence",
+      "definition": "تكرار المهمة نفسها يعطي النتيجة نفسها دون تغيير إضافي."
+     },
+     {
+      "term": "Playbook",
+      "definition": "ملف YAML في Ansible يسرد المهام المنفذة على قائمة الجرد."
+     },
+     {
+      "term": "State file",
+      "definition": "سجل Terraform للموارد التي يديرها."
+     },
+     {
+      "term": "Drift",
+      "definition": "الفرق بين البنية الفعلية وحالتها المسجلة أو المعلنة."
+     },
+     {
+      "term": "Source of truth",
+      "definition": "البيانات المُصدَّرة بالإصدارات التي تعرّف الإعداد المقصود."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "شغّلت دفتر Ansible نفسه مرتين. ماذا يجب أن يبلغ التشغيل الثاني إن كانت الوحدات غير متأثرة بالتكرار؟",
+      "options": [
+       "changed=0",
+       "Every task changed",
+       "A duplicate object per task",
+       "A failed state file"
+      ],
+      "answer": 0,
+      "explanation": "تقارن الوحدات الحالة المطلوبة بالراهنة ولا تغيّر شيئاً إن تطابقتا."
+     },
+     {
+      "question": "أي العبارات عن Terraform صحيحة؟ اختر كل ما ينطبق.",
+      "options": [
+       "يخزن الموارد المُدارة في ملف حالة",
+       "يعرض plan الإضافات والتغييرات والحذف",
+       "إزالة مورد من الإعداد قد تحذفه من النسيج",
+       "لا يحتاج أبداً إلى خلفية بعيدة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "الحالة والخطة والحذف عند الإزالة سلوكيات أساسية، والخلفية البعيدة المقفلة هي الممارسة الموصى بها للفرق."
+     },
+     {
+      "question": "كيف يصادق نص Python على واجهة APIC REST؟",
+      "options": [
+       "إرسال بيانات الاعتماد بـ POST إلى /api/aaaLogin.json وإعادة استخدام APIC-cookie",
+       "إرسال سلسلة مجتمع SNMP",
+       "استخدام لافتة Telnet",
+       "فتح نفق SSH إلى كل ورقة"
+      ],
+      "answer": 0,
+      "explanation": "يعيد APIC ملف تعريف الرمز بعد تسجيل دخول ناجح ويتوقعه في الطلبات اللاحقة."
+     },
+     {
+      "question": "أي الممارسات تُبقي الأتمتة آمنة؟ اختر كل ما ينطبق.",
+      "options": [
+       "تخزين الأسرار في Ansible Vault أو البيئة",
+       "المعاينة بـ --check أو terraform plan",
+       "الاختبار في نسيج مخبري أولاً",
+       "كتابة كلمة مرور المسؤول داخل المستودع"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "تقلل إدارة الأسرار والمعاينة والاختبار المخبري المخاطر، وتتسرب كلمات المرور المضمّنة عبر نظام الإصدارات."
+     },
+     {
+      "question": "غيّر زميل bridge domain في الواجهة الرسومية. ما الذي سيُظهره terraform plan التالي غالباً؟",
+      "options": [
+       "تغييراً للتراجع عن الانحراف",
+       "لا شيء، لأن Terraform يتجاهل النسيج",
+       "مستأجراً جديداً",
+       "فخ SNMP"
+      ],
+      "answer": 0,
+      "explanation": "يقارن Terraform الكائنات الفعلية بإعداده ويخطط لاستعادة القيم المعلنة."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nتقوم الأتمتة على Nexus وACI على واجهات قابلة للبرمجة: NX-API وواجهة APIC REST بكائناتها المُدارة وأسمائها المميِّزة. يمنحك Python المرونة، ويمنحك Ansible تغييرات غير متأثرة بالتكرار لكل جهاز، ويمنحك Terraform إدارة بالخطة والحالة للكائنات طويلة العمر. أبقِ الأسرار خارج الشيفرة وتحقق من الشهادات وعاين كل تغيير واختبر في مختبر وافحص جسم الرد دائماً. وفي الاختبار اختر أصغر أداة تؤدي المهمة وأثبت النتيجة بقراءة عكسية."
+   }
+  ]
+ }
+}

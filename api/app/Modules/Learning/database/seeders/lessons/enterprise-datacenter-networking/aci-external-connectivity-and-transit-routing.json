@@ -1,0 +1,560 @@
+{
+ "slug": "aci-external-connectivity-and-transit-routing",
+ "title": "ACI External Connectivity and Transit Routing",
+ "summary": "Build L3Outs, classify and control external prefixes with external EPG subnet scopes, and configure transit routing and inter-VRF route leaking.",
+ "duration_minutes": 40,
+ "objectives": [
+  "Describe the L3Out object hierarchy and choose the right interface type",
+  "Explain how external routes travel through the fabric using MP-BGP route reflection",
+  "Distinguish external EPG subnet scopes for classification and route control",
+  "Configure transit routing and inter-VRF route leaking and verify them"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "The tenant is up, servers talk to each other through contracts, and then the business asks for three things at once: users in the campus must reach the web tier, the web tier must reach a partner over a WAN router, and the partner's prefixes must also be visible to a second data center through a different router. Inside the fabric all of that is policy. At the edge it is routing, and mistakes there leak routes, blackhole traffic or let the wrong prefix into the wrong EPG.\n\nACI connects to the outside through **L3Outs**. The CCIE Data Center lab tests whether you can build one, classify external prefixes, control which routes enter and leave, and configure **transit routing** and **inter-VRF route leaking**. This lesson assumes you know the tenant model from [ACI Access, Fabric and Tenant Policies](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies), and the routing protocols from [OSPF, IS-IS, BGP and BFD](/learn/enterprise-datacenter-networking/ospf-is-is-bgp-and-bfd)."
+  },
+  {
+   "id": "l3out",
+   "type": "text",
+   "markdown": "## Anatomy of an L3Out\n\nAn L3Out is a set of objects under a tenant, tied to **one VRF**. Learn the parts and the order in which you build them.\n\n1. **L3Out** (`l3extOut`): the container. It references the VRF, an external routed **domain** (with a VLAN pool if you use SVIs or sub-interfaces) and the routing protocol (OSPF, EIGRP, BGP or none for static routes).\n2. **Logical node profile**: selects the **border leaf** nodes and gives each a **router ID**. Static routes are defined here.\n3. **Logical interface profile**: selects the ports and the interface type: **routed port**, **routed sub-interface** (802.1Q tagged) or **SVI** (a VLAN shared by several ports, needed for vPC). Each interface has an address and the protocol's interface policy.\n4. **External EPG** (`l3extInstP`): classifies outside prefixes into a policy group so contracts can reference them.\n\nThe leaves that run the L3Out learn external routes and hand them to the **spines**, which act as **MP-BGP route reflectors** in the infra VRF `overlay-1`. The spines distribute the routes to every leaf that has the VRF deployed. For this to work, an **MP-BGP route reflector policy** with the fabric ASN and at least two spines must exist; without it, no external route leaves the border leaf.\n\nAnd the reverse direction: a bridge domain subnet is advertised outward only if the subnet is marked **Advertised Externally** (public) *and* the BD is associated with the L3Out."
+  },
+  {
+   "id": "l3json",
+   "type": "code",
+   "language": "json",
+   "code": "{\"l3extOut\": {\"attributes\": {\"name\": \"L3Out-WAN\"}, \"children\": [\n  {\"l3extRsEctx\": {\"attributes\": {\"tnFvCtxName\": \"VRF1\"}}},\n  {\"l3extRsL3DomAtt\": {\"attributes\": {\"tDn\": \"uni/l3dom-L3Dom-WAN\"}}},\n  {\"ospfExtP\": {\"attributes\": {\"areaId\": \"0.0.0.1\", \"areaType\": \"regular\"}}},\n  {\"l3extLNodeP\": {\"attributes\": {\"name\": \"BL-101\"}, \"children\": [\n    {\"l3extRsNodeL3OutAtt\": {\"attributes\": {\"tDn\": \"topology/pod-1/node-101\", \"rtrId\": \"10.255.0.101\"}}},\n    {\"l3extLIfP\": {\"attributes\": {\"name\": \"IF-eth1-20\"}, \"children\": [\n      {\"ospfIfP\": {\"attributes\": {}}},\n      {\"l3extRsPathL3OutAtt\": {\"attributes\": {\"tDn\": \"topology/pod-1/paths-101/pathep-[eth1/20]\",\n        \"ifInstT\": \"l3-port\", \"addr\": \"198.51.100.1/30\"}}}]}}]}},\n  {\"l3extInstP\": {\"attributes\": {\"name\": \"WAN-ALL\"}, \"children\": [\n    {\"l3extSubnet\": {\"attributes\": {\"ip\": \"0.0.0.0/0\", \"scope\": \"import-security\"}}}]}}\n]}}",
+   "filename": "POST https://apic.example.com/api/mo/uni/tn-Prod.json",
+   "caption": "A minimal OSPF L3Out on border leaf 101 using a routed port. The external EPG classifies every outside prefix (0.0.0.0/0 with scope import-security) so a contract can reference it.",
+   "highlight": [
+    8,
+    13,
+    14,
+    15
+   ]
+  },
+  {
+   "id": "subnets",
+   "type": "text",
+   "markdown": "## External EPG subnet scopes\n\nThe checkboxes on an external EPG subnet are where most L3Out mistakes live. Each one has a single job.\n\n| Scope | What it does |\n|:--|:--|\n| **External Subnets for the External EPG** (`import-security`) | Classifies matching source or destination prefixes into this EPG for **contracts**. It does not filter routes. |\n| **Export Route Control Subnet** (`export-rtctrl`) | Allows the prefix to be **advertised out** of this L3Out. Used for transit routing. |\n| **Import Route Control Subnet** (`import-rtctrl`) | Allows the prefix to be **accepted in**, but only when *Import Route Control Enforcement* is enabled on the L3Out. |\n| **Shared Route Control Subnet** (`shared-rctrl`) | Leaks the route into other VRFs. |\n| **Shared Security Import Subnet** (`shared-security`) | Classifies the prefix for contracts in the consumer VRF. |\n| **Aggregate options** | Treat the subnet as a range that matches longer prefixes. |\n\nThe golden rule: **security classification and route control are separate.** A prefix that is classified but not imported is not in the routing table. A prefix that is imported but not classified falls into the VRF-wide default external class, so contracts written for your specific external EPG will not match it. Always design both.\n\nRoute maps are applied through **route profiles** (`rtctrlProfile`) for finer control: match on prefix lists, set local preference, MED, AS path or communities. Per-VRF **route tags** (default 4294967295) are applied to routes that ACI redistributes into OSPF, which helps prevent loops when more than one border device redistributes between domains."
+  },
+  {
+   "id": "transit",
+   "type": "text",
+   "markdown": "## Transit routing and route leaking\n\n### Transit routing\n\nIn **transit routing** the fabric learns prefixes from one L3Out and advertises them out of another, in the same VRF. Think of ACI as a very large router between two WANs. Three things must be true:\n\n- On the **source** L3Out, the prefix is imported (and classified if you want a contract).\n- On the **destination** L3Out, the same prefix carries **Export Route Control Subnet** in an external EPG. Otherwise ACI never advertises it.\n- A **contract** is needed between the two external EPGs for the data traffic to pass, just as for any two EPGs.\n\nThe common failure is a perfectly healthy routing adjacency with a missing contract: the prefix appears on the far router, and every packet is dropped by policy.\n\n### Inter-VRF route leaking (shared services)\n\nTo let tenants or VRFs reach a common service such as a shared L3Out or DNS EPG, ACI leaks routes between VRFs:\n\n1. The **provider** marks its BD subnet **Shared between VRFs** and the contract is exported or placed in tenant `common`.\n2. The **consumer** EPG consumes the contract. Because the VRFs differ, the APIC installs the provider's subnet in the consumer VRF and the consumer's subnet in the provider VRF.\n3. For shared L3Outs, the external EPG subnet needs **Shared Route Control** and **Shared Security Import**.\n\nOverlapping subnets cannot be leaked. Plan addressing before you share."
+  },
+  {
+   "id": "transit-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Transit routing between two L3Outs",
+   "caption": "A prefix learned on L3Out A is advertised on L3Out B only with export control, and traffic passes only with a contract.",
+   "data": {
+    "token": "Route 203.0.113.0/24",
+    "nodes": [
+     {
+      "id": "wan1",
+      "label": "WAN router A",
+      "sub": "partner side",
+      "icon": "router"
+     },
+     {
+      "id": "bl1",
+      "label": "Border leaf 101",
+      "sub": "L3Out-A import",
+      "icon": "switch"
+     },
+     {
+      "id": "sp",
+      "label": "Spine",
+      "sub": "MP-BGP RR",
+      "icon": "cloud"
+     },
+     {
+      "id": "bl2",
+      "label": "Border leaf 102",
+      "sub": "L3Out-B export",
+      "icon": "switch"
+     },
+     {
+      "id": "wan2",
+      "label": "WAN router B",
+      "sub": "DC2 side",
+      "icon": "router"
+     }
+    ],
+    "steps": [
+     {
+      "at": "wan1",
+      "caption": "Router A advertises 203.0.113.0/24 over OSPF."
+     },
+     {
+      "at": "bl1",
+      "caption": "Leaf 101 imports the prefix and classifies it in external EPG A (import-security).",
+      "tone": "secure"
+     },
+     {
+      "at": "sp",
+      "caption": "The spine reflects the VPNv4 route to all leaves where the VRF exists."
+     },
+     {
+      "at": "bl2",
+      "caption": "Leaf 102 sees the prefix, but advertises it only if external EPG B marks it Export Route Control.",
+      "tone": "warning"
+     },
+     {
+      "at": "wan2",
+      "caption": "Router B receives the prefix in its routing table. Control plane is done."
+     },
+     {
+      "at": "wan2",
+      "caption": "Router B sends a packet toward 203.0.113.10. Without a contract between the two external EPGs, leaf 102 drops it.",
+      "tone": "danger"
+     },
+     {
+      "at": "wan1",
+      "caption": "With a contract applied, the packet is forwarded through the fabric and delivered.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "verify",
+   "type": "terminal",
+   "title": "Verifying an L3Out on the border leaf",
+   "prompt": "bl-101#",
+   "lines": [
+    {
+     "cmd": "show ip ospf neighbors vrf Prod:VRF1",
+     "output": " OSPF Process ID default VRF Prod:VRF1\n Total number of neighbors: 1\n Neighbor ID     Pri State            Up Time  Address         Interface\n 192.0.2.1         1 FULL/BDR         00:12:41 198.51.100.2    Eth1/20"
+    },
+    {
+     "comment": "The adjacency with the WAN router is FULL. Stuck in INIT or EXSTART points to MTU, area or interface-type mismatches."
+    },
+    {
+     "cmd": "show ip route vrf Prod:VRF1 203.0.113.0/24",
+     "output": "203.0.113.0/24, ubest/mbest: 1/0\n    *via 198.51.100.2, Eth1/20, [110/20], 00:12:30, ospf-default, type-2, tag 4294967295"
+    },
+    {
+     "comment": "The prefix is in the VRF table. If it is missing, check import route control and the route profile."
+    },
+    {
+     "cmd": "show bgp vpnv4 unicast summary vrf overlay-1",
+     "output": "Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd\n10.0.96.64      4 65001    5230    5210       84    0    0 3d02h    7"
+    },
+    {
+     "comment": "The leaf has an MP-BGP session to the spine route reflector. Without it, external routes do not leave this border leaf."
+    }
+   ]
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Expecting `import-security` to filter routes. It only classifies; use import route control for filtering.\n- Forgetting to mark the BD subnet **Advertised Externally** and to associate the BD with the L3Out. The external router never learns the subnet.\n- Using a routed port where vPC is needed. Only an SVI works across a vPC pair.\n- Building a transit design with correct export scopes but no contract between the two external EPGs.\n- Leaking overlapping subnets between VRFs."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab or simulator with two external routers (use RFC 1918 and documentation addresses only):\n\n1. Build `L3Out-A` (OSPF, area 0.0.0.1) and `L3Out-B` (OSPF, area 0.0.0.2) in the same VRF on two border leaves.\n2. Make router A advertise `203.0.113.0/24`. Confirm it appears in `show ip route vrf Prod:VRF1` on the border leaf.\n3. Check that router B does **not** have the prefix. Add `203.0.113.0/24` with **Export Route Control Subnet** to the external EPG of `L3Out-B`.\n4. Ping from router B toward the prefix and observe the drop. Add a contract provided by one external EPG and consumed by the other, and ping again.\n\nExpected result: you can state what each of the three steps (import, export, contract) changed."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "L3Out",
+     "definition": "The tenant object set that connects one VRF to external routed networks."
+    },
+    {
+     "term": "Border leaf",
+     "definition": "A leaf that runs an L3Out and exchanges routes with external routers."
+    },
+    {
+     "term": "External EPG",
+     "definition": "An EPG that classifies outside prefixes so contracts can reference them."
+    },
+    {
+     "term": "import-security",
+     "definition": "Subnet scope that classifies prefixes for contracts; it does not filter routes."
+    },
+    {
+     "term": "Export Route Control",
+     "definition": "Subnet scope that allows a prefix to be advertised out of an L3Out."
+    },
+    {
+     "term": "Transit routing",
+     "definition": "Learning routes on one L3Out and advertising them from another in the same VRF."
+    },
+    {
+     "term": "Route leaking",
+     "definition": "Sharing routes and policy between VRFs for shared services."
+    },
+    {
+     "term": "Route profile",
+     "definition": "A route map object that sets match and set rules on imported or exported routes."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "An external EPG subnet has only External Subnets for the External EPG checked. What does it do?",
+     "options": [
+      "Imports the route and advertises it",
+      "Classifies matching traffic for contracts but does not control route import or export",
+      "Leaks the route to other VRFs",
+      "Blocks the route"
+     ],
+     "answer": 1,
+     "explanation": "import-security is classification for contracts only. Route import and export have their own scopes."
+    },
+    {
+     "question": "What is required for a BD subnet to be advertised to an external router? Choose all that apply.",
+     "options": [
+      "Subnet scope Advertised Externally",
+      "BD associated with the L3Out",
+      "A contract between the BD and the router",
+      "An MP-BGP route reflector policy in the fabric"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "The subnet must be public, the BD must be tied to the L3Out, and the fabric needs MP-BGP route reflection. A contract affects data traffic, not advertisement."
+    },
+    {
+     "question": "Router B has the transit prefix in its routing table, yet pings fail. What is the most likely cause?",
+     "options": [
+      "A missing contract between the two external EPGs",
+      "The OSPF area is wrong",
+      "The VRF has no spines",
+      "The prefix was not imported"
+     ],
+     "answer": 0,
+     "explanation": "The prefix reached router B, so routing and export work. Dropped data traffic after that points to missing policy."
+    },
+    {
+     "question": "Which interface type must be used on a border leaf pair in vPC that share one external connection?",
+     "options": [
+      "Routed port",
+      "Routed sub-interface",
+      "SVI",
+      "Loopback"
+     ],
+     "answer": 2,
+     "explanation": "Only an SVI, with a VLAN shared across the vPC pair, can span both leaves. Routed ports and sub-interfaces are local to one node."
+    },
+    {
+     "question": "Which are needed to leak a provider's subnet into a consumer VRF? Choose all that apply.",
+     "options": [
+      "The provider BD subnet marked Shared between VRFs",
+      "A contract between the provider and the consumer EPGs",
+      "Non-overlapping subnets",
+      "An L3Out in both VRFs"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Leaking is driven by the contract relationship and the shared flag, and fails on overlapping subnets. An L3Out is not required."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- An L3Out ties one VRF to the outside through a node profile, interface profile and external EPG. Use SVIs for vPC.\n- The fabric spreads external routes with MP-BGP route reflection on the spines; BD subnets leave only when advertised externally and tied to the L3Out.\n- External EPG scopes separate **classification** (`import-security`) from **route control** (import, export, shared).\n- Transit routing needs import on one L3Out, export on the other and a contract between the two external EPGs.\n- Route leaking uses shared flags and contracts, and cannot work with overlapping subnets.\n\nNext, extend the fabric across locations in [Multi-Site, Multi-Pod and Remote Leaf](/learn/enterprise-datacenter-networking/multi-site-multi-pod-and-remote-leaf)."
+  }
+ ],
+ "ar": {
+  "title": "الاتصال الخارجي وتوجيه العبور في ACI",
+  "summary": "بناء L3Out، وتصنيف البادئات الخارجية والتحكم فيها بنطاقات الشبكات الفرعية في EPG الخارجية، وضبط توجيه العبور وتسريب المسارات بين VRF.",
+  "objectives": [
+   "وصف التسلسل الهرمي لكائنات L3Out واختيار نوع الواجهة المناسب",
+   "شرح كيف تنتقل المسارات الخارجية داخل النسيج بعكس المسارات في MP-BGP",
+   "التمييز بين نطاقات الشبكات الفرعية في EPG الخارجية للتصنيف وللتحكم في المسارات",
+   "ضبط توجيه العبور وتسريب المسارات بين VRF والتحقق منهما"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "أصبح المستأجر يعمل، وتتخاطب الخوادم عبر العقود، ثم يطلب العمل ثلاثة أمور معاً: أن يصل مستخدمو الحرم الجامعي (Campus) إلى طبقة الويب، وأن تصل طبقة الويب إلى شريك عبر موجّه WAN، وأن تُرى بادئات (Prefixes) الشريك أيضاً من مركز بيانات ثانٍ عبر موجّه آخر. داخل النسيج كل ذلك سياسات، وعند الحافة هو توجيه، والأخطاء هناك تسرّب المسارات أو تُسقط الحركة أو تُدخل البادئة الخطأ إلى EPG الخطأ.\n\nيتصل ACI بالخارج عبر **L3Out**. ويختبر CCIE Data Center العملي قدرتك على بنائها، وتصنيف البادئات الخارجية، والتحكم فيما يدخل وما يخرج من المسارات، وضبط **توجيه العبور (Transit routing)** و**تسريب المسارات بين VRF**. يفترض الدرس معرفتك بنموذج المستأجر من [ACI Access, Fabric and Tenant Policies](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies) وببروتوكولات التوجيه من [OSPF, IS-IS, BGP and BFD](/learn/enterprise-datacenter-networking/ospf-is-is-bgp-and-bfd)."
+   },
+   {
+    "id": "l3out",
+    "type": "text",
+    "markdown": "## تشريح L3Out\n\nمجموعة L3Out كائنات تحت مستأجر وترتبط بـ **VRF واحدة**. تعلّم الأجزاء وترتيب بنائها.\n\n1. **L3Out** (`l3extOut`): الحاوية. تشير إلى VRF ونطاق توجيه خارجي (**Domain**) مع مجمّع VLAN إذا استخدمت SVI أو واجهات فرعية، وإلى بروتوكول التوجيه (OSPF أو EIGRP أو BGP أو لا شيء للمسارات الثابتة).\n2. **ملف العقدة المنطقي (Logical node profile)**: يختار أوراق **الحافة (Border leaf)** ويعطي كلاً منها **معرّف موجّه (Router ID)**. وتُعرَّف المسارات الثابتة هنا.\n3. **ملف الواجهة المنطقي (Logical interface profile)**: يختار المنافذ ونوع الواجهة: **منفذ موجّه** أو **واجهة فرعية موجّهة** (موسومة 802.1Q) أو **SVI** (VLAN مشتركة بين عدة منافذ ولازمة لـ vPC). ولكل واجهة عنوان وسياسة البروتوكول.\n4. **EPG الخارجية (External EPG)** (`l3extInstP`): تصنّف البادئات الخارجية في مجموعة سياسة لتتمكن العقود من الإشارة إليها.\n\nتتعلّم الأوراق التي تشغّل L3Out المسارات الخارجية وتسلّمها إلى **العُمُد (Spines)** التي تعمل **عاكسات مسارات (Route reflectors) في MP-BGP** داخل VRF البنية التحتية `overlay-1`. وتوزّع العُمُد المسارات على كل ورقة نُشرت عليها VRF. ولكي يعمل ذلك لا بد من **سياسة MP-BGP Route Reflector** تحمل رقم AS للنسيج وعمودين على الأقل؛ وبدونها لا يغادر أي مسار خارجي ورقة الحافة.\n\nوفي الاتجاه المعاكس: لا تُعلَن شبكة فرعية في BD نحو الخارج إلا إذا وُسمت **Advertised Externally** (عامة) *وكانت* BD مرتبطة بـ L3Out."
+   },
+   {
+    "id": "l3json",
+    "type": "code",
+    "language": "json",
+    "code": "{\"l3extOut\": {\"attributes\": {\"name\": \"L3Out-WAN\"}, \"children\": [\n  {\"l3extRsEctx\": {\"attributes\": {\"tnFvCtxName\": \"VRF1\"}}},\n  {\"l3extRsL3DomAtt\": {\"attributes\": {\"tDn\": \"uni/l3dom-L3Dom-WAN\"}}},\n  {\"ospfExtP\": {\"attributes\": {\"areaId\": \"0.0.0.1\", \"areaType\": \"regular\"}}},\n  {\"l3extLNodeP\": {\"attributes\": {\"name\": \"BL-101\"}, \"children\": [\n    {\"l3extRsNodeL3OutAtt\": {\"attributes\": {\"tDn\": \"topology/pod-1/node-101\", \"rtrId\": \"10.255.0.101\"}}},\n    {\"l3extLIfP\": {\"attributes\": {\"name\": \"IF-eth1-20\"}, \"children\": [\n      {\"ospfIfP\": {\"attributes\": {}}},\n      {\"l3extRsPathL3OutAtt\": {\"attributes\": {\"tDn\": \"topology/pod-1/paths-101/pathep-[eth1/20]\",\n        \"ifInstT\": \"l3-port\", \"addr\": \"198.51.100.1/30\"}}}]}}]}},\n  {\"l3extInstP\": {\"attributes\": {\"name\": \"WAN-ALL\"}, \"children\": [\n    {\"l3extSubnet\": {\"attributes\": {\"ip\": \"0.0.0.0/0\", \"scope\": \"import-security\"}}}]}}\n]}}",
+    "filename": "POST https://apic.example.com/api/mo/uni/tn-Prod.json",
+    "caption": "L3Out بسيطة بنمط OSPF على ورقة الحافة 101 بمنفذ موجّه. تصنّف EPG الخارجية كل البادئات الخارجية (0.0.0.0/0 بنطاق import-security) لتتمكن العقود من الإشارة إليها.",
+    "highlight": [
+     8,
+     13,
+     14,
+     15
+    ]
+   },
+   {
+    "id": "subnets",
+    "type": "text",
+    "markdown": "## نطاقات الشبكات الفرعية في EPG الخارجية\n\nتكمن معظم أخطاء L3Out في مربعات الاختيار الخاصة بالشبكة الفرعية في EPG الخارجية. ولكل منها مهمة واحدة.\n\n| النطاق | وظيفته |\n|:--|:--|\n| **External Subnets for the External EPG** (`import-security`) | يصنّف البادئات المطابقة، مصدراً أو وجهة، في هذه EPG لأغراض **العقود**. ولا يرشّح المسارات. |\n| **Export Route Control Subnet** (`export-rtctrl`) | يسمح بـ **إعلان** البادئة إلى الخارج من هذه L3Out. ويُستخدم في توجيه العبور. |\n| **Import Route Control Subnet** (`import-rtctrl`) | يسمح **بقبول** البادئة، لكن فقط عند تفعيل *Import Route Control Enforcement* على L3Out. |\n| **Shared Route Control Subnet** (`shared-rctrl`) | يسرّب المسار إلى VRF أخرى. |\n| **Shared Security Import Subnet** (`shared-security`) | يصنّف البادئة لأغراض العقود في VRF المستهلِكة. |\n| **خيارات التجميع (Aggregate)** | تعامل الشبكة الفرعية كنطاق يطابق بادئات أطول. |\n\nالقاعدة الذهبية: **التصنيف الأمني والتحكم في المسارات أمران منفصلان.** البادئة المصنّفة التي لم تُستورد لا تظهر في جدول التوجيه. والبادئة المستوردة غير المصنّفة تقع في الفئة الخارجية الافتراضية على مستوى VRF، فلا تطابقها العقود المكتوبة لـ EPG الخارجية المحددة. صمّم الاثنين دائماً.\n\nوتُطبَّق خرائط المسارات (Route maps) عبر **ملفات المسارات (Route profiles)** (`rtctrlProfile`) لتحكم أدق: المطابقة على قوائم البادئات، وضبط التفضيل المحلي وMED ومسار AS والمجتمعات. ويُوسَم كل مسار تعيد ACI توزيعه إلى OSPF بـ **وسم مسار (Route tag)** لكل VRF (القيمة الافتراضية 4294967295)، وهذا يساعد على منع الحلقات عندما يعيد أكثر من جهاز حافة التوزيع بين النطاقات."
+   },
+   {
+    "id": "transit",
+    "type": "text",
+    "markdown": "## توجيه العبور وتسريب المسارات\n\n### توجيه العبور (Transit routing)\n\nفي **توجيه العبور** يتعلّم النسيج بادئات من L3Out ويعلنها من L3Out أخرى في VRF نفسها. تخيّل ACI موجّهاً ضخماً بين شبكتَي WAN. ويجب تحقق ثلاثة أمور:\n\n- على L3Out **المصدر** تُستورد البادئة (وتُصنَّف إن أردت عقداً).\n- على L3Out **الوجهة** تحمل البادئة نفسها **Export Route Control Subnet** في EPG خارجية. وإلا لن تعلنها ACI أبداً.\n- يلزم **عقد** بين EPG الخارجيتين لتمرير حركة البيانات، كما بين أي مجموعتَي EPG.\n\nوالعطل الشائع هو جوار توجيه سليم تماماً مع عقد مفقود: تظهر البادئة على الموجّه البعيد وتُسقط السياسة كل حزمة.\n\n### تسريب المسارات بين VRF (الخدمات المشتركة)\n\nلتمكين المستأجرين أو شبكات VRF من الوصول إلى خدمة مشتركة مثل L3Out مشتركة أو EPG للـ DNS، تسرّب ACI المسارات بين VRF:\n\n1. يضع **المزوِّد (Provider)** على شبكة BD الفرعية الخيار **Shared between VRFs** ويُصدَّر العقد أو يوضع في المستأجر `common`.\n2. تستهلك EPG **المستهلِكة** العقد. ولأن VRF مختلفتان يثبّت APIC شبكة المزوِّد الفرعية في VRF المستهلِك وشبكة المستهلِك الفرعية في VRF المزوِّد.\n3. في حالة L3Out المشتركة تحتاج الشبكة الفرعية في EPG الخارجية إلى **Shared Route Control** و**Shared Security Import**.\n\nلا يمكن تسريب شبكات فرعية متداخلة. فخطّط العناوين قبل المشاركة."
+   },
+   {
+    "id": "transit-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "توجيه العبور بين L3Out اثنتين",
+    "caption": "لا تُعلَن بادئة تعلّمتها L3Out A على L3Out B إلا مع التحكم في التصدير، ولا تمر الحركة إلا بعقد.",
+    "data": {
+     "token": "المسار 203.0.113.0/24",
+     "nodes": [
+      {
+       "id": "wan1",
+       "label": "موجّه WAN A",
+       "sub": "partner side",
+       "icon": "router"
+      },
+      {
+       "id": "bl1",
+       "label": "ورقة الحافة 101",
+       "sub": "L3Out-A import",
+       "icon": "switch"
+      },
+      {
+       "id": "sp",
+       "label": "العمود",
+       "sub": "MP-BGP RR",
+       "icon": "cloud"
+      },
+      {
+       "id": "bl2",
+       "label": "ورقة الحافة 102",
+       "sub": "L3Out-B export",
+       "icon": "switch"
+      },
+      {
+       "id": "wan2",
+       "label": "موجّه WAN B",
+       "sub": "DC2 side",
+       "icon": "router"
+      }
+     ],
+     "steps": [
+      {
+       "at": "wan1",
+       "caption": "يعلن الموجّه A البادئة 203.0.113.0/24 عبر OSPF."
+      },
+      {
+       "at": "bl1",
+       "caption": "تستورد الورقة 101 البادئة وتصنّفها في EPG الخارجية A (import-security).",
+       "tone": "secure"
+      },
+      {
+       "at": "sp",
+       "caption": "يعكس العمود المسار VPNv4 إلى كل الورقات التي توجد فيها VRF."
+      },
+      {
+       "at": "bl2",
+       "caption": "ترى الورقة 102 البادئة، لكنها لا تعلنها إلا إذا وسمتها EPG الخارجية B بـ Export Route Control.",
+       "tone": "warning"
+      },
+      {
+       "at": "wan2",
+       "caption": "يتلقى الموجّه B البادئة في جدول توجيهه. وانتهى مستوى التحكم."
+      },
+      {
+       "at": "wan2",
+       "caption": "يرسل الموجّه B حزمة إلى 203.0.113.10. وبدون عقد بين EPG الخارجيتين تُسقطها الورقة 102.",
+       "tone": "danger"
+      },
+      {
+       "at": "wan1",
+       "caption": "وبعد تطبيق العقد تُحوَّل الحزمة عبر النسيج وتُسلَّم.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "verify",
+    "type": "terminal",
+    "title": "التحقق من L3Out على ورقة الحافة",
+    "prompt": "bl-101#",
+    "lines": [
+     {
+      "cmd": "show ip ospf neighbors vrf Prod:VRF1",
+      "output": " OSPF Process ID default VRF Prod:VRF1\n Total number of neighbors: 1\n Neighbor ID     Pri State            Up Time  Address         Interface\n 192.0.2.1         1 FULL/BDR         00:12:41 198.51.100.2    Eth1/20"
+     },
+     {
+      "comment": "الجوار مع موجّه WAN في حالة FULL. أما التعثر في INIT أو EXSTART فيشير إلى عدم تطابق في MTU أو المنطقة أو نوع الواجهة."
+     },
+     {
+      "cmd": "show ip route vrf Prod:VRF1 203.0.113.0/24",
+      "output": "203.0.113.0/24, ubest/mbest: 1/0\n    *via 198.51.100.2, Eth1/20, [110/20], 00:12:30, ospf-default, type-2, tag 4294967295"
+     },
+     {
+      "comment": "البادئة موجودة في جدول VRF. وإن كانت مفقودة فافحص Import Route Control وملف المسارات."
+     },
+     {
+      "cmd": "show bgp vpnv4 unicast summary vrf overlay-1",
+      "output": "Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd\n10.0.96.64      4 65001    5230    5210       84    0    0 3d02h    7"
+     },
+     {
+      "comment": "للورقة جلسة MP-BGP مع عاكس المسارات في العمود. وبدونها لا تغادر المسارات الخارجية ورقة الحافة هذه."
+     }
+    ]
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- توقّع أن يرشّح `import-security` المسارات. إنه يصنّف فقط؛ استخدم Import Route Control للترشيح.\n- نسيان وسم شبكة BD الفرعية بـ **Advertised Externally** وربط BD بـ L3Out. فلا يتعلّم الموجّه الخارجي الشبكة أبداً.\n- استخدام منفذ موجّه حيث يلزم vPC. لا يعمل عبر زوج vPC إلا SVI.\n- بناء تصميم عبور بنطاقات تصدير صحيحة دون عقد بين EPG الخارجيتين.\n- تسريب شبكات فرعية متداخلة بين VRF."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر أو محاكٍ بموجّهين خارجيين (استخدم عناوين RFC 1918 وعناوين التوثيق فقط):\n\n1. ابنِ `L3Out-A` (OSPF، المنطقة 0.0.0.1) و`L3Out-B` (OSPF، المنطقة 0.0.0.2) في VRF نفسها على ورقتَي حافة.\n2. اجعل الموجّه A يعلن `203.0.113.0/24`. وتأكد من ظهورها في `show ip route vrf Prod:VRF1` على ورقة الحافة.\n3. تأكد أن الموجّه B **لا** يملك البادئة. أضف `203.0.113.0/24` مع **Export Route Control Subnet** إلى EPG الخارجية الخاصة بـ `L3Out-B`.\n4. نفّذ ping من الموجّه B نحو البادئة ولاحظ الإسقاط. ثم أضف عقداً يوفّره أحد EPG الخارجيتين وتستهلكه الأخرى، وأعد ping.\n\nالنتيجة المتوقعة: تستطيع ذكر ما غيّرته كل خطوة من الخطوات الثلاث (الاستيراد والتصدير والعقد)."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "L3Out",
+      "definition": "مجموعة كائنات المستأجر التي تصل VRF واحدة بالشبكات الموجّهة الخارجية."
+     },
+     {
+      "term": "ورقة الحافة",
+      "definition": "ورقة تشغّل L3Out وتتبادل المسارات مع الموجّهات الخارجية."
+     },
+     {
+      "term": "EPG الخارجية",
+      "definition": "مجموعة EPG تصنّف البادئات الخارجية لتتمكن العقود من الإشارة إليها."
+     },
+     {
+      "term": "import-security",
+      "definition": "نطاق شبكة فرعية يصنّف البادئات لأغراض العقود ولا يرشّح المسارات."
+     },
+     {
+      "term": "Export Route Control",
+      "definition": "نطاق شبكة فرعية يسمح بإعلان بادئة إلى الخارج من L3Out."
+     },
+     {
+      "term": "توجيه العبور",
+      "definition": "تعلّم المسارات على L3Out وإعلانها من أخرى في VRF نفسها."
+     },
+     {
+      "term": "تسريب المسارات",
+      "definition": "مشاركة المسارات والسياسات بين VRF للخدمات المشتركة."
+     },
+     {
+      "term": "ملف المسارات",
+      "definition": "كائن خريطة مسارات يحدد قواعد المطابقة والضبط على المسارات المستوردة أو المصدّرة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "شبكة فرعية في EPG خارجية فُعّل فيها External Subnets for the External EPG فقط. ماذا تفعل؟",
+      "options": [
+       "تستورد المسار وتعلنه",
+       "تصنّف الحركة المطابقة للعقود ولا تتحكم في استيراد المسار أو تصديره",
+       "تسرّب المسار إلى VRF أخرى",
+       "تحجب المسار"
+      ],
+      "answer": 1,
+      "explanation": "إن import-security تصنيف للعقود فقط. أما استيراد المسارات وتصديرها فلهما نطاقاتهما."
+     },
+     {
+      "question": "ما المطلوب لإعلان شبكة BD فرعية إلى موجّه خارجي؟ اختر كل ما ينطبق.",
+      "options": [
+       "نطاق الشبكة الفرعية Advertised Externally",
+       "ربط BD بـ L3Out",
+       "عقد بين BD والموجّه",
+       "سياسة MP-BGP Route Reflector في النسيج"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يجب أن تكون الشبكة عامة، وأن ترتبط BD بـ L3Out، وأن يملك النسيج عكس المسارات عبر MP-BGP. أما العقد فيؤثر في حركة البيانات لا في الإعلان."
+     },
+     {
+      "question": "الموجّه B يملك بادئة العبور في جدول توجيهه لكن ping يفشل. ما السبب الأرجح؟",
+      "options": [
+       "عقد مفقود بين EPG الخارجيتين",
+       "منطقة OSPF خاطئة",
+       "لا عُمُد في VRF",
+       "لم تُستورد البادئة"
+      ],
+      "answer": 0,
+      "explanation": "وصلت البادئة إلى الموجّه B فالتوجيه والتصدير يعملان. وإسقاط حركة البيانات بعد ذلك يشير إلى سياسة مفقودة."
+     },
+     {
+      "question": "أي نوع واجهة يجب استخدامه على زوج أوراق حافة في vPC يتشاركان اتصالاً خارجياً واحداً؟",
+      "options": [
+       "منفذ موجّه",
+       "واجهة فرعية موجّهة",
+       "SVI",
+       "Loopback"
+      ],
+      "answer": 2,
+      "explanation": "وحدها SVI بـ VLAN مشتركة عبر زوج vPC تمتد عبر الورقتين. أما المنافذ الموجّهة والواجهات الفرعية فمحلية لعقدة واحدة."
+     },
+     {
+      "question": "ما المطلوب لتسريب شبكة المزوِّد الفرعية إلى VRF المستهلِك؟ اختر كل ما ينطبق.",
+      "options": [
+       "وسم شبكة BD الفرعية للمزوِّد بـ Shared between VRFs",
+       "عقد بين EPG المزوِّد والمستهلِك",
+       "شبكات فرعية غير متداخلة",
+       "L3Out في كلتا VRF"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يعتمد التسريب على علاقة العقد والوسم المشترك، ويفشل مع الشبكات المتداخلة. ولا يلزم وجود L3Out."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تربط L3Out بين VRF واحدة والخارج عبر ملف العقدة وملف الواجهة وEPG الخارجية. واستخدم SVI مع vPC.\n- ينشر النسيج المسارات الخارجية بعكس المسارات في MP-BGP على العُمُد؛ ولا تغادر شبكات BD الفرعية إلا إذا أُعلنت خارجياً وارتبطت بـ L3Out.\n- تفصل نطاقات EPG الخارجية بين **التصنيف** (`import-security`) و**التحكم في المسارات** (الاستيراد والتصدير والمشاركة).\n- يتطلب توجيه العبور استيراداً على L3Out وتصديراً على الأخرى وعقداً بين EPG الخارجيتين.\n- يعتمد تسريب المسارات على الوسوم المشتركة والعقود، ولا يعمل مع الشبكات الفرعية المتداخلة.\n\nوفي الدرس التالي نمدّ النسيج عبر المواقع في [Multi-Site, Multi-Pod and Remote Leaf](/learn/enterprise-datacenter-networking/multi-site-multi-pod-and-remote-leaf)."
+   }
+  ]
+ }
+}

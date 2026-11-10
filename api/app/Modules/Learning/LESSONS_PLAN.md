@@ -15,9 +15,9 @@
 | | العدد |
 |:--|--:|
 | دروس المنهج | **655** |
-| دروس مكتوبة باللغتين | **233** |
+| دروس مكتوبة باللغتين | **300** |
 | دروس مراجعة (تُولَّد تلقائياً وتحيل إلى الدرس الأصلي) | **84** |
-| **دروس متبقية للكتابة** | **338** |
+| **دروس متبقية للكتابة** | **271** |
 
 > **ملاحظة:** درس المراجعة لا يُكتب له محتوى. يُنشر تلقائياً عند كتابة الدرس
 > الأصلي الذي يحيل إليه وإعادة تشغيل الـ seeder. لذلك ترتيب الدفعات أدناه
@@ -34,7 +34,7 @@
 - [x] Ethical Hacking (15) + OT Security (12) — الدفعة 5
 - [x] Cisco CCNP Automation 350-901 (23) — الدفعة 18
 - [x] Cisco CCNP Enterprise ENCOR + ENARSI (25) — الدفعة 19
-- [ ] متبقٍّ من Cisco: CCNP Data Center (22)، CCIE Security (22)، CCIE Data Center (23)
+- [x] Cisco CCNP Data Center (23)، CCIE Security (22)، CCIE Data Center (23) — الدفعات 20–22، واكتملت دورات Cisco كلها
 
 ---
 
@@ -68,9 +68,9 @@
 | 17 | Hands-On Labs | Hands-On Labs & Building Experience | 20 | — | [ ] |
 | 18 | Network Automation & DevOps | Cisco CCNP Automation (350-901) | 23 | — | [x] |
 | 19 | Enterprise & Data Center | Cisco CCNP Enterprise (ENCOR + ENARSI) | 25 | — | [x] |
-| 20 | Enterprise & Data Center | Cisco CCNP Data Center (DCCOR 350-601) | 23 | — | [ ] |
-| 21 | Cisco Security Track | Cisco CCIE Security (v6.1 Lab) | 22 | — | [ ] |
-| 22 | Enterprise & Data Center | Cisco CCIE Data Center (v3.1 Lab) | 23 | — | [ ] |
+| 20 | Enterprise & Data Center | Cisco CCNP Data Center (DCCOR 350-601) | 23 | — | [x] |
+| 21 | Cisco Security Track | Cisco CCIE Security (v6.1 Lab) | 22 | — | [x] |
+| 22 | Enterprise & Data Center | Cisco CCIE Data Center (v3.1 Lab) | 23 | — | [x] |
 | | | **المجموع** | **521** (المتبقي 494) | | |
 
 **المحطات:**

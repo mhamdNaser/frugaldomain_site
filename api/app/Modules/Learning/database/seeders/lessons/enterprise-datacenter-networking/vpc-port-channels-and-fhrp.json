@@ -1,0 +1,516 @@
+{
+  "slug": "vpc-port-channels-and-fhrp",
+  "title": "vPC, Port Channels and FHRP",
+  "summary": "Bundle links with LACP, build a vPC domain on Nexus switches, understand its failure behavior and add HSRP or VRRP gateway redundancy.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Configure LACP port channels and explain hashing limits",
+    "Describe vPC components: peer link, keepalive, member ports",
+    "Predict vPC behavior during peer link and keepalive failures",
+    "Compare HSRP, VRRP and GLBP and use them with vPC",
+    "Verify vPC consistency and port channel state"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A storage array is dual-homed to two access switches for resilience. With classic port channels, a link to each switch cannot form one bundle, so spanning tree blocks one of them and half the bandwidth sits idle. When the active switch is reloaded for an upgrade, the standby link takes seconds to unblock, and the database sees a timeout.\n\n**Virtual Port Channel (vPC)** on Nexus switches removes the problem: two physical switches present themselves to a server, switch or router as one logical port-channel peer. Both links forward at the same time, and a switch can fail or reload without breaking the connection. First hop redundancy protocols (FHRP) then give hosts a gateway that survives a router failure. This lesson covers port channels, vPC and the FHRPs, which DCCOR tests heavily. vPC is also commonly used on the server leaves of the fabric described in [VXLAN EVPN Overlay and Underlay](/learn/enterprise-datacenter-networking/vxlan-evpn-overlay-and-underlay)."
+    },
+    {
+      "id": "pc",
+      "type": "text",
+      "markdown": "## Port channel basics\n\nA **port channel** bundles physical links into one logical interface. It gives more bandwidth, faster failover than spanning tree, and load sharing by flow hash on source and destination addresses and ports.\n\n- **LACP** (IEEE 802.3ad, `channel-group N mode active`) negotiates the bundle and detects mismatches. Use it by default.\n- **Static** (`mode on`) forms the bundle without negotiation. A cabling or configuration mistake then causes a loop or black hole.\n- Member ports must match in speed, duplex, trunking mode and allowed VLANs.\n\nOn NX-OS, enable the feature first with `feature lacp`.\n\n| Mode | Behavior |\n|:--|:--|\n| `active` | Sends LACP packets and initiates negotiation |\n| `passive` | Responds only; two passive ends never form a bundle |\n| `on` | No protocol; both ends must be configured identically |\n\nA single flow always uses one member link, so one large transfer cannot exceed the speed of one member. The hash only balances many flows.\n\n### Choosing the hash\n\nThe default hash on Nexus uses Layer 3 and Layer 4 fields, which spreads flows well. If one member carries far more traffic than the others, check whether most of your traffic comes from a few hosts or one tunnel. VXLAN traffic is a good case: the outer UDP source port varies with the inner flow, so the hash still distributes it. Change the method with `port-channel load-balance` only after measuring the member counters."
+    },
+    {
+      "id": "vpc",
+      "type": "text",
+      "markdown": "## How vPC works\n\nA vPC domain has two peer switches and four required components.\n\n- **vPC peer link**: a port channel between the two peers that carries control traffic, unknown unicast and BUM frames, and traffic for single-attached devices. Use at least two 10G or faster links on different line cards.\n- **vPC peer keepalive**: a separate Layer 3 path (usually the management VRF or a dedicated VRF) that detects whether the peer is alive. It must **not** use the peer link.\n- **vPC member ports**: the port channels toward downstream devices, each tagged with a `vpc` number that must match on both peers.\n- **vPC domain**: the ID shared by the peers, with one switch elected **primary** and the other **secondary** (by role priority).\n\nThe downstream device sees an ordinary LACP port channel with a shared system ID. Both peers forward, and traffic arriving on one peer for a vPC member is delivered locally when possible. The key loop-prevention rule is that a frame received on the peer link is **never forwarded out of a vPC member port**, so duplicates cannot occur.\n\n### Failure behavior\n\n- **Peer link fails, keepalive up:** the secondary suspends its vPC member ports and its vPC SVIs, so the primary alone serves traffic.\n- **Peer link and keepalive both fail:** both peers think the other is dead (split brain). This is why keepalive must use an independent path.\n- **One peer reloads:** members remain active through the survivor."
+    },
+    {
+      "id": "vpccfg",
+      "type": "code",
+      "language": "cisco",
+      "filename": "n9k-a.cfg",
+      "caption": "vPC domain on the primary switch; the peer uses the same configuration with its own addresses.",
+      "code": "feature lacp\nfeature vpc\n!\nvrf context VPC-KA\n!\ninterface Ethernet1/47\n  no switchport\n  vrf member VPC-KA\n  ip address 192.0.2.1/30\n  no shutdown\n!\nvpc domain 10\n  role priority 100\n  peer-keepalive destination 192.0.2.2 source 192.0.2.1 vrf VPC-KA\n  peer-switch\n  peer-gateway\n  auto-recovery\n  ip arp synchronize\n!\ninterface port-channel1\n  description vPC peer link\n  switchport mode trunk\n  spanning-tree port type network\n  vpc peer-link\n!\ninterface Ethernet1/49-50\n  switchport mode trunk\n  channel-group 1 mode active\n  no shutdown\n!\ninterface port-channel20\n  description to-server-1\n  switchport mode trunk\n  vpc 20\n!\ninterface Ethernet1/1\n  switchport mode trunk\n  channel-group 20 mode active\n  no shutdown\n"
+    },
+    {
+      "id": "vpc-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "vPC failure: peer link down while the keepalive stays up",
+      "data": {
+        "actors": [
+          {
+            "id": "srv",
+            "label": "Server",
+            "sub": "LACP bundle",
+            "icon": "server"
+          },
+          {
+            "id": "a",
+            "label": "Switch A",
+            "sub": "vPC primary",
+            "icon": "switch"
+          },
+          {
+            "id": "b",
+            "label": "Switch B",
+            "sub": "vPC secondary",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "srv",
+            "to": "a",
+            "label": "Frames on link 1",
+            "note": "Normally the server hashes flows over both links, to Switch A and Switch B."
+          },
+          {
+            "from": "srv",
+            "to": "b",
+            "label": "Frames on link 2",
+            "note": "Both vPC members forward at the same time."
+          },
+          {
+            "from": "a",
+            "to": "b",
+            "label": "Peer link fails",
+            "tone": "danger",
+            "note": "The peer link goes down, but the keepalive path is still alive."
+          },
+          {
+            "from": "b",
+            "to": "a",
+            "label": "Keepalive: peer alive",
+            "tone": "secure",
+            "note": "Switch B checks the keepalive and learns that Switch A is still running, so this is not a dead peer."
+          },
+          {
+            "from": "b",
+            "to": "b",
+            "label": "Suspend vPC members and SVIs",
+            "tone": "warning",
+            "note": "The secondary shuts its vPC member ports to prevent a split brain and duplicate forwarding."
+          },
+          {
+            "from": "srv",
+            "to": "a",
+            "label": "All traffic on link 1",
+            "tone": "success",
+            "note": "LACP removes the suspended link and the server continues through the primary only, at half the bandwidth."
+          }
+        ]
+      }
+    },
+    {
+      "id": "fhrp",
+      "type": "text",
+      "markdown": "## First hop redundancy protocols\n\nAn FHRP gives hosts one virtual gateway IP and MAC that survives the failure of any one router.\n\n| Protocol | Standard | Active members | Notes |\n|:--|:--|:--|:--|\n| HSRP | Cisco | One active, one standby | Default on Nexus; v2 supports IPv6 |\n| VRRP | IETF RFC 5798 | One master | Multivendor; preempt enabled by default |\n| GLBP | Cisco | Several forwarders | Load sharing; not supported on Nexus |\n\n### FHRP with vPC\n\nOn a vPC pair, **both peers forward** traffic for the HSRP or VRRP virtual MAC, even though one is formally active. Without it, frames arriving at the standby peer would cross the peer link. Make this work with `peer-gateway`, which lets each peer route frames addressed to the other peer's physical MAC, as some storage and NAS devices send. Set HSRP priorities and preempt consistently.\n\nIn a VXLAN EVPN fabric you will not use HSRP at all on the leaves. The distributed anycast gateway replaces it. HSRP and VRRP remain common at the border, in classic designs and in Layer 3 handoff to firewalls."
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Verifying vPC and port channels",
+      "prompt": "n9k-a#",
+      "lines": [
+        {
+          "cmd": "show vpc brief",
+          "output": "Legend:\n                (*) - local vPC is down, forwarding via vPC peer-link\n\nvPC domain id                     : 10\nPeer status                       : peer adjacency formed ok\nvPC keep-alive status             : peer is alive\nConfiguration consistency status  : success\nPer-vlan consistency status       : success\nType-2 consistency status         : success\nvPC role                          : primary\nNumber of vPCs configured         : 1\nPeer Gateway                      : Enabled\nAuto-recovery status              : Enabled, timer is off.(timeout = 240s)\n\nvPC Peer-link status\n---------------------------------------------------------------------\nid    Port   Status Active vlans\n--    ----   ------ -------------------------------------------------\n1     Po1    up     1,10,20\n\nvPC status\n----------------------------------------------------------------------\nid    Port   Status Consistency Reason     Active vlans\n--    ----   ------ ----------- ------     ------------\n20    Po20   up     success     success    10,20"
+        },
+        {
+          "comment": "Every line should read ok, alive or success. A consistency failure with Type-1 suspends the vPC to protect the network."
+        },
+        {
+          "cmd": "show port-channel summary",
+          "output": "Group Port-       Type     Protocol  Member Ports\n      Channel\n--------------------------------------------------------------------\n1     Po1(SU)     Eth      LACP      Eth1/49(P)   Eth1/50(P)\n20    Po20(SU)    Eth      LACP      Eth1/1(P)"
+        },
+        {
+          "comment": "SU means Layer 2, in use. (P) means the member is bundled. (s) suspended or (I) individual signals a mismatch."
+        }
+      ]
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common mistakes",
+      "markdown": "Never run the keepalive across the peer link, and never leave it on a path that shares fate with the peer link. A mismatch of any Type-1 parameter, such as STP mode, MTU or allowed VLANs, suspends the vPC. Do not forget `peer-switch` with STP so both peers present the same bridge ID. Orphan ports (single-attached hosts) lose connectivity when the secondary suspends its members, so avoid them or use `vpc orphan-port suspend`."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a Nexus 9000v or CML lab, configure two switches as a vPC pair with a two-link peer link and a keepalive on a dedicated VRF. Connect a third switch with one link to each peer as a LACP port channel with a matching `vpc` number. Run `show vpc brief`, then shut down the peer link and watch which peer suspends its members. Restore it and repeat with the keepalive shut down too to observe the difference. Finish by adding HSRP on an SVI and confirm both peers forward traffic."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Port channel",
+          "definition": "A logical interface bundling several physical links."
+        },
+        {
+          "term": "LACP",
+          "definition": "IEEE 802.3ad protocol that negotiates port channel membership."
+        },
+        {
+          "term": "vPC",
+          "definition": "Virtual Port Channel: two Nexus switches act as one LACP peer."
+        },
+        {
+          "term": "Peer link",
+          "definition": "The port channel between vPC peers that carries control and orphan traffic."
+        },
+        {
+          "term": "Peer keepalive",
+          "definition": "An independent Layer 3 heartbeat that prevents split brain."
+        },
+        {
+          "term": "Orphan port",
+          "definition": "A port with a host attached to only one vPC peer."
+        },
+        {
+          "term": "HSRP",
+          "definition": "Cisco FHRP with an active and standby router sharing a virtual IP."
+        },
+        {
+          "term": "Peer gateway",
+          "definition": "Lets each vPC peer route frames addressed to the other peer's MAC."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the purpose of the vPC peer keepalive?",
+          "options": [
+            "Carry data traffic",
+            "Detect whether the peer is alive and prevent split brain",
+            "Synchronize MAC tables",
+            "Elect the root bridge"
+          ],
+          "answer": 1,
+          "explanation": "The keepalive is an out-of-band check. The peer link carries data and control traffic."
+        },
+        {
+          "question": "The vPC peer link fails and the keepalive stays up. What happens?",
+          "options": [
+            "The secondary suspends its vPC members",
+            "The primary suspends its members",
+            "Both continue forwarding",
+            "Both reload"
+          ],
+          "answer": 0,
+          "explanation": "The secondary shuts its vPC members to avoid duplicate forwarding. The primary serves traffic alone."
+        },
+        {
+          "question": "Which are valid LACP modes? (Choose all that apply.)",
+          "options": [
+            "active",
+            "passive",
+            "on (static, no LACP)",
+            "auto"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "`auto` and `desirable` are PAgP modes. Two passive ends will not form a bundle."
+        },
+        {
+          "question": "Which FHRP is not supported on Nexus switches?",
+          "options": [
+            "HSRP",
+            "VRRP",
+            "GLBP",
+            "Anycast gateway"
+          ],
+          "answer": 2,
+          "explanation": "Nexus supports HSRP, VRRP and the fabric anycast gateway, but not GLBP."
+        },
+        {
+          "question": "A single transfer between two hosts over a 4 x 10G port channel can reach what speed?",
+          "options": [
+            "About 40 Gbps",
+            "About 10 Gbps",
+            "About 20 Gbps",
+            "About 2.5 Gbps"
+          ],
+          "answer": 1,
+          "explanation": "A flow hashes to one member link, so it is capped at 10 Gbps. Many flows spread across all members."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- **Port channels** bundle links; use **LACP** and match speed, duplex and VLANs. A single flow uses a single member link.\n- **vPC** lets two Nexus switches act as one LACP peer: both forward, neither blocks.\n- A vPC domain needs a **peer link**, an independent **keepalive**, matching **member port** numbers and consistent Type-1 parameters.\n- On failure, the **secondary** suspends its members when the peer link is down but the keepalive is up.\n- **HSRP/VRRP** provide gateway redundancy, with `peer-gateway` for vPC. The EVPN fabric uses the **anycast gateway** instead."
+    }
+  ],
+  "ar": {
+    "title": "vPC وقنوات المنافذ وFHRP",
+    "summary": "اجمع الوصلات بـLACP، وابنِ نطاق vPC على مفاتيح Nexus، وافهم سلوكه عند الأعطال، وأضف احتياط البوابة بـHSRP أو VRRP.",
+    "objectives": [
+      "اضبط قنوات منافذ LACP واشرح حدود التجزئة",
+      "صف مكونات vPC: وصلة النظير والنبض ومنافذ الأعضاء",
+      "توقّع سلوك vPC عند سقوط وصلة النظير والنبض",
+      "قارن بين HSRP وVRRP وGLBP واستخدمها مع vPC",
+      "تحقق من اتساق vPC وحالة قنوات المنافذ"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تتصل مصفوفة تخزين بمفتاحي وصول لتحقيق المرونة. ومع قنوات المنافذ التقليدية لا تستطيع الوصلتان، كل واحدة إلى مفتاح مختلف، تكوين حزمة واحدة، فتحجب الشجرة الممتدة إحداهما ويبقى نصف النطاق الترددي معطلًا. وعند إعادة تشغيل المفتاح الفعال للترقية تحتاج الوصلة الاحتياطية إلى ثوانٍ لتخرج من الحجب، فتواجه قاعدة البيانات انتهاء مهلة.\n\nتزيل تقنية **قناة المنافذ الافتراضية (vPC)** على مفاتيح Nexus هذه المشكلة: يظهر مفتاحان ماديان أمام الخادم أو المفتاح أو الموجّه كنظير قناة منافذ منطقي واحد. تمرّر الوصلتان الحركة معًا، ويستطيع أحد المفتاحين أن يتعطل أو يُعاد تشغيله دون انقطاع الاتصال. ثم تمنح بروتوكولات الاحتياط للقفزة الأولى (FHRP) المضيفين بوابة تنجو من عطل موجّه. يغطي هذا الدرس قنوات المنافذ وvPC وبروتوكولات FHRP، وهي مواضيع يركز عليها DCCOR كثيرًا. كما يُستخدم vPC عادةً على أوراق الخوادم في النسيج الموصوف في درس [الشبكة العلوية والشبكة التحتية في VXLAN EVPN](/learn/enterprise-datacenter-networking/vxlan-evpn-overlay-and-underlay)."
+      },
+      {
+        "id": "pc",
+        "type": "text",
+        "markdown": "## أساسيات قناة المنافذ\n\nتجمع **قناة المنافذ (Port channel)** وصلات مادية في واجهة منطقية واحدة. وهي تعطي نطاقًا ترددياً أكبر وتحويلاً أسرع من الشجرة الممتدة وتوزيع حمل بحسب تجزئة التدفق على العناوين والمنافذ المصدر والوجهة.\n\n- **LACP** (المعيار IEEE 802.3ad، والأمر `channel-group N mode active`) يتفاوض على الحزمة ويكتشف عدم التطابق. استخدمه افتراضيًا.\n- **الثابت** (`mode on`) يكوّن الحزمة بلا تفاوض، فيسبب خطأ في الكابلات أو الضبط حلقةً أو ثقبًا أسود.\n- يجب أن تتطابق المنافذ الأعضاء في السرعة والازدواج ووضع الاتصال الجذعي وشبكات VLAN المسموح بها.\n\nوعلى NX-OS فعّل الميزة أولًا بالأمر `feature lacp`.\n\n| الوضع | السلوك |\n|:--|:--|\n| `active` | يرسل حزم LACP ويبدأ التفاوض |\n| `passive` | يستجيب فقط، ولا تتكوّن حزمة بين طرفين سلبيين |\n| `on` | بلا بروتوكول، ويجب ضبط الطرفين بالطريقة نفسها |\n\nويستخدم التدفق الواحد وصلة عضوًا واحدة دائمًا، فلا يستطيع نقل كبير واحد تجاوز سرعة عضو واحد. وتوازن التجزئة التدفقات الكثيرة فقط.\n\n### اختيار دالة التجزئة\n\nتستخدم التجزئة الافتراضية على Nexus حقول الطبقتين الثالثة والرابعة، وتوزّع التدفقات توزيعًا جيدًا. فإذا حمل عضو واحد حركة أكبر بكثير من بقية الأعضاء فتحقق هل تأتي معظم الحركة من مضيفين قليلين أو من نفق واحد. وحركة VXLAN مثال جيد: يتغير منفذ UDP المصدر الخارجي بحسب التدفق الداخلي، فتظل التجزئة توزّعها. ولا تغيّر الطريقة بالأمر `port-channel load-balance` إلا بعد قياس عدادات الأعضاء."
+      },
+      {
+        "id": "vpc",
+        "type": "text",
+        "markdown": "## كيف يعمل vPC\n\nيتألف نطاق vPC من مفتاحين نظيرين وأربعة مكونات لازمة.\n\n- **وصلة النظير (Peer link)**: قناة منافذ بين النظيرين تحمل حركة التحكم والأحادي المجهول وإطارات BUM وحركة الأجهزة المتصلة بمفتاح واحد. استخدم وصلتين على الأقل بسرعة 10G أو أعلى على بطاقتي خط مختلفتين.\n- **نبض النظير (Peer keepalive)**: مسار مستقل من الطبقة الثالثة (عادةً VRF الإدارة أو VRF مخصصة) يكتشف إن كان النظير حيًا. ويجب **ألّا** يستخدم وصلة النظير.\n- **منافذ أعضاء vPC**: قنوات المنافذ نحو الأجهزة التابعة، ولكل منها رقم `vpc` يجب أن يتطابق على النظيرين.\n- **نطاق vPC (Domain)**: المعرّف المشترك بين النظيرين، ويُنتخب مفتاح **أساسي (Primary)** والآخر **ثانوي (Secondary)** بحسب أولوية الدور.\n\nيرى الجهاز التابع قناة منافذ LACP عادية بمعرّف نظام مشترك. يمرّر النظيران الحركة معًا، وتُسلَّم الحركة الواصلة إلى أحدهما والموجهة لعضو vPC محليًا متى أمكن. وقاعدة منع الحلقات الأساسية أن الإطار المستلم على وصلة النظير **لا يُمرَّر أبدًا إلى منفذ عضو في vPC**، فلا تظهر نسخ مكررة.\n\n### سلوك الأعطال\n\n- **سقوط وصلة النظير مع بقاء النبض:** يعلّق الثانوي منافذ أعضاء vPC وواجهات SVI الخاصة بـvPC، فيخدم الأساسي الحركة وحده.\n- **سقوط وصلة النظير والنبض معًا:** يظن كل نظير أن الآخر معطل (انقسام الدماغ). ولهذا يجب أن يستخدم النبض مسارًا مستقلًا.\n- **إعادة تشغيل أحد النظيرين:** تبقى الأعضاء فعالة عبر الناجي."
+      },
+      {
+        "id": "vpccfg",
+        "type": "code",
+        "language": "cisco",
+        "filename": "n9k-a.cfg",
+        "caption": "نطاق vPC على المفتاح الأساسي، ويستخدم النظير الضبط نفسه بعناوينه الخاصة.",
+        "code": "feature lacp\nfeature vpc\n!\nvrf context VPC-KA\n!\ninterface Ethernet1/47\n  no switchport\n  vrf member VPC-KA\n  ip address 192.0.2.1/30\n  no shutdown\n!\nvpc domain 10\n  role priority 100\n  peer-keepalive destination 192.0.2.2 source 192.0.2.1 vrf VPC-KA\n  peer-switch\n  peer-gateway\n  auto-recovery\n  ip arp synchronize\n!\ninterface port-channel1\n  description vPC peer link\n  switchport mode trunk\n  spanning-tree port type network\n  vpc peer-link\n!\ninterface Ethernet1/49-50\n  switchport mode trunk\n  channel-group 1 mode active\n  no shutdown\n!\ninterface port-channel20\n  description to-server-1\n  switchport mode trunk\n  vpc 20\n!\ninterface Ethernet1/1\n  switchport mode trunk\n  channel-group 20 mode active\n  no shutdown\n"
+      },
+      {
+        "id": "vpc-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "vPC failure: peer link down while the keepalive stays up",
+        "data": {
+          "actors": [
+            {
+              "id": "srv",
+              "label": "Server",
+              "sub": "LACP bundle",
+              "icon": "server"
+            },
+            {
+              "id": "a",
+              "label": "المفتاح A",
+              "sub": "vPC primary",
+              "icon": "switch"
+            },
+            {
+              "id": "b",
+              "label": "المفتاح B",
+              "sub": "vPC secondary",
+              "icon": "switch"
+            }
+          ],
+          "steps": [
+            {
+              "from": "srv",
+              "to": "a",
+              "label": "Frames on link 1",
+              "note": "في الحالة العادية يوزّع الخادم التدفقات على الوصلتين نحو المفتاح A والمفتاح B."
+            },
+            {
+              "from": "srv",
+              "to": "b",
+              "label": "Frames on link 2",
+              "note": "يمرّر عضوا vPC الحركة معًا."
+            },
+            {
+              "from": "a",
+              "to": "b",
+              "label": "Peer link fails",
+              "tone": "danger",
+              "note": "تسقط وصلة النظير لكن مسار النبض ما زال حيًا."
+            },
+            {
+              "from": "b",
+              "to": "a",
+              "label": "Keepalive: peer alive",
+              "tone": "secure",
+              "note": "يفحص المفتاح B النبض فيعلم أن المفتاح A يعمل، فهذا ليس نظيرًا ميتًا."
+            },
+            {
+              "from": "b",
+              "to": "b",
+              "label": "Suspend vPC members and SVIs",
+              "tone": "warning",
+              "note": "يوقف الثانوي منافذ أعضاء vPC لديه لمنع انقسام الدماغ والتمرير المكرر."
+            },
+            {
+              "from": "srv",
+              "to": "a",
+              "label": "All traffic on link 1",
+              "tone": "success",
+              "note": "يزيل LACP الوصلة المعلّقة ويتابع الخادم عبر الأساسي وحده بنصف النطاق الترددي."
+            }
+          ]
+        }
+      },
+      {
+        "id": "fhrp",
+        "type": "text",
+        "markdown": "## بروتوكولات الاحتياط للقفزة الأولى\n\nيمنح بروتوكول FHRP المضيفين عنوان IP وعنوان MAC افتراضيين للبوابة يبقيان بعد عطل أي موجّه.\n\n| البروتوكول | المعيار | الأعضاء الفعالون | ملاحظات |\n|:--|:--|:--|:--|\n| HSRP | سيسكو | واحد فعال وواحد احتياطي | الافتراضي على Nexus، والإصدار 2 يدعم IPv6 |\n| VRRP | RFC 5798 من IETF | رئيس واحد | متعدد المورّدين، والاستباق مفعّل افتراضيًا |\n| GLBP | سيسكو | عدة ممرّرين | يوزّع الحمل، وغير مدعوم على Nexus |\n\n### FHRP مع vPC\n\nفي زوج vPC **يمرّر النظيران معًا** الحركة الموجهة إلى عنوان MAC الافتراضي لـHSRP أو VRRP، رغم أن أحدهما فعال رسميًا. ومن دون ذلك تعبر الإطارات الواصلة إلى النظير الاحتياطي وصلة النظير. ويتحقق ذلك بالأمر `peer-gateway` الذي يتيح لكل نظير توجيه الإطارات الموجهة إلى عنوان MAC المادي للنظير الآخر، كما ترسلها بعض أجهزة التخزين وNAS. واضبط أولويات HSRP والاستباق بانسجام.\n\nوفي نسيج VXLAN EVPN لن تستخدم HSRP على الأوراق إطلاقًا، فالبوابة الموزعة متعددة البث تحل محله. ويبقى HSRP وVRRP شائعين عند الحدود وفي التصاميم التقليدية وفي التسليم من الطبقة الثالثة إلى جدران الحماية."
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "التحقق من vPC وقنوات المنافذ",
+        "prompt": "n9k-a#",
+        "lines": [
+          {
+            "cmd": "show vpc brief",
+            "output": "Legend:\n                (*) - local vPC is down, forwarding via vPC peer-link\n\nvPC domain id                     : 10\nPeer status                       : peer adjacency formed ok\nvPC keep-alive status             : peer is alive\nConfiguration consistency status  : success\nPer-vlan consistency status       : success\nType-2 consistency status         : success\nvPC role                          : primary\nNumber of vPCs configured         : 1\nPeer Gateway                      : Enabled\nAuto-recovery status              : Enabled, timer is off.(timeout = 240s)\n\nvPC Peer-link status\n---------------------------------------------------------------------\nid    Port   Status Active vlans\n--    ----   ------ -------------------------------------------------\n1     Po1    up     1,10,20\n\nvPC status\n----------------------------------------------------------------------\nid    Port   Status Consistency Reason     Active vlans\n--    ----   ------ ----------- ------     ------------\n20    Po20   up     success     success    10,20"
+          },
+          {
+            "comment": "يجب أن يظهر في كل سطر ok أو alive أو success. وفشل تطابق من النوع 1 يعلّق vPC حمايةً للشبكة."
+          },
+          {
+            "cmd": "show port-channel summary",
+            "output": "Group Port-       Type     Protocol  Member Ports\n      Channel\n--------------------------------------------------------------------\n1     Po1(SU)     Eth      LACP      Eth1/49(P)   Eth1/50(P)\n20    Po20(SU)    Eth      LACP      Eth1/1(P)"
+          },
+          {
+            "comment": "SU تعني الطبقة الثانية قيد الاستخدام. و(P) تعني أن العضو داخل الحزمة. أما (s) معلّق أو (I) فردي فتدل على عدم تطابق."
+          }
+        ]
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة",
+        "markdown": "لا تُجرِ النبض عبر وصلة النظير أبدًا، ولا تتركه على مسار يتشارك المصير معها. وعدم تطابق أي معامل من النوع 1، مثل وضع STP أو MTU أو شبكات VLAN المسموح بها، يعلّق vPC. ولا تنس `peer-switch` مع STP كي يقدّم النظيران معرّف جسر واحدًا. أما المنافذ اليتيمة (المضيفون المتصلون بمفتاح واحد) فتفقد الاتصال عندما يعلّق الثانوي أعضاءه، فتجنبها أو استخدم `vpc orphan-port suspend`."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في مختبر Nexus 9000v أو CML اضبط مفتاحين كزوج vPC بوصلة نظير من وصلتين ونبض على VRF مخصصة. وصِل مفتاحًا ثالثًا بوصلة إلى كل نظير كقناة منافذ LACP برقم `vpc` متطابق. نفّذ `show vpc brief`، ثم أوقف وصلة النظير وراقب أي نظير يعلّق أعضاءه. أعدها ثم كرر التجربة مع إيقاف النبض أيضًا لملاحظة الفرق. وأخيرًا أضف HSRP على واجهة SVI وتأكد أن النظيرين يمرّران الحركة."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "Port channel",
+            "definition": "واجهة منطقية تجمع عدة وصلات مادية."
+          },
+          {
+            "term": "LACP",
+            "definition": "بروتوكول IEEE 802.3ad الذي يتفاوض على عضوية قناة المنافذ."
+          },
+          {
+            "term": "vPC",
+            "definition": "قناة المنافذ الافتراضية: يعمل مفتاحا Nexus كنظير LACP واحد."
+          },
+          {
+            "term": "Peer link",
+            "definition": "قناة المنافذ بين نظيري vPC التي تحمل حركة التحكم والحركة اليتيمة."
+          },
+          {
+            "term": "Peer keepalive",
+            "definition": "نبض مستقل من الطبقة الثالثة يمنع انقسام الدماغ."
+          },
+          {
+            "term": "Orphan port",
+            "definition": "منفذ يتصل به مضيف بنظير vPC واحد فقط."
+          },
+          {
+            "term": "HSRP",
+            "definition": "بروتوكول FHRP من سيسكو يتشارك فيه موجّه فعال وآخر احتياطي عنوان IP افتراضيًا."
+          },
+          {
+            "term": "Peer gateway",
+            "definition": "يتيح لكل نظير في vPC توجيه الإطارات الموجهة إلى MAC النظير الآخر."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما غرض نبض النظير في vPC؟",
+            "options": [
+              "حمل حركة البيانات",
+              "اكتشاف حياة النظير ومنع انقسام الدماغ",
+              "مزامنة جداول MAC",
+              "انتخاب الجسر الجذر"
+            ],
+            "answer": 1,
+            "explanation": "النبض فحص خارج النطاق، بينما تحمل وصلة النظير البيانات والتحكم."
+          },
+          {
+            "question": "تسقط وصلة النظير في vPC ويبقى النبض فعالًا. ماذا يحدث؟",
+            "options": [
+              "يعلّق الثانوي أعضاء vPC لديه",
+              "يعلّق الأساسي أعضاءه",
+              "يستمر الاثنان في التمرير",
+              "يعيد الاثنان التشغيل"
+            ],
+            "answer": 0,
+            "explanation": "يغلق الثانوي أعضاءه لتجنب التمرير المكرر، ويخدم الأساسي الحركة وحده."
+          },
+          {
+            "question": "أي مما يلي أوضاع LACP صالحة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "active",
+              "passive",
+              "on (ثابت بلا LACP)",
+              "auto"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "`auto` و`desirable` من أوضاع PAgP. ولا يتكوّن حزمة بين طرفين سلبيين."
+          },
+          {
+            "question": "أي بروتوكول FHRP غير مدعوم على مفاتيح Nexus؟",
+            "options": [
+              "HSRP",
+              "VRRP",
+              "GLBP",
+              "البوابة متعددة البث"
+            ],
+            "answer": 2,
+            "explanation": "يدعم Nexus بروتوكولات HSRP وVRRP والبوابة متعددة البث في النسيج، لكنه لا يدعم GLBP."
+          },
+          {
+            "question": "إلى أي سرعة يمكن أن يصل نقل واحد بين مضيفين عبر قناة منافذ 4 × 10G؟",
+            "options": [
+              "نحو 40 Gbps",
+              "نحو 10 Gbps",
+              "نحو 20 Gbps",
+              "نحو 2.5 Gbps"
+            ],
+            "answer": 1,
+            "explanation": "يُجزَّأ التدفق إلى وصلة عضو واحدة فيُحدّ بـ10 Gbps. أما التدفقات الكثيرة فتتوزع على كل الأعضاء."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- تجمع **قنوات المنافذ** الوصلات؛ استخدم **LACP** وطابق السرعة والازدواج وشبكات VLAN. ويستخدم التدفق الواحد وصلة عضوًا واحدة.\n- يتيح **vPC** لمفتاحي Nexus أن يعملا كنظير LACP واحد: كلاهما يمرّر ولا يحجب أحدهما.\n- يحتاج نطاق vPC إلى **وصلة نظير** و**نبض** مستقل وأرقام **منافذ أعضاء** متطابقة ومعاملات متسقة من النوع 1.\n- عند العطل يعلّق **الثانوي** أعضاءه إذا سقطت وصلة النظير وبقي النبض فعالًا.\n- يوفّر **HSRP/VRRP** احتياط البوابة، مع `peer-gateway` عند استخدام vPC. ويستخدم نسيج EVPN **البوابة متعددة البث** بدلًا منهما."
+      }
+    ]
+  }
+}

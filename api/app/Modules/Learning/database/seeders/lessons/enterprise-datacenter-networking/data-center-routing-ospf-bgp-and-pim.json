@@ -1,0 +1,562 @@
+{
+  "slug": "data-center-routing-ospf-bgp-and-pim",
+  "title": "Data Center Routing: OSPF, BGP and PIM",
+  "summary": "Choose and configure the underlay routing protocol for a spine-leaf fabric, and deliver BUM traffic with ingress replication or PIM anycast RP.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Choose OSPF, IS-IS or eBGP for a fabric underlay",
+    "Configure point-to-point OSPF with BFD on NX-OS",
+    "Explain eBGP ECMP and next-hop behavior in EVPN fabrics",
+    "Compare ingress replication with a PIM multicast underlay",
+    "Troubleshoot the underlay bottom-up"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A new leaf is cabled to four spines on a Friday night. By morning, the network team sees that only two of the four uplinks carry traffic, a multicast application fails for half the racks, and a BGP session flaps every few minutes. Each symptom has a different cause, yet all three live in the underlay that every overlay depends on.\n\nIn a data center fabric, the routing protocols are not exotic. They are the same OSPF, BGP and PIM you know, tuned for point-to-point links, fast convergence and large ECMP. This lesson shows the choices the DCCOR exam expects: which protocol to run where, how to configure it on NX-OS, and how to verify it. The topology comes from [Data Center Network Architecture and Fabrics](/learn/enterprise-datacenter-networking/data-center-network-architecture-and-fabrics)."
+    },
+    {
+      "id": "choose",
+      "type": "text",
+      "markdown": "## Choosing the underlay protocol\n\nThe underlay has one job: give every VTEP loopback IP reachability with equal-cost paths. Three designs are common.\n\n| Design | Strengths | Watch for |\n|:--|:--|:--|\n| OSPF (single area 0) | Simple, fast, well known | Flooding scales poorly at very large sizes |\n| IS-IS | Very stable, no IP dependency | Less familiar to many teams |\n| eBGP (a unique AS per leaf, or one AS per rack) | Scales largest, strong policy | More configuration, needs `allowas-in` or unique AS planning |\n\nWhatever you pick, apply these habits:\n\n- Use **point-to-point** routed interfaces, with /31 addresses (or unnumbered with a shared loopback) to save addresses and avoid DR/BDR elections.\n- Advertise only **loopbacks** into the underlay. Server subnets belong in the overlay.\n- Tune **BFD** so link failures are detected in well under a second instead of waiting for protocol timers.\n- Keep the same MTU on every link."
+    },
+    {
+      "id": "ospf",
+      "type": "text",
+      "markdown": "## OSPF in the fabric\n\nOSPF is the default choice in most Cisco-built NX-OS fabrics. A single area 0 is enough for hundreds of switches.\n\nKey points:\n\n- Set `ip ospf network point-to-point` on fabric links. This skips the DR election and speeds up adjacency.\n- Use a stable **router ID** from a loopback.\n- Enable `bfd` on the interface for sub-second failure detection.\n- Use `maximum-paths` large enough for the number of spines. NX-OS installs up to 64 ECMP paths.\n- Make loopbacks passive with a /32 so that only the host route is advertised.\n\nA common failure is an MTU mismatch: the OSPF neighbor sticks in **EXSTART** because database descriptor packets exceed one side's MTU. Check `show ip ospf neighbor` and the interface MTU on both ends."
+    },
+    {
+      "id": "ospfcfg",
+      "type": "code",
+      "language": "cisco",
+      "filename": "spine1.cfg",
+      "caption": "OSPF underlay on a spine with BFD and a loopback advertised as a /32.",
+      "code": "feature ospf\nfeature bfd\n!\nrouter ospf UNDERLAY\n  router-id 10.0.255.1\n!\ninterface loopback0\n  ip address 10.0.255.1/32\n  ip router ospf UNDERLAY area 0.0.0.0\n!\ninterface Ethernet1/1\n  description to-leaf1\n  no switchport\n  mtu 9216\n  ip address 10.0.1.0/31\n  ip ospf network point-to-point\n  ip ospf bfd\n  ip router ospf UNDERLAY area 0.0.0.0\n  no shutdown\n"
+    },
+    {
+      "id": "bgp",
+      "type": "text",
+      "markdown": "## BGP in the fabric\n\nBGP appears in two roles.\n\n**eBGP underlay.** Each leaf has its own AS, all spines share one AS, and the leaf peers with every spine. The spine passes routes on unchanged, so path length is equal and ECMP works. If leaves share an AS, loop prevention drops the routes, so you need unique AS numbers or `allowas-in`.\n\n**iBGP overlay (BGP EVPN).** Even with an OSPF underlay, the overlay uses BGP with the `l2vpn evpn` address family. Spines act as **route reflectors** so leaves do not need a full mesh. You will configure this in [VXLAN EVPN Overlay and Underlay](/learn/enterprise-datacenter-networking/vxlan-evpn-overlay-and-underlay).\n\n### The exam traps\n\n- ECMP over eBGP requires `maximum-paths` (and with different neighbor ASes, `bestpath as-path multipath-relax`).\n- A route reflector does not change the next hop for iBGP, but an eBGP spine in an EVPN fabric must keep it with `route-map ... set ip next-hop unchanged`, or traffic is pulled through the spine and VXLAN breaks.\n- Use `retain route-target all` on a spine that does not itself import the routes it must reflect."
+    },
+    {
+      "id": "bgpcfg",
+      "type": "code",
+      "language": "cisco",
+      "filename": "leaf1-bgp.cfg",
+      "caption": "eBGP underlay on a leaf in AS 65101 peering with two spines in AS 65000.",
+      "code": "feature bgp\n!\nrouter bgp 65101\n  router-id 10.0.255.11\n  bestpath as-path multipath-relax\n  address-family ipv4 unicast\n    network 10.0.255.11/32\n    maximum-paths 4\n  neighbor 10.0.1.0\n    remote-as 65000\n    bfd\n    address-family ipv4 unicast\n  neighbor 10.0.1.2\n    remote-as 65000\n    bfd\n    address-family ipv4 unicast\n"
+    },
+    {
+      "id": "tuning",
+      "type": "text",
+      "markdown": "## Convergence, scale and failure behavior\n\nA fabric is judged by what happens when something breaks, so design the failure behavior before the first packet flows.\n\n- **Link failure.** BFD detects the loss in about 150 milliseconds with a 50 ms interval and multiplier of 3. The IGP then removes the next hop from the ECMP set, and traffic shifts to the remaining spines. Without BFD, OSPF waits for the dead interval, which can be 40 seconds by default.\n- **Spine failure.** Each leaf loses one of its equal-cost paths. With four spines, the fabric loses 25 percent of its bandwidth but no connectivity. This is why you plan oversubscription with one spine failed.\n- **Leaf maintenance.** Use graceful insertion and removal (the `system mode maintenance` feature on NX-OS) so a leaf withdraws its routes before you reload it, instead of dropping traffic.\n- **Scale limits.** OSPF handles hundreds of nodes in one area. Beyond that, or when you want per-leaf policy and clear fault domains, move to eBGP.\n\n### Authentication and hygiene\n\nProtect the underlay as you would any production routing domain: enable MD5 or SHA authentication on OSPF and BGP neighbors, restrict which prefixes may enter the underlay with a route map, and keep control-plane policing (CoPP) enabled. A rogue device cabled into a leaf port should never be able to inject routes into the fabric.\n\n| Failure | Detection | Typical recovery |\n|:--|:--|:--|\n| Link down | Link signal, BFD | Under one second |\n| Neighbor stops forwarding | BFD, hello timers | Sub-second with BFD |\n| Spine reload | BFD on all leaves | Seconds, no traffic loss for other flows |\n| RP failure | Unicast reconvergence | Seconds with anycast RP |"
+    },
+    {
+      "id": "pim",
+      "type": "text",
+      "markdown": "## PIM for multicast\n\nVXLAN needs a way to deliver broadcast, unknown unicast and multicast (BUM) traffic. There are two methods:\n\n- **Ingress replication** (unicast): the source VTEP copies each BUM frame to every peer. It needs no multicast in the underlay, and is the simple option when BGP EVPN supplies the peer list.\n- **Multicast underlay**: each Layer 2 VNI maps to a multicast group, and PIM builds the tree. It scales better for heavy BUM traffic but adds a protocol to operate.\n\nFor a multicast underlay Cisco recommends **PIM Sparse Mode with anycast RP** on the spines. Both spines advertise the same RP address, so any leaf reaches the nearest one, and either spine can take over instantly if the other fails. MSDP is not needed when both spines use PIM anycast RP, which is the NX-OS approach.\n\nThe leaf-side rules:\n\n1. Enable `feature pim` and `ip pim sparse-mode` on every fabric interface and on the loopback used as the VTEP source.\n2. Point every switch to the RP with `ip pim rp-address`.\n3. Verify with `show ip pim neighbor` and `show ip mroute`."
+    },
+    {
+      "id": "pim-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "PIM anycast RP and a VNI multicast group",
+      "data": {
+        "actors": [
+          {
+            "id": "l1",
+            "label": "Leaf 1",
+            "sub": "VTEP 10.0.255.11",
+            "icon": "switch"
+          },
+          {
+            "id": "s1",
+            "label": "Spine 1",
+            "sub": "RP 10.0.254.1",
+            "icon": "router"
+          },
+          {
+            "id": "s2",
+            "label": "Spine 2",
+            "sub": "RP 10.0.254.1",
+            "icon": "router"
+          },
+          {
+            "id": "l2",
+            "label": "Leaf 2",
+            "sub": "VTEP 10.0.255.12",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "l2",
+            "to": "s1",
+            "label": "PIM Join (*,239.1.1.10)",
+            "note": "Leaf 2 hosts VNI 10010, which is mapped to group 239.1.1.10, so it joins the shared tree toward the RP."
+          },
+          {
+            "from": "s1",
+            "to": "s2",
+            "label": "Anycast RP: same address",
+            "tone": "secure",
+            "note": "Both spines own 10.0.254.1. Unicast routing sends each join to the closest one; either can fail without changing the design."
+          },
+          {
+            "from": "l1",
+            "to": "s1",
+            "label": "PIM Register",
+            "note": "Leaf 1 receives a broadcast on VNI 10010 and registers the source with the RP."
+          },
+          {
+            "from": "s1",
+            "to": "l2",
+            "label": "Multicast data (VXLAN)",
+            "tone": "success",
+            "note": "The RP forwards the encapsulated BUM frame down the tree to every leaf that joined."
+          },
+          {
+            "from": "l2",
+            "to": "l1",
+            "label": "SPT switchover",
+            "note": "Leaf 2 then builds a source tree directly toward Leaf 1 and leaves the shared tree."
+          }
+        ]
+      }
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Verifying the routing underlay",
+      "prompt": "leaf1#",
+      "lines": [
+        {
+          "cmd": "show ip ospf neighbor",
+          "output": " OSPF Process ID UNDERLAY VRF default\n Total number of neighbors: 2\n Neighbor ID     Pri State            Up Time  Address         Interface\n 10.0.255.1        1 FULL/ -          00:52:19 10.0.1.0        Eth1/49\n 10.0.255.2        1 FULL/ -          00:52:11 10.0.1.2        Eth1/50"
+        },
+        {
+          "comment": "FULL/ - with a dash means point-to-point: no DR or BDR. A neighbor stuck in EXSTART points to an MTU mismatch."
+        },
+        {
+          "cmd": "show ip pim neighbor",
+          "output": "PIM Neighbor Status for VRF \"default\"\nNeighbor        Interface            Uptime    Expires   DR       Bidir-  BFD\n                                                         Priority Capable State\n10.0.1.0        Ethernet1/49         00:51:40  00:01:33  1        yes     n/a\n10.0.1.2        Ethernet1/50         00:51:38  00:01:31  1        yes     n/a"
+        },
+        {
+          "comment": "If a spine is missing here, multicast joins for the VNI groups cannot reach the RP."
+        },
+        {
+          "cmd": "show ip route 10.0.254.1",
+          "output": "10.0.254.1/32, ubest/mbest: 2/0\n    *via 10.0.1.0, Eth1/49, [110/41], 00:50:02, ospf-UNDERLAY, intra\n    *via 10.0.1.2, Eth1/50, [110/41], 00:50:02, ospf-UNDERLAY, intra"
+        },
+        {
+          "comment": "The anycast RP address is reachable through both spines at equal cost."
+        }
+      ]
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Troubleshooting order",
+      "markdown": "Work bottom-up: interface and MTU, then IGP adjacency, then loopback reachability, then PIM neighbors and RP, and only then BGP EVPN. Most overlay faults that look like BGP problems are really an underlay route or MTU problem."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a Nexus 9000v or Cisco Modeling Labs lab with two spines and two leaves, configure the OSPF underlay with BFD, then add PIM sparse mode with an anycast RP of 10.0.254.1 on both spines. Verify the OSPF neighbors, the PIM neighbors and the ECMP routes. Shut down one spine link and confirm that BFD removes the route in under a second and traffic continues through the other spine."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Underlay",
+          "definition": "The routed IP network that carries encapsulated overlay traffic between VTEPs."
+        },
+        {
+          "term": "BFD",
+          "definition": "Bidirectional Forwarding Detection: sub-second link failure detection."
+        },
+        {
+          "term": "Route reflector",
+          "definition": "An iBGP speaker that reflects routes so peers need no full mesh."
+        },
+        {
+          "term": "Anycast RP",
+          "definition": "Several routers sharing one RP address for load sharing and instant failover."
+        },
+        {
+          "term": "BUM traffic",
+          "definition": "Broadcast, unknown unicast and multicast frames that must reach every VTEP in a segment."
+        },
+        {
+          "term": "Ingress replication",
+          "definition": "Unicast copies of BUM traffic sent to each remote VTEP."
+        },
+        {
+          "term": "ECMP",
+          "definition": "Equal-cost multipath across several routes."
+        },
+        {
+          "term": "Point-to-point link",
+          "definition": "A routed link with exactly two routers, so OSPF needs no DR election."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why configure `ip ospf network point-to-point` on fabric links?",
+          "options": [
+            "It skips DR/BDR election and speeds up adjacency",
+            "It enables multicast",
+            "It raises the MTU",
+            "It authenticates neighbors"
+          ],
+          "answer": 0,
+          "explanation": "Fabric links connect exactly two routers, so a DR adds delay and no benefit."
+        },
+        {
+          "question": "An OSPF neighbor is stuck in EXSTART. What is the most likely cause?",
+          "options": [
+            "MTU mismatch",
+            "Wrong area ID",
+            "Missing BFD",
+            "Duplicate loopback"
+          ],
+          "answer": 0,
+          "explanation": "Database descriptor packets that exceed one side's MTU never complete the exchange. A wrong area would prevent the neighbor reaching 2-WAY at all."
+        },
+        {
+          "question": "Which statements about anycast RP in an NX-OS fabric are true? (Choose all that apply.)",
+          "options": [
+            "Spines share one RP address",
+            "Failover relies on unicast routing",
+            "MSDP is mandatory",
+            "It provides load sharing between RPs"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "NX-OS anycast RP uses PIM anycast RP set, so no MSDP peering is needed."
+        },
+        {
+          "question": "In an eBGP EVPN fabric, what must a spine do with the next hop of EVPN routes?",
+          "options": [
+            "Keep it unchanged",
+            "Set it to itself",
+            "Set it to the RP",
+            "Remove it"
+          ],
+          "answer": 0,
+          "explanation": "If the spine rewrites the next hop, VXLAN traffic is sent to the spine instead of the remote VTEP."
+        },
+        {
+          "question": "Which BUM delivery method needs no multicast in the underlay?",
+          "options": [
+            "Ingress replication",
+            "PIM sparse mode",
+            "Anycast RP",
+            "Bidir PIM"
+          ],
+          "answer": 0,
+          "explanation": "The source VTEP sends a unicast copy to each peer, so the underlay only needs IP unicast."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- The underlay exists to give every VTEP loopback **ECMP reachability**. Use routed point-to-point links, /31 addressing, BFD and one MTU everywhere.\n- **OSPF** is the simple default; **eBGP** scales larger but needs AS planning and `maximum-paths`. EVPN itself always uses BGP.\n- BUM traffic uses **ingress replication** or a **PIM sparse-mode multicast underlay** with anycast RP on the spines.\n- Troubleshoot bottom-up: MTU, IGP, loopbacks, PIM, then BGP EVPN."
+    }
+  ],
+  "ar": {
+    "title": "التوجيه في مراكز البيانات: OSPF وBGP وPIM",
+    "summary": "اختر بروتوكول التوجيه للشبكة التحتية في نسيج السبين والليف واضبطه، وسلّم حركة BUM بالنسخ عند المدخل أو بـPIM وAnycast RP.",
+    "objectives": [
+      "اختر OSPF أو IS-IS أو eBGP للشبكة التحتية في النسيج",
+      "اضبط OSPF من نقطة إلى نقطة مع BFD على NX-OS",
+      "اشرح ECMP في eBGP وسلوك القفزة التالية في أنسجة EVPN",
+      "قارن النسخ عند المدخل بشبكة تحتية بالبث المتعدد وPIM",
+      "استكشف أعطال الشبكة التحتية من الأسفل إلى الأعلى"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تُوصَّل ورقة جديدة بأربعة سبينات مساء الجمعة. وفي الصباح يلاحظ فريق الشبكة أن وصلتين فقط من أربع تحملان الحركة، وأن تطبيق بث متعدد يفشل في نصف الرفوف، وأن جلسة BGP تنقطع كل بضع دقائق. لكل عرَض سبب مختلف، ومع ذلك تقع الأسباب الثلاثة في الشبكة التحتية (Underlay) التي تعتمد عليها كل شبكة علوية.\n\nليست بروتوكولات التوجيه في نسيج مركز البيانات غريبة. إنها OSPF وBGP وPIM نفسها التي تعرفها، لكنها مضبوطة لوصلات نقطة إلى نقطة وتقارب سريع وتوزيع حمل واسع. يعرض هذا الدرس الخيارات التي يتوقعها اختبار DCCOR: أي بروتوكول يعمل وأين، وكيف يُضبط على NX-OS، وكيف يُتحقق منه. وتأتي الطوبولوجيا من درس [بنية شبكات مراكز البيانات والنسيج الشبكي](/learn/enterprise-datacenter-networking/data-center-network-architecture-and-fabrics)."
+      },
+      {
+        "id": "choose",
+        "type": "text",
+        "markdown": "## اختيار بروتوكول الشبكة التحتية\n\nللشبكة التحتية وظيفة واحدة: إتاحة الوصول إلى عناوين الاسترجاع (Loopback) الخاصة بكل نقطة VTEP عبر مسارات متساوية الكلفة. وهناك ثلاثة تصاميم شائعة.\n\n| التصميم | نقاط القوة | ما يجب الانتباه إليه |\n|:--|:--|:--|\n| OSPF (منطقة واحدة 0) | بسيط وسريع ومعروف | يضعف تحمّل الإغراق عند الأحجام الكبيرة جدًا |\n| IS-IS | استقرار عالٍ ولا يعتمد على IP | أقل ألفة لدى كثير من الفرق |\n| eBGP (نظام مستقل لكل ليف أو لكل رف) | الأكثر قابلية للتوسع وسياسات قوية | ضبط أكثر ويحتاج تخطيطًا لأرقام الأنظمة المستقلة أو `allowas-in` |\n\nومهما اخترت، التزم بهذه العادات:\n\n- استخدم واجهات موجَّهة **من نقطة إلى نقطة** بعناوين /31 (أو واجهات بلا عنوان مع Loopback مشترك) لتوفير العناوين وتجنب انتخاب DR/BDR.\n- أعلن **عناوين الاسترجاع فقط** في الشبكة التحتية، فشبكات الخوادم مكانها الشبكة العلوية.\n- اضبط **BFD** لاكتشاف أعطال الوصلات في أقل بكثير من ثانية بدل انتظار مؤقتات البروتوكول.\n- أبقِ MTU متطابقًا على كل الوصلات."
+      },
+      {
+        "id": "ospf",
+        "type": "text",
+        "markdown": "## OSPF في النسيج\n\nOSPF هو الخيار الافتراضي في معظم أنسجة NX-OS التي تبنيها سيسكو. وتكفي منطقة واحدة 0 لمئات المفاتيح.\n\nالنقاط الأساسية:\n\n- اضبط `ip ospf network point-to-point` على وصلات النسيج، فيُتجاوز انتخاب DR ويتسارع تكوين الجوار.\n- استخدم **معرّف موجّه (Router ID)** ثابتًا مأخوذًا من واجهة Loopback.\n- فعّل `bfd` على الواجهة لاكتشاف الأعطال في أقل من ثانية.\n- استخدم `maximum-paths` بقيمة تكفي عدد السبينات. ويثبّت NX-OS حتى 64 مسارًا متساوي الكلفة.\n- اجعل واجهات الاسترجاع سلبية (Passive) بقناع /32 كي يُعلَن مسار المضيف وحده.\n\nومن الأعطال الشائعة عدم تطابق MTU: يعلق الجار في الحالة **EXSTART** لأن حزم وصف قاعدة البيانات تتجاوز MTU أحد الطرفين. افحص `show ip ospf neighbor` وقيمة MTU على الطرفين."
+      },
+      {
+        "id": "ospfcfg",
+        "type": "code",
+        "language": "cisco",
+        "filename": "spine1.cfg",
+        "caption": "شبكة تحتية بـOSPF على سبين مع BFD وعنوان استرجاع يُعلَن بقناع /32.",
+        "code": "feature ospf\nfeature bfd\n!\nrouter ospf UNDERLAY\n  router-id 10.0.255.1\n!\ninterface loopback0\n  ip address 10.0.255.1/32\n  ip router ospf UNDERLAY area 0.0.0.0\n!\ninterface Ethernet1/1\n  description to-leaf1\n  no switchport\n  mtu 9216\n  ip address 10.0.1.0/31\n  ip ospf network point-to-point\n  ip ospf bfd\n  ip router ospf UNDERLAY area 0.0.0.0\n  no shutdown\n"
+      },
+      {
+        "id": "bgp",
+        "type": "text",
+        "markdown": "## BGP في النسيج\n\nيظهر BGP بدورين.\n\n**eBGP في الشبكة التحتية.** لكل ليف نظام مستقل خاص به، وتشترك السبينات في نظام واحد، ويتجاور الليف مع كل سبين. يمرّر السبين المسارات دون تعديل، فيتساوى طول المسار ويعمل ECMP. وإذا اشترك الأوراق في النظام نفسه فإن منع الحلقات يُسقط المسارات، فتحتاج إلى أرقام أنظمة فريدة أو `allowas-in`.\n\n**iBGP في الشبكة العلوية (BGP EVPN).** حتى مع شبكة تحتية بـOSPF تستخدم الشبكة العلوية BGP مع عائلة العناوين `l2vpn evpn`. وتعمل السبينات **عاكسات مسارات (Route Reflectors)** فلا تحتاج الأوراق إلى شبكة متشابكة كاملة. وستضبط ذلك في درس [الشبكة العلوية والشبكة التحتية في VXLAN EVPN](/learn/enterprise-datacenter-networking/vxlan-evpn-overlay-and-underlay).\n\n### فخاخ الاختبار\n\n- يتطلب ECMP عبر eBGP الأمر `maximum-paths` (ومع اختلاف أنظمة الجيران يلزم `bestpath as-path multipath-relax`).\n- لا يغيّر عاكس المسارات القفزة التالية في iBGP، لكن سبين eBGP في نسيج EVPN يجب أن يُبقيها بالأمر `route-map ... set ip next-hop unchanged`، وإلا انجذبت الحركة عبر السبين وتعطّل VXLAN.\n- استخدم `retain route-target all` على سبين لا يستورد بنفسه المسارات التي عليه عكسها."
+      },
+      {
+        "id": "bgpcfg",
+        "type": "code",
+        "language": "cisco",
+        "filename": "leaf1-bgp.cfg",
+        "caption": "شبكة تحتية بـeBGP على ليف في النظام 65101 يتجاور مع سبينين في النظام 65000.",
+        "code": "feature bgp\n!\nrouter bgp 65101\n  router-id 10.0.255.11\n  bestpath as-path multipath-relax\n  address-family ipv4 unicast\n    network 10.0.255.11/32\n    maximum-paths 4\n  neighbor 10.0.1.0\n    remote-as 65000\n    bfd\n    address-family ipv4 unicast\n  neighbor 10.0.1.2\n    remote-as 65000\n    bfd\n    address-family ipv4 unicast\n"
+      },
+      {
+        "id": "tuning",
+        "type": "text",
+        "markdown": "## التقارب والتوسع وسلوك الأعطال\n\nيُحكم على النسيج بما يحدث عند حصول عطل، لذلك صمّم سلوك الأعطال قبل مرور أول حزمة.\n\n- **عطل الوصلة.** يكتشف BFD الفقد في نحو 150 ميلي ثانية بفاصل 50 ms ومضاعف 3. ثم يزيل بروتوكول التوجيه الداخلي القفزة التالية من مجموعة ECMP، فتتحول الحركة إلى السبينات المتبقية. ومن دون BFD ينتظر OSPF مدة الموت (Dead interval) التي قد تبلغ 40 ثانية افتراضيًا.\n- **عطل السبين.** يفقد كل ليف أحد مساراته المتساوية الكلفة. ومع أربعة سبينات يخسر النسيج 25 بالمئة من نطاقه الترددي دون أن يفقد الاتصال. ولهذا يُخطَّط فرط الاشتراك على افتراض تعطل سبين واحد.\n- **صيانة الليف.** استخدم الإدخال والإخراج الرشيقين (ميزة `system mode maintenance` في NX-OS) كي يسحب الليف مساراته قبل إعادة تشغيله بدل أن يُسقط الحركة.\n- **حدود التوسع.** يتحمل OSPF مئات العقد في منطقة واحدة. وبعد ذلك، أو عندما تريد سياسة لكل ليف ونطاقات أعطال واضحة، انتقل إلى eBGP.\n\n### التوثيق والنظافة\n\nاحمِ الشبكة التحتية كما تحمي أي نطاق توجيه إنتاجي: فعّل توثيق MD5 أو SHA على جيران OSPF وBGP، وقيّد البادئات المسموح بدخولها الشبكة التحتية بخريطة مسارات (Route map)، وأبقِ تقييد مستوى التحكم (CoPP) مفعّلًا. فلا ينبغي لجهاز دخيل يُوصَّل بمنفذ ليف أن يتمكن من حقن مسارات في النسيج.\n\n| العطل | آلية الاكتشاف | التعافي المعتاد |\n|:--|:--|:--|\n| سقوط الوصلة | إشارة الوصلة وBFD | أقل من ثانية |\n| توقف الجار عن التمرير | BFD ومؤقتات Hello | أقل من ثانية مع BFD |\n| إعادة تشغيل سبين | BFD على كل الأوراق | ثوانٍ دون فقد لبقية التدفقات |\n| عطل RP | إعادة تقارب التوجيه أحادي البث | ثوانٍ مع Anycast RP |"
+      },
+      {
+        "id": "pim",
+        "type": "text",
+        "markdown": "## PIM للبث المتعدد\n\nيحتاج VXLAN إلى طريقة لتسليم حركة البث والبث المجهول والبث المتعدد (BUM). وهناك طريقتان:\n\n- **النسخ عند المدخل (Ingress replication)** (أحادي البث): تنسخ نقطة VTEP المصدر كل إطار BUM إلى كل نظير. لا تحتاج إلى بث متعدد في الشبكة التحتية، وهي الخيار البسيط عندما يوفّر BGP EVPN قائمة النظراء.\n- **شبكة تحتية بالبث المتعدد**: تُربَط كل VNI من الطبقة الثانية بمجموعة بث متعدد ويبني PIM الشجرة. وهي أقدر على التوسع مع حركة BUM الكثيفة لكنها تضيف بروتوكولًا يجب تشغيله.\n\nوللشبكة التحتية بالبث المتعدد توصي سيسكو بـ**PIM في الوضع المتناثر (Sparse Mode) مع RP متعدد البث (Anycast RP)** على السبينات. يعلن السبينان عنوان RP نفسه، فيصل كل ليف إلى الأقرب، ويحل أحدهما محل الآخر فورًا عند عطله. ولا حاجة إلى MSDP عندما يستخدم السبينان PIM Anycast RP، وهذا هو أسلوب NX-OS.\n\nقواعد جهة الليف:\n\n1. فعّل `feature pim` والأمر `ip pim sparse-mode` على كل واجهة نسيج وعلى واجهة الاسترجاع المستخدمة مصدرًا لـVTEP.\n2. وجّه كل مفتاح إلى RP بالأمر `ip pim rp-address`.\n3. تحقق بالأمرين `show ip pim neighbor` و`show ip mroute`."
+      },
+      {
+        "id": "pim-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "PIM anycast RP and a VNI multicast group",
+        "data": {
+          "actors": [
+            {
+              "id": "l1",
+              "label": "Leaf 1",
+              "sub": "VTEP 10.0.255.11",
+              "icon": "switch"
+            },
+            {
+              "id": "s1",
+              "label": "Spine 1",
+              "sub": "RP 10.0.254.1",
+              "icon": "router"
+            },
+            {
+              "id": "s2",
+              "label": "Spine 2",
+              "sub": "RP 10.0.254.1",
+              "icon": "router"
+            },
+            {
+              "id": "l2",
+              "label": "Leaf 2",
+              "sub": "VTEP 10.0.255.12",
+              "icon": "switch"
+            }
+          ],
+          "steps": [
+            {
+              "from": "l2",
+              "to": "s1",
+              "label": "PIM Join (*,239.1.1.10)",
+              "note": "يستضيف Leaf 2 الشبكة VNI 10010 المرتبطة بالمجموعة 239.1.1.10، فينضم إلى الشجرة المشتركة نحو RP."
+            },
+            {
+              "from": "s1",
+              "to": "s2",
+              "label": "Anycast RP: same address",
+              "tone": "secure",
+              "note": "يملك السبينان العنوان 10.0.254.1. يوجّه التوجيه كل انضمام إلى الأقرب، ويمكن أن يتعطل أي منهما دون تغيير التصميم."
+            },
+            {
+              "from": "l1",
+              "to": "s1",
+              "label": "PIM Register",
+              "note": "يستقبل Leaf 1 بثًا على VNI 10010 فيسجّل المصدر لدى RP."
+            },
+            {
+              "from": "s1",
+              "to": "l2",
+              "label": "Multicast data (VXLAN)",
+              "tone": "success",
+              "note": "يمرّر RP إطار BUM المغلّف عبر الشجرة إلى كل ليف انضم."
+            },
+            {
+              "from": "l2",
+              "to": "l1",
+              "label": "SPT switchover",
+              "note": "ثم يبني Leaf 2 شجرة مصدر مباشرة نحو Leaf 1 ويغادر الشجرة المشتركة."
+            }
+          ]
+        }
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "التحقق من التوجيه في الشبكة التحتية",
+        "prompt": "leaf1#",
+        "lines": [
+          {
+            "cmd": "show ip ospf neighbor",
+            "output": " OSPF Process ID UNDERLAY VRF default\n Total number of neighbors: 2\n Neighbor ID     Pri State            Up Time  Address         Interface\n 10.0.255.1        1 FULL/ -          00:52:19 10.0.1.0        Eth1/49\n 10.0.255.2        1 FULL/ -          00:52:11 10.0.1.2        Eth1/50"
+          },
+          {
+            "comment": "الحالة FULL/ - بشرطة تعني نقطة إلى نقطة بلا DR أو BDR. وجار عالق في EXSTART يشير إلى عدم تطابق MTU."
+          },
+          {
+            "cmd": "show ip pim neighbor",
+            "output": "PIM Neighbor Status for VRF \"default\"\nNeighbor        Interface            Uptime    Expires   DR       Bidir-  BFD\n                                                         Priority Capable State\n10.0.1.0        Ethernet1/49         00:51:40  00:01:33  1        yes     n/a\n10.0.1.2        Ethernet1/50         00:51:38  00:01:31  1        yes     n/a"
+          },
+          {
+            "comment": "إذا غاب سبين عن هذه القائمة فلن تصل انضمامات البث المتعدد لمجموعات VNI إلى RP."
+          },
+          {
+            "cmd": "show ip route 10.0.254.1",
+            "output": "10.0.254.1/32, ubest/mbest: 2/0\n    *via 10.0.1.0, Eth1/49, [110/41], 00:50:02, ospf-UNDERLAY, intra\n    *via 10.0.1.2, Eth1/50, [110/41], 00:50:02, ospf-UNDERLAY, intra"
+          },
+          {
+            "comment": "يمكن الوصول إلى عنوان RP المتعدد عبر السبينين بكلفة متساوية."
+          }
+        ]
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "ترتيب استكشاف الأخطاء",
+        "markdown": "اعمل من الأسفل إلى الأعلى: الواجهة وMTU، ثم جوار بروتوكول التوجيه الداخلي، ثم الوصول إلى عناوين الاسترجاع، ثم جيران PIM وRP، وبعدها فقط BGP EVPN. ومعظم أعطال الشبكة العلوية التي تبدو مشكلات BGP هي في حقيقتها مشكلة مسار أو MTU في الشبكة التحتية."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في مختبر Nexus 9000v أو Cisco Modeling Labs فيه سبينان وليفان، اضبط شبكة OSPF تحتية مع BFD، ثم أضف PIM في الوضع المتناثر مع RP متعدد البث بالعنوان 10.0.254.1 على السبينين. تحقق من جيران OSPF وجيران PIM ومسارات ECMP. ثم أوقف إحدى وصلات السبين وتأكد أن BFD يزيل المسار في أقل من ثانية وأن الحركة تستمر عبر السبين الآخر."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "Underlay",
+            "definition": "شبكة IP الموجَّهة التي تحمل حركة الشبكة العلوية المغلّفة بين نقاط VTEP."
+          },
+          {
+            "term": "BFD",
+            "definition": "اكتشاف الأعطال ثنائي الاتجاه: يكتشف أعطال الوصلات في أقل من ثانية."
+          },
+          {
+            "term": "Route reflector",
+            "definition": "جهاز iBGP يعكس المسارات فلا يحتاج النظراء إلى شبكة متشابكة كاملة."
+          },
+          {
+            "term": "Anycast RP",
+            "definition": "عدة موجّهات تتشارك عنوان RP واحدًا لتوزيع الحمل والتحويل الفوري عند العطل."
+          },
+          {
+            "term": "BUM traffic",
+            "definition": "إطارات البث والبث المجهول والبث المتعدد التي يجب أن تصل إلى كل VTEP في المقطع."
+          },
+          {
+            "term": "Ingress replication",
+            "definition": "نسخ أحادية البث من حركة BUM تُرسل إلى كل VTEP بعيد."
+          },
+          {
+            "term": "ECMP",
+            "definition": "توزيع الحمل على عدة مسارات متساوية الكلفة."
+          },
+          {
+            "term": "Point-to-point link",
+            "definition": "وصلة موجَّهة بين موجّهين فقط، فلا يحتاج OSPF إلى انتخاب DR."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا يُضبط الأمر `ip ospf network point-to-point` على وصلات النسيج؟",
+            "options": [
+              "يتجاوز انتخاب DR/BDR ويسرّع تكوين الجوار",
+              "يفعّل البث المتعدد",
+              "يرفع MTU",
+              "يوثّق الجيران"
+            ],
+            "answer": 0,
+            "explanation": "تربط وصلات النسيج موجّهين فقط، فيضيف DR تأخيرًا بلا فائدة."
+          },
+          {
+            "question": "جار OSPF عالق في الحالة EXSTART. ما أرجح سبب؟",
+            "options": [
+              "عدم تطابق MTU",
+              "معرّف منطقة خاطئ",
+              "غياب BFD",
+              "واجهة استرجاع مكررة"
+            ],
+            "answer": 0,
+            "explanation": "حزم وصف قاعدة البيانات التي تتجاوز MTU أحد الطرفين لا يكتمل تبادلها. أما منطقة خاطئة فتمنع الجار من بلوغ 2-WAY أصلًا."
+          },
+          {
+            "question": "أي العبارات الآتية عن Anycast RP في نسيج NX-OS صحيحة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تتشارك السبينات عنوان RP واحدًا",
+              "يعتمد التحويل عند العطل على التوجيه أحادي البث",
+              "MSDP إلزامي",
+              "يوفّر توزيع الحمل بين نقاط RP"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "يستخدم NX-OS مجموعة PIM Anycast RP، فلا حاجة إلى جوار MSDP."
+          },
+          {
+            "question": "في نسيج EVPN بـeBGP، ماذا يجب أن يفعل السبين بالقفزة التالية لمسارات EVPN؟",
+            "options": [
+              "يُبقيها دون تغيير",
+              "يجعلها نفسه",
+              "يجعلها RP",
+              "يحذفها"
+            ],
+            "answer": 0,
+            "explanation": "إذا أعاد السبين كتابة القفزة التالية أُرسلت حركة VXLAN إلى السبين بدل VTEP البعيد."
+          },
+          {
+            "question": "أي طريقة لتسليم BUM لا تحتاج إلى بث متعدد في الشبكة التحتية؟",
+            "options": [
+              "النسخ عند المدخل",
+              "PIM في الوضع المتناثر",
+              "Anycast RP",
+              "Bidir PIM"
+            ],
+            "answer": 0,
+            "explanation": "ترسل نقطة VTEP المصدر نسخة أحادية البث إلى كل نظير، فلا تحتاج الشبكة التحتية إلا إلى توجيه أحادي البث."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- وُجدت الشبكة التحتية لتوفير **وصول ECMP** إلى عنوان الاسترجاع لكل VTEP. استخدم وصلات موجَّهة من نقطة إلى نقطة وعناوين /31 وBFD وMTU واحدًا في كل مكان.\n- **OSPF** هو الخيار الافتراضي البسيط، أما **eBGP** فيتوسع أكثر لكنه يتطلب تخطيط الأنظمة المستقلة و`maximum-paths`. أما EVPN نفسه فيستخدم BGP دائمًا.\n- تستخدم حركة BUM **النسخ عند المدخل** أو **شبكة تحتية بالبث المتعدد وPIM في الوضع المتناثر** مع Anycast RP على السبينات.\n- استكشف الأعطال من الأسفل إلى الأعلى: MTU ثم بروتوكول التوجيه الداخلي ثم عناوين الاسترجاع ثم PIM ثم BGP EVPN."
+      }
+    ]
+  }
+}

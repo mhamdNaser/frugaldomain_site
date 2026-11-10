@@ -1,0 +1,548 @@
+{
+  "slug": "pxgrid-and-context-sharing",
+  "title": "pxGrid and Context Sharing",
+  "summary": "Share ISE identity and endpoint context with firewalls and other tools through pxGrid, and use ANC to quarantine endpoints automatically.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Describe pxGrid roles, services and topics",
+    "Register and approve a pxGrid client with REST calls",
+    "Use ANC policies with authorization rules to quarantine endpoints",
+    "Troubleshoot pxGrid certificate and approval problems"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 02:14 the firewall's intrusion policy flags a workstation at 10.20.30.77 for command-and-control beaconing. The analyst sees an IP address, nothing more. Who is logged in? Is it a managed laptop or a guest phone? Which switch port is it on? Finding out takes four consoles and twenty minutes. Meanwhile the host keeps talking.\n\n**Cisco Platform Exchange Grid (pxGrid)** removes that delay. It is a publish and subscribe fabric that lets ISE share identity, group, posture and device context with security products, and lets those products send back an action such as \"quarantine this endpoint\". The CCIE Security lab uses pxGrid to connect ISE to a firewall, a web proxy and automation scripts. The firewall side is covered in [Secure Firewall Threat Defense and Management Center](/learn/cisco-security-certification-track/secure-firewall-threat-defense-and-management-center)."
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## Architecture and roles\n\npxGrid 2.0 runs over **REST** and **WebSocket/STOMP** on **TCP 8910**, secured by TLS. There is no custom binary protocol, so any language with an HTTPS client can participate.\n\n| Role | What it does | Example |\n|:--|:--|:--|\n| **Controller** | The ISE node running the pxGrid persona; authenticates clients, registers services, authorizes topics | ISE pxGrid node |\n| **Publisher** | Offers a service and publishes messages on a topic | ISE (sessions, ANC, TrustSec configuration) |\n| **Subscriber / consumer** | Looks up a service and receives its messages | Secure Firewall, Secure Network Analytics, a SIEM |\n| **Client with a query** | Pulls current state on demand | Python script calling `getSessions` |\n\nImportant services published by ISE:\n\n- `com.cisco.ise.session`: authenticated sessions (IP, MAC, user, groups, SGT, posture, endpoint profile).\n- `com.cisco.ise.radius.failure`: RADIUS authentication failures.\n- `com.cisco.ise.config.trustsec`: SGT, SGACL and policy data.\n- `com.cisco.ise.config.anc`: Adaptive Network Control policies and endpoint assignments.\n- `com.cisco.ise.mdm`: mobile device management data.\n- `com.cisco.ise.pubsub`: the WebSocket/STOMP transport used to receive publications.\n\nAn ISE deployment can have several pxGrid nodes for redundancy; clients connect to one and fail over to another."
+    },
+    {
+      "id": "px-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "A pxGrid client from registration to quarantine",
+      "caption": "Account, approval, service lookup, subscription and an ANC action.",
+      "data": {
+        "actors": [
+          {
+            "id": "fw",
+            "label": "Consumer",
+            "sub": "FMC / script",
+            "icon": "firewall"
+          },
+          {
+            "id": "px",
+            "label": "ISE pxGrid",
+            "sub": "192.0.2.25:8910",
+            "icon": "server"
+          },
+          {
+            "id": "sw",
+            "label": "Switch",
+            "sub": "Gi1/0/14",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "fw",
+            "to": "px",
+            "label": "AccountCreate",
+            "detail": "nodeName",
+            "note": "The client registers and receives a generated password (password mode)."
+          },
+          {
+            "from": "px",
+            "to": "fw",
+            "label": "PENDING",
+            "tone": "warning",
+            "note": "An administrator approves the client, or auto-approve is enabled."
+          },
+          {
+            "from": "fw",
+            "to": "px",
+            "label": "AccountActivate",
+            "tone": "success",
+            "note": "Once approved the account becomes ENABLED."
+          },
+          {
+            "from": "fw",
+            "to": "px",
+            "label": "ServiceLookup",
+            "detail": "com.cisco.ise.session",
+            "note": "The consumer asks which node publishes the session service."
+          },
+          {
+            "from": "fw",
+            "to": "px",
+            "label": "AccessSecret",
+            "tone": "secure",
+            "note": "The controller issues a token to talk to the publisher node."
+          },
+          {
+            "from": "px",
+            "to": "fw",
+            "label": "STOMP MESSAGE",
+            "detail": "session 10.20.30.77",
+            "tone": "success",
+            "note": "Subscribed over WebSocket: every new session arrives in real time."
+          },
+          {
+            "from": "fw",
+            "to": "px",
+            "label": "applyEndpointByIp",
+            "detail": "policy QUARANTINE",
+            "tone": "warning",
+            "note": "An IPS alert triggers an ANC action on the endpoint."
+          },
+          {
+            "from": "px",
+            "to": "sw",
+            "label": "CoA",
+            "detail": "reauthenticate",
+            "tone": "danger",
+            "note": "ISE sends a CoA, and the switch applies the quarantine result."
+          }
+        ]
+      }
+    },
+    {
+      "id": "security",
+      "type": "text",
+      "markdown": "## Authentication and authorization\n\nA client authenticates to the controller in one of two ways:\n\n- **Password-based.** The client calls `AccountCreate`, an admin approves it in *Administration > pxGrid Services > Client Management*, and the client then calls `AccountActivate`. Simple for scripts, but the generated password is a secret to protect.\n- **Certificate-based.** The client presents its own certificate, signed by a CA that ISE trusts. This is preferred for production and for products like FMC.\n\nEither way, the **server** must be trusted by the client. Import the pxGrid node's certificate (or its CA) into the client trust store. The pxGrid certificate must contain the `clientAuth` and `serverAuth` EKUs; this is the most common reason a new integration fails.\n\nAuthorization is per **service and operation**. ISE places clients in groups such as `ANC` or `Session`; a client approved only for sessions cannot call ANC operations. Review approvals regularly, because a pxGrid client can read the full identity map of your network.\n\n### Adaptive Network Control (ANC)\n\nANC lets an authorized pxGrid client assign an endpoint to a named policy: `QUARANTINE`, `SHUT_DOWN` or `PORT_BOUNCE`. ISE then issues the right CoA and returns authorization that matches the ANC assignment. You must create an authorization rule that matches the ANC policy (`ANC:ANCPolicy EQUALS QUARANTINE`) and returns a quarantine SGT or VLAN; the ANC policy itself changes nothing without that rule. Tag-based enforcement is explained in [Segmentation with VRF, TrustSec and SGTs](/learn/cisco-security-certification-track/segmentation-with-vrf-trustsec-and-sgts)."
+    },
+    {
+      "id": "rest",
+      "type": "terminal",
+      "title": "pxGrid 2.0 REST calls (lab values)",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl --cacert ise-ca.pem -X POST https://ise-pxgrid.example.com:8910/pxgrid/control/AccountCreate -H 'Content-Type: application/json' -H 'Accept: application/json' -d '{\"nodeName\":\"lab-client-01\"}'",
+          "output": "{\"nodeName\":\"lab-client-01\",\"userName\":\"lab-client-01\",\"password\":\"<GENERATED_PASSWORD>\"}",
+          "comment": "Step 1: register a password-mode client. Store the password as a secret."
+        },
+        {
+          "cmd": "curl --cacert ise-ca.pem -u lab-client-01:<GENERATED_PASSWORD> -X POST https://ise-pxgrid.example.com:8910/pxgrid/control/AccountActivate -H 'Content-Type: application/json' -d '{}'",
+          "output": "{\"accountState\":\"PENDING\",\"version\":\"2.0.0.0\"}",
+          "comment": "PENDING until an ISE admin approves the client; later calls return ENABLED."
+        },
+        {
+          "cmd": "curl --cacert ise-ca.pem -u lab-client-01:<GENERATED_PASSWORD> -X POST https://ise-pxgrid.example.com:8910/pxgrid/control/ServiceLookup -H 'Content-Type: application/json' -d '{\"name\":\"com.cisco.ise.session\"}'",
+          "output": "{\"services\":[{\"name\":\"com.cisco.ise.session\",\"nodeName\":\"ise-pxgrid-1\",\n  \"properties\":{\"wsPubsubService\":\"com.cisco.ise.pubsub\",\"sessionTopic\":\"/topic/com.cisco.ise.session\",\n  \"restBaseUrl\":\"https://ise-pxgrid.example.com:8910/pxgrid/ise/session\"}}]}",
+          "comment": "The lookup returns the topic to subscribe to and the REST base URL for queries."
+        }
+      ]
+    },
+    {
+      "id": "consumers",
+      "type": "text",
+      "markdown": "## What consumes pxGrid\n\n- **Secure Firewall (FMC).** Uses the ISE identity realm to map IPs to users and groups, so access control rules can say \"Engineering\" or \"SGT Quarantine\" instead of address objects. See [Dynamic Objects and Security Intelligence](/learn/cisco-security-certification-track/dynamic-objects-and-security-intelligence) for the dynamic-object model.\n- **Secure Web Appliance and Secure Email.** Apply identity-based web policy through the ISE identification profile.\n- **Secure Network Analytics.** Enriches flows with user and device context and can trigger ANC quarantine.\n- **Catalyst Center.** Reads ISE data for assurance and group-based policy.\n- **SIEM and SOAR.** Subscribe to sessions and failures for correlation and automated response.\n- **Third-party integrations.** Vendors publish their own pxGrid topics, for example endpoint compliance or vulnerability context, which ISE can then use in policy.\n\nOperational advice: give every integration its own client name and its own certificate, so that you can revoke one product without disturbing the others. Document which services each client may use, and review the client list whenever a project ends. Monitor the pxGrid node like any other critical service, because a firewall that depends on identity data will fall back to address-based rules, or fail closed, when the feed stops.\n\nDesign choice: **subscription** gives real-time updates and is the right approach for firewalls that must track many sessions; **REST query** gives current state and fits scripts and reports. Many products use both, bootstrapping with a bulk query and staying current with a subscription."
+    },
+    {
+      "id": "trouble",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Troubleshooting integrations",
+      "markdown": "- **Client stays PENDING.** Nobody approved it, or auto-approve is off. Check *Client Management > Clients*.\n- **TLS handshake fails.** The client does not trust the pxGrid certificate, or the certificate lacks the required EKUs or SAN for the hostname used.\n- **Connects, then receives nothing.** The client is not subscribed to the topic, or ISE has no session matching its filter.\n- **ANC action succeeds but nothing changes.** There is no authorization rule that matches the ANC policy, or the CoA cannot reach the switch.\n- **Works on one node only.** pxGrid persona not enabled on all intended nodes, or DNS names resolve to the wrong node. Time sync (NTP) differences also break certificate validation."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab ISE node you control and a Linux or Windows host with `curl` or Python.\n\n1. Enable the pxGrid persona on your ISE node and turn on *Automatically approve new certificate-based accounts* for the lab only.\n2. Run the three REST calls from this lesson against your own node, using your own CA file and placeholder-safe password handling.\n3. Approve the client in *Client Management* and call `AccountActivate` again to see ENABLED.\n4. Create an ANC policy `QUARANTINE` and an authorization rule that returns a restricted SGT for it.\n5. Apply the policy to a test endpoint from *Operations > Adaptive Network Control* and watch the CoA and the session change in Live Logs."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "pxGrid",
+          "definition": "Cisco Platform Exchange Grid: a publish/subscribe framework for sharing security context."
+        },
+        {
+          "term": "Controller",
+          "definition": "The ISE pxGrid node that authenticates clients and registers services."
+        },
+        {
+          "term": "Topic",
+          "definition": "A named message channel such as /topic/com.cisco.ise.session."
+        },
+        {
+          "term": "STOMP over WebSocket",
+          "definition": "The messaging transport pxGrid 2.0 uses to deliver publications."
+        },
+        {
+          "term": "ANC",
+          "definition": "Adaptive Network Control: assigning an endpoint a mitigation policy such as QUARANTINE."
+        },
+        {
+          "term": "Client approval",
+          "definition": "The admin or automatic step that enables a registered pxGrid client."
+        },
+        {
+          "term": "Session directory",
+          "definition": "The set of live session records ISE publishes with IP, user, groups and SGT."
+        },
+        {
+          "term": "Context sharing",
+          "definition": "Passing identity and device data from one security product to another."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which TCP port does pxGrid 2.0 use?",
+          "options": [
+            "443",
+            "8443",
+            "8910",
+            "1700"
+          ],
+          "answer": 2,
+          "explanation": "pxGrid 2.0 REST and WebSocket traffic uses TCP 8910. 8443 is the ISE portal port and 1700 is CoA."
+        },
+        {
+          "question": "A pxGrid client shows PENDING. What is the usual cause?",
+          "options": [
+            "The firewall blocks UDP 1812",
+            "An administrator has not approved the client",
+            "The switch lacks CoA",
+            "The SGT is missing"
+          ],
+          "answer": 1,
+          "explanation": "Password-mode and certificate-mode clients wait for approval unless auto-approve is on."
+        },
+        {
+          "question": "Choose all that apply. Which can pxGrid consumers do?",
+          "options": [
+            "Subscribe to ISE session events",
+            "Query current sessions over REST",
+            "Apply an ANC policy to an endpoint",
+            "Rewrite ISE certificates"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Subscriptions, queries and ANC actions are supported. Rewriting ISE certificates is not part of pxGrid."
+        },
+        {
+          "question": "An ANC QUARANTINE assignment succeeds but access does not change. What is missing?",
+          "options": [
+            "An authorization rule that matches the ANC policy",
+            "A new switch VLAN database",
+            "More pxGrid nodes",
+            "A larger certificate key"
+          ],
+          "answer": 0,
+          "explanation": "ANC only records the assignment; an authorization rule must return the restrictive result."
+        },
+        {
+          "question": "Choose all that apply. Which are common causes of a failed pxGrid TLS connection?",
+          "options": [
+            "The client lacks the pxGrid CA in its trust store",
+            "The certificate lacks clientAuth or serverAuth EKU",
+            "Clock difference between client and ISE",
+            "A mismatch of OSPF area numbers"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Trust, EKUs and time all affect certificate validation. OSPF areas do not."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- pxGrid is a REST and WebSocket/STOMP fabric on TCP 8910 for sharing ISE context.\n- Clients register, get approved, look up services and subscribe or query.\n- Certificate-based clients and correct EKUs are the most common integration points of failure.\n- ANC lets a consumer quarantine an endpoint, but only an authorization rule makes it effective.\n- Firewalls, web gateways, analytics and SOAR tools use pxGrid to turn IP addresses into identities."
+    }
+  ],
+  "ar": {
+    "title": "pxGrid وتبادل السياق",
+    "summary": "شارك سياق الهوية والأجهزة من ISE مع جدران الحماية وأدوات أخرى عبر pxGrid، واستخدم ANC لعزل الأجهزة تلقائيًا.",
+    "objectives": [
+      "صِف أدوار pxGrid وخدماته ومواضيعه",
+      "سجّل عميل pxGrid ووافق عليه باستدعاءات REST",
+      "استخدم سياسات ANC مع قواعد التفويض لعزل الأجهزة",
+      "شخّص مشكلات شهادات pxGrid والموافقة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الثانية والربع صباحًا تُبلّغ سياسة منع التسلل في جدار الحماية عن محطة عمل على العنوان 10.20.30.77 بسبب إشارات تحكم وسيطرة. لا يرى المحلل سوى عنوان IP. من الذي سجّل دخوله؟ هل هو حاسوب مُدار أم هاتف ضيف؟ وعلى أي منفذ محوّل؟ يتطلب الجواب أربع وحدات تحكم وعشرين دقيقة، بينما يواصل المضيف الاتصال.\n\nتزيل **منصة Cisco لتبادل المنصات (pxGrid)** هذا التأخير. وهي نسيج نشر واشتراك يتيح لـ ISE مشاركة سياق الهوية والمجموعة والوضعية والجهاز مع المنتجات الأمنية، ويتيح لتلك المنتجات إعادة إجراء مثل «اعزل هذا الجهاز». ويستخدم مختبر CCIE Security الخدمة pxGrid لربط ISE بجدار حماية ووكيل ويب ونصوص أتمتة. وتغطي جانب جدار الحماية دروس [Secure Firewall Threat Defense and Management Center](/learn/cisco-security-certification-track/secure-firewall-threat-defense-and-management-center)."
+      },
+      {
+        "id": "arch",
+        "type": "text",
+        "markdown": "## البنية والأدوار\n\nيعمل pxGrid 2.0 عبر **REST** و**WebSocket/STOMP** على المنفذ **TCP 8910** ومؤمَّنًا بـ TLS. لا يوجد بروتوكول ثنائي مخصص، فيستطيع المشاركة أي لغة لها عميل HTTPS.\n\n| الدور | ما يفعله | مثال |\n|:--|:--|:--|\n| **المتحكم (Controller)** | عقدة ISE التي تشغّل شخصية pxGrid؛ تصادق العملاء وتسجل الخدمات وتخوّل المواضيع | عقدة ISE pxGrid |\n| **الناشر (Publisher)** | يعرض خدمة وينشر رسائل على موضوع | ISE (الجلسات وANC وضبط TrustSec) |\n| **المشترك / المستهلك** | يبحث عن خدمة ويتلقى رسائلها | Secure Firewall وSecure Network Analytics ونظام SIEM |\n| **عميل باستعلام** | يسحب الحالة الراهنة عند الطلب | نص Python يستدعي `getSessions` |\n\nومن أهم الخدمات التي ينشرها ISE:\n\n- `com.cisco.ise.session`: الجلسات المصادَق عليها (IP وMAC والمستخدم والمجموعات وSGT والوضعية وملف الجهاز).\n- `com.cisco.ise.radius.failure`: إخفاقات مصادقة RADIUS.\n- `com.cisco.ise.config.trustsec`: بيانات SGT وSGACL والسياسة.\n- `com.cisco.ise.config.anc`: سياسات التحكم التكيفي في الشبكة (ANC) وإسنادات الأجهزة.\n- `com.cisco.ise.mdm`: بيانات إدارة الأجهزة المحمولة.\n- `com.cisco.ise.pubsub`: نقل WebSocket/STOMP المستخدم لتلقي المنشورات.\n\nويمكن أن تضم منظومة ISE عدة عقد pxGrid للتكرار؛ يتصل العملاء بواحدة وينتقلون إلى أخرى عند العطل."
+      },
+      {
+        "id": "px-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "عميل pxGrid من التسجيل حتى العزل",
+        "caption": "حساب وموافقة وبحث عن الخدمة واشتراك وإجراء ANC.",
+        "data": {
+          "actors": [
+            {
+              "id": "fw",
+              "label": "المستهلك",
+              "sub": "FMC / script",
+              "icon": "firewall"
+            },
+            {
+              "id": "px",
+              "label": "ISE pxGrid",
+              "sub": "192.0.2.25:8910",
+              "icon": "server"
+            },
+            {
+              "id": "sw",
+              "label": "المحوّل",
+              "sub": "Gi1/0/14",
+              "icon": "switch"
+            }
+          ],
+          "steps": [
+            {
+              "from": "fw",
+              "to": "px",
+              "label": "AccountCreate",
+              "detail": "nodeName",
+              "note": "يسجّل العميل ويتلقى كلمة مرور مولَّدة (نمط كلمة المرور)."
+            },
+            {
+              "from": "px",
+              "to": "fw",
+              "label": "PENDING",
+              "tone": "warning",
+              "note": "يوافق مسؤول على العميل، أو تكون الموافقة التلقائية مفعّلة."
+            },
+            {
+              "from": "fw",
+              "to": "px",
+              "label": "AccountActivate",
+              "tone": "success",
+              "note": "عند الموافقة يصبح الحساب ENABLED."
+            },
+            {
+              "from": "fw",
+              "to": "px",
+              "label": "ServiceLookup",
+              "detail": "com.cisco.ise.session",
+              "note": "يسأل المستهلك أي عقدة تنشر خدمة الجلسات."
+            },
+            {
+              "from": "fw",
+              "to": "px",
+              "label": "AccessSecret",
+              "tone": "secure",
+              "note": "يصدر المتحكم رمزًا للتخاطب مع عقدة الناشر."
+            },
+            {
+              "from": "px",
+              "to": "fw",
+              "label": "STOMP MESSAGE",
+              "detail": "session 10.20.30.77",
+              "tone": "success",
+              "note": "بعد الاشتراك عبر WebSocket تصل كل جلسة جديدة فورًا."
+            },
+            {
+              "from": "fw",
+              "to": "px",
+              "label": "applyEndpointByIp",
+              "detail": "policy QUARANTINE",
+              "tone": "warning",
+              "note": "ينبّه نظام IPS فيطلق إجراء ANC على الجهاز."
+            },
+            {
+              "from": "px",
+              "to": "sw",
+              "label": "CoA",
+              "detail": "reauthenticate",
+              "tone": "danger",
+              "note": "يرسل ISE رسالة CoA فيطبّق المحوّل نتيجة العزل."
+            }
+          ]
+        }
+      },
+      {
+        "id": "security",
+        "type": "text",
+        "markdown": "## المصادقة والتفويض\n\nيصادق العميل لدى المتحكم بإحدى طريقتين:\n\n- **بكلمة مرور.** يستدعي العميل `AccountCreate`، ويوافق مسؤول عليه في *Administration > pxGrid Services > Client Management*، ثم يستدعي العميل `AccountActivate`. وهي بسيطة للنصوص لكن كلمة المرور المولَّدة سرّ يجب حمايته.\n- **بالشهادة.** يقدّم العميل شهادته الخاصة موقَّعة من مرجع يثق به ISE. وهي المفضلة للإنتاج ولمنتجات مثل FMC.\n\nوفي الحالتين يجب أن **يثق العميل بالخادم**. استورد شهادة عقدة pxGrid (أو مرجعها) إلى مخزن الثقة لدى العميل. ويجب أن تحتوي شهادة pxGrid الاستخدامين الممتدين `clientAuth` و`serverAuth`؛ وهذا أشيع سبب لفشل تكامل جديد.\n\nويكون التفويض لكل **خدمة وعملية**. يضع ISE العملاء في مجموعات مثل `ANC` أو `Session`؛ ولا يستطيع عميل وُوفق عليه للجلسات فقط استدعاء عمليات ANC. راجع الموافقات دوريًا، فعميل pxGrid يستطيع قراءة خريطة الهوية الكاملة لشبكتك.\n\n### التحكم التكيفي في الشبكة (ANC)\n\nيتيح ANC لعميل pxGrid مخوَّل أن يسند جهازًا إلى سياسة مسمّاة: `QUARANTINE` أو `SHUT_DOWN` أو `PORT_BOUNCE`. فيصدر ISE رسالة CoA المناسبة ويرجع تفويضًا يطابق إسناد ANC. ويجب أن تنشئ قاعدة تفويض تطابق سياسة ANC (`ANC:ANCPolicy EQUALS QUARANTINE`) وتُرجع SGT أو VLAN للعزل؛ فسياسة ANC نفسها لا تغيّر شيئًا بدون هذه القاعدة. ويُشرح الفرض المبني على الوسوم في [Segmentation with VRF, TrustSec and SGTs](/learn/cisco-security-certification-track/segmentation-with-vrf-trustsec-and-sgts)."
+      },
+      {
+        "id": "rest",
+        "type": "terminal",
+        "title": "استدعاءات pxGrid 2.0 عبر REST (قيم مخبرية)",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "curl --cacert ise-ca.pem -X POST https://ise-pxgrid.example.com:8910/pxgrid/control/AccountCreate -H 'Content-Type: application/json' -H 'Accept: application/json' -d '{\"nodeName\":\"lab-client-01\"}'",
+            "output": "{\"nodeName\":\"lab-client-01\",\"userName\":\"lab-client-01\",\"password\":\"<GENERATED_PASSWORD>\"}",
+            "comment": "الخطوة 1: سجّل عميلًا بنمط كلمة المرور. احفظ كلمة المرور كسر."
+          },
+          {
+            "cmd": "curl --cacert ise-ca.pem -u lab-client-01:<GENERATED_PASSWORD> -X POST https://ise-pxgrid.example.com:8910/pxgrid/control/AccountActivate -H 'Content-Type: application/json' -d '{}'",
+            "output": "{\"accountState\":\"PENDING\",\"version\":\"2.0.0.0\"}",
+            "comment": "تبقى PENDING حتى يوافق مسؤول ISE على العميل؛ ثم تعود ENABLED."
+          },
+          {
+            "cmd": "curl --cacert ise-ca.pem -u lab-client-01:<GENERATED_PASSWORD> -X POST https://ise-pxgrid.example.com:8910/pxgrid/control/ServiceLookup -H 'Content-Type: application/json' -d '{\"name\":\"com.cisco.ise.session\"}'",
+            "output": "{\"services\":[{\"name\":\"com.cisco.ise.session\",\"nodeName\":\"ise-pxgrid-1\",\n  \"properties\":{\"wsPubsubService\":\"com.cisco.ise.pubsub\",\"sessionTopic\":\"/topic/com.cisco.ise.session\",\n  \"restBaseUrl\":\"https://ise-pxgrid.example.com:8910/pxgrid/ise/session\"}}]}",
+            "comment": "يعيد البحث الموضوع الذي يُشترك فيه وعنوان REST الأساسي للاستعلامات."
+          }
+        ]
+      },
+      {
+        "id": "consumers",
+        "type": "text",
+        "markdown": "## من يستهلك pxGrid\n\n- **Secure Firewall (FMC).** يستخدم نطاق هوية ISE لربط عناوين IP بالمستخدمين والمجموعات، فتستطيع قواعد التحكم في الوصول أن تقول «Engineering» أو «SGT Quarantine» بدل كائنات العناوين. وراجع [Dynamic Objects and Security Intelligence](/learn/cisco-security-certification-track/dynamic-objects-and-security-intelligence) لنموذج الكائنات الديناميكية.\n- **Secure Web Appliance وSecure Email.** تطبّقان سياسة ويب مبنية على الهوية عبر ملف التعريف في ISE.\n- **Secure Network Analytics.** يثري التدفقات بسياق المستخدم والجهاز، ويستطيع إطلاق عزل ANC.\n- **Catalyst Center.** يقرأ بيانات ISE لأغراض الضمان والسياسة المبنية على المجموعات.\n- **SIEM وSOAR.** يشتركان في الجلسات والإخفاقات للربط والاستجابة الآلية.\n- **تكاملات الجهات الخارجية.** ينشر المورّدون مواضيع pxGrid خاصة بهم، مثل سياق امتثال الأجهزة أو الثغرات، ويستطيع ISE استخدامها في السياسة.\n\nنصيحة تشغيلية: امنح كل تكامل اسم عميل وشهادة خاصين به، لتستطيع إلغاء منتج واحد دون المساس بالبقية. ووثّق الخدمات المسموحة لكل عميل، وراجع قائمة العملاء كلما انتهى مشروع. وراقب عقدة pxGrid كأي خدمة حرجة، فجدار الحماية الذي يعتمد على بيانات الهوية يعود إلى قواعد العناوين أو يفشل مغلقًا عندما يتوقف التدفق.\n\nاختيار التصميم: **الاشتراك** يعطي تحديثات فورية وهو المناسب لجدران الحماية التي تتابع جلسات كثيرة؛ و**استعلام REST** يعطي الحالة الراهنة ويناسب النصوص والتقارير. وتستخدم منتجات كثيرة الأسلوبين: تبدأ باستعلام شامل وتبقى محدَّثة بالاشتراك."
+      },
+      {
+        "id": "trouble",
+        "type": "callout",
+        "variant": "warning",
+        "title": "تشخيص التكاملات",
+        "markdown": "- **يبقى العميل PENDING.** لم يوافق عليه أحد، أو أن الموافقة التلقائية معطّلة. افحص *Client Management > Clients*.\n- **فشل مصافحة TLS.** العميل لا يثق بشهادة pxGrid، أو تفتقر الشهادة إلى الاستخدامين الممتدين المطلوبين أو إلى SAN للاسم المستخدم.\n- **يتصل ثم لا يتلقى شيئًا.** العميل غير مشترك في الموضوع، أو أن ISE لا يملك جلسة تطابق مرشِّحه.\n- **ينجح إجراء ANC ولا يتغير شيء.** لا توجد قاعدة تفويض تطابق سياسة ANC، أو أن CoA لا تصل إلى المحوّل.\n- **يعمل على عقدة واحدة فقط.** لم تُفعَّل شخصية pxGrid على كل العقد المقصودة، أو أن أسماء DNS تُحل إلى عقدة خاطئة. كما أن اختلاف ضبط الوقت (NTP) يكسر التحقق من الشهادات."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم عقدة ISE مخبرية تتحكم بها ومضيف Linux أو Windows عليه `curl` أو Python.\n\n1. فعّل شخصية pxGrid على عقدة ISE عندك وشغّل *Automatically approve new certificate-based accounts* في المختبر فقط.\n2. نفّذ استدعاءات REST الثلاثة الواردة في الدرس على عقدتك مستخدمًا ملف المرجع الخاص بك ومع التعامل الآمن مع كلمة المرور.\n3. وافق على العميل في *Client Management* ثم استدع `AccountActivate` مرة أخرى لترى الحالة ENABLED.\n4. أنشئ سياسة ANC باسم `QUARANTINE` وقاعدة تفويض تُرجع SGT مقيِّدة لها.\n5. طبّق السياسة على جهاز اختبار من *Operations > Adaptive Network Control* وراقب CoA وتغيّر الجلسة في السجلات الحية."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "pxGrid",
+            "definition": "منصة Cisco لتبادل المنصات: إطار نشر واشتراك لمشاركة السياق الأمني."
+          },
+          {
+            "term": "Controller",
+            "definition": "عقدة ISE pxGrid التي تصادق العملاء وتسجل الخدمات."
+          },
+          {
+            "term": "Topic",
+            "definition": "قناة رسائل مسمّاة مثل /topic/com.cisco.ise.session."
+          },
+          {
+            "term": "STOMP over WebSocket",
+            "definition": "نقل الرسائل الذي يستخدمه pxGrid 2.0 لتسليم المنشورات."
+          },
+          {
+            "term": "ANC",
+            "definition": "التحكم التكيفي في الشبكة: إسناد سياسة تخفيف مثل QUARANTINE إلى جهاز."
+          },
+          {
+            "term": "Client approval",
+            "definition": "خطوة المسؤول أو الخطوة التلقائية التي تفعّل عميل pxGrid المسجَّل."
+          },
+          {
+            "term": "Session directory",
+            "definition": "مجموعة سجلات الجلسات الحية التي ينشرها ISE بالـ IP والمستخدم والمجموعات وSGT."
+          },
+          {
+            "term": "Context sharing",
+            "definition": "تمرير بيانات الهوية والجهاز من منتج أمني إلى آخر."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي منفذ TCP يستخدمه pxGrid 2.0؟",
+            "options": [
+              "443",
+              "8443",
+              "8910",
+              "1700"
+            ],
+            "answer": 2,
+            "explanation": "تستخدم حركة REST وWebSocket في pxGrid 2.0 المنفذ TCP 8910. أما 8443 فمنفذ بوابات ISE و1700 لرسائل CoA."
+          },
+          {
+            "question": "يظهر عميل pxGrid بحالة PENDING. ما السبب المعتاد؟",
+            "options": [
+              "The firewall blocks UDP 1812",
+              "An administrator has not approved the client",
+              "The switch lacks CoA",
+              "The SGT is missing"
+            ],
+            "answer": 1,
+            "explanation": "ينتظر العملاء الموافقة ما لم تكن الموافقة التلقائية مفعّلة."
+          },
+          {
+            "question": "اختر كل ما ينطبق. ماذا تستطيع مستهلكات pxGrid أن تفعل؟",
+            "options": [
+              "Subscribe to ISE session events",
+              "Query current sessions over REST",
+              "Apply an ANC policy to an endpoint",
+              "Rewrite ISE certificates"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الاشتراكات والاستعلامات وإجراءات ANC مدعومة، أما إعادة كتابة شهادات ISE فليست من pxGrid."
+          },
+          {
+            "question": "تنجح عملية إسناد ANC بالقيمة QUARANTINE ولا يتغير الوصول. ما الناقص؟",
+            "options": [
+              "An authorization rule that matches the ANC policy",
+              "A new switch VLAN database",
+              "More pxGrid nodes",
+              "A larger certificate key"
+            ],
+            "answer": 0,
+            "explanation": "يسجّل ANC الإسناد فقط؛ ويجب أن تُرجع قاعدة تفويض النتيجة المقيِّدة."
+          },
+          {
+            "question": "اختر كل ما ينطبق. ما الأسباب الشائعة لفشل اتصال TLS في pxGrid؟",
+            "options": [
+              "The client lacks the pxGrid CA in its trust store",
+              "The certificate lacks clientAuth or serverAuth EKU",
+              "Clock difference between client and ISE",
+              "A mismatch of OSPF area numbers"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "تؤثر الثقة والاستخدامات الممتدة والوقت في التحقق من الشهادات، أما مناطق OSPF فلا."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- pxGrid نسيج REST وWebSocket/STOMP على المنفذ TCP 8910 لمشاركة سياق ISE.\n- يسجّل العملاء ثم يُوافَق عليهم ثم يبحثون عن الخدمات ويشتركون أو يستعلمون.\n- العملاء المعتمدون على الشهادات والاستخدامات الممتدة الصحيحة هم أكثر نقاط فشل التكامل.\n- يتيح ANC للمستهلك عزل جهاز، لكن قاعدة التفويض وحدها تجعله فعّالًا.\n- تستخدم جدران الحماية وبوابات الويب وأدوات التحليل وSOAR الخدمة pxGrid لتحويل عناوين IP إلى هويات."
+      }
+    ]
+  }
+}

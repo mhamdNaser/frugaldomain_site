@@ -1,0 +1,576 @@
+{
+ "slug": "multi-site-multi-pod-and-remote-leaf",
+ "title": "Multi-Site, Multi-Pod and Remote Leaf",
+ "summary": "Compare ACI Multi-Pod, Multi-Site and Remote Leaf, build the inter-pod network, and choose the right architecture from failure-domain and latency requirements.",
+ "duration_minutes": 40,
+ "objectives": [
+  "Describe the Multi-Pod architecture and the IPN requirements",
+  "Explain how Multi-Site uses NDO schemas, templates and an ISN",
+  "Describe Remote Leaf behavior, limits and failure handling",
+  "Choose and combine the architectures from design requirements"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "One fabric is rarely enough. The business opens a second data hall 2 km away, a disaster recovery site in another city, and small branch locations that still need the same application policies as the main fabric. Each requirement points to a different ACI architecture, and picking the wrong one is expensive: you either inherit a failure domain you wanted to avoid, or you build operational overhead you did not need.\n\nACI offers three ways to extend: **Multi-Pod** (one fabric, several pods), **Multi-Site** (several independent fabrics managed together) and **Remote Leaf** (leaf switches placed far from the spines). The CCIE Data Center lab tests whether you can choose between them from requirements, build the inter-pod network, and explain what is shared and what is isolated. This lesson relies on [ACI Fabric Discovery and Architecture](/learn/enterprise-datacenter-networking/aci-fabric-discovery-and-architecture) and the EVPN concepts in [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+  },
+  {
+   "id": "pod",
+   "type": "text",
+   "markdown": "## Multi-Pod: one fabric, many pods\n\nIn **Multi-Pod**, each pod is a normal spine-leaf fabric with its own **TEP pool** and its own IS-IS and COOP instance. The pods are joined by an **Inter-Pod Network (IPN)**: ordinary Nexus or other routers connected to the spines. There is still **one APIC cluster** and one policy domain. A tenant, EPG or contract exists everywhere, and an endpoint can move between pods and keep its IP address.\n\nBecause it is one fabric, it is also **one failure domain** for the control plane and one configuration domain. APIC controllers are distributed across pods, but a policy mistake reaches every pod at once.\n\n### What the IPN must provide\n\n| Requirement | Why |\n|:--|:--|\n| **OSPF** (or another IGP) with the spines on a sub-interface using **VLAN 4** | Reachability of every pod's TEP pool |\n| **PIM Bidir** with a rendezvous point for `225.0.0.0/15` and `239.255.255.240/28` | Carries BUM traffic between pods. Each bridge domain gets a multicast group (GIPo) from that range |\n| **DHCP relay** pointing at the APICs | Lets a new pod's spines get an address and join |\n| **MTU of 9150** or more | VXLAN adds about 50 bytes to a 9000-byte host frame |\n| Round-trip time of **50 ms or less** | The APIC cluster and the control plane span pods |\n\nBetween pods the spines run **MP-BGP EVPN** to exchange endpoint and prefix information, and COOP entries are synchronized so that a leaf in pod 2 can find an endpoint in pod 1. Traffic then crosses the IPN inside VXLAN, and the fabric still enforces contracts using the sender's policy class."
+  },
+  {
+   "id": "ipn",
+   "type": "code",
+   "language": "cisco",
+   "code": "feature ospf\nfeature pim\nfeature dhcp\nfeature lldp\nservice dhcp\nip dhcp relay\n!\nrouter ospf IPN\n  router-id 192.0.2.1\n!\nip pim rp-address 192.0.2.254 group-list 225.0.0.0/15 bidir\nip pim rp-address 192.0.2.254 group-list 239.255.255.240/28 bidir\n!\ninterface Ethernet1/1\n  no switchport\n  mtu 9150\n  no shutdown\n!\ninterface Ethernet1/1.4\n  mtu 9150\n  encapsulation dot1q 4\n  ip address 192.0.2.5/30\n  ip ospf network point-to-point\n  ip router ospf IPN area 0.0.0.0\n  ip pim sparse-mode\n  ip dhcp relay address 10.0.0.1\n  ip dhcp relay address 10.0.0.2\n  no shutdown",
+   "filename": "IPN-1 (NX-OS)",
+   "caption": "An IPN router facing a spine. Sub-interface VLAN 4, OSPF, PIM Bidir for the two multicast ranges, jumbo MTU and DHCP relay to the APICs (placeholder TEP addresses). The physical port is made routed before the sub-interface is created.",
+   "highlight": [
+    11,
+    12,
+    21,
+    26,
+    27
+   ]
+  },
+  {
+   "id": "pod-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "A new pod joins a Multi-Pod fabric",
+   "caption": "The only things the new pod needs from the IPN are IP reachability to the APICs and DHCP relay.",
+   "data": {
+    "actors": [
+     {
+      "id": "sp2",
+      "label": "Pod 2 spine",
+      "sub": "node 211",
+      "icon": "switch"
+     },
+     {
+      "id": "ipn",
+      "label": "IPN router",
+      "sub": "VLAN 4 + relay",
+      "icon": "router"
+     },
+     {
+      "id": "apic",
+      "label": "APIC (Pod 1)",
+      "sub": "10.0.0.1",
+      "icon": "server"
+     },
+     {
+      "id": "sp1",
+      "label": "Pod 1 spine",
+      "sub": "node 201",
+      "icon": "switch"
+     }
+    ],
+    "steps": [
+     {
+      "from": "sp2",
+      "to": "ipn",
+      "label": "DHCP Discover",
+      "note": "The new spine boots and sends DHCP on its IPN-facing sub-interface.",
+      "detail": "VLAN 4"
+     },
+     {
+      "from": "ipn",
+      "to": "apic",
+      "label": "Relayed DHCP",
+      "note": "The IPN router relays the request to the APIC, because DHCP broadcast cannot cross the IPN.",
+      "detail": "unicast to APIC"
+     },
+     {
+      "from": "apic",
+      "to": "sp2",
+      "label": "DHCP Offer",
+      "note": "The APIC offers an address from the TEP pool configured for pod 2 and the bootstrap information.",
+      "detail": "TEP from Pod 2 pool",
+      "tone": "secure"
+     },
+     {
+      "from": "sp2",
+      "to": "sp1",
+      "label": "OSPF + MP-BGP EVPN",
+      "note": "The spine forms OSPF adjacency with the IPN and an EVPN peering with the spines of pod 1.",
+      "detail": "through the IPN"
+     },
+     {
+      "from": "sp2",
+      "to": "sp2",
+      "label": "Leaves discovered",
+      "note": "The pod 2 leaves are discovered through the spine and registered like any other node.",
+      "detail": "pod 2 leaves register"
+     },
+     {
+      "from": "sp1",
+      "to": "sp2",
+      "label": "COOP sync",
+      "note": "Endpoint databases are synchronized, so an endpoint in pod 1 is reachable from pod 2.",
+      "detail": "endpoints",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "site",
+   "type": "text",
+   "markdown": "## Multi-Site: several fabrics, one orchestrator\n\n**Multi-Site** connects separate ACI fabrics, each with its **own APIC cluster**. They are separate availability zones and separate failure domains. A change on one APIC does not break the others. Management is unified by **Nexus Dashboard Orchestrator (NDO)**, which pushes configuration to each site's APIC through its API.\n\n### Policy on the orchestrator\n\nYou define a **schema** that contains one or more **templates**, and associate each template with sites.\n\n- A **site-local** object exists in one site only.\n- A **stretched** object (VRF, BD or EPG) exists in several sites. NDO creates the matching object on each APIC with consistent identifiers and handles the policy translation between sites, so that contracts work across them.\n\n### The Inter-Site Network (ISN)\n\nThe ISN is simpler than an IPN. It needs **IP reachability** between the sites' spines (OSPF or BGP), an MTU of **9150** and the usual quality of service, but it does **not** need multicast or DHCP relay, and it tolerates much higher latency. BUM traffic for stretched L2 domains uses **head-end replication**: the source spine sends one unicast copy to each remote site. The spines exchange endpoint and route information with **MP-BGP EVPN**.\n\nMulti-Site is the right answer when you need **fault isolation**, separate upgrade windows, or a disaster recovery design in which one site's mistake cannot take down the other. Stretching L2 between sites is possible but should be an exception."
+  },
+  {
+   "id": "rl",
+   "type": "text",
+   "markdown": "## Remote Leaf: a leaf far from the spines\n\nA **Remote Leaf (RL)** is an ordinary ACI leaf installed at a location without spines or APICs, such as a small colocation or a branch. It connects over a generic **IP WAN** to a pod in the main data center and is managed by the same APIC cluster. Policy, EPGs, contracts and VMM integration all work as if the leaf were local.\n\nKey points:\n\n- The WAN needs only IP reachability, DHCP relay for discovery, and a **round-trip time of up to 300 ms** and at least 100 Mbps of bandwidth.\n- The RL builds VXLAN tunnels to the spines of its pod. A remote leaf pair can form a vPC, and with *direct traffic forwarding* two remote locations can exchange data without hairpinning through the main site.\n- If the WAN fails, the RL **keeps forwarding** with its existing policy but cannot learn new policy from the APIC.\n- It has its own TEP pool for the remote location.\n\n### Choosing\n\n| Requirement | Pick |\n|:--|:--|\n| Two nearby halls, one operational domain, L2 mobility | **Multi-Pod** |\n| Separate fault domains, DR, different lifecycles | **Multi-Site** |\n| Few racks at a distant location, no local spines | **Remote Leaf** |\n| All of the above together | Multi-Pod or Remote Leaf *inside* sites that are tied by Multi-Site |\n\nThe options combine: each Multi-Site member can itself be a Multi-Pod fabric with remote leaves."
+  },
+  {
+   "id": "verify",
+   "type": "terminal",
+   "title": "Verifying Multi-Pod and Multi-Site",
+   "prompt": "apic1#",
+   "lines": [
+    {
+     "cmd": "acidiag fnvread",
+     "output": "      ID   Pod ID                 Name    Serial Number         IP Address    Role        State   LastUpdMsgId\n--------------------------------------------------------------------------------------------------------------\n     101        1             leaf-101      FDO24210ABC      10.0.80.64/32    leaf         active   0\n     201        1            spine-201      FDO24180XYZ      10.0.80.66/32   spine         active   0\n     301        2             leaf-301      FDO24330DEF      10.1.80.64/32    leaf         active   0\n     211        2            spine-211      FDO24340GHI      10.1.80.66/32   spine         active   0"
+    },
+    {
+     "comment": "Nodes from both pods are listed with different Pod IDs and TEP ranges. A pod-2 spine stuck in discovering usually means a DHCP relay or VLAN 4 problem on the IPN."
+    },
+    {
+     "cmd": "show bgp l2vpn evpn summary vrf overlay-1",
+     "prompt": "spine-201#",
+     "output": "Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd\n10.1.80.66      4 65001    1880    1865      212    0    0 1d03h    24"
+    },
+    {
+     "comment": "The EVPN peering to the spine of pod 2 is established and has received 24 routes. Idle or Active means the IPN underlay or the MTU is wrong."
+    },
+    {
+     "cmd": "show ip pim rp",
+     "prompt": "IPN-1#",
+     "output": "PIM RP Status Information for VRF \"default\"\nBSR disabled\nAuto-RP disabled\nRP: 192.0.2.254, (0), uptime: 3d02h  priority: 255,\n  RP-source: (local), group ranges:\n      225.0.0.0/15 (bidir)\n      239.255.255.240/28 (bidir)"
+    },
+    {
+     "comment": "The bidirectional RP covers both ranges the fabric needs. If a BD stretched across pods does not forward BUM traffic, check this first."
+    }
+   ]
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Calling Multi-Pod \"disaster recovery\". It is one fabric, one APIC cluster and one failure domain.\n- Leaving the IPN MTU at 1500 or 9000. The fabric needs 9150 or more on every link, or large frames are silently dropped.\n- Forgetting PIM Bidir on the IPN, or using only one of the two multicast ranges.\n- Expecting Multi-Site to need multicast. It does not; head-end replication carries BUM traffic.\n- Assuming a remote leaf stops forwarding when the WAN fails. It keeps its current policy but cannot take new policy."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "With a design worksheet (no hardware needed) and, if available, the IPN configuration above in a simulator:\n\n1. A company has two buildings 5 km apart, wants VM mobility with the same IP, and one operations team. Which architecture fits, and which failure domain does it create?\n2. A second requirement: a DR site in another country with its own upgrade schedule. Which architecture, and which network element carries the policy?\n3. A third: six racks in a distant branch with no space for spines. Which architecture, and what is the minimum WAN bandwidth and the maximum round-trip time?\n4. For answer 1, write the five IPN requirements from memory and compare them with the table.\n\nExpected result: Multi-Pod, Multi-Site with NDO, and Remote Leaf (100 Mbps, 300 ms), with all five IPN requirements recalled."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Multi-Pod",
+     "definition": "One ACI fabric made of several pods joined by an IPN, with a single APIC cluster."
+    },
+    {
+     "term": "IPN",
+     "definition": "The Inter-Pod Network: routers running OSPF, PIM Bidir and DHCP relay between pods."
+    },
+    {
+     "term": "Multi-Site",
+     "definition": "Several independent ACI fabrics managed together by Nexus Dashboard Orchestrator."
+    },
+    {
+     "term": "ISN",
+     "definition": "The Inter-Site Network: IP transport with MTU 9150 and no multicast requirement."
+    },
+    {
+     "term": "Remote Leaf",
+     "definition": "A leaf at a distant location managed by the main APIC cluster over an IP WAN."
+    },
+    {
+     "term": "Stretched object",
+     "definition": "An NDO-managed VRF, BD or EPG that exists in more than one site."
+    },
+    {
+     "term": "GIPo",
+     "definition": "The multicast group address assigned to each bridge domain for BUM traffic across pods."
+    },
+    {
+     "term": "Head-end replication",
+     "definition": "Sending one unicast copy of BUM traffic to each remote site instead of using multicast."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which design gives separate APIC clusters and independent failure domains?",
+     "options": [
+      "Multi-Pod",
+      "Multi-Site",
+      "Remote Leaf",
+      "A single pod with more spines"
+     ],
+     "answer": 1,
+     "explanation": "Multi-Site connects independent fabrics, each with its own APIC cluster, managed by NDO."
+    },
+    {
+     "question": "Which are IPN requirements for Multi-Pod? Choose all that apply.",
+     "options": [
+      "OSPF on VLAN 4 sub-interfaces toward the spines",
+      "PIM Bidir for the fabric multicast ranges",
+      "DHCP relay toward the APICs",
+      "MTU of 1500"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The IPN needs an IGP, bidirectional PIM, DHCP relay and a large MTU (9150 or more), not 1500."
+    },
+    {
+     "question": "A remote leaf loses its WAN link to the main site. What happens?",
+     "options": [
+      "It stops forwarding immediately",
+      "It keeps forwarding with the policy it already has but cannot receive new policy",
+      "It joins another APIC cluster",
+      "It reboots into discovery"
+     ],
+     "answer": 1,
+     "explanation": "Forwarding state is local. The remote leaf continues with existing policy, but changes require the APIC."
+    },
+    {
+     "question": "How does Multi-Site carry BUM traffic for a stretched bridge domain?",
+     "options": [
+      "PIM Bidir across the ISN",
+      "Head-end replication with unicast copies to each remote site",
+      "It does not carry BUM traffic at all",
+      "IGMP snooping on the APIC"
+     ],
+     "answer": 1,
+     "explanation": "Multi-Site does not require multicast in the ISN; the source spine replicates to each remote site by unicast."
+    },
+    {
+     "question": "A pod-2 spine stays in discovering after being cabled to the IPN. Which checks are relevant? Choose all that apply.",
+     "options": [
+      "The sub-interface uses VLAN 4",
+      "DHCP relay points to the APICs",
+      "OSPF reachability to the APIC TEP addresses",
+      "The VMM domain of the tenant"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "A new pod needs the infra VLAN, DHCP relay and IP reachability to the APICs. VMM domains matter only later."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- **Multi-Pod** is one fabric and one APIC cluster joined by an IPN (OSPF, PIM Bidir, DHCP relay, MTU 9150, RTT of 50 ms or less). It is one failure domain.\n- **Multi-Site** joins independent fabrics with NDO schemas and templates over a simple ISN with no multicast. It gives fault isolation and suits DR.\n- **Remote Leaf** extends one pod to a distant location over a plain IP WAN (up to 300 ms RTT, at least 100 Mbps) and keeps forwarding if the WAN fails.\n- The options combine, so choose by failure domain, latency and operational model rather than by distance alone.\n\nFor the controller platform behind Multi-Site, continue with [Nexus Dashboard: Orchestrator, Fabric Controller, Insights](/learn/enterprise-datacenter-networking/nexus-dashboard-orchestrator-fabric-controller-insights)."
+  }
+ ],
+ "ar": {
+  "title": "Multi-Site وMulti-Pod وRemote Leaf",
+  "summary": "المقارنة بين Multi-Pod وMulti-Site وRemote Leaf في ACI، وبناء الشبكة بين الـ Pods، واختيار البنية المناسبة بحسب نطاق الفشل ومتطلبات زمن التأخير.",
+  "objectives": [
+   "وصف بنية Multi-Pod ومتطلبات IPN",
+   "شرح كيف يستخدم Multi-Site مخططات NDO وقوالبه وشبكة ISN",
+   "وصف سلوك Remote Leaf وحدوده وتعامله مع الأعطال",
+   "اختيار البنى ودمجها انطلاقاً من متطلبات التصميم"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "نادراً ما يكفي نسيج واحد. يفتح العمل قاعة بيانات ثانية على بعد كيلومترين، وموقعاً للتعافي من الكوارث في مدينة أخرى، وفروعاً صغيرة تحتاج مع ذلك إلى سياسات التطبيقات نفسها الموجودة في النسيج الرئيسي. وكل متطلب يشير إلى بنية ACI مختلفة، واختيار الخاطئة منها مكلف: إما أن ترث نطاق فشل (Failure domain) أردت تجنبه، أو تبني عبئاً تشغيلياً لا تحتاج إليه.\n\nيقدّم ACI ثلاث طرق للتوسّع: **Multi-Pod** (نسيج واحد وعدة Pods) و**Multi-Site** (عدة أنسجة مستقلة تُدار معاً) و**Remote Leaf** (أوراق توضع بعيداً عن العُمُد). ويختبر CCIE Data Center العملي قدرتك على الاختيار بينها انطلاقاً من المتطلبات، وبناء الشبكة بين الـ Pods، وشرح ما هو مشترك وما هو معزول. يعتمد هذا الدرس على [ACI Fabric Discovery and Architecture](/learn/enterprise-datacenter-networking/aci-fabric-discovery-and-architecture) وعلى مفاهيم EVPN في [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+   },
+   {
+    "id": "pod",
+    "type": "text",
+    "markdown": "## Multi-Pod: نسيج واحد وعدة Pods\n\nفي **Multi-Pod** يكون كل Pod نسيج عُمُد وأوراق عادياً له **مجمّع TEP** خاص وحالته الخاصة من IS-IS وCOOP. وتُربَط الـ Pods بـ **شبكة بين الـ Pods (IPN)**: موجّهات Nexus أو غيرها متصلة بالعُمُد. ويبقى هناك **عنقود APIC واحد** ونطاق سياسات واحد. فالمستأجر أو EPG أو العقد موجود في كل مكان، ويمكن للنقطة الطرفية الانتقال بين الـ Pods محتفظة بعنوان IP.\n\nولأنه نسيج واحد فهو أيضاً **نطاق فشل واحد** لمستوى التحكم ونطاق إعداد واحد. تتوزع متحكمات APIC عبر الـ Pods، لكن الخطأ في سياسة ما يصل إلى كل الـ Pods دفعة واحدة.\n\n### ما يجب أن توفّره IPN\n\n| المتطلب | السبب |\n|:--|:--|\n| **OSPF** (أو IGP آخر) مع العُمُد على واجهة فرعية بـ **VLAN 4** | الوصول إلى مجمّع TEP لكل Pod |\n| **PIM Bidir** مع نقطة التقاء (RP) للنطاقين `225.0.0.0/15` و`239.255.255.240/28` | ينقل حركة BUM بين الـ Pods. وتأخذ كل BD مجموعة بث متعدد (GIPo) من هذا النطاق |\n| **ترحيل DHCP (DHCP relay)** نحو متحكمات APIC | يمكّن عُمُد Pod جديد من الحصول على عنوان والانضمام |\n| **MTU بقيمة 9150** أو أكثر | يضيف VXLAN نحو 50 بايت إلى إطار المضيف البالغ 9000 بايت |\n| زمن ذهاب وإياب **50 مللي ثانية أو أقل** | يمتد عنقود APIC ومستوى التحكم عبر الـ Pods |\n\nتشغّل العُمُد بين الـ Pods بروتوكول **MP-BGP EVPN** لتبادل معلومات النقاط الطرفية والبادئات، وتتزامن مدخلات COOP لتجد ورقة في Pod 2 نقطة طرفية في Pod 1. وتعبر الحركة IPN داخل VXLAN، وما زال النسيج يطبّق العقود اعتماداً على فئة سياسة المرسِل."
+   },
+   {
+    "id": "ipn",
+    "type": "code",
+    "language": "cisco",
+    "code": "feature ospf\nfeature pim\nfeature dhcp\nfeature lldp\nservice dhcp\nip dhcp relay\n!\nrouter ospf IPN\n  router-id 192.0.2.1\n!\nip pim rp-address 192.0.2.254 group-list 225.0.0.0/15 bidir\nip pim rp-address 192.0.2.254 group-list 239.255.255.240/28 bidir\n!\ninterface Ethernet1/1\n  no switchport\n  mtu 9150\n  no shutdown\n!\ninterface Ethernet1/1.4\n  mtu 9150\n  encapsulation dot1q 4\n  ip address 192.0.2.5/30\n  ip ospf network point-to-point\n  ip router ospf IPN area 0.0.0.0\n  ip pim sparse-mode\n  ip dhcp relay address 10.0.0.1\n  ip dhcp relay address 10.0.0.2\n  no shutdown",
+    "filename": "IPN-1 (NX-OS)",
+    "caption": "موجّه IPN مواجه لعمود. واجهة فرعية بـ VLAN 4، وOSPF، وPIM Bidir للنطاقين متعددَي البث، وMTU كبير، وترحيل DHCP إلى متحكمات APIC (عناوين TEP نائبة). يُحوَّل المنفذ الفيزيائي إلى منفذ موجّه قبل إنشاء الواجهة الفرعية.",
+    "highlight": [
+     11,
+     12,
+     21,
+     26,
+     27
+    ]
+   },
+   {
+    "id": "pod-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "انضمام Pod جديد إلى نسيج Multi-Pod",
+    "caption": "كل ما يحتاجه الـ Pod الجديد من IPN هو الوصول إلى متحكمات APIC عبر IP وترحيل DHCP.",
+    "data": {
+     "actors": [
+      {
+       "id": "sp2",
+       "label": "عمود Pod 2",
+       "sub": "node 211",
+       "icon": "switch"
+      },
+      {
+       "id": "ipn",
+       "label": "موجّه IPN",
+       "sub": "VLAN 4 + relay",
+       "icon": "router"
+      },
+      {
+       "id": "apic",
+       "label": "APIC (Pod 1)",
+       "sub": "10.0.0.1",
+       "icon": "server"
+      },
+      {
+       "id": "sp1",
+       "label": "عمود Pod 1",
+       "sub": "node 201",
+       "icon": "switch"
+      }
+     ],
+     "steps": [
+      {
+       "from": "sp2",
+       "to": "ipn",
+       "label": "DHCP Discover",
+       "note": "يقلع العمود الجديد ويرسل DHCP على واجهته الفرعية المواجهة لـ IPN.",
+       "detail": "VLAN 4"
+      },
+      {
+       "from": "ipn",
+       "to": "apic",
+       "label": "Relayed DHCP",
+       "note": "يرحّل موجّه IPN الطلب إلى APIC لأن بث DHCP لا يعبر IPN.",
+       "detail": "unicast to APIC"
+      },
+      {
+       "from": "apic",
+       "to": "sp2",
+       "label": "DHCP Offer",
+       "note": "يعرض APIC عنواناً من مجمّع TEP المضبوط للـ Pod 2 ومعلومات الإقلاع.",
+       "detail": "TEP from Pod 2 pool",
+       "tone": "secure"
+      },
+      {
+       "from": "sp2",
+       "to": "sp1",
+       "label": "OSPF + MP-BGP EVPN",
+       "note": "يشكّل العمود جواراً مع IPN عبر OSPF وجلسة EVPN مع عُمُد Pod 1.",
+       "detail": "through the IPN"
+      },
+      {
+       "from": "sp2",
+       "to": "sp2",
+       "label": "Leaves discovered",
+       "note": "تُكتشف أوراق Pod 2 عبر العمود وتُسجَّل كأي عقدة أخرى.",
+       "detail": "pod 2 leaves register"
+      },
+      {
+       "from": "sp1",
+       "to": "sp2",
+       "label": "COOP sync",
+       "note": "تتزامن قواعد بيانات النقاط الطرفية فيصبح الوصول من Pod 2 إلى نقطة طرفية في Pod 1 ممكناً.",
+       "detail": "endpoints",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "site",
+    "type": "text",
+    "markdown": "## Multi-Site: عدة أنسجة ومنسّق واحد\n\nيصل **Multi-Site** بين أنسجة ACI منفصلة، لكل منها **عنقود APIC خاص به**. وهي مناطق إتاحة منفصلة ونطاقات فشل منفصلة. فتغيير على APIC واحد لا يعطّل الباقي. وتوحَّد الإدارة بواسطة **Nexus Dashboard Orchestrator (NDO)** الذي يدفع الإعدادات إلى APIC كل موقع عبر واجهته البرمجية.\n\n### السياسات على المنسّق\n\nتعرّف **مخططاً (Schema)** يحتوي قالباً (**Template**) أو أكثر، وتربط كل قالب بمواقع.\n\n- الكائن **المحلي للموقع (Site-local)** موجود في موقع واحد فقط.\n- الكائن **الممتد (Stretched)** (VRF أو BD أو EPG) موجود في عدة مواقع. ينشئ NDO الكائن المقابل على كل APIC بمعرّفات متسقة ويتولى ترجمة السياسات بين المواقع لتعمل العقود عبرها.\n\n### الشبكة بين المواقع (ISN)\n\nالـ ISN أبسط من IPN. فهي تحتاج إلى **وصول IP** بين عُمُد المواقع (OSPF أو BGP) و**MTU بقيمة 9150** وجودة الخدمة المعتادة، لكنها **لا** تحتاج إلى بث متعدد ولا ترحيل DHCP، وتتحمل زمن تأخير أكبر بكثير. وتستخدم حركة BUM في نطاقات L2 الممتدة **النسخ من نقطة الرأس (Head-end replication)**: يرسل العمود المصدر نسخة أحادية البث إلى كل موقع بعيد. وتتبادل العُمُد معلومات النقاط الطرفية والمسارات عبر **MP-BGP EVPN**.\n\nيناسب Multi-Site الحالات التي تحتاج إلى **عزل الأعطال** أو نوافذ ترقية منفصلة أو تصميم تعافٍ من الكوارث لا يستطيع فيه خطأ موقع واحد إسقاط الآخر. وتمديد L2 بين المواقع ممكن لكن ينبغي أن يكون استثناءً."
+   },
+   {
+    "id": "rl",
+    "type": "text",
+    "markdown": "## Remote Leaf: ورقة بعيدة عن العُمُد\n\n**الورقة البعيدة (Remote Leaf أو RL)** هي ورقة ACI عادية تُركَّب في موقع بلا عُمُد ولا APIC، مثل مرفق استضافة صغير أو فرع. تتصل عبر **شبكة WAN بروتوكول IP** عامة بـ Pod في مركز البيانات الرئيسي، ويديرها عنقود APIC نفسه. وتعمل السياسات ومجموعات EPG والعقود وتكامل VMM كما لو كانت الورقة محلية.\n\nأهم النقاط:\n\n- تحتاج الـ WAN إلى وصول IP فقط وترحيل DHCP للاكتشاف و**زمن ذهاب وإياب حتى 300 مللي ثانية** ونطاق ترددي لا يقل عن 100 Mbps.\n- تبني RL أنفاق VXLAN إلى عُمُد الـ Pod الخاص بها. ويمكن لزوج أوراق بعيدة تكوين vPC، ومع *Direct traffic forwarding* يتبادل موقعان بعيدان البيانات دون الالتفاف عبر الموقع الرئيسي.\n- إذا انقطعت الـ WAN **تواصل RL التحويل** بسياستها الحالية لكنها لا تستطيع تعلّم سياسة جديدة من APIC.\n- لها مجمّع TEP خاص بالموقع البعيد.\n\n### الاختيار\n\n| المتطلب | الاختيار |\n|:--|:--|\n| قاعتان متقاربتان ونطاق تشغيل واحد وتنقّل L2 | **Multi-Pod** |\n| نطاقات فشل منفصلة وتعافٍ من الكوارث ودورات حياة مختلفة | **Multi-Site** |\n| بضعة رفوف في موقع بعيد بلا عُمُد محلية | **Remote Leaf** |\n| كل ما سبق معاً | Multi-Pod أو Remote Leaf *داخل* مواقع مربوطة بـ Multi-Site |\n\nتتكامل الخيارات: يمكن أن يكون كل عضو في Multi-Site نسيج Multi-Pod نفسه مع أوراق بعيدة."
+   },
+   {
+    "id": "verify",
+    "type": "terminal",
+    "title": "التحقق من Multi-Pod وMulti-Site",
+    "prompt": "apic1#",
+    "lines": [
+     {
+      "cmd": "acidiag fnvread",
+      "output": "      ID   Pod ID                 Name    Serial Number         IP Address    Role        State   LastUpdMsgId\n--------------------------------------------------------------------------------------------------------------\n     101        1             leaf-101      FDO24210ABC      10.0.80.64/32    leaf         active   0\n     201        1            spine-201      FDO24180XYZ      10.0.80.66/32   spine         active   0\n     301        2             leaf-301      FDO24330DEF      10.1.80.64/32    leaf         active   0\n     211        2            spine-211      FDO24340GHI      10.1.80.66/32   spine         active   0"
+     },
+     {
+      "comment": "تظهر عقد كلا الـ Pod بمعرّفات Pod ومجالات TEP مختلفة. وإذا ظل عمود Pod 2 في حالة discovering فالسبب في الغالب مشكلة في ترحيل DHCP أو VLAN 4 على IPN."
+     },
+     {
+      "cmd": "show bgp l2vpn evpn summary vrf overlay-1",
+      "prompt": "spine-201#",
+      "output": "Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd\n10.1.80.66      4 65001    1880    1865      212    0    0 1d03h    24"
+     },
+     {
+      "comment": "جلسة EVPN مع عمود Pod 2 قائمة وقد تلقّت 24 مساراً. أما الحالتان Idle أو Active فتعنيان خللاً في الطبقة السفلية لـ IPN أو في MTU."
+     },
+     {
+      "cmd": "show ip pim rp",
+      "prompt": "IPN-1#",
+      "output": "PIM RP Status Information for VRF \"default\"\nBSR disabled\nAuto-RP disabled\nRP: 192.0.2.254, (0), uptime: 3d02h  priority: 255,\n  RP-source: (local), group ranges:\n      225.0.0.0/15 (bidir)\n      239.255.255.240/28 (bidir)"
+     },
+     {
+      "comment": "نقطة الالتقاء ثنائية الاتجاه تغطي النطاقين اللذين يحتاجهما النسيج. وإذا لم تمرّر BD ممتدة عبر الـ Pods حركة BUM فابدأ بفحص هذا."
+     }
+    ]
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- تسمية Multi-Pod «تعافياً من الكوارث». فهو نسيج واحد وعنقود APIC واحد ونطاق فشل واحد.\n- ترك MTU في IPN عند 1500 أو 9000. يحتاج النسيج إلى 9150 أو أكثر على كل رابط وإلا أُسقطت الإطارات الكبيرة بصمت.\n- نسيان PIM Bidir على IPN أو استخدام أحد النطاقين المتعددَي البث فقط.\n- توقع أن يحتاج Multi-Site إلى بث متعدد. لا يحتاج؛ فالنسخ من نقطة الرأس تحمل حركة BUM.\n- افتراض أن الورقة البعيدة تتوقف عن التحويل عند انقطاع WAN. إنها تحتفظ بسياستها الحالية لكنها لا تتلقى سياسة جديدة."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "باستخدام ورقة تصميم (دون حاجة إلى عتاد) ومع إعداد IPN أعلاه في محاكٍ إن توفّر:\n\n1. شركة لديها مبنيان تفصل بينهما 5 كم، وتريد تنقّل الأجهزة الافتراضية بالعنوان نفسه، وفريق تشغيل واحداً. ما البنية المناسبة، وأي نطاق فشل تنشئه؟\n2. متطلب ثانٍ: موقع تعافٍ من الكوارث في بلد آخر وله جدول ترقية خاص. ما البنية، وأي عنصر يحمل السياسات؟\n3. متطلب ثالث: ستة رفوف في فرع بعيد لا يتسع للعُمُد. ما البنية، وما أدنى نطاق ترددي للـ WAN وأقصى زمن ذهاب وإياب؟\n4. للإجابة الأولى اكتب من الذاكرة متطلبات IPN الخمسة وقارنها بالجدول.\n\nالنتيجة المتوقعة: Multi-Pod، وMulti-Site مع NDO، وRemote Leaf (100 Mbps و300 ms)، مع استحضار متطلبات IPN الخمسة كلها."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "Multi-Pod",
+      "definition": "نسيج ACI واحد مؤلف من عدة Pods تربطها IPN مع عنقود APIC واحد."
+     },
+     {
+      "term": "IPN",
+      "definition": "الشبكة بين الـ Pods: موجّهات تشغّل OSPF وPIM Bidir وترحيل DHCP."
+     },
+     {
+      "term": "Multi-Site",
+      "definition": "عدة أنسجة ACI مستقلة تُدار معاً بواسطة Nexus Dashboard Orchestrator."
+     },
+     {
+      "term": "ISN",
+      "definition": "الشبكة بين المواقع: نقل IP بـ MTU 9150 ودون متطلب بث متعدد."
+     },
+     {
+      "term": "Remote Leaf",
+      "definition": "ورقة في موقع بعيد يديرها عنقود APIC الرئيسي عبر WAN بروتوكول IP."
+     },
+     {
+      "term": "كائن ممتد",
+      "definition": "VRF أو BD أو EPG يديره NDO وموجود في أكثر من موقع."
+     },
+     {
+      "term": "GIPo",
+      "definition": "عنوان مجموعة البث المتعدد المعيّن لكل BD لحركة BUM عبر الـ Pods."
+     },
+     {
+      "term": "النسخ من نقطة الرأس",
+      "definition": "إرسال نسخة أحادية البث من حركة BUM إلى كل موقع بعيد بدل استخدام البث المتعدد."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي تصميم يعطي عناقيد APIC منفصلة ونطاقات فشل مستقلة؟",
+      "options": [
+       "Multi-Pod",
+       "Multi-Site",
+       "Remote Leaf",
+       "Pod واحد بعُمُد أكثر"
+      ],
+      "answer": 1,
+      "explanation": "يربط Multi-Site أنسجة مستقلة لكل منها عنقود APIC خاص، ويديرها NDO."
+     },
+     {
+      "question": "ما متطلبات IPN في Multi-Pod؟ اختر كل ما ينطبق.",
+      "options": [
+       "OSPF على واجهات فرعية VLAN 4 نحو العُمُد",
+       "PIM Bidir لنطاقات البث المتعدد الخاصة بالنسيج",
+       "ترحيل DHCP نحو متحكمات APIC",
+       "MTU بقيمة 1500"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "تحتاج IPN إلى IGP وPIM ثنائي الاتجاه وترحيل DHCP وMTU كبيرة (9150 فأكثر) لا 1500."
+     },
+     {
+      "question": "فقدت ورقة بعيدة رابط WAN إلى الموقع الرئيسي. ماذا يحدث؟",
+      "options": [
+       "تتوقف عن التحويل فوراً",
+       "تواصل التحويل بالسياسة التي تملكها لكنها لا تتلقى سياسة جديدة",
+       "تنضم إلى عنقود APIC آخر",
+       "تعيد الإقلاع إلى طور الاكتشاف"
+      ],
+      "answer": 1,
+      "explanation": "حالة التحويل محلية. تواصل الورقة البعيدة العمل بالسياسة الحالية، لكن التغييرات تحتاج إلى APIC."
+     },
+     {
+      "question": "كيف ينقل Multi-Site حركة BUM لـ BD ممتدة؟",
+      "options": [
+       "PIM Bidir عبر ISN",
+       "النسخ من نقطة الرأس بنسخ أحادية البث إلى كل موقع بعيد",
+       "لا ينقل حركة BUM إطلاقاً",
+       "IGMP snooping على APIC"
+      ],
+      "answer": 1,
+      "explanation": "لا يتطلب Multi-Site بثاً متعدداً في ISN؛ إذ ينسخ العمود المصدر إلى كل موقع بعيد بنسخ أحادية البث."
+     },
+     {
+      "question": "يبقى عمود Pod 2 في حالة discovering بعد توصيله بـ IPN. ما الفحوص ذات الصلة؟ اختر كل ما ينطبق.",
+      "options": [
+       "أن تستخدم الواجهة الفرعية VLAN 4",
+       "أن يشير ترحيل DHCP إلى متحكمات APIC",
+       "وصول OSPF إلى عناوين TEP الخاصة بـ APIC",
+       "نطاق VMM الخاص بالمستأجر"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يحتاج الـ Pod الجديد إلى VLAN البنية التحتية وترحيل DHCP ووصول IP إلى متحكمات APIC. أما نطاقات VMM فتهم لاحقاً فقط."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- **Multi-Pod** نسيج واحد وعنقود APIC واحد تربطهما IPN (OSPF وPIM Bidir وترحيل DHCP وMTU 9150 وزمن ذهاب وإياب 50 مللي ثانية أو أقل). وهو نطاق فشل واحد.\n- **Multi-Site** يربط أنسجة مستقلة بمخططات وقوالب NDO عبر ISN بسيطة بلا بث متعدد. ويعطي عزلاً للأعطال ويناسب التعافي من الكوارث.\n- **Remote Leaf** يمدّ Pod واحداً إلى موقع بعيد عبر WAN بروتوكول IP عادية (حتى 300 مللي ثانية وما لا يقل عن 100 Mbps) ويواصل التحويل عند انقطاع WAN.\n- تتكامل الخيارات، فاختر بحسب نطاق الفشل وزمن التأخير ونموذج التشغيل لا بحسب المسافة وحدها.\n\nولمنصة التحكم التي تقف وراء Multi-Site تابع مع [Nexus Dashboard: Orchestrator, Fabric Controller, Insights](/learn/enterprise-datacenter-networking/nexus-dashboard-orchestrator-fabric-controller-insights)."
+   }
+  ]
+ }
+}
