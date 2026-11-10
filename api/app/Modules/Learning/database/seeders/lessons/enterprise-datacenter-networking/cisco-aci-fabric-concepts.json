@@ -1,0 +1,398 @@
+{
+  "slug": "cisco-aci-fabric-concepts",
+  "title": "Cisco ACI Fabric Concepts",
+  "summary": "Understand how Cisco Application Centric Infrastructure (ACI) builds a policy-driven spine-leaf fabric: the APIC cluster, fabric discovery, the tenant object model, contracts and access policies.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Describe the ACI spine-leaf topology and the role of the APIC cluster",
+    "Explain how the fabric discovers and registers new switches using LLDP, DHCP and the TEP pool",
+    "Relate tenants, VRFs, bridge domains, EPGs and application profiles in the ACI object model",
+    "Explain how contracts, subjects and filters permit traffic between EPGs",
+    "Build the access-policy chain from VLAN pool to switch profile and verify the fabric from the CLI"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A new application team needs three tiers, web, app and database, on isolated segments with only specific ports open between them. On a traditional network that means VLANs, SVIs, ACLs and firewall rules on many boxes, each typed by hand. In **Cisco Application Centric Infrastructure (ACI)** you describe the intent once, as objects on the controller, and the fabric renders it on every switch that needs it.\n\nACI is a core topic of the DCCOR exam. You must know the fabric components, how switches join, the logical object model and the access policies that connect servers to it. This lesson builds that foundation; the underlying VXLAN mechanics are covered in [VXLAN EVPN Overlay and Underlay](/learn/enterprise-datacenter-networking/vxlan-evpn-overlay-and-underlay)."
+    },
+    {
+      "id": "fabric",
+      "type": "text",
+      "markdown": "## The fabric: spines, leaves and the APIC\n\nAn ACI fabric is a strict **two-tier Clos (spine-leaf)** topology built from Nexus 9000 switches running ACI mode.\n\n- **Leaf switches** connect everything: servers, firewalls, load balancers, routers (border leaves) and the controllers themselves. Policy is enforced here.\n- **Spine switches** connect only to leaves. They forward VXLAN traffic between leaves and hold the endpoint database used to find unknown destinations.\n- Every leaf connects to every spine. Leaves never connect to each other and spines never connect to each other (except in Multi-Pod and Multi-Site designs, through an inter-pod network).\n\nThe **Application Policy Infrastructure Controller (APIC)** is the management and policy plane. It is a cluster, normally of **three or more** appliances, attached to leaves. The APIC database is split into shards and each shard is replicated three times, so the cluster keeps working if one controller fails. The APIC is **not in the data path**: if every APIC goes down, the fabric keeps forwarding with the last policy it received; you simply cannot make changes.\n\n### Control-plane protocols inside the fabric\n\n| Protocol | Job |\n|:--|:--|\n| **IS-IS** | Underlay routing between tunnel endpoint (TEP) addresses in VRF `overlay-1` |\n| **VXLAN** | Data-plane encapsulation between leaves (iVXLAN with policy bits) |\n| **COOP** | Leaves report their local endpoints to the spines, which keep the mapping database |\n| **MP-BGP** | Spines act as route reflectors to spread external routes learned on border leaves |"
+    },
+    {
+      "id": "discovery",
+      "type": "text",
+      "markdown": "## Fabric discovery and registration\n\nSwitches join the fabric automatically, but only after an administrator approves them.\n\n1. A leaf connected to an APIC boots and exchanges **LLDP**. The APIC advertises the **infrastructure VLAN** (often 3967) in LLDP.\n2. The leaf sends DHCP on the infra VLAN. It appears in **Fabric > Inventory > Fabric Membership** with its serial number, waiting for approval.\n3. The administrator **registers** the switch by giving it a **node ID** (for example 101) and a name. The APIC then assigns it a TEP address from the **TEP pool** chosen at APIC setup (for example 10.0.0.0/16).\n4. The leaf downloads its configuration and firmware policy, brings up IS-IS and becomes active. Spines connected to it are discovered next, then the remaining leaves through those spines.\n\nPlan the TEP pool carefully: it cannot be changed without rebuilding the fabric and must not overlap with any address range that will be routed into the fabric."
+    },
+    {
+      "id": "disc-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "How a new leaf joins the ACI fabric",
+      "caption": "Nothing is configured on the switch itself; identity and policy come from the APIC.",
+      "data": {
+        "actors": [
+          { "id": "apic", "label": "APIC 1", "sub": "10.0.0.1", "icon": "server" },
+          { "id": "leaf", "label": "Leaf", "sub": "new switch", "icon": "switch" },
+          { "id": "adm", "label": "Administrator", "sub": "APIC GUI", "icon": "user" },
+          { "id": "spine", "label": "Spine", "sub": "node 201", "icon": "switch" }
+        ],
+        "steps": [
+          { "from": "leaf", "to": "apic", "label": "LLDP", "detail": "infra VLAN 3967", "note": "The leaf and the APIC exchange LLDP; the APIC tells the leaf which VLAN carries infrastructure traffic." },
+          { "from": "leaf", "to": "apic", "label": "DHCP Discover", "detail": "serial FDO24210ABC", "note": "The leaf asks for an address. The APIC records it as an unregistered node in Fabric Membership." },
+          { "from": "adm", "to": "apic", "label": "Register node", "detail": "ID 101, leaf-101", "note": "An administrator approves the serial number and assigns a node ID and name. Unknown switches never join on their own." },
+          { "from": "apic", "to": "leaf", "label": "DHCP Offer", "detail": "TEP 10.0.80.64/32", "tone": "secure", "note": "The APIC assigns a tunnel endpoint (TEP) address from the TEP pool." },
+          { "from": "leaf", "to": "apic", "label": "Download policy", "detail": "config + firmware", "note": "The leaf pulls its configuration and firmware policy from the APIC." },
+          { "from": "leaf", "to": "spine", "label": "LLDP + IS-IS", "detail": "VRF overlay-1", "note": "The leaf discovers its spines, which then go through the same registration, and IS-IS builds TEP reachability." },
+          { "from": "leaf", "to": "leaf", "label": "Active", "tone": "success", "note": "The leaf is active and ready to receive tenant and access policies." }
+        ]
+      }
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## The logical object model\n\nACI configuration is a tree of **managed objects (MOs)** under the root `uni`. The tenant branch describes applications:\n\n| Object | Class | Purpose |\n|:--|:--|:--|\n| **Tenant** | `fvTenant` | Administrative and isolation boundary (a customer, business unit or environment). Built-in tenants: `common`, `infra`, `mgmt`. |\n| **VRF** (context) | `fvCtx` | A Layer 3 routing domain. Subnets in different VRFs can overlap. |\n| **Bridge domain (BD)** | `fvBD` | A Layer 2 flood domain tied to one VRF. It owns the gateway **subnets** and decides how ARP and unknown unicast are handled. |\n| **Application profile** | `fvAp` | A container that groups the EPGs of one application. |\n| **Endpoint group (EPG)** | `fvAEPg` | A set of endpoints with the same policy. Each EPG belongs to one BD. |\n| **Contract** | `vzBrCP` | The policy that permits traffic between EPGs. |\n\nThe key mindset change: **a VLAN is no longer the segment**. The VLAN ID on a port (the *encapsulation*) only classifies traffic into an EPG. Two leaves can use different VLAN IDs for the same EPG, and the gateway for a subnet is a **pervasive gateway** that exists on every leaf where the BD is deployed (an anycast gateway).\n\n### Bridge domain settings worth knowing\n\n- **Unicast routing**: enables the BD subnet gateway and IP endpoint learning.\n- **L2 unknown unicast**: *Hardware proxy* (send to the spine database, the default) or *Flood*.\n- **ARP flooding**: off by default when unicast routing is enabled; turn it on for silent hosts or migrations from legacy networks."
+    },
+    {
+      "id": "contracts",
+      "type": "text",
+      "markdown": "## Contracts: whitelist policy between EPGs\n\nBy default a VRF is in **enforced** mode: endpoints **inside** the same EPG can talk freely, but traffic **between** EPGs is denied unless a contract permits it.\n\n- A **filter** matches traffic, much like an ACL entry: EtherType, IP protocol, ports.\n- A **subject** groups filters and sets options such as *apply both directions* and *reverse filter ports*, so return traffic is allowed.\n- A **contract** contains subjects. One EPG **provides** the contract (the service, for example `db`) and another **consumes** it (the client, for example `app`).\n\nThe leaves program contracts as hardware rules in TCAM, identified by each EPG's **pcTag** (class ID). Shortcuts exist for broad policy: **vzAny** applies a contract to every EPG in a VRF, and a **preferred group** lets members talk without contracts. Newer releases add **endpoint security groups (ESGs)**, which separate security grouping from the forwarding constructs of EPGs and BDs."
+    },
+    {
+      "id": "rest",
+      "type": "code",
+      "language": "json",
+      "filename": "POST https://apic.example.com/api/mo/uni.json",
+      "caption": "One REST call creates a tenant, VRF, bridge domain with a gateway, and a three-tier application profile. Lines 7–8 bind the BD to the VRF and add the anycast gateway.",
+      "highlight": [7, 8],
+      "code": "{\"fvTenant\": {\"attributes\": {\"name\": \"Prod\"}, \"children\": [\n  {\"fvCtx\": {\"attributes\": {\"name\": \"VRF1\", \"pcEnfPref\": \"enforced\"}}},\n  {\"fvBD\": {\"attributes\": {\n      \"name\": \"BD-Web\", \"unicastRoute\": \"yes\",\n      \"unkMacUcastAct\": \"proxy\", \"arpFlood\": \"no\"},\n    \"children\": [\n      {\"fvRsCtx\": {\"attributes\": {\"tnFvCtxName\": \"VRF1\"}}},\n      {\"fvSubnet\": {\"attributes\": {\"ip\": \"10.1.10.1/24\", \"scope\": \"private\"}}}]}},\n  {\"fvAp\": {\"attributes\": {\"name\": \"Shop\"}, \"children\": [\n      {\"fvAEPg\": {\"attributes\": {\"name\": \"web\"}, \"children\": [\n        {\"fvRsBd\": {\"attributes\": {\"tnFvBDName\": \"BD-Web\"}}},\n        {\"fvRsDomAtt\": {\"attributes\": {\"tDn\": \"uni/phys-PhysDom-Servers\"}}},\n        {\"fvRsCons\": {\"attributes\": {\"tnVzBrCPName\": \"web-to-app\"}}}]}}]}}\n]}}"
+    },
+    {
+      "id": "access",
+      "type": "text",
+      "markdown": "## Access policies: connecting servers to the fabric\n\nAn EPG alone does not open a port. The **access policies** (under *Fabric > Access Policies*) describe the physical side, and they form a chain that learners must memorize:\n\n1. **VLAN pool**: the range of VLAN IDs allowed (static or dynamic allocation).\n2. **Domain**: physical, L3 external, L2 external or VMM. It references the VLAN pool and is attached to the EPG (`fvRsDomAtt` above).\n3. **Attachable Access Entity Profile (AAEP)**: links domains to interfaces.\n4. **Interface policy group**: interface settings (speed, LLDP, LACP) plus the AAEP. Types: access port, port channel or vPC.\n5. **Interface profile**: selects ports, for example `1/10`, and applies the policy group.\n6. **Switch profile**: selects leaf node IDs, for example 101–102, and applies the interface profile.\n\nFinally, the EPG gets a **static port** binding (port plus `vlan-110` encapsulation) or a VMM domain that lets the APIC push port groups to the hypervisor. If any link in this chain is missing, the APIC raises a fault such as *invalid VLAN configuration* and the port does not forward for that EPG."
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Verifying the fabric from the APIC and a leaf",
+      "prompt": "apic1#",
+      "lines": [
+        {
+          "cmd": "acidiag fnvread",
+          "output": "      ID   Pod ID                 Name    Serial Number         IP Address    Role        State   LastUpdMsgId\n--------------------------------------------------------------------------------------------------------------\n     101        1             leaf-101      FDO24210ABC      10.0.80.64/32    leaf         active   0\n     102        1             leaf-102      FDO24210ABD      10.0.80.65/32    leaf         active   0\n     201        1            spine-201      FDO24180XYZ      10.0.80.66/32   spine         active   0\n\nTotal 3 nodes"
+        },
+        { "comment": "Registered nodes, their TEP addresses and state. A node stuck in 'discovering' or 'inactive' points to a cabling, LLDP or infra VLAN problem." },
+        {
+          "cmd": "show isis adjacency vrf overlay-1",
+          "prompt": "leaf-101#",
+          "output": "IS-IS process: isis_infra VRF:overlay-1\nIS-IS adjacency database:\nSystem ID        SNPA            Level  State  Hold Time  Interface\n0A00.5042.0000   N/A             1      UP     00:01:01   eth1/49.35"
+        },
+        { "comment": "The underlay: one IS-IS adjacency per spine uplink inside the infra VRF overlay-1." },
+        {
+          "cmd": "show endpoint vrf Prod:VRF1",
+          "prompt": "leaf-101#",
+          "output": "+-----------------------------------+---------------+-----------------+--------------+-------------+\n      VLAN/                           Encap           MAC Address       MAC Info/       Interface\n      Domain                          VLAN            IP Address        IP Info\n+-----------------------------------+---------------+-----------------+--------------+-------------+\n31                                         vlan-110    0050.56a1.1b2c L                     eth1/10\nProd:VRF1                                  vlan-110        10.1.10.11 L                     eth1/10"
+        },
+        { "comment": "The web server was learned locally (L) on eth1/10 with encapsulation vlan-110. The leaf reports it to the spines through COOP." }
+      ],
+      "caption": "Use read-only show commands; in ACI you change configuration through the APIC, not on the switches."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where learners go wrong",
+      "markdown": "- **Treating the VLAN as the segment.** The BD is the flood domain; the VLAN is only an encapsulation that maps a port to an EPG.\n- **Forgetting the domain on the EPG.** Without a domain whose VLAN pool contains the encapsulation, the static port fails with a fault.\n- **Expecting EPGs to talk by default.** In an enforced VRF, inter-EPG traffic needs a contract; intra-EPG traffic is allowed unless isolation is configured.\n- **Configuring leaves by CLI.** Changes belong on the APIC; the switch CLI is for verification."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use the Cisco DevNet always-on ACI sandbox or an ACI Simulator, never a production APIC:\n\n1. Create tenant `Lab-<yourname>` with VRF `VRF1` and bridge domain `BD-Web` with gateway `10.1.10.1/24`.\n2. Add application profile `Shop` with EPGs `web` and `app`, both in `BD-Web`.\n3. Create filter `tcp-8080`, a contract `web-to-app` with one subject using it, then make `app` the provider and `web` the consumer.\n4. Open the tenant topology view and confirm the relationships. Then use the API Inspector (*Help and Tools*) to see the REST calls the GUI sent.\n5. Delete your tenant when you finish."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        { "term": "APIC", "definition": "Application Policy Infrastructure Controller: the clustered controller that stores ACI policy and pushes it to the switches; it is not in the data path." },
+        { "term": "TEP pool", "definition": "The address range from which the APIC assigns tunnel endpoint addresses to fabric nodes; chosen at setup and hard to change later." },
+        { "term": "Tenant", "definition": "A top-level container that isolates the policies of a customer, business unit or environment." },
+        { "term": "Bridge domain", "definition": "A Layer 2 forwarding domain bound to one VRF; it holds the gateway subnets and the flooding behavior." },
+        { "term": "EPG", "definition": "Endpoint group: endpoints that share the same policy; traffic between EPGs requires a contract." },
+        { "term": "Contract", "definition": "A policy made of subjects and filters that permits traffic from a consumer EPG to a provider EPG." },
+        { "term": "AAEP", "definition": "Attachable Access Entity Profile: the access-policy object that connects domains (and their VLAN pools) to interface policy groups." },
+        { "term": "COOP", "definition": "Council of Oracle Protocol: leaves report local endpoints to the spines, which keep the fabric-wide endpoint database." }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "All three APICs in a fabric lose power. What happens to traffic between existing endpoints?",
+          "options": [
+            "All forwarding stops immediately",
+            "Forwarding continues with the last policy; no changes can be made",
+            "Leaves fall back to flooding all traffic",
+            "Spines take over the APIC role automatically"
+          ],
+          "answer": 1,
+          "explanation": "The APIC is the management and policy plane, not the data plane. Switches keep forwarding with the policy already programmed in hardware."
+        },
+        {
+          "question": "Which steps are part of adding a new leaf to an ACI fabric? (Choose all that apply.)",
+          "options": [
+            "The leaf exchanges LLDP with the APIC and learns the infra VLAN",
+            "An administrator registers the serial number with a node ID",
+            "The administrator configures IS-IS manually on the leaf CLI",
+            "The APIC assigns a TEP address through DHCP"
+          ],
+          "answer": [0, 1, 3],
+          "explanation": "Discovery uses LLDP, DHCP on the infra VLAN and manual registration. IS-IS in overlay-1 is brought up automatically by the fabric."
+        },
+        {
+          "question": "Endpoints in EPG web and EPG app are in the same bridge domain in an enforced VRF, with no contract. What happens?",
+          "options": [
+            "They communicate because they share a bridge domain",
+            "They communicate only through ARP flooding",
+            "Traffic between them is denied",
+            "Traffic is permitted but logged"
+          ],
+          "answer": 2,
+          "explanation": "Policy is applied per EPG, not per BD. Inter-EPG traffic in an enforced VRF needs a contract."
+        },
+        {
+          "question": "Which access-policy object links a physical domain to an interface policy group?",
+          "options": [
+            "Switch profile",
+            "Attachable Access Entity Profile (AAEP)",
+            "VLAN pool",
+            "Interface profile"
+          ],
+          "answer": 1,
+          "explanation": "The chain is VLAN pool, domain, AAEP, interface policy group, interface profile, switch profile. The AAEP is the bridge between domains and interfaces."
+        },
+        {
+          "question": "Which statements about bridge domains are true? (Choose all that apply.)",
+          "options": [
+            "A bridge domain is associated with exactly one VRF",
+            "Gateway subnets are configured on the bridge domain",
+            "A bridge domain can only use one VLAN ID across the fabric",
+            "L2 unknown unicast can use hardware proxy through the spines"
+          ],
+          "answer": [0, 1, 3],
+          "explanation": "A BD belongs to one VRF, owns the pervasive gateway subnets and can proxy unknown unicast to the spine database. VLAN IDs are only local encapsulations for EPGs."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- ACI is a **spine-leaf** fabric managed by an **APIC cluster** that is outside the data path.\n- New switches are discovered with **LLDP** and **DHCP** on the infra VLAN, **registered** by node ID and given a **TEP** address; **IS-IS**, **COOP** and **MP-BGP** then run automatically.\n- The tenant model is **tenant > VRF > bridge domain > EPG**, with application profiles grouping EPGs. VLANs only classify traffic into EPGs.\n- **Contracts** (subjects and filters) are required for traffic between EPGs in an enforced VRF.\n- **Access policies** chain VLAN pool, domain, AAEP, interface policy group, interface profile and switch profile.\n\nNext, see how fabrics are operated at scale in [Nexus Dashboard and Fabric Management](/learn/enterprise-datacenter-networking/nexus-dashboard-and-fabric-management)."
+    }
+  ],
+  "ar": {
+    "title": "مفاهيم النسيج الشبكي في Cisco ACI",
+    "summary": "تعرّف كيف تبني البنية التحتية المتمحورة حول التطبيقات (Cisco ACI) نسيجًا شبكيًا من نوع العمود الفقري والورقة تقوده السياسات: عنقود APIC، واكتشاف النسيج، ونموذج كائنات المستأجر، والعقود، وسياسات الوصول.",
+    "objectives": [
+      "وصف طوبولوجيا العمود الفقري والورقة في ACI ودور عنقود APIC",
+      "شرح كيف يكتشف النسيج المحوّلات الجديدة ويسجّلها باستخدام LLDP وDHCP ومجمّع عناوين TEP",
+      "ربط المستأجرين وVRF ونطاقات الجسر ومجموعات EPG وملفات تعريف التطبيقات في نموذج كائنات ACI",
+      "شرح كيف تسمح العقود والمواضيع والمرشّحات بمرور الحركة بين مجموعات EPG",
+      "بناء سلسلة سياسات الوصول من مجمّع VLAN إلى ملف تعريف المحوّل، والتحقق من النسيج عبر سطر الأوامر"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يحتاج فريق تطبيقات جديد إلى ثلاث طبقات، الويب والتطبيق وقاعدة البيانات، على مقاطع معزولة لا يُفتح بينها إلا منافذ محددة. في الشبكة التقليدية يعني ذلك شبكات VLAN وواجهات SVI وقوائم ACL وقواعد جدار حماية على أجهزة كثيرة، تُكتب كلها يدويًا. أمّا في **البنية التحتية المتمحورة حول التطبيقات (Cisco ACI)** فتصف ما تريده مرة واحدة على هيئة كائنات في المتحكّم، ويتولّى النسيج تطبيقه على كل محوّل يحتاج إليه.\n\nيُعدّ ACI موضوعًا محوريًا في اختبار DCCOR؛ إذ يجب أن تعرف مكوّنات النسيج، وكيف تنضم المحوّلات إليه، والنموذج المنطقي للكائنات، وسياسات الوصول التي تربط الخوادم به. يضع هذا الدرس ذلك الأساس، أمّا آليات VXLAN التي يقوم عليها فيتناولها درس [VXLAN EVPN: الطبقة العلوية والطبقة السفلية](/learn/enterprise-datacenter-networking/vxlan-evpn-overlay-and-underlay)."
+      },
+      {
+        "id": "fabric",
+        "type": "text",
+        "markdown": "## النسيج: محوّلات العمود الفقري والأوراق ومتحكّم APIC\n\nنسيج ACI طوبولوجيا **Clos من مستويين (Spine-Leaf)** صارمة، مبنية من محوّلات Nexus 9000 تعمل بنمط ACI.\n\n- **محوّلات الأوراق (Leaf)** تتصل بكل شيء: الخوادم، وجدران الحماية، وموازِنات الحمل، والموجّهات (عبر أوراق الحدود Border leaves)، والمتحكّمات نفسها. وفيها تُطبَّق السياسات.\n- **محوّلات العمود الفقري (Spine)** لا تتصل إلا بالأوراق، فتمرّر حركة VXLAN بينها وتحتفظ بقاعدة بيانات نقاط النهاية التي تُستخدم لإيجاد الوجهات المجهولة.\n- كل ورقة تتصل بكل محوّل عمود فقري، ولا تتصل الأوراق ببعضها ولا محوّلات العمود الفقري ببعضها (إلا في تصاميم Multi-Pod وMulti-Site عبر شبكة بين الوحدات).\n\nأمّا **متحكّم البنية التحتية لسياسات التطبيقات (APIC)** فهو مستوى الإدارة والسياسات، ويعمل عنقودًا (Cluster) يضم عادةً **ثلاثة أجهزة أو أكثر** متصلة بالأوراق. تُقسَّم قاعدة بيانات APIC إلى أجزاء (Shards) يُنسخ كلٌّ منها ثلاث مرات، فيستمر العنقود في العمل إن تعطّل متحكّم واحد. ولا يقع APIC **في مسار البيانات**؛ فلو توقفت جميع المتحكّمات لواصل النسيج التمرير بآخر سياسة استلمها، غير أنك لن تستطيع إجراء أيّ تغيير.\n\n### بروتوكولات مستوى التحكم داخل النسيج\n\n| البروتوكول | وظيفته |\n|:--|:--|\n| **IS-IS** | التوجيه في الطبقة السفلية بين عناوين نقاط نهاية الأنفاق (TEP) داخل `overlay-1` |\n| **VXLAN** | التغليف في مستوى البيانات بين الأوراق (iVXLAN مع بتات السياسة) |\n| **COOP** | تُبلغ الأوراق محوّلات العمود الفقري بنقاط النهاية المحلية، فتحتفظ هذه بقاعدة بيانات الربط |\n| **MP-BGP** | تعمل محوّلات العمود الفقري عاكساتِ مسارات (Route reflectors) لنشر المسارات الخارجية المتعلَّمة على أوراق الحدود |"
+      },
+      {
+        "id": "discovery",
+        "type": "text",
+        "markdown": "## اكتشاف النسيج وتسجيل المحوّلات\n\nتنضم المحوّلات إلى النسيج تلقائيًا، لكن بعد موافقة المسؤول فقط.\n\n1. تُقلع ورقةٌ متصلة بمتحكّم APIC وتتبادل معه **LLDP**، فيعلن APIC عبره عن **شبكة VLAN الخاصة بالبنية التحتية (Infra VLAN)**، وكثيرًا ما تكون 3967.\n2. ترسل الورقة طلب DHCP على شبكة Infra VLAN، فتظهر في **Fabric > Inventory > Fabric Membership** برقمها التسلسلي بانتظار الموافقة.\n3. **يسجّل** المسؤول المحوّل بإعطائه **معرّف عقدة (Node ID)** مثل 101 واسمًا، ثم يمنحه APIC عنوان TEP من **مجمّع عناوين TEP (TEP pool)** الذي اختير عند إعداد APIC (مثل 10.0.0.0/16).\n4. تُنزّل الورقة إعداداتها وسياسة البرنامج الثابت (Firmware)، وتُشغّل IS-IS وتصبح نشطة. ثم تُكتشف محوّلات العمود الفقري المتصلة بها، ثم بقية الأوراق عبر تلك المحوّلات.\n\nخطّط لمجمّع TEP بعناية؛ فلا يمكن تغييره دون إعادة بناء النسيج، ويجب ألا يتداخل مع أيّ نطاق عناوين سيُوجَّه إلى النسيج."
+      },
+      {
+        "id": "disc-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "كيف تنضم ورقة جديدة إلى نسيج ACI",
+        "caption": "لا يُضبط شيء على المحوّل نفسه؛ فالهوية والسياسة تأتيان من APIC.",
+        "data": {
+          "actors": [
+            { "id": "apic", "label": "APIC 1", "sub": "10.0.0.1", "icon": "server" },
+            { "id": "leaf", "label": "ورقة", "sub": "محوّل جديد", "icon": "switch" },
+            { "id": "adm", "label": "المسؤول", "sub": "واجهة APIC", "icon": "user" },
+            { "id": "spine", "label": "عمود فقري", "sub": "العقدة 201", "icon": "switch" }
+          ],
+          "steps": [
+            { "from": "leaf", "to": "apic", "label": "LLDP", "detail": "infra VLAN 3967", "note": "تتبادل الورقة وAPIC رسائل LLDP، ويخبر APIC الورقةَ بشبكة VLAN التي تحمل حركة البنية التحتية." },
+            { "from": "leaf", "to": "apic", "label": "DHCP Discover", "detail": "serial FDO24210ABC", "note": "تطلب الورقة عنوانًا، فيسجّلها APIC عقدةً غير مسجّلة في Fabric Membership." },
+            { "from": "adm", "to": "apic", "label": "تسجيل العقدة", "detail": "ID 101, leaf-101", "note": "يوافق المسؤول على الرقم التسلسلي ويعيّن معرّف العقدة واسمها؛ فالمحوّلات المجهولة لا تنضم من تلقاء نفسها أبدًا." },
+            { "from": "apic", "to": "leaf", "label": "DHCP Offer", "detail": "TEP 10.0.80.64/32", "tone": "secure", "note": "يعيّن APIC عنوان نقطة نهاية النفق (TEP) من مجمّع TEP." },
+            { "from": "leaf", "to": "apic", "label": "تنزيل السياسة", "detail": "config + firmware", "note": "تسحب الورقة إعداداتها وسياسة البرنامج الثابت من APIC." },
+            { "from": "leaf", "to": "spine", "label": "LLDP + IS-IS", "detail": "VRF overlay-1", "note": "تكتشف الورقة محوّلات العمود الفقري التي تمرّ بدورها بالتسجيل نفسه، ويبني IS-IS إمكانية الوصول بين عناوين TEP." },
+            { "from": "leaf", "to": "leaf", "label": "نشطة", "tone": "success", "note": "أصبحت الورقة نشطة وجاهزة لاستقبال سياسات المستأجرين والوصول." }
+          ]
+        }
+      },
+      {
+        "id": "model",
+        "type": "text",
+        "markdown": "## النموذج المنطقي للكائنات\n\nإعدادات ACI شجرةٌ من **الكائنات المُدارة (Managed Objects)** تحت الجذر `uni`، ويصف فرعُ المستأجر التطبيقات:\n\n| الكائن | الصنف | الغرض |\n|:--|:--|:--|\n| **المستأجر (Tenant)** | `fvTenant` | حدّ إداري وحدّ عزل (عميل أو وحدة أعمال أو بيئة). المستأجرون المدمجون: `common` و`infra` و`mgmt`. |\n| **VRF** (السياق) | `fvCtx` | نطاق توجيه في الطبقة 3، ويجوز أن تتداخل الشبكات الفرعية بين VRF مختلفة. |\n| **نطاق الجسر (Bridge Domain)** | `fvBD` | نطاق إغراق في الطبقة 2 مرتبط بـ VRF واحد، يملك **الشبكات الفرعية** للبوابة ويحدد طريقة التعامل مع ARP والحركة أحادية الوجهة المجهولة. |\n| **ملف تعريف التطبيق (Application Profile)** | `fvAp` | حاوية تجمع مجموعات EPG الخاصة بتطبيق واحد. |\n| **مجموعة نقاط النهاية (EPG)** | `fvAEPg` | مجموعة نقاط نهاية تخضع للسياسة نفسها، وتنتمي كل EPG إلى نطاق جسر واحد. |\n| **العقد (Contract)** | `vzBrCP` | السياسة التي تسمح بالحركة بين مجموعات EPG. |\n\nالتحوّل الجوهري في طريقة التفكير: **لم تعد VLAN هي المقطع**. فمعرّف VLAN على المنفذ (أي *التغليف* Encapsulation) لا يفعل سوى تصنيف الحركة ضمن EPG. ويمكن لورقتين استخدام معرّفَي VLAN مختلفين للمجموعة نفسها، أمّا بوابة الشبكة الفرعية فهي **بوابة منتشرة (Pervasive gateway)** موجودة على كل ورقة نُشر عليها نطاق الجسر (أي بوابة Anycast).\n\n### إعدادات نطاق الجسر الجديرة بالمعرفة\n\n- **التوجيه أحادي الوجهة (Unicast routing)**: يُفعّل بوابة الشبكة الفرعية وتعلّم نقاط النهاية بعناوين IP.\n- **الحركة أحادية الوجهة المجهولة في الطبقة 2**: إمّا *Hardware proxy* (إرسالها إلى قاعدة بيانات العمود الفقري، وهو الافتراضي) وإمّا *Flood*.\n- **إغراق ARP (ARP flooding)**: معطّل افتراضيًا عند تفعيل التوجيه أحادي الوجهة؛ فعّله للمضيفات الصامتة أو عند الترحيل من الشبكات التقليدية."
+      },
+      {
+        "id": "contracts",
+        "type": "text",
+        "markdown": "## العقود: سياسة القائمة البيضاء بين مجموعات EPG\n\nيكون VRF افتراضيًا في نمط **الإنفاذ (Enforced)**: تتواصل نقاط النهاية **داخل** المجموعة نفسها بحرية، أمّا الحركة **بين** المجموعات فتُرفض ما لم يسمح بها عقد.\n\n- **المرشّح (Filter)** يطابق الحركة كما يفعل إدخال ACL: نوع EtherType، وبروتوكول IP، والمنافذ.\n- **الموضوع (Subject)** يجمع المرشّحات ويضبط خيارات مثل *التطبيق في الاتجاهين* و*عكس منافذ المرشّح*، فيُسمح بحركة الرد.\n- **العقد (Contract)** يحتوي المواضيع؛ إذ **تقدّم (Provide)** إحدى المجموعات العقد (الخدمة، مثل `db`)، و**تستهلكه (Consume)** مجموعة أخرى (العميل، مثل `app`).\n\nتبرمج الأوراق العقود قواعدَ في ذاكرة TCAM، وتُعرَّف كل EPG فيها بوسمها **pcTag** (معرّف الصنف). وتوجد اختصارات للسياسات الواسعة: **vzAny** يطبّق عقدًا على كل مجموعات EPG في VRF، و**المجموعة المفضّلة (Preferred group)** تتيح لأعضائها التواصل دون عقود. وتضيف الإصدارات الأحدث **مجموعات أمان نقاط النهاية (ESG)** التي تفصل التجميع الأمني عن بنى التمرير المتمثلة في EPG ونطاقات الجسر."
+      },
+      {
+        "id": "rest",
+        "type": "code",
+        "language": "json",
+        "filename": "POST https://apic.example.com/api/mo/uni.json",
+        "caption": "استدعاء REST واحد يُنشئ مستأجرًا وVRF ونطاق جسر ببوابة، وملف تعريف تطبيق من ثلاث طبقات. يربط السطران 7 و8 نطاق الجسر بـ VRF ويضيفان بوابة Anycast.",
+        "highlight": [7, 8],
+        "code": "{\"fvTenant\": {\"attributes\": {\"name\": \"Prod\"}, \"children\": [\n  {\"fvCtx\": {\"attributes\": {\"name\": \"VRF1\", \"pcEnfPref\": \"enforced\"}}},\n  {\"fvBD\": {\"attributes\": {\n      \"name\": \"BD-Web\", \"unicastRoute\": \"yes\",\n      \"unkMacUcastAct\": \"proxy\", \"arpFlood\": \"no\"},\n    \"children\": [\n      {\"fvRsCtx\": {\"attributes\": {\"tnFvCtxName\": \"VRF1\"}}},\n      {\"fvSubnet\": {\"attributes\": {\"ip\": \"10.1.10.1/24\", \"scope\": \"private\"}}}]}},\n  {\"fvAp\": {\"attributes\": {\"name\": \"Shop\"}, \"children\": [\n      {\"fvAEPg\": {\"attributes\": {\"name\": \"web\"}, \"children\": [\n        {\"fvRsBd\": {\"attributes\": {\"tnFvBDName\": \"BD-Web\"}}},\n        {\"fvRsDomAtt\": {\"attributes\": {\"tDn\": \"uni/phys-PhysDom-Servers\"}}},\n        {\"fvRsCons\": {\"attributes\": {\"tnVzBrCPName\": \"web-to-app\"}}}]}}]}}\n]}}"
+      },
+      {
+        "id": "access",
+        "type": "text",
+        "markdown": "## سياسات الوصول: ربط الخوادم بالنسيج\n\nلا تفتح EPG وحدها أيّ منفذ. فـ**سياسات الوصول (Access Policies)** الموجودة تحت *Fabric > Access Policies* تصف الجانب المادي، وتشكّل سلسلة ينبغي للمتعلّم حفظها:\n\n1. **مجمّع VLAN (VLAN pool)**: نطاق معرّفات VLAN المسموح بها (تخصيص ثابت أو ديناميكي).\n2. **النطاق (Domain)**: مادي، أو خارجي في الطبقة 3، أو خارجي في الطبقة 2، أو VMM. يشير إلى مجمّع VLAN ويُربط بمجموعة EPG (`fvRsDomAtt` في المثال أعلاه).\n3. **ملف تعريف كيان الوصول القابل للربط (AAEP)**: يربط النطاقات بالواجهات.\n4. **مجموعة سياسات الواجهة (Interface policy group)**: إعدادات الواجهة (السرعة وLLDP وLACP) إضافةً إلى AAEP، وأنواعها: منفذ وصول، أو قناة منافذ (Port channel)، أو vPC.\n5. **ملف تعريف الواجهة (Interface profile)**: يختار المنافذ، مثل `1/10`، ويطبّق عليها مجموعة السياسات.\n6. **ملف تعريف المحوّل (Switch profile)**: يختار معرّفات عقد الأوراق، مثل 101–102، ويطبّق عليها ملف تعريف الواجهة.\n\nأخيرًا تحصل EPG على **ربط منفذ ثابت (Static port)** يحدد المنفذ والتغليف `vlan-110`، أو على نطاق VMM يتيح لـ APIC دفع مجموعات المنافذ إلى المشرف الافتراضي (Hypervisor). وإن غابت أيّ حلقة من هذه السلسلة أطلق APIC خطأً (Fault) مثل *invalid VLAN configuration*، ولن يمرّر المنفذ حركة تلك المجموعة."
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "التحقق من النسيج من APIC ومن إحدى الأوراق",
+        "prompt": "apic1#",
+        "lines": [
+          {
+            "cmd": "acidiag fnvread",
+            "output": "      ID   Pod ID                 Name    Serial Number         IP Address    Role        State   LastUpdMsgId\n--------------------------------------------------------------------------------------------------------------\n     101        1             leaf-101      FDO24210ABC      10.0.80.64/32    leaf         active   0\n     102        1             leaf-102      FDO24210ABD      10.0.80.65/32    leaf         active   0\n     201        1            spine-201      FDO24180XYZ      10.0.80.66/32   spine         active   0\n\nTotal 3 nodes"
+          },
+          { "comment": "العقد المسجّلة وعناوين TEP الخاصة بها وحالتها. والعقدة العالقة في الحالة 'discovering' أو 'inactive' تشير إلى مشكلة في الكوابل أو LLDP أو Infra VLAN." },
+          {
+            "cmd": "show isis adjacency vrf overlay-1",
+            "prompt": "leaf-101#",
+            "output": "IS-IS process: isis_infra VRF:overlay-1\nIS-IS adjacency database:\nSystem ID        SNPA            Level  State  Hold Time  Interface\n0A00.5042.0000   N/A             1      UP     00:01:01   eth1/49.35"
+          },
+          { "comment": "الطبقة السفلية: تجاور IS-IS واحد لكل وصلة صاعدة نحو العمود الفقري داخل VRF البنية التحتية overlay-1." },
+          {
+            "cmd": "show endpoint vrf Prod:VRF1",
+            "prompt": "leaf-101#",
+            "output": "+-----------------------------------+---------------+-----------------+--------------+-------------+\n      VLAN/                           Encap           MAC Address       MAC Info/       Interface\n      Domain                          VLAN            IP Address        IP Info\n+-----------------------------------+---------------+-----------------+--------------+-------------+\n31                                         vlan-110    0050.56a1.1b2c L                     eth1/10\nProd:VRF1                                  vlan-110        10.1.10.11 L                     eth1/10"
+          },
+          { "comment": "تعلّمت الورقة خادم الويب محليًا (L) على eth1/10 بالتغليف vlan-110، وتُبلغ به محوّلات العمود الفقري عبر COOP." }
+        ],
+        "caption": "استخدم أوامر العرض للقراءة فقط؛ ففي ACI تُجرى التغييرات عبر APIC لا على المحوّلات."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أين يخطئ المتعلّمون",
+        "markdown": "- **معاملة VLAN على أنها المقطع.** نطاق الجسر هو نطاق الإغراق، أمّا VLAN فمجرد تغليف يربط منفذًا بمجموعة EPG.\n- **نسيان ربط النطاق بمجموعة EPG.** إن لم يوجد نطاق يحتوي مجمّعُ VLAN الخاص به على التغليف المستخدم، فشل ربط المنفذ الثابت وظهر خطأ.\n- **توقّع تواصل مجموعات EPG افتراضيًا.** في VRF بنمط الإنفاذ تحتاج الحركة بين المجموعات إلى عقد، أمّا الحركة داخل المجموعة فمسموحة ما لم يُضبط العزل.\n- **إعداد الأوراق عبر سطر الأوامر.** مكان التغييرات هو APIC، أمّا سطر أوامر المحوّل فللتحقق."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم بيئة ACI التجريبية الدائمة في Cisco DevNet أو محاكي ACI، ولا تستخدم أبدًا متحكّم APIC إنتاجيًا:\n\n1. أنشئ المستأجر `Lab-<yourname>` ومعه VRF باسم `VRF1` ونطاق جسر باسم `BD-Web` بالبوابة `10.1.10.1/24`.\n2. أضف ملف تعريف التطبيق `Shop` مع المجموعتين `web` و`app`، كلتاهما في `BD-Web`.\n3. أنشئ المرشّح `tcp-8080` وعقدًا باسم `web-to-app` بموضوع واحد يستخدمه، ثم اجعل `app` مقدّمًا و`web` مستهلكًا.\n4. افتح عرض طوبولوجيا المستأجر وتأكّد من العلاقات، ثم استخدم API Inspector (في *Help and Tools*) لترى استدعاءات REST التي أرسلتها الواجهة.\n5. احذف المستأجر عند الانتهاء."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          { "term": "APIC", "definition": "متحكّم البنية التحتية لسياسات التطبيقات: متحكّم عنقودي يخزّن سياسات ACI ويدفعها إلى المحوّلات، ولا يقع في مسار البيانات." },
+          { "term": "مجمّع TEP", "definition": "نطاق العناوين الذي يعيّن منه APIC عناوين نقاط نهاية الأنفاق لعقد النسيج؛ يُختار عند الإعداد ويصعب تغييره لاحقًا." },
+          { "term": "المستأجر", "definition": "حاوية عليا تعزل سياسات عميل أو وحدة أعمال أو بيئة." },
+          { "term": "نطاق الجسر", "definition": "نطاق تمرير في الطبقة 2 مرتبط بـ VRF واحد، يحمل الشبكات الفرعية للبوابة وسلوك الإغراق." },
+          { "term": "EPG", "definition": "مجموعة نقاط النهاية: نقاط نهاية تتشارك السياسة نفسها، وتحتاج الحركة بين المجموعات إلى عقد." },
+          { "term": "العقد", "definition": "سياسة مؤلّفة من مواضيع ومرشّحات تسمح بالحركة من مجموعة EPG مستهلكة إلى مجموعة مقدّمة." },
+          { "term": "AAEP", "definition": "ملف تعريف كيان الوصول القابل للربط: كائن في سياسات الوصول يربط النطاقات (ومجمّعات VLAN الخاصة بها) بمجموعات سياسات الواجهات." },
+          { "term": "COOP", "definition": "بروتوكول مجلس العرّافين (Council of Oracle Protocol): تُبلغ عبره الأوراقُ محوّلاتِ العمود الفقري بنقاط النهاية المحلية، فتحتفظ هذه بقاعدة بيانات نقاط النهاية للنسيج كله." }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "انقطعت الكهرباء عن متحكّمات APIC الثلاثة في النسيج. ماذا يحدث للحركة بين نقاط النهاية القائمة؟",
+            "options": [
+              "يتوقف التمرير كله فورًا",
+              "يستمر التمرير بآخر سياسة، ولا يمكن إجراء تغييرات",
+              "تعود الأوراق إلى إغراق الحركة كلها",
+              "تتولّى محوّلات العمود الفقري دور APIC تلقائيًا"
+            ],
+            "answer": 1,
+            "explanation": "APIC هو مستوى الإدارة والسياسات لا مستوى البيانات، وتواصل المحوّلات التمرير بالسياسة المبرمجة مسبقًا في العتاد."
+          },
+          {
+            "question": "أيّ الخطوات الآتية جزء من إضافة ورقة جديدة إلى نسيج ACI؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تتبادل الورقة LLDP مع APIC وتتعلّم Infra VLAN",
+              "يسجّل المسؤول الرقم التسلسلي بمعرّف عقدة",
+              "يضبط المسؤول IS-IS يدويًا عبر سطر أوامر الورقة",
+              "يعيّن APIC عنوان TEP عبر DHCP"
+            ],
+            "answer": [0, 1, 3],
+            "explanation": "يعتمد الاكتشاف على LLDP وDHCP على Infra VLAN والتسجيل اليدوي، أمّا IS-IS داخل overlay-1 فيشغّله النسيج تلقائيًا."
+          },
+          {
+            "question": "نقاط نهاية في المجموعتين web وapp ضمن نطاق الجسر نفسه في VRF بنمط الإنفاذ، ولا يوجد عقد. ماذا يحدث؟",
+            "options": [
+              "تتواصل لأنها تتشارك نطاق الجسر",
+              "تتواصل عبر إغراق ARP فقط",
+              "تُرفض الحركة بينها",
+              "يُسمح بالحركة مع تسجيلها"
+            ],
+            "answer": 2,
+            "explanation": "تُطبَّق السياسة لكل EPG لا لكل نطاق جسر، والحركة بين المجموعات في VRF بنمط الإنفاذ تحتاج إلى عقد."
+          },
+          {
+            "question": "أيّ كائن في سياسات الوصول يربط النطاق المادي بمجموعة سياسات الواجهة؟",
+            "options": [
+              "ملف تعريف المحوّل",
+              "ملف تعريف كيان الوصول القابل للربط (AAEP)",
+              "مجمّع VLAN",
+              "ملف تعريف الواجهة"
+            ],
+            "answer": 1,
+            "explanation": "السلسلة هي: مجمّع VLAN، ثم النطاق، ثم AAEP، ثم مجموعة سياسات الواجهة، ثم ملف تعريف الواجهة، ثم ملف تعريف المحوّل. وAAEP هو الجسر بين النطاقات والواجهات."
+          },
+          {
+            "question": "أيّ العبارات الآتية عن نطاقات الجسر صحيحة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "يرتبط نطاق الجسر بـ VRF واحد فقط",
+              "تُضبط الشبكات الفرعية للبوابة على نطاق الجسر",
+              "لا يستخدم نطاق الجسر إلا معرّف VLAN واحدًا في النسيج كله",
+              "يمكن تمرير الحركة أحادية الوجهة المجهولة في الطبقة 2 عبر Hardware proxy في العمود الفقري"
+            ],
+            "answer": [0, 1, 3],
+            "explanation": "ينتمي نطاق الجسر إلى VRF واحد، ويملك الشبكات الفرعية للبوابة المنتشرة، ويستطيع إحالة الحركة المجهولة إلى قاعدة بيانات العمود الفقري. أمّا معرّفات VLAN فمجرد تغليف محلي لمجموعات EPG."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- ACI نسيج من نوع **العمود الفقري والورقة** يديره **عنقود APIC** يقع خارج مسار البيانات.\n- تُكتشف المحوّلات الجديدة عبر **LLDP** و**DHCP** على Infra VLAN، ثم **تُسجَّل** بمعرّف عقدة وتحصل على عنوان **TEP**، ثم تعمل بروتوكولات **IS-IS** و**COOP** و**MP-BGP** تلقائيًا.\n- نموذج المستأجر هو **المستأجر > VRF > نطاق الجسر > EPG**، وتجمع ملفات تعريف التطبيقات مجموعات EPG، أمّا VLAN فلا تفعل سوى تصنيف الحركة ضمن المجموعات.\n- **العقود** (المواضيع والمرشّحات) لازمة للحركة بين مجموعات EPG في VRF بنمط الإنفاذ.\n- **سياسات الوصول** سلسلة تبدأ بمجمّع VLAN، ثم النطاق، ثم AAEP، ثم مجموعة سياسات الواجهة، ثم ملف تعريف الواجهة، ثم ملف تعريف المحوّل.\n\nتابع لترى كيف تُشغَّل الأنسجة على نطاق واسع في درس [Nexus Dashboard وإدارة النسيج الشبكي](/learn/enterprise-datacenter-networking/nexus-dashboard-and-fabric-management)."
+      }
+    ]
+  }
+}

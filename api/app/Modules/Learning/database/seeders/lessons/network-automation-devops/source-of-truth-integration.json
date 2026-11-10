@@ -1,0 +1,596 @@
+{
+  "slug": "source-of-truth-integration",
+  "title": "Source of Truth Integration",
+  "summary": "Use a source of truth such as NetBox as the authoritative intent for automation: query its API, drive dynamic inventories and event-driven pipelines, and detect drift.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Explain intended versus actual state and the role of a source of truth",
+    "Query and allocate data through the NetBox REST API with pagination and token authentication",
+    "Use NetBox as a dynamic Ansible inventory and as input for Jinja2 rendering",
+    "Design an event-driven workflow from a SoT change to a tested deployment",
+    "Detect and resolve drift and protect the data quality of the SoT"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Your automation repository renders 400 switch configurations. Where do the VLAN IDs, IP addresses and device roles come from? If the answer is \"a spreadsheet, three YAML files and whatever is already on the device,\" every run is a guess.\n\nA **source of truth (SoT)** is the authoritative record of what the network *should* look like. Automation reads intent from it, renders configuration, deploys it, and then compares the live network against it. The AUTOCOR blueprint expects you to integrate a SoT into an automation workflow: query it through its API, use it as a dynamic inventory, react to its changes and detect drift."
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## What a source of truth holds\n\nA SoT stores **intended state**: the devices you should have, how they connect, which addresses they use and which services they run. The network itself holds **actual state**. Automation exists to make the two match.\n\n| Data domain | Typical authoritative system | Example data |\n|:--|:--|:--|\n| Inventory and DCIM | NetBox, Nautobot | Sites, racks, devices, roles, platforms, cables |\n| IPAM | NetBox, Infoblox | Prefixes, IP addresses, VLANs, VRFs |\n| Configuration variables | NetBox config contexts, Git (YAML) | NTP servers, syslog hosts, banners |\n| Secrets | HashiCorp Vault, CyberArk | Credentials, API tokens (never in the SoT) |\n\n### Rules that keep a SoT trustworthy\n\n- **One owner per data item.** \"Single source of truth\" rarely means one product. It means every field has exactly one authoritative system. When several systems are combined, an aggregation layer (such as the Nautobot SSoT app or your own sync jobs) defines who wins.\n- **The network is not the source of truth.** Discovery can seed the SoT once. After that, intent flows from the SoT to the devices, never the other way around.\n- **Changes go through the SoT.** An engineer who edits a device by CLI creates drift that the next run will either overwrite or report."
+    },
+    {
+      "id": "netbox",
+      "type": "text",
+      "markdown": "## NetBox as the reference SoT\n\nNetBox is the open-source SoT most often used with Cisco automation. Its data model covers DCIM and IPAM, and you can extend it with **custom fields**, **tags** and **config contexts** (JSON data merged by site, role or platform and attached to each device).\n\nEverything is available through a **REST API** under `/api/` and a read-only **GraphQL** endpoint under `/graphql/`:\n\n- **Authentication:** an API token in the `Authorization: Token <token>` header. Give read-only automation a read-only token.\n- **Filtering:** query parameters such as `?site=dc1&role=leaf&status=active`.\n- **Pagination:** `limit` and `offset`, with a `next` URL until the last page. See [Advanced REST APIs: Pagination, Auth and Rate Limits](/learn/network-automation-devops/advanced-rest-apis-pagination-auth-and-rate-limits).\n- **Allocation:** `POST` to `/api/ipam/prefixes/<id>/available-ips/` reserves the next free address atomically, so two pipelines never pick the same IP."
+    },
+    {
+      "id": "api-term",
+      "type": "terminal",
+      "title": "Querying and allocating through the NetBox REST API",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -H \"Authorization: Token $NETBOX_TOKEN\" -H \"Accept: application/json\" \"https://netbox.example.com/api/dcim/devices/?site=dc1&role=leaf&status=active&limit=2\"",
+          "output": "{\n  \"count\": 12,\n  \"next\": \"https://netbox.example.com/api/dcim/devices/?limit=2&offset=2&role=leaf&site=dc1&status=active\",\n  \"previous\": null,\n  \"results\": [\n    {\n      \"id\": 41,\n      \"name\": \"dc1-leaf-01\",\n      \"role\": { \"id\": 3, \"name\": \"Leaf\", \"slug\": \"leaf\" },\n      \"platform\": { \"id\": 2, \"name\": \"Cisco IOS XE\", \"slug\": \"ios-xe\" },\n      \"site\": { \"id\": 1, \"name\": \"DC1\", \"slug\": \"dc1\" },\n      \"status\": { \"value\": \"active\", \"label\": \"Active\" },\n      \"primary_ip4\": { \"id\": 310, \"address\": \"192.0.2.11/24\" },\n      \"custom_fields\": { \"change_window\": \"sun-0200\" },\n      \"config_context\": { \"ntp_servers\": [\"192.0.2.123\"], \"syslog_host\": \"198.51.100.20\" }\n    },\n    \"... one more device ...\"\n  ]\n}"
+        },
+        {
+          "comment": "count is the total number of matches; follow next until it is null. config_context is the merged data for this device."
+        },
+        {
+          "cmd": "curl -s -X POST -H \"Authorization: Token $NETBOX_TOKEN\" -H \"Content-Type: application/json\" -d '{\"description\": \"Loopback0 dc1-leaf-13\", \"status\": \"reserved\"}' https://netbox.example.com/api/ipam/prefixes/27/available-ips/",
+          "output": "{\n  \"id\": 355,\n  \"address\": \"198.51.100.13/32\",\n  \"status\": { \"value\": \"reserved\", \"label\": \"Reserved\" },\n  \"description\": \"Loopback0 dc1-leaf-13\"\n}"
+        },
+        {
+          "comment": "NetBox picks the next free address in prefix 27 and records it immediately. The automation then uses it instead of guessing."
+        }
+      ],
+      "caption": "Lab output, trimmed. The token is read from an environment variable and never typed on the command line."
+    },
+    {
+      "id": "patterns",
+      "type": "text",
+      "markdown": "## Integration patterns\n\n| Pattern | How it works | Typical tool |\n|:--|:--|:--|\n| **Inventory** | The SoT tells the tool which devices exist and how to group them | Ansible `netbox.netbox.nb_inventory`, Nornir NetBox plugin |\n| **Pull and render** | A script reads intent and renders configuration from templates | `pynetbox` + Jinja2 |\n| **Event-driven** | The SoT calls a webhook when an object changes, and the webhook starts a pipeline | NetBox event rules, GitLab pipeline triggers |\n| **Write-back** | Automation records what it allocated or discovered | `available-ips`, journal entries |\n| **Drift check** | Actual state is compared with the SoT after (or between) deployments | pyATS, Batfish, custom diff |\n\nIn the **inventory** pattern, Ansible never keeps a static hosts file. Groups such as sites, roles and platforms come straight from NetBox, and config contexts become host variables. See [Ansible for Network Configuration](/learn/network-automation-devops/ansible-for-network-configuration).\n\nIn the **event-driven** pattern, a NetBox event rule sends a JSON payload with the event type, the model, the user, a request ID and pre-change and post-change snapshots. Do not deploy straight from the webhook receiver. Let it start a CI pipeline that renders, tests and deploys with an approval gate. See [GitLab CI/CD Pipelines: Build, Validate and Deploy](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)."
+    },
+    {
+      "id": "inv",
+      "type": "code",
+      "language": "yaml",
+      "filename": "netbox_inv.yml",
+      "caption": "A dynamic Ansible inventory. Check it with ansible-inventory -i netbox_inv.yml --graph.",
+      "code": "# netbox_inv.yml - NETBOX_API and NETBOX_TOKEN come from the environment\nplugin: netbox.netbox.nb_inventory\nvalidate_certs: true\nconfig_context: true\ngroup_by:\n  - sites\n  - device_roles\n  - platforms\nquery_filters:\n  - status: active\n  - has_primary_ip: true\ncompose:\n  ansible_network_os: \"'cisco.nxos.nxos' if 'nx-os' in platforms else 'cisco.ios.ios'\"\n",
+      "highlight": [
+        2,
+        13
+      ]
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "An intent change flowing from the SoT to the network",
+      "caption": "The SoT starts the change, the pipeline proves it, and a drift check closes the loop.",
+      "data": {
+        "token": "Change",
+        "nodes": [
+          {
+            "id": "eng",
+            "label": "Engineer",
+            "sub": "changes intent",
+            "icon": "user"
+          },
+          {
+            "id": "sot",
+            "label": "NetBox",
+            "sub": "source of truth",
+            "icon": "database"
+          },
+          {
+            "id": "ci",
+            "label": "CI pipeline",
+            "sub": "GitLab",
+            "icon": "server"
+          },
+          {
+            "id": "test",
+            "label": "Test lab",
+            "sub": "CML + pyATS",
+            "icon": "cpu"
+          },
+          {
+            "id": "net",
+            "label": "Network",
+            "sub": "IOS XE leaves",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "at": "eng",
+            "caption": "An engineer assigns a new VLAN to dc1-leaf-07 in NetBox. No one logs in to the switch."
+          },
+          {
+            "at": "sot",
+            "caption": "NetBox validates the data and records the change with the user and a request ID."
+          },
+          {
+            "at": "ci",
+            "token": "Webhook",
+            "caption": "An event rule calls the pipeline trigger with the pre-change and post-change snapshots."
+          },
+          {
+            "at": "ci",
+            "token": "Configs",
+            "caption": "The pipeline pulls intent with pynetbox and renders configurations from Jinja2 templates."
+          },
+          {
+            "at": "test",
+            "token": "Configs",
+            "caption": "The configurations are applied to a CML topology and checked with pyATS.",
+            "tone": "success"
+          },
+          {
+            "at": "net",
+            "token": "Configs",
+            "caption": "After approval, the change is deployed to production in the change window.",
+            "tone": "secure"
+          },
+          {
+            "at": "sot",
+            "token": "Drift report",
+            "caption": "A scheduled job compares actual state with NetBox. One leaf differs: someone added a VLAN by CLI.",
+            "tone": "warning"
+          },
+          {
+            "at": "eng",
+            "token": "Drift report",
+            "caption": "The engineer decides: remediate the device, or record the change in NetBox if it was approved."
+          }
+        ]
+      }
+    },
+    {
+      "id": "render",
+      "type": "code",
+      "language": "python",
+      "filename": "render_from_netbox.py",
+      "caption": "Pull-and-render with pynetbox. StrictUndefined makes the render fail if the SoT is missing a value, instead of producing a half-empty configuration.",
+      "code": "import os\nimport pynetbox\nfrom jinja2 import Environment, FileSystemLoader, StrictUndefined\n\nnb = pynetbox.api(\"https://netbox.example.com\", token=os.environ[\"NETBOX_TOKEN\"])\nenv = Environment(loader=FileSystemLoader(\"templates\"), undefined=StrictUndefined,\n                  trim_blocks=True, lstrip_blocks=True)\ntemplate = env.get_template(\"leaf.j2\")\n\nfor device in nb.dcim.devices.filter(site=\"dc1\", role=\"leaf\", status=\"active\"):\n    # One API call per object type; pynetbox follows the \"next\" links for you.\n    ips = {ip.assigned_object_id: ip.address\n           for ip in nb.ipam.ip_addresses.filter(device_id=device.id)}\n    interfaces = [\n        {\"name\": i.name, \"description\": i.description,\n         \"enabled\": i.enabled, \"address\": ips.get(i.id)}\n        for i in nb.dcim.interfaces.filter(device_id=device.id)\n    ]\n    config = template.render(\n        hostname=device.name,\n        context=device.config_context,   # merged NTP, syslog, AAA data\n        interfaces=interfaces,\n    )\n    with open(f\"build/{device.name}.cfg\", \"w\", encoding=\"utf-8\") as f:\n        f.write(config)\n    print(f\"rendered {device.name}: {len(interfaces)} interfaces\")\n",
+      "highlight": [
+        5,
+        21
+      ]
+    },
+    {
+      "id": "drift",
+      "type": "text",
+      "markdown": "## Closing the loop: drift and data quality\n\nDeployment is not the end of the workflow. **Drift** is any difference between the SoT and the network. Detect it on a schedule and after every deployment:\n\n1. **Configuration drift:** compare the rendered configuration with the running configuration.\n2. **Operational drift:** compare learned state (neighbors, interface status, routes) with the intent. See [Change Validation with pyATS](/learn/network-automation-devops/change-validation-with-pyats).\n3. **Decide:** remediate the device, or update the SoT when the change was legitimate and approved. Never let the drift report become noise that nobody reads.\n\nAutomation is only as good as its data, so protect data quality:\n\n- Use required custom fields, choice sets and custom validation rules to reject bad input.\n- Use NetBox **branching** or change requests for large edits, so they can be reviewed before they take effect.\n- Keep the **changelog**. It records who changed what and when, and it is your audit trail.\n- Scope API tokens. A rendering job needs read access only; an IPAM allocator needs write access to IPAM only. Store tokens in a secrets manager. See [Secure Coding: Input Validation and Secret Management](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where engineers go wrong",
+      "markdown": "- **Two sources for the same field.** If VLANs live in NetBox *and* in `group_vars`, they will disagree. Pick one owner.\n- **Syncing from the network back into the SoT on every run.** That makes the SoT a copy of reality, including its mistakes.\n- **Ignoring pagination.** NetBox returns 50 objects per page by default. A script that reads only `results` silently skips devices.\n- **Deploying directly from a webhook.** Webhooks can arrive twice, out of order or during a bulk import. Trigger a pipeline and make the deployment idempotent.\n- **Putting secrets in custom fields or config contexts.** Anyone with read access, and every log line, can see them."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab NetBox (the `netbox-docker` project or a public demo instance) and a lab IOS XE device in Cisco Modeling Labs.\n\n1. Create a site `dc1`, a role `leaf`, a platform `ios-xe` and two devices with interfaces and IP addresses.\n2. Add a config context for the site with `ntp_servers` and `syslog_host`, and confirm it appears in the device's `config_context` through the API.\n3. Create a read-only API token. Query the devices with `curl`, then with `?limit=1`, and follow the `next` links.\n4. Run `render_from_netbox.py` with a template that uses the context values. Remove a required value in NetBox and watch `StrictUndefined` stop the render.\n5. Point `ansible-inventory --graph` at `netbox_inv.yml` and check the groups.\n6. Change a description on the lab device by CLI, then write a short check that reports the difference from NetBox."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Source of truth (SoT)",
+          "definition": "The authoritative record of the intended state of the network, which automation reads from."
+        },
+        {
+          "term": "Intended state",
+          "definition": "What the network should look like, as recorded in the SoT."
+        },
+        {
+          "term": "Actual state",
+          "definition": "What the network really looks like, as read from the devices."
+        },
+        {
+          "term": "Drift",
+          "definition": "Any difference between the intended state in the SoT and the actual state of the network."
+        },
+        {
+          "term": "Config context",
+          "definition": "NetBox JSON data merged by site, role, platform or tag and attached to each device as variables."
+        },
+        {
+          "term": "Dynamic inventory",
+          "definition": "An inventory generated at run time from an external system, such as the NetBox nb_inventory plugin for Ansible."
+        },
+        {
+          "term": "Event rule (webhook)",
+          "definition": "A NetBox rule that sends an HTTP request when objects are created, updated or deleted."
+        },
+        {
+          "term": "pynetbox",
+          "definition": "The Python client library for the NetBox REST API."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which statement best describes a source of truth in network automation?",
+          "options": [
+            "A backup of every device's running configuration",
+            "The authoritative record of the network's intended state",
+            "A monitoring system that stores live interface counters",
+            "A Git repository that holds automation scripts"
+          ],
+          "answer": 1,
+          "explanation": "A SoT records what the network should look like. Backups and monitoring hold actual state, and a script repository holds code, not intent."
+        },
+        {
+          "question": "A script reads /api/dcim/devices/?site=dc1 and processes only the results array. The site has 120 devices, but the script configures 50. What is the most likely cause?",
+          "options": [
+            "The token is read-only",
+            "The script ignores pagination and never follows the next URL",
+            "NetBox filters out devices without a platform",
+            "The GraphQL endpoint must be used for more than 50 objects"
+          ],
+          "answer": 1,
+          "explanation": "NetBox paginates results (50 per page by default). The client must follow next until it is null, or use a library such as pynetbox that does it for you."
+        },
+        {
+          "question": "Which practices protect the data quality of a SoT? (Choose all that apply.)",
+          "options": [
+            "Required custom fields and validation rules",
+            "Reviewing large edits in a branch or change request before they take effect",
+            "Importing every device's running configuration into the SoT on each run",
+            "Keeping the changelog as an audit trail"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Validation, review and the changelog keep intent correct and traceable. Re-importing the network on each run turns the SoT into a copy of reality, including its errors."
+        },
+        {
+          "question": "A NetBox event rule fires when a device changes. What should the webhook receiver do?",
+          "options": [
+            "Push the new configuration to the device immediately",
+            "Start a CI pipeline that renders, tests and deploys with an approval gate",
+            "Write the change back into NetBox",
+            "Ignore the payload and poll NetBox every minute"
+          ],
+          "answer": 1,
+          "explanation": "Webhooks can repeat or arrive out of order. A pipeline adds testing, approval and idempotent deployment instead of a blind push."
+        },
+        {
+          "question": "A drift check shows a VLAN on a switch that is not in NetBox. Which responses are valid? (Choose all that apply.)",
+          "options": [
+            "Remove the VLAN from the device to restore the intended state",
+            "Record the VLAN in NetBox if the change was approved",
+            "Disable the drift check because the network is correct",
+            "Make the network the source of truth from now on"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "Drift is resolved by remediating the device or by updating the SoT through the normal process. Disabling the check or reversing the direction of truth removes the control."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A **source of truth** stores intended state. The network holds actual state, and automation makes them match.\n- Each data item needs **one owner**. Secrets belong in a secrets manager, not in the SoT.\n- **NetBox** exposes devices, IPAM and config contexts through a token-authenticated, paginated REST API and GraphQL.\n- Integration patterns: **dynamic inventory**, **pull and render**, **event-driven** pipelines, **write-back** of allocations, and **drift checks**.\n- Protect data quality with validation, reviews, the changelog and scoped tokens.\n\nNext, learn how to shape the data you render in [YAML / JSON Configurations from YANG Models](/learn/network-automation-devops/yaml-json-configurations-from-yang-models)."
+    }
+  ],
+  "ar": {
+    "title": "التكامل مع مصدر الحقيقة (Source of Truth)",
+    "summary": "استخدم مصدر حقيقة مثل NetBox مرجعًا للنية في الأتمتة: استعلم عن واجهته البرمجية، وشغّل به المخزون الديناميكي وخطوط التنفيذ المدفوعة بالأحداث، واكشف الانحراف.",
+    "objectives": [
+      "شرح الفرق بين الحالة المقصودة والحالة الفعلية ودور مصدر الحقيقة",
+      "الاستعلام عن البيانات وتخصيصها عبر واجهة REST في NetBox مع ترقيم الصفحات والمصادقة بالرموز",
+      "استخدام NetBox مخزونًا ديناميكيًا لـ Ansible ومدخلًا لتوليد القوالب بـ Jinja2",
+      "تصميم سير عمل مدفوع بالأحداث من تغيير في مصدر الحقيقة إلى نشر مُختبَر",
+      "كشف الانحراف ومعالجته وحماية جودة البيانات في مصدر الحقيقة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يولّد مستودع الأتمتة لديك إعدادات 400 مبدّل. فمن أين تأتي أرقام شبكات VLAN وعناوين IP وأدوار الأجهزة؟ إن كان الجواب «جدول بيانات وثلاثة ملفات YAML وما هو موجود أصلًا على الجهاز»، فكل تشغيل مجرد تخمين.\n\n**مصدر الحقيقة (Source of Truth - SoT)** هو السجل المرجعي لما *ينبغي* أن تكون عليه الشبكة؛ تقرأ منه الأتمتة النية، وتولّد الإعدادات، وتنشرها، ثم تقارن الشبكة الحية به. ويتوقع منك مخطط اختبار AUTOCOR أن تدمج مصدر الحقيقة في سير عمل الأتمتة: أن تستعلم عنه عبر واجهته البرمجية، وتستخدمه مخزونًا ديناميكيًا، وتستجيب لتغييراته، وتكشف الانحراف."
+      },
+      {
+        "id": "what",
+        "type": "text",
+        "markdown": "## ماذا يحفظ مصدر الحقيقة؟\n\nيخزّن مصدر الحقيقة **الحالة المقصودة (Intended state)**: الأجهزة التي يجب أن تملكها، وكيف تتصل، وأيّ العناوين تستخدم، وأيّ الخدمات تشغّل. أمّا الشبكة نفسها فتحمل **الحالة الفعلية (Actual state)**، والأتمتة موجودة لتجعل الحالتين متطابقتين.\n\n| مجال البيانات | النظام المرجعي المعتاد | أمثلة على البيانات |\n|:--|:--|:--|\n| المخزون وإدارة البنية المادية (DCIM) | NetBox وNautobot | المواقع والخزائن والأجهزة والأدوار والمنصات والكابلات |\n| إدارة عناوين IP (IPAM) | NetBox وInfoblox | البادئات وعناوين IP وشبكات VLAN وVRF |\n| متغيرات الإعداد | سياقات الإعداد في NetBox وGit (YAML) | خوادم NTP ومضيفات syslog واللافتات |\n| الأسرار | HashiCorp Vault وCyberArk | بيانات الاعتماد ورموز API (لا توضع أبدًا في مصدر الحقيقة) |\n\n### قواعد تحفظ الثقة بمصدر الحقيقة\n\n- **مالك واحد لكل عنصر بيانات.** نادرًا ما يعني «مصدر الحقيقة الوحيد» منتجًا واحدًا، بل يعني أن لكل حقل نظامًا مرجعيًا واحدًا فقط. وعند الجمع بين عدة أنظمة تحدّد طبقة تجميع (مثل تطبيق Nautobot SSoT أو مهام مزامنة تكتبها بنفسك) أيّها يُعتمد.\n- **الشبكة ليست مصدر الحقيقة.** قد يملأ الاستكشاف مصدرَ الحقيقة مرة واحدة في البداية، ثم تتدفق النية بعد ذلك من مصدر الحقيقة إلى الأجهزة، لا العكس.\n- **تمرّ التغييرات عبر مصدر الحقيقة.** المهندس الذي يعدّل جهازًا عبر سطر الأوامر يُحدث انحرافًا سيكتب التشغيلُ التالي فوقه أو يُبلغ عنه."
+      },
+      {
+        "id": "netbox",
+        "type": "text",
+        "markdown": "## NetBox مصدرًا مرجعيًا للحقيقة\n\nNetBox هو مصدر الحقيقة مفتوح المصدر الأكثر استخدامًا مع أتمتة Cisco. يغطي نموذج بياناته DCIM وIPAM، ويمكنك توسيعه عبر **الحقول المخصصة (Custom fields)** و**الوسوم (Tags)** و**سياقات الإعداد (Config contexts)**، وهي بيانات JSON تُدمج حسب الموقع أو الدور أو المنصة وتُلحق بكل جهاز.\n\nكل شيء متاح عبر **واجهة REST** تحت المسار `/api/`، وعبر نقطة **GraphQL** للقراءة فقط تحت `/graphql/`:\n\n- **المصادقة:** رمز API في الترويسة `Authorization: Token <token>`. امنح الأتمتة التي تقرأ فقط رمزًا للقراءة فقط.\n- **الترشيح:** معاملات استعلام مثل `?site=dc1&role=leaf&status=active`.\n- **ترقيم الصفحات (Pagination):** المعاملان `limit` و`offset`، مع عنوان `next` حتى الصفحة الأخيرة. راجع درس [واجهات REST المتقدمة: ترقيم الصفحات والمصادقة وحدود المعدل](/learn/network-automation-devops/advanced-rest-apis-pagination-auth-and-rate-limits).\n- **التخصيص:** يحجز طلب `POST` إلى `/api/ipam/prefixes/<id>/available-ips/` العنوانَ الحر التالي بعملية ذرّية، فلا يختار خطّا أتمتة العنوان نفسه أبدًا."
+      },
+      {
+        "id": "api-term",
+        "type": "terminal",
+        "title": "الاستعلام والتخصيص عبر واجهة REST في NetBox",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "curl -s -H \"Authorization: Token $NETBOX_TOKEN\" -H \"Accept: application/json\" \"https://netbox.example.com/api/dcim/devices/?site=dc1&role=leaf&status=active&limit=2\"",
+            "output": "{\n  \"count\": 12,\n  \"next\": \"https://netbox.example.com/api/dcim/devices/?limit=2&offset=2&role=leaf&site=dc1&status=active\",\n  \"previous\": null,\n  \"results\": [\n    {\n      \"id\": 41,\n      \"name\": \"dc1-leaf-01\",\n      \"role\": { \"id\": 3, \"name\": \"Leaf\", \"slug\": \"leaf\" },\n      \"platform\": { \"id\": 2, \"name\": \"Cisco IOS XE\", \"slug\": \"ios-xe\" },\n      \"site\": { \"id\": 1, \"name\": \"DC1\", \"slug\": \"dc1\" },\n      \"status\": { \"value\": \"active\", \"label\": \"Active\" },\n      \"primary_ip4\": { \"id\": 310, \"address\": \"192.0.2.11/24\" },\n      \"custom_fields\": { \"change_window\": \"sun-0200\" },\n      \"config_context\": { \"ntp_servers\": [\"192.0.2.123\"], \"syslog_host\": \"198.51.100.20\" }\n    },\n    \"... one more device ...\"\n  ]\n}"
+          },
+          {
+            "comment": "يمثّل count العدد الكلي للنتائج المطابقة؛ تابع next حتى تصبح قيمته null. أمّا config_context فهو البيانات المدمجة لهذا الجهاز."
+          },
+          {
+            "cmd": "curl -s -X POST -H \"Authorization: Token $NETBOX_TOKEN\" -H \"Content-Type: application/json\" -d '{\"description\": \"Loopback0 dc1-leaf-13\", \"status\": \"reserved\"}' https://netbox.example.com/api/ipam/prefixes/27/available-ips/",
+            "output": "{\n  \"id\": 355,\n  \"address\": \"198.51.100.13/32\",\n  \"status\": { \"value\": \"reserved\", \"label\": \"Reserved\" },\n  \"description\": \"Loopback0 dc1-leaf-13\"\n}"
+          },
+          {
+            "comment": "يختار NetBox العنوان الحر التالي في البادئة 27 ويسجّله فورًا، ثم تستخدمه الأتمتة بدلًا من التخمين."
+          }
+        ],
+        "caption": "مخرجات مختبرية مختصرة. يُقرأ الرمز من متغير بيئة ولا يُكتب أبدًا في سطر الأوامر."
+      },
+      {
+        "id": "patterns",
+        "type": "text",
+        "markdown": "## أنماط التكامل\n\n| النمط | آلية العمل | الأداة المعتادة |\n|:--|:--|:--|\n| **المخزون (Inventory)** | يخبر مصدرُ الحقيقة الأداةَ بالأجهزة الموجودة وكيفية تجميعها | `netbox.netbox.nb_inventory` في Ansible، وإضافة NetBox في Nornir |\n| **السحب والتوليد (Pull and render)** | يقرأ سكربت النية ويولّد الإعدادات من القوالب | `pynetbox` مع Jinja2 |\n| **المدفوع بالأحداث (Event-driven)** | يستدعي مصدرُ الحقيقة خطاف ويب (Webhook) عند تغيّر كائن، فيبدأ الخطاف خط تنفيذ | قواعد الأحداث في NetBox ومشغّلات خطوط GitLab |\n| **الكتابة العكسية (Write-back)** | تسجّل الأتمتة ما خصّصته أو اكتشفته | `available-ips` وقيود السجل اليومي |\n| **فحص الانحراف (Drift check)** | تُقارَن الحالة الفعلية بمصدر الحقيقة بعد عمليات النشر أو فيما بينها | pyATS وBatfish ومقارنة مخصصة |\n\nفي نمط **المخزون** لا يحتفظ Ansible بملف مضيفات ثابت أبدًا؛ إذ تأتي المجموعات، كالمواقع والأدوار والمنصات، من NetBox مباشرة، وتصبح سياقات الإعداد متغيرات للمضيفات. راجع درس [Ansible لإعداد الشبكات](/learn/network-automation-devops/ansible-for-network-configuration).\n\nوفي النمط **المدفوع بالأحداث** ترسل قاعدة أحداث في NetBox حمولة JSON تتضمن نوع الحدث والنموذج والمستخدم ومعرّف الطلب ولقطتين لما قبل التغيير وما بعده. لا تنشر مباشرة من مستقبِل الخطاف، بل دعه يبدأ خط CI يولّد الإعدادات ويختبرها وينشرها عبر بوابة موافقة. راجع درس [خطوط GitLab CI/CD: البناء والتحقق والنشر](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)."
+      },
+      {
+        "id": "inv",
+        "type": "code",
+        "language": "yaml",
+        "filename": "netbox_inv.yml",
+        "caption": "مخزون Ansible ديناميكي. تحقّق منه بالأمر ansible-inventory -i netbox_inv.yml --graph.",
+        "code": "# netbox_inv.yml - NETBOX_API and NETBOX_TOKEN come from the environment\nplugin: netbox.netbox.nb_inventory\nvalidate_certs: true\nconfig_context: true\ngroup_by:\n  - sites\n  - device_roles\n  - platforms\nquery_filters:\n  - status: active\n  - has_primary_ip: true\ncompose:\n  ansible_network_os: \"'cisco.nxos.nxos' if 'nx-os' in platforms else 'cisco.ios.ios'\"\n",
+        "highlight": [
+          2,
+          13
+        ]
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "تغيير في النية يتدفق من مصدر الحقيقة إلى الشبكة",
+        "caption": "يبدأ مصدرُ الحقيقة التغيير، ويثبت خط التنفيذ صحته، ويُغلق فحصُ الانحراف الحلقة.",
+        "data": {
+          "token": "تغيير",
+          "nodes": [
+            {
+              "id": "eng",
+              "label": "المهندس",
+              "sub": "يغيّر النية",
+              "icon": "user"
+            },
+            {
+              "id": "sot",
+              "label": "NetBox",
+              "sub": "مصدر الحقيقة",
+              "icon": "database"
+            },
+            {
+              "id": "ci",
+              "label": "خط CI",
+              "sub": "GitLab",
+              "icon": "server"
+            },
+            {
+              "id": "test",
+              "label": "مختبر الاختبار",
+              "sub": "CML + pyATS",
+              "icon": "cpu"
+            },
+            {
+              "id": "net",
+              "label": "الشبكة",
+              "sub": "مبدّلات IOS XE",
+              "icon": "switch"
+            }
+          ],
+          "steps": [
+            {
+              "at": "eng",
+              "caption": "يخصّص مهندس شبكة VLAN جديدة للمبدّل dc1-leaf-07 في NetBox، دون أن يدخل أحد إلى المبدّل."
+            },
+            {
+              "at": "sot",
+              "caption": "يتحقق NetBox من البيانات ويسجّل التغيير مع اسم المستخدم ومعرّف الطلب."
+            },
+            {
+              "at": "ci",
+              "token": "Webhook",
+              "caption": "تستدعي قاعدة أحداث مشغّلَ خط التنفيذ مع لقطتي ما قبل التغيير وما بعده."
+            },
+            {
+              "at": "ci",
+              "token": "إعدادات",
+              "caption": "يسحب خط التنفيذ النية عبر pynetbox ويولّد الإعدادات من قوالب Jinja2."
+            },
+            {
+              "at": "test",
+              "token": "إعدادات",
+              "caption": "تُطبَّق الإعدادات على مخطط في CML وتُفحص باستخدام pyATS.",
+              "tone": "success"
+            },
+            {
+              "at": "net",
+              "token": "إعدادات",
+              "caption": "بعد الموافقة يُنشر التغيير في بيئة الإنتاج ضمن نافذة التغيير.",
+              "tone": "secure"
+            },
+            {
+              "at": "sot",
+              "token": "تقرير الانحراف",
+              "caption": "تقارن مهمة مجدولة الحالة الفعلية بما في NetBox، فيظهر اختلاف في مبدّل واحد: أضاف أحدهم شبكة VLAN عبر سطر الأوامر.",
+              "tone": "warning"
+            },
+            {
+              "at": "eng",
+              "token": "تقرير الانحراف",
+              "caption": "يقرّر المهندس: إمّا إصلاح الجهاز، وإمّا تسجيل التغيير في NetBox إن كان معتمدًا."
+            }
+          ]
+        }
+      },
+      {
+        "id": "render",
+        "type": "code",
+        "language": "python",
+        "filename": "render_from_netbox.py",
+        "caption": "السحب والتوليد باستخدام pynetbox. يجعل StrictUndefined التوليدَ يفشل إذا نقصت قيمة في مصدر الحقيقة، بدلًا من إنتاج إعدادات نصف فارغة.",
+        "code": "import os\nimport pynetbox\nfrom jinja2 import Environment, FileSystemLoader, StrictUndefined\n\nnb = pynetbox.api(\"https://netbox.example.com\", token=os.environ[\"NETBOX_TOKEN\"])\nenv = Environment(loader=FileSystemLoader(\"templates\"), undefined=StrictUndefined,\n                  trim_blocks=True, lstrip_blocks=True)\ntemplate = env.get_template(\"leaf.j2\")\n\nfor device in nb.dcim.devices.filter(site=\"dc1\", role=\"leaf\", status=\"active\"):\n    # One API call per object type; pynetbox follows the \"next\" links for you.\n    ips = {ip.assigned_object_id: ip.address\n           for ip in nb.ipam.ip_addresses.filter(device_id=device.id)}\n    interfaces = [\n        {\"name\": i.name, \"description\": i.description,\n         \"enabled\": i.enabled, \"address\": ips.get(i.id)}\n        for i in nb.dcim.interfaces.filter(device_id=device.id)\n    ]\n    config = template.render(\n        hostname=device.name,\n        context=device.config_context,   # merged NTP, syslog, AAA data\n        interfaces=interfaces,\n    )\n    with open(f\"build/{device.name}.cfg\", \"w\", encoding=\"utf-8\") as f:\n        f.write(config)\n    print(f\"rendered {device.name}: {len(interfaces)} interfaces\")\n",
+        "highlight": [
+          5,
+          21
+        ]
+      },
+      {
+        "id": "drift",
+        "type": "text",
+        "markdown": "## إغلاق الحلقة: الانحراف وجودة البيانات\n\nلا ينتهي سير العمل عند النشر. **الانحراف (Drift)** هو أي اختلاف بين مصدر الحقيقة والشبكة، فاكشفه وفق جدول زمني وبعد كل عملية نشر:\n\n1. **انحراف الإعدادات:** قارن الإعدادات المولَّدة بالإعدادات الجارية.\n2. **الانحراف التشغيلي:** قارن الحالة المكتسبة (الجيران وحالة المنافذ والمسارات) بالنية. راجع درس [التحقق من التغييرات باستخدام pyATS](/learn/network-automation-devops/change-validation-with-pyats).\n3. **القرار:** أصلح الجهاز، أو حدّث مصدر الحقيقة إن كان التغيير مشروعًا ومعتمدًا. ولا تدع تقرير الانحراف يتحول إلى ضجيج لا يقرؤه أحد.\n\nلا تكون الأتمتة أفضل من بياناتها، فاحمِ جودة البيانات:\n\n- استخدم الحقول المخصصة الإلزامية ومجموعات الخيارات وقواعد التحقق المخصصة لرفض المدخلات الخاطئة.\n- استخدم **التفريع (Branching)** في NetBox أو طلبات التغيير للتعديلات الكبيرة، كي تُراجَع قبل أن تسري.\n- احتفظ **بسجل التغييرات (Changelog)**؛ فهو يسجّل مَن غيّر ماذا ومتى، وهو مسار التدقيق لديك.\n- حدّد نطاق رموز API: مهمة التوليد تحتاج إلى القراءة فقط، ومخصِّص العناوين يحتاج إلى الكتابة في IPAM وحدها. واحفظ الرموز في مدير أسرار. راجع درس [البرمجة الآمنة: التحقق من المدخلات وإدارة الأسرار](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة لدى المهندسين",
+        "markdown": "- **مصدران للحقل نفسه.** إن وُجدت شبكات VLAN في NetBox *وفي* `group_vars` معًا فسيختلفان حتمًا، فاختر مالكًا واحدًا.\n- **المزامنة من الشبكة إلى مصدر الحقيقة في كل تشغيل.** يجعل ذلك مصدرَ الحقيقة نسخة من الواقع بأخطائه.\n- **تجاهل ترقيم الصفحات.** يعيد NetBox افتراضيًا 50 كائنًا في الصفحة، والسكربت الذي لا يقرأ إلا `results` يتخطى أجهزة دون أن ينبّهك.\n- **النشر مباشرة من خطاف الويب.** قد تصل الخطافات مرتين أو بترتيب مختلف أو أثناء استيراد جماعي، فشغّل خط تنفيذ واجعل النشر متساوي الأثر (Idempotent).\n- **وضع الأسرار في الحقول المخصصة أو سياقات الإعداد.** يراها حينئذ كل من يملك صلاحية القراءة، وكل سطر في السجلات."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم نسخة NetBox مختبرية (مشروع `netbox-docker` أو نسخة تجريبية عامة) وجهاز IOS XE مختبريًا في Cisco Modeling Labs.\n\n1. أنشئ الموقع `dc1` والدور `leaf` والمنصة `ios-xe` وجهازين بمنافذ وعناوين IP.\n2. أضف سياق إعداد للموقع يحتوي `ntp_servers` و`syslog_host`، وتأكد عبر الواجهة البرمجية أنه يظهر في `config_context` الخاص بالجهاز.\n3. أنشئ رمز API للقراءة فقط، واستعلم عن الأجهزة باستخدام `curl`، ثم كرّر الاستعلام مع `?limit=1` وتابع روابط `next`.\n4. شغّل `render_from_netbox.py` مع قالب يستخدم قيم السياق، ثم احذف قيمة لازمة من NetBox ولاحظ كيف يوقف `StrictUndefined` عملية التوليد.\n5. وجّه الأمر `ansible-inventory --graph` إلى `netbox_inv.yml` وافحص المجموعات.\n6. غيّر وصف منفذ على الجهاز المختبري عبر سطر الأوامر، ثم اكتب فحصًا قصيرًا يُبلغ عن اختلافه عمّا في NetBox."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "مصدر الحقيقة (Source of Truth - SoT)",
+            "definition": "السجل المرجعي للحالة المقصودة للشبكة، وتقرأ منه الأتمتة."
+          },
+          {
+            "term": "الحالة المقصودة (Intended state)",
+            "definition": "ما ينبغي أن تكون عليه الشبكة كما هو مسجّل في مصدر الحقيقة."
+          },
+          {
+            "term": "الحالة الفعلية (Actual state)",
+            "definition": "ما عليه الشبكة حقًا كما يُقرأ من الأجهزة."
+          },
+          {
+            "term": "الانحراف (Drift)",
+            "definition": "أي اختلاف بين الحالة المقصودة في مصدر الحقيقة والحالة الفعلية للشبكة."
+          },
+          {
+            "term": "سياق الإعداد (Config context)",
+            "definition": "بيانات JSON في NetBox تُدمج حسب الموقع أو الدور أو المنصة أو الوسم، وتُلحق بكل جهاز بوصفها متغيرات."
+          },
+          {
+            "term": "المخزون الديناميكي (Dynamic inventory)",
+            "definition": "مخزون يُولَّد وقت التشغيل من نظام خارجي، مثل إضافة nb_inventory من NetBox في Ansible."
+          },
+          {
+            "term": "قاعدة الأحداث (Event rule / Webhook)",
+            "definition": "قاعدة في NetBox ترسل طلب HTTP عند إنشاء الكائنات أو تحديثها أو حذفها."
+          },
+          {
+            "term": "pynetbox",
+            "definition": "مكتبة عميل Python لواجهة REST في NetBox."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أيّ العبارات تصف مصدر الحقيقة في أتمتة الشبكات على أفضل وجه؟",
+            "options": [
+              "نسخة احتياطية من الإعدادات الجارية لكل جهاز",
+              "السجل المرجعي للحالة المقصودة للشبكة",
+              "نظام مراقبة يخزّن عدّادات المنافذ الحية",
+              "مستودع Git يحفظ سكربتات الأتمتة"
+            ],
+            "answer": 1,
+            "explanation": "يسجّل مصدر الحقيقة ما ينبغي أن تكون عليه الشبكة. أمّا النسخ الاحتياطية والمراقبة فتحمل الحالة الفعلية، ومستودع السكربتات يحمل شيفرة لا نية."
+          },
+          {
+            "question": "يقرأ سكربت المسار /api/dcim/devices/?site=dc1 ولا يعالج إلا المصفوفة results. في الموقع 120 جهازًا، لكن السكربت يُعدّ 50 فقط. ما السبب الأرجح؟",
+            "options": [
+              "الرمز للقراءة فقط",
+              "يتجاهل السكربت ترقيم الصفحات ولا يتابع عنوان next",
+              "يستبعد NetBox الأجهزة التي لا منصة لها",
+              "يجب استخدام نقطة GraphQL لأكثر من 50 كائنًا"
+            ],
+            "answer": 1,
+            "explanation": "يقسّم NetBox النتائج إلى صفحات (50 في الصفحة افتراضيًا)، فعلى العميل أن يتابع next حتى تصبح null، أو أن يستخدم مكتبة مثل pynetbox تفعل ذلك نيابةً عنه."
+          },
+          {
+            "question": "أيّ الممارسات تحمي جودة البيانات في مصدر الحقيقة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "الحقول المخصصة الإلزامية وقواعد التحقق",
+              "مراجعة التعديلات الكبيرة في فرع أو طلب تغيير قبل أن تسري",
+              "استيراد الإعدادات الجارية لكل جهاز إلى مصدر الحقيقة في كل تشغيل",
+              "الاحتفاظ بسجل التغييرات مسارًا للتدقيق"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "يحافظ التحقق والمراجعة وسجل التغييرات على صحة النية وإمكان تتبّعها. أمّا إعادة استيراد الشبكة في كل تشغيل فتحوّل مصدر الحقيقة إلى نسخة من الواقع بأخطائه."
+          },
+          {
+            "question": "تنطلق قاعدة أحداث في NetBox عند تغيّر جهاز. ماذا ينبغي أن يفعل مستقبِل خطاف الويب؟",
+            "options": [
+              "أن يدفع الإعدادات الجديدة إلى الجهاز فورًا",
+              "أن يبدأ خط CI يولّد الإعدادات ويختبرها وينشرها عبر بوابة موافقة",
+              "أن يكتب التغيير مرة أخرى في NetBox",
+              "أن يتجاهل الحمولة ويستطلع NetBox كل دقيقة"
+            ],
+            "answer": 1,
+            "explanation": "قد تتكرر الخطافات أو تصل بترتيب مختلف، ويضيف خط التنفيذ الاختبار والموافقة والنشر متساوي الأثر بدلًا من الدفع الأعمى."
+          },
+          {
+            "question": "يُظهر فحص الانحراف شبكة VLAN على مبدّل غير موجودة في NetBox. أيّ الاستجابات صحيحة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "إزالة شبكة VLAN من الجهاز لاستعادة الحالة المقصودة",
+              "تسجيل شبكة VLAN في NetBox إن كان التغيير معتمدًا",
+              "تعطيل فحص الانحراف لأن الشبكة سليمة",
+              "جعل الشبكة مصدر الحقيقة من الآن فصاعدًا"
+            ],
+            "answer": [
+              0,
+              1
+            ],
+            "explanation": "يُعالَج الانحراف بإصلاح الجهاز أو بتحديث مصدر الحقيقة عبر الإجراء المعتاد، أمّا تعطيل الفحص أو عكس اتجاه الحقيقة فيُلغي الضبط."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يخزّن **مصدر الحقيقة** الحالة المقصودة، وتحمل الشبكة الحالة الفعلية، والأتمتة تجعلهما متطابقتين.\n- يحتاج كل عنصر بيانات إلى **مالك واحد**، ومكان الأسرار مدير أسرار لا مصدر الحقيقة.\n- يعرض **NetBox** الأجهزة وIPAM وسياقات الإعداد عبر واجهة REST مصادَق عليها بالرموز ومقسّمة إلى صفحات، وعبر GraphQL.\n- أنماط التكامل: **المخزون الديناميكي**، و**السحب والتوليد**، وخطوط التنفيذ **المدفوعة بالأحداث**، و**الكتابة العكسية** للتخصيصات، و**فحوص الانحراف**.\n- احمِ جودة البيانات بالتحقق والمراجعات وسجل التغييرات والرموز محددة النطاق.\n\nتابع لتتعلم كيف تشكّل البيانات التي تولّدها في درس [إعدادات YAML / JSON انطلاقًا من نماذج YANG](/learn/network-automation-devops/yaml-json-configurations-from-yang-models)."
+      }
+    ]
+  }
+}

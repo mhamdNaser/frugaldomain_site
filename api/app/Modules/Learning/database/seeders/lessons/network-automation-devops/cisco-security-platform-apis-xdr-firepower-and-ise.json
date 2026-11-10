@@ -1,0 +1,670 @@
+{
+  "slug": "cisco-security-platform-apis-xdr-firepower-and-ise",
+  "title": "Cisco Security Platform APIs: XDR, Firepower and ISE",
+  "summary": "Learn how to authenticate to and use the Cisco XDR, Secure Firewall Management Center and ISE APIs, and how they combine into an automated investigation and containment playbook.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Obtain a Cisco XDR token with OAuth 2.0 client credentials and use the Inspect and Enrich APIs",
+    "Authenticate to the FMC REST API and create objects in a domain",
+    "Explain why FMC changes require a deployment request",
+    "Describe the ISE ERS, OpenAPI, MnT and pxGrid interfaces and enable ERS securely",
+    "Use ANC through ERS to quarantine an endpoint and explain the resulting CoA"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 02:10 an alert reports a laptop beaconing to an unknown address. A manual response means opening four consoles: look up the address, check which hosts talked to it, block it on the firewall, and isolate the laptop. With APIs, one playbook does all of it in under a minute, and logs every step.\n\nThe CCNA Automation exam expects you to describe the APIs of Cisco's security platforms and to read code that uses them. This lesson covers the three that appear most often in automation: **Cisco XDR** for detection and investigation, **Secure Firewall Management Center** (FMC, formerly Firepower Management Center) for firewall policy, and **Identity Services Engine** (ISE) for identity and network access."
+    },
+    {
+      "id": "xdr",
+      "type": "text",
+      "markdown": "## Cisco XDR APIs\n\n**Cisco XDR** (extended detection and response) correlates telemetry from Cisco and third-party products: endpoints, firewalls, email, DNS and network flows. Its APIs come from the Threat Response platform, so many paths start with `/iroh/`.\n\n### Authentication: OAuth 2.0 client credentials\n\n1. In the XDR console, an administrator creates an **API client** and grants only the **scopes** it needs, such as `inspect`, `enrich:read` and `response`.\n2. The script sends the client ID and password to `POST /iroh/oauth2/token` with `grant_type=client_credentials`.\n3. XDR returns an `access_token` that expires after about 10 minutes. Each API call sends it as `Authorization: Bearer <token>`.\n\nThe host depends on the region where the tenant lives (North America, Europe or Asia Pacific).\n\n### Key APIs\n\n| API | Path | What it does |\n|:--|:--|:--|\n| **Inspect** | `/iroh/iroh-inspect/inspect` | Extracts **observables** (IPs, domains, hashes, URLs) from free text |\n| **Enrich** | `/iroh/iroh-enrich/observe/observables` | Asks every integrated module for verdicts and **sightings** |\n| **Response** | `/iroh/iroh-response/respond/observables` | Lists actions available for an observable, such as blocking or isolating |\n| **Private Intelligence** | `/ctia/...` | Stores your own judgements, sightings and incidents in the CTIM model |\n\nAn observable is always a small JSON object with a `type` and a `value`, for example `{\"type\": \"ip\", \"value\": \"203.0.113.50\"}`. XDR also includes **Automation** workflows, a no-code engine that can call these same APIs."
+    },
+    {
+      "id": "xdr-code",
+      "type": "code",
+      "language": "python",
+      "filename": "xdr_enrich.py",
+      "caption": "Getting an XDR token, extracting observables from alert text and enriching them. Client credentials come from environment variables.",
+      "code": "import os\nimport requests\n\nXDR = \"https://visibility.amp.cisco.com\"          # North America region; EU and APJC differ\nCLIENT_ID = os.environ[\"XDR_CLIENT_ID\"]\nCLIENT_SECRET = os.environ[\"XDR_CLIENT_PASSWORD\"]\n\n\ndef get_token():\n    \"\"\"OAuth 2.0 client credentials grant. The token is short-lived (about 10 minutes).\"\"\"\n    resp = requests.post(\n        f\"{XDR}/iroh/oauth2/token\",\n        auth=(CLIENT_ID, CLIENT_SECRET),\n        data={\"grant_type\": \"client_credentials\"},\n        headers={\"Accept\": \"application/json\"},\n        timeout=10,\n    )\n    resp.raise_for_status()\n    return resp.json()[\"access_token\"]\n\n\nheaders = {\"Authorization\": f\"Bearer {get_token()}\", \"Content-Type\": \"application/json\"}\n\n# 1. Inspect: pull observables out of free text (an alert, an email, a ticket)\ntext = \"Beaconing from 10.20.30.44 to 203.0.113.50 and bad.example.net\"\nobservables = requests.post(f\"{XDR}/iroh/iroh-inspect/inspect\",\n                            headers=headers, json={\"content\": text}, timeout=10).json()\nprint(observables)\n# [{'type': 'ip', 'value': '10.20.30.44'}, {'type': 'ip', 'value': '203.0.113.50'},\n#  {'type': 'domain', 'value': 'bad.example.net'}]\n\n# 2. Enrich: ask every integrated module what it knows about them\nreport = requests.post(f\"{XDR}/iroh/iroh-enrich/observe/observables\",\n                       headers=headers, json=observables, timeout=30).json()\nfor module in report[\"data\"]:\n    verdicts = module[\"data\"].get(\"verdicts\", {}).get(\"docs\", [])\n    for v in verdicts:\n        print(module[\"module\"], v[\"observable\"][\"value\"], v[\"disposition_name\"])",
+      "highlight": [
+        11,
+        26,
+        33
+      ]
+    },
+    {
+      "id": "fmc",
+      "type": "text",
+      "markdown": "## Secure Firewall Management Center (FMC) REST API\n\n**FMC** centrally manages Secure Firewall Threat Defense (FTD) devices. Its REST API covers objects, access control policies, NAT, device records and deployments. Every FMC includes an interactive **API Explorer** at `https://<fmc>/api/api-explorer`, where you can try calls and read the schemas.\n\n### Authentication\n\n- `POST /api/fmc_platform/v1/auth/generatetoken` with **HTTP Basic** credentials returns `204 No Content`. The tokens are in the response **headers**: `X-auth-access-token`, `X-auth-refresh-token` and `DOMAIN_UUID`.\n- Send `X-auth-access-token` with every request. The token lasts **30 minutes** and can be refreshed up to **three times** with `/auth/refreshtoken`.\n- Use a dedicated API user. Logging in to the API with the same account as a GUI session can end that session.\n\n### Working with configuration\n\n- Configuration paths include the domain: `/api/fmc_config/v1/domain/{domainUUID}/object/hosts`, `/object/networkgroups`, `/policy/accesspolicies`, `/devices/devicerecords`.\n- Lists are paginated with `offset` and `limit`; `expanded=true` returns full objects.\n- FMC limits API clients to about **120 requests per minute**; above that it answers `429`.\n- **Changes are not live until deployed.** `POST .../deployment/deploymentrequests` starts an **asynchronous** deployment job that you then monitor.\n\nFor a single unmanaged firewall, the **Firewall Device Manager (FDM)** offers its own REST API with OAuth-style tokens, and cloud-delivered FMC exposes the same FMC API through Security Cloud Control."
+    },
+    {
+      "id": "fmc-term",
+      "type": "terminal",
+      "title": "FMC: token, device list and a new host object",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -i -X POST -u apiuser:<password-placeholder> https://fmc.example.com/api/fmc_platform/v1/auth/generatetoken",
+          "output": "HTTP/1.1 204 No Content\nX-auth-access-token: 4b1f6c2e-<truncated>\nX-auth-refresh-token: 9e07d3a1-<truncated>\nDOMAIN_UUID: e276abec-e0f2-11e3-8169-6d9ed49b625f\nglobal: e276abec-e0f2-11e3-8169-6d9ed49b625f"
+        },
+        {
+          "comment": "The token comes back in response headers, not in a body. It lasts 30 minutes and can be refreshed three times."
+        },
+        {
+          "cmd": "export TOKEN=\"<token-placeholder>\" DOM=\"e276abec-e0f2-11e3-8169-6d9ed49b625f\"",
+          "output": ""
+        },
+        {
+          "cmd": "curl -s -H \"X-auth-access-token: $TOKEN\" \"https://fmc.example.com/api/fmc_config/v1/domain/$DOM/devices/devicerecords?expanded=true\" | jq '.items[] | {name, model, sw_version, healthStatus}'",
+          "output": "{\n  \"name\": \"ftd-edge-1\",\n  \"model\": \"Cisco Secure Firewall 3110 Threat Defense\",\n  \"sw_version\": \"7.4.1\",\n  \"healthStatus\": \"green\"\n}"
+        },
+        {
+          "comment": "Configuration resources live under /api/fmc_config/v1/domain/{domainUUID}/. expanded=true returns full objects instead of references."
+        },
+        {
+          "cmd": "curl -s -X POST -H \"X-auth-access-token: $TOKEN\" -H \"Content-Type: application/json\" -d '{\"name\": \"blk-203.0.113.50\", \"type\": \"Host\", \"value\": \"203.0.113.50\", \"description\": \"XDR case 1042\"}' \"https://fmc.example.com/api/fmc_config/v1/domain/$DOM/object/hosts\"",
+          "output": "{\"type\": \"Host\", \"value\": \"203.0.113.50\", \"name\": \"blk-203.0.113.50\", \"id\": \"005056A1-0733-0ed3-0000-004294969331\", ...}"
+        },
+        {
+          "comment": "201 Created: the object exists on FMC only. It reaches the firewalls after a deployment request."
+        }
+      ],
+      "caption": "Lab output, shortened. The domain UUID shown is the default Global domain."
+    },
+    {
+      "id": "ise",
+      "type": "text",
+      "markdown": "## Identity Services Engine (ISE) APIs\n\n**ISE** decides who and what may join the network, using 802.1X, MAB and posture. It exposes several APIs, each for a different job:\n\n| API | Transport | Typical use |\n|:--|:--|:--|\n| **ERS** (External RESTful Services) | REST, HTTPS port **9060** | CRUD on endpoints, network devices, internal users, identity groups, ANC |\n| **OpenAPI** | REST, HTTPS 443, `/api/v1/` | Policy sets, authorization rules, certificates, backups (ISE 3.1 and later) |\n| **MnT** (Monitoring) | REST, XML | Active sessions, authentication status, session details |\n| **pxGrid 2.0** | WebSocket publish/subscribe plus REST | Share session context and receive ANC requests from partner products |\n\n### Enabling and securing ERS\n\nERS is **disabled by default**. Enable it under **Administration > System > Settings > API Settings**, then create an admin account in the **ERS Admin** group (read-write) or **ERS Operator** group (read-only). Requests use **HTTP Basic** authentication over TLS and need `Accept` and `Content-Type` headers set to `application/json` (or XML).\n\n### Adaptive Network Control (ANC)\n\nANC lets automation **quarantine** an endpoint. An administrator defines ANC policies such as `Quarantine` and an authorization rule that matches them. When a script applies the policy to a MAC address, ISE issues a **Change of Authorization (CoA)** to the switch or wireless controller, and the endpoint is re-authorized into a restricted VLAN or downloadable ACL."
+    },
+    {
+      "id": "ise-code",
+      "type": "code",
+      "language": "python",
+      "filename": "ise_quarantine.py",
+      "caption": "Finding an endpoint with ERS and applying an ANC quarantine policy. Certificate verification uses the ISE CA bundle.",
+      "code": "import os\nimport requests\n\nISE = \"https://ise.example.com:9060\"                # ERS listens on TCP 9060\nAUTH = (os.environ[\"ISE_ERS_USER\"], os.environ[\"ISE_ERS_PASSWORD\"])\nHDRS = {\"Accept\": \"application/json\", \"Content-Type\": \"application/json\"}\nMAC = \"00:50:56:A1:07:33\"\n\n# Find the endpoint by MAC address (ERS filter syntax: field.OPERATOR.value)\nr = requests.get(f\"{ISE}/ers/config/endpoint\", params={\"filter\": f\"mac.EQ.{MAC}\"},\n                 auth=AUTH, headers=HDRS, timeout=10, verify=\"/etc/ssl/ise-ca.pem\")\nresult = r.json()[\"SearchResult\"]\nprint(\"Matches:\", result[\"total\"])                  # 1\n\n# Apply the ANC \"Quarantine\" policy; ISE then sends a CoA to the switch\nbody = {\"OperationAdditionalData\": {\"additionalData\": [\n    {\"name\": \"macAddress\", \"value\": MAC},\n    {\"name\": \"policyName\", \"value\": \"Quarantine\"}]}}\nr = requests.put(f\"{ISE}/ers/config/ancendpoint/apply\", json=body,\n                 auth=AUTH, headers=HDRS, timeout=10, verify=\"/etc/ssl/ise-ca.pem\")\nprint(r.status_code)                                # 204 No Content = applied",
+      "highlight": [
+        10,
+        19
+      ]
+    },
+    {
+      "id": "soar-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "An automated containment playbook",
+      "caption": "XDR decides, FMC blocks the destination, ISE isolates the source. Every call is logged by the playbook.",
+      "data": {
+        "actors": [
+          {
+            "id": "p",
+            "label": "Playbook",
+            "sub": "Python or XDR Automation",
+            "icon": "cpu"
+          },
+          {
+            "id": "x",
+            "label": "Cisco XDR",
+            "sub": "Inspect / Enrich",
+            "icon": "shield"
+          },
+          {
+            "id": "f",
+            "label": "FMC",
+            "sub": "fmc.example.com",
+            "icon": "firewall"
+          },
+          {
+            "id": "i",
+            "label": "ISE",
+            "sub": "ise.example.com",
+            "icon": "lock"
+          },
+          {
+            "id": "s",
+            "label": "Access switch",
+            "sub": "Gi1/0/12",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "p",
+            "to": "x",
+            "label": "POST /inspect",
+            "detail": "alert text",
+            "note": "The playbook extracts the observables: the internal host and the external address."
+          },
+          {
+            "from": "p",
+            "to": "x",
+            "label": "POST /observe/observables",
+            "detail": "ip 203.0.113.50",
+            "note": "XDR asks its integrated modules what they know about the address."
+          },
+          {
+            "from": "x",
+            "to": "p",
+            "label": "Verdict: Malicious",
+            "detail": "3 sightings",
+            "tone": "danger",
+            "note": "Several modules agree that the address is malicious, so containment is justified."
+          },
+          {
+            "from": "p",
+            "to": "f",
+            "label": "PUT /object/networkgroups/{id}",
+            "detail": "add blk-203.0.113.50",
+            "tone": "blocked",
+            "note": "The address is added to a block-list group already used by an access control rule."
+          },
+          {
+            "from": "p",
+            "to": "f",
+            "label": "POST /deploymentrequests",
+            "detail": "202 Accepted",
+            "note": "The change is pushed to the FTD devices as an asynchronous deployment job."
+          },
+          {
+            "from": "p",
+            "to": "i",
+            "label": "PUT /ancendpoint/apply",
+            "detail": "Quarantine, 00:50:56:A1:07:33",
+            "tone": "warning",
+            "note": "ISE marks the laptop's MAC address with the Quarantine ANC policy."
+          },
+          {
+            "from": "i",
+            "to": "s",
+            "label": "RADIUS CoA",
+            "detail": "reauthenticate",
+            "tone": "secure",
+            "note": "ISE sends a Change of Authorization; the switch re-authenticates the port."
+          },
+          {
+            "from": "s",
+            "to": "s",
+            "label": "Quarantine VLAN",
+            "tone": "success",
+            "note": "The laptop can reach only remediation services. The playbook opens a ticket for the analyst."
+          }
+        ]
+      }
+    },
+    {
+      "id": "compare",
+      "type": "text",
+      "markdown": "## Comparing the security APIs\n\n| | Cisco XDR | FMC | ISE ERS |\n|:--|:--|:--|:--|\n| Role in a playbook | Investigate and decide | Block traffic | Contain the endpoint |\n| Authentication | OAuth 2.0 client credentials, Bearer token | Basic, then `X-auth-access-token` | HTTP Basic on every request |\n| Token lifetime | About 10 minutes | 30 minutes, three refreshes | No token |\n| Change takes effect | Immediately | After a deployment | Immediately (CoA) |\n\nSecurity APIs are powerful, so protect them like admin consoles: dedicated accounts with least privilege, secrets in a vault, TLS verification, and audit logs. See [App Security: Secrets, Encryption, Data Handling](/learn/network-automation-devops/app-security-secrets-encryption-data-handling) and [HTTP Response Codes and API Authentication](/learn/network-automation-devops/http-response-codes-and-api-authentication)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where learners go wrong",
+      "markdown": "- **Forgetting the FMC deployment.** A `201 Created` on FMC changes nothing on the firewalls until you deploy.\n- **Looking for the FMC token in the body.** It is in the response headers of a `204`.\n- **Calling ERS without enabling it.** ERS is off by default and needs an ERS Admin or ERS Operator account.\n- **Over-privileged API clients.** Give an XDR client only the scopes the playbook uses, and never reuse a personal admin account.\n- **Automating containment with no guardrails.** Require a strong verdict, keep an allow list of critical hosts, and log every action for review."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Work only in a lab or DevNet Sandbox you are authorized to use. Never test containment on production endpoints.\n\n1. **FMC:** open the API Explorer, generate a token with `curl -i`, and list device records. Create a host object for `203.0.113.50`, then delete it.\n2. **ISE:** enable ERS, create an ERS Operator account, and list endpoints with `GET /ers/config/endpoint`. Note what happens when the same account tries a `POST`.\n3. **XDR:** create an API client with only the `inspect` scope and run step 1 of `xdr_enrich.py`. Then try the enrich call and observe the authorization error.\n4. Write down, for each platform, where the token is returned and how long it lasts."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Cisco XDR",
+          "definition": "Cisco's extended detection and response platform, which correlates telemetry from many security products and exposes Inspect, Enrich and Response APIs."
+        },
+        {
+          "term": "Observable",
+          "definition": "A piece of evidence such as an IP address, domain, URL or file hash, expressed in XDR as a type and a value."
+        },
+        {
+          "term": "Client credentials grant",
+          "definition": "An OAuth 2.0 flow where an application exchanges its own client ID and secret for an access token, with no user involved."
+        },
+        {
+          "term": "FMC",
+          "definition": "Secure Firewall Management Center, the central manager for Threat Defense firewalls, with a REST API under /api/fmc_config/v1."
+        },
+        {
+          "term": "Domain UUID",
+          "definition": "The FMC domain identifier that appears in every configuration path and is returned when a token is generated."
+        },
+        {
+          "term": "Deployment request",
+          "definition": "The FMC API call that pushes pending configuration changes to managed devices as an asynchronous job."
+        },
+        {
+          "term": "ERS",
+          "definition": "External RESTful Services, the ISE REST API on TCP 9060 for endpoints, network devices, users, groups and ANC."
+        },
+        {
+          "term": "ANC",
+          "definition": "Adaptive Network Control, an ISE feature that applies a policy such as Quarantine to an endpoint and triggers re-authorization."
+        },
+        {
+          "term": "pxGrid",
+          "definition": "Platform Exchange Grid, the ISE publish/subscribe framework for sharing context with other security products."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "How does a script obtain an access token from Cisco XDR?",
+          "options": [
+            "HTTP Basic to /api/fmc_platform/v1/auth/generatetoken",
+            "OAuth 2.0 client credentials to /iroh/oauth2/token",
+            "POST /api/aaaLogin.json with a JSON body",
+            "An API key generated in the user profile"
+          ],
+          "answer": 1,
+          "explanation": "XDR API clients use the OAuth 2.0 client credentials grant. The client ID and password are sent to /iroh/oauth2/token, which returns a short-lived bearer token."
+        },
+        {
+          "question": "A script creates a host object on FMC and receives 201 Created, but the firewalls still allow the traffic. What is missing?",
+          "options": [
+            "A token refresh",
+            "A deployment request",
+            "A pxGrid subscription",
+            "A Change of Authorization"
+          ],
+          "answer": 1,
+          "explanation": "FMC stores the change but does not push it to the managed devices until a deployment is requested and completes."
+        },
+        {
+          "question": "Which statements about the ISE ERS API are true? (Choose all that apply.)",
+          "options": [
+            "It is disabled by default",
+            "It listens on TCP 9060",
+            "It uses OAuth bearer tokens",
+            "Accounts need the ERS Admin or ERS Operator role",
+            "It can apply ANC policies to endpoints"
+          ],
+          "answer": [
+            0,
+            1,
+            3,
+            4
+          ],
+          "explanation": "ERS must be enabled, listens on 9060, uses HTTP Basic authentication with ERS Admin or ERS Operator accounts, and includes the ancendpoint resource for ANC."
+        },
+        {
+          "question": "Where does FMC return the access token after a successful generatetoken call?",
+          "options": [
+            "In the JSON body under access_token",
+            "In the X-auth-access-token response header",
+            "In a Set-Cookie header",
+            "In the URL query string"
+          ],
+          "answer": 1,
+          "explanation": "FMC answers 204 No Content and puts X-auth-access-token, X-auth-refresh-token and DOMAIN_UUID in the response headers."
+        },
+        {
+          "question": "Which practices make automated containment safer? (Choose all that apply.)",
+          "options": [
+            "Granting API clients only the scopes they need",
+            "Using a shared personal admin account for all scripts",
+            "Requiring a confirmed verdict before blocking",
+            "Logging every API action for review"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "Least privilege, evidence-based decisions and audit logs limit damage from mistakes. Shared personal accounts remove accountability and widen access."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- **Cisco XDR** uses OAuth 2.0 client credentials. Inspect extracts observables, Enrich gathers verdicts and sightings, and Response lists and triggers actions.\n- **FMC** issues tokens in response headers, scopes every path by domain UUID, rate-limits clients and needs a **deployment** before changes take effect.\n- **ISE** offers ERS (port 9060, Basic auth), OpenAPI, MnT and pxGrid. ANC quarantines an endpoint through a CoA.\n- Together they form a containment playbook: decide in XDR, block in FMC, isolate in ISE.\n\nNext, learn how devices themselves are programmed in [YANG, NETCONF and RESTCONF Programmability](/learn/network-automation-devops/yang-netconf-and-restconf-programmability)."
+    }
+  ],
+  "ar": {
+    "title": "واجهات برمجة منصات Cisco الأمنية: XDR وFirepower وISE",
+    "summary": "تعلّم كيف تصادق على واجهات Cisco XDR وSecure Firewall Management Center وISE وتستخدمها، وكيف تجتمع في دليل تشغيل آلي للتحقيق والاحتواء.",
+    "objectives": [
+      "الحصول على رمز Cisco XDR عبر منح بيانات اعتماد العميل في OAuth 2.0 واستخدام واجهتي Inspect وEnrich",
+      "المصادقة على واجهة REST في FMC وإنشاء كائنات داخل نطاق",
+      "شرح سبب حاجة تغييرات FMC إلى طلب نشر",
+      "وصف واجهات ERS وOpenAPI وMnT وpxGrid في ISE وتفعيل ERS بأمان",
+      "استخدام ANC عبر ERS لعزل جهاز طرفي وشرح تغيير التفويض الناتج"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الساعة 02:10 يصل تنبيه بأن حاسوبًا محمولًا يرسل إشارات دورية (Beaconing) إلى عنوان مجهول. تعني الاستجابة اليدوية فتح أربع وحدات تحكم: البحث عن العنوان، ومعرفة الأجهزة التي تواصلت معه، وحظره على جدار الحماية، وعزل الحاسوب. أمّا مع واجهات البرمجة، فيؤدي دليل تشغيل (Playbook) واحد كل ذلك في أقل من دقيقة، ويسجّل كل خطوة.\n\nيتوقع منك اختبار CCNA Automation أن تصف واجهات برمجة منصات Cisco الأمنية وأن تقرأ شيفرة تستخدمها. ويتناول هذا الدرس الثلاث الأكثر حضورًا في الأتمتة: **Cisco XDR** للكشف والتحقيق، و**Secure Firewall Management Center** (FMC، المعروفة سابقًا باسم Firepower Management Center) لسياسات جدار الحماية، و**Identity Services Engine** (ISE) للهوية والتحكم في الوصول إلى الشبكة."
+      },
+      {
+        "id": "xdr",
+        "type": "text",
+        "markdown": "## واجهات Cisco XDR\n\nتربط **Cisco XDR (الكشف والاستجابة الموسّعان)** بين بيانات القياس الواردة من منتجات Cisco ومنتجات الجهات الأخرى: الأجهزة الطرفية وجدران الحماية والبريد وDNS وتدفقات الشبكة. وتأتي واجهاتها من منصة Threat Response، لذا يبدأ كثير من مساراتها بـ `/iroh/`.\n\n### المصادقة: منح بيانات اعتماد العميل في OAuth 2.0\n\n1. ينشئ المسؤول في وحدة تحكم XDR **عميل API (API client)** ويمنحه **النطاقات (Scopes)** التي يحتاجها فقط، مثل `inspect` و`enrich:read` و`response`.\n2. يرسل السكربت معرّف العميل وكلمة مروره إلى `POST /iroh/oauth2/token` مع `grant_type=client_credentials`.\n3. تعيد XDR رمز `access_token` تنتهي صلاحيته بعد نحو 10 دقائق، ويُرسَل مع كل استدعاء بالشكل `Authorization: Bearer <token>`.\n\nيتوقف اسم المضيف على المنطقة التي يقيم فيها المستأجر (أمريكا الشمالية أو أوروبا أو آسيا والمحيط الهادئ).\n\n### الواجهات الرئيسية\n\n| الواجهة | المسار | وظيفتها |\n|:--|:--|:--|\n| **Inspect** | `/iroh/iroh-inspect/inspect` | تستخرج **المؤشرات القابلة للرصد (Observables)** مثل العناوين والنطاقات والبصمات والروابط من نص حر |\n| **Enrich** | `/iroh/iroh-enrich/observe/observables` | تسأل كل وحدة مدمجة عن أحكامها و**مشاهداتها (Sightings)** |\n| **Response** | `/iroh/iroh-response/respond/observables` | تسرد الإجراءات المتاحة لمؤشر ما، مثل الحظر أو العزل |\n| **Private Intelligence** | `/ctia/...` | تخزّن أحكامك ومشاهداتك وحوادثك الخاصة وفق نموذج CTIM |\n\nالمؤشر دائمًا كائن JSON صغير له `type` و`value`، مثل `{\"type\": \"ip\", \"value\": \"203.0.113.50\"}`. وتضم XDR كذلك سير عمل **Automation**، وهو محرك لا يتطلب كتابة شيفرة ويمكنه استدعاء هذه الواجهات نفسها."
+      },
+      {
+        "id": "xdr-code",
+        "type": "code",
+        "language": "python",
+        "filename": "xdr_enrich.py",
+        "caption": "الحصول على رمز XDR، واستخراج المؤشرات من نص التنبيه، وإثراؤها. تأتي بيانات اعتماد العميل من متغيرات البيئة.",
+        "code": "import os\nimport requests\n\nXDR = \"https://visibility.amp.cisco.com\"          # North America region; EU and APJC differ\nCLIENT_ID = os.environ[\"XDR_CLIENT_ID\"]\nCLIENT_SECRET = os.environ[\"XDR_CLIENT_PASSWORD\"]\n\n\ndef get_token():\n    \"\"\"OAuth 2.0 client credentials grant. The token is short-lived (about 10 minutes).\"\"\"\n    resp = requests.post(\n        f\"{XDR}/iroh/oauth2/token\",\n        auth=(CLIENT_ID, CLIENT_SECRET),\n        data={\"grant_type\": \"client_credentials\"},\n        headers={\"Accept\": \"application/json\"},\n        timeout=10,\n    )\n    resp.raise_for_status()\n    return resp.json()[\"access_token\"]\n\n\nheaders = {\"Authorization\": f\"Bearer {get_token()}\", \"Content-Type\": \"application/json\"}\n\n# 1. Inspect: pull observables out of free text (an alert, an email, a ticket)\ntext = \"Beaconing from 10.20.30.44 to 203.0.113.50 and bad.example.net\"\nobservables = requests.post(f\"{XDR}/iroh/iroh-inspect/inspect\",\n                            headers=headers, json={\"content\": text}, timeout=10).json()\nprint(observables)\n# [{'type': 'ip', 'value': '10.20.30.44'}, {'type': 'ip', 'value': '203.0.113.50'},\n#  {'type': 'domain', 'value': 'bad.example.net'}]\n\n# 2. Enrich: ask every integrated module what it knows about them\nreport = requests.post(f\"{XDR}/iroh/iroh-enrich/observe/observables\",\n                       headers=headers, json=observables, timeout=30).json()\nfor module in report[\"data\"]:\n    verdicts = module[\"data\"].get(\"verdicts\", {}).get(\"docs\", [])\n    for v in verdicts:\n        print(module[\"module\"], v[\"observable\"][\"value\"], v[\"disposition_name\"])",
+        "highlight": [
+          11,
+          26,
+          33
+        ]
+      },
+      {
+        "id": "fmc",
+        "type": "text",
+        "markdown": "## واجهة REST في Secure Firewall Management Center (FMC)\n\nتدير **FMC** مركزيًا أجهزة Secure Firewall Threat Defense (FTD). وتغطي واجهتها REST الكائنات وسياسات التحكم في الوصول وNAT وسجلات الأجهزة وعمليات النشر. وتتضمن كل FMC أداة **API Explorer** تفاعلية على `https://<fmc>/api/api-explorer` تجرّب فيها الاستدعاءات وتقرأ مخططاتها.\n\n### المصادقة\n\n- يعيد `POST /api/fmc_platform/v1/auth/generatetoken` مع بيانات اعتماد **HTTP Basic** الاستجابة `204 No Content`، وتكون الرموز في **ترويسات** الاستجابة: `X-auth-access-token` و`X-auth-refresh-token` و`DOMAIN_UUID`.\n- أرسل `X-auth-access-token` مع كل طلب. يدوم الرمز **30 دقيقة** ويمكن تجديده حتى **ثلاث مرات** عبر `/auth/refreshtoken`.\n- استخدم مستخدمًا مخصصًا للواجهة البرمجية، فالدخول إلى الواجهة بالحساب نفسه المستخدم في جلسة رسومية قد ينهي تلك الجلسة.\n\n### التعامل مع الإعدادات\n\n- تتضمن مسارات الإعداد النطاق: `/api/fmc_config/v1/domain/{domainUUID}/object/hosts` و`/object/networkgroups` و`/policy/accesspolicies` و`/devices/devicerecords`.\n- تُقسَّم القوائم إلى صفحات عبر `offset` و`limit`، ويعيد `expanded=true` الكائنات كاملة.\n- تحدّ FMC عملاء الواجهة بنحو **120 طلبًا في الدقيقة**، وما زاد يُقابَل بـ `429`.\n- **لا تسري التغييرات قبل نشرها.** يبدأ `POST .../deployment/deploymentrequests` مهمة نشر **غير متزامنة** تتابع حالتها بعد ذلك.\n\nأمّا الجدار الناري المفرد غير المُدار مركزيًا، فيوفّر له **Firewall Device Manager (FDM)** واجهة REST خاصة برموز على نمط OAuth، كما تعرض FMC السحابية واجهة FMC نفسها عبر Security Cloud Control."
+      },
+      {
+        "id": "fmc-term",
+        "type": "terminal",
+        "title": "FMC: الرمز وقائمة الأجهزة وكائن مضيف جديد",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "curl -s -i -X POST -u apiuser:<password-placeholder> https://fmc.example.com/api/fmc_platform/v1/auth/generatetoken",
+            "output": "HTTP/1.1 204 No Content\nX-auth-access-token: 4b1f6c2e-<truncated>\nX-auth-refresh-token: 9e07d3a1-<truncated>\nDOMAIN_UUID: e276abec-e0f2-11e3-8169-6d9ed49b625f\nglobal: e276abec-e0f2-11e3-8169-6d9ed49b625f"
+          },
+          {
+            "comment": "يعود الرمز في ترويسات الاستجابة لا في جسمها، ويبقى صالحًا 30 دقيقة ويمكن تجديده ثلاث مرات."
+          },
+          {
+            "cmd": "export TOKEN=\"<token-placeholder>\" DOM=\"e276abec-e0f2-11e3-8169-6d9ed49b625f\"",
+            "output": ""
+          },
+          {
+            "cmd": "curl -s -H \"X-auth-access-token: $TOKEN\" \"https://fmc.example.com/api/fmc_config/v1/domain/$DOM/devices/devicerecords?expanded=true\" | jq '.items[] | {name, model, sw_version, healthStatus}'",
+            "output": "{\n  \"name\": \"ftd-edge-1\",\n  \"model\": \"Cisco Secure Firewall 3110 Threat Defense\",\n  \"sw_version\": \"7.4.1\",\n  \"healthStatus\": \"green\"\n}"
+          },
+          {
+            "comment": "تقع موارد الإعداد تحت /api/fmc_config/v1/domain/{domainUUID}/، ويعيد expanded=true الكائنات كاملة بدلًا من مراجع إليها."
+          },
+          {
+            "cmd": "curl -s -X POST -H \"X-auth-access-token: $TOKEN\" -H \"Content-Type: application/json\" -d '{\"name\": \"blk-203.0.113.50\", \"type\": \"Host\", \"value\": \"203.0.113.50\", \"description\": \"XDR case 1042\"}' \"https://fmc.example.com/api/fmc_config/v1/domain/$DOM/object/hosts\"",
+            "output": "{\"type\": \"Host\", \"value\": \"203.0.113.50\", \"name\": \"blk-203.0.113.50\", \"id\": \"005056A1-0733-0ed3-0000-004294969331\", ...}"
+          },
+          {
+            "comment": "201 Created: الكائن موجود على FMC فقط، ولا يصل إلى الجدران النارية إلا بعد طلب نشر."
+          }
+        ],
+        "caption": "مخرجات مختبرية مختصرة. معرّف النطاق الظاهر هو معرّف النطاق الافتراضي Global."
+      },
+      {
+        "id": "ise",
+        "type": "text",
+        "markdown": "## واجهات Identity Services Engine (ISE)\n\nتقرّر **ISE** مَن يُسمح له بالانضمام إلى الشبكة وما يُسمح به، مستخدمةً 802.1X وMAB وفحص الامتثال (Posture). وتعرض عدة واجهات برمجة، لكلٍّ منها وظيفة مختلفة:\n\n| الواجهة | النقل | الاستخدام المعتاد |\n|:--|:--|:--|\n| **ERS (خدمات REST الخارجية)** | REST عبر HTTPS على المنفذ **9060** | عمليات CRUD على الأجهزة الطرفية وأجهزة الشبكة والمستخدمين الداخليين ومجموعات الهوية وANC |\n| **OpenAPI** | REST عبر HTTPS 443 تحت `/api/v1/` | مجموعات السياسات وقواعد التفويض والشهادات والنسخ الاحتياطي (ISE 3.1 فما بعدها) |\n| **MnT (المراقبة)** | REST بصيغة XML | الجلسات النشطة وحالة المصادقة وتفاصيل الجلسات |\n| **pxGrid 2.0** | نشر/اشتراك عبر WebSocket إضافةً إلى REST | مشاركة سياق الجلسات وتلقي طلبات ANC من منتجات الشركاء |\n\n### تفعيل ERS وتأمينها\n\nواجهة ERS **معطّلة افتراضيًا**. فعّلها من **Administration > System > Settings > API Settings**، ثم أنشئ حساب مسؤول في مجموعة **ERS Admin** (قراءة وكتابة) أو **ERS Operator** (قراءة فقط). تستخدم الطلبات مصادقة **HTTP Basic** عبر TLS، وتحتاج إلى ضبط الترويستين `Accept` و`Content-Type` على `application/json` (أو XML).\n\n### التحكم التكيّفي في الشبكة (ANC)\n\nيتيح ANC للأتمتة **عزل (Quarantine)** جهاز طرفي. يعرّف المسؤول سياسات ANC مثل `Quarantine` وقاعدة تفويض تطابقها، وعندما يطبّق سكربت السياسة على عنوان MAC، ترسل ISE **تغيير تفويض (CoA)** إلى المبدّل أو وحدة تحكم الشبكة اللاسلكية، فيُعاد تفويضُ الجهاز الطرفي إلى شبكة VLAN مقيّدة أو إلى قائمة تحكم في الوصول قابلة للتنزيل (dACL)."
+      },
+      {
+        "id": "ise-code",
+        "type": "code",
+        "language": "python",
+        "filename": "ise_quarantine.py",
+        "caption": "البحث عن جهاز طرفي عبر ERS وتطبيق سياسة العزل في ANC. يستخدم التحقق من الشهادة حزمة شهادات CA الخاصة بـ ISE.",
+        "code": "import os\nimport requests\n\nISE = \"https://ise.example.com:9060\"                # ERS listens on TCP 9060\nAUTH = (os.environ[\"ISE_ERS_USER\"], os.environ[\"ISE_ERS_PASSWORD\"])\nHDRS = {\"Accept\": \"application/json\", \"Content-Type\": \"application/json\"}\nMAC = \"00:50:56:A1:07:33\"\n\n# Find the endpoint by MAC address (ERS filter syntax: field.OPERATOR.value)\nr = requests.get(f\"{ISE}/ers/config/endpoint\", params={\"filter\": f\"mac.EQ.{MAC}\"},\n                 auth=AUTH, headers=HDRS, timeout=10, verify=\"/etc/ssl/ise-ca.pem\")\nresult = r.json()[\"SearchResult\"]\nprint(\"Matches:\", result[\"total\"])                  # 1\n\n# Apply the ANC \"Quarantine\" policy; ISE then sends a CoA to the switch\nbody = {\"OperationAdditionalData\": {\"additionalData\": [\n    {\"name\": \"macAddress\", \"value\": MAC},\n    {\"name\": \"policyName\", \"value\": \"Quarantine\"}]}}\nr = requests.put(f\"{ISE}/ers/config/ancendpoint/apply\", json=body,\n                 auth=AUTH, headers=HDRS, timeout=10, verify=\"/etc/ssl/ise-ca.pem\")\nprint(r.status_code)                                # 204 No Content = applied",
+        "highlight": [
+          10,
+          19
+        ]
+      },
+      {
+        "id": "soar-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "دليل تشغيل آلي للاحتواء",
+        "caption": "تقرّر XDR، وتحظر FMC الوجهة، وتعزل ISE المصدر، ويسجّل دليل التشغيل كل استدعاء.",
+        "data": {
+          "actors": [
+            {
+              "id": "p",
+              "label": "دليل التشغيل",
+              "sub": "Python أو XDR Automation",
+              "icon": "cpu"
+            },
+            {
+              "id": "x",
+              "label": "Cisco XDR",
+              "sub": "Inspect / Enrich",
+              "icon": "shield"
+            },
+            {
+              "id": "f",
+              "label": "FMC",
+              "sub": "fmc.example.com",
+              "icon": "firewall"
+            },
+            {
+              "id": "i",
+              "label": "ISE",
+              "sub": "ise.example.com",
+              "icon": "lock"
+            },
+            {
+              "id": "s",
+              "label": "مبدّل الوصول",
+              "sub": "Gi1/0/12",
+              "icon": "switch"
+            }
+          ],
+          "steps": [
+            {
+              "from": "p",
+              "to": "x",
+              "label": "POST /inspect",
+              "detail": "نص التنبيه",
+              "note": "يستخرج دليل التشغيل المؤشرات: المضيف الداخلي والعنوان الخارجي."
+            },
+            {
+              "from": "p",
+              "to": "x",
+              "label": "POST /observe/observables",
+              "detail": "ip 203.0.113.50",
+              "note": "تسأل XDR وحداتها المدمجة عمّا تعرفه عن العنوان."
+            },
+            {
+              "from": "x",
+              "to": "p",
+              "label": "الحكم: ضار",
+              "detail": "3 مشاهدات",
+              "tone": "danger",
+              "note": "تتفق عدة وحدات على أن العنوان ضار، فيصبح الاحتواء مبرَّرًا."
+            },
+            {
+              "from": "p",
+              "to": "f",
+              "label": "PUT /object/networkgroups/{id}",
+              "detail": "إضافة blk-203.0.113.50",
+              "tone": "blocked",
+              "note": "يُضاف العنوان إلى مجموعة حظر تستخدمها قاعدة تحكم في الوصول قائمة."
+            },
+            {
+              "from": "p",
+              "to": "f",
+              "label": "POST /deploymentrequests",
+              "detail": "202 Accepted",
+              "note": "يُدفع التغيير إلى أجهزة FTD عبر مهمة نشر غير متزامنة."
+            },
+            {
+              "from": "p",
+              "to": "i",
+              "label": "PUT /ancendpoint/apply",
+              "detail": "Quarantine، 00:50:56:A1:07:33",
+              "tone": "warning",
+              "note": "تَسِم ISE عنوان MAC للحاسوب بسياسة ANC المسمّاة Quarantine."
+            },
+            {
+              "from": "i",
+              "to": "s",
+              "label": "RADIUS CoA",
+              "detail": "إعادة المصادقة",
+              "tone": "secure",
+              "note": "ترسل ISE تغيير تفويض، فيعيد المبدّل مصادقة المنفذ."
+            },
+            {
+              "from": "s",
+              "to": "s",
+              "label": "VLAN العزل",
+              "tone": "success",
+              "note": "لا يصل الحاسوب إلا إلى خدمات المعالجة، ويفتح دليل التشغيل تذكرة للمحلل."
+            }
+          ]
+        }
+      },
+      {
+        "id": "compare",
+        "type": "text",
+        "markdown": "## مقارنة واجهات البرمجة الأمنية\n\n| | Cisco XDR | FMC | ISE ERS |\n|:--|:--|:--|:--|\n| الدور في دليل التشغيل | التحقيق واتخاذ القرار | حظر الحركة | احتواء الجهاز الطرفي |\n| المصادقة | بيانات اعتماد العميل في OAuth 2.0 ورمز Bearer | Basic ثم `X-auth-access-token` | HTTP Basic مع كل طلب |\n| عمر الرمز | نحو 10 دقائق | 30 دقيقة مع ثلاث تجديدات | لا يوجد رمز |\n| سريان التغيير | فوري | بعد النشر | فوري (عبر CoA) |\n\nواجهات البرمجة الأمنية بالغة القوة، فاحمها كما تحمي وحدات تحكم المسؤولين: حسابات مخصصة بأقل الصلاحيات، وأسرار في خزنة، وتحقق من TLS، وسجلات تدقيق. راجع درس [أمن التطبيقات: الأسرار والتشفير ومعالجة البيانات](/learn/network-automation-devops/app-security-secrets-encryption-data-handling) ودرس [رموز استجابة HTTP ومصادقة واجهات البرمجة](/learn/network-automation-devops/http-response-codes-and-api-authentication)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة لدى المتعلمين",
+        "markdown": "- **نسيان النشر في FMC.** لا يغيّر `201 Created` على FMC شيئًا في الجدران النارية حتى تنشر التغيير.\n- **البحث عن رمز FMC في جسم الاستجابة.** إنه في ترويسات استجابة `204`.\n- **استدعاء ERS دون تفعيلها.** ERS معطّلة افتراضيًا، وتحتاج إلى حساب ERS Admin أو ERS Operator.\n- **عملاء API بصلاحيات زائدة.** امنح عميل XDR النطاقات التي يستخدمها دليل التشغيل فقط، ولا تُعِد استخدام حساب مسؤول شخصي أبدًا.\n- **أتمتة الاحتواء بلا ضوابط.** اشترط حكمًا قويًا، واحتفظ بقائمة سماح للأجهزة الحرجة، وسجّل كل إجراء للمراجعة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "اعمل فقط في مختبر أو DevNet Sandbox مصرّح لك باستخدامه، ولا تختبر الاحتواء على أجهزة طرفية في بيئة الإنتاج أبدًا.\n\n1. **FMC:** افتح API Explorer، وولّد رمزًا باستخدام `curl -i`، واسرد سجلات الأجهزة. أنشئ كائن مضيف للعنوان `203.0.113.50` ثم احذفه.\n2. **ISE:** فعّل ERS، وأنشئ حساب ERS Operator، واسرد الأجهزة الطرفية عبر `GET /ers/config/endpoint`. لاحظ ما يحدث عندما يحاول الحساب نفسه تنفيذ `POST`.\n3. **XDR:** أنشئ عميل API بالنطاق `inspect` وحده وشغّل الخطوة 1 من `xdr_enrich.py`، ثم جرّب استدعاء الإثراء ولاحظ خطأ التفويض.\n4. دوّن لكل منصة أين يُعاد الرمز وكم يدوم."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "Cisco XDR",
+            "definition": "منصة Cisco للكشف والاستجابة الموسّعين، تربط بيانات القياس من منتجات أمنية كثيرة وتعرض واجهات Inspect وEnrich وResponse."
+          },
+          {
+            "term": "المؤشر القابل للرصد (Observable)",
+            "definition": "دليل مثل عنوان IP أو نطاق أو رابط أو بصمة ملف، يُعبَّر عنه في XDR بنوع وقيمة."
+          },
+          {
+            "term": "منح بيانات اعتماد العميل (Client credentials grant)",
+            "definition": "تدفق في OAuth 2.0 يستبدل فيه التطبيق بمعرّفه وسرّه رمزَ وصول، دون تدخل أي مستخدم."
+          },
+          {
+            "term": "FMC",
+            "definition": "Secure Firewall Management Center: المدير المركزي لجدران Threat Defense النارية، وله واجهة REST تحت /api/fmc_config/v1."
+          },
+          {
+            "term": "معرّف النطاق (Domain UUID)",
+            "definition": "معرّف نطاق FMC الذي يظهر في كل مسار إعداد ويُعاد عند توليد الرمز."
+          },
+          {
+            "term": "طلب النشر (Deployment request)",
+            "definition": "استدعاء في واجهة FMC يدفع التغييرات المعلّقة إلى الأجهزة المُدارة عبر مهمة غير متزامنة."
+          },
+          {
+            "term": "ERS",
+            "definition": "خدمات REST الخارجية: واجهة REST في ISE على المنفذ TCP 9060 للأجهزة الطرفية وأجهزة الشبكة والمستخدمين والمجموعات وANC."
+          },
+          {
+            "term": "ANC",
+            "definition": "التحكم التكيّفي في الشبكة: ميزة في ISE تطبّق سياسة مثل Quarantine على جهاز طرفي وتستثير إعادة تفويضه."
+          },
+          {
+            "term": "pxGrid",
+            "definition": "Platform Exchange Grid: إطار النشر والاشتراك في ISE لمشاركة السياق مع المنتجات الأمنية الأخرى."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "كيف يحصل سكربت على رمز وصول من Cisco XDR؟",
+            "options": [
+              "HTTP Basic إلى /api/fmc_platform/v1/auth/generatetoken",
+              "منح بيانات اعتماد العميل في OAuth 2.0 إلى /iroh/oauth2/token",
+              "POST /api/aaaLogin.json مع جسم JSON",
+              "مفتاح API يُولَّد من الملف التعريفي للمستخدم"
+            ],
+            "answer": 1,
+            "explanation": "يستخدم عملاء API في XDR منح بيانات اعتماد العميل في OAuth 2.0؛ يُرسَل معرّف العميل وكلمة مروره إلى /iroh/oauth2/token فيعيد رمز Bearer قصير الأمد."
+          },
+          {
+            "question": "ينشئ سكربت كائن مضيف على FMC ويتلقى 201 Created، لكن الجدران النارية ما زالت تسمح بالحركة. ما الناقص؟",
+            "options": [
+              "تجديد الرمز",
+              "طلب نشر",
+              "اشتراك في pxGrid",
+              "تغيير تفويض"
+            ],
+            "answer": 1,
+            "explanation": "تخزّن FMC التغيير لكنها لا تدفعه إلى الأجهزة المُدارة حتى يُطلب النشر ويكتمل."
+          },
+          {
+            "question": "أيّ العبارات الآتية عن واجهة ERS في ISE صحيحة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "معطّلة افتراضيًا",
+              "تستمع على المنفذ TCP 9060",
+              "تستخدم رموز OAuth من نوع Bearer",
+              "تحتاج الحسابات إلى دور ERS Admin أو ERS Operator",
+              "يمكنها تطبيق سياسات ANC على الأجهزة الطرفية"
+            ],
+            "answer": [
+              0,
+              1,
+              3,
+              4
+            ],
+            "explanation": "يجب تفعيل ERS، وهي تستمع على 9060، وتستخدم مصادقة HTTP Basic بحسابات ERS Admin أو ERS Operator، وتتضمن المورد ancendpoint الخاص بـ ANC."
+          },
+          {
+            "question": "أين تعيد FMC رمز الوصول بعد نجاح استدعاء generatetoken؟",
+            "options": [
+              "في جسم JSON تحت access_token",
+              "في ترويسة الاستجابة X-auth-access-token",
+              "في ترويسة Set-Cookie",
+              "في سلسلة الاستعلام في عنوان URL"
+            ],
+            "answer": 1,
+            "explanation": "تردّ FMC بـ 204 No Content وتضع X-auth-access-token وX-auth-refresh-token وDOMAIN_UUID في ترويسات الاستجابة."
+          },
+          {
+            "question": "أيّ الممارسات تجعل الاحتواء الآلي أكثر أمانًا؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "منح عملاء API النطاقات التي يحتاجونها فقط",
+              "استخدام حساب مسؤول شخصي مشترك لكل السكربتات",
+              "اشتراط حكم مؤكَّد قبل الحظر",
+              "تسجيل كل إجراء عبر الواجهة للمراجعة"
+            ],
+            "answer": [
+              0,
+              2,
+              3
+            ],
+            "explanation": "أقل الصلاحيات والقرارات المبنية على الأدلة وسجلات التدقيق تحدّ من أضرار الأخطاء، أمّا الحسابات الشخصية المشتركة فتُضيع المساءلة وتوسّع الصلاحيات."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- تستخدم **Cisco XDR** منح بيانات اعتماد العميل في OAuth 2.0؛ تستخرج Inspect المؤشرات، وتجمع Enrich الأحكام والمشاهدات، وتسرد Response الإجراءات وتنفّذها.\n- تصدر **FMC** الرموز في ترويسات الاستجابة، وتقيّد كل مسار بمعرّف النطاق، وتحدّ معدل العملاء، وتحتاج إلى **نشر** قبل أن تسري التغييرات.\n- توفّر **ISE** واجهات ERS (المنفذ 9060 ومصادقة Basic) وOpenAPI وMnT وpxGrid، ويعزل ANC الجهاز الطرفي عبر CoA.\n- تشكّل المنصات الثلاث معًا دليل احتواء: القرار في XDR، والحظر في FMC، والعزل في ISE.\n\nتابع لتتعلم كيف تُبرمَج الأجهزة نفسها في درس [البرمجة باستخدام YANG وNETCONF وRESTCONF](/learn/network-automation-devops/yang-netconf-and-restconf-programmability)."
+      }
+    ]
+  }
+}

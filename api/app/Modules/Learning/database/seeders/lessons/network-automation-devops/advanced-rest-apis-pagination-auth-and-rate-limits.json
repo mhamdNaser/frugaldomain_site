@@ -1,0 +1,378 @@
+{
+ "slug": "advanced-rest-apis-pagination-auth-and-rate-limits",
+ "title": "Advanced REST APIs: Pagination, Auth and Rate Limits",
+ "summary": "Write API clients that survive production: follow offset, page and cursor pagination, manage tokens and OAuth flows, and respect rate limits with Retry-After and exponential backoff.",
+ "duration_minutes": 40,
+ "objectives": [
+  "Compare offset/limit, page-number and cursor (Link header) pagination and collect a complete result set",
+  "Choose and implement Basic, API key, session token and OAuth 2.0 client credentials authentication",
+  "Cache and refresh tokens correctly and keep secrets out of code",
+  "Handle HTTP 429 using Retry-After, exponential backoff with jitter and client-side throttling",
+  "Decide which failed requests are safe to retry"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "An inventory script works perfectly in the lab, where the Meraki organization has 40 devices. In production it reports exactly 1,000 devices, although the organization has 3,800. The next night it crashes halfway through with `HTTP 429 Too Many Requests`, and a week later every run fails with `401 Unauthorized` after the first hour.\n\nNone of these are bugs in the API. They are three behaviors that every serious REST API has: **pagination**, **authentication with expiring credentials** and **rate limits**. The AUTOCOR 350-901 blueprint expects you to build clients that handle all three. This lesson shows the patterns used by Cisco platform APIs and the Python code that handles them."
+  },
+  {
+   "id": "pagination",
+   "type": "text",
+   "markdown": "## Pagination patterns\n\nAPIs return large collections in **pages** so that a single response stays small and fast. You must keep requesting pages until the collection is exhausted.\n\n| Pattern | How you ask | How you know there is more | Cisco examples |\n|:--|:--|:--|:--|\n| **Offset / limit** | `?offset=501&limit=500` | A full page came back; keep going until a page is shorter than `limit` | Catalyst Center intent API (`offset` starts at 1) |\n| **Page number / size** | `?page=2&size=100` | The body contains a total or a `nextPage` link | ISE ERS API (`SearchResult` with `nextPage`) |\n| **Cursor / Link header** | `?perPage=1000&startingAfter=<id>` | An HTTP `Link` header with `rel=next` (RFC 8288) | Meraki Dashboard API, Webex APIs |\n\n### Offsets versus cursors\n\nOffset pagination is easy to reason about, but it is **unstable** while data changes. If a device is added at position 10 while you read page 2, every later item shifts by one, and you can skip or duplicate a record. A **cursor** points to a specific item (\"start after device Q2XX-AAAA-0003\"), so inserts elsewhere do not disturb it.\n\nWith a Link header you should **not build the next URL yourself**. Follow the `next` URL exactly as the server sends it. The Python `requests` library parses the header for you into `resp.links`.\n\nBefore paging through everything, check whether the API can **filter** on the server (for example `?family=Switches%20and%20Hubs` on Catalyst Center or `productTypes[]=switch` on Meraki). Fewer pages also means fewer requests against the rate limit."
+  },
+  {
+   "id": "auth",
+   "type": "text",
+   "markdown": "## Authentication patterns\n\n| Method | How it works | Cisco examples |\n|:--|:--|:--|\n| **HTTP Basic** | Username and password, Base64-encoded, on every request | RESTCONF on IOS XE, ISE ERS |\n| **API key / bearer token** | A long-lived key in a header | Meraki: `Authorization: Bearer <api-key>` |\n| **Session token** | Log in once with Basic auth and receive a short-lived token | Catalyst Center: `POST /dna/system/api/v1/auth/token`, then `X-Auth-Token`; FMC: `generatetoken`, then `X-auth-access-token` |\n| **OAuth 2.0 client credentials** | Exchange a client ID and secret for an access token at a token endpoint | Cisco XDR and Secure Endpoint API clients |\n| **OAuth 2.0 authorization code** | A user signs in and consents; the app receives tokens on the user's behalf | Webex integrations |\n\n### Handling tokens correctly\n\n- **Reuse** the token for its whole lifetime. Logging in before every request is slow and may itself be rate-limited. Catalyst Center tokens, for example, are valid for about an hour.\n- **Refresh early.** Track the expiry time (`expires_in` in OAuth responses) and renew shortly before it.\n- **On 401, refresh once and retry once.** If the retry also fails, stop: the credentials are wrong or have been revoked.\n- **Never hard-code secrets.** Read them from environment variables, a vault or CI/CD protected variables, and never log `Authorization` headers.\n- Always use HTTPS with certificate verification. A bearer token sent over plain HTTP, or to a server you do not verify, can be stolen and replayed."
+  },
+  {
+   "id": "api-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "A robust client talks to Catalyst Center",
+   "caption": "Token reuse, offset pagination, a rate-limit pause and a token refresh in one run.",
+   "data": {
+    "actors": [
+     { "id": "c", "label": "Inventory script", "sub": "Python requests", "icon": "laptop" },
+     { "id": "s", "label": "Catalyst Center", "sub": "catc.example.com", "icon": "server" }
+    ],
+    "steps": [
+     { "from": "c", "to": "s", "label": "POST /auth/token", "detail": "Basic auth", "note": "The script logs in once with Basic authentication over HTTPS.", "tone": "secure" },
+     { "from": "s", "to": "c", "label": "200 {\"Token\": ...}", "detail": "valid about 60 min", "note": "The token is cached and sent as X-Auth-Token on every request.", "tone": "success" },
+     { "from": "c", "to": "s", "label": "GET network-device", "detail": "offset=1&limit=500", "note": "The first page is requested." },
+     { "from": "s", "to": "c", "label": "200, 500 items", "detail": "a full page", "note": "A full page means there may be more, so the offset moves to 501." },
+     { "from": "c", "to": "s", "label": "GET network-device", "detail": "offset=501&limit=500", "note": "The script asks for the second page." },
+     { "from": "s", "to": "c", "label": "429 Too Many Requests", "detail": "Retry-After: 2", "note": "The server is protecting itself. The script must slow down, not give up.", "tone": "warning" },
+     { "from": "c", "to": "c", "label": "Wait 2 s + jitter", "note": "The script honors Retry-After and adds a small random delay." },
+     { "from": "c", "to": "s", "label": "GET network-device", "detail": "offset=501&limit=500", "note": "A GET is safe to repeat, so the same request is retried." },
+     { "from": "s", "to": "c", "label": "200, 312 items", "detail": "shorter than limit", "note": "A short page means the collection is complete: 812 devices in total.", "tone": "success" },
+     { "from": "s", "to": "c", "label": "401 on a later call", "detail": "token expired", "note": "The script renews the token once and retries; a second 401 would stop the run.", "tone": "danger" }
+    ]
+   }
+  },
+  {
+   "id": "ratelimits",
+   "type": "text",
+   "markdown": "## Rate limits\n\nA **rate limit** caps how many requests a client may send in a time window, so that one script cannot overload a shared controller. Meraki, for example, allows about 10 requests per second per organization, with a short burst allowance. When you exceed a limit, the server answers **`429 Too Many Requests`**, usually with a **`Retry-After`** header that gives the number of seconds to wait. Some APIs also return headers such as `X-RateLimit-Remaining` so that clients can slow down before they hit the limit.\n\nA well-behaved client:\n\n1. **Honors `Retry-After`** when it is present.\n2. Otherwise uses **exponential backoff with jitter**: wait 1, 2, 4, 8 seconds plus a random fraction, up to a cap. Jitter stops many workers from retrying at the same instant.\n3. **Limits concurrency.** Ten threads hammering one organization will all be throttled. Use a small worker pool or a token-bucket throttle.\n4. **Reduces the number of calls** with server-side filters, bulk endpoints (Meraki action batches, for example) and caching of data that rarely changes.\n5. **Gives up eventually** with a clear error, rather than looping forever.\n\n### Which failures are safe to retry?\n\n| Response | Retry? |\n|:--|:--|\n| `429`, `503` | Yes, after `Retry-After` or backoff |\n| `500`, `502`, `504`, timeouts | Yes for **idempotent** methods (GET, PUT, DELETE); be careful with POST, which may create a duplicate |\n| `401` | Refresh the token once, then stop |\n| `400`, `403`, `404`, `422` | No: the request itself is wrong, so fix the request |"
+  },
+  {
+   "id": "curl-terminal",
+   "type": "terminal",
+   "title": "Inspecting pagination and limits with curl -i",
+   "prompt": "$",
+   "lines": [
+    { "comment": "Catalyst Center: obtain a session token (credentials come from environment variables)" },
+    { "cmd": "curl -s -X POST -u \"$CATC_USER:$CATC_PASS\" https://catc.example.com/dna/system/api/v1/auth/token", "output": "{\"Token\":\"eyJhbGciOiJSUzI1NiIs...<redacted>\"}" },
+    { "comment": "Meraki: -i shows the response headers, including the Link header" },
+    { "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3\"", "output": "HTTP/2 200\ncontent-type: application/json; charset=utf-8\nlink: <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=0000-0000-0000>; rel=first, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=Q2XX-AAAA-0003>; rel=next, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&endingBefore=zzzz-zzzz-zzzz>; rel=last\n\n[{\"serial\":\"Q2XX-AAAA-0001\",...},{\"serial\":\"Q2XX-AAAA-0002\",...},{\"serial\":\"Q2XX-AAAA-0003\",...}]" },
+    { "comment": "rel=next carries the cursor: start after the last serial on this page" },
+    { "comment": "Too many calls in a tight loop:" },
+    { "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/networks\"", "output": "HTTP/2 429\nretry-after: 1\ncontent-type: application/json; charset=utf-8\n\n{\"errors\":[\"API rate limit exceeded for organization\"]}" },
+    { "comment": "Wait at least the Retry-After value (seconds) before trying again" }
+   ],
+   "caption": "The exact error text varies by platform; the status code and the Retry-After header are what your code should act on."
+  },
+  {
+   "id": "client-code",
+   "type": "code",
+   "language": "python",
+   "filename": "meraki_inventory.py",
+   "caption": "One session, a bearer key from the environment, Link-header pagination and retries that honor Retry-After with exponential backoff and jitter. Meraki sends Retry-After in seconds; some APIs send an HTTP date instead.",
+   "highlight": [14, 15, 16, 17, 30],
+   "code": "import os\nimport random\nimport time\n\nimport requests\n\nBASE = \"https://api.meraki.com/api/v1\"\nsession = requests.Session()\nsession.headers.update({\n    \"Authorization\": f\"Bearer {os.environ['MERAKI_API_KEY']}\",\n    \"Accept\": \"application/json\",\n})\n\ndef get_with_retry(url, params=None, max_tries=5):\n    for attempt in range(max_tries):\n        resp = session.get(url, params=params, timeout=15)\n        if resp.status_code == 429 or resp.status_code >= 500:\n            wait = float(resp.headers.get(\"Retry-After\", 2 ** attempt))\n            time.sleep(min(wait, 60) + random.uniform(0, 0.5))\n            continue\n        resp.raise_for_status()   # 4xx errors are not retried\n        return resp\n    raise RuntimeError(f\"Gave up after {max_tries} attempts: {url}\")\n\ndef get_all(path, per_page=1000):\n    url, params, items = f\"{BASE}{path}\", {\"perPage\": per_page}, []\n    while url:\n        resp = get_with_retry(url, params)\n        items.extend(resp.json())\n        url = resp.links.get(\"next\", {}).get(\"url\")\n        params = None   # the next URL already carries the cursor\n    return items\n\ndevices = get_all(\"/organizations/123456/devices\")\nprint(f\"Collected {len(devices)} devices\")"
+  },
+  {
+   "id": "sdk-note",
+   "type": "callout",
+   "variant": "note",
+   "title": "SDKs do much of this for you",
+   "markdown": "The official Meraki Python library (`meraki`) can follow pages with `total_pages='all'` and retries 429 responses automatically. The Catalyst Center SDK (`dnacentersdk`) renews tokens for you. Use SDKs where they exist, but understand the underlying behavior: the exam tests the HTTP mechanics, and you will need them when an SDK does not cover an endpoint."
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Mistakes that pass in the lab and fail in production",
+   "markdown": "- Reading only the first page because the lab never had more than one.\n- Retrying a POST that creates objects after a timeout, and creating duplicates. Check whether the object exists first, or use an idempotent PUT.\n- Retrying immediately in a tight loop, which turns one 429 into hundreds.\n- Printing the full request for debugging and leaking the API key into CI logs."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. Use the Cisco DevNet Meraki sandbox or your own organization, and store the key in an environment variable: `export MERAKI_API_KEY=<your-key>`.\n2. Run the `curl -i ... ?perPage=3` request and identify the `rel=next` URL in the `link` header.\n3. Run `meraki_inventory.py` with `per_page=3` and confirm that the total matches the device count in the dashboard.\n4. Add a counter for 429 responses and a log line that shows each wait time. Run two copies of the script at once and watch the backoff work.\n5. Send requests only to organizations you are authorized to use."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    { "term": "Pagination", "definition": "Returning a large collection in a series of smaller pages that the client requests in turn." },
+    { "term": "Offset / limit", "definition": "Pagination by item position and page size, such as offset=501&limit=500." },
+    { "term": "Cursor", "definition": "An opaque pointer to a position in a collection, stable even when items are added elsewhere." },
+    { "term": "Link header", "definition": "An HTTP header (RFC 8288) that carries URLs such as rel=next and rel=last for navigating pages." },
+    { "term": "Bearer token", "definition": "A credential sent as Authorization: Bearer <token>; anyone who holds it can use it." },
+    { "term": "OAuth 2.0 client credentials", "definition": "A flow in which an application exchanges its client ID and secret for a short-lived access token." },
+    { "term": "Rate limit", "definition": "A cap on the number of requests a client may send in a time window." },
+    { "term": "HTTP 429 and Retry-After", "definition": "The Too Many Requests status code, and the header that tells the client how long to wait." },
+    { "term": "Exponential backoff with jitter", "definition": "Retry delays that double after each failure, plus a random component so that clients do not retry in sync." }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "A Meraki response includes a Link header with rel=next. What should your client do?",
+     "options": [
+      "Increase an offset parameter by the page size",
+      "Request the rel=next URL exactly as given, until no rel=next is returned",
+      "Stop, because the first page contains all items",
+      "Request rel=last first to count the items"
+     ],
+     "answer": 1,
+     "explanation": "Cursor pagination encodes the position in the URL. Follow rel=next as sent, and stop when the header no longer contains it."
+    },
+    {
+     "question": "Why can offset pagination skip or duplicate records?",
+     "options": [
+      "Offsets are limited to 100 items",
+      "Items added or removed during the read shift the positions of later items",
+      "Offsets require OAuth",
+      "Servers ignore the limit parameter"
+     ],
+     "answer": 1,
+     "explanation": "Offsets are positions. If the collection changes between page requests, items move across page boundaries. Cursors point to a specific item and avoid this."
+    },
+    {
+     "question": "Your script receives HTTP 429 with Retry-After: 5. What is the correct behavior?",
+     "options": [
+      "Retry immediately up to 100 times",
+      "Treat it as a fatal error and exit",
+      "Wait at least 5 seconds, then retry, and limit the total number of attempts",
+      "Log in again to get a new token"
+     ],
+     "answer": 2,
+     "explanation": "429 means slow down. Honor Retry-After, add jitter if many workers run, and give up with a clear error after a bounded number of attempts."
+    },
+    {
+     "question": "Which practices are correct for session tokens such as the Catalyst Center X-Auth-Token? (Choose all that apply.)",
+     "options": [
+      "Reuse the token until shortly before it expires",
+      "Request a new token before every API call",
+      "On a 401, refresh the token once and retry once",
+      "Store credentials in environment variables or a vault, not in the script"
+     ],
+     "answer": [0, 2, 3],
+     "explanation": "Tokens are meant to be reused for their lifetime. A single refresh on 401 handles expiry, and secrets stay outside the code. Logging in before every call is slow and can itself be throttled."
+    },
+    {
+     "question": "Which failed requests are generally safe to retry automatically? (Choose all that apply.)",
+     "options": [
+      "A GET that returned 503",
+      "A PUT that timed out",
+      "A POST that returned 400 Bad Request",
+      "A GET that returned 429"
+     ],
+     "answer": [0, 1, 3],
+     "explanation": "429 and 503 are temporary, and GET and PUT are idempotent, so repeating them is safe. A 400 means the request is wrong and will fail again until it is fixed."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- APIs paginate with **offset/limit**, **page/size** or **cursors in a Link header**. Loop until the collection is exhausted, follow `rel=next` as sent, and filter on the server where you can.\n- Authentication ranges from **Basic** and **API keys** to **session tokens** and **OAuth 2.0**. Reuse tokens, refresh them early, refresh once on 401 and keep secrets out of code and logs.\n- On **429**, honor **Retry-After**, otherwise use **exponential backoff with jitter**, limit concurrency and give up after a bounded number of attempts.\n- Retry only temporary errors, and only **idempotent** requests without extra checks.\n\nNext, apply these patterns to configuration APIs in [RESTCONF with YANG Models](/learn/network-automation-devops/restconf-with-yang-models)."
+  }
+ ],
+ "ar": {
+  "title": "واجهات REST API المتقدمة: ترقيم الصفحات والمصادقة وحدود المعدّل",
+  "summary": "اكتب عملاء API يصمدون في بيئة الإنتاج: تتبّع ترقيم الصفحات بالإزاحة ورقم الصفحة والمؤشّر، وأدِر الرموز المميّزة وتدفّقات OAuth، واحترم حدود المعدّل باستخدام Retry-After والتراجع الأسّي.",
+  "objectives": [
+   "المقارنة بين ترقيم الصفحات بالإزاحة والحد، وبرقم الصفحة، وبالمؤشّر (ترويسة Link)، وجمع مجموعة النتائج كاملة",
+   "اختيار المصادقة الأساسية ومفتاح API ورمز الجلسة وبيانات اعتماد العميل في OAuth 2.0 وتطبيقها",
+   "تخزين الرموز المميّزة مؤقتًا وتجديدها بشكل صحيح وإبعاد الأسرار عن الشيفرة",
+   "معالجة الاستجابة HTTP 429 باستخدام Retry-After والتراجع الأسّي مع العشوائية والتقييد من جهة العميل",
+   "تحديد الطلبات الفاشلة التي تجوز إعادة محاولتها بأمان"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يعمل سكربت جرد الأجهزة بإتقان في المختبر، حيث تضم مؤسسة Meraki أربعين جهازًا. أما في الإنتاج فيُبلغ عن 1000 جهاز بالضبط، مع أن المؤسسة تضم 3800 جهاز. وفي الليلة التالية يتعطّل في منتصف التشغيل بالخطأ `HTTP 429 Too Many Requests`، وبعد أسبوع يفشل كل تشغيل بالخطأ `401 Unauthorized` بعد الساعة الأولى.\n\nلا شيء من ذلك خللٌ في واجهة API، بل هي ثلاثة سلوكيات تتّسم بها كل واجهة REST جادّة: **ترقيم الصفحات (Pagination)**، و**المصادقة ببيانات اعتماد تنتهي صلاحيتها**، و**حدود المعدّل (Rate Limits)**. ويتوقّع مخطط اختبار AUTOCOR 350-901 أن تبني عملاء يتعاملون مع الثلاثة جميعًا. يعرض هذا الدرس الأنماط التي تستخدمها واجهات منصات Cisco، وشيفرة Python التي تعالجها."
+   },
+   {
+    "id": "pagination",
+    "type": "text",
+    "markdown": "## أنماط ترقيم الصفحات\n\nتُعيد واجهات API المجموعات الكبيرة على شكل **صفحات** كي تبقى كل استجابة صغيرة وسريعة، وعليك أن تواصل طلب الصفحات حتى تنفد المجموعة.\n\n| النمط | كيف تطلب | كيف تعرف أن هناك المزيد | أمثلة من Cisco |\n|:--|:--|:--|:--|\n| **الإزاحة والحد (Offset / Limit)** | `?offset=501&limit=500` | عادت صفحة كاملة؛ تابع حتى تعود صفحة أقصر من `limit` | واجهة intent في Catalyst Center (يبدأ `offset` من 1) |\n| **رقم الصفحة وحجمها** | `?page=2&size=100` | يحوي جسم الاستجابة إجماليًا أو رابط `nextPage` | واجهة ISE ERS (`SearchResult` مع `nextPage`) |\n| **المؤشّر وترويسة Link** | `?perPage=1000&startingAfter=<id>` | ترويسة HTTP باسم `Link` فيها `rel=next` (وفق RFC 8288) | واجهة Meraki Dashboard API وواجهات Webex |\n\n### الإزاحة مقابل المؤشّر\n\nترقيم الصفحات بالإزاحة سهل الفهم، لكنه **غير مستقر** حين تتغيّر البيانات. فإذا أُضيف جهاز في الموضع العاشر بينما تقرأ الصفحة الثانية، انزاح كل عنصر لاحق بمقدار واحد، وقد تتخطّى سجلًا أو تكرّره. أما **المؤشّر (Cursor)** فيشير إلى عنصر محدّد («ابدأ بعد الجهاز Q2XX-AAAA-0003»)، فلا تؤثّر فيه الإضافات في مواضع أخرى.\n\nومع ترويسة Link **لا تبنِ عنوان الصفحة التالية بنفسك**، بل اتبع عنوان `next` كما يرسله الخادم تمامًا. وتحلّل مكتبة `requests` في Python هذه الترويسة نيابةً عنك وتضعها في `resp.links`.\n\nوقبل أن تتصفّح كل شيء، تحقّق مما إذا كانت الواجهة تدعم **التصفية** على الخادم (مثل `?family=Switches%20and%20Hubs` في Catalyst Center أو `productTypes[]=switch` في Meraki). فقلّة الصفحات تعني أيضًا طلبات أقل تُحتسب من حد المعدّل."
+   },
+   {
+    "id": "auth",
+    "type": "text",
+    "markdown": "## أنماط المصادقة\n\n| الطريقة | آلية عملها | أمثلة من Cisco |\n|:--|:--|:--|\n| **المصادقة الأساسية (HTTP Basic)** | اسم مستخدم وكلمة مرور بترميز Base64 مع كل طلب | RESTCONF على IOS XE، وISE ERS |\n| **مفتاح API / رمز حامل (Bearer Token)** | مفتاح طويل الأمد في ترويسة | Meraki: `Authorization: Bearer <api-key>` |\n| **رمز الجلسة (Session Token)** | تسجيل الدخول مرة واحدة بالمصادقة الأساسية واستلام رمز قصير الأمد | Catalyst Center: `POST /dna/system/api/v1/auth/token` ثم `X-Auth-Token`؛ وFMC: `generatetoken` ثم `X-auth-access-token` |\n| **بيانات اعتماد العميل في OAuth 2.0 (Client Credentials)** | مبادلة معرّف العميل وسرّه برمز وصول من نقطة نهاية الرموز | عملاء API في Cisco XDR وSecure Endpoint |\n| **رمز التفويض في OAuth 2.0 (Authorization Code)** | يسجّل المستخدم دخوله ويوافق، فيتلقّى التطبيق رموزًا نيابةً عنه | تكاملات Webex |\n\n### التعامل الصحيح مع الرموز المميّزة\n\n- **أعد استخدام** الرمز طوال مدة صلاحيته. فتسجيل الدخول قبل كل طلب بطيء، وقد يخضع هو نفسه لحد المعدّل. فرموز Catalyst Center مثلًا صالحة لنحو ساعة.\n- **جدّد مبكرًا.** تتبّع وقت الانتهاء (`expires_in` في استجابات OAuth) وجدّد الرمز قبله بقليل.\n- **عند 401 جدّد مرة واحدة وأعد المحاولة مرة واحدة.** فإن فشلت الإعادة أيضًا فتوقّف؛ لأن بيانات الاعتماد خاطئة أو أُلغيت.\n- **لا تكتب الأسرار في الشيفرة أبدًا.** اقرأها من متغيرات البيئة أو من خزنة أسرار (Vault) أو من المتغيرات المحمية في CI/CD، ولا تسجّل ترويسات `Authorization` في السجلات.\n- استخدم دائمًا HTTPS مع التحقق من الشهادة. فالرمز الحامل المرسل عبر HTTP غير المشفّر، أو إلى خادم لم تتحقّق منه، يمكن سرقته وإعادة استخدامه."
+   },
+   {
+    "id": "api-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "عميل متين يتحاور مع Catalyst Center",
+    "caption": "إعادة استخدام الرمز وترقيم الصفحات بالإزاحة والتوقّف بسبب حد المعدّل وتجديد الرمز في تشغيل واحد.",
+    "data": {
+     "actors": [
+      { "id": "c", "label": "سكربت الجرد", "sub": "Python requests", "icon": "laptop" },
+      { "id": "s", "label": "Catalyst Center", "sub": "catc.example.com", "icon": "server" }
+     ],
+     "steps": [
+      { "from": "c", "to": "s", "label": "POST /auth/token", "detail": "مصادقة أساسية", "note": "يسجّل السكربت دخوله مرة واحدة بالمصادقة الأساسية عبر HTTPS.", "tone": "secure" },
+      { "from": "s", "to": "c", "label": "200 {\"Token\": ...}", "detail": "صالح نحو 60 دقيقة", "note": "يُخزَّن الرمز مؤقتًا ويُرسل في الترويسة X-Auth-Token مع كل طلب.", "tone": "success" },
+      { "from": "c", "to": "s", "label": "GET network-device", "detail": "offset=1&limit=500", "note": "يُطلب أول صفحة." },
+      { "from": "s", "to": "c", "label": "200، 500 عنصر", "detail": "صفحة كاملة", "note": "الصفحة الكاملة تعني احتمال وجود المزيد، فتنتقل الإزاحة إلى 501." },
+      { "from": "c", "to": "s", "label": "GET network-device", "detail": "offset=501&limit=500", "note": "يطلب السكربت الصفحة الثانية." },
+      { "from": "s", "to": "c", "label": "429 Too Many Requests", "detail": "Retry-After: 2", "note": "الخادم يحمي نفسه، وعلى السكربت أن يُبطئ لا أن يستسلم.", "tone": "warning" },
+      { "from": "c", "to": "c", "label": "انتظار ثانيتين + عشوائية", "note": "يحترم السكربت قيمة Retry-After ويضيف تأخيرًا عشوائيًا صغيرًا." },
+      { "from": "c", "to": "s", "label": "GET network-device", "detail": "offset=501&limit=500", "note": "طلب GET آمن التكرار، فيُعاد الطلب نفسه." },
+      { "from": "s", "to": "c", "label": "200، 312 عنصرًا", "detail": "أقصر من الحد", "note": "الصفحة القصيرة تعني اكتمال المجموعة: 812 جهازًا إجمالًا.", "tone": "success" },
+      { "from": "s", "to": "c", "label": "401 في طلب لاحق", "detail": "انتهت صلاحية الرمز", "note": "يجدّد السكربت الرمز مرة واحدة ويعيد المحاولة، أما 401 ثانية فتوقف التشغيل.", "tone": "danger" }
+     ]
+    }
+   },
+   {
+    "id": "ratelimits",
+    "type": "text",
+    "markdown": "## حدود المعدّل\n\n**حد المعدّل** سقفٌ لعدد الطلبات التي يجوز للعميل إرسالها في نافذة زمنية، كي لا يُثقل سكربت واحد وحدة تحكّم مشتركة. فـ Meraki مثلًا تسمح بنحو 10 طلبات في الثانية لكل مؤسسة، مع هامش قصير للاندفاع (Burst). وحين تتجاوز الحد يجيب الخادم بالرمز **`429 Too Many Requests`**، ويرفق عادةً ترويسة **`Retry-After`** تحدّد عدد الثواني الواجب انتظارها. وتُعيد بعض الواجهات أيضًا ترويسات مثل `X-RateLimit-Remaining` ليُبطئ العميل قبل بلوغ الحد.\n\nالعميل المنضبط:\n\n1. **يحترم `Retry-After`** حين تكون موجودة.\n2. وإلا يستخدم **التراجع الأسّي مع العشوائية (Exponential Backoff with Jitter)**: ينتظر 1 ثم 2 ثم 4 ثم 8 ثوانٍ مع كسر عشوائي، حتى سقف معيّن. وتمنع العشوائية عمّالًا كثيرين من إعادة المحاولة في اللحظة نفسها.\n3. **يقيّد التزامن.** عشرة خيوط تقصف مؤسسة واحدة ستُقيَّد كلها، فاستخدم مجموعة عمّال صغيرة أو مُقيِّدًا بأسلوب دلو الرموز (Token Bucket).\n4. **يقلّل عدد الاستدعاءات** بالتصفية على الخادم، ونقاط النهاية المجمّعة (مثل Action Batches في Meraki)، والتخزين المؤقت للبيانات التي نادرًا ما تتغيّر.\n5. **يستسلم في النهاية** برسالة خطأ واضحة بدلًا من الدوران بلا نهاية.\n\n### أي الإخفاقات تجوز إعادة محاولتها؟\n\n| الاستجابة | هل تُعاد المحاولة؟ |\n|:--|:--|\n| `429` و`503` | نعم، بعد `Retry-After` أو التراجع |\n| `500` و`502` و`504` وانتهاء المهلة | نعم للطرق **متساوية الأثر (Idempotent)** (GET وPUT وDELETE)؛ واحذر مع POST الذي قد يُنشئ نسخة مكرّرة |\n| `401` | جدّد الرمز مرة واحدة ثم توقّف |\n| `400` و`403` و`404` و`422` | لا: الطلب نفسه خاطئ، فأصلحه |"
+   },
+   {
+    "id": "curl-terminal",
+    "type": "terminal",
+    "title": "فحص ترقيم الصفحات والحدود باستخدام curl -i",
+    "prompt": "$",
+    "lines": [
+     { "comment": "Catalyst Center: الحصول على رمز جلسة (بيانات الاعتماد من متغيرات البيئة)" },
+     { "cmd": "curl -s -X POST -u \"$CATC_USER:$CATC_PASS\" https://catc.example.com/dna/system/api/v1/auth/token", "output": "{\"Token\":\"eyJhbGciOiJSUzI1NiIs...<redacted>\"}" },
+     { "comment": "Meraki: يعرض الخيار -i ترويسات الاستجابة، ومنها ترويسة Link" },
+     { "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3\"", "output": "HTTP/2 200\ncontent-type: application/json; charset=utf-8\nlink: <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=0000-0000-0000>; rel=first, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=Q2XX-AAAA-0003>; rel=next, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&endingBefore=zzzz-zzzz-zzzz>; rel=last\n\n[{\"serial\":\"Q2XX-AAAA-0001\",...},{\"serial\":\"Q2XX-AAAA-0002\",...},{\"serial\":\"Q2XX-AAAA-0003\",...}]" },
+     { "comment": "يحمل rel=next المؤشّر: ابدأ بعد آخر رقم تسلسلي في هذه الصفحة" },
+     { "comment": "استدعاءات كثيرة جدًا في حلقة متلاحقة:" },
+     { "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/networks\"", "output": "HTTP/2 429\nretry-after: 1\ncontent-type: application/json; charset=utf-8\n\n{\"errors\":[\"API rate limit exceeded for organization\"]}" },
+     { "comment": "انتظر على الأقل قيمة Retry-After (بالثواني) قبل المحاولة مجددًا" }
+    ],
+    "caption": "يختلف نص الخطأ الدقيق من منصة إلى أخرى؛ أما ما يجب أن تتصرّف شيفرتك بناءً عليه فهو رمز الحالة وترويسة Retry-After."
+   },
+   {
+    "id": "client-code",
+    "type": "code",
+    "language": "python",
+    "filename": "meraki_inventory.py",
+    "caption": "جلسة واحدة، ومفتاح حامل من متغيرات البيئة، وترقيم صفحات بترويسة Link، وإعادة محاولات تحترم Retry-After مع تراجع أسّي وعشوائية. ترسل Meraki قيمة Retry-After بالثواني، وبعض الواجهات ترسل تاريخ HTTP بدلًا منها.",
+    "highlight": [14, 15, 16, 17, 30],
+    "code": "import os\nimport random\nimport time\n\nimport requests\n\nBASE = \"https://api.meraki.com/api/v1\"\nsession = requests.Session()\nsession.headers.update({\n    \"Authorization\": f\"Bearer {os.environ['MERAKI_API_KEY']}\",\n    \"Accept\": \"application/json\",\n})\n\ndef get_with_retry(url, params=None, max_tries=5):\n    for attempt in range(max_tries):\n        resp = session.get(url, params=params, timeout=15)\n        if resp.status_code == 429 or resp.status_code >= 500:\n            wait = float(resp.headers.get(\"Retry-After\", 2 ** attempt))\n            time.sleep(min(wait, 60) + random.uniform(0, 0.5))\n            continue\n        resp.raise_for_status()   # 4xx errors are not retried\n        return resp\n    raise RuntimeError(f\"Gave up after {max_tries} attempts: {url}\")\n\ndef get_all(path, per_page=1000):\n    url, params, items = f\"{BASE}{path}\", {\"perPage\": per_page}, []\n    while url:\n        resp = get_with_retry(url, params)\n        items.extend(resp.json())\n        url = resp.links.get(\"next\", {}).get(\"url\")\n        params = None   # the next URL already carries the cursor\n    return items\n\ndevices = get_all(\"/organizations/123456/devices\")\nprint(f\"Collected {len(devices)} devices\")"
+   },
+   {
+    "id": "sdk-note",
+    "type": "callout",
+    "variant": "note",
+    "title": "حِزم SDK تؤدي كثيرًا من ذلك عنك",
+    "markdown": "تستطيع مكتبة Meraki الرسمية في Python (`meraki`) تتبّع الصفحات بالخيار `total_pages='all'`، وتعيد محاولة استجابات 429 تلقائيًا. وتجدّد حزمة Catalyst Center (`dnacentersdk`) الرموز نيابةً عنك. استخدم حِزم SDK حيث وُجدت، لكن افهم السلوك الكامن تحتها؛ فالاختبار يقيس آليات HTTP، وستحتاج إليها حين لا تغطّي الحزمة نقطة نهاية ما."
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء تمرّ في المختبر وتفشل في الإنتاج",
+    "markdown": "- قراءة الصفحة الأولى فقط لأن المختبر لم يحوِ أكثر من صفحة قط.\n- إعادة محاولة طلب POST يُنشئ كائنات بعد انتهاء المهلة، وإنشاء نسخ مكرّرة. تحقّق أولًا من وجود الكائن، أو استخدم PUT متساوي الأثر.\n- إعادة المحاولة فورًا في حلقة متلاحقة، فيتحوّل خطأ 429 واحد إلى مئات.\n- طباعة الطلب كاملًا لأغراض التنقيح وتسريب مفتاح API إلى سجلات CI."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. استخدم بيئة Meraki التجريبية (Sandbox) في Cisco DevNet أو مؤسستك الخاصة، واحفظ المفتاح في متغير بيئة: `export MERAKI_API_KEY=<your-key>`.\n2. نفّذ الطلب `curl -i ... ?perPage=3` وحدّد عنوان `rel=next` في ترويسة `link`.\n3. شغّل `meraki_inventory.py` مع `per_page=3` وتأكّد من أن الإجمالي يطابق عدد الأجهزة في لوحة التحكم.\n4. أضف عدّادًا لاستجابات 429 وسطر سجل يعرض كل مدة انتظار. شغّل نسختين من السكربت معًا وراقب عمل التراجع.\n5. أرسل الطلبات فقط إلى مؤسسات مخوَّل باستخدامها."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     { "term": "ترقيم الصفحات (Pagination)", "definition": "إعادة مجموعة كبيرة على شكل سلسلة من الصفحات الأصغر يطلبها العميل تباعًا." },
+     { "term": "الإزاحة والحد (Offset / Limit)", "definition": "ترقيم الصفحات بموضع العنصر وحجم الصفحة، مثل offset=501&limit=500." },
+     { "term": "المؤشّر (Cursor)", "definition": "مرجع مُعتِم إلى موضع في المجموعة، يبقى مستقرًا حتى لو أُضيفت عناصر في مواضع أخرى." },
+     { "term": "ترويسة Link", "definition": "ترويسة HTTP (وفق RFC 8288) تحمل عناوين مثل rel=next وrel=last للتنقّل بين الصفحات." },
+     { "term": "الرمز الحامل (Bearer Token)", "definition": "بيانات اعتماد تُرسل بصيغة Authorization: Bearer <token>، ويستطيع استخدامها كل من يحوزها." },
+     { "term": "بيانات اعتماد العميل في OAuth 2.0", "definition": "تدفّق يبادل فيه التطبيق معرّف العميل وسرّه برمز وصول قصير الأمد." },
+     { "term": "حد المعدّل (Rate Limit)", "definition": "سقف لعدد الطلبات التي يجوز للعميل إرسالها في نافذة زمنية." },
+     { "term": "HTTP 429 وRetry-After", "definition": "رمز الحالة Too Many Requests، والترويسة التي تخبر العميل بمدة الانتظار." },
+     { "term": "التراجع الأسّي مع العشوائية", "definition": "مُهَل لإعادة المحاولة تتضاعف بعد كل إخفاق، مع مكوّن عشوائي كي لا يعيد العملاء المحاولة متزامنين." }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "تتضمّن استجابة من Meraki ترويسة Link فيها rel=next. ماذا يجب أن يفعل العميل؟",
+      "options": [
+       "زيادة معامل الإزاحة بمقدار حجم الصفحة",
+       "طلب عنوان rel=next كما ورد تمامًا، حتى لا يعود rel=next",
+       "التوقّف، لأن الصفحة الأولى تحوي كل العناصر",
+       "طلب rel=last أولًا لعدّ العناصر"
+      ],
+      "answer": 1,
+      "explanation": "يُرمِّز ترقيم الصفحات بالمؤشّر الموضعَ داخل العنوان. اتبع rel=next كما أُرسل، وتوقّف حين تخلو الترويسة منه."
+     },
+     {
+      "question": "لماذا قد يتخطّى ترقيم الصفحات بالإزاحة سجلات أو يكرّرها؟",
+      "options": [
+       "لأن الإزاحة محدودة بمئة عنصر",
+       "لأن العناصر المضافة أو المحذوفة أثناء القراءة تُزيح مواضع العناصر اللاحقة",
+       "لأن الإزاحة تتطلّب OAuth",
+       "لأن الخوادم تتجاهل معامل limit"
+      ],
+      "answer": 1,
+      "explanation": "الإزاحة مواضع. فإذا تغيّرت المجموعة بين طلبات الصفحات انتقلت العناصر عبر حدود الصفحات. أما المؤشّر فيشير إلى عنصر بعينه فيتجنّب ذلك."
+     },
+     {
+      "question": "يتلقّى السكربت HTTP 429 مع Retry-After: 5. ما السلوك الصحيح؟",
+      "options": [
+       "إعادة المحاولة فورًا حتى 100 مرة",
+       "اعتباره خطأً قاتلًا والخروج",
+       "الانتظار 5 ثوانٍ على الأقل ثم إعادة المحاولة، مع تحديد عدد المحاولات الكلي",
+       "تسجيل الدخول مجددًا للحصول على رمز جديد"
+      ],
+      "answer": 2,
+      "explanation": "الرمز 429 يعني «أبطئ». احترم Retry-After، وأضف عشوائية إن عمل عمّال كثيرون، واستسلم برسالة واضحة بعد عدد محدود من المحاولات."
+     },
+     {
+      "question": "أيّ الممارسات صحيحة مع رموز الجلسة مثل X-Auth-Token في Catalyst Center؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "إعادة استخدام الرمز حتى ما قبل انتهاء صلاحيته بقليل",
+       "طلب رمز جديد قبل كل استدعاء API",
+       "عند 401، تجديد الرمز مرة واحدة وإعادة المحاولة مرة واحدة",
+       "حفظ بيانات الاعتماد في متغيرات البيئة أو في خزنة أسرار، لا في السكربت"
+      ],
+      "answer": [0, 2, 3],
+      "explanation": "صُمّمت الرموز لتُعاد استخدامها طوال صلاحيتها. والتجديد مرة واحدة عند 401 يعالج انتهاء الصلاحية، وتبقى الأسرار خارج الشيفرة. أما تسجيل الدخول قبل كل استدعاء فبطيء وقد يُقيَّد هو نفسه."
+     },
+     {
+      "question": "أيّ الطلبات الفاشلة تجوز إعادة محاولتها تلقائيًا عمومًا؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "طلب GET أعاد 503",
+       "طلب PUT انتهت مهلته",
+       "طلب POST أعاد 400 Bad Request",
+       "طلب GET أعاد 429"
+      ],
+      "answer": [0, 1, 3],
+      "explanation": "الرمزان 429 و503 مؤقتان، وGET وPUT متساويا الأثر، فتكرارهما آمن. أما 400 فيعني أن الطلب خاطئ وسيفشل مجددًا حتى يُصلَح."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- ترقّم واجهات API الصفحات **بالإزاحة والحد**، أو **برقم الصفحة وحجمها**، أو **بمؤشّرات في ترويسة Link**. كرّر الطلب حتى تنفد المجموعة، واتبع `rel=next` كما أُرسل، وصفِّ النتائج على الخادم حيث أمكن.\n- تتدرّج المصادقة من **المصادقة الأساسية** و**مفاتيح API** إلى **رموز الجلسة** و**OAuth 2.0**. أعد استخدام الرموز، وجدّدها مبكرًا، وجدّدها مرة واحدة عند 401، وأبقِ الأسرار خارج الشيفرة والسجلات.\n- عند **429** احترم **Retry-After**، وإلا فاستخدم **التراجع الأسّي مع العشوائية**، وقيّد التزامن، واستسلم بعد عدد محدود من المحاولات.\n- أعد محاولة الأخطاء المؤقتة فقط، ولا تُعِد دون فحوص إضافية إلا الطلبات **متساوية الأثر**.\n\nتابع لتطبّق هذه الأنماط على واجهات الإعداد في [RESTCONF with YANG Models](/learn/network-automation-devops/restconf-with-yang-models)."
+   }
+  ]
+ }
+}

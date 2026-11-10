@@ -1,0 +1,612 @@
+{
+  "slug": "troubleshooting-dhcp-snmp-syslog-and-ip-sla-enarsi",
+  "title": "Troubleshooting DHCP, SNMP, Syslog and IP SLA (ENARSI)",
+  "summary": "Isolate faults in DHCP relay and snooping, SNMP polling and traps, Syslog delivery and IP SLA tracking with a structured method and the right show and debug commands.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Apply a structured method to isolate faults in infrastructure services",
+    "Troubleshoot DHCP relay, pools, conflicts and snooping",
+    "Troubleshoot SNMP polling and traps",
+    "Troubleshoot Syslog delivery and IP SLA with tracked routes"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Monday, 8:55. Users at the new branch cannot get an IP address, the monitoring system shows the branch router as \"down\" although you can SSH to it, the log server has not received a message from it since Friday, and the backup default route is not taking over because its tracking object says the primary is still reachable.\n\nThese four symptoms belong to four services that every enterprise network depends on but few engineers study until they break: **DHCP**, **SNMP**, **Syslog** and **IP SLA**. ENARSI expects you to isolate faults in each using a methodical approach and the right `show` and `debug` commands. The measurement side of IP SLA is also covered in [NetFlow, SPAN / ERSPAN and IP SLA](/learn/enterprise-datacenter-networking/netflow-span-erspan-and-ip-sla)."
+    },
+    {
+      "id": "method",
+      "type": "text",
+      "markdown": "## A method that works for all four\n\nAll four services are client/server protocols over UDP. A fault is therefore almost always in one of five places:\n\n1. **The client** is not sending or is configured wrongly (no `ip address dhcp`, wrong community string).\n2. **The path**: routing, an ACL, a firewall, or CoPP drops the packets.\n3. **The source address**: the device sends from an interface the server does not know or cannot reply to.\n4. **The server**: wrong pool, wrong community or user, process stopped.\n5. **Time and state**: a lease expired, a counter wrapped, clocks differ.\n\nStart with a simple question: *does the packet leave, does it arrive, and does the reply return?* A `show` command tells you what the device believes. A packet capture, an ACL counter or a targeted `debug` tells you what is really happening. Limit debugs with an ACL or `conditionally` and always turn them off with `undebug all`."
+    },
+    {
+      "id": "dhcp",
+      "type": "text",
+      "markdown": "## Troubleshooting DHCP\n\nThe exchange is **Discover, Offer, Request, Acknowledge (DORA)**. Clients broadcast, so a server on another subnet requires a **relay agent**.\n\n| Symptom | Likely cause | Check |\n|:--|:--|:--|\n| Client gets 169.254.x.x | No offer received | Relay config, server reachability, `debug ip dhcp server packet` |\n| Offer seen, no lease | Pool exhausted or conflict | `show ip dhcp pool`, `show ip dhcp conflict` |\n| Works on one VLAN only | Missing `ip helper-address` | `show running-config interface` |\n| Wrong gateway or DNS | Pool options wrong | `show ip dhcp pool` and `show ip dhcp binding` |\n| Only trunk uplinks fail | DHCP snooping untrusted port | `show ip dhcp snooping` |\n\nWith **DHCP snooping**, uplinks toward the DHCP server must be `ip dhcp snooping trust`. Otherwise OFFER packets arriving on an untrusted port are dropped, which looks exactly like a dead server. With relay, remember that the server selects the pool by the `giaddr` (the relay interface address), so a pool for that subnet must exist. Option 82 insertion by the switch can also make a server reject requests if it is not configured to accept it (`ip dhcp relay information trust-all`)."
+    },
+    {
+      "id": "dhcp-term",
+      "type": "terminal",
+      "title": "DHCP checks",
+      "lines": [
+        {
+          "prompt": "Branch-R1#",
+          "cmd": "show ip dhcp pool",
+          "output": "Pool BRANCH-LAN :\n Utilization mark (high/low)    : 100 / 0\n Current index                  : 192.0.2.62\n Total addresses                : 61\n Leased addresses               : 61\n Pending event                  : none",
+          "comment": "61 of 61 leased: the pool is exhausted."
+        },
+        {
+          "prompt": "Branch-R1#",
+          "cmd": "show ip dhcp conflict",
+          "output": "IP address        Detection method   Detection time          VRF\n192.0.2.17        Ping               Nov 10 2026 08:41 AM",
+          "comment": "A host answered a ping for an address the server wanted to lease, so it was removed from the pool."
+        },
+        {
+          "prompt": "Branch-R1#",
+          "cmd": "clear ip dhcp conflict *",
+          "comment": "Clear stale conflicts after fixing the static device."
+        },
+        {
+          "prompt": "Access-SW#",
+          "cmd": "show ip dhcp snooping",
+          "output": "Switch DHCP snooping is enabled\nDHCP snooping is configured on following VLANs: 10\nInterface                  Trusted    Allow option    Rate limit (pps)\nGigabitEthernet1/0/48      no         no              unlimited",
+          "comment": "The uplink is not trusted, so server replies are dropped. Add ip dhcp snooping trust on Gi1/0/48."
+        }
+      ],
+      "caption": "Typical causes: exhausted pool, conflicts, untrusted snooping port."
+    },
+    {
+      "id": "snmp",
+      "type": "text",
+      "markdown": "## Troubleshooting SNMP\n\nSNMP uses UDP 161 for polling (GET, GETNEXT, GETBULK, SET) and UDP 162 for traps and informs. Versions differ in security: v1 and v2c use a **community string** in clear text, while v3 provides authentication (`auth`) and encryption (`priv`) through users and groups.\n\nCommon faults:\n\n- **Poll times out.** The community or v3 user does not match, an ACL attached to the community denies the NMS address, or an interface ACL or CoPP drops UDP 161.\n- **v3 fails with \"unknown user\" or \"wrong digest\".** Authentication or privacy passwords or algorithms differ, or the `engineID` changed after the user was created.\n- **Traps never arrive.** `snmp-server host` is missing, no `snmp-server enable traps` for the event class, wrong source interface, or the trap receiver's firewall.\n- **Wrong interface index after reload.** Enable `snmp-server ifindex persist` so the IF-MIB index stays stable for the NMS.\n\nUse `show snmp` for packet counters. Increasing *input packets* with *bad community names* tells you the NMS reaches the device but uses the wrong credential. No input at all points to the network path."
+    },
+    {
+      "id": "snmp-cfg",
+      "type": "code",
+      "language": "cisco",
+      "code": "ip access-list standard SNMP-NMS\n permit 192.0.2.50\n!\nsnmp-server view RO-VIEW iso included\nsnmp-server group NOC v3 priv read RO-VIEW access SNMP-NMS\nsnmp-server user noc-user NOC v3 auth sha <AUTH-PASS> priv aes 128 <PRIV-PASS>\nsnmp-server ifindex persist\nsnmp-server source-interface informs Loopback0\nsnmp-server enable traps config\nsnmp-server host 192.0.2.50 version 3 priv noc-user\n!\n! verify\nshow snmp user\nshow snmp host\nshow snmp | include input|bad",
+      "caption": "SNMPv3 with a read-only view limited to one NMS. Passwords are placeholders."
+    },
+    {
+      "id": "syslog",
+      "type": "text",
+      "markdown": "## Troubleshooting Syslog\n\nSyslog sends messages with a **facility** and a **severity** from 0 (emergencies) to 7 (debugging) to a server on UDP 514. Devices keep local copies in the buffer (`logging buffered`) and may also send to the console and monitor sessions.\n\nWhen the server is silent, check:\n\n- **Severity filter.** `logging trap informational` sends levels 0 to 6. If it is set to `warnings`, informational messages never leave.\n- **Source address.** `logging source-interface Loopback0` makes the server see a stable source. A server that filters by IP will ignore the packets otherwise.\n- **Reachability** from that source and any VRF: add `logging host 192.0.2.60 vrf MGMT` when the server is in a management VRF.\n- **Timestamps and sequence numbers.** `service timestamps log datetime msec` and `service sequence-numbers` make missing messages visible. Without `ntp` the times are wrong, so correlate only after fixing time (see [NTP, PTP and Multicast](/learn/enterprise-datacenter-networking/ntp-ptp-and-multicast)).\n- **Rate limiting** with `logging rate-limit` can silently suppress messages during an event storm."
+    },
+    {
+      "id": "ipsla",
+      "type": "text",
+      "markdown": "## Troubleshooting IP SLA\n\nAn **IP SLA** operation sends synthetic probes (ICMP echo, UDP jitter, TCP connect, HTTP) at a fixed `frequency` and records the result. A **track** object converts the result into up or down, which can control a static route, HSRP priority or an EEM action.\n\nThe classic design is a floating default route:\n\n```\nip sla 10\n icmp-echo 198.51.100.1 source-interface GigabitEthernet0/0\n frequency 10\n threshold 500\n timeout 1000\nip sla schedule 10 life forever start-time now\ntrack 10 ip sla 10 reachability\nip route 0.0.0.0 0.0.0.0 203.0.113.1 track 10\nip route 0.0.0.0 0.0.0.0 192.0.2.1 250\n```\n\nCommon faults:\n\n- **Never scheduled.** The operation exists but `ip sla schedule` is missing, so statistics show *No operations*.\n- **Probes use the wrong path.** Without `source-interface` or `source-ip`, the probe may leave a different interface than the one being tested. If the probe target is reachable over the backup link, the tracked route never fails.\n- **Track flaps.** A `frequency` that is too short, or no `delay down`/`delay up` on the track, makes the route bounce on one lost packet.\n- **Wrong target.** Probing the ISP next hop proves only the first link. Probe a stable host beyond it."
+    },
+    {
+      "id": "dhcp-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "DHCP through a relay agent: where it breaks",
+      "data": {
+        "actors": [
+          {
+            "id": "c",
+            "label": "Client",
+            "sub": "VLAN 20",
+            "icon": "laptop"
+          },
+          {
+            "id": "r",
+            "label": "Relay (SVI)",
+            "sub": "giaddr 192.0.2.1",
+            "icon": "router"
+          },
+          {
+            "id": "s",
+            "label": "DHCP server",
+            "sub": "198.51.100.10",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "c",
+            "to": "r",
+            "label": "DHCPDISCOVER",
+            "detail": "broadcast",
+            "note": "The client broadcasts. Check that the interface has ip helper-address."
+          },
+          {
+            "from": "r",
+            "to": "s",
+            "label": "Unicast DISCOVER",
+            "detail": "giaddr=192.0.2.1",
+            "note": "The relay forwards it as unicast and sets giaddr. A routing or ACL fault here means no offer ever returns.",
+            "tone": "warning"
+          },
+          {
+            "from": "s",
+            "to": "r",
+            "label": "DHCPOFFER",
+            "detail": "192.0.2.25 /24",
+            "note": "The server picks the pool that contains giaddr. No pool means no offer."
+          },
+          {
+            "from": "r",
+            "to": "c",
+            "label": "DHCPOFFER",
+            "detail": "via snooping trust",
+            "note": "On a snooping switch, the offer passes only through trusted ports.",
+            "tone": "secure"
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "DHCPREQUEST",
+            "detail": "accept 192.0.2.25",
+            "note": "The client requests the offered address through the relay."
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "DHCPACK",
+            "detail": "lease 8 days",
+            "note": "The server acknowledges and records the binding in show ip dhcp binding.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sla-term",
+      "type": "terminal",
+      "title": "IP SLA and logging verification",
+      "lines": [
+        {
+          "prompt": "R1#",
+          "cmd": "show ip sla statistics 10",
+          "output": "IPSLAs Latest Operation Statistics\n\nIPSLA operation id: 10\n        Latest RTT: 14 milliseconds\nLatest operation start time: 08:55:10 UTC Tue Nov 10 2026\nLatest operation return code: OK\nNumber of successes: 312\nNumber of failures: 0",
+          "comment": "Healthy: return code OK, no failures."
+        },
+        {
+          "prompt": "R1#",
+          "cmd": "show track 10",
+          "output": "Track 10\n  IP SLA 10 reachability\n  Reachability is Up\n    2 changes, last change 00:21:10",
+          "comment": "Two changes show the object has gone down and back up."
+        },
+        {
+          "prompt": "R1#",
+          "cmd": "show logging | include %TRACK|%SYS",
+          "output": "Nov 10 08:34:02.114: %TRACK-6-STATE: 10 ip sla 10 reachability Up -> Down\nNov 10 08:34:21.390: %TRACK-6-STATE: 10 ip sla 10 reachability Down -> Up",
+          "comment": "Syslog confirms exactly when the tracked route failed over."
+        }
+      ],
+      "caption": "A tracked default route is verified from three angles."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Be careful with debugs",
+      "markdown": "`debug ip dhcp server packet`, `debug snmp packets` and `debug ip sla trace` are safe on a quiet lab router but can overload a production device. Use `show` commands and counters first, apply a condition when possible, and run `undebug all` when you finish. Never leave `logging console` at debugging level on a busy device."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a lab with a router, a switch and one host:\n\n1. Configure a DHCP pool on the router and an `ip helper-address` on a remote SVI. Break it by removing the helper and read what the client gets.\n2. Enable DHCP snooping and leave the uplink untrusted. Observe the missing offer, then fix it with `ip dhcp snooping trust`.\n3. Configure the SNMPv3 example with a deliberately wrong password and observe `show snmp` counters.\n4. Point `logging host` at a lab server and change `logging trap` severity to see which messages stop.\n5. Build the floating-route IP SLA example, shut the primary link, and use `show track` and `show ip route` to watch failover."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "DORA",
+          "definition": "DHCP Discover, Offer, Request, Acknowledge exchange."
+        },
+        {
+          "term": "giaddr",
+          "definition": "Relay interface address that tells the server which pool to use."
+        },
+        {
+          "term": "DHCP snooping trust",
+          "definition": "Port setting that allows DHCP server replies."
+        },
+        {
+          "term": "Community string",
+          "definition": "Shared secret used by SNMPv1 and v2c."
+        },
+        {
+          "term": "SNMPv3 priv",
+          "definition": "Security level with authentication and encryption."
+        },
+        {
+          "term": "Severity",
+          "definition": "Syslog level from 0 emergencies to 7 debugging."
+        },
+        {
+          "term": "IP SLA",
+          "definition": "Synthetic probe that measures reachability and performance."
+        },
+        {
+          "term": "Track object",
+          "definition": "Up/down state derived from an IP SLA result, used to control routes."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Clients behind a relay get 169.254.x.x addresses. The server's logs show no requests. What do you check first?",
+          "options": [
+            "The lease time",
+            "ip helper-address on the client-facing interface",
+            "The SNMP community",
+            "The logging severity"
+          ],
+          "answer": 1,
+          "explanation": "No requests at the server means the relay is not forwarding them, so check the helper and the path to the server."
+        },
+        {
+          "question": "Which can cause DHCP offers to be lost on a switch? Choose all that apply.",
+          "options": [
+            "Uplink not trusted by DHCP snooping",
+            "A rate limit that is exceeded",
+            "A missing pool on the server for the VLAN",
+            "Wrong NTP server"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "An untrusted uplink drops replies, an exceeded snooping rate limit can err-disable a port, and a missing pool means no offer exists. NTP does not affect DHCP."
+        },
+        {
+          "question": "show snmp shows rising \"bad community names\". What does this indicate?",
+          "options": [
+            "The NMS reaches the device with wrong credentials",
+            "UDP 161 is blocked",
+            "The trap host is missing",
+            "The engineID changed"
+          ],
+          "answer": 0,
+          "explanation": "The packets arrive, so the path is fine, but the community string does not match."
+        },
+        {
+          "question": "A floating static route never fails over although the primary ISP is down. What is a likely cause?",
+          "options": [
+            "The probe leaves through the backup link",
+            "The syslog severity is too high",
+            "DHCP has no pool",
+            "SNMP traps are off"
+          ],
+          "answer": 0,
+          "explanation": "If the IP SLA probe is not forced out of the primary interface, it can succeed over the backup, so the track stays up."
+        },
+        {
+          "question": "Syslog messages at informational level are missing on the server, but warnings arrive. Which command is the likely cause?",
+          "options": [
+            "logging trap warnings",
+            "logging buffered",
+            "service timestamps",
+            "ntp server"
+          ],
+          "answer": 0,
+          "explanation": "logging trap warnings sends severities 0 to 4 only, so levels 5 to 6 are filtered before leaving the device."
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## Summary\n\n- Troubleshoot each service by asking: does the packet leave, arrive and return? Use counters before debugs.\n- DHCP failures are usually relay, snooping trust, pool or conflict problems.\n- SNMP failures split into credential faults (bad community, v3 user) and path faults (ACL, CoPP, source interface).\n- Syslog depends on severity, source interface, VRF and correct time.\n- IP SLA needs a schedule, a correct source and a sensible target. A track object turns it into routing action."
+    }
+  ],
+  "ar": {
+    "title": "استكشاف أعطال DHCP وSNMP وSyslog وIP SLA وإصلاحها (ENARSI)",
+    "summary": "اعزل الأعطال في ترحيل DHCP وsnooping واستعلامات SNMP وتنبيهاته وتسليم Syslog وتتبع IP SLA بمنهج منظّم وأوامر show وdebug المناسبة.",
+    "objectives": [
+      "تطبيق منهج منظّم لعزل أعطال خدمات البنية التحتية",
+      "استكشاف أعطال ترحيل DHCP والمجموعات والتعارضات وsnooping",
+      "استكشاف أعطال استعلامات SNMP وتنبيهاته",
+      "استكشاف أعطال تسليم Syslog وIP SLA مع المسارات المُتتبَّعة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "صباح الاثنين، الساعة 8:55. لا يستطيع مستخدمو الفرع الجديد الحصول على عنوان IP، ويُظهر نظام المراقبة أن موجّه الفرع «متوقف» مع أنك تستطيع الدخول إليه بـ SSH، ولم يستلم خادم السجلات منه أي رسالة منذ الجمعة، ولا يتولى المسار الافتراضي الاحتياطي العمل لأن كائن التتبع الخاص به يرى أن المسار الأساسي ما زال متاحًا.\n\nتنتمي هذه الأعراض الأربعة إلى أربع خدمات تعتمد عليها كل شبكة مؤسسية ولا يدرسها كثير من المهندسين إلا بعد أن تتعطل: **DHCP** و**SNMP** و**Syslog** و**IP SLA**. وتتوقع ENARSI منك عزل الأعطال في كل منها بمنهج منظّم وبأوامر `show` و`debug` المناسبة. وتجد جانب القياس في IP SLA في درس [NetFlow وSPAN / ERSPAN وIP SLA](/learn/enterprise-datacenter-networking/netflow-span-erspan-and-ip-sla)."
+      },
+      {
+        "id": "method",
+        "type": "text",
+        "markdown": "## منهج يصلح للأربع جميعًا\n\nالخدمات الأربع كلها بروتوكولات عميل/خادم فوق UDP، لذا يكون العطل في الغالب في واحد من خمسة مواضع:\n\n1. **العميل** لا يرسل أو إعداده خاطئ (غياب `ip address dhcp` أو سلسلة community خاطئة).\n2. **المسار**: التوجيه أو قائمة ACL أو جدار حماية أو CoPP يُسقط الحزم.\n3. **عنوان المصدر**: يرسل الجهاز من واجهة لا يعرفها الخادم أو لا يستطيع الرد عليها.\n4. **الخادم**: مجموعة عناوين خاطئة أو community أو مستخدم خاطئ أو عملية متوقفة.\n5. **الزمن والحالة**: انتهاء عقد، أو التفاف عدّاد، أو اختلاف الساعات.\n\nابدأ بسؤال بسيط: *هل تغادر الحزمة، وهل تصل، وهل يعود الرد؟* يخبرك أمر `show` بما يعتقده الجهاز، أما التقاط الحزم أو عدّاد ACL أو `debug` موجَّه فيخبرك بما يحدث فعلًا. قيّد أوامر debug بقائمة ACL أو بشرط، وأوقفها دائمًا بالأمر `undebug all`."
+      },
+      {
+        "id": "dhcp",
+        "type": "text",
+        "markdown": "## استكشاف أعطال DHCP\n\nتتألف العملية من **Discover ثم Offer ثم Request ثم Acknowledge (DORA)**. يرسل العملاء بثًا عامًا، لذا يتطلب خادم في شبكة فرعية أخرى **وكيل ترحيل (Relay agent)**.\n\n| العرض | السبب المرجح | الفحص |\n|:--|:--|:--|\n| يحصل العميل على 169.254.x.x | لم يصل أي عرض | إعداد الترحيل، وصولية الخادم، `debug ip dhcp server packet` |\n| ظهر العرض ولا يوجد عقد | استنفاد المجموعة أو تعارض | `show ip dhcp pool` و`show ip dhcp conflict` |\n| يعمل في VLAN واحدة فقط | غياب `ip helper-address` | `show running-config interface` |\n| بوابة أو DNS خاطئ | خيارات المجموعة خاطئة | `show ip dhcp pool` و`show ip dhcp binding` |\n| تفشل وصلات الجذع الصاعدة فقط | منفذ غير موثوق في DHCP snooping | `show ip dhcp snooping` |\n\nمع **DHCP snooping** يجب أن تكون الوصلات الصاعدة نحو خادم DHCP بالأمر `ip dhcp snooping trust`، وإلا أُسقطت حزم OFFER الواردة على منفذ غير موثوق، وهذا يشبه تمامًا خادمًا ميتًا. ومع الترحيل تذكّر أن الخادم يختار المجموعة وفق `giaddr` (عنوان واجهة الترحيل)، فلا بد من وجود مجموعة لتلك الشبكة الفرعية. وقد يجعل إدراج الخيار 82 من المبدّل الخادمَ يرفض الطلبات إن لم يُضبط على قبوله (`ip dhcp relay information trust-all`)."
+      },
+      {
+        "id": "dhcp-term",
+        "type": "terminal",
+        "title": "فحوص DHCP",
+        "lines": [
+          {
+            "prompt": "Branch-R1#",
+            "cmd": "show ip dhcp pool",
+            "output": "Pool BRANCH-LAN :\n Utilization mark (high/low)    : 100 / 0\n Current index                  : 192.0.2.62\n Total addresses                : 61\n Leased addresses               : 61\n Pending event                  : none",
+            "comment": "استُؤجر 61 من 61: المجموعة مستنفدة."
+          },
+          {
+            "prompt": "Branch-R1#",
+            "cmd": "show ip dhcp conflict",
+            "output": "IP address        Detection method   Detection time          VRF\n192.0.2.17        Ping               Nov 10 2026 08:41 AM",
+            "comment": "ردّ جهاز على ping لعنوان أراد الخادم تأجيره فأُخرج من المجموعة."
+          },
+          {
+            "prompt": "Branch-R1#",
+            "cmd": "clear ip dhcp conflict *",
+            "comment": "امسح التعارضات القديمة بعد إصلاح الجهاز ذي العنوان الثابت."
+          },
+          {
+            "prompt": "Access-SW#",
+            "cmd": "show ip dhcp snooping",
+            "output": "Switch DHCP snooping is enabled\nDHCP snooping is configured on following VLANs: 10\nInterface                  Trusted    Allow option    Rate limit (pps)\nGigabitEthernet1/0/48      no         no              unlimited",
+            "comment": "الوصلة الصاعدة غير موثوقة فتُسقط ردود الخادم. أضف ip dhcp snooping trust على Gi1/0/48."
+          }
+        ],
+        "caption": "أسباب نموذجية: مجموعة مستنفدة وتعارضات ومنفذ snooping غير موثوق."
+      },
+      {
+        "id": "snmp",
+        "type": "text",
+        "markdown": "## استكشاف أعطال SNMP\n\nيستخدم SNMP المنفذ UDP 161 للاستعلام (GET وGETNEXT وGETBULK وSET) والمنفذ UDP 162 للتنبيهات (traps) والإبلاغات (informs). وتختلف الإصدارات في الأمان: يستخدم v1 وv2c **سلسلة community** بنص صريح، بينما يوفّر v3 المصادقة (`auth`) والتشفير (`priv`) عبر المستخدمين والمجموعات.\n\nمن الأعطال الشائعة:\n\n- **انتهاء مهلة الاستعلام.** عدم تطابق community أو مستخدم v3، أو قائمة ACL مرتبطة بـ community ترفض عنوان NMS، أو قائمة ACL على واجهة أو CoPP تُسقط UDP 161.\n- **فشل v3 برسالة «مستخدم غير معروف» أو «ملخص خاطئ».** اختلاف كلمات المرور أو الخوارزميات للمصادقة أو التشفير، أو تغيّر `engineID` بعد إنشاء المستخدم.\n- **لا تصل التنبيهات أبدًا.** غياب `snmp-server host`، أو عدم تفعيل `snmp-server enable traps` لفئة الحدث، أو مصدر واجهة خاطئ، أو جدار حماية عند مستقبل التنبيهات.\n- **فهرس واجهة خاطئ بعد إعادة التشغيل.** فعّل `snmp-server ifindex persist` ليبقى فهرس IF-MIB ثابتًا لدى NMS.\n\nاستخدم `show snmp` لعدّادات الحزم. فازدياد *input packets* مع *bad community names* يعني أن NMS يصل إلى الجهاز لكنه يستخدم بيانات اعتماد خاطئة. وغياب أي حزم واردة يشير إلى مسار الشبكة."
+      },
+      {
+        "id": "snmp-cfg",
+        "type": "code",
+        "language": "cisco",
+        "code": "ip access-list standard SNMP-NMS\n permit 192.0.2.50\n!\nsnmp-server view RO-VIEW iso included\nsnmp-server group NOC v3 priv read RO-VIEW access SNMP-NMS\nsnmp-server user noc-user NOC v3 auth sha <AUTH-PASS> priv aes 128 <PRIV-PASS>\nsnmp-server ifindex persist\nsnmp-server source-interface informs Loopback0\nsnmp-server enable traps config\nsnmp-server host 192.0.2.50 version 3 priv noc-user\n!\n! verify\nshow snmp user\nshow snmp host\nshow snmp | include input|bad",
+        "caption": "SNMPv3 بعرض للقراءة فقط مقيّد بخادم NMS واحد. كلمات المرور مجرد عناصر نائبة."
+      },
+      {
+        "id": "syslog",
+        "type": "text",
+        "markdown": "## استكشاف أعطال Syslog\n\nيرسل Syslog رسائل بـ**مرفق (facility)** و**شدة (severity)** من 0 (طوارئ) إلى 7 (تنقيح) إلى خادم عبر UDP 514. وتحتفظ الأجهزة بنسخ محلية في المخزن المؤقت (`logging buffered`) وقد ترسلها أيضًا إلى وحدة التحكم وجلسات المراقبة.\n\nعندما يصمت الخادم افحص:\n\n- **مرشّح الشدة.** يرسل `logging trap informational` المستويات من 0 إلى 6. وإذا ضُبط على `warnings` فلن تغادر الرسائل المعلوماتية الجهاز.\n- **عنوان المصدر.** يجعل `logging source-interface Loopback0` الخادم يرى مصدرًا ثابتًا، وإلا قد يتجاهل خادم يرشّح بحسب IP الحزم.\n- **الوصولية** من ذلك المصدر ومن أي VRF: أضف `logging host 192.0.2.60 vrf MGMT` حين يكون الخادم في VRF للإدارة.\n- **الأختام الزمنية وأرقام التسلسل.** يجعل `service timestamps log datetime msec` و`service sequence-numbers` الرسائل المفقودة ظاهرة. وبدون `ntp` تكون الأزمنة خاطئة، فلا تربط الأحداث إلا بعد إصلاح الوقت (راجع [NTP وPTP والبث المتعدد](/learn/enterprise-datacenter-networking/ntp-ptp-and-multicast)).\n- **تحديد المعدل** بـ `logging rate-limit` قد يكتم الرسائل بصمت أثناء عاصفة الأحداث."
+      },
+      {
+        "id": "ipsla",
+        "type": "text",
+        "markdown": "## استكشاف أعطال IP SLA\n\nترسل عملية **IP SLA** مجسّات اصطناعية (ICMP echo أو UDP jitter أو اتصال TCP أو HTTP) بتكرار ثابت `frequency` وتسجّل النتيجة. ويحوّل كائن **track** النتيجة إلى حالة تشغيل أو توقف تتحكم في مسار ثابت أو أولوية HSRP أو إجراء EEM.\n\nالتصميم الكلاسيكي هو المسار الافتراضي العائم:\n\n```\nip sla 10\n icmp-echo 198.51.100.1 source-interface GigabitEthernet0/0\n frequency 10\n threshold 500\n timeout 1000\nip sla schedule 10 life forever start-time now\ntrack 10 ip sla 10 reachability\nip route 0.0.0.0 0.0.0.0 203.0.113.1 track 10\nip route 0.0.0.0 0.0.0.0 192.0.2.1 250\n```\n\nمن الأعطال الشائعة:\n\n- **لم تُجدوَل أبدًا.** العملية موجودة لكن `ip sla schedule` غائب، فتعرض الإحصاءات *No operations*.\n- **المجسّات تسلك مسارًا خاطئًا.** بدون `source-interface` أو `source-ip` قد يغادر المجسّ من واجهة غير التي تُختبر. وإذا كانت وجهة المجسّ متاحة عبر الوصلة الاحتياطية فلن يفشل المسار المُتتبَّع أبدًا.\n- **تذبذب التتبع.** تكرار قصير جدًا، أو غياب `delay down` و`delay up` في track، يجعل المسار يتذبذب عند ضياع حزمة واحدة.\n- **وجهة خاطئة.** فحص القفزة التالية لدى مزوّد الخدمة يثبت الوصلة الأولى فقط. افحص مضيفًا ثابتًا خلفها."
+      },
+      {
+        "id": "dhcp-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "DHCP عبر وكيل ترحيل: أين ينكسر",
+        "data": {
+          "actors": [
+            {
+              "id": "c",
+              "label": "العميل",
+              "sub": "VLAN 20",
+              "icon": "laptop"
+            },
+            {
+              "id": "r",
+              "label": "وكيل الترحيل (SVI)",
+              "sub": "giaddr 192.0.2.1",
+              "icon": "router"
+            },
+            {
+              "id": "s",
+              "label": "خادم DHCP",
+              "sub": "198.51.100.10",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "from": "c",
+              "to": "r",
+              "label": "DHCPDISCOVER",
+              "detail": "broadcast",
+              "note": "يبث العميل. تحقق من أن الواجهة تحتوي على ip helper-address."
+            },
+            {
+              "from": "r",
+              "to": "s",
+              "label": "DISCOVER أحادي البث",
+              "detail": "giaddr=192.0.2.1",
+              "note": "يمرّره الوكيل أحادي البث ويضبط giaddr. أي خلل في التوجيه أو ACL هنا يعني ألا يعود عرض أبدًا.",
+              "tone": "warning"
+            },
+            {
+              "from": "s",
+              "to": "r",
+              "label": "DHCPOFFER",
+              "detail": "192.0.2.25 /24",
+              "note": "يختار الخادم المجموعة التي تحوي giaddr. غياب المجموعة يعني غياب العرض."
+            },
+            {
+              "from": "r",
+              "to": "c",
+              "label": "DHCPOFFER",
+              "detail": "via snooping trust",
+              "note": "على مبدّل snooping لا يمرّ العرض إلا عبر منافذ موثوقة.",
+              "tone": "secure"
+            },
+            {
+              "from": "c",
+              "to": "s",
+              "label": "DHCPREQUEST",
+              "detail": "accept 192.0.2.25",
+              "note": "يطلب العميل العنوان المعروض عبر الوكيل."
+            },
+            {
+              "from": "s",
+              "to": "c",
+              "label": "DHCPACK",
+              "detail": "lease 8 days",
+              "note": "يؤكد الخادم ويسجّل الربط في show ip dhcp binding.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "sla-term",
+        "type": "terminal",
+        "title": "التحقق من IP SLA والسجلات",
+        "lines": [
+          {
+            "prompt": "R1#",
+            "cmd": "show ip sla statistics 10",
+            "output": "IPSLAs Latest Operation Statistics\n\nIPSLA operation id: 10\n        Latest RTT: 14 milliseconds\nLatest operation start time: 08:55:10 UTC Tue Nov 10 2026\nLatest operation return code: OK\nNumber of successes: 312\nNumber of failures: 0",
+            "comment": "سليم: رمز الإرجاع OK ولا إخفاقات."
+          },
+          {
+            "prompt": "R1#",
+            "cmd": "show track 10",
+            "output": "Track 10\n  IP SLA 10 reachability\n  Reachability is Up\n    2 changes, last change 00:21:10",
+            "comment": "يدل تغيّران على أن الكائن توقف ثم عاد."
+          },
+          {
+            "prompt": "R1#",
+            "cmd": "show logging | include %TRACK|%SYS",
+            "output": "Nov 10 08:34:02.114: %TRACK-6-STATE: 10 ip sla 10 reachability Up -> Down\nNov 10 08:34:21.390: %TRACK-6-STATE: 10 ip sla 10 reachability Down -> Up",
+            "comment": "يؤكد Syslog بدقة متى تحوّل المسار المُتتبَّع."
+          }
+        ],
+        "caption": "التحقق من مسار افتراضي مُتتبَّع من ثلاث زوايا."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "احذر من أوامر debug",
+        "markdown": "الأوامر `debug ip dhcp server packet` و`debug snmp packets` و`debug ip sla trace` آمنة على موجّه مختبر هادئ لكنها قد تُرهق جهازًا في بيئة الإنتاج. استخدم أوامر `show` والعدّادات أولًا، وطبّق شرطًا إن أمكن، ونفّذ `undebug all` عند الانتهاء. ولا تترك `logging console` بمستوى debugging على جهاز مزدحم."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في مختبر يضم موجّهًا ومبدّلًا وجهازًا واحدًا:\n\n1. اضبط مجموعة DHCP على الموجّه و`ip helper-address` على SVI بعيدة. عطّلها بحذف الـ helper واقرأ ما يحصل عليه العميل.\n2. فعّل DHCP snooping واترك الوصلة الصاعدة غير موثوقة. لاحظ غياب العرض ثم أصلحه بـ `ip dhcp snooping trust`.\n3. اضبط مثال SNMPv3 بكلمة مرور خاطئة عمدًا ولاحظ عدّادات `show snmp`.\n4. وجّه `logging host` إلى خادم في المختبر وغيّر شدة `logging trap` لترى أي الرسائل تتوقف.\n5. ابنِ مثال IP SLA للمسار العائم، وأوقف الوصلة الأساسية، واستخدم `show track` و`show ip route` لمراقبة التحويل."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "DORA",
+            "definition": "تبادل DHCP: Discover وOffer وRequest وAcknowledge."
+          },
+          {
+            "term": "giaddr",
+            "definition": "عنوان واجهة الترحيل الذي يخبر الخادم أي مجموعة يستخدم."
+          },
+          {
+            "term": "ثقة DHCP snooping",
+            "definition": "إعداد منفذ يسمح بردود خادم DHCP."
+          },
+          {
+            "term": "سلسلة community",
+            "definition": "سر مشترك يستخدمه SNMPv1 وv2c."
+          },
+          {
+            "term": "مستوى priv في SNMPv3",
+            "definition": "مستوى أمان يتضمن المصادقة والتشفير."
+          },
+          {
+            "term": "الشدة",
+            "definition": "مستوى Syslog من 0 طوارئ إلى 7 تنقيح."
+          },
+          {
+            "term": "IP SLA",
+            "definition": "مجسّ اصطناعي يقيس الوصولية والأداء."
+          },
+          {
+            "term": "كائن track",
+            "definition": "حالة تشغيل/توقف مشتقة من نتيجة IP SLA تُستخدم للتحكم في المسارات."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "تحصل الأجهزة خلف وكيل ترحيل على عناوين 169.254.x.x ولا تُظهر سجلات الخادم أي طلبات. ماذا تفحص أولًا؟",
+            "options": [
+              "مدة العقد",
+              "ip helper-address على الواجهة المتجهة إلى العملاء",
+              "community في SNMP",
+              "شدة التسجيل"
+            ],
+            "answer": 1,
+            "explanation": "غياب الطلبات عند الخادم يعني أن الوكيل لا يمررها، فافحص الـ helper والمسار إلى الخادم."
+          },
+          {
+            "question": "ما الذي قد يسبب فقدان عروض DHCP على مبدّل؟ اختر كل ما ينطبق.",
+            "options": [
+              "الوصلة الصاعدة غير موثوقة في DHCP snooping",
+              "تجاوز حدّ المعدل",
+              "غياب مجموعة للشبكة المحلية الافتراضية على الخادم",
+              "خادم NTP خاطئ"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الوصلة غير الموثوقة تُسقط الردود، وتجاوز حد المعدل قد يعطّل المنفذ، وغياب المجموعة يعني عدم وجود عرض. أما NTP فلا يؤثر في DHCP."
+          },
+          {
+            "question": "يعرض show snmp ازدياد «bad community names». ماذا يعني ذلك؟",
+            "options": [
+              "NMS يصل إلى الجهاز ببيانات اعتماد خاطئة",
+              "UDP 161 محجوب",
+              "مضيف التنبيهات غائب",
+              "تغيّر engineID"
+            ],
+            "answer": 0,
+            "explanation": "الحزم تصل، فالمسار سليم، لكن سلسلة community لا تطابق."
+          },
+          {
+            "question": "لا يتحوّل مسار ثابت عائم رغم أن مزوّد الخدمة الأساسي متوقف. ما السبب المرجح؟",
+            "options": [
+              "المجسّ يخرج عبر الوصلة الاحتياطية",
+              "شدة syslog عالية جدًا",
+              "DHCP بلا مجموعة",
+              "تنبيهات SNMP معطّلة"
+            ],
+            "answer": 0,
+            "explanation": "إذا لم يُجبَر مجسّ IP SLA على الخروج من الواجهة الأساسية فقد ينجح عبر الاحتياطية فيبقى track في حالة تشغيل."
+          },
+          {
+            "question": "رسائل Syslog بمستوى informational غائبة عن الخادم بينما تصل رسائل warnings. أي أمر هو السبب المرجح؟",
+            "options": [
+              "logging trap warnings",
+              "logging buffered",
+              "service timestamps",
+              "ntp server"
+            ],
+            "answer": 0,
+            "explanation": "يرسل logging trap warnings المستويات من 0 إلى 4 فقط، فتُرشَّح المستويات 5 إلى 6 قبل مغادرة الجهاز."
+          }
+        ]
+      },
+      {
+        "id": "sum",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- استكشف كل خدمة بالسؤال: هل تغادر الحزمة وتصل وتعود؟ واستخدم العدّادات قبل debug.\n- تعود أعطال DHCP غالبًا إلى الترحيل أو ثقة snooping أو المجموعة أو التعارضات.\n- تنقسم أعطال SNMP إلى أعطال بيانات اعتماد (community أو مستخدم v3 خاطئ) وأعطال مسار (ACL أو CoPP أو واجهة المصدر).\n- يعتمد Syslog على الشدة وواجهة المصدر وVRF والوقت الصحيح.\n- يحتاج IP SLA إلى جدولة ومصدر صحيح ووجهة معقولة، ويحوّله كائن track إلى إجراء توجيه."
+      }
+    ]
+  }
+}

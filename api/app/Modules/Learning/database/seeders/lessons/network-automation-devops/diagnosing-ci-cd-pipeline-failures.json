@@ -1,0 +1,652 @@
+{
+ "slug": "diagnosing-ci-cd-pipeline-failures",
+ "title": "Diagnosing CI/CD Pipeline Failures",
+ "summary": "Read pipeline graphs, job logs and exit codes to find the root cause of CI/CD failures such as missing dependencies, incompatible versions and failed tests, then fix them so they stay fixed.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Classify a pipeline failure by stage, symptom and exit code",
+  "Diagnose failures caused by missing dependencies and incompatible versions",
+  "Decide whether a failed test points to the change, the test or the environment",
+  "Recognize failures caused by protected variables, runner selection and network reachability",
+  "Apply pinning, dependency checks and test reports to prevent repeat failures"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A merge request that changes OSPF costs has a red pipeline. The author insists the code works on his laptop, the reviewer is waiting, and the maintenance window starts in two hours. Rerunning the pipeline and hoping is not a strategy.\n\nA failed pipeline is evidence. Every failure leaves a trace in a job log, an exit code or a test report, and most failures fall into a handful of categories. This lesson gives you a repeatable method to read that evidence, find the root cause and fix it so it stays fixed. The AUTOCOR exam expects you to diagnose failures caused by **missing dependencies**, **incompatible versions** and **failed tests**, so those get the most attention."
+  },
+  {
+   "id": "classes",
+   "type": "text",
+   "markdown": "## Where pipelines fail\n\nBefore reading a single log line, notice **which stage** failed and **how**. A pipeline that never starts, a job stuck in *pending* and a job that ran and exited with code 1 point to very different problems.\n\n| Failure class | Typical symptom | Where to look |\n|:--|:--|:--|\n| Pipeline configuration | Pipeline not created; \"This GitLab CI configuration is invalid\" | Pipeline editor, CI Lint, `glab ci lint` |\n| Runner or executor | Job stuck in *pending*; image pull error | Runner tags, runner status, registry access |\n| Missing dependency | `ModuleNotFoundError`, `command not found` (exit 127), \"couldn't resolve module/action\" | `requirements.txt`, CI image, Ansible `requirements.yml` |\n| Incompatible version | pip resolver conflict, \"requires a different Python\", deprecated module | Pinned versions, image tag, `pip check` |\n| Failed tests | `pytest` exit code 1, pyATS *failed*, lint errors | Test report, JUnit artifact, diff of the change |\n| Secrets and access | HTTP 401/403, authentication failed, empty variable | CI/CD variables, protected branches |\n| Environment and reachability | Timeouts, connection refused, pyATS *errored* | Runner network path to the lab or devices |\n\nThe first four classes are failures of the **pipeline**. Only *failed tests* usually means the **change** is wrong, and even then the test itself may be the culprit."
+  },
+  {
+   "id": "triage-anim",
+   "type": "animation",
+   "kind": "cycle",
+   "title": "A repeatable triage loop",
+   "caption": "Each failure you fix should end with a guard that stops it from coming back.",
+   "data": {
+    "center": "Pipeline triage",
+    "items": [
+     {
+      "label": "Locate",
+      "sub": "Failed stage and job"
+     },
+     {
+      "label": "Read",
+      "sub": "First error, not last line"
+     },
+     {
+      "label": "Classify",
+      "sub": "Config, deps, version, test, access"
+     },
+     {
+      "label": "Reproduce",
+      "sub": "Same image, same commands"
+     },
+     {
+      "label": "Fix",
+      "sub": "Smallest change at the cause"
+     },
+     {
+      "label": "Prevent",
+      "sub": "Pin, lint or add a check"
+     }
+    ],
+    "steps": [
+     {
+      "item": 0,
+      "caption": "Open the pipeline graph: the test stage failed, so validate passed and deploy was skipped."
+     },
+     {
+      "item": 1,
+      "caption": "Scroll up from \"Job failed: exit code 1\" to the first ERROR line. That line is the cause; the rest is fallout."
+     },
+     {
+      "item": 2,
+      "caption": "Classify it: \"No matching distribution found\" is a version problem, not a code problem."
+     },
+     {
+      "item": 3,
+      "caption": "Start a container from the exact CI image and run the same script lines to reproduce it locally."
+     },
+     {
+      "item": 4,
+      "caption": "Fix the cause, for example pin the Python image to a supported version, and push.",
+      "tone": "success"
+     },
+     {
+      "item": 5,
+      "caption": "Add a guard such as pip check or a pinned image tag so the same failure cannot return silently.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "id": "read",
+   "type": "text",
+   "markdown": "## Reading the job log\n\nA job runs its `script` lines in order inside the runner's shell, and **stops at the first command that returns a nonzero exit code**. The runner then prints `ERROR: Job failed: exit code N`. That final line tells you *that* the job failed, never *why*. Scroll up to the first error.\n\nExit codes carry meaning:\n\n- **1**: generic failure. For `pytest`, it means at least one test failed.\n- **2, 4, 5** from `pytest`: interrupted, usage error, or no tests collected. Code 5 often means a wrong path or test discovery pattern, not broken code.\n- **4** from `ansible-playbook`: a parser or module resolution error, before any task runs.\n- **127**: command not found. The tool is missing from the image or the `PATH`.\n- **137**: the process was killed (SIGKILL), usually because the container ran out of memory.\n\nAlso read the header of the log. It records the runner, the executor and **the image actually used**. If it says `python:latest`, the job ran on whatever Python was newest that day, which is a classic source of failures that appear overnight without any code change."
+  },
+  {
+   "id": "log",
+   "type": "terminal",
+   "title": "Finding the first real error in two failed jobs",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "glab ci status --branch feature/ospf-cost",
+     "output": "(success) lint           validate\n(failed)  unit-tests     test\n(failed)  ansible-check  test\n(skipped) deploy-lab     deploy\n\nPipeline state: failed"
+    },
+    {
+     "comment": "The pipeline graph shows which stage failed. Deploy was skipped, so nothing reached the network."
+    },
+    {
+     "cmd": "glab ci trace unit-tests",
+     "output": "Running with gitlab-runner 17.5.2 (c6eae8d7)\n  on netops-docker-01 t2_xYz8, system ID: s_4f1c0a9b2e3d\nPreparing the \"docker\" executor\nUsing docker image python:latest ...\n$ pip install -r requirements.txt\nCollecting ncclient==0.6.15\nCollecting pyats[full]==24.10\nERROR: Ignored the following versions that require a different python version: 24.10 Requires-Python <3.13,>=3.8\nERROR: Could not find a version that satisfies the requirement pyats[full]==24.10\nERROR: No matching distribution found for pyats[full]==24.10\nCleaning up project directory and file based variables\nERROR: Job failed: exit code 1"
+    },
+    {
+     "comment": "Root cause: python:latest moved to a Python release that pyATS 24.10 does not support. An incompatible version, not a code bug."
+    },
+    {
+     "cmd": "glab ci trace ansible-check",
+     "output": "$ ansible-playbook -i inventory/lab.yml site.yml --check --diff\nERROR! couldn't resolve module/action 'cisco.ios.ios_ospfv2'. This often indicates a misspelling, missing collection, or incorrect module path.\n\nThe error appears to be in '/builds/netops/ospf/roles/ospf/tasks/main.yml': line 2, column 3\nERROR: Job failed: exit code 4"
+    },
+    {
+     "comment": "Exit code 4 before any task ran: the cisco.ios collection is not installed in the CI image. A missing dependency."
+    }
+   ],
+   "caption": "Log output abbreviated. The last line only says the job failed; the cause is a few lines above it."
+  },
+  {
+   "id": "deps",
+   "type": "text",
+   "markdown": "## Missing dependencies and incompatible versions\n\nMost \"works on my laptop\" failures come from a difference between the developer's environment and the CI image.\n\n### Missing dependencies\n\n- A Python package was installed globally on the laptop but never added to `requirements.txt`.\n- A system tool such as `git`, `ssh` or a C library is absent from a `-slim` image.\n- An Ansible collection such as `cisco.ios` or `cisco.nxos` is used but not listed in `collections/requirements.yml`.\n\n### Incompatible versions\n\n- **Floating tags**: `python:latest` or `ubuntu:latest` changes under you.\n- **Unpinned packages**: `netmiko>=4` installs a new major release with a changed API.\n- **Conflicting requirements**: two packages need different versions of the same library, and pip's resolver stops with \"conflicting dependencies\".\n- **Interpreter limits**: a package declares `Requires-Python` and refuses the interpreter in the image.\n\nThe fix is **reproducibility**. Pin the base image to a specific tag (or digest), pin every Python package to an exact version (generate the lock file with `pip freeze` or `pip-compile`), pin collection versions, and run `pip check` after installation. Better still, build a dedicated **CI toolchain image** that already contains the tools, and update it through its own pipeline. Cache the pip download directory with a key derived from `requirements.txt` so a change to the file invalidates the cache."
+  },
+  {
+   "id": "ci-yaml",
+   "type": "code",
+   "language": "yaml",
+   "filename": ".gitlab-ci.yml",
+   "code": "default:\n  image: registry.example.com/netops/ci-python:3.12-2026.10   # pinned toolchain image\n  retry:\n    max: 2\n    when: [runner_system_failure, stuck_or_timeout_failure]  # never retry real test failures\n\nstages: [validate, test, deploy]\n\nvariables:\n  PIP_CACHE_DIR: \"$CI_PROJECT_DIR/.cache/pip\"\n\ncache:\n  key:\n    files: [requirements.txt, collections/requirements.yml]\n  paths: [.cache/pip]\n\nlint:\n  stage: validate\n  script:\n    - yamllint .\n    - ansible-lint\n\nunit-tests:\n  stage: test\n  script:\n    - pip install -r requirements.txt   # fully pinned versions\n    - pip check                         # fail fast on broken dependencies\n    - python -m pytest --junitxml=report.xml\n  artifacts:\n    when: always\n    reports:\n      junit: report.xml                 # failed tests appear in the merge request\n\nansible-check:\n  stage: test\n  script:\n    - ansible-galaxy collection install -r collections/requirements.yml\n    - ansible-playbook -i inventory/lab.yml site.yml --check --diff\n",
+   "highlight": [
+    2,
+    5,
+    27,
+    32
+   ],
+   "caption": "A hardened pipeline: pinned image, pinned dependencies, a dependency check, JUnit reports and retries limited to infrastructure failures."
+  },
+  {
+   "id": "tests",
+   "type": "text",
+   "markdown": "## Failed tests: the change, the test or the environment?\n\nWhen a test fails, three explanations are possible, and you must rule them in or out in order.\n\n1. **The change is wrong.** The test caught a real defect. This is the pipeline doing its job: fix the code.\n2. **The test is wrong.** It encodes an outdated expectation, depends on test order, or compares strings too strictly (the double space in the example below). Fix the test, and say so in the merge request.\n3. **The environment is wrong.** A device in the lab was not booted, a timeout was too short, or the runner could not reach the management network. In pyATS, this usually shows as **errored** rather than **failed**: the test could not run at all.\n\nPublish results as **JUnit XML** (`pytest --junitxml`, or pyATS `--xunit`) so GitLab shows which tests failed directly in the merge request. Treat **flaky tests**, which pass and fail without any code change, as defects. Do not hide them with blanket `retry` settings; limit retries to runner and timeout failures, and quarantine a flaky test until someone fixes it."
+  },
+  {
+   "id": "repro",
+   "type": "terminal",
+   "title": "Reproducing the job locally in the CI image",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "docker run --rm -it -v \"$PWD\":/src -w /src python:3.12-slim bash",
+     "comment": "Same image as the job, repository mounted at /src: the environment now matches CI."
+    },
+    {
+     "prompt": "root@ci:/src#",
+     "cmd": "pip install -q -r requirements.txt && pip install -q -r requirements-dev.txt",
+     "output": "ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. ...\nnetmiko 4.4.0 requires ntc-templates>=3.1.0, but you have ntc-templates 2.3.2 which is incompatible."
+    },
+    {
+     "prompt": "root@ci:/src#",
+     "cmd": "pip check; echo \"exit=$?\"",
+     "output": "netmiko 4.4.0 has requirement ntc-templates>=3.1.0, but you have ntc-templates 2.3.2.\nexit=1"
+    },
+    {
+     "comment": "The second install downgraded a package and only printed a warning (exit code 0). pip check turns the conflict into a failing exit code."
+    },
+    {
+     "prompt": "root@ci:/src#",
+     "cmd": "python -m pytest -q -x tests/",
+     "output": "F\n=================================== FAILURES ===================================\n_____________________ test_render_ospf_cost[R1-Gi2-10] _____________________\n    def test_render_ospf_cost(host, intf, cost):\n        cfg = render(\"ospf.j2\", host=host, intf=intf, cost=cost)\n>       assert f\" ip ospf cost {cost}\" in cfg\nE       AssertionError: assert ' ip ospf cost 10' in 'interface GigabitEthernet2\\n ip ospf cost  10\\n'\n=========================== short test summary info ============================\nFAILED tests/test_render.py::test_render_ospf_cost[R1-Gi2-10] - AssertionError\n1 failed in 0.41s"
+    },
+    {
+     "comment": "The template renders two spaces before the cost. The test is correct; the Jinja2 template has a bug."
+    },
+    {
+     "prompt": "root@ci:/src#",
+     "cmd": "echo $?",
+     "output": "1"
+    }
+   ],
+   "caption": "Reproducing in the exact image removes the \"works on my laptop\" variable."
+  },
+  {
+   "id": "access",
+   "type": "text",
+   "markdown": "## Secrets, runners and reachability\n\nSome failures have nothing to do with code or packages.\n\n- **Protected variables.** A CI/CD variable marked *protected* is injected only into pipelines on protected branches and tags. On a feature branch it is empty, so a RESTCONF call returns **401 Unauthorized**. Decide deliberately which jobs need production credentials; lab credentials can be unprotected, production ones should not be.\n- **Masked variables** hide values in logs. Never enable `CI_DEBUG_TRACE` on a job that handles secrets: it prints every command with expanded variables.\n- **Runner selection.** A job with `tags: [lab-access]` stays *pending* if no online runner has that tag.\n- **Network path.** A runner in a cloud VPC cannot reach a management network at 192.0.2.0/24 without a route or a jump host. Test reachability from the runner, not from your laptop.\n\nFor storing these secrets safely, see [Secure Coding: Input Validation and Secret Management](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Where learners go wrong",
+   "markdown": "- **Reading only the last line.** `Job failed: exit code 1` is a symptom. The cause is the first error above it.\n- **Rerunning until green.** If a rerun passes, you have a flaky test or an unpinned dependency. Find out which.\n- **Fixing CI by editing the job, not the cause.** Adding `allow_failure: true` to a failing test job removes the safety net for everyone.\n- **Assuming the code changed.** A pipeline that broke overnight with no commits points to a floating image tag or an unpinned package."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Validate the pipeline file before you push",
+   "markdown": "Use the GitLab **pipeline editor** or run `glab ci lint` to catch YAML and keyword errors before they create a broken pipeline. Run `yamllint` and `ansible-lint` locally with a pre-commit hook so lint failures never reach CI. The pipeline structure itself is covered in [GitLab CI/CD Pipelines: Build, Validate and Deploy](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a private test repository with a GitLab runner you control:\n\n1. Create a job that uses `python:3.12-slim`, installs a pinned `requirements.txt` and runs `pytest` on one simple test.\n2. Remove a package from `requirements.txt` that the code imports. Read the log and identify the `ModuleNotFoundError`.\n3. Pin two packages to versions that conflict, and read pip's resolver message.\n4. Make the test fail on purpose, add `--junitxml=report.xml` with a `junit` report artifact, and find the failure in the merge request.\n5. Reproduce each failure locally with `docker run` in the same image, then fix it and add a guard such as `pip check`."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Job log (trace)",
+     "definition": "The console output of a CI job, including the runner, the image used and every command with its output."
+    },
+    {
+     "term": "Exit code",
+     "definition": "The numeric status a command returns; any nonzero value stops a CI job and marks it failed."
+    },
+    {
+     "term": "Missing dependency",
+     "definition": "A package, tool or collection the code needs that is not present in the CI environment."
+    },
+    {
+     "term": "Version pinning",
+     "definition": "Fixing exact versions of images, packages and collections so every run uses the same environment."
+    },
+    {
+     "term": "pip check",
+     "definition": "A command that verifies installed Python packages have compatible dependencies."
+    },
+    {
+     "term": "JUnit report",
+     "definition": "An XML test result format that GitLab displays in merge requests and pipeline views."
+    },
+    {
+     "term": "Flaky test",
+     "definition": "A test that passes and fails on the same code, usually due to timing or environment dependence."
+    },
+    {
+     "term": "Protected variable",
+     "definition": "A GitLab CI/CD variable exposed only to pipelines running on protected branches or tags."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "A job log ends with \"ERROR: Job failed: exit code 1\". What should you do first?",
+     "options": [
+      "Rerun the job",
+      "Scroll up to the first error message in the log",
+      "Add allow_failure: true to the job",
+      "Restart the runner"
+     ],
+     "answer": 1,
+     "explanation": "The final line only reports that the job failed. The first error above it identifies the cause."
+    },
+    {
+     "question": "A pipeline that passed yesterday fails today with no new commits. Which causes are likely? (Choose all that apply.)",
+     "options": [
+      "The job uses python:latest and the tag now points to a newer Python",
+      "An unpinned package released a new major version",
+      "A floating Ansible collection version changed a module",
+      "Git rewrote the commit history automatically"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Floating image tags and unpinned packages or collections change without any commit. Git does not rewrite history on its own."
+    },
+    {
+     "question": "A job exits with code 127 while running ansible-lint. What is the most likely cause?",
+     "options": [
+      "A test assertion failed",
+      "The ansible-lint command is not installed in the job image",
+      "The runner ran out of memory",
+      "The YAML file has a syntax error"
+     ],
+     "answer": 1,
+     "explanation": "Exit code 127 means command not found: the tool is missing from the image or the PATH."
+    },
+    {
+     "question": "A RESTCONF test passes on main but returns 401 on a feature branch. What is the most likely reason?",
+     "options": [
+      "The device rejects feature branches",
+      "The credential variable is protected, so it is empty on unprotected branches",
+      "JUnit reports are disabled",
+      "The pip cache is stale"
+     ],
+     "answer": 1,
+     "explanation": "Protected CI/CD variables are injected only into pipelines for protected branches and tags."
+    },
+    {
+     "question": "Which practices make dependency failures less likely? (Choose all that apply.)",
+     "options": [
+      "Pin the CI image to a specific tag or digest",
+      "Pin exact package versions and run pip check",
+      "Retry every failed job three times",
+      "Use a dedicated CI toolchain image"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Pinning and a dedicated toolchain image make the environment reproducible. Blanket retries hide problems instead of fixing them."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Start with the pipeline graph: which stage failed, and whether the job ran, waited or never started.\n- In the log, the **first error** is the cause and the exit code tells you its kind (1, 4, 5, 127, 137).\n- **Missing dependencies** and **incompatible versions** come from differences between the developer's machine and the CI image. Pin images, packages and collections, and run `pip check`.\n- A **failed test** means the change, the test or the environment is wrong. Rule them out in that order, and publish JUnit reports.\n- Protected variables, runner tags and network paths cause failures that look like code bugs but are not.\n- Reproduce in the same image, fix the cause, then add a guard so it cannot return.\n\nNext, give your pipeline a realistic network to test against in [Cisco Modeling Labs (CML) for Testing](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing)."
+  }
+ ],
+ "ar": {
+  "title": "تشخيص إخفاقات خطوط CI/CD",
+  "summary": "اقرأ مخططات الخطوط وسجلات المهام ورموز الخروج لتصل إلى السبب الجذري لإخفاقات CI/CD، كالتبعيات المفقودة والإصدارات غير المتوافقة والاختبارات الفاشلة، ثم أصلِحها إصلاحًا دائمًا.",
+  "objectives": [
+   "تصنيف إخفاق الخط بحسب المرحلة والعرَض ورمز الخروج",
+   "تشخيص الإخفاقات الناتجة عن التبعيات المفقودة والإصدارات غير المتوافقة",
+   "تحديد ما إذا كان الاختبار الفاشل يشير إلى التغيير أم إلى الاختبار أم إلى البيئة",
+   "التعرّف على الإخفاقات الناتجة عن المتغيرات المحمية واختيار المشغّل وإمكانية الوصول الشبكي",
+   "تطبيق تثبيت الإصدارات وفحص التبعيات وتقارير الاختبار لمنع تكرار الإخفاقات"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "طلبُ دمجٍ (Merge request) يغيّر كلفة OSPF وخطُّه أحمر. يؤكد كاتبه أنّ الشيفرة تعمل على حاسوبه، والمراجِع ينتظر، ونافذة الصيانة تبدأ بعد ساعتين. إنّ إعادة تشغيل الخط على أمل النجاح ليست استراتيجية.\n\nالخط الفاشل دليلٌ يُقرأ؛ فكل إخفاق يترك أثرًا في سجل المهمة (Job log) أو في رمز الخروج (Exit code) أو في تقرير الاختبار، ومعظم الإخفاقات تندرج تحت عدد محدود من الفئات. يقدّم لك هذا الدرس منهجيةً قابلة للتكرار لقراءة هذا الدليل، والوصول إلى السبب الجذري، وإصلاحه إصلاحًا دائمًا. ويتوقع منك امتحان AUTOCOR تشخيص الإخفاقات الناتجة عن **التبعيات المفقودة (Missing dependencies)** و**الإصدارات غير المتوافقة** و**الاختبارات الفاشلة**، لذا تحظى هذه الفئات بالاهتمام الأكبر."
+   },
+   {
+    "id": "classes",
+    "type": "text",
+    "markdown": "## أين تفشل خطوط CI/CD؟\n\nقبل قراءة أي سطر من السجل، لاحظ **أيّ مرحلة (Stage)** فشلت و**كيف** فشلت. فالخط الذي لم يبدأ أصلًا، والمهمة العالقة في حالة *pending*، والمهمة التي نُفِّذت وخرجت بالرمز 1، تشير كلٌّ منها إلى مشكلة مختلفة تمامًا.\n\n| فئة الإخفاق | العرَض النموذجي | أين تبحث |\n|:--|:--|:--|\n| إعدادات الخط | لم يُنشأ الخط؛ «This GitLab CI configuration is invalid» | محرّر الخط، CI Lint، `glab ci lint` |\n| المشغّل (Runner) أو المنفّذ | مهمة عالقة في *pending*؛ خطأ في سحب الصورة | وسوم المشغّل وحالته، والوصول إلى السجل (Registry) |\n| تبعية مفقودة | `ModuleNotFoundError`، `command not found` (الرمز 127)، «couldn't resolve module/action» | `requirements.txt`، صورة CI، ملف `requirements.yml` في Ansible |\n| إصدار غير متوافق | تعارض في محلِّل اعتماديات pip، «requires a different Python»، وحدة مُهمَلة | الإصدارات المثبَّتة، وسم الصورة، `pip check` |\n| اختبارات فاشلة | رمز الخروج 1 من `pytest`، نتيجة *failed* في pyATS، أخطاء الفحص الساكن | تقرير الاختبار، ملف JUnit، فروق التغيير |\n| الأسرار والصلاحيات | HTTP 401/403، فشل المصادقة، متغير فارغ | متغيرات CI/CD، الفروع المحمية |\n| البيئة وإمكانية الوصول | انتهاء المهلة، رفض الاتصال، نتيجة *errored* في pyATS | مسار الشبكة من المشغّل إلى المختبر أو الأجهزة |\n\nالفئات الأربع الأولى إخفاقاتٌ في **الخط** نفسه. أمّا *الاختبارات الفاشلة* فهي وحدها التي تعني عادةً أنّ **التغيير** خاطئ، وحتى في هذه الحالة قد يكون الاختبار نفسه هو المخطئ."
+   },
+   {
+    "id": "triage-anim",
+    "type": "animation",
+    "kind": "cycle",
+    "title": "حلقة فرز قابلة للتكرار",
+    "caption": "ينبغي أن ينتهي كل إصلاح بضابطٍ يمنع عودة الإخفاق نفسه.",
+    "data": {
+     "center": "فرز إخفاقات الخط",
+     "items": [
+      {
+       "label": "حدِّد الموضع",
+       "sub": "المرحلة والمهمة الفاشلتان"
+      },
+      {
+       "label": "اقرأ",
+       "sub": "الخطأ الأول لا السطر الأخير"
+      },
+      {
+       "label": "صنِّف",
+       "sub": "إعدادات، تبعيات، إصدار، اختبار، صلاحيات"
+      },
+      {
+       "label": "أعِد الإنتاج",
+       "sub": "الصورة نفسها والأوامر نفسها"
+      },
+      {
+       "label": "أصلِح",
+       "sub": "أصغر تغيير عند السبب"
+      },
+      {
+       "label": "امنع التكرار",
+       "sub": "ثبِّت الإصدار أو افحص أو أضِف اختبارًا"
+      }
+     ],
+     "steps": [
+      {
+       "item": 0,
+       "caption": "افتح مخطط الخط: فشلت مرحلة test، أي إنّ validate نجحت وتُخطِّيت مرحلة deploy."
+      },
+      {
+       "item": 1,
+       "caption": "اصعد من السطر «Job failed: exit code 1» إلى أول سطر ERROR؛ فهو السبب، وما بعده نتائج له."
+      },
+      {
+       "item": 2,
+       "caption": "صنِّفه: «No matching distribution found» مشكلة إصدار لا مشكلة شيفرة."
+      },
+      {
+       "item": 3,
+       "caption": "شغّل حاوية من صورة CI ذاتها ونفّذ أسطر السكربت نفسها لإعادة إنتاج الخطأ محليًا."
+      },
+      {
+       "item": 4,
+       "caption": "أصلِح السبب، كأن تثبّت صورة Python على إصدار مدعوم، ثم ادفع التغيير.",
+       "tone": "success"
+      },
+      {
+       "item": 5,
+       "caption": "أضِف ضابطًا مثل pip check أو وسم صورة مثبَّتًا كي لا يعود الإخفاق نفسه بصمت.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "id": "read",
+    "type": "text",
+    "markdown": "## قراءة سجل المهمة\n\nتنفّذ المهمة أسطر `script` بالترتيب داخل صدفة المشغّل، و**تتوقف عند أول أمر يعيد رمز خروج غير صفري**، ثم يطبع المشغّل `ERROR: Job failed: exit code N`. يخبرك هذا السطر الأخير *أنّ* المهمة فشلت، ولا يخبرك *لماذا* أبدًا؛ فاصعد إلى أول خطأ.\n\nلرموز الخروج دلالات:\n\n- **1**: إخفاق عام. وفي `pytest` يعني أنّ اختبارًا واحدًا على الأقل قد فشل.\n- **2 و4 و5** من `pytest`: مقاطعة، أو خطأ في الاستخدام، أو عدم العثور على أي اختبار. وكثيرًا ما يعني الرمز 5 مسارًا خاطئًا أو نمطَ اكتشاف غير مطابق، لا شيفرةً معطوبة.\n- **4** من `ansible-playbook`: خطأ في التحليل أو في العثور على الوحدة، قبل تنفيذ أي مهمة.\n- **127**: الأمر غير موجود؛ فالأداة غائبة عن الصورة أو عن `PATH`.\n- **137**: أُنهيت العملية قسرًا (SIGKILL)، وغالبًا بسبب نفاد ذاكرة الحاوية.\n\nاقرأ كذلك ترويسة السجل؛ فهي تسجّل المشغّل والمنفّذ و**الصورة المستخدمة فعلًا**. فإن ظهر فيها `python:latest`، فقد نُفِّذت المهمة على أحدث إصدار من Python في ذلك اليوم، وهذا مصدر كلاسيكي لإخفاقات تظهر بين ليلة وضحاها دون أي تغيير في الشيفرة."
+   },
+   {
+    "id": "log",
+    "type": "terminal",
+    "title": "العثور على الخطأ الحقيقي الأول في مهمتين فاشلتين",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "glab ci status --branch feature/ospf-cost",
+      "output": "(success) lint           validate\n(failed)  unit-tests     test\n(failed)  ansible-check  test\n(skipped) deploy-lab     deploy\n\nPipeline state: failed"
+     },
+     {
+      "comment": "يُظهر مخطط الخط المرحلة التي فشلت. تُخطِّيت مرحلة deploy، فلم يصل شيء إلى الشبكة."
+     },
+     {
+      "cmd": "glab ci trace unit-tests",
+      "output": "Running with gitlab-runner 17.5.2 (c6eae8d7)\n  on netops-docker-01 t2_xYz8, system ID: s_4f1c0a9b2e3d\nPreparing the \"docker\" executor\nUsing docker image python:latest ...\n$ pip install -r requirements.txt\nCollecting ncclient==0.6.15\nCollecting pyats[full]==24.10\nERROR: Ignored the following versions that require a different python version: 24.10 Requires-Python <3.13,>=3.8\nERROR: Could not find a version that satisfies the requirement pyats[full]==24.10\nERROR: No matching distribution found for pyats[full]==24.10\nCleaning up project directory and file based variables\nERROR: Job failed: exit code 1"
+     },
+     {
+      "comment": "السبب الجذري: انتقل الوسم python:latest إلى إصدار من Python لا يدعمه pyATS 24.10. إنها مشكلة إصدار غير متوافق، لا خطأ في الشيفرة."
+     },
+     {
+      "cmd": "glab ci trace ansible-check",
+      "output": "$ ansible-playbook -i inventory/lab.yml site.yml --check --diff\nERROR! couldn't resolve module/action 'cisco.ios.ios_ospfv2'. This often indicates a misspelling, missing collection, or incorrect module path.\n\nThe error appears to be in '/builds/netops/ospf/roles/ospf/tasks/main.yml': line 2, column 3\nERROR: Job failed: exit code 4"
+     },
+     {
+      "comment": "رمز الخروج 4 قبل تنفيذ أي مهمة: المجموعة cisco.ios غير مثبَّتة في صورة CI. إنها تبعية مفقودة."
+     }
+    ],
+    "caption": "المخرجات مختصرة. يقول السطر الأخير فقط إنّ المهمة فشلت، أمّا السبب فيقع قبله ببضعة أسطر."
+   },
+   {
+    "id": "deps",
+    "type": "text",
+    "markdown": "## التبعيات المفقودة والإصدارات غير المتوافقة\n\nتنشأ معظم إخفاقات «تعمل على حاسوبي» من اختلافٍ بين بيئة المطوِّر وصورة CI.\n\n### التبعيات المفقودة\n\n- حزمة Python مثبَّتة على الحاسوب على مستوى النظام، لكنها لم تُضَف قط إلى `requirements.txt`.\n- أداة نظامية مثل `git` أو `ssh` أو مكتبة C غائبة عن صورة من نوع `-slim`.\n- مجموعة Ansible (Collection) مثل `cisco.ios` أو `cisco.nxos` مستخدَمة لكنها غير مدرجة في `collections/requirements.yml`.\n\n### الإصدارات غير المتوافقة\n\n- **الوسوم العائمة**: يتغيّر `python:latest` أو `ubuntu:latest` من تحت قدميك.\n- **الحزم غير المثبَّتة**: يثبّت القيد `netmiko>=4` إصدارًا رئيسيًا جديدًا بواجهة برمجية مختلفة.\n- **المتطلبات المتعارضة**: تحتاج حزمتان إلى إصدارين مختلفين من المكتبة نفسها، فيتوقف محلِّل الاعتماديات في pip برسالة «conflicting dependencies».\n- **قيود المفسِّر**: تعلن الحزمة `Requires-Python` وترفض المفسِّر الموجود في الصورة.\n\nالعلاج هو **قابلية إعادة الإنتاج (Reproducibility)**: ثبّت الصورة الأساسية على وسم محدد (أو على بصمتها Digest)، وثبّت كل حزمة Python على إصدار دقيق (وولِّد ملف القفل بالأمر `pip freeze` أو `pip-compile`)، وثبّت إصدارات المجموعات، ونفّذ `pip check` بعد التثبيت. والأفضل من ذلك أن تبني **صورة أدوات مخصّصة لـ CI** تحوي الأدوات مسبقًا، وتُحدِّثها عبر خطّها الخاص. وخزِّن مجلد تنزيلات pip مؤقتًا بمفتاح مشتق من `requirements.txt`، حتى يُلغى المخزن المؤقت عند تغيُّر الملف."
+   },
+   {
+    "id": "ci-yaml",
+    "type": "code",
+    "language": "yaml",
+    "filename": ".gitlab-ci.yml",
+    "code": "default:\n  image: registry.example.com/netops/ci-python:3.12-2026.10   # pinned toolchain image\n  retry:\n    max: 2\n    when: [runner_system_failure, stuck_or_timeout_failure]  # never retry real test failures\n\nstages: [validate, test, deploy]\n\nvariables:\n  PIP_CACHE_DIR: \"$CI_PROJECT_DIR/.cache/pip\"\n\ncache:\n  key:\n    files: [requirements.txt, collections/requirements.yml]\n  paths: [.cache/pip]\n\nlint:\n  stage: validate\n  script:\n    - yamllint .\n    - ansible-lint\n\nunit-tests:\n  stage: test\n  script:\n    - pip install -r requirements.txt   # fully pinned versions\n    - pip check                         # fail fast on broken dependencies\n    - python -m pytest --junitxml=report.xml\n  artifacts:\n    when: always\n    reports:\n      junit: report.xml                 # failed tests appear in the merge request\n\nansible-check:\n  stage: test\n  script:\n    - ansible-galaxy collection install -r collections/requirements.yml\n    - ansible-playbook -i inventory/lab.yml site.yml --check --diff\n",
+    "highlight": [
+     2,
+     5,
+     27,
+     32
+    ],
+    "caption": "خط مُحصَّن: صورة مثبَّتة الإصدار، وتبعيات مثبَّتة، وفحص للتبعيات، وتقارير JUnit، وإعادة محاولة مقصورة على أعطال البنية التحتية."
+   },
+   {
+    "id": "tests",
+    "type": "text",
+    "markdown": "## الاختبارات الفاشلة: التغيير أم الاختبار أم البيئة؟\n\nحين يفشل اختبار، فثمة ثلاثة تفسيرات محتملة، وعليك إثباتها أو استبعادها بالترتيب.\n\n1. **التغيير خاطئ.** التقط الاختبار عيبًا حقيقيًا، وهذا هو عمل الخط بالضبط؛ فأصلِح الشيفرة.\n2. **الاختبار خاطئ.** فهو يعبّر عن توقُّع قديم، أو يعتمد على ترتيب الاختبارات، أو يقارن النصوص بصرامة مفرطة (كالمسافة المزدوجة في المثال أدناه). أصلِح الاختبار، واذكر ذلك صراحةً في طلب الدمج.\n3. **البيئة خاطئة.** لم يكتمل إقلاع جهاز في المختبر، أو كانت المهلة قصيرة جدًا، أو لم يستطع المشغّل الوصول إلى شبكة الإدارة. وفي pyATS يظهر ذلك عادةً بالنتيجة **errored** لا **failed**، أي إنّ الاختبار لم يُنفَّذ أصلًا.\n\nانشر النتائج بصيغة **JUnit XML** (`pytest --junitxml`، أو الخيار `--xunit` في pyATS) كي يعرض GitLab الاختبارات الفاشلة مباشرةً في طلب الدمج. وعامِل **الاختبارات المتقلّبة (Flaky tests)**، التي تنجح وتفشل دون أي تغيير في الشيفرة، معاملةَ العيوب. لا تُخفِها بإعدادات `retry` شاملة؛ بل اقصر إعادة المحاولة على أعطال المشغّل وانتهاء المهلة، واعزل الاختبار المتقلّب حتى يُصلَح."
+   },
+   {
+    "id": "repro",
+    "type": "terminal",
+    "title": "إعادة إنتاج المهمة محليًا داخل صورة CI",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "docker run --rm -it -v \"$PWD\":/src -w /src python:3.12-slim bash",
+      "comment": "الصورة نفسها المستخدمة في المهمة، والمستودع مركَّب على /src: صارت البيئة مطابقة لبيئة CI."
+     },
+     {
+      "prompt": "root@ci:/src#",
+      "cmd": "pip install -q -r requirements.txt && pip install -q -r requirements-dev.txt",
+      "output": "ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. ...\nnetmiko 4.4.0 requires ntc-templates>=3.1.0, but you have ntc-templates 2.3.2 which is incompatible."
+     },
+     {
+      "prompt": "root@ci:/src#",
+      "cmd": "pip check; echo \"exit=$?\"",
+      "output": "netmiko 4.4.0 has requirement ntc-templates>=3.1.0, but you have ntc-templates 2.3.2.\nexit=1"
+     },
+     {
+      "comment": "خفّض التثبيت الثاني إصدار إحدى الحزم واكتفى بطباعة تحذير (رمز الخروج 0)، أمّا pip check فيحوّل التعارض إلى رمز خروج فاشل."
+     },
+     {
+      "prompt": "root@ci:/src#",
+      "cmd": "python -m pytest -q -x tests/",
+      "output": "F\n=================================== FAILURES ===================================\n_____________________ test_render_ospf_cost[R1-Gi2-10] _____________________\n    def test_render_ospf_cost(host, intf, cost):\n        cfg = render(\"ospf.j2\", host=host, intf=intf, cost=cost)\n>       assert f\" ip ospf cost {cost}\" in cfg\nE       AssertionError: assert ' ip ospf cost 10' in 'interface GigabitEthernet2\\n ip ospf cost  10\\n'\n=========================== short test summary info ============================\nFAILED tests/test_render.py::test_render_ospf_cost[R1-Gi2-10] - AssertionError\n1 failed in 0.41s"
+     },
+     {
+      "comment": "يولّد القالب مسافتين قبل الكلفة. الاختبار صحيح، والخطأ في قالب Jinja2."
+     },
+     {
+      "prompt": "root@ci:/src#",
+      "cmd": "echo $?",
+      "output": "1"
+     }
+    ],
+    "caption": "إعادة الإنتاج في الصورة نفسها تُسقط متغيّر «تعمل على حاسوبي» من المعادلة."
+   },
+   {
+    "id": "access",
+    "type": "text",
+    "markdown": "## الأسرار والمشغّلات وإمكانية الوصول\n\nبعض الإخفاقات لا علاقة لها بالشيفرة ولا بالحزم.\n\n- **المتغيرات المحمية (Protected variables).** لا يُحقَن متغير CI/CD الموسوم بـ *protected* إلا في خطوط الفروع والوسوم المحمية. وفي فرع الميزات يكون فارغًا، فيعيد استدعاء RESTCONF الرمز **401 Unauthorized**. قرِّر عن وعيٍ أيّ المهام تحتاج إلى بيانات اعتماد الإنتاج؛ فبيانات اعتماد المختبر يمكن أن تكون غير محمية، أمّا بيانات الإنتاج فلا.\n- **المتغيرات المقنَّعة (Masked variables)** تُخفي القيم في السجلات. ولا تفعّل `CI_DEBUG_TRACE` أبدًا في مهمة تتعامل مع أسرار، لأنه يطبع كل أمر بعد توسيع متغيراته.\n- **اختيار المشغّل.** تبقى المهمة ذات `tags: [lab-access]` في حالة *pending* إذا لم يكن ثمة مشغّل متصل يحمل هذا الوسم.\n- **مسار الشبكة.** لا يستطيع مشغّل في سحابة خاصة افتراضية (VPC) الوصول إلى شبكة إدارة على 192.0.2.0/24 دون مسار توجيه أو مضيف وسيط (Jump host). اختبر إمكانية الوصول من المشغّل، لا من حاسوبك.\n\nولتخزين هذه الأسرار بأمان، راجع درس [Secure Coding: Input Validation and Secret Management](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة لدى المتعلّمين",
+    "markdown": "- **قراءة السطر الأخير وحده.** إنّ `Job failed: exit code 1` عرَضٌ، والسبب هو أول خطأ فوقه.\n- **إعادة التشغيل حتى يخضرّ الخط.** إذا نجحت إعادة التشغيل، فلديك اختبار متقلّب أو تبعية غير مثبَّتة، فاكتشف أيّهما.\n- **إصلاح CI بتعديل المهمة لا السبب.** إضافة `allow_failure: true` إلى مهمة اختبار فاشلة تُسقط شبكة الأمان عن الجميع.\n- **افتراض أنّ الشيفرة تغيّرت.** الخط الذي تعطّل بين ليلة وضحاها دون أي إيداع (Commit) يشير إلى وسم صورة عائم أو حزمة غير مثبَّتة."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "تحقّق من ملف الخط قبل الدفع",
+    "markdown": "استخدم **محرّر الخط (Pipeline editor)** في GitLab أو نفّذ `glab ci lint` لالتقاط أخطاء YAML والكلمات المفتاحية قبل أن تُنشئ خطًّا معطوبًا. وشغّل `yamllint` و`ansible-lint` محليًا عبر خطّاف pre-commit كي لا تصل أخطاء الفحص الساكن إلى CI أبدًا. أمّا بنية الخط نفسها فيغطيها درس [GitLab CI/CD Pipelines: Build, Validate and Deploy](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مستودع اختبار خاص مع مشغّل GitLab تتحكم فيه:\n\n1. أنشئ مهمة تستخدم `python:3.12-slim`، وتثبّت ملف `requirements.txt` بإصدارات مثبَّتة، وتشغّل `pytest` على اختبار بسيط واحد.\n2. احذف من `requirements.txt` حزمةً تستوردها الشيفرة، ثم اقرأ السجل وحدِّد الخطأ `ModuleNotFoundError`.\n3. ثبّت حزمتين على إصدارين متعارضين، واقرأ رسالة محلِّل الاعتماديات في pip.\n4. اجعل الاختبار يفشل عمدًا، وأضِف `--junitxml=report.xml` مع ناتج تقرير من نوع `junit`، ثم اعثر على الإخفاق في طلب الدمج.\n5. أعِد إنتاج كل إخفاق محليًا بالأمر `docker run` في الصورة نفسها، ثم أصلِحه وأضِف ضابطًا مثل `pip check`."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "سجل المهمة (Job log / trace)",
+      "definition": "مخرجات وحدة التحكم لمهمة CI، وتشمل المشغّل والصورة المستخدمة وكل أمر مع مخرجاته."
+     },
+     {
+      "term": "رمز الخروج (Exit code)",
+      "definition": "القيمة الرقمية التي يعيدها الأمر؛ وأي قيمة غير صفرية توقف مهمة CI وتسمها بالفشل."
+     },
+     {
+      "term": "تبعية مفقودة (Missing dependency)",
+      "definition": "حزمة أو أداة أو مجموعة تحتاجها الشيفرة وهي غير موجودة في بيئة CI."
+     },
+     {
+      "term": "تثبيت الإصدار (Version pinning)",
+      "definition": "تحديد إصدارات دقيقة للصور والحزم والمجموعات كي يستخدم كل تشغيل البيئة ذاتها."
+     },
+     {
+      "term": "pip check",
+      "definition": "أمر يتحقق من أنّ حزم Python المثبَّتة ذات تبعيات متوافقة."
+     },
+     {
+      "term": "تقرير JUnit",
+      "definition": "صيغة XML لنتائج الاختبارات يعرضها GitLab في طلبات الدمج وصفحات الخطوط."
+     },
+     {
+      "term": "اختبار متقلّب (Flaky test)",
+      "definition": "اختبار ينجح ويفشل على الشيفرة نفسها، غالبًا بسبب التوقيت أو الاعتماد على البيئة."
+     },
+     {
+      "term": "متغير محمي (Protected variable)",
+      "definition": "متغير CI/CD في GitLab لا يُتاح إلا للخطوط العاملة على فروع أو وسوم محمية."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ينتهي سجل مهمة بالسطر «ERROR: Job failed: exit code 1». ما أول ما ينبغي فعله؟",
+      "options": [
+       "إعادة تشغيل المهمة",
+       "الصعود إلى أول رسالة خطأ في السجل",
+       "إضافة allow_failure: true إلى المهمة",
+       "إعادة تشغيل المشغّل"
+      ],
+      "answer": 1,
+      "explanation": "لا يذكر السطر الأخير إلا أنّ المهمة فشلت، أمّا أول خطأ فوقه فيحدد السبب."
+     },
+     {
+      "question": "خطٌّ نجح أمس ويفشل اليوم دون أي إيداعات جديدة. ما الأسباب المرجّحة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "تستخدم المهمة python:latest وصار الوسم يشير إلى إصدار أحدث من Python",
+       "أصدرت حزمة غير مثبَّتة إصدارًا رئيسيًا جديدًا",
+       "غيّر إصدار عائم من مجموعة Ansible سلوكَ إحدى الوحدات",
+       "أعاد Git كتابة سجل الإيداعات تلقائيًا"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "الوسوم العائمة للصور والحزم والمجموعات غير المثبَّتة تتغير دون أي إيداع، أمّا Git فلا يعيد كتابة السجل من تلقاء نفسه."
+     },
+     {
+      "question": "تخرج مهمة بالرمز 127 أثناء تشغيل ansible-lint. ما السبب الأرجح؟",
+      "options": [
+       "فشل تأكيد في أحد الاختبارات",
+       "الأمر ansible-lint غير مثبَّت في صورة المهمة",
+       "نفدت ذاكرة المشغّل",
+       "في ملف YAML خطأ صياغي"
+      ],
+      "answer": 1,
+      "explanation": "الرمز 127 يعني أنّ الأمر غير موجود: الأداة غائبة عن الصورة أو عن PATH."
+     },
+     {
+      "question": "ينجح اختبار RESTCONF على الفرع main ويعيد 401 على فرع ميزات. ما السبب الأرجح؟",
+      "options": [
+       "يرفض الجهاز فروع الميزات",
+       "متغير بيانات الاعتماد محمي، فيكون فارغًا على الفروع غير المحمية",
+       "تقارير JUnit معطَّلة",
+       "المخزن المؤقت لـ pip قديم"
+      ],
+      "answer": 1,
+      "explanation": "لا تُحقَن متغيرات CI/CD المحمية إلا في خطوط الفروع والوسوم المحمية."
+     },
+     {
+      "question": "أيّ الممارسات تقلل احتمال إخفاقات التبعيات؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "تثبيت صورة CI على وسم أو بصمة محددة",
+       "تثبيت إصدارات دقيقة للحزم وتنفيذ pip check",
+       "إعادة محاولة كل مهمة فاشلة ثلاث مرات",
+       "استخدام صورة أدوات مخصّصة لـ CI"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "التثبيت وصورة الأدوات المخصّصة يجعلان البيئة قابلة لإعادة الإنتاج، أمّا إعادة المحاولة الشاملة فتُخفي المشكلات ولا تصلحها."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- ابدأ بمخطط الخط: أيّ مرحلة فشلت، وهل نُفِّذت المهمة أم انتظرت أم لم تبدأ أصلًا.\n- في السجل، **الخطأ الأول** هو السبب، ورمز الخروج يدلّك على نوعه (1 و4 و5 و127 و137).\n- تنشأ **التبعيات المفقودة** و**الإصدارات غير المتوافقة** من الفروق بين جهاز المطوِّر وصورة CI؛ فثبّت الصور والحزم والمجموعات، ونفّذ `pip check`.\n- يعني **الاختبار الفاشل** أنّ التغيير أو الاختبار أو البيئة خاطئ؛ فاستبعدها بهذا الترتيب، وانشر تقارير JUnit.\n- المتغيرات المحمية ووسوم المشغّلات ومسارات الشبكة تسبب إخفاقات تبدو أخطاءً في الشيفرة وليست كذلك.\n- أعِد الإنتاج في الصورة نفسها، وأصلِح السبب، ثم أضِف ضابطًا يمنع عودته.\n\nتابع لتمنح خطّك شبكة واقعية يختبر عليها في درس [Cisco Modeling Labs (CML) للاختبار](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,520 @@
+{
+ "slug": "logging-for-automation-solutions",
+ "title": "Logging for Automation Solutions",
+ "summary": "Design logging for network automation: levels, structured JSON with correlation IDs, central collection and safe handling of secrets.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Choose the right log level for each event",
+  "Write structured logs with a correlation ID",
+  "Redact secrets and avoid logging sensitive data",
+  "Collect and rotate logs for CI and containers",
+  "Use logs to troubleshoot and audit automation runs"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 02:10 a pipeline pushed a change to 60 switches. At 02:14 the monitoring system alerted that six of them lost their uplink. The on-call engineer opens the job log and finds a single line: `Error`. Which device? Which task? Which request? With no useful logs the only option is to guess or roll everything back.\n\nLogging is how an automation solution explains itself. Good logs answer four questions: **what** happened, **where** (which device and task), **when**, and **why** it failed. Bad logs either say nothing or, worse, leak the password they were using."
+  },
+  {
+   "id": "levels",
+   "type": "text",
+   "markdown": "## Log levels and what belongs in each\n\n| Level | Use it for | Example |\n|:--|:--|:--|\n| `DEBUG` | Detail for developers: payloads size, timings | `GET /restconf/data/... took 0.42s` |\n| `INFO` | Normal milestones | `R1 ntp changed` |\n| `WARNING` | Something unexpected that was handled | `retry 2/3 after 503` |\n| `ERROR` | A task failed; the run continues | `R2 patch failed: 401` |\n| `CRITICAL` | The whole run cannot continue | `inventory file missing` |\n\nRun production at `INFO` and switch to `DEBUG` only for troubleshooting, ideally per run through an environment variable. Log events, not chatter: one line per device and action is more useful than 500 lines of progress dots.\n\nAlso log **exceptions with their stack trace** (`log.exception(...)` inside `except`) and the **outcome** of each task (changed, unchanged, failed). An audit trail needs the answer to \"who ran what, on which device, and what was the result\"."
+  },
+  {
+   "id": "struct",
+   "type": "text",
+   "markdown": "## Structured logs and correlation\n\nFree text is easy to write and hard to search. **Structured logging** writes each event as JSON with fixed fields, so a log platform such as Splunk, Elastic or Loki can filter on `device=\"R2\"` or `level=\"ERROR\"` without regular expressions.\n\nAdd a **correlation ID** (`run_id`) to every line of one run. Then a single search returns the full story of a pipeline job across scripts, API calls and devices. Use the same field names in every tool, and record timestamps in UTC with an offset, so logs from different time zones line up.\n\nSend logs to a central place. Local files disappear with an ephemeral CI runner or container, so write to **stdout** and let the platform collect them, or ship them with a syslog or agent. Cap local files with rotation (`RotatingFileHandler`) so a busy night does not fill the disk. See also [Model-Driven Telemetry](/learn/network-automation-devops/model-driven-telemetry) for the device-side counterpart of this data."
+  },
+  {
+   "id": "code",
+   "type": "code",
+   "language": "python",
+   "filename": "logsetup.py",
+   "code": "import json\nimport logging\nimport logging.handlers\nimport re\nimport sys\nimport uuid\n\nSECRET = re.compile(r\"(password|token|secret|api[_-]?key)(\\\"?\\s*[:=]\\s*\\\"?)[^\\s\\\",}]+\", re.I)\n\n\nclass RedactFilter(logging.Filter):\n    def filter(self, record):\n        record.msg = SECRET.sub(r\"\\1\\2***\", str(record.msg))   # mask before output\n        return True\n\n\nclass JsonFormatter(logging.Formatter):\n    def format(self, record):\n        entry = {\n            \"ts\": self.formatTime(record, \"%Y-%m-%dT%H:%M:%S%z\"),\n            \"level\": record.levelname,\n            \"logger\": record.name,\n            \"msg\": record.getMessage(),\n            \"run_id\": getattr(record, \"run_id\", None),\n            \"device\": getattr(record, \"device\", None),\n        }\n        if record.exc_info:\n            entry[\"exc\"] = self.formatException(record.exc_info)\n        return json.dumps(entry)\n\n\ndef setup(level=logging.INFO):\n    root = logging.getLogger()\n    root.setLevel(level)\n    console = logging.StreamHandler(sys.stdout)                     # CI and containers read stdout\n    console.setFormatter(JsonFormatter())\n    console.addFilter(RedactFilter())\n    root.addHandler(console)\n    rotating = logging.handlers.RotatingFileHandler(\"automation.log\", maxBytes=5_000_000, backupCount=5)\n    rotating.setFormatter(JsonFormatter())\n    rotating.addFilter(RedactFilter())\n    root.addHandler(rotating)\n\n\nif __name__ == \"__main__\":\n    setup()\n    log = logging.LoggerAdapter(logging.getLogger(\"ntp-sync\"), {\"run_id\": uuid.uuid4().hex[:8], \"device\": \"198.51.100.11\"})\n    log.info(\"change applied\")\n    log.warning(\"login retry password=Sup3rSecret\")\n    try:\n        1 / 0\n    except ZeroDivisionError:\n        log.exception(\"unexpected error\")\n",
+   "caption": "Structured JSON logging with a correlation ID, secret redaction, stdout output and file rotation.",
+   "highlight": [
+    10,
+    11,
+    12,
+    30,
+    31,
+    32,
+    36
+   ]
+  },
+  {
+   "id": "out",
+   "type": "terminal",
+   "title": "python logsetup.py",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "python logsetup.py",
+     "output": "{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"INFO\", \"logger\": \"ntp-sync\", \"msg\": \"change applied\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"WARNING\", \"logger\": \"ntp-sync\", \"msg\": \"login retry password=***\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"ERROR\", \"logger\": \"ntp-sync\", \"msg\": \"unexpected error\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\", \"exc\": \"Traceback ... ZeroDivisionError: division by zero\"}",
+     "comment": "The password value is masked before the line is written."
+    }
+   ],
+   "caption": "One JSON object per event, all sharing the same run_id."
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "From event to insight",
+   "caption": "A log line only helps if it reaches a searchable, protected place.",
+   "data": {
+    "token": "Log event",
+    "nodes": [
+     {
+      "id": "app",
+      "label": "Automation job",
+      "sub": "Python / Ansible",
+      "icon": "cpu"
+     },
+     {
+      "id": "flt",
+      "label": "Redaction",
+      "sub": "mask secrets",
+      "icon": "shield"
+     },
+     {
+      "id": "col",
+      "label": "Collector",
+      "sub": "stdout / syslog",
+      "icon": "server"
+     },
+     {
+      "id": "sto",
+      "label": "Log platform",
+      "sub": "Splunk / Elastic",
+      "icon": "database"
+     },
+     {
+      "id": "eng",
+      "label": "Engineer",
+      "sub": "search by run_id",
+      "icon": "user"
+     }
+    ],
+    "steps": [
+     {
+      "at": "app",
+      "caption": "The job emits one structured event per device and action."
+     },
+     {
+      "at": "flt",
+      "caption": "A filter masks passwords and tokens before anything is written.",
+      "tone": "success"
+     },
+     {
+      "at": "col",
+      "caption": "The CI runner or container platform collects stdout."
+     },
+     {
+      "at": "sto",
+      "caption": "Events are indexed with time, level, device and run_id, with a retention policy."
+     },
+     {
+      "at": "eng",
+      "caption": "A search on one run_id reconstructs the whole job in order.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "sec",
+   "type": "text",
+   "markdown": "## Protecting logs\n\nLogs are data too. They often hold hostnames, usernames, IP addresses and API responses, so treat them as sensitive.\n\n- **Never log secrets.** This includes passwords, tokens, API keys, SNMP communities, pre-shared keys and `Authorization` headers. Redact by pattern as a safety net, but do not rely on it: avoid putting secrets in messages in the first place. See [Secure Coding](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n- **Beware of full responses.** A device configuration returned by an API may contain hashed or reversible passwords. Log the status code and size, not the body.\n- **Restrict access and keep integrity.** Allow read-only access to the people who need it, write logs to storage that the automation account cannot delete, and keep them for the period your policy requires.\n- **Sanitize user input before logging it.** A value containing a newline can forge a fake log line (log injection). Structured JSON escapes it for you.\n- **Do not use `print()`.** It has no level, no timestamp and no handler control."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Debug logs in production",
+   "markdown": "`DEBUG` output from HTTP libraries can include request headers with credentials. Never leave debug logging on for a production run, and review what a library logs before enabling it."
+  },
+  {
+   "id": "ops",
+   "type": "text",
+   "markdown": "## Using logs to troubleshoot\n\nWhen the 02:14 alert fires, a good log lets you work in a fixed order.\n\n1. **Find the run.** Search the job's `run_id`, or the time window and the device name.\n2. **Read the first error, not the last.** Later errors are often consequences of the first failure.\n3. **Check the context.** Look at the lines before the error: which request, which retry, which response code.\n4. **Compare with a good run.** The same device in yesterday's run shows what changed.\n\nPlain log lines can also feed **alerts**. Count `ERROR` events per run and notify the team if the rate passes a threshold, or if a run produces no `INFO` completion line at all, which suggests it crashed silently.\n\n### Retention and cost\n\nKeep detailed logs for a short time and summary or audit events for longer. A common split is 30 days for full logs and a year or more for who-changed-what records, following your compliance policy. Avoid logging whole payloads at `INFO`: volume costs money in a central platform and buries the signal.\n\n### Ansible and other tools\n\nThe same principles apply outside Python. Ansible can write a log file through the `log_path` setting and shows task results with `-v` verbosity, but higher levels print module arguments, so keep them off in production and use `no_log: true` on tasks that handle secrets.\n\n### Review logs as part of the change\n\nAfter every significant run, skim the summary: how many devices changed, stayed unchanged and failed. Record the `run_id` in the change ticket so an auditor can reach the evidence later. Treat a log message that nobody could act on as a defect and improve its wording, because the engineer reading it at night has no other context."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. Save `logsetup.py` and run it. Confirm the password is replaced with `***` in the console and in `automation.log`.\n2. Add a `device` value from a loop over three documentation addresses (198.51.100.11 to .13) and a failure for one of them.\n3. Use `jq` to list only errors: `jq 'select(.level==\"ERROR\")' automation.log`.\n4. Group the lines of one run with `jq 'select(.run_id==\"<id>\")' automation.log`. Then add the redaction of an `Authorization` header and test it."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Log level",
+     "definition": "A severity label (DEBUG to CRITICAL) that controls how much is recorded."
+    },
+    {
+     "term": "Structured logging",
+     "definition": "Writing events as key-value data such as JSON instead of free text."
+    },
+    {
+     "term": "Correlation ID",
+     "definition": "A unique value attached to every log line of one run or request."
+    },
+    {
+     "term": "Redaction",
+     "definition": "Masking sensitive values before they are written to a log."
+    },
+    {
+     "term": "Log rotation",
+     "definition": "Starting a new log file when the current one reaches a size or age limit."
+    },
+    {
+     "term": "Log injection",
+     "definition": "Forging log entries by inserting control characters such as newlines."
+    },
+    {
+     "term": "Audit trail",
+     "definition": "A tamper-resistant record of who did what, where and when."
+    },
+    {
+     "term": "Syslog",
+     "definition": "A standard protocol for sending log messages to a central collector."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What is the main benefit of a correlation ID such as run_id?",
+     "options": [
+      "It lets you retrieve all log lines of one run across tools and devices",
+      "It encrypts log files",
+      "It speeds up the device CPU",
+      "It replaces log levels"
+     ],
+     "answer": 0,
+     "explanation": "One search on the ID reconstructs the whole run in order."
+    },
+    {
+     "question": "Which should never appear in logs? Choose all that apply.",
+     "options": [
+      "API tokens",
+      "Authorization headers",
+      "The device hostname",
+      "SNMP community strings"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Hostnames are normal context. Tokens, auth headers and community strings are secrets."
+    },
+    {
+     "question": "At which level should a handled, unexpected retry be logged?",
+     "options": [
+      "DEBUG",
+      "WARNING",
+      "CRITICAL",
+      "None, retries should be silent"
+     ],
+     "answer": 1,
+     "explanation": "WARNING marks something unusual that did not stop the work."
+    },
+    {
+     "question": "Why write logs to stdout in a containerized CI job?",
+     "options": [
+      "Local files disappear with the container, while the platform collects stdout",
+      "stdout is encrypted by default",
+      "Files cannot be rotated",
+      "It avoids using timestamps"
+     ],
+     "answer": 0,
+     "explanation": "Central collection keeps the evidence after the runner is gone."
+    },
+    {
+     "question": "Which practice makes troubleshooting a failed run faster?",
+     "options": [
+      "Reading the last error line first",
+      "Reading the first error and the lines before it",
+      "Deleting the log and rerunning at DEBUG in production",
+      "Ignoring warnings"
+     ],
+     "answer": 1,
+     "explanation": "Later errors are often consequences of the first failure, and the lines before it show the context."
+    }
+   ]
+  },
+  {
+   "id": "sum",
+   "type": "text",
+   "markdown": "## Summary\n\n- Logs must say what happened, where, when and why, with a result for each device and task.\n- Use levels correctly: INFO for milestones, WARNING for handled surprises, ERROR for failed tasks.\n- Prefer structured JSON with a correlation ID, UTC timestamps and consistent field names.\n- Send logs to a central, access-controlled place and rotate local files.\n- Never log secrets or full device configurations, and keep debug logging off in production."
+  }
+ ],
+ "ar": {
+  "title": "التسجيل في حلول الأتمتة",
+  "summary": "صمّم التسجيل في أتمتة الشبكات: المستويات، وJSON المنظّم مع معرّفات الترابط، والتجميع المركزي، والتعامل الآمن مع الأسرار.",
+  "objectives": [
+   "اختيار مستوى التسجيل المناسب لكل حدث",
+   "كتابة سجلات منظّمة مع معرّف ترابط",
+   "حجب الأسرار وتجنّب تسجيل البيانات الحسّاسة",
+   "جمع السجلات وتدويرها في CI والحاويات",
+   "استخدام السجلات لاستكشاف أخطاء التشغيل وتدقيقه"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في الساعة 02:10 دفع خطُّ أنابيب تغييرًا إلى 60 مبدّلًا. وفي 02:14 نبّه نظام المراقبة إلى أن ستة منها فقدت وصلتَها الصاعدة. يفتح المهندس المناوب سجلّ المهمّة فلا يجد إلا سطرًا واحدًا: `Error`. أيّ جهاز؟ أيّ مهمّة؟ أيّ طلب؟ وبلا سجلات مفيدة لا خيار إلا التخمين أو التراجع عن كل شيء.\n\nالتسجيل (Logging) هو الطريقة التي يشرح بها حلُّ الأتمتة نفسَه. تجيب السجلات الجيدة عن أربعة أسئلة: **ماذا** حدث، و**أين** (أي جهاز وأي مهمّة)، و**متى**، و**لماذا** فشل. أما السجلات السيئة فإما أنها لا تقول شيئًا، أو أسوأ من ذلك تُسرّب كلمةَ المرور التي كانت تستخدمها."
+   },
+   {
+    "id": "levels",
+    "type": "text",
+    "markdown": "## مستويات التسجيل وما يناسب كل مستوى\n\n| المستوى | الغرض | مثال |\n|:--|:--|:--|\n| `DEBUG` | تفاصيل للمطوّرين: حجم الحمولات والأزمنة | `GET /restconf/data/... took 0.42s` |\n| `INFO` | المراحل العادية | `R1 ntp changed` |\n| `WARNING` | أمر غير متوقَّع جرت معالجته | `retry 2/3 after 503` |\n| `ERROR` | فشلت مهمّة ويستمر التشغيل | `R2 patch failed: 401` |\n| `CRITICAL` | لا يمكن متابعة التشغيل كله | `inventory file missing` |\n\nشغّل الإنتاج على المستوى `INFO` ولا تنتقل إلى `DEBUG` إلا لاستكشاف الأخطاء، ويُفضَّل أن يكون ذلك لكل تشغيل عبر متغيّر بيئة. سجّل الأحداث لا الثرثرة: سطر واحد لكل جهاز وإجراء أنفع من 500 سطر من نقاط التقدّم.\n\nسجّل كذلك **الاستثناءات مع تتبّع المكدّس** (`log.exception(...)` داخل `except`) و**نتيجة** كل مهمّة (تغيّر أو لم يتغيّر أو أخفق). يحتاج سجلُّ التدقيق إلى إجابة: من شغّل ماذا، على أيّ جهاز، وما النتيجة."
+   },
+   {
+    "id": "struct",
+    "type": "text",
+    "markdown": "## السجلات المنظّمة ومعرّف الترابط\n\nالنصّ الحرّ سهل الكتابة وصعب البحث. أما **التسجيل المنظّم (Structured logging)** فيكتب كل حدث بصيغة JSON بحقول ثابتة، فتستطيع منصّةُ السجلات مثل Splunk أو Elastic أو Loki أن تصفّي بحسب `device=\"R2\"` أو `level=\"ERROR\"` دون تعابير نمطية.\n\nأضف **معرّف ترابط (Correlation ID)** هو `run_id` إلى كل سطر في التشغيل الواحد، فيُعيد بحثٌ واحد القصةَ الكاملة لمهمّة خطّ الأنابيب عبر السكربتات ونداءات الواجهات والأجهزة. استخدم أسماءَ الحقول نفسَها في كل الأدوات، وسجّل الأزمنةَ بالتوقيت العالمي (UTC) مع الإزاحة كي تتطابق سجلّاتُ المناطق الزمنية المختلفة.\n\nأرسل السجلات إلى مكان مركزي. فالملفات المحلية تختفي مع مشغّل CI أو حاوية مؤقتة، لذا اكتب إلى **stdout** ودع المنصّة تجمعها، أو أرسلها عبر syslog أو وكيل. وقيّد الملفات المحلية بالتدوير (`RotatingFileHandler`) حتى لا تملأ ليلةٌ مزدحمة القرص. راجع أيضًا [القياس عن بُعد القائم على النماذج](/learn/network-automation-devops/model-driven-telemetry) بوصفه النظيرَ على جانب الجهاز لهذه البيانات."
+   },
+   {
+    "id": "code",
+    "type": "code",
+    "language": "python",
+    "filename": "logsetup.py",
+    "code": "import json\nimport logging\nimport logging.handlers\nimport re\nimport sys\nimport uuid\n\nSECRET = re.compile(r\"(password|token|secret|api[_-]?key)(\\\"?\\s*[:=]\\s*\\\"?)[^\\s\\\",}]+\", re.I)\n\n\nclass RedactFilter(logging.Filter):\n    def filter(self, record):\n        record.msg = SECRET.sub(r\"\\1\\2***\", str(record.msg))   # mask before output\n        return True\n\n\nclass JsonFormatter(logging.Formatter):\n    def format(self, record):\n        entry = {\n            \"ts\": self.formatTime(record, \"%Y-%m-%dT%H:%M:%S%z\"),\n            \"level\": record.levelname,\n            \"logger\": record.name,\n            \"msg\": record.getMessage(),\n            \"run_id\": getattr(record, \"run_id\", None),\n            \"device\": getattr(record, \"device\", None),\n        }\n        if record.exc_info:\n            entry[\"exc\"] = self.formatException(record.exc_info)\n        return json.dumps(entry)\n\n\ndef setup(level=logging.INFO):\n    root = logging.getLogger()\n    root.setLevel(level)\n    console = logging.StreamHandler(sys.stdout)                     # CI and containers read stdout\n    console.setFormatter(JsonFormatter())\n    console.addFilter(RedactFilter())\n    root.addHandler(console)\n    rotating = logging.handlers.RotatingFileHandler(\"automation.log\", maxBytes=5_000_000, backupCount=5)\n    rotating.setFormatter(JsonFormatter())\n    rotating.addFilter(RedactFilter())\n    root.addHandler(rotating)\n\n\nif __name__ == \"__main__\":\n    setup()\n    log = logging.LoggerAdapter(logging.getLogger(\"ntp-sync\"), {\"run_id\": uuid.uuid4().hex[:8], \"device\": \"198.51.100.11\"})\n    log.info(\"change applied\")\n    log.warning(\"login retry password=Sup3rSecret\")\n    try:\n        1 / 0\n    except ZeroDivisionError:\n        log.exception(\"unexpected error\")\n",
+    "caption": "تسجيل JSON منظّم مع معرّف ترابط وحجب للأسرار وإخراج إلى stdout وتدوير للملفات.",
+    "highlight": [
+     10,
+     11,
+     12,
+     30,
+     31,
+     32,
+     36
+    ]
+   },
+   {
+    "id": "out",
+    "type": "terminal",
+    "title": "python logsetup.py",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "python logsetup.py",
+      "output": "{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"INFO\", \"logger\": \"ntp-sync\", \"msg\": \"change applied\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"WARNING\", \"logger\": \"ntp-sync\", \"msg\": \"login retry password=***\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"ERROR\", \"logger\": \"ntp-sync\", \"msg\": \"unexpected error\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\", \"exc\": \"Traceback ... ZeroDivisionError: division by zero\"}",
+      "comment": "تُحجب قيمةُ كلمة المرور قبل كتابة السطر."
+     }
+    ],
+    "caption": "كائن JSON واحد لكل حدث، وكلها تشترك في run_id نفسه."
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "من الحدث إلى الفهم",
+    "caption": "لا يفيد سطرُ السجل إلا إن وصل إلى مكان قابل للبحث ومحميّ.",
+    "data": {
+     "token": "حدث سجل",
+     "nodes": [
+      {
+       "id": "app",
+       "label": "مهمّة الأتمتة",
+       "sub": "Python / Ansible",
+       "icon": "cpu"
+      },
+      {
+       "id": "flt",
+       "label": "الحجب",
+       "sub": "حجب الأسرار",
+       "icon": "shield"
+      },
+      {
+       "id": "col",
+       "label": "المجمّع",
+       "sub": "stdout / syslog",
+       "icon": "server"
+      },
+      {
+       "id": "sto",
+       "label": "منصّة السجلات",
+       "sub": "Splunk / Elastic",
+       "icon": "database"
+      },
+      {
+       "id": "eng",
+       "label": "المهندس",
+       "sub": "بحث بـ run_id",
+       "icon": "user"
+      }
+     ],
+     "steps": [
+      {
+       "at": "app",
+       "caption": "تُصدر المهمّة حدثًا منظّمًا واحدًا لكل جهاز وإجراء."
+      },
+      {
+       "at": "flt",
+       "caption": "يحجب مرشّح كلمات المرور والرموز قبل كتابة أي شيء.",
+       "tone": "success"
+      },
+      {
+       "at": "col",
+       "caption": "يجمع مشغّل CI أو منصّة الحاويات ما يُكتب إلى stdout."
+      },
+      {
+       "at": "sto",
+       "caption": "تُفهرس الأحداث بالزمن والمستوى والجهاز وrun_id مع سياسة احتفاظ."
+      },
+      {
+       "at": "eng",
+       "caption": "يعيد البحث بـ run_id واحد بناءَ المهمّة كلها بالترتيب.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "sec",
+    "type": "text",
+    "markdown": "## حماية السجلات\n\nالسجلاتُ بيانات كذلك. فهي تحوي غالبًا أسماءَ المضيفات وأسماءَ المستخدمين وعناوينَ IP واستجاباتِ الواجهات، فعامِلها بوصفها حسّاسة.\n\n- **لا تسجّل الأسرار أبدًا.** ويشمل ذلك كلمات المرور والرموز ومفاتيح API ومجتمعات SNMP والمفاتيح المشتركة مسبقًا وترويسات `Authorization`. احجبها بالنمط شبكةَ أمان، لكن لا تعتمد عليه: تجنّب أصلًا وضعَ الأسرار في الرسائل. راجع [الترميز الآمن](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n- **احذر الاستجابات الكاملة.** قد يحوي إعدادُ الجهاز الذي تُعيده الواجهةُ كلماتِ مرور مجزّأة أو قابلة للعكس. سجّل رمزَ الحالة والحجم لا الجسم.\n- **قيّد الوصول واحفظ السلامة.** امنح وصولًا للقراءة فقط لمن يحتاج إليه، واكتب السجلات في تخزين لا يستطيع حسابُ الأتمتة حذفَه، واحتفظ بها المدّة التي تتطلبها سياستُك.\n- **نقِّ مدخلات المستخدم قبل تسجيلها.** قد تزوّر قيمةٌ تحوي سطرًا جديدًا سطرَ سجل مزيّفًا (حقن السجلات). ويقوم JSON المنظّم بالتهريب نيابةً عنك.\n- **لا تستخدم `print()`.** فهي بلا مستوى ولا ختم زمني ولا تحكّم في المعالجات."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "سجلات التنقيح في الإنتاج",
+    "markdown": "قد يحوي إخراج `DEBUG` من مكتبات HTTP ترويساتِ طلبات فيها بيانات اعتماد. لا تترك تسجيل التنقيح مفعّلًا في تشغيل إنتاجي، وراجع ما تسجّله المكتبة قبل تفعيله."
+   },
+   {
+    "id": "ops",
+    "type": "text",
+    "markdown": "## استخدام السجلات في استكشاف الأخطاء\n\nحين ينطلق تنبيه الساعة 02:14، يتيح السجلُّ الجيد العملَ بترتيب ثابت.\n\n1. **اعثر على التشغيل.** ابحث بـ `run_id` للمهمّة، أو بالنافذة الزمنية واسم الجهاز.\n2. **اقرأ أول خطأ لا آخره.** غالبًا تكون الأخطاء اللاحقة نتائجَ للإخفاق الأول.\n3. **افحص السياق.** انظر إلى الأسطر السابقة للخطأ: أي طلب، وأي محاولة، وأي رمز استجابة.\n4. **قارن بتشغيل سليم.** يُظهر الجهازُ نفسُه في تشغيل الأمس ما الذي تغيّر.\n\nيمكن لأسطر السجل أن تغذّي **التنبيهات** أيضًا. عُدَّ أحداث `ERROR` لكل تشغيل وأخطِر الفريقَ إن تجاوز المعدلُ عتبةً معيّنة، أو إن لم ينتج التشغيلُ سطرَ إكمال `INFO` إطلاقًا، وهو ما يدل على انهيار صامت.\n\n### الاحتفاظ والكلفة\n\nاحتفظ بالسجلات التفصيلية مدّة قصيرة وبأحداث الملخّص أو التدقيق مدّة أطول. من التقسيمات الشائعة 30 يومًا للسجلات الكاملة وسنةً أو أكثر لسجلات «من غيّر ماذا» وفق سياسة الامتثال لديك. تجنّب تسجيل الحمولات الكاملة بالمستوى `INFO`: فالحجم يكلّف مالًا في المنصّة المركزية ويطمر الإشارة.\n\n### Ansible وأدوات أخرى\n\nتنطبق المبادئ نفسها خارج Python. يستطيع Ansible الكتابةَ في ملفّ سجل عبر الإعداد `log_path` ويعرض نتائج المهام بالتفصيل `-v`، لكنّ المستويات الأعلى تطبع وسائطَ الوحدات، فأبقِها معطّلة في الإنتاج واستخدم `no_log: true` في المهام التي تتعامل مع الأسرار.\n\n### راجع السجلات جزءًا من التغيير\n\nبعد كل تشغيل مهم، اطّلع على الملخّص: كم جهازًا تغيّر وكم بقي دون تغيير وكم أخفق. دوّن `run_id` في تذكرة التغيير ليصل المدقّق إلى الأدلة لاحقًا. اعدُد رسالةَ السجل التي لا يستطيع أحد التصرّف بناءً عليها عيبًا وحسِّن صياغتها، لأن المهندس الذي يقرؤها ليلًا لا يملك سياقًا آخر."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. احفظ `logsetup.py` وشغّله. تأكّد من استبدال كلمة المرور بـ `***` في الطرفية وفي `automation.log`.\n2. أضف قيمةَ `device` من حلقة على ثلاثة عناوين توثيقية (198.51.100.11 إلى .13) وفشلًا لأحدها.\n3. استخدم `jq` لسرد الأخطاء فقط: `jq 'select(.level==\"ERROR\")' automation.log`.\n4. اجمع أسطرَ تشغيل واحد بالأمر `jq 'select(.run_id==\"<id>\")' automation.log`. ثم أضف حجبَ ترويسة `Authorization` واختبره."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "Log level",
+      "definition": "وسم لشدّة الحدث (من DEBUG إلى CRITICAL) يتحكّم في مقدار ما يُسجَّل."
+     },
+     {
+      "term": "Structured logging",
+      "definition": "كتابة الأحداث كبيانات مفتاح-قيمة مثل JSON بدل النصّ الحر."
+     },
+     {
+      "term": "Correlation ID",
+      "definition": "قيمة فريدة تُرفق بكل سطر سجل في تشغيل أو طلب واحد."
+     },
+     {
+      "term": "Redaction",
+      "definition": "حجب القيم الحسّاسة قبل كتابتها في السجل."
+     },
+     {
+      "term": "Log rotation",
+      "definition": "بدء ملفّ سجل جديد عند بلوغ الحالي حدًّا للحجم أو العمر."
+     },
+     {
+      "term": "Log injection",
+      "definition": "تزوير مدخلات السجل بإدخال محارف تحكّم مثل السطر الجديد."
+     },
+     {
+      "term": "Audit trail",
+      "definition": "سجلّ مقاوم للعبث يبيّن من فعل ماذا وأين ومتى."
+     },
+     {
+      "term": "Syslog",
+      "definition": "بروتوكول معياري لإرسال رسائل السجل إلى مجمّع مركزي."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما الفائدة الرئيسة لمعرّف ترابط مثل run_id؟",
+      "options": [
+       "يتيح استرجاع كل أسطر السجل لتشغيل واحد عبر الأدوات والأجهزة",
+       "يشفّر ملفات السجل",
+       "يسرّع معالج الجهاز",
+       "يحلّ محلّ مستويات التسجيل"
+      ],
+      "answer": 0,
+      "explanation": "يعيد بحثٌ واحد بالمعرّف بناءَ التشغيل كله بالترتيب."
+     },
+     {
+      "question": "أيٌّ مما يلي يجب ألا يظهر في السجلات؟ اختر كل ما ينطبق.",
+      "options": [
+       "رموز API",
+       "ترويسات Authorization",
+       "اسم مضيف الجهاز",
+       "سلاسل مجتمع SNMP"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "أسماء المضيفات سياق عادي، أما الرموز وترويسات المصادقة وسلاسل المجتمع فأسرار."
+     },
+     {
+      "question": "بأي مستوى يُسجَّل تكرارُ محاولة غير متوقَّع جرت معالجته؟",
+      "options": [
+       "DEBUG",
+       "WARNING",
+       "CRITICAL",
+       "لا شيء، ينبغي أن تكون المحاولات صامتة"
+      ],
+      "answer": 1,
+      "explanation": "يُعلّم WARNING أمرًا غير معتاد لم يوقف العمل."
+     },
+     {
+      "question": "لماذا نكتب السجلات إلى stdout في مهمّة CI داخل حاوية؟",
+      "options": [
+       "لأن الملفات المحلية تختفي مع الحاوية بينما تجمع المنصّة stdout",
+       "لأن stdout مشفّر افتراضيًّا",
+       "لأن الملفات لا يمكن تدويرها",
+       "لتجنّب الأختام الزمنية"
+      ],
+      "answer": 0,
+      "explanation": "يحفظ التجميع المركزي الأدلةَ بعد زوال المشغّل."
+     },
+     {
+      "question": "أيّ ممارسة تسرّع استكشاف أخطاء تشغيل فاشل؟",
+      "options": [
+       "قراءة آخر سطر خطأ أولًا",
+       "قراءة أول خطأ والأسطر التي تسبقه",
+       "حذف السجل وإعادة التشغيل بالمستوى DEBUG في الإنتاج",
+       "تجاهل التحذيرات"
+      ],
+      "answer": 1,
+      "explanation": "غالبًا تكون الأخطاء اللاحقة نتائجَ للإخفاق الأول، وتُظهر الأسطرُ التي تسبقه السياق."
+     }
+    ]
+   },
+   {
+    "id": "sum",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يجب أن تبيّن السجلات ماذا حدث وأين ومتى ولماذا، مع نتيجة لكل جهاز ومهمّة.\n- استخدم المستويات بصواب: INFO للمراحل، وWARNING للمفاجآت المعالَجة، وERROR للمهام الفاشلة.\n- فضّل JSON المنظّم مع معرّف ترابط وأختام زمنية UTC وأسماء حقول متّسقة.\n- أرسل السجلات إلى مكان مركزي خاضع للتحكم في الوصول ودوّر الملفات المحلية.\n- لا تسجّل الأسرار ولا إعداداتِ الأجهزة الكاملة، وأبقِ تسجيلَ التنقيح معطّلًا في الإنتاج."
+   }
+  ]
+ }
+}

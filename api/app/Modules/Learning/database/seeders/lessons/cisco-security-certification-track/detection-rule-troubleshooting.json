@@ -1,0 +1,404 @@
+{
+  "slug": "detection-rule-troubleshooting",
+  "title": "Detection Rule Troubleshooting",
+  "summary": "Find out why a SIEM or IPS detection stays silent or fires too often, by testing each stage of the detection pipeline, from log source and parsing to rule logic, scheduling and policy deployment on Cisco Secure Firewall.",
+  "duration_minutes": 40,
+  "objectives": [
+    "Describe the stages of a detection pipeline and the failures that occur at each stage",
+    "Apply a structured, divide-and-conquer workflow to a rule that does not fire",
+    "Diagnose SIEM rule failures caused by missing data, field changes and ingestion lag",
+    "Troubleshoot a Snort 3 rule offline and on Cisco Secure Firewall Threat Defense using packet-tracer",
+    "Prevent regressions with test events and detection-as-code practices"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "During an authorized purple-team exercise, the red team emulated a first-stage download and a command-line credential dump on a lab workstation. The SOC had a Snort rule for the download and a SIEM rule for the dump. Neither fired. The exercise did not reveal a gap in *coverage*; the detections existed on paper. It revealed a gap in *operation*: somewhere between the event and the alert, something broke.\n\nCBRCOR expects you to troubleshoot detection rules, not just write them. This lesson gives you a method that works for any SIEM or IPS, then applies it to two real cases: a Splunk rule and a Snort 3 rule on Cisco Secure Firewall Threat Defense (FTD)."
+    },
+    {
+      "id": "pipeline",
+      "type": "text",
+      "markdown": "## The detection pipeline and where it breaks\n\nEvery alert is the end of a chain. A failure anywhere along it produces silence:\n\n| Stage | Typical failure | Quick check |\n|:--|:--|:--|\n| **Source** | Audit policy not enabled, logging level too low, agent stopped | Does the device generate the event locally? |\n| **Transport** | Syslog sent to the wrong collector, firewall blocking UDP 514 or TCP 6514, forwarder queue full | Do any events from this host arrive? |\n| **Parsing** | Vendor upgrade changed the message format, so fields are no longer extracted | Is the field present and populated? |\n| **Time** | Wrong time zone or clock, or ingestion lag | Compare event time with index time |\n| **Rule logic** | Wrong field name or value, AND instead of OR, case or path differences | Run the search manually on a known event |\n| **Schedule and window** | The search window misses late events, or the search is disabled or skipped | Check the scheduler history |\n| **Threshold and suppression** | Threshold too high, throttling or an old exclusion hides the event | Remove them temporarily in a test copy |\n| **Alert action** | Notable event, email or SOAR webhook fails | Check the action logs |\n\nAn IPS adds its own stages: the rule must be **enabled** in the intrusion policy, the policy must be **attached** to the access control rule that matches the traffic, the traffic must actually **reach Snort** (not trusted, fast-pathed or encrypted), and the network variables such as `$HOME_NET` must describe your real networks.\n\nNoisy rules break in the same places, in the opposite direction: a parser that puts the wrong value in a field, a missing exclusion, or a time window that counts the same event twice. Tuning them is covered in [Rule, Filter and Policy Tuning](/learn/cisco-security-certification-track/rule-filter-and-policy-tuning)."
+    },
+    {
+      "id": "method",
+      "type": "text",
+      "markdown": "## A structured troubleshooting workflow\n\n1. **Reproduce with a known-true event.** Generate the behavior in a lab, replay a saved PCAP, or find a real past event that should have matched. Without a known-true event, you cannot tell a broken rule from an absence of attacks.\n2. **Divide and conquer.** Check the middle of the pipeline first: is the raw event in the SIEM? If yes, the problem is downstream (parsing, logic, schedule). If no, it is upstream (source, transport). Halve the remaining stages until you find the break.\n3. **Change one thing at a time** in a copy of the rule, and test again with the same event.\n4. **Fix the root cause**, not the symptom. Widening a search to every index may make the alert fire, but it hides a parsing problem that will break other rules.\n5. **Add the event to a regression test** so the rule is tested automatically after every change, upgrade or parser update.\n\nThe animation follows the credential-dump test event through this workflow."
+    },
+    {
+      "id": "flow-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Following one test event through the detection pipeline",
+      "caption": "Each stage is checked in order until the break is found. Here, the event was collected, but the field the rule needs was never generated.",
+      "data": {
+        "token": "Event 4688",
+        "nodes": [
+          { "id": "host", "label": "Workstation", "sub": "Windows audit policy", "icon": "desktop" },
+          { "id": "fwd", "label": "Forwarder", "sub": "Transport", "icon": "log" },
+          { "id": "idx", "label": "SIEM index", "sub": "Parsing and time", "icon": "database" },
+          { "id": "rule", "label": "Correlation rule", "sub": "Logic and schedule", "icon": "cpu" },
+          { "id": "alert", "label": "Alert", "sub": "Notable + SOAR", "icon": "alert" }
+        ],
+        "steps": [
+          { "at": "host", "caption": "The red team runs the test. Windows writes event 4688 for the new process." },
+          { "at": "fwd", "caption": "The forwarder sends the event. Transport is fine.", "tone": "success" },
+          { "at": "idx", "caption": "The event is in the index with the correct time: the source and transport are not the problem.", "tone": "success" },
+          { "at": "idx", "token": "CommandLine = (empty)", "caption": "But the CommandLine field is empty in every 4688 event from this host.", "tone": "warning" },
+          { "at": "rule", "token": "No match", "caption": "The rule searches CommandLine for the dump tool's arguments, so it can never match.", "tone": "danger" },
+          { "at": "host", "token": "GPO fix", "caption": "Root cause: the policy that includes the command line in process creation events was not applied to this OU.", "tone": "secure" },
+          { "at": "alert", "token": "Event 4688", "caption": "After the policy fix, the replayed test produces an alert. The event is saved as a regression test.", "tone": "success" }
+        ]
+      }
+    },
+    {
+      "id": "siem-case",
+      "type": "text",
+      "markdown": "## Case 1: a SIEM rule that misses events\n\nThe credential-dump case above was a **source** problem, found because the field was empty. The same rule also had a second, subtler problem, which is extremely common: **ingestion lag**.\n\nThe rule ran every 15 minutes over the previous 15 minutes of *event time*. Events from remote offices arrived up to eight minutes late. An event that occurred at 10:14 but was indexed at 10:21 fell outside the 10:00 to 10:15 window when the 10:15 search ran, and was before the 10:15 to 10:30 window when the next search ran. It was never evaluated.\n\nThe fix is to measure the lag and shift the window, accepting a small delay in exchange for complete coverage. The searches below show the diagnosis and the corrected rule."
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "credential-dump-rule.spl",
+      "caption": "Splunk SPL. Search 1 checks whether the needed field exists, search 2 measures ingestion lag, and the corrected rule (lines 15 to 18) uses a delayed, overlapping-safe window.",
+      "highlight": [3, 8, 9, 15],
+      "code": "# 1. Is the field the rule needs actually populated?\nindex=wineventlog EventCode=4688 host=LAB-WS-* earliest=-24h\n| eval has_cmd = if(isnull(CommandLine) OR CommandLine=\"\", \"empty\", \"present\")\n| stats count BY host has_cmd\n\n# 2. How late do events arrive? (index time minus event time, in seconds)\nindex=wineventlog earliest=-24h\n| eval lag = _indextime - _time\n| stats avg(lag) AS avg_lag perc95(lag) AS p95_lag max(lag) AS max_lag BY host\n\n# 3. Corrected rule, scheduled every 15 minutes (cron */15 * * * *)\n#    Old window: earliest=-15m latest=now  -> late events were never searched\n#    New window: a 15-minute slice that ends 10 minutes ago, so\n#    events up to 10 minutes late are still evaluated exactly once\nindex=wineventlog EventCode=4688 earliest=-25m@m latest=-10m@m\n    (CommandLine=\"*sekurlsa*\" OR CommandLine=\"*lsass*\" OR CommandLine=\"*comsvcs.dll*MiniDump*\")\n| stats earliest(_time) AS first_seen values(CommandLine) AS cmd BY host user ParentProcessName\n| eval first_seen = strftime(first_seen, \"%F %T\")\n\n# Diagnosis output (search 2):\n# host           avg_lag   p95_lag   max_lag\n# HQ-WS-0114        4.1      11.0      38.0\n# BR-WS-0207      162.5     401.0     487.0   <- remote office, up to 8 minutes late"
+    },
+    {
+      "id": "ips-case",
+      "type": "text",
+      "markdown": "## Case 2: a Snort 3 rule that never fires on FTD\n\nThe second detection was a local Snort 3 rule for the first-stage download (`/static/upd.bin` fetched over HTTP). Troubleshoot it in two halves.\n\n### Half 1: does the rule match the traffic at all?\n\nTest the rule **offline** against a PCAP of the test traffic on a lab Snort 3 sensor. This separates rule problems from deployment problems. In this case, the first run produced no alert. The rule header uses `$HOME_NET`, and the lab configuration still defined `HOME_NET` as `192.168.0.0/16`, while the workstation was `10.20.30.57`. The same mistake existed in the variable set on the Firewall Management Center (FMC). Overriding the variable proved the rule logic was correct.\n\n### Half 2: does the traffic reach Snort on the firewall?\n\nWith the rule proven, use `packet-tracer` on FTD to see which access control rule the flow matches. Here it matched a rule with the **Trust** action. Trusted traffic is allowed without deep inspection, so no intrusion policy ever saw it. The same happens with a **Fastpath** prefilter rule, with traffic that matches an access rule that has no intrusion policy attached, and with encrypted traffic that is not decrypted.\n\nThe fixes were to correct `HOME_NET` in the FMC variable set, change the access control rule from Trust to Allow with the intrusion policy attached, and deploy."
+    },
+    {
+      "id": "snort-term",
+      "type": "terminal",
+      "title": "Testing the rule offline, then tracing the flow on FTD",
+      "prompt": "analyst@lab-sensor:~$",
+      "lines": [
+        { "cmd": "cat local.rules", "output": "alert http $HOME_NET any -> $EXTERNAL_NET any ( msg:\"LOCAL first-stage download upd.bin\"; flow:to_server,established; http_uri; content:\"/static/upd.bin\",fast_pattern; http_header:field user-agent; content:\"MSIE 7.0\"; classtype:trojan-activity; sid:1000101; rev:2; )" },
+        { "comment": "Validate the configuration and rules first" },
+        { "cmd": "snort -c /usr/local/etc/snort/snort.lua -R local.rules -T -q", "output": "Snort successfully validated the configuration (with 0 warnings)." },
+        { "comment": "Replay the test PCAP: no alert is produced" },
+        { "cmd": "snort -c /usr/local/etc/snort/snort.lua -R local.rules -r upd-download.pcap -A alert_fast -q", "output": "" },
+        { "comment": "Override HOME_NET to the real internal range and run again" },
+        { "cmd": "snort -c /usr/local/etc/snort/snort.lua --lua \"HOME_NET = '10.0.0.0/8'\" -R local.rules -r upd-download.pcap -A alert_fast -q", "output": "11/02-07:00:04.118230 [**] [1:1000101:2] \"LOCAL first-stage download upd.bin\" [**] [Classification: A Network Trojan was detected] [Priority: 1] {TCP} 10.20.30.57:51544 -> 203.0.113.80:80" },
+        { "comment": "On the FTD CLI: which access control rule does the flow match?" },
+        { "prompt": ">", "cmd": "packet-tracer input inside tcp 10.20.30.57 51544 203.0.113.80 80 detailed", "output": "...\nPhase: 4\nType: ACCESS-LIST\nSubtype: log\nResult: ALLOW\nConfig:\naccess-group CSM_FW_ACL_ global\naccess-list CSM_FW_ACL_ advanced trust tcp ifc inside any any eq www rule-id 268435461 event-log flow-end\naccess-list CSM_FW_ACL_ remark rule-id 268435461: ACCESS POLICY: Branch-ACP - Mandatory\naccess-list CSM_FW_ACL_ remark rule-id 268435461: L7 RULE: Trust-Internal-Web\n...\nAction: allow" },
+        { "comment": "'advanced trust' means the flow bypasses Snort inspection: the intrusion policy never sees it" }
+      ],
+      "caption": "Documentation addresses only. The rule ID and policy names are examples. Output is shortened with '...'."
+    },
+    {
+      "id": "regression",
+      "type": "text",
+      "markdown": "## Preventing the next silent failure\n\nMost broken detections are not broken on the day they are written. They break later, when a vendor upgrade changes a log format, a group policy is not applied to a new organizational unit, or someone adds a Trust rule to fix a performance problem. Protect detections the way developers protect code:\n\n- **Keep a test event for every rule**: a saved log line, a PCAP or a lab procedure, stored with the rule in version control.\n- **Run tests automatically** after parser, policy and software changes, and on a schedule. A daily synthetic event per critical rule, with an alert if it does *not* fire, catches silent failures quickly.\n- **Monitor the pipeline itself**: alert when a log source stops sending, when ingestion lag exceeds the rule's window, or when a scheduled search is skipped.\n- **Record the ATT&CK technique** each rule covers, so a broken rule appears as a coverage gap. See [Identifying Attacker TTPs (MITRE ATT&CK)](/learn/cisco-security-certification-track/identifying-attacker-ttps-mitre-att-and-ck)."
+    },
+    {
+      "id": "warn-widen",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not fix a silent rule by making it vague",
+      "markdown": "Replacing a precise condition with `*`, searching all indexes, or removing the destination port may make the test alert fire, but it also creates false positives and hides the real fault. Find the stage that broke and fix it there."
+    },
+    {
+      "id": "tip-trust",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Trust and Fastpath are performance tools, not security decisions",
+      "markdown": "On Cisco Secure Firewall, Trust and prefilter Fastpath rules skip deep inspection. Review them regularly, keep them narrow (specific hosts and ports, such as backup traffic between two data centers), and never use them for user internet traffic."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "1. On a lab Snort 3 sensor you control, save the rule from this lesson to `local.rules`, then create a test PCAP by capturing your own HTTP request to a lab web server for `/static/upd.bin` with the user agent set to `MSIE 7.0`.\n2. Run Snort offline with `-r` and `-A alert_fast`. If it does not alert, check `HOME_NET` first, then the URI and the header value.\n3. Change `rev` to 3 and break the rule deliberately (for example, change the URI). Confirm that your test now fails, then fix it.\n4. In a SIEM you administer, run the lag search from this lesson for your own log sources and calculate a safe search window for a 15-minute schedule.\n5. Write a one-paragraph root-cause note for each fault, stating the stage that failed, the evidence and the fix."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        { "term": "Detection pipeline", "definition": "The chain of stages from event generation through transport, parsing, indexing and rule evaluation to the alert action." },
+        { "term": "Known-true event", "definition": "An event that should definitely trigger the rule, used to prove whether the rule works." },
+        { "term": "Ingestion lag", "definition": "The delay between when an event occurs and when it is indexed and searchable." },
+        { "term": "Field extraction", "definition": "Parsing raw log text into named fields; a format change can silently break it." },
+        { "term": "HOME_NET", "definition": "The Snort variable that defines the protected internal networks; many rules depend on it." },
+        { "term": "Trust action", "definition": "A Cisco Secure Firewall access control action that allows traffic without further inspection, including intrusion inspection." },
+        { "term": "packet-tracer", "definition": "An ASA and FTD command that simulates a packet and shows each processing phase and the matching rule." },
+        { "term": "Regression test", "definition": "An automated check that a rule still fires on its test event after changes." },
+        { "term": "Detection as code", "definition": "Managing detection rules, their tests and documentation in version control with review and automated testing." }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "A SIEM rule has never fired. What is the most useful first step?",
+          "options": [
+            "Lower the threshold to zero",
+            "Generate or find a known-true event and check whether it exists in the SIEM",
+            "Rewrite the rule in a different query language",
+            "Disable the rule because it is clearly broken"
+          ],
+          "answer": 1,
+          "explanation": "A known-true event separates a broken pipeline from an absence of attacks. Checking whether the raw event is in the SIEM splits the pipeline in half."
+        },
+        {
+          "question": "A scheduled search runs every 15 minutes over the last 15 minutes. Events from branch offices arrive up to 8 minutes late. What is the best fix?",
+          "options": [
+            "Run the search every minute over the last minute",
+            "Shift the window, for example earliest=-25m@m latest=-10m@m, so late events are evaluated exactly once",
+            "Search the last 24 hours every 15 minutes",
+            "Ignore branch office events"
+          ],
+          "answer": 1,
+          "explanation": "A delayed window covers the measured lag without duplicate evaluation. Searching 24 hours each time would create duplicate alerts and waste resources."
+        },
+        {
+          "question": "A Snort 3 rule alerts when tested offline against a PCAP but never fires on FTD for the same traffic. Which causes are possible? (Choose all that apply.)",
+          "options": [
+            "The flow matches an access control rule with the Trust action",
+            "A prefilter rule fast-paths the traffic",
+            "The access control rule that matches the traffic has no intrusion policy attached",
+            "The rule has a syntax error"
+          ],
+          "answer": [0, 1, 2],
+          "explanation": "Since the rule works offline, its syntax and logic are fine. The traffic is not reaching Snort or not being inspected with the right policy on the firewall."
+        },
+        {
+          "question": "In packet-tracer output on FTD, the matching line reads access-list CSM_FW_ACL_ advanced trust tcp ... What does this tell you?",
+          "options": [
+            "The traffic is blocked",
+            "The traffic is allowed and sent to Snort for intrusion inspection",
+            "The traffic is allowed without deep inspection, so intrusion rules cannot fire",
+            "The traffic is decrypted"
+          ],
+          "answer": 2,
+          "explanation": "The trust keyword corresponds to the Trust action in the access control policy, which bypasses deep inspection."
+        },
+        {
+          "question": "Which practices help detect silent rule failures before an attacker exploits them? (Choose all that apply.)",
+          "options": [
+            "A daily synthetic test event per critical rule, with an alert if the rule does not fire",
+            "Alerting when a log source stops sending",
+            "Storing each rule's test event in version control with the rule",
+            "Deleting rules that have not fired in 30 days"
+          ],
+          "answer": [0, 1, 2],
+          "explanation": "Synthetic tests, pipeline monitoring and stored test events catch failures. A rule that has not fired may simply mean the attack has not happened."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Every alert depends on a **pipeline**: source, transport, parsing, time, rule logic, schedule, thresholds and alert action. IPS detections also depend on rule state, policy attachment, traffic reaching Snort and correct network variables.\n- Troubleshoot with a **known-true event**, **divide and conquer**, change one thing at a time and fix the **root cause**.\n- In a SIEM, check that fields are **populated** and measure **ingestion lag** before trusting a search window.\n- For Snort 3, test **offline** first, then use **packet-tracer** on FTD to find Trust, Fastpath or missing intrusion policies.\n- Prevent regressions with **stored test events, synthetic tests and pipeline monitoring**.\n\nWith working detections in place, connect them to response in [SOAR Workflows and Escalation](/learn/cisco-security-certification-track/soar-workflows-and-escalation)."
+    }
+  ],
+  "ar": {
+    "title": "استكشاف أعطال قواعد الكشف وإصلاحها",
+    "summary": "اكتشف سبب صمت قاعدة كشف في SIEM أو IPS أو كثرة إطلاقها، باختبار كل مرحلة من مراحل خط الكشف، من مصدر السجلات وتحليلها إلى منطق القاعدة وجدولتها ونشر السياسة على Cisco Secure Firewall.",
+    "objectives": [
+      "وصف مراحل خط الكشف والأعطال التي تقع في كل مرحلة",
+      "تطبيق مسار عمل منظّم قائم على التقسيم والتضييق على قاعدة لا تُطلق تنبيهات",
+      "تشخيص أعطال قواعد SIEM الناتجة عن البيانات المفقودة وتغيّر الحقول وتأخر الاستيعاب",
+      "استكشاف أعطال قاعدة Snort 3 دون اتصال وعلى Cisco Secure Firewall Threat Defense باستخدام packet-tracer",
+      "منع التراجعات باستخدام أحداث الاختبار وممارسات الكشف كشيفرة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "خلال تمرين مُصرَّح به للفريق البنفسجي (Purple team)، حاكى الفريق الأحمر تنزيل مرحلة أولى وتفريغًا لبيانات الاعتماد عبر سطر الأوامر على محطة عمل مختبرية. وكان لدى مركز العمليات قاعدة Snort للتنزيل وقاعدة SIEM للتفريغ، ولم تُطلق أيٌّ منهما تنبيهًا. لم يكشف التمرين ثغرة في *التغطية*، فعمليات الكشف موجودة على الورق؛ بل كشف ثغرة في *التشغيل*: في مكانٍ ما بين الحدث والتنبيه، انكسر شيء.\n\nيُنتظر منك في اختبار CBRCOR أن تستكشف أعطال قواعد الكشف وتصلحها، لا أن تكتبها فحسب. يقدّم لك هذا الدرس منهجية تصلح لأي SIEM أو نظام لمنع التسلل (IPS)، ثم يطبّقها على حالتين واقعيتين: قاعدة في Splunk، وقاعدة Snort 3 على Cisco Secure Firewall Threat Defense (FTD)."
+      },
+      {
+        "id": "pipeline",
+        "type": "text",
+        "markdown": "## خط الكشف وأماكن انكساره\n\nكل تنبيه هو نهاية سلسلة، وأي عطل على امتدادها يُنتج صمتًا:\n\n| المرحلة | العطل المعتاد | الفحص السريع |\n|:--|:--|:--|\n| **المصدر** | سياسة التدقيق غير مفعّلة، أو مستوى التسجيل منخفض جدًا، أو الوكيل متوقف | هل يولّد الجهاز الحدث محليًا؟ |\n| **النقل** | إرسال Syslog إلى مُجمِّع خاطئ، أو جدار حماية يحجب UDP 514 أو TCP 6514، أو امتلاء طابور المُمرِّر | هل يصل أي حدث من هذا الجهاز؟ |\n| **التحليل (Parsing)** | ترقية من المورّد غيّرت صيغة الرسالة فلم تعد الحقول تُستخرج | هل الحقل موجود ومملوء؟ |\n| **الوقت** | منطقة زمنية أو ساعة خاطئة، أو تأخر الاستيعاب | قارن وقت الحدث بوقت الفهرسة |\n| **منطق القاعدة** | اسم حقل أو قيمة خاطئة، أو AND بدل OR، أو اختلاف حالة الأحرف أو المسار | شغّل البحث يدويًا على حدث معروف |\n| **الجدولة والنافذة** | نافذة البحث تفوّت الأحداث المتأخرة، أو البحث معطّل أو متخطّى | راجع سجل المُجدوِل |\n| **العتبة والكتم** | عتبة مرتفعة جدًا، أو تقييد (Throttling)، أو استثناء قديم يُخفي الحدث | أزلها مؤقتًا في نسخة اختبارية |\n| **إجراء التنبيه** | فشل الحدث الجدير بالاهتمام أو البريد أو خطاف ويب SOAR | راجع سجلات الإجراء |\n\nويضيف نظام منع التسلل مراحله الخاصة: يجب أن تكون القاعدة **مفعّلة** في سياسة التسلل، وأن تكون السياسة **مرتبطة** بقاعدة التحكم في الوصول التي تطابق حركة المرور، وأن **تصل** حركة المرور فعلًا إلى Snort (غير موثوقة، ولا عابرة بالمسار السريع، ولا مشفّرة)، وأن تصف متغيرات الشبكة مثل `$HOME_NET` شبكاتك الحقيقية.\n\nأما القواعد كثيرة الضجيج فتنكسر في الأماكن نفسها لكن في الاتجاه المعاكس: محلّل يضع قيمة خاطئة في حقل، أو استثناء مفقود، أو نافذة زمنية تحتسب الحدث نفسه مرتين. ويغطي ضبطَها درس [ضبط القواعد والمرشّحات والسياسات](/learn/cisco-security-certification-track/rule-filter-and-policy-tuning)."
+      },
+      {
+        "id": "method",
+        "type": "text",
+        "markdown": "## مسار عمل منظّم لاستكشاف الأعطال\n\n1. **أعِد إنتاج المشكلة بحدث معروف الصحة (Known-true event).** ولّد السلوك في المختبر، أو أعِد تشغيل ملف PCAP محفوظ، أو ابحث عن حدث حقيقي سابق كان ينبغي أن يطابق. فمن دون حدث معروف الصحة لا يمكنك التمييز بين قاعدة معطوبة وغياب الهجمات.\n2. **قسّم وضيّق (Divide and conquer).** افحص منتصف الخط أولًا: هل الحدث الخام موجود في SIEM؟ إن كان موجودًا فالمشكلة لاحقة (التحليل، أو المنطق، أو الجدولة)، وإلا فهي سابقة (المصدر، أو النقل). ثم نصّف المراحل المتبقية حتى تجد موضع الانكسار.\n3. **غيّر شيئًا واحدًا في كل مرة** في نسخة من القاعدة، واختبر من جديد بالحدث نفسه.\n4. **أصلح السبب الجذري** لا العَرَض. فتوسيع البحث ليشمل كل الفهارس قد يجعل التنبيه يُطلق، لكنه يُخفي مشكلة تحليل ستكسر قواعد أخرى.\n5. **أضف الحدث إلى اختبار تراجع (Regression test)** كي تُختبر القاعدة آليًا بعد كل تغيير أو ترقية أو تحديث للمحلّل.\n\nتتتبّع الحركة التوضيحية حدث اختبار تفريغ بيانات الاعتماد عبر مسار العمل هذا."
+      },
+      {
+        "id": "flow-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "تتبّع حدث اختبار واحد عبر خط الكشف",
+        "caption": "تُفحص كل مرحلة بالترتيب حتى يُعثر على موضع الانكسار. وهنا جُمع الحدث، لكن الحقل الذي تحتاج إليه القاعدة لم يُولَّد قط.",
+        "data": {
+          "token": "Event 4688",
+          "nodes": [
+            { "id": "host", "label": "محطة العمل", "sub": "سياسة التدقيق في Windows", "icon": "desktop" },
+            { "id": "fwd", "label": "المُمرِّر", "sub": "النقل", "icon": "log" },
+            { "id": "idx", "label": "فهرس SIEM", "sub": "التحليل والوقت", "icon": "database" },
+            { "id": "rule", "label": "قاعدة الربط", "sub": "المنطق والجدولة", "icon": "cpu" },
+            { "id": "alert", "label": "التنبيه", "sub": "حدث جدير بالاهتمام + SOAR", "icon": "alert" }
+          ],
+          "steps": [
+            { "at": "host", "caption": "يشغّل الفريق الأحمر الاختبار، فيكتب Windows الحدث 4688 للعملية الجديدة." },
+            { "at": "fwd", "caption": "يرسل المُمرِّر الحدث، والنقل سليم.", "tone": "success" },
+            { "at": "idx", "caption": "الحدث موجود في الفهرس بالوقت الصحيح، فالمصدر والنقل ليسا المشكلة.", "tone": "success" },
+            { "at": "idx", "token": "CommandLine = (empty)", "caption": "لكن الحقل CommandLine فارغ في جميع أحداث 4688 الواردة من هذا الجهاز.", "tone": "warning" },
+            { "at": "rule", "token": "لا تطابق", "caption": "تبحث القاعدة في CommandLine عن وسائط أداة التفريغ، فلا يمكن أن تطابق أبدًا.", "tone": "danger" },
+            { "at": "host", "token": "إصلاح GPO", "caption": "السبب الجذري: السياسة التي تُضمّن سطر الأوامر في أحداث إنشاء العمليات لم تُطبَّق على هذه الوحدة التنظيمية (OU).", "tone": "secure" },
+            { "at": "alert", "token": "Event 4688", "caption": "بعد إصلاح السياسة، يُنتج الاختبار المُعاد تنبيهًا، ويُحفظ الحدث اختبارَ تراجع.", "tone": "success" }
+          ]
+        }
+      },
+      {
+        "id": "siem-case",
+        "type": "text",
+        "markdown": "## الحالة 1: قاعدة SIEM تفوّت الأحداث\n\nكانت حالة تفريغ بيانات الاعتماد أعلاه مشكلةً في **المصدر**، واكتُشفت لأن الحقل كان فارغًا. لكن القاعدة نفسها كانت تعاني مشكلة ثانية أدقّ وشائعة جدًا: **تأخر الاستيعاب (Ingestion lag)**.\n\nكانت القاعدة تعمل كل 15 دقيقة على الدقائق الخمس عشرة السابقة من *وقت الحدث*، وكانت أحداث المكاتب البعيدة تصل متأخرة حتى ثماني دقائق. فالحدث الذي وقع في 10:14 وفُهرس في 10:21 كان خارج نافذة 10:00 إلى 10:15 حين عمل بحث 10:15، وكان قبل نافذة 10:15 إلى 10:30 حين عمل البحث التالي؛ فلم يُقيَّم قط.\n\nوالإصلاح هو قياس التأخر وإزاحة النافذة، مع قبول تأخير بسيط مقابل تغطية كاملة. تُظهر عمليات البحث أدناه التشخيص والقاعدة المصحّحة."
+      },
+      {
+        "id": "spl",
+        "type": "code",
+        "language": "plain",
+        "filename": "credential-dump-rule.spl",
+        "caption": "بلغة Splunk SPL. يتحقق البحث 1 من وجود الحقل المطلوب، ويقيس البحث 2 تأخر الاستيعاب، وتستخدم القاعدة المصحّحة (الأسطر 15 إلى 18) نافذة مُزاحة لا تفوّت الأحداث ولا تكرّرها.",
+        "highlight": [3, 8, 9, 15],
+        "code": "# 1. Is the field the rule needs actually populated?\nindex=wineventlog EventCode=4688 host=LAB-WS-* earliest=-24h\n| eval has_cmd = if(isnull(CommandLine) OR CommandLine=\"\", \"empty\", \"present\")\n| stats count BY host has_cmd\n\n# 2. How late do events arrive? (index time minus event time, in seconds)\nindex=wineventlog earliest=-24h\n| eval lag = _indextime - _time\n| stats avg(lag) AS avg_lag perc95(lag) AS p95_lag max(lag) AS max_lag BY host\n\n# 3. Corrected rule, scheduled every 15 minutes (cron */15 * * * *)\n#    Old window: earliest=-15m latest=now  -> late events were never searched\n#    New window: a 15-minute slice that ends 10 minutes ago, so\n#    events up to 10 minutes late are still evaluated exactly once\nindex=wineventlog EventCode=4688 earliest=-25m@m latest=-10m@m\n    (CommandLine=\"*sekurlsa*\" OR CommandLine=\"*lsass*\" OR CommandLine=\"*comsvcs.dll*MiniDump*\")\n| stats earliest(_time) AS first_seen values(CommandLine) AS cmd BY host user ParentProcessName\n| eval first_seen = strftime(first_seen, \"%F %T\")\n\n# Diagnosis output (search 2):\n# host           avg_lag   p95_lag   max_lag\n# HQ-WS-0114        4.1      11.0      38.0\n# BR-WS-0207      162.5     401.0     487.0   <- remote office, up to 8 minutes late"
+      },
+      {
+        "id": "ips-case",
+        "type": "text",
+        "markdown": "## الحالة 2: قاعدة Snort 3 لا تُطلق أبدًا على FTD\n\nكان الكشف الثاني قاعدة Snort 3 محلية لتنزيل المرحلة الأولى (جلب `/static/upd.bin` عبر HTTP). استكشف عطلها على نصفين.\n\n### النصف الأول: هل تطابق القاعدة حركة المرور أصلًا؟\n\nاختبر القاعدة **دون اتصال (Offline)** على ملف PCAP لحركة المرور الاختبارية في مستشعر Snort 3 مختبري، فهذا يفصل مشكلات القاعدة عن مشكلات النشر. في هذه الحالة لم يُنتج التشغيل الأول أي تنبيه. فترويسة القاعدة تستخدم `$HOME_NET`، وكانت التهيئة المختبرية لا تزال تعرّف `HOME_NET` بالقيمة `192.168.0.0/16`، بينما عنوان محطة العمل `10.20.30.57`. وكان الخطأ نفسه موجودًا في مجموعة المتغيرات (Variable set) على Firewall Management Center (FMC). وأثبت تجاوز قيمة المتغير أن منطق القاعدة سليم.\n\n### النصف الثاني: هل تصل حركة المرور إلى Snort على جدار الحماية؟\n\nبعد إثبات صحة القاعدة، استخدم `packet-tracer` على FTD لمعرفة قاعدة التحكم في الوصول التي يطابقها التدفق. وقد طابق هنا قاعدةً بالإجراء **Trust**. وحركة المرور الموثوقة يُسمح بها دون فحص عميق، فلم ترها أي سياسة تسلل قط. ويحدث الأمر نفسه مع قاعدة تصفية مسبقة (Prefilter) بالإجراء **Fastpath**، ومع حركة مرور تطابق قاعدة وصول لا ترتبط بها سياسة تسلل، ومع حركة مرور مشفّرة لا يُفك تشفيرها.\n\nوكانت الإصلاحات: تصحيح `HOME_NET` في مجموعة المتغيرات على FMC، وتغيير قاعدة التحكم في الوصول من Trust إلى Allow مع ربط سياسة التسلل، ثم النشر."
+      },
+      {
+        "id": "snort-term",
+        "type": "terminal",
+        "title": "اختبار القاعدة دون اتصال ثم تتبّع التدفق على FTD",
+        "prompt": "analyst@lab-sensor:~$",
+        "lines": [
+          { "cmd": "cat local.rules", "output": "alert http $HOME_NET any -> $EXTERNAL_NET any ( msg:\"LOCAL first-stage download upd.bin\"; flow:to_server,established; http_uri; content:\"/static/upd.bin\",fast_pattern; http_header:field user-agent; content:\"MSIE 7.0\"; classtype:trojan-activity; sid:1000101; rev:2; )" },
+          { "comment": "تحقّق من صحة التهيئة والقواعد أولًا" },
+          { "cmd": "snort -c /usr/local/etc/snort/snort.lua -R local.rules -T -q", "output": "Snort successfully validated the configuration (with 0 warnings)." },
+          { "comment": "إعادة تشغيل ملف PCAP الاختباري: لا يصدر أي تنبيه" },
+          { "cmd": "snort -c /usr/local/etc/snort/snort.lua -R local.rules -r upd-download.pcap -A alert_fast -q", "output": "" },
+          { "comment": "تجاوز قيمة HOME_NET بالنطاق الداخلي الحقيقي ثم التشغيل مجددًا" },
+          { "cmd": "snort -c /usr/local/etc/snort/snort.lua --lua \"HOME_NET = '10.0.0.0/8'\" -R local.rules -r upd-download.pcap -A alert_fast -q", "output": "11/02-07:00:04.118230 [**] [1:1000101:2] \"LOCAL first-stage download upd.bin\" [**] [Classification: A Network Trojan was detected] [Priority: 1] {TCP} 10.20.30.57:51544 -> 203.0.113.80:80" },
+          { "comment": "على واجهة سطر أوامر FTD: أي قاعدة تحكم في الوصول يطابقها التدفق؟" },
+          { "prompt": ">", "cmd": "packet-tracer input inside tcp 10.20.30.57 51544 203.0.113.80 80 detailed", "output": "...\nPhase: 4\nType: ACCESS-LIST\nSubtype: log\nResult: ALLOW\nConfig:\naccess-group CSM_FW_ACL_ global\naccess-list CSM_FW_ACL_ advanced trust tcp ifc inside any any eq www rule-id 268435461 event-log flow-end\naccess-list CSM_FW_ACL_ remark rule-id 268435461: ACCESS POLICY: Branch-ACP - Mandatory\naccess-list CSM_FW_ACL_ remark rule-id 268435461: L7 RULE: Trust-Internal-Web\n...\nAction: allow" },
+          { "comment": "تعني 'advanced trust' أن التدفق يتجاوز فحص Snort، فلا تراه سياسة التسلل أبدًا" }
+        ],
+        "caption": "عناوين مخصّصة للتوثيق فقط، ومعرّف القاعدة وأسماء السياسات أمثلة، والمُخرج مختصر بـ '...'."
+      },
+      {
+        "id": "regression",
+        "type": "text",
+        "markdown": "## منع العطل الصامت التالي\n\nمعظم عمليات الكشف المعطوبة لا تكون معطوبة يوم كتابتها، بل تنكسر لاحقًا: حين تغيّر ترقيةٌ من المورّد صيغة السجل، أو لا تُطبَّق سياسة مجموعة على وحدة تنظيمية جديدة، أو يضيف أحدهم قاعدة Trust لحل مشكلة أداء. فاحمِ عمليات الكشف كما يحمي المطوّرون شيفرتهم:\n\n- **احتفظ بحدث اختبار لكل قاعدة**: سطر سجل محفوظ، أو ملف PCAP، أو إجراء مختبري، مخزّنًا مع القاعدة في نظام إدارة الإصدارات.\n- **شغّل الاختبارات آليًا** بعد تغييرات المحلّلات والسياسات والبرمجيات، ووفق جدول دوري. فحدثٌ اصطناعي يومي لكل قاعدة حرجة، مع تنبيه إذا *لم* تُطلق القاعدة، يكشف الأعطال الصامتة بسرعة.\n- **راقب خط الكشف نفسه**: نبّه حين يتوقف مصدر سجلات عن الإرسال، أو حين يتجاوز تأخر الاستيعاب نافذة القاعدة، أو حين يُتخطّى بحث مجدول.\n- **سجّل تقنية ATT&CK** التي تغطيها كل قاعدة، كي تظهر القاعدة المعطوبة ثغرةً في التغطية. راجع درس [تحديد أساليب المهاجمين وتقنياتهم وإجراءاتهم (MITRE ATT&CK)](/learn/cisco-security-certification-track/identifying-attacker-ttps-mitre-att-and-ck)."
+      },
+      {
+        "id": "warn-widen",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تُصلح قاعدة صامتة بجعلها مبهمة",
+        "markdown": "استبدال شرط دقيق بالرمز `*`، أو البحث في كل الفهارس، أو حذف منفذ الوجهة، قد يجعل تنبيه الاختبار يُطلق، لكنه يُنشئ إيجابيات كاذبة ويُخفي العطل الحقيقي. اعثر على المرحلة التي انكسرت وأصلحها هناك."
+      },
+      {
+        "id": "tip-trust",
+        "type": "callout",
+        "variant": "tip",
+        "title": "إجراءا Trust وFastpath أداتا أداء لا قراران أمنيان",
+        "markdown": "في Cisco Secure Firewall، تتخطى قواعد Trust وقواعد Fastpath في التصفية المسبقة الفحصَ العميق. راجعها بانتظام، واجعلها ضيقة (أجهزة ومنافذ محددة، كحركة النسخ الاحتياطي بين مركزَي بيانات)، ولا تستخدمها أبدًا لحركة المستخدمين إلى الإنترنت."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "1. على مستشعر Snort 3 مختبري تتحكم فيه، احفظ القاعدة الواردة في هذا الدرس في الملف `local.rules`، ثم أنشئ ملف PCAP اختباريًا بالتقاط طلب HTTP خاص بك إلى خادم ويب مختبري للمسار `/static/upd.bin` مع ضبط وكيل المستخدم على `MSIE 7.0`.\n2. شغّل Snort دون اتصال باستخدام `-r` و`-A alert_fast`. فإن لم يُطلق تنبيهًا، فافحص `HOME_NET` أولًا، ثم المسار وقيمة الترويسة.\n3. غيّر `rev` إلى 3 واكسر القاعدة عمدًا (بتغيير المسار مثلًا). تأكّد أن اختبارك يفشل الآن، ثم أصلحها.\n4. في SIEM تديره أنت، شغّل بحث التأخر الوارد في هذا الدرس على مصادر سجلاتك، واحسب نافذة بحث آمنة لجدولة كل 15 دقيقة.\n5. اكتب لكل عطل ملاحظة سبب جذري في فقرة واحدة، تذكر فيها المرحلة التي فشلت والدليل والإصلاح."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          { "term": "خط الكشف (Detection pipeline)", "definition": "سلسلة المراحل من توليد الحدث مرورًا بالنقل والتحليل والفهرسة وتقييم القاعدة وصولًا إلى إجراء التنبيه." },
+          { "term": "حدث معروف الصحة (Known-true event)", "definition": "حدث يجب أن يُطلق القاعدة حتمًا، ويُستخدم لإثبات عمل القاعدة أو عدمه." },
+          { "term": "تأخر الاستيعاب (Ingestion lag)", "definition": "التأخير بين وقوع الحدث وفهرسته وإتاحته للبحث." },
+          { "term": "استخراج الحقول (Field extraction)", "definition": "تحليل نص السجل الخام إلى حقول مسمّاة، وقد يكسره تغيّر الصيغة بصمت." },
+          { "term": "HOME_NET", "definition": "متغير Snort الذي يعرّف الشبكات الداخلية المحمية، وتعتمد عليه قواعد كثيرة." },
+          { "term": "الإجراء Trust", "definition": "إجراء في سياسة التحكم في الوصول على Cisco Secure Firewall يسمح بحركة المرور دون فحص إضافي، بما في ذلك فحص التسلل." },
+          { "term": "packet-tracer", "definition": "أمر في ASA وFTD يحاكي حزمة ويعرض كل مرحلة من مراحل معالجتها والقاعدة المطابقة." },
+          { "term": "اختبار التراجع (Regression test)", "definition": "فحص مؤتمت يتأكد أن القاعدة لا تزال تُطلق على حدث اختبارها بعد التغييرات." },
+          { "term": "الكشف كشيفرة (Detection as code)", "definition": "إدارة قواعد الكشف واختباراتها ووثائقها في نظام إدارة الإصدارات مع المراجعة والاختبار المؤتمت." }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "قاعدة SIEM لم تُطلق تنبيهًا قط. ما أنفع خطوة أولى؟",
+            "options": [
+              "خفض العتبة إلى الصفر",
+              "توليد حدث معروف الصحة أو العثور عليه، والتحقق من وجوده في SIEM",
+              "إعادة كتابة القاعدة بلغة استعلام مختلفة",
+              "تعطيل القاعدة لأنها معطوبة بوضوح"
+            ],
+            "answer": 1,
+            "explanation": "يفصل الحدث معروف الصحة بين خط كشف معطوب وغياب الهجمات، والتحقق من وجود الحدث الخام في SIEM يقسم الخط إلى نصفين."
+          },
+          {
+            "question": "يعمل بحث مجدول كل 15 دقيقة على آخر 15 دقيقة، وتصل أحداث الفروع متأخرة حتى 8 دقائق. ما أفضل إصلاح؟",
+            "options": [
+              "تشغيل البحث كل دقيقة على الدقيقة الأخيرة",
+              "إزاحة النافذة، مثل earliest=-25m@m latest=-10m@m، كي تُقيَّم الأحداث المتأخرة مرة واحدة بالضبط",
+              "البحث في آخر 24 ساعة كل 15 دقيقة",
+              "تجاهل أحداث الفروع"
+            ],
+            "answer": 1,
+            "explanation": "تغطي النافذة المُزاحة التأخر المقيس دون تقييم مكرر، أما البحث في 24 ساعة كل مرة فيُنشئ تنبيهات مكررة ويهدر الموارد."
+          },
+          {
+            "question": "قاعدة Snort 3 تُطلق تنبيهًا عند اختبارها دون اتصال على ملف PCAP، لكنها لا تُطلق أبدًا على FTD لحركة المرور نفسها. ما الأسباب المحتملة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "التدفق يطابق قاعدة تحكم في الوصول بالإجراء Trust",
+              "قاعدة تصفية مسبقة تمرّر حركة المرور بالمسار السريع (Fastpath)",
+              "قاعدة التحكم في الوصول التي تطابق حركة المرور لا ترتبط بها سياسة تسلل",
+              "في القاعدة خطأ في الصياغة"
+            ],
+            "answer": [0, 1, 2],
+            "explanation": "بما أن القاعدة تعمل دون اتصال، فصياغتها ومنطقها سليمان. والمشكلة أن حركة المرور لا تصل إلى Snort أو لا تُفحص بالسياسة الصحيحة على جدار الحماية."
+          },
+          {
+            "question": "في مُخرج packet-tracer على FTD، السطر المطابق هو access-list CSM_FW_ACL_ advanced trust tcp ... ماذا يخبرك ذلك؟",
+            "options": [
+              "حركة المرور محجوبة",
+              "حركة المرور مسموح بها وتُرسل إلى Snort لفحص التسلل",
+              "حركة المرور مسموح بها دون فحص عميق، فلا يمكن لقواعد التسلل أن تُطلق",
+              "يُفك تشفير حركة المرور"
+            ],
+            "answer": 2,
+            "explanation": "الكلمة trust تقابل الإجراء Trust في سياسة التحكم في الوصول، وهو يتجاوز الفحص العميق."
+          },
+          {
+            "question": "أيّ الممارسات التالية تساعد على كشف الأعطال الصامتة في القواعد قبل أن يستغلها مهاجم؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "حدث اختبار اصطناعي يومي لكل قاعدة حرجة، مع تنبيه إذا لم تُطلق القاعدة",
+              "التنبيه حين يتوقف مصدر سجلات عن الإرسال",
+              "حفظ حدث اختبار كل قاعدة معها في نظام إدارة الإصدارات",
+              "حذف القواعد التي لم تُطلق منذ 30 يومًا"
+            ],
+            "answer": [0, 1, 2],
+            "explanation": "الاختبارات الاصطناعية ومراقبة خط الكشف وأحداث الاختبار المحفوظة تكشف الأعطال، أما القاعدة التي لم تُطلق فقد يعني ذلك ببساطة أن الهجوم لم يقع."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يعتمد كل تنبيه على **خط كشف**: المصدر، والنقل، والتحليل، والوقت، ومنطق القاعدة، والجدولة، والعتبات، وإجراء التنبيه. وتعتمد عمليات كشف IPS أيضًا على حالة القاعدة، وارتباط السياسة، ووصول حركة المرور إلى Snort، وصحة متغيرات الشبكة.\n- استكشف الأعطال بـ **حدث معروف الصحة**، و**التقسيم والتضييق**، وتغيير شيء واحد في كل مرة، وإصلاح **السبب الجذري**.\n- في SIEM، تحقّق من أن الحقول **مملوءة** وقِس **تأخر الاستيعاب** قبل الوثوق بنافذة البحث.\n- في Snort 3، اختبر **دون اتصال** أولًا، ثم استخدم **packet-tracer** على FTD لكشف قواعد Trust أو Fastpath أو سياسات التسلل المفقودة.\n- امنع التراجعات بـ **أحداث الاختبار المحفوظة، والاختبارات الاصطناعية، ومراقبة خط الكشف**.\n\nبعد أن تعمل عمليات الكشف كما ينبغي، اربطها بالاستجابة في درس [مسارات عمل SOAR والتصعيد](/learn/cisco-security-certification-track/soar-workflows-and-escalation)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,648 @@
+{
+  "slug": "ansible-for-network-configuration",
+  "title": "Ansible for Network Configuration",
+  "summary": "Use Ansible to configure Cisco devices at scale: inventories, connection plugins, resource modules and their states, check mode, Vault and a troubleshooting workflow for failing playbooks.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Explain how Ansible reaches network devices through network_cli, netconf and httpapi connection plugins",
+    "Build a YAML inventory with group variables and Vault-protected credentials",
+    "Choose the right resource module state (merged, replaced, overridden, deleted, gathered, rendered, parsed)",
+    "Run playbooks safely with check mode and verify idempotency",
+    "Troubleshoot unreachable hosts, privilege errors, timeouts and non-idempotent tasks"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A retail company has 120 branch offices, each with one or two Catalyst access switches. A new IP telephony rollout needs VLAN 30 named `VOICE` on every switch, and every user port needs a voice VLAN. Done by hand, that is hundreds of SSH sessions, and the result is never quite identical: a typo in one branch, a forgotten `name` in another.\n\n**Ansible** turns this into one reviewed file and one command. You describe the state you want, Ansible connects to each switch, works out what is missing, and changes only that. A second run changes nothing. The CCNP Automation core exam (AUTOCOR 350-901) expects you to build, read and troubleshoot playbooks that configure Cisco devices, so this lesson focuses on how Ansible actually talks to network gear and how to keep runs safe and repeatable."
+    },
+    {
+      "id": "how",
+      "type": "text",
+      "markdown": "## How Ansible manages network devices\n\nAnsible is **agentless**. A *control node* (your laptop, a CI runner or an automation server) holds three things: an **inventory** of devices, **playbooks** that list tasks, and **collections** that contain the modules. For servers, Ansible copies Python code to the target and runs it there. Network operating systems cannot run that code, so network modules execute **on the control node** and drive the device through a *connection plugin*.\n\n| `ansible_connection` | Transport | Typical targets |\n|:--|:--|:--|\n| `ansible.netcommon.network_cli` | SSH to the CLI | IOS XE, NX-OS, IOS XR, ASA |\n| `ansible.netcommon.netconf` | NETCONF over SSH (830) | IOS XE, IOS XR, Junos |\n| `ansible.netcommon.httpapi` | HTTPS API | NX-API, FTD/FMC, Check Point |\n| `local` | Module calls a REST API itself | Meraki Dashboard, Catalyst Center, ACI |\n\nCisco ships certified collections on Ansible Galaxy and Automation Hub: `cisco.ios`, `cisco.nxos`, `cisco.iosxr`, `cisco.asa`, `cisco.aci`, `cisco.meraki` and `cisco.dnac` (Catalyst Center). Install them with `ansible-galaxy collection install cisco.ios` and pin the versions in a `requirements.yml` so every engineer and every pipeline runs the same code.\n\n`network_cli` keeps a **persistent connection** open for the whole play, so a playbook with ten tasks does not log in ten times."
+    },
+    {
+      "id": "run-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "One Ansible task against one switch",
+      "caption": "Network modules run on the control node, compare desired and current state, and send only the difference.",
+      "data": {
+        "actors": [
+          {
+            "id": "eng",
+            "label": "Engineer",
+            "sub": "Git + CI",
+            "icon": "user"
+          },
+          {
+            "id": "ctl",
+            "label": "Control node",
+            "sub": "ansible-core + cisco.ios",
+            "icon": "server"
+          },
+          {
+            "id": "sw",
+            "label": "Branch switch",
+            "sub": "sw-br01 (IOS XE)",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "eng",
+            "to": "ctl",
+            "label": "ansible-playbook vlans.yml",
+            "detail": "inventory + playbook + vault",
+            "note": "The run starts on the control node. Nothing is installed on the switch: Ansible is agentless."
+          },
+          {
+            "from": "ctl",
+            "to": "ctl",
+            "label": "Resolve inventory and variables",
+            "detail": "group_vars, host_vars, vault",
+            "note": "Ansible merges inventory, group and host variables and decrypts vaulted secrets in memory."
+          },
+          {
+            "from": "ctl",
+            "to": "sw",
+            "label": "SSH (network_cli)",
+            "detail": "persistent connection, enable",
+            "tone": "secure",
+            "note": "The module code runs on the control node and opens one persistent SSH session per device."
+          },
+          {
+            "from": "ctl",
+            "to": "sw",
+            "label": "Gather current state",
+            "detail": "show running-config | section ^vlan",
+            "note": "The resource module reads the relevant part of the configuration and parses it into structured data."
+          },
+          {
+            "from": "ctl",
+            "to": "ctl",
+            "label": "Compare desired vs. current",
+            "detail": "state: merged",
+            "note": "Only the difference becomes commands. If nothing differs, no commands are generated."
+          },
+          {
+            "from": "ctl",
+            "to": "sw",
+            "label": "vlan 30 / name VOICE",
+            "tone": "warning",
+            "note": "In check mode this step is skipped and the commands are only reported."
+          },
+          {
+            "from": "sw",
+            "to": "ctl",
+            "label": "Prompt returns, no errors",
+            "tone": "success",
+            "note": "The connection plugin watches the CLI for error strings such as '% Invalid input'."
+          },
+          {
+            "from": "ctl",
+            "to": "eng",
+            "label": "PLAY RECAP: changed=1",
+            "tone": "success",
+            "note": "A second run reports changed=0. That is idempotency, and it is what makes scheduled runs safe."
+          }
+        ]
+      }
+    },
+    {
+      "id": "inventory",
+      "type": "text",
+      "markdown": "## Inventory and variables\n\nThe inventory says *which* devices exist and *how* to reach them. YAML inventories group hosts and attach variables to groups. In real projects the inventory is often generated from a source of truth such as NetBox through an inventory plugin, which is covered in [Source of Truth Integration](/learn/network-automation-devops/source-of-truth-integration).\n\nVariables follow a precedence order. The ones you will use most are, from weakest to strongest: group variables (`group_vars/<group>.yml`), host variables (`host_vars/<host>.yml`), play variables, and extra variables passed with `-e`. Keep connection settings in `group_vars` and site-specific data (VLAN lists, NTP servers) in host or group files, not inside the playbook.\n\nThree variables are essential for Cisco devices: `ansible_network_os` (which platform plugin to load), `ansible_connection`, and `ansible_become`/`ansible_become_method: enable` when the user does not land in privileged EXEC mode."
+    },
+    {
+      "id": "inv-code",
+      "type": "code",
+      "language": "yaml",
+      "filename": "inventory.yml",
+      "caption": "A YAML inventory with connection variables at the group level. The password comes from an Ansible Vault variable, never from plain text.",
+      "highlight": [
+        11,
+        12,
+        14
+      ],
+      "code": "# inventory.yml\nall:\n  children:\n    branch_switches:\n      hosts:\n        sw-br01:\n          ansible_host: 10.20.1.11\n        sw-br02:\n          ansible_host: 10.20.2.11\n      vars:\n        ansible_network_os: cisco.ios.ios\n        ansible_connection: ansible.netcommon.network_cli\n        ansible_user: netauto\n        ansible_password: \"{{ vault_netauto_password }}\"   # defined in an encrypted vars file\n        ansible_become: true\n        ansible_become_method: enable"
+    },
+    {
+      "id": "resource",
+      "type": "text",
+      "markdown": "## Resource modules and states\n\nOlder playbooks used `ios_config` with raw `lines:` and `parents:`. It works, but it compares text and can easily become non-idempotent. **Resource modules** (`ios_vlans`, `ios_interfaces`, `ios_l2_interfaces`, `ios_l3_interfaces`, `ios_bgp_global`, `ios_acls` and many more) model one feature as structured data and support a common set of `state` values:\n\n| `state` | Effect |\n|:--|:--|\n| `merged` | Add or update what is listed; leave everything else alone |\n| `replaced` | Make each listed object match exactly; unlisted objects are untouched |\n| `overridden` | Make the whole feature match the list; remove anything not listed |\n| `deleted` | Remove the listed objects (or the whole feature if `config` is empty) |\n| `gathered` | Read the device and return structured data, no change |\n| `rendered` | Produce the commands offline, no device needed |\n| `parsed` | Convert a saved `running_config` text into structured data |\n\n`merged` is the safe default. `overridden` gives you true declarative control, but on an access switch it will also delete VLANs that someone added outside Ansible, so use it only when the playbook really is the source of truth."
+    },
+    {
+      "id": "play-code",
+      "type": "code",
+      "language": "yaml",
+      "filename": "vlans.yml",
+      "caption": "A playbook that uses resource modules. The registered result exposes the exact commands generated for the device.",
+      "highlight": [
+        8,
+        14,
+        15,
+        18,
+        30,
+        34,
+        35
+      ],
+      "code": "---\n- name: Standardize branch VLANs and access ports\n  hosts: branch_switches\n  gather_facts: false\n\n  tasks:\n    - name: Ensure standard VLANs exist\n      cisco.ios.ios_vlans:\n        config:\n          - vlan_id: 10\n            name: USERS\n          - vlan_id: 30\n            name: VOICE\n        state: merged\n      register: vlan_result\n\n    - name: Configure user access ports\n      cisco.ios.ios_l2_interfaces:\n        config:\n          - name: GigabitEthernet1/0/5\n            mode: access\n            access:\n              vlan: 10\n            voice:\n              vlan: 30\n        state: merged\n\n    - name: Show commands that were (or would be) sent\n      ansible.builtin.debug:\n        var: vlan_result.commands\n\n    - name: Save the running configuration if it differs from startup\n      cisco.ios.ios_config:\n        save_when: modified\n      when: not ansible_check_mode"
+    },
+    {
+      "id": "run",
+      "type": "terminal",
+      "title": "Check mode first, then the real run, then a rerun",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --check --limit sw-br01",
+          "output": "Vault password: \n\nPLAY [Standardize branch VLANs and access ports] *******************************\n\nTASK [Ensure standard VLANs exist] *********************************************\nchanged: [sw-br01]\n\nTASK [Configure user access ports] *********************************************\nchanged: [sw-br01]\n\nTASK [Show commands that were (or would be) sent] ******************************\nok: [sw-br01] => {\n    \"vlan_result.commands\": [\n        \"vlan 30\",\n        \"name VOICE\"\n    ]\n}\n\nTASK [Save the running configuration if it differs from startup] ***************\nskipping: [sw-br01]\n\nPLAY RECAP *********************************************************************\nsw-br01   : ok=3    changed=2    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0"
+        },
+        {
+          "comment": "Check mode (--check) connects, compares and reports the commands without sending them. The save task is skipped by its when: condition, because check mode never writes to the device."
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --limit sw-br01",
+          "output": "...\nPLAY RECAP *********************************************************************\nsw-br01   : ok=4    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --limit sw-br01",
+          "output": "...\nPLAY RECAP *********************************************************************\nsw-br01   : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+        },
+        {
+          "comment": "The second real run reports changed=0. If a rerun still shows changes, the task is not idempotent: look for abbreviated commands in ios_config lines or a value the device normalizes differently."
+        }
+      ],
+      "caption": "Add --diff to see before/after output for modules that support it."
+    },
+    {
+      "id": "templates",
+      "type": "text",
+      "markdown": "## Templates, roles and secrets\n\nFor larger features you will often render a configuration from a **Jinja2** template and push it with `ios_config: src: ntp.j2`, or render structured data for a resource module. Keep logic in templates simple: loops over data and a few conditionals. Complex logic belongs in Python filters.\n\nAs a project grows, split it into **roles** (`roles/access_switch/tasks/main.yml`, `defaults/`, `templates/`). A role is a reusable unit you can test on its own and share across playbooks.\n\nCredentials go into **Ansible Vault**. `ansible-vault encrypt group_vars/branch_switches/vault.yml` encrypts a whole file; `ansible-vault encrypt_string` encrypts a single value. In pipelines, the vault password comes from the CI system's protected variables, not from the repository. Many teams also run playbooks inside an **execution environment**, a container image built with `ansible-builder` and run with `ansible-navigator`, so that Python libraries and collection versions are identical everywhere."
+    },
+    {
+      "id": "troubleshoot",
+      "type": "text",
+      "markdown": "## Troubleshooting a failing playbook\n\nWhen a task fails, work from the transport upward:\n\n1. **Reachability and authentication.** `unreachable=1` usually means SSH, a host key or credentials. Test with `ansible sw-br01 -i inventory.yml -m cisco.ios.ios_facts --ask-vault-pass`.\n2. **Privilege.** *\"unable to elevate privilege to enable mode\"* means `ansible_become` is missing or the enable secret is wrong.\n3. **Timeouts.** Slow commands such as `copy` or `write memory` on large configurations may need a higher `ansible_command_timeout`.\n4. **Device errors.** The CLI returned `% Invalid input`: the command does not exist on that platform or release. Run with `-vvv` and enable the persistent connection log (`log_path` in `ansible.cfg`) to see the exact exchange.\n5. **Idempotency.** A task that is always `changed` is a design bug, not a cosmetic issue, because it hides real drift."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where engineers go wrong",
+      "markdown": "- **Running `overridden` or `deleted` without a check-mode run.** Always run `--check` first and read the generated commands.\n- **Assuming every module supports check mode.** `ios_command` cannot predict what a command will do; guard such tasks with `when: not ansible_check_mode`.\n- **Plain-text passwords in `group_vars`.** Once committed to Git they are in the history forever. Use Vault or an external secrets manager.\n- **Forgetting to save.** Changes land in the running configuration. Use `save_when: modified` (or a handler) so a reload does not undo the work."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Exam tip",
+      "markdown": "Know the difference between `merged`, `replaced` and `overridden`, and which `ansible_connection` value fits a target (CLI over SSH, NETCONF or an HTTP API). For a broader comparison of Ansible with Terraform and custom code, see [Choosing an Approach: IaC, Low-Code or Custom Apps](/learn/network-automation-devops/choosing-an-approach-iac-low-code-or-custom-apps)."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab you own: a Cisco Modeling Labs topology or a DevNet sandbox with one or two IOS XE switches. See [Cisco Modeling Labs (CML) for Testing](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing).\n\n1. Create a virtual environment, then run `pip install ansible-core ansible-pylibssh` and `ansible-galaxy collection install cisco.ios`.\n2. Build the inventory above with your lab addresses. Put the password in `group_vars/branch_switches/vault.yml` and encrypt it with `ansible-vault encrypt`.\n3. Run a `gathered` task for `ios_vlans` and print the result. Compare it with `show vlan brief` on the switch.\n4. Run `vlans.yml` with `--check`, then for real, then once more. Confirm the last run shows `changed=0`.\n5. Add a VLAN by hand on the switch, then change the task to `state: overridden` and run it in check mode only. Read which commands Ansible would send to remove your manual VLAN."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Control node",
+          "definition": "The machine that runs Ansible. For network devices, the module code also executes here."
+        },
+        {
+          "term": "Inventory",
+          "definition": "The list of managed devices, their groups and their connection variables."
+        },
+        {
+          "term": "Playbook",
+          "definition": "A YAML file of plays and tasks that describes the desired configuration and the order of work."
+        },
+        {
+          "term": "Collection",
+          "definition": "A versioned package of modules, plugins and roles, such as cisco.ios."
+        },
+        {
+          "term": "network_cli",
+          "definition": "The connection plugin that drives a device's CLI over a persistent SSH session."
+        },
+        {
+          "term": "Resource module",
+          "definition": "A module that models one configuration feature as structured data and supports states such as merged and overridden."
+        },
+        {
+          "term": "Idempotency",
+          "definition": "The property that running the same task again produces no further changes."
+        },
+        {
+          "term": "Ansible Vault",
+          "definition": "Ansible's built-in feature for encrypting variables and files that hold secrets."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Where does the code of the cisco.ios.ios_vlans module run when it configures a switch?",
+          "options": [
+            "On the switch, after Ansible copies it there",
+            "On the control node, which drives the switch over the connection plugin",
+            "Inside a container on the switch's guest shell",
+            "On Catalyst Center"
+          ],
+          "answer": 1,
+          "explanation": "Network devices cannot run Ansible's Python modules, so network modules run on the control node and use network_cli, netconf or httpapi to reach the device."
+        },
+        {
+          "question": "A switch has VLANs 10, 20 and 99. A task lists only VLANs 10 and 30 with state: overridden. What is the result?",
+          "options": [
+            "VLANs 10, 20, 30 and 99 exist",
+            "VLANs 10 and 30 exist; 20 and 99 are removed",
+            "Only VLAN 30 is added",
+            "The task fails because 20 and 99 are not listed"
+          ],
+          "answer": 1,
+          "explanation": "overridden makes the whole feature match the list exactly, so unlisted VLANs are removed and missing ones are created."
+        },
+        {
+          "question": "Which of the following help keep Ansible runs safe in production? (Choose all that apply.)",
+          "options": [
+            "Running the playbook with --check and reviewing the generated commands",
+            "Storing credentials with Ansible Vault or an external secrets manager",
+            "Using ios_command for all configuration changes",
+            "Pinning collection versions in requirements.yml"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Check mode, protected secrets and pinned versions make runs predictable. ios_command is for show commands and cannot report what a change would do."
+        },
+        {
+          "question": "A playbook reports changed=2 on every run, even though nobody touches the devices. What is the most likely cause?",
+          "options": [
+            "The inventory is in YAML instead of INI",
+            "A task is not idempotent, for example an ios_config line that the device stores in a different form",
+            "ansible_become is set to true",
+            "The persistent connection timed out"
+          ],
+          "answer": 1,
+          "explanation": "Repeated changes mean the comparison never matches. Abbreviated or normalized commands in ios_config lines are a classic cause; resource modules avoid most of these problems."
+        },
+        {
+          "question": "Which state values make no change to the device? (Choose all that apply.)",
+          "options": [
+            "gathered",
+            "rendered",
+            "parsed",
+            "merged"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "gathered only reads the device, rendered generates commands offline, and parsed converts saved text into structured data. merged adds or updates configuration."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Ansible is agentless. For network devices, modules run on the **control node** and reach the device through `network_cli`, `netconf` or `httpapi`.\n- The **inventory** and `group_vars` hold devices and connection settings; `ansible_network_os` selects the platform.\n- **Resource modules** turn features into structured data. `merged` adds, `replaced` fixes listed objects, `overridden` enforces the full list, and `gathered`/`rendered`/`parsed` make no change.\n- Always run `--check` first, aim for `changed=0` on reruns, save with `save_when`, and keep secrets in **Vault**.\n- Troubleshoot from transport to privilege to device errors, using `-vvv` and the persistent connection log.\n\nNext, compare this procedural approach with a stateful, declarative one in [Terraform for Network Configuration](/learn/network-automation-devops/terraform-for-network-configuration), and see how to run playbooks from a pipeline in [GitLab CI/CD Pipelines: Build, Validate and Deploy](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)."
+    }
+  ],
+  "ar": {
+    "title": "Ansible لإعداد الشبكات",
+    "summary": "استخدم Ansible لإعداد أجهزة Cisco على نطاق واسع: المخزون، وإضافات الاتصال، ووحدات الموارد وحالاتها، ووضع الفحص، وVault، ومنهجية لتشخيص أدلة التشغيل المتعثّرة.",
+    "objectives": [
+      "شرح كيفية وصول Ansible إلى أجهزة الشبكة عبر إضافات الاتصال network_cli وnetconf وhttpapi",
+      "بناء مخزون بصيغة YAML مع متغيرات المجموعات وبيانات اعتماد محمية بـVault",
+      "اختيار حالة وحدة الموارد المناسبة (merged وreplaced وoverridden وdeleted وgathered وrendered وparsed)",
+      "تشغيل أدلة التشغيل بأمان في وضع الفحص والتحقق من التساوي في النتيجة",
+      "تشخيص المضيفين غير القابلين للوصول وأخطاء الصلاحيات وانتهاء المهلة والمهام التي لا تحقّق التساوي في النتيجة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تملك شركة بيع بالتجزئة 120 فرعًا، في كلٍّ منها مبدّل وصول (Access Switch) أو اثنان من طراز Catalyst. ويتطلّب مشروع جديد للهاتف الشبكي إنشاء الشبكة VLAN 30 باسم `VOICE` على كل مبدّل، وتخصيص شبكة صوتية لكل منفذ مستخدم. لو نُفّذ ذلك يدويًا لاحتاج مئات جلسات SSH، ولن تأتي النتيجة متطابقة تمامًا أبدًا: خطأ مطبعي في فرع، وأمر `name` منسيّ في آخر.\n\nيحوّل **Ansible** هذه المهمة إلى ملف واحد خاضع للمراجعة وأمر واحد. تصف الحالة التي تريدها، فيتصل Ansible بكل مبدّل، ويستنتج ما ينقصه، ولا يغيّر إلا ذلك. والتشغيل الثاني لا يغيّر شيئًا. ويتوقّع منك امتحان CCNP Automation الأساسي (AUTOCOR 350-901) أن تبني أدلة التشغيل (Playbooks) التي تُعدّ أجهزة Cisco وتقرأها وتشخّص أعطالها؛ لذا يركّز هذا الدرس على الطريقة التي يتخاطب بها Ansible فعلًا مع أجهزة الشبكة، وعلى إبقاء عمليات التشغيل آمنة وقابلة للتكرار."
+      },
+      {
+        "id": "how",
+        "type": "text",
+        "markdown": "## كيف يدير Ansible أجهزة الشبكة؟\n\nلا يحتاج Ansible إلى وكيل على الأجهزة (Agentless). تحتفظ *عقدة التحكم (Control Node)*، سواء أكانت حاسوبك المحمول أم مشغّل CI أم خادم أتمتة، بثلاثة أشياء: **مخزون (Inventory)** الأجهزة، و**أدلة التشغيل** التي تسرد المهام، و**المجموعات (Collections)** التي تضم الوحدات (Modules). في حالة الخوادم ينسخ Ansible شيفرة Python إلى الهدف ويشغّلها هناك. أما أنظمة تشغيل الشبكات فلا تستطيع تشغيل هذه الشيفرة، ولذلك تعمل وحدات الشبكة **على عقدة التحكم نفسها** وتقود الجهاز عبر *إضافة اتصال (Connection Plugin)*.\n\n| `ansible_connection` | وسيلة النقل | الأهداف المعتادة |\n|:--|:--|:--|\n| `ansible.netcommon.network_cli` | SSH إلى واجهة الأوامر | IOS XE وNX-OS وIOS XR وASA |\n| `ansible.netcommon.netconf` | NETCONF عبر SSH (المنفذ 830) | IOS XE وIOS XR وJunos |\n| `ansible.netcommon.httpapi` | واجهة برمجية عبر HTTPS | NX-API وFTD/FMC وCheck Point |\n| `local` | الوحدة نفسها تستدعي واجهة REST | Meraki Dashboard وCatalyst Center وACI |\n\nتوفّر Cisco مجموعات معتمدة على Ansible Galaxy وAutomation Hub، منها: `cisco.ios` و`cisco.nxos` و`cisco.iosxr` و`cisco.asa` و`cisco.aci` و`cisco.meraki` و`cisco.dnac` (لـCatalyst Center). ثبّتها بالأمر `ansible-galaxy collection install cisco.ios`، وثبّت إصداراتها في الملف `requirements.yml` حتى يشغّل كل مهندس وكل خط إنتاج (Pipeline) الشيفرة نفسها.\n\nتُبقي الإضافة `network_cli` **اتصالًا دائمًا (Persistent Connection)** مفتوحًا طوال المسرحية (Play)، فلا يسجّل دليلٌ من عشر مهام الدخولَ عشر مرات."
+      },
+      {
+        "id": "run-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "مهمة Ansible واحدة على مبدّل واحد",
+        "caption": "تعمل وحدات الشبكة على عقدة التحكم، فتقارن الحالة المطلوبة بالحالية، ولا ترسل إلا الفرق.",
+        "data": {
+          "actors": [
+            {
+              "id": "eng",
+              "label": "المهندس",
+              "sub": "Git + CI",
+              "icon": "user"
+            },
+            {
+              "id": "ctl",
+              "label": "عقدة التحكم",
+              "sub": "ansible-core + cisco.ios",
+              "icon": "server"
+            },
+            {
+              "id": "sw",
+              "label": "مبدّل الفرع",
+              "sub": "sw-br01 (IOS XE)",
+              "icon": "switch"
+            }
+          ],
+          "steps": [
+            {
+              "from": "eng",
+              "to": "ctl",
+              "label": "ansible-playbook vlans.yml",
+              "detail": "المخزون + دليل التشغيل + الخزنة",
+              "note": "يبدأ التشغيل على عقدة التحكم، ولا يُثبَّت شيء على المبدّل، فـAnsible لا يحتاج إلى وكيل (Agentless)."
+            },
+            {
+              "from": "ctl",
+              "to": "ctl",
+              "label": "حلّ المخزون والمتغيرات",
+              "detail": "group_vars وhost_vars والخزنة",
+              "note": "يدمج Ansible متغيرات المخزون والمجموعات والمضيفين، ويفكّ تشفير الأسرار المحفوظة في الخزنة داخل الذاكرة فقط."
+            },
+            {
+              "from": "ctl",
+              "to": "sw",
+              "label": "SSH (network_cli)",
+              "detail": "اتصال دائم، ووضع enable",
+              "tone": "secure",
+              "note": "تعمل شيفرة الوحدة على عقدة التحكم، وتفتح جلسة SSH دائمة واحدة لكل جهاز."
+            },
+            {
+              "from": "ctl",
+              "to": "sw",
+              "label": "جمع الحالة الحالية",
+              "detail": "show running-config | section ^vlan",
+              "note": "تقرأ وحدة الموارد الجزء المعنيّ من الإعدادات وتحلّله إلى بيانات منظّمة."
+            },
+            {
+              "from": "ctl",
+              "to": "ctl",
+              "label": "مقارنة المطلوب بالحالي",
+              "detail": "state: merged",
+              "note": "لا يتحوّل إلى أوامر إلا الفرق. وإن لم يوجد فرق فلا تُولَّد أي أوامر."
+            },
+            {
+              "from": "ctl",
+              "to": "sw",
+              "label": "vlan 30 / name VOICE",
+              "tone": "warning",
+              "note": "في وضع الفحص (Check Mode) تُتخطّى هذه الخطوة ويُكتفى بالإبلاغ عن الأوامر."
+            },
+            {
+              "from": "sw",
+              "to": "ctl",
+              "label": "عاد المحثّ دون أخطاء",
+              "tone": "success",
+              "note": "تراقب إضافة الاتصال واجهة الأوامر بحثًا عن عبارات الخطأ مثل '% Invalid input'."
+            },
+            {
+              "from": "ctl",
+              "to": "eng",
+              "label": "PLAY RECAP: changed=1",
+              "tone": "success",
+              "note": "يُبلغ التشغيل الثاني عن changed=0. هذا هو التساوي في النتيجة (Idempotency)، وهو ما يجعل التشغيل المجدول آمنًا."
+            }
+          ]
+        }
+      },
+      {
+        "id": "inventory",
+        "type": "text",
+        "markdown": "## المخزون والمتغيرات\n\nيحدّد المخزون *أيّ* الأجهزة موجودة و*كيف* يُوصَل إليها. وتجمع المخزونات بصيغة YAML المضيفين في مجموعات وتربط المتغيرات بها. وفي المشاريع الحقيقية كثيرًا ما يُولَّد المخزون من مصدر للحقيقة (Source of Truth) مثل NetBox عبر إضافة مخزون، وهو ما يتناوله درس [دمج مصدر الحقيقة](/learn/network-automation-devops/source-of-truth-integration).\n\nتخضع المتغيرات لترتيب أولوية. وأكثرها استخدامًا، من الأضعف إلى الأقوى: متغيرات المجموعة (`group_vars/<group>.yml`)، ومتغيرات المضيف (`host_vars/<host>.yml`)، ومتغيرات المسرحية، والمتغيرات الإضافية الممرَّرة بالخيار `-e`. احفظ إعدادات الاتصال في `group_vars`، والبيانات الخاصة بكل موقع (قوائم VLAN وخوادم NTP) في ملفات المضيف أو المجموعة، لا داخل دليل التشغيل.\n\nثلاثة متغيرات لا غنى عنها مع أجهزة Cisco: `ansible_network_os` (لتحديد إضافة المنصة المطلوب تحميلها)، و`ansible_connection`، و`ansible_become` مع `ansible_become_method: enable` حين لا يدخل المستخدم مباشرةً إلى وضع EXEC المميّز."
+      },
+      {
+        "id": "inv-code",
+        "type": "code",
+        "language": "yaml",
+        "filename": "inventory.yml",
+        "caption": "مخزون بصيغة YAML تُضبط فيه متغيرات الاتصال على مستوى المجموعة. تأتي كلمة المرور من متغير في Ansible Vault، ولا تُكتب نصًّا صريحًا أبدًا.",
+        "highlight": [
+          11,
+          12,
+          14
+        ],
+        "code": "# inventory.yml\nall:\n  children:\n    branch_switches:\n      hosts:\n        sw-br01:\n          ansible_host: 10.20.1.11\n        sw-br02:\n          ansible_host: 10.20.2.11\n      vars:\n        ansible_network_os: cisco.ios.ios\n        ansible_connection: ansible.netcommon.network_cli\n        ansible_user: netauto\n        ansible_password: \"{{ vault_netauto_password }}\"   # defined in an encrypted vars file\n        ansible_become: true\n        ansible_become_method: enable"
+      },
+      {
+        "id": "resource",
+        "type": "text",
+        "markdown": "## وحدات الموارد والحالات\n\nكانت أدلة التشغيل القديمة تستخدم `ios_config` مع `lines:` و`parents:` الخام. هذا يعمل، لكنه يقارن نصوصًا، فيفقد بسهولة خاصية التساوي في النتيجة (Idempotency). أما **وحدات الموارد (Resource Modules)**، مثل `ios_vlans` و`ios_interfaces` و`ios_l2_interfaces` و`ios_l3_interfaces` و`ios_bgp_global` و`ios_acls` وغيرها كثير، فتمثّل كلٌّ منها ميزة واحدة في صورة بيانات منظّمة، وتدعم مجموعة مشتركة من قيم `state`:\n\n| `state` | الأثر |\n|:--|:--|\n| `merged` | يضيف ما في القائمة أو يحدّثه، ويترك ما سواه كما هو |\n| `replaced` | يجعل كل كائن مذكور مطابقًا تمامًا، ولا يمسّ الكائنات غير المذكورة |\n| `overridden` | يجعل الميزة كلها مطابقة للقائمة، ويحذف كل ما لم يُذكر |\n| `deleted` | يحذف الكائنات المذكورة (أو الميزة كلها إن كان `config` فارغًا) |\n| `gathered` | يقرأ الجهاز ويعيد بيانات منظّمة دون أي تغيير |\n| `rendered` | يولّد الأوامر دون اتصال، ولا يحتاج إلى جهاز |\n| `parsed` | يحوّل نص `running_config` محفوظًا إلى بيانات منظّمة |\n\nالقيمة `merged` هي الخيار الافتراضي الآمن. أما `overridden` فتمنحك تحكّمًا تصريحيًا (Declarative) حقيقيًا، لكنها على مبدّل الوصول ستحذف أيضًا شبكات VLAN التي أضافها أحدهم خارج Ansible؛ فلا تستخدمها إلا حين يكون دليل التشغيل هو مصدر الحقيقة فعلًا."
+      },
+      {
+        "id": "play-code",
+        "type": "code",
+        "language": "yaml",
+        "filename": "vlans.yml",
+        "caption": "دليل تشغيل يستخدم وحدات الموارد. وتكشف النتيجة المسجَّلة الأوامرَ الدقيقة التي وُلّدت للجهاز.",
+        "highlight": [
+          8,
+          14,
+          15,
+          18,
+          30,
+          34,
+          35
+        ],
+        "code": "---\n- name: Standardize branch VLANs and access ports\n  hosts: branch_switches\n  gather_facts: false\n\n  tasks:\n    - name: Ensure standard VLANs exist\n      cisco.ios.ios_vlans:\n        config:\n          - vlan_id: 10\n            name: USERS\n          - vlan_id: 30\n            name: VOICE\n        state: merged\n      register: vlan_result\n\n    - name: Configure user access ports\n      cisco.ios.ios_l2_interfaces:\n        config:\n          - name: GigabitEthernet1/0/5\n            mode: access\n            access:\n              vlan: 10\n            voice:\n              vlan: 30\n        state: merged\n\n    - name: Show commands that were (or would be) sent\n      ansible.builtin.debug:\n        var: vlan_result.commands\n\n    - name: Save the running configuration if it differs from startup\n      cisco.ios.ios_config:\n        save_when: modified\n      when: not ansible_check_mode"
+      },
+      {
+        "id": "run",
+        "type": "terminal",
+        "title": "وضع الفحص أولًا، ثم التشغيل الفعلي، ثم إعادة التشغيل",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --check --limit sw-br01",
+            "output": "Vault password: \n\nPLAY [Standardize branch VLANs and access ports] *******************************\n\nTASK [Ensure standard VLANs exist] *********************************************\nchanged: [sw-br01]\n\nTASK [Configure user access ports] *********************************************\nchanged: [sw-br01]\n\nTASK [Show commands that were (or would be) sent] ******************************\nok: [sw-br01] => {\n    \"vlan_result.commands\": [\n        \"vlan 30\",\n        \"name VOICE\"\n    ]\n}\n\nTASK [Save the running configuration if it differs from startup] ***************\nskipping: [sw-br01]\n\nPLAY RECAP *********************************************************************\nsw-br01   : ok=3    changed=2    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0"
+          },
+          {
+            "comment": "يتصل وضع الفحص (--check) ويقارن ويُبلغ عن الأوامر دون إرسالها. وتُتخطّى مهمة الحفظ بسبب شرط when الخاص بها، لأن وضع الفحص لا يكتب على الجهاز أبدًا."
+          },
+          {
+            "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --limit sw-br01",
+            "output": "...\nPLAY RECAP *********************************************************************\nsw-br01   : ok=4    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+          },
+          {
+            "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --limit sw-br01",
+            "output": "...\nPLAY RECAP *********************************************************************\nsw-br01   : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+          },
+          {
+            "comment": "يُبلغ التشغيل الفعلي الثاني عن changed=0. فإن ظلّت إعادة التشغيل تُظهر تغييرات، فالمهمة لا تحقّق التساوي في النتيجة: ابحث عن أوامر مختصرة في أسطر ios_config أو عن قيمة يعيد الجهاز صياغتها بشكل مختلف."
+          }
+        ],
+        "caption": "أضِف الخيار --diff لرؤية الحالة قبل التغيير وبعده في الوحدات التي تدعم ذلك."
+      },
+      {
+        "id": "templates",
+        "type": "text",
+        "markdown": "## القوالب والأدوار والأسرار\n\nفي الميزات الأكبر ستولّد الإعدادات غالبًا من قالب **Jinja2** وتدفعها بالصيغة `ios_config: src: ntp.j2`، أو تولّد بيانات منظّمة لوحدة موارد. أبقِ المنطق داخل القوالب بسيطًا: حلقات تمرّ على البيانات وبضعة شروط، أما المنطق المعقّد فمكانه مرشّحات (Filters) مكتوبة بلغة Python.\n\nومع نموّ المشروع قسّمه إلى **أدوار (Roles)**، مثل `roles/access_switch/tasks/main.yml` و`defaults/` و`templates/`. والدور وحدة قابلة لإعادة الاستخدام، يمكنك اختبارها منفردة ومشاركتها بين أدلة التشغيل.\n\nتُحفظ بيانات الاعتماد في **Ansible Vault**. فالأمر `ansible-vault encrypt group_vars/branch_switches/vault.yml` يشفّر ملفًا كاملًا، والأمر `ansible-vault encrypt_string` يشفّر قيمة واحدة. وفي خطوط الإنتاج تأتي كلمة مرور الخزنة من المتغيرات المحمية في نظام CI، لا من المستودع. وتشغّل فرق كثيرة أدلتها أيضًا داخل **بيئة تنفيذ (Execution Environment)**، وهي صورة حاوية تُبنى بالأداة `ansible-builder` وتُشغَّل بالأداة `ansible-navigator`، لتتطابق مكتبات Python وإصدارات المجموعات في كل مكان."
+      },
+      {
+        "id": "troubleshoot",
+        "type": "text",
+        "markdown": "## تشخيص دليل تشغيل متعثّر\n\nحين تفشل مهمة، ابدأ من طبقة النقل وتدرّج صعودًا:\n\n1. **إمكانية الوصول والمصادقة.** تعني `unreachable=1` عادةً مشكلة في SSH أو في مفتاح المضيف أو في بيانات الاعتماد. اختبر بالأمر `ansible sw-br01 -i inventory.yml -m cisco.ios.ios_facts --ask-vault-pass`.\n2. **الصلاحيات.** تعني الرسالة *\"unable to elevate privilege to enable mode\"* أن `ansible_become` غير مضبوط أو أن كلمة سر enable خاطئة.\n3. **انتهاء المهلة.** قد تحتاج الأوامر البطيئة، مثل `copy` أو `write memory` على الإعدادات الكبيرة، إلى قيمة أعلى للمتغير `ansible_command_timeout`.\n4. **أخطاء الجهاز.** إن أعادت واجهة الأوامر `% Invalid input` فالأمر غير موجود على تلك المنصة أو ذلك الإصدار. شغّل بالخيار `-vvv` وفعّل سجل الاتصال الدائم (`log_path` في الملف `ansible.cfg`) لترى التبادل كما هو.\n5. **التساوي في النتيجة.** المهمة التي تُبلغ دائمًا عن `changed` خلل في التصميم لا مسألة شكلية، لأنها تخفي الانحراف (Drift) الحقيقي."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أين يخطئ المهندسون؟",
+        "markdown": "- **تشغيل `overridden` أو `deleted` دون تشغيل مسبق في وضع الفحص.** شغّل `--check` أولًا دائمًا، واقرأ الأوامر المولَّدة.\n- **افتراض أن كل وحدة تدعم وضع الفحص.** لا تستطيع `ios_command` التنبؤ بأثر الأمر؛ احمِ مثل هذه المهام بالشرط `when: not ansible_check_mode`.\n- **كلمات مرور بنص صريح في `group_vars`.** متى أُودعت في Git بقيت في السجل إلى الأبد. استخدم Vault أو مدير أسرار خارجيًا.\n- **نسيان الحفظ.** تصل التغييرات إلى الإعدادات الجارية فقط. استخدم `save_when: modified` (أو معالجًا Handler) حتى لا تضيع النتيجة بعد إعادة تحميل الجهاز."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "نصيحة للامتحان",
+        "markdown": "اعرف الفرق بين `merged` و`replaced` و`overridden`، واعرف أيّ قيمة لـ`ansible_connection` تناسب كل هدف (واجهة الأوامر عبر SSH أو NETCONF أو واجهة HTTP). وللمقارنة الأشمل بين Ansible وTerraform والشيفرة المخصّصة، راجِع درس [اختيار النهج: البنية التحتية كشيفرة أم المنصات منخفضة الشيفرة أم التطبيقات المخصّصة](/learn/network-automation-devops/choosing-an-approach-iac-low-code-or-custom-apps)."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم مختبرًا تملكه: مخطّطًا في Cisco Modeling Labs أو بيئة DevNet Sandbox فيها مبدّل أو مبدّلان بنظام IOS XE. راجِع درس [Cisco Modeling Labs (CML) للاختبار](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing).\n\n1. أنشئ بيئة افتراضية، ثم نفّذ `pip install ansible-core ansible-pylibssh` و`ansible-galaxy collection install cisco.ios`.\n2. ابنِ المخزون السابق بعناوين مختبرك. ضع كلمة المرور في `group_vars/branch_switches/vault.yml` وشفّرها بالأمر `ansible-vault encrypt`.\n3. شغّل مهمة `gathered` للوحدة `ios_vlans` واطبع النتيجة، ثم قارنها بمخرجات `show vlan brief` على المبدّل.\n4. شغّل `vlans.yml` بالخيار `--check`، ثم تشغيلًا فعليًا، ثم مرة أخرى. تأكّد أن التشغيل الأخير يُظهر `changed=0`.\n5. أضِف شبكة VLAN يدويًا على المبدّل، ثم غيّر المهمة إلى `state: overridden` وشغّلها في وضع الفحص فقط. اقرأ الأوامر التي سيرسلها Ansible لحذف الشبكة التي أضفتها يدويًا."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "عقدة التحكم (Control Node)",
+            "definition": "الجهاز الذي يشغّل Ansible. ومع أجهزة الشبكة تُنفَّذ شيفرة الوحدات عليه أيضًا."
+          },
+          {
+            "term": "المخزون (Inventory)",
+            "definition": "قائمة الأجهزة المُدارة ومجموعاتها ومتغيرات الاتصال بها."
+          },
+          {
+            "term": "دليل التشغيل (Playbook)",
+            "definition": "ملف YAML يضم مسرحيات ومهام تصف الإعدادات المطلوبة وترتيب العمل."
+          },
+          {
+            "term": "المجموعة (Collection)",
+            "definition": "حزمة ذات إصدار تضم وحدات وإضافات وأدوارًا، مثل cisco.ios."
+          },
+          {
+            "term": "network_cli",
+            "definition": "إضافة الاتصال التي تقود واجهة أوامر الجهاز عبر جلسة SSH دائمة."
+          },
+          {
+            "term": "وحدة الموارد (Resource Module)",
+            "definition": "وحدة تمثّل ميزة إعداد واحدة في صورة بيانات منظّمة، وتدعم حالات مثل merged وoverridden."
+          },
+          {
+            "term": "التساوي في النتيجة (Idempotency)",
+            "definition": "خاصية ألّا يُحدث تشغيل المهمة نفسها مرة أخرى أي تغيير إضافي."
+          },
+          {
+            "term": "Ansible Vault",
+            "definition": "ميزة مدمجة في Ansible لتشفير المتغيرات والملفات التي تحتوي على أسرار."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أين تعمل شيفرة الوحدة cisco.ios.ios_vlans حين تُعدّ مبدّلًا؟",
+            "options": [
+              "على المبدّل، بعد أن ينسخها Ansible إليه",
+              "على عقدة التحكم، التي تقود المبدّل عبر إضافة الاتصال",
+              "داخل حاوية في الصدفة الضيفة (Guest Shell) على المبدّل",
+              "على Catalyst Center"
+            ],
+            "answer": 1,
+            "explanation": "لا تستطيع أجهزة الشبكة تشغيل وحدات Python الخاصة بـAnsible، لذا تعمل وحدات الشبكة على عقدة التحكم وتصل إلى الجهاز عبر network_cli أو netconf أو httpapi."
+          },
+          {
+            "question": "على مبدّلٍ شبكات VLAN رقم 10 و20 و99. ومهمةٌ لا تذكر إلا الشبكتين 10 و30 مع state: overridden. ما النتيجة؟",
+            "options": [
+              "توجد الشبكات 10 و20 و30 و99",
+              "توجد الشبكتان 10 و30، وتُحذف 20 و99",
+              "تُضاف الشبكة 30 فقط",
+              "تفشل المهمة لأن 20 و99 غير مذكورتين"
+            ],
+            "answer": 1,
+            "explanation": "تجعل overridden الميزةَ كلها مطابقة للقائمة تمامًا، فتُحذف الشبكات غير المذكورة وتُنشأ الناقصة."
+          },
+          {
+            "question": "أيٌّ مما يلي يساعد على إبقاء تشغيل Ansible آمنًا في بيئة الإنتاج؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تشغيل دليل التشغيل بالخيار --check ومراجعة الأوامر المولَّدة",
+              "حفظ بيانات الاعتماد في Ansible Vault أو في مدير أسرار خارجي",
+              "استخدام ios_command لكل تغييرات الإعداد",
+              "تثبيت إصدارات المجموعات في requirements.yml"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "وضع الفحص والأسرار المحمية والإصدارات المثبّتة تجعل التشغيل متوقَّعًا. أما ios_command فمخصّصة لأوامر show، ولا تستطيع الإبلاغ عن أثر التغيير."
+          },
+          {
+            "question": "يُبلغ دليل تشغيل عن changed=2 في كل تشغيل، مع أن أحدًا لا يلمس الأجهزة. ما السبب الأرجح؟",
+            "options": [
+              "المخزون بصيغة YAML لا INI",
+              "مهمة لا تحقّق التساوي في النتيجة، كسطر في ios_config يخزّنه الجهاز بصيغة مختلفة",
+              "ضبط ansible_become على true",
+              "انتهاء مهلة الاتصال الدائم"
+            ],
+            "answer": 1,
+            "explanation": "تكرار التغييرات يعني أن المقارنة لا تتطابق أبدًا. والأوامر المختصرة أو التي يعيد الجهاز صياغتها في أسطر ios_config سبب تقليدي لذلك، ووحدات الموارد تتجنّب معظم هذه المشكلات."
+          },
+          {
+            "question": "أيّ قيم state لا تُحدث أي تغيير على الجهاز؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "gathered",
+              "rendered",
+              "parsed",
+              "merged"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "gathered تقرأ الجهاز فقط، وrendered تولّد الأوامر دون اتصال، وparsed تحوّل نصًّا محفوظًا إلى بيانات منظّمة. أما merged فتضيف الإعدادات أو تحدّثها."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- لا يحتاج Ansible إلى وكيل. ومع أجهزة الشبكة تعمل الوحدات على **عقدة التحكم** وتصل إلى الجهاز عبر `network_cli` أو `netconf` أو `httpapi`.\n- يحفظ **المخزون** و`group_vars` الأجهزةَ وإعدادات الاتصال، ويحدّد `ansible_network_os` المنصة.\n- تحوّل **وحدات الموارد** الميزاتِ إلى بيانات منظّمة: `merged` تضيف، و`replaced` تصحّح الكائنات المذكورة، و`overridden` تفرض القائمة كاملة، و`gathered` و`rendered` و`parsed` لا تغيّر شيئًا.\n- شغّل `--check` أولًا دائمًا، واستهدف `changed=0` عند إعادة التشغيل، واحفظ بالخيار `save_when`، واحفظ الأسرار في **Vault**.\n- شخّص الأعطال من طبقة النقل إلى الصلاحيات إلى أخطاء الجهاز، مستعينًا بالخيار `-vvv` وبسجل الاتصال الدائم.\n\nبعد ذلك، قارِن هذا النهج الإجرائي بنهج تصريحي قائم على الحالة في درس [Terraform لإعداد الشبكات](/learn/network-automation-devops/terraform-for-network-configuration)، وتعرّف كيف تشغّل أدلة التشغيل من خط إنتاج في درس [خطوط GitLab CI/CD: البناء والتحقق والنشر](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)."
+      }
+    ]
+  }
+}

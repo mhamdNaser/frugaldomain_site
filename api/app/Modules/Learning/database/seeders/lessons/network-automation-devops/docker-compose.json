@@ -1,0 +1,622 @@
+{
+ "slug": "docker-compose",
+ "title": "Docker Compose",
+ "summary": "Define, run and troubleshoot multi-container automation applications with Docker Compose, and use it to provide repeatable dependencies for integration tests in CI/CD.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain projects, services and containers in Docker Compose",
+  "Write a compose.yaml with builds, networks, volumes, secrets and health checks",
+  "Use service discovery and internal networks to connect and isolate services",
+  "Distinguish variable interpolation from container environment settings",
+  "Run, inspect and clean up a Compose stack in a CI/CD job"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "Your team's change-automation service has grown. There is an API that receives change requests, a worker that renders configurations and pushes them over RESTCONF, and a Redis queue between them. Starting it means three `docker run` commands with a dozen flags each, in the right order, on the right network. A new colleague gets one flag wrong and spends an afternoon debugging.\n\n**Docker Compose** replaces those commands with one declarative file. You describe the services, networks, volumes and secrets, and `docker compose up` creates them consistently on any machine, including a CI runner. This lesson builds on what you already know about images and Dockerfiles and shows how to write, run and troubleshoot a multi-container application."
+  },
+  {
+   "id": "why",
+   "type": "text",
+   "markdown": "## From docker run to a Compose project\n\nCompose reads a YAML file, by convention `compose.yaml`, and manages everything in it as one **project**. The project name (from the `name:` key or the folder name) prefixes every resource, so `netops-change-api-redis-1` is the first container of the `redis` service.\n\nThree terms matter:\n\n- A **service** is a definition: an image or build, a command, its settings. It can run as one or many containers.\n- A **container** is a running instance of a service.\n- A **project** is the set of services, networks and volumes from one Compose file.\n\nModern Docker ships Compose as a CLI plugin, so the command is `docker compose` (with a space). The older standalone `docker-compose` binary is retired. The file follows the **Compose Specification**; the top-level `version:` key is obsolete and is ignored."
+  },
+  {
+   "id": "anatomy",
+   "type": "text",
+   "markdown": "## Anatomy of a Compose file\n\n| Top-level key | Purpose |\n|:--|:--|\n| `services` | The containers to run and how to build or pull them |\n| `networks` | User-defined networks; services join them by name |\n| `volumes` | Named volumes for data that must outlive containers |\n| `secrets` | Sensitive values mounted as files inside containers |\n| `configs` | Non-sensitive configuration files mounted into containers |\n\nThe most used service keys are `image` and `build`, `command`, `ports`, `environment` and `env_file`, `volumes`, `networks`, `depends_on`, `healthcheck`, `restart` and `profiles`. When a service has both `build` and `image`, Compose builds the image and tags it with that name, which is how the same file serves development and a registry push."
+  },
+  {
+   "id": "compose",
+   "type": "code",
+   "language": "yaml",
+   "filename": "compose.yaml",
+   "code": "name: netops-change-api\n\nservices:\n  api:\n    build: .\n    image: registry.example.com/netops/change-api:${APP_VERSION:-dev}\n    ports:\n      - \"127.0.0.1:8080:8080\"          # publish on the host loopback only\n    environment:\n      REDIS_URL: redis://redis:6379/0   # \"redis\" resolves through Compose DNS\n      LOG_LEVEL: ${LOG_LEVEL:-info}     # interpolated from the shell or .env\n    env_file: app.env                   # non-secret settings\n    secrets: [restconf_password]        # mounted at /run/secrets/restconf_password\n    depends_on:\n      redis:\n        condition: service_healthy      # wait for health, not just start\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request as u; u.urlopen('http://localhost:8080/health')\"]\n      interval: 10s\n      timeout: 3s\n      retries: 5\n    networks: [app, data]\n    restart: unless-stopped\n\n  worker:\n    build: .\n    command: [\"python\", \"-m\", \"app.worker\"]   # same code, different process\n    environment:\n      REDIS_URL: redis://redis:6379/0\n    secrets: [restconf_password]\n    depends_on:\n      redis:\n        condition: service_healthy\n    networks: [app, data]\n    restart: unless-stopped\n\n  redis:\n    image: redis:7.4-alpine\n    command: [\"redis-server\", \"--appendonly\", \"yes\"]\n    volumes:\n      - redis-data:/data                # named volume survives restarts\n    healthcheck:\n      test: [\"CMD\", \"redis-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 5\n    networks: [data]                    # not reachable from the app network\n\n  tests:\n    build: .\n    command: [\"python\", \"-m\", \"pytest\", \"-q\", \"tests/integration\"]\n    profiles: [test]                    # started only with --profile test\n    depends_on:\n      api:\n        condition: service_healthy\n    networks: [app]\n\nnetworks:\n  app: {}\n  data:\n    internal: true                      # no external connectivity\n\nvolumes:\n  redis-data: {}\n\nsecrets:\n  restconf_password:\n    file: ./secrets/restconf_password.txt   # git-ignored file, placeholder in the repo\n",
+   "caption": "A change-automation stack: API, worker, Redis queue and an optional integration-test service.",
+   "highlight": [
+    10,
+    13,
+    16,
+    61
+   ]
+  },
+  {
+   "id": "net",
+   "type": "text",
+   "markdown": "## Networking and service discovery\n\nWithout any `networks` key, Compose creates one network called `<project>_default` and attaches every service. Each service is reachable by its **service name** through Docker's embedded DNS, which is why the API connects to `redis://redis:6379` instead of an IP address that changes on every restart.\n\nThe example defines two networks. `data` is `internal: true`, so Redis has no route outside the host, and only services attached to `data` can reach it. The API and worker sit on both networks; the worker needs `app` because that is the network with outbound access to devices such as 192.0.2.11.\n\n`ports` **publishes** a container port on the host (`127.0.0.1:8080:8080` exposes it on the loopback only). Containers on the same network do not need published ports to talk to each other. Publishing Redis would only widen the attack surface."
+  },
+  {
+   "id": "up-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "What docker compose up does",
+   "caption": "Compose turns one file into networks, volumes and containers in dependency order.",
+   "data": {
+    "token": "compose up",
+    "nodes": [
+     {
+      "id": "file",
+      "label": "compose.yaml",
+      "sub": "plus .env",
+      "icon": "file"
+     },
+     {
+      "id": "eng",
+      "label": "Docker Engine",
+      "sub": "networks, volumes",
+      "icon": "cpu"
+     },
+     {
+      "id": "redis",
+      "label": "redis",
+      "sub": "healthcheck",
+      "icon": "database"
+     },
+     {
+      "id": "api",
+      "label": "api",
+      "sub": "depends_on redis",
+      "icon": "server"
+     },
+     {
+      "id": "worker",
+      "label": "worker",
+      "sub": "depends_on redis",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "at": "file",
+      "caption": "Compose reads compose.yaml, interpolates ${...} variables from the shell and .env, and validates the model."
+     },
+     {
+      "at": "eng",
+      "token": "Networks",
+      "caption": "The engine creates the project networks app and data and the named volume redis-data."
+     },
+     {
+      "at": "eng",
+      "token": "Images",
+      "caption": "Images are pulled (redis) or built from the Dockerfile (api, worker)."
+     },
+     {
+      "at": "redis",
+      "caption": "redis starts first, because api and worker depend on it."
+     },
+     {
+      "at": "redis",
+      "token": "Healthy",
+      "caption": "redis-cli ping succeeds, so redis is reported healthy and its dependents may start.",
+      "tone": "success"
+     },
+     {
+      "at": "api",
+      "caption": "api starts with REDIS_URL pointing at the service name redis and its secret mounted under /run/secrets."
+     },
+     {
+      "at": "worker",
+      "caption": "worker starts on the same networks. The whole stack is up from one command.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "config",
+   "type": "text",
+   "markdown": "## Configuration, secrets and start order\n\n### Variables\n\nCompose uses variables in two different ways, and confusing them is a common mistake.\n\n- **Interpolation**: `${LOG_LEVEL:-info}` in the file is replaced *before* anything runs, using the shell environment and a `.env` file next to `compose.yaml`. The `:-` syntax supplies a default.\n- **Container environment**: `environment:` and `env_file:` set variables *inside* the container. If the same variable is set in both, the value in `environment:` wins.\n\nRun `docker compose config` to see the fully resolved model. It is the fastest way to check what Compose will actually do.\n\n### Secrets\n\nEnvironment variables leak easily into logs, `docker inspect` output and crash reports. A **secret** is mounted as a read-only file under `/run/secrets/<name>`, and your code reads it from there. Keep the source file out of Git and never copy secrets into the image. For production-grade secret handling, see [Secure Coding: Input Validation and Secret Management](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n\n### Start order and health\n\nPlain `depends_on: [redis]` only controls **start order**: Redis's container has started, not that Redis accepts connections. Combine `depends_on` with `condition: service_healthy` and a `healthcheck` to wait for real readiness. Add `restart: unless-stopped` so a crashed worker comes back by itself."
+  },
+  {
+   "id": "cli",
+   "type": "terminal",
+   "title": "Running and inspecting the stack",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "docker compose config --quiet && echo valid",
+     "output": "valid"
+    },
+    {
+     "comment": "Validate and resolve the file first; add no flags to see the full resolved YAML."
+    },
+    {
+     "cmd": "docker compose up -d --build --wait",
+     "output": "[+] Building 14.2s (12/12) FINISHED\n...\n[+] Running 7/7\n ✔ Network netops-change-api_app           Created\n ✔ Network netops-change-api_data          Created\n ✔ Volume \"netops-change-api_redis-data\"   Created\n ✔ Container netops-change-api-redis-1     Healthy\n ✔ Container netops-change-api-worker-1    Started\n ✔ Container netops-change-api-api-1       Healthy"
+    },
+    {
+     "comment": "--wait returns only when services are running and those with health checks are healthy, which is ideal for scripts and CI."
+    },
+    {
+     "cmd": "docker compose ps",
+     "output": "NAME                         IMAGE                                        SERVICE   STATUS                    PORTS\nnetops-change-api-api-1      registry.example.com/netops/change-api:dev   api       Up 41 seconds (healthy)   127.0.0.1:8080->8080/tcp\nnetops-change-api-redis-1    redis:7.4-alpine                             redis     Up 52 seconds (healthy)   6379/tcp\nnetops-change-api-worker-1   netops-change-api-worker                     worker    Up 40 seconds"
+    },
+    {
+     "cmd": "docker compose exec api ls /run/secrets",
+     "output": "restconf_password"
+    },
+    {
+     "cmd": "docker compose logs --tail 3 worker",
+     "output": "worker-1  | INFO  connected to redis://redis:6379/0\nworker-1  | INFO  waiting for jobs on queue 'changes'\nworker-1  | INFO  job 4711: render OSPF config for R1 (192.0.2.11)"
+    },
+    {
+     "comment": "Logs from every container of a service are prefixed with the container name."
+    },
+    {
+     "cmd": "docker compose --profile test run --rm tests",
+     "output": "....\n4 passed in 2.87s"
+    },
+    {
+     "cmd": "docker compose down -v",
+     "output": "[+] Running 6/6\n ✔ Container netops-change-api-api-1       Removed\n ✔ Container netops-change-api-worker-1    Removed\n ✔ Container netops-change-api-redis-1     Removed\n ✔ Volume netops-change-api_redis-data     Removed\n ✔ Network netops-change-api_data          Removed\n ✔ Network netops-change-api_app           Removed"
+    },
+    {
+     "comment": "down removes containers and networks; -v also removes named volumes, which is what you want for a clean test run."
+    }
+   ],
+   "caption": "Output trimmed. All commands run from the folder that contains compose.yaml."
+  },
+  {
+   "id": "ci",
+   "type": "text",
+   "markdown": "## Compose in testing and CI/CD\n\nCompose is a convenient way to give integration tests the **dependencies** they need: a queue, a database, a mock API or a telemetry collector.\n\n- **Override files.** Compose automatically merges `compose.override.yaml` for local development. In CI, combine files explicitly: `docker compose -f compose.yaml -f compose.ci.yaml up -d --wait`.\n- **Profiles.** Services such as `tests` start only when their profile is enabled, so `docker compose up` stays lean.\n- **One-off runs.** `docker compose run --rm tests` runs the test container and returns its exit code to the job. Alternatively, `docker compose up --exit-code-from tests` stops the stack and returns that service's exit code.\n- **Cleanup.** Run `docker compose down -v` in `after_script` so leftover volumes never leak state into the next job.\n\nIf an integration job fails, apply the triage method from [Diagnosing CI/CD Pipeline Failures](/learn/network-automation-devops/diagnosing-ci-cd-pipeline-failures): `docker compose ps` shows which service is unhealthy, and `docker compose logs <service>` usually shows why.\n\nCompose runs on **one host**. When you need scheduling across many hosts, rolling updates and self-healing at scale, the same images move to Kubernetes."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Where learners go wrong",
+   "markdown": "- **Using `localhost` between containers.** Inside a container, `localhost` is that container. Use the service name.\n- **Expecting `depends_on` to wait for readiness.** Without a health condition it only orders container starts.\n- **Publishing every port.** Only publish what must be reached from outside the host, and bind to `127.0.0.1` when possible.\n- **Forgetting `-v` in CI.** `docker compose down` keeps named volumes, so stale data can make the next test run pass or fail for the wrong reason.\n- **Putting secrets in `environment:`.** Use `secrets:` and read the file."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On your own machine with Docker installed:\n\n1. Create a `compose.yaml` with a `redis:7.4-alpine` service that has a `redis-cli ping` health check and a named volume.\n2. Add a small Python service that connects to `redis://redis:6379/0`, increments a counter and prints it.\n3. Run `docker compose config`, then `docker compose up -d --build --wait`, then `docker compose ps` and `docker compose logs`.\n4. Change the Redis host to `localhost` and observe the connection error, then change it back.\n5. Run `docker compose down`, start the stack again and confirm the counter survived; then run `docker compose down -v` and confirm it reset."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Docker Compose",
+     "definition": "A tool that defines and runs multi-container applications from a declarative YAML file."
+    },
+    {
+     "term": "Project",
+     "definition": "The set of services, networks and volumes managed together from one Compose file, named by name: or the folder."
+    },
+    {
+     "term": "Service",
+     "definition": "A Compose definition of how to run one component; it can run as one or more containers."
+    },
+    {
+     "term": "Service discovery",
+     "definition": "Resolution of service names to container addresses through Docker's embedded DNS."
+    },
+    {
+     "term": "Named volume",
+     "definition": "Docker-managed storage that persists after containers are removed, until it is deleted explicitly."
+    },
+    {
+     "term": "Health check",
+     "definition": "A command Docker runs periodically to decide whether a container is healthy."
+    },
+    {
+     "term": "Compose secret",
+     "definition": "A sensitive value mounted as a read-only file under /run/secrets inside the container."
+    },
+    {
+     "term": "Profile",
+     "definition": "A label that keeps optional services, such as test runners, from starting unless the profile is enabled."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "In the example, how does the worker container reach Redis?",
+     "options": [
+      "Through localhost:6379",
+      "Through the published host port",
+      "Through the service name redis, resolved by Docker's embedded DNS",
+      "Through a static IP address in the Compose file"
+     ],
+     "answer": 2,
+     "explanation": "Containers on a shared network resolve each other by service name, so redis://redis:6379 works on any host."
+    },
+    {
+     "question": "Which settings make the api service wait until Redis actually accepts connections? (Choose all that apply.)",
+     "options": [
+      "A healthcheck on the redis service",
+      "depends_on with condition: service_healthy",
+      "restart: unless-stopped",
+      "Publishing port 6379"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "The health check defines readiness, and the service_healthy condition makes the dependent wait for it. Restart policies and published ports do not affect start order."
+    },
+    {
+     "question": "A CI job must start the stack and continue only when services are healthy. Which command fits best?",
+     "options": [
+      "docker compose up",
+      "docker compose up -d --wait",
+      "docker compose start",
+      "docker compose create"
+     ],
+     "answer": 1,
+     "explanation": "--wait returns after services are running and healthy, so the next script line can rely on them."
+    },
+    {
+     "question": "Which statements about Compose variables are true? (Choose all that apply.)",
+     "options": [
+      "${VAR:-default} is interpolated before containers are created",
+      "A .env file next to compose.yaml can supply interpolation values",
+      "env_file always overrides environment:",
+      "docker compose config shows the resolved configuration"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Interpolation happens first and can read .env, and config prints the resolved model. When both are set, environment: takes precedence over env_file."
+    },
+    {
+     "question": "Why use docker compose down -v at the end of an integration test job?",
+     "options": [
+      "It deletes the Docker images",
+      "It also removes named volumes so the next run starts from clean state",
+      "It pushes images to the registry",
+      "It is required to free published ports"
+     ],
+     "answer": 1,
+     "explanation": "Without -v, named volumes keep data between runs, which can make tests depend on earlier runs."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Compose describes a multi-container application in one `compose.yaml` and manages it as a **project** with `docker compose`.\n- Services find each other by **name** on shared networks; publish ports only when the host must reach them, and use internal networks to isolate data stores.\n- Interpolation (`${VAR}`, `.env`) is different from container environment (`environment`, `env_file`); `docker compose config` shows the result.\n- Mount **secrets** as files, and combine `healthcheck` with `depends_on: condition: service_healthy` for real readiness.\n- In CI, use override files, profiles, `--wait`, `run --rm` and `down -v` for repeatable integration tests.\n\nNext, prove that a network change did exactly what was intended in [Change Validation with pyATS](/learn/network-automation-devops/change-validation-with-pyats)."
+  }
+ ],
+ "ar": {
+  "title": "Docker Compose",
+  "summary": "عرِّف تطبيقات الأتمتة متعددة الحاويات وشغّلها وشخّص أعطالها باستخدام Docker Compose، واستخدمه لتوفير تبعيات قابلة للتكرار لاختبارات التكامل في CI/CD.",
+  "objectives": [
+   "شرح المشاريع والخدمات والحاويات في Docker Compose",
+   "كتابة ملف compose.yaml يتضمن البناء والشبكات ووحدات التخزين والأسرار وفحوص السلامة",
+   "استخدام اكتشاف الخدمات والشبكات الداخلية لربط الخدمات وعزلها",
+   "التمييز بين استبدال المتغيرات وإعدادات بيئة الحاوية",
+   "تشغيل منظومة Compose وفحصها وتنظيفها داخل مهمة CI/CD"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "كبرت خدمة أتمتة التغييرات لدى فريقك؛ فهناك واجهة برمجية تستقبل طلبات التغيير، وعامل (Worker) يولّد الإعدادات ويدفعها عبر RESTCONF، وطابور Redis بينهما. وتشغيلها يعني ثلاثة أوامر `docker run` بعشرات الخيارات، بالترتيب الصحيح وعلى الشبكة الصحيحة. يكفي أن يخطئ زميل جديد في خيار واحد ليقضي ظهيرته في تتبّع الخلل.\n\nيستبدل **Docker Compose** بهذه الأوامر ملفًا تصريحيًا واحدًا. تصف فيه الخدمات والشبكات ووحدات التخزين (Volumes) والأسرار، فينشئها `docker compose up` على نحو متّسق على أي جهاز، بما في ذلك مشغّل CI. يبني هذا الدرس على مفاهيم Docker والصور وملفات Dockerfile، ويوضّح كيف تكتب تطبيقًا متعدد الحاويات وتشغّله وتشخّص أعطاله."
+   },
+   {
+    "id": "why",
+    "type": "text",
+    "markdown": "## من docker run إلى مشروع Compose\n\nيقرأ Compose ملف YAML، يُسمّى اصطلاحًا `compose.yaml`، ويدير كل ما فيه بوصفه **مشروعًا (Project)** واحدًا. ويُستخدم اسم المشروع (من المفتاح `name:` أو من اسم المجلد) بادئةً لكل مورد، فالحاوية `netops-change-api-redis-1` هي الحاوية الأولى للخدمة `redis`.\n\nثلاثة مصطلحات مهمة:\n\n- **الخدمة (Service)** تعريفٌ: صورة أو تعليمات بناء، وأمر، وإعدادات. ويمكن أن تعمل في حاوية واحدة أو أكثر.\n- **الحاوية (Container)** نسخة عاملة من الخدمة.\n- **المشروع** مجموعة الخدمات والشبكات ووحدات التخزين المعرَّفة في ملف Compose واحد.\n\nيأتي Compose في إصدارات Docker الحديثة إضافةً لسطر الأوامر، فالأمر هو `docker compose` (بمسافة). أمّا الأداة المستقلة القديمة `docker-compose` فقد أُوقف العمل بها. ويتبع الملف **مواصفة Compose ‏(Compose Specification)**، والمفتاح العلوي `version:` متقادم ويُتجاهَل."
+   },
+   {
+    "id": "anatomy",
+    "type": "text",
+    "markdown": "## بنية ملف Compose\n\n| المفتاح العلوي | الغرض |\n|:--|:--|\n| `services` | الحاويات المطلوب تشغيلها وطريقة بنائها أو سحبها |\n| `networks` | شبكات معرَّفة من المستخدم تنضم إليها الخدمات بالاسم |\n| `volumes` | وحدات تخزين مسمّاة لبيانات يجب أن تبقى بعد زوال الحاويات |\n| `secrets` | قيم حساسة تُركَّب ملفاتٍ داخل الحاويات |\n| `configs` | ملفات إعدادات غير حساسة تُركَّب داخل الحاويات |\n\nأكثر مفاتيح الخدمة استخدامًا: `image` و`build`، و`command`، و`ports`، و`environment` و`env_file`، و`volumes`، و`networks`، و`depends_on`، و`healthcheck`، و`restart`، و`profiles`. وحين تحمل الخدمة `build` و`image` معًا، يبني Compose الصورة ويسمها بذلك الاسم، وبهذا يخدم الملف نفسه بيئة التطوير والدفع إلى السجل (Registry)."
+   },
+   {
+    "id": "compose",
+    "type": "code",
+    "language": "yaml",
+    "filename": "compose.yaml",
+    "code": "name: netops-change-api\n\nservices:\n  api:\n    build: .\n    image: registry.example.com/netops/change-api:${APP_VERSION:-dev}\n    ports:\n      - \"127.0.0.1:8080:8080\"          # publish on the host loopback only\n    environment:\n      REDIS_URL: redis://redis:6379/0   # \"redis\" resolves through Compose DNS\n      LOG_LEVEL: ${LOG_LEVEL:-info}     # interpolated from the shell or .env\n    env_file: app.env                   # non-secret settings\n    secrets: [restconf_password]        # mounted at /run/secrets/restconf_password\n    depends_on:\n      redis:\n        condition: service_healthy      # wait for health, not just start\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request as u; u.urlopen('http://localhost:8080/health')\"]\n      interval: 10s\n      timeout: 3s\n      retries: 5\n    networks: [app, data]\n    restart: unless-stopped\n\n  worker:\n    build: .\n    command: [\"python\", \"-m\", \"app.worker\"]   # same code, different process\n    environment:\n      REDIS_URL: redis://redis:6379/0\n    secrets: [restconf_password]\n    depends_on:\n      redis:\n        condition: service_healthy\n    networks: [app, data]\n    restart: unless-stopped\n\n  redis:\n    image: redis:7.4-alpine\n    command: [\"redis-server\", \"--appendonly\", \"yes\"]\n    volumes:\n      - redis-data:/data                # named volume survives restarts\n    healthcheck:\n      test: [\"CMD\", \"redis-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 5\n    networks: [data]                    # not reachable from the app network\n\n  tests:\n    build: .\n    command: [\"python\", \"-m\", \"pytest\", \"-q\", \"tests/integration\"]\n    profiles: [test]                    # started only with --profile test\n    depends_on:\n      api:\n        condition: service_healthy\n    networks: [app]\n\nnetworks:\n  app: {}\n  data:\n    internal: true                      # no external connectivity\n\nvolumes:\n  redis-data: {}\n\nsecrets:\n  restconf_password:\n    file: ./secrets/restconf_password.txt   # git-ignored file, placeholder in the repo\n",
+    "caption": "منظومة لأتمتة التغييرات: واجهة برمجية، وعامل، وطابور Redis، وخدمة اختبارات تكامل اختيارية.",
+    "highlight": [
+     10,
+     13,
+     16,
+     61
+    ]
+   },
+   {
+    "id": "net",
+    "type": "text",
+    "markdown": "## الشبكات واكتشاف الخدمات\n\nفي غياب المفتاح `networks`، ينشئ Compose شبكة واحدة باسم `<project>_default` ويضم إليها كل الخدمات. ويمكن الوصول إلى كل خدمة عبر **اسمها** من خلال خادم DNS المدمج في Docker، ولهذا تتصل الواجهة البرمجية بالعنوان `redis://redis:6379` بدلًا من عنوان IP يتغيّر مع كل إعادة تشغيل.\n\nيعرّف المثال شبكتين: الشبكة `data` موسومة بـ `internal: true`، فلا مسار لـ Redis إلى خارج المضيف، ولا تصل إليه إلا الخدمات المتصلة بـ `data`. أمّا الواجهة البرمجية والعامل فعلى الشبكتين معًا؛ إذ يحتاج العامل إلى `app` لأنها الشبكة التي تملك وصولًا صادرًا إلى الأجهزة مثل 192.0.2.11.\n\nيقوم المفتاح `ports` بـ **نشر (Publish)** منفذ الحاوية على المضيف (فالقيمة `127.0.0.1:8080:8080` تكشفه على واجهة الاسترجاع فقط). ولا تحتاج الحاويات على الشبكة نفسها إلى منافذ منشورة كي تتخاطب، ونشرُ منفذ Redis لن يفعل سوى توسيع سطح الهجوم."
+   },
+   {
+    "id": "up-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "ماذا يفعل docker compose up",
+    "caption": "يحوّل Compose ملفًا واحدًا إلى شبكات ووحدات تخزين وحاويات بحسب ترتيب الاعتماد.",
+    "data": {
+     "token": "compose up",
+     "nodes": [
+      {
+       "id": "file",
+       "label": "compose.yaml",
+       "sub": "مع ملف .env",
+       "icon": "file"
+      },
+      {
+       "id": "eng",
+       "label": "Docker Engine",
+       "sub": "شبكات، وحدات تخزين",
+       "icon": "cpu"
+      },
+      {
+       "id": "redis",
+       "label": "redis",
+       "sub": "فحص السلامة",
+       "icon": "database"
+      },
+      {
+       "id": "api",
+       "label": "api",
+       "sub": "تعتمد على redis",
+       "icon": "server"
+      },
+      {
+       "id": "worker",
+       "label": "worker",
+       "sub": "يعتمد على redis",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "at": "file",
+       "caption": "يقرأ Compose الملف compose.yaml، ويستبدل متغيرات ${...} من الصدفة ومن ملف .env، ويتحقق من صحة النموذج."
+      },
+      {
+       "at": "eng",
+       "token": "الشبكات",
+       "caption": "ينشئ المحرّك شبكتَي المشروع app وdata ووحدة التخزين المسمّاة redis-data."
+      },
+      {
+       "at": "eng",
+       "token": "الصور",
+       "caption": "تُسحب الصور (redis) أو تُبنى من ملف Dockerfile ‏(api، worker)."
+      },
+      {
+       "at": "redis",
+       "caption": "تبدأ redis أولًا لأنّ api وworker يعتمدان عليها."
+      },
+      {
+       "at": "redis",
+       "token": "سليم",
+       "caption": "ينجح الأمر redis-cli ping فتُعلَن redis سليمة (healthy)، ويُسمح بتشغيل الخدمات المعتمدة عليها.",
+       "tone": "success"
+      },
+      {
+       "at": "api",
+       "caption": "تبدأ api والمتغير REDIS_URL يشير إلى اسم الخدمة redis، وسرّها مركَّب تحت /run/secrets."
+      },
+      {
+       "at": "worker",
+       "caption": "يبدأ worker على الشبكات نفسها، فتعمل المنظومة كلها بأمر واحد.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "config",
+    "type": "text",
+    "markdown": "## الإعدادات والأسرار وترتيب البدء\n\n### المتغيرات\n\nيستخدم Compose المتغيرات بطريقتين مختلفتين، والخلط بينهما خطأ شائع.\n\n- **الاستبدال (Interpolation)**: يُستبدل `${LOG_LEVEL:-info}` في الملف *قبل* تشغيل أي شيء، اعتمادًا على بيئة الصدفة وعلى ملف `.env` المجاور لـ `compose.yaml`. وتوفّر الصيغة `:-` قيمة افتراضية.\n- **بيئة الحاوية**: يضبط `environment:` و`env_file:` المتغيرات *داخل* الحاوية. وإذا ضُبط المتغير نفسه في الاثنين، فالغلبة للقيمة الواردة في `environment:`.\n\nنفّذ `docker compose config` لترى النموذج بعد حلّه كاملًا، فهو أسرع وسيلة للتحقق مما سيفعله Compose فعلًا.\n\n### الأسرار\n\nتتسرّب متغيرات البيئة بسهولة إلى السجلات ومخرجات `docker inspect` وتقارير الأعطال. أمّا **السر (Secret)** فيُركَّب ملفًا للقراءة فقط تحت `/run/secrets/<name>`، وتقرؤه شيفرتك من هناك. أبقِ الملف المصدر خارج Git، ولا تنسخ الأسرار إلى الصورة أبدًا. وللتعامل مع الأسرار على مستوى الإنتاج، راجع درس [Secure Coding: Input Validation and Secret Management](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n\n### ترتيب البدء والسلامة\n\nلا يتحكم `depends_on: [redis]` المجرَّد إلا في **ترتيب البدء**؛ أي إنّ حاوية Redis بدأت، لا أنّ Redis يقبل الاتصالات. اجمع `depends_on` مع `condition: service_healthy` و`healthcheck` لانتظار الجاهزية الحقيقية، وأضِف `restart: unless-stopped` كي يعود العامل من تلقاء نفسه إذا تعطّل."
+   },
+   {
+    "id": "cli",
+    "type": "terminal",
+    "title": "تشغيل المنظومة وفحصها",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "docker compose config --quiet && echo valid",
+      "output": "valid"
+     },
+     {
+      "comment": "تحقّق من الملف وحُلّه أولًا، ونفّذه دون خيارات لترى ملف YAML المحلول كاملًا."
+     },
+     {
+      "cmd": "docker compose up -d --build --wait",
+      "output": "[+] Building 14.2s (12/12) FINISHED\n...\n[+] Running 7/7\n ✔ Network netops-change-api_app           Created\n ✔ Network netops-change-api_data          Created\n ✔ Volume \"netops-change-api_redis-data\"   Created\n ✔ Container netops-change-api-redis-1     Healthy\n ✔ Container netops-change-api-worker-1    Started\n ✔ Container netops-change-api-api-1       Healthy"
+     },
+     {
+      "comment": "لا يعود الخيار --wait إلا بعد أن تعمل الخدمات، وتجتاز كلُّ خدمةٍ ذاتِ فحص سلامة فحصَها، وهو مثالي للسكربتات وCI."
+     },
+     {
+      "cmd": "docker compose ps",
+      "output": "NAME                         IMAGE                                        SERVICE   STATUS                    PORTS\nnetops-change-api-api-1      registry.example.com/netops/change-api:dev   api       Up 41 seconds (healthy)   127.0.0.1:8080->8080/tcp\nnetops-change-api-redis-1    redis:7.4-alpine                             redis     Up 52 seconds (healthy)   6379/tcp\nnetops-change-api-worker-1   netops-change-api-worker                     worker    Up 40 seconds"
+     },
+     {
+      "cmd": "docker compose exec api ls /run/secrets",
+      "output": "restconf_password"
+     },
+     {
+      "cmd": "docker compose logs --tail 3 worker",
+      "output": "worker-1  | INFO  connected to redis://redis:6379/0\nworker-1  | INFO  waiting for jobs on queue 'changes'\nworker-1  | INFO  job 4711: render OSPF config for R1 (192.0.2.11)"
+     },
+     {
+      "comment": "تحمل سجلات كل حاويات الخدمة بادئةً باسم الحاوية."
+     },
+     {
+      "cmd": "docker compose --profile test run --rm tests",
+      "output": "....\n4 passed in 2.87s"
+     },
+     {
+      "cmd": "docker compose down -v",
+      "output": "[+] Running 6/6\n ✔ Container netops-change-api-api-1       Removed\n ✔ Container netops-change-api-worker-1    Removed\n ✔ Container netops-change-api-redis-1     Removed\n ✔ Volume netops-change-api_redis-data     Removed\n ✔ Network netops-change-api_data          Removed\n ✔ Network netops-change-api_app           Removed"
+     },
+     {
+      "comment": "يحذف down الحاويات والشبكات، ويحذف الخيار -v كذلك وحدات التخزين المسمّاة، وهذا ما تريده لتشغيل اختبار نظيف."
+     }
+    ],
+    "caption": "المخرجات مختصرة. تُنفَّذ كل الأوامر من المجلد الذي يحوي compose.yaml."
+   },
+   {
+    "id": "ci",
+    "type": "text",
+    "markdown": "## Compose في الاختبار وفي CI/CD\n\nيُعدّ Compose وسيلة ملائمة لتزويد اختبارات التكامل بـ **التبعيات** التي تحتاجها: طابور، أو قاعدة بيانات، أو واجهة برمجية وهمية (Mock)، أو جامع للقياس عن بُعد (Telemetry).\n\n- **ملفات التجاوز (Override files).** يدمج Compose تلقائيًا الملف `compose.override.yaml` للتطوير المحلي. وفي CI اجمع الملفات صراحةً: `docker compose -f compose.yaml -f compose.ci.yaml up -d --wait`.\n- **الملفات التعريفية (Profiles).** لا تبدأ خدمات مثل `tests` إلا عند تفعيل ملفها التعريفي، فيبقى `docker compose up` خفيفًا.\n- **التشغيل لمرة واحدة.** يشغّل `docker compose run --rm tests` حاوية الاختبار ويعيد رمز خروجها إلى المهمة. وبديلًا عن ذلك، يوقف `docker compose up --exit-code-from tests` المنظومة ويعيد رمز خروج تلك الخدمة.\n- **التنظيف.** نفّذ `docker compose down -v` في `after_script` كي لا تتسرّب وحدات تخزين متبقية بحالتها إلى المهمة التالية.\n\nوإذا فشلت مهمة تكامل، فطبّق منهجية الفرز من درس [تشخيص إخفاقات خطوط CI/CD](/learn/network-automation-devops/diagnosing-ci-cd-pipeline-failures): يُظهر `docker compose ps` الخدمة غير السليمة، ويبيّن `docker compose logs <service>` السبب في الغالب.\n\nيعمل Compose على **مضيف واحد**. وحين تحتاج إلى الجدولة عبر مضيفات كثيرة والتحديثات المتدرجة والتعافي الذاتي على نطاق واسع، تنتقل الصور نفسها إلى Kubernetes."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة لدى المتعلّمين",
+    "markdown": "- **استخدام `localhost` بين الحاويات.** داخل الحاوية، `localhost` هو الحاوية نفسها؛ فاستخدم اسم الخدمة.\n- **توقُّع أن ينتظر `depends_on` الجاهزية.** فهو دون شرط السلامة لا يفعل سوى ترتيب بدء الحاويات.\n- **نشر كل المنافذ.** لا تنشر إلا ما يجب الوصول إليه من خارج المضيف، واربطه بـ `127.0.0.1` متى أمكن.\n- **نسيان `-v` في CI.** يُبقي `docker compose down` وحدات التخزين المسمّاة، فقد تجعل البيانات القديمة تشغيل الاختبار التالي ينجح أو يفشل لسبب خاطئ.\n- **وضع الأسرار في `environment:`.** استخدم `secrets:` واقرأ الملف."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على جهازك الخاص المثبَّت عليه Docker:\n\n1. أنشئ ملف `compose.yaml` فيه خدمة `redis:7.4-alpine` مع فحص سلامة بالأمر `redis-cli ping` ووحدة تخزين مسمّاة.\n2. أضِف خدمة Python صغيرة تتصل بـ `redis://redis:6379/0`، وتزيد عدّادًا، وتطبعه.\n3. نفّذ `docker compose config`، ثم `docker compose up -d --build --wait`، ثم `docker compose ps` و`docker compose logs`.\n4. غيّر مضيف Redis إلى `localhost` ولاحظ خطأ الاتصال، ثم أعِده كما كان.\n5. نفّذ `docker compose down`، وشغّل المنظومة مجددًا، وتأكد من بقاء قيمة العدّاد؛ ثم نفّذ `docker compose down -v` وتأكد من أنها عادت إلى البداية."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "Docker Compose",
+      "definition": "أداة تعرّف التطبيقات متعددة الحاويات وتشغّلها انطلاقًا من ملف YAML تصريحي."
+     },
+     {
+      "term": "المشروع (Project)",
+      "definition": "مجموعة الخدمات والشبكات ووحدات التخزين التي تُدار معًا من ملف Compose واحد، ويُسمّى بالمفتاح name: أو باسم المجلد."
+     },
+     {
+      "term": "الخدمة (Service)",
+      "definition": "تعريف في Compose لطريقة تشغيل مكوّن واحد، ويمكن أن يعمل في حاوية واحدة أو أكثر."
+     },
+     {
+      "term": "اكتشاف الخدمات (Service discovery)",
+      "definition": "تحويل أسماء الخدمات إلى عناوين الحاويات عبر خادم DNS المدمج في Docker."
+     },
+     {
+      "term": "وحدة تخزين مسمّاة (Named volume)",
+      "definition": "تخزين يديره Docker ويبقى بعد حذف الحاويات حتى يُحذف صراحةً."
+     },
+     {
+      "term": "فحص السلامة (Health check)",
+      "definition": "أمر يشغّله Docker دوريًا ليقرر ما إذا كانت الحاوية سليمة."
+     },
+     {
+      "term": "سر Compose ‏(Secret)",
+      "definition": "قيمة حساسة تُركَّب ملفًا للقراءة فقط تحت /run/secrets داخل الحاوية."
+     },
+     {
+      "term": "الملف التعريفي (Profile)",
+      "definition": "وسم يمنع الخدمات الاختيارية، مثل مشغّلات الاختبار، من البدء ما لم يُفعَّل."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "في المثال، كيف تصل حاوية العامل إلى Redis؟",
+      "options": [
+       "عبر localhost:6379",
+       "عبر منفذ المضيف المنشور",
+       "عبر اسم الخدمة redis الذي يحلّه خادم DNS المدمج في Docker",
+       "عبر عنوان IP ثابت في ملف Compose"
+      ],
+      "answer": 2,
+      "explanation": "تحلّ الحاويات على شبكة مشتركة أسماءَ بعضها بأسماء الخدمات، فيعمل redis://redis:6379 على أي مضيف."
+     },
+     {
+      "question": "أيّ الإعدادات تجعل خدمة api تنتظر حتى يقبل Redis الاتصالات فعلًا؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "فحص سلامة على خدمة redis",
+       "depends_on مع condition: service_healthy",
+       "restart: unless-stopped",
+       "نشر المنفذ 6379"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "يعرّف فحص السلامة معنى الجاهزية، ويجعل الشرط service_healthy الخدمةَ المعتمِدة تنتظرها. أمّا سياسات إعادة التشغيل والمنافذ المنشورة فلا تؤثر في ترتيب البدء."
+     },
+     {
+      "question": "يجب على مهمة CI أن تشغّل المنظومة ولا تتابع إلا بعد أن تصبح الخدمات سليمة. أيّ الأوامر أنسب؟",
+      "options": [
+       "docker compose up",
+       "docker compose up -d --wait",
+       "docker compose start",
+       "docker compose create"
+      ],
+      "answer": 1,
+      "explanation": "يعود الخيار --wait بعد أن تعمل الخدمات وتصبح سليمة، فيستطيع السطر التالي من السكربت الاعتماد عليها."
+     },
+     {
+      "question": "أيّ العبارات الآتية عن متغيرات Compose صحيحة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "يُستبدل ${VAR:-default} قبل إنشاء الحاويات",
+       "يمكن لملف .env المجاور لـ compose.yaml أن يوفّر قيم الاستبدال",
+       "يتغلّب env_file دائمًا على environment:",
+       "يعرض docker compose config الإعدادات بعد حلّها"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يحدث الاستبدال أولًا ويمكنه القراءة من .env، ويطبع config النموذج المحلول. وحين يُضبط المتغير في الاثنين، تتقدّم environment: على env_file."
+     },
+     {
+      "question": "لماذا يُستخدم docker compose down -v في نهاية مهمة اختبار تكامل؟",
+      "options": [
+       "لأنه يحذف صور Docker",
+       "لأنه يحذف كذلك وحدات التخزين المسمّاة فيبدأ التشغيل التالي من حالة نظيفة",
+       "لأنه يدفع الصور إلى السجل",
+       "لأنه مطلوب لتحرير المنافذ المنشورة"
+      ],
+      "answer": 1,
+      "explanation": "دون -v تحتفظ وحدات التخزين المسمّاة بالبيانات بين التشغيلات، فقد تعتمد الاختبارات على تشغيلات سابقة."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يصف Compose التطبيق متعدد الحاويات في ملف `compose.yaml` واحد، ويديره بوصفه **مشروعًا** بالأمر `docker compose`.\n- تجد الخدمات بعضها **بالاسم** على الشبكات المشتركة؛ فلا تنشر المنافذ إلا حين يحتاج المضيف إلى الوصول إليها، واستخدم الشبكات الداخلية لعزل مخازن البيانات.\n- الاستبدال (`${VAR}`، `.env`) يختلف عن بيئة الحاوية (`environment`، `env_file`)، ويعرض `docker compose config` النتيجة.\n- ركِّب **الأسرار** ملفاتٍ، واجمع `healthcheck` مع `depends_on: condition: service_healthy` للجاهزية الحقيقية.\n- في CI، استخدم ملفات التجاوز والملفات التعريفية و`--wait` و`run --rm` و`down -v` لاختبارات تكامل قابلة للتكرار.\n\nتابع لتثبت أنّ تغيير الشبكة فعل ما قُصد منه تمامًا في درس [التحقق من التغييرات باستخدام pyATS](/learn/network-automation-devops/change-validation-with-pyats)."
+   }
+  ]
+ }
+}

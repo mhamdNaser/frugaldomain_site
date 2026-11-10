@@ -1,0 +1,686 @@
+{
+  "slug": "yaml-json-configurations-from-yang-models",
+  "title": "YAML / JSON Configurations from YANG Models",
+  "summary": "Turn a YANG tree into valid JSON and YAML payloads: map statements to data structures, apply the RFC 7951 encoding rules, validate with yanglint and send with RESTCONF.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Map YANG containers, lists, leaves, choices and presence containers to JSON and YAML",
+    "Apply the RFC 7951 rules for module prefixes, numeric types, booleans, empty and identityref",
+    "Build model-shaped payloads from short YAML intent files with Python",
+    "Validate payloads against YANG modules before sending them",
+    "Choose tools such as pyang, Cisco YANG Suite and yanglint to build and check payloads"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A RESTCONF call fails with `400 Bad Request` and the message `unknown element`. The payload looked fine: it was valid JSON, and every value was correct. It still did not match the **YANG model**: a module prefix was missing, a boolean was sent as a string, and a list was written as a single object.\n\nYANG defines the shape of the data, and the payload must follow that shape exactly. The AUTOCOR blueprint expects you to construct YAML and JSON configurations from YANG models: read the tree, apply the encoding rules, validate the result and send it. This lesson does that for an IETF model and the IOS XE native model."
+    },
+    {
+      "id": "map",
+      "type": "text",
+      "markdown": "## Reading the model before writing data\n\nStart with the tree view from `pyang -f tree`, or browse the model in **Cisco YANG Suite**. Each YANG statement maps to one JSON or YAML construct:\n\n| YANG statement | Tree marker | JSON | YAML |\n|:--|:--|:--|:--|\n| `container` | `+--rw ip` | object `{ }` | mapping |\n| `list` | `Loopback* [name]` | array of objects, each with its key | sequence of mappings |\n| `leaf` | `name  uint32` | a single value | scalar |\n| `leaf-list` | `server*` (no key) | array of values | sequence of scalars |\n| presence container | `primary!` | object, even if empty | mapping |\n| `choice` / `case` | `(address-choice)`, `:(fixed-case)` | **not encoded**: pick one case and write its nodes | not encoded |\n\nAlso check:\n\n- **rw or ro.** Only `rw` nodes belong in a configuration payload. `ro` nodes are state, and the device rejects them in an edit.\n- **Mandatory and optional.** A `?` marks an optional leaf. List keys are always required.\n- **Device support.** The device must implement the module and the revision you target. Check its capabilities or `/restconf/data/ietf-yang-library:modules-state`."
+    },
+    {
+      "id": "tree",
+      "type": "code",
+      "language": "plain",
+      "filename": "native-loopback-tree.txt",
+      "caption": "A trimmed tree of the IOS XE native model. The choice and case lines never appear in the payload; their children do.",
+      "code": "$ pyang -p ./yang -f tree --tree-path /native/interface/Loopback Cisco-IOS-XE-native.yang\nmodule: Cisco-IOS-XE-native\n  +--rw native\n     +--rw interface\n        +--rw Loopback* [name]\n           +--rw name               uint32\n           +--rw description?       string\n           +--rw shutdown?          empty\n           +--rw ip\n              +--rw address\n                 +--rw (address-choice)?\n                    +--:(fixed-case)\n                       +--rw primary!\n                          +--rw address    inet:ipv4-address\n                          +--rw mask       inet:ipv4-address\n           ... (trimmed)",
+      "highlight": [
+        5,
+        11,
+        12
+      ]
+    },
+    {
+      "id": "rfc7951",
+      "type": "text",
+      "markdown": "## RFC 7951: the JSON encoding rules\n\nRESTCONF and gNMI encode YANG data in JSON as defined by **RFC 7951**. The rules that break most payloads:\n\n| Rule | Correct | Wrong |\n|:--|:--|:--|\n| The top-level node carries the module name | `\"Cisco-IOS-XE-native:interface\"` | `\"interface\"` |\n| A child repeats the prefix only when the namespace changes (augment) | `\"ietf-ip:ipv4\"` inside `ietf-interfaces` | `\"ipv4\"` |\n| `int8` to `int32` and `uint8` to `uint32` are numbers | `\"name\": 100` | `\"name\": \"100\"` |\n| `int64`, `uint64` and `decimal64` are strings | `\"in-octets\": \"1529384\"` | `\"in-octets\": 1529384` |\n| `boolean` is a JSON literal | `true` | `\"true\"` |\n| `empty` is an array holding null | `\"shutdown\": [null]` | `\"shutdown\": true` |\n| `identityref` is qualified by its module | `\"iana-if-type:softwareLoopback\"` | `\"softwareLoopback\"` |\n| A list is an array, even with one entry | `\"Loopback\": [ { ... } ]` | `\"Loopback\": { ... }` |\n\nThe RESTCONF body names the **target resource** of the URI. A `PATCH` to `/restconf/data/Cisco-IOS-XE-native:native/interface` carries `Cisco-IOS-XE-native:interface` at the top. When you `GET` a single list entry, IOS XE returns it as an object, so make your parsers accept both forms. NETCONF carries the same tree in XML (RFC 7950), with an `xmlns` namespace in place of the prefix. See [RESTCONF with YANG Models](/learn/network-automation-devops/restconf-with-yang-models)."
+    },
+    {
+      "id": "native",
+      "type": "code",
+      "language": "json",
+      "filename": "loopbacks-native.json",
+      "caption": "The same tree as JSON. Loopback is a list, so it is an array; name is uint32, so it is a number; shutdown is empty, so it is [null].",
+      "code": "{\n  \"Cisco-IOS-XE-native:interface\": {\n    \"Loopback\": [\n      {\n        \"name\": 100,\n        \"description\": \"Router ID - managed by automation\",\n        \"ip\": {\n          \"address\": {\n            \"primary\": {\n              \"address\": \"198.51.100.100\",\n              \"mask\": \"255.255.255.255\"\n            }\n          }\n        }\n      },\n      {\n        \"name\": 101,\n        \"description\": \"Probe target - parked\",\n        \"shutdown\": [null]\n      }\n    ]\n  }\n}",
+      "highlight": [
+        2,
+        3,
+        19
+      ]
+    },
+    {
+      "id": "yaml",
+      "type": "text",
+      "markdown": "## YAML: the same tree for people\n\nYAML 1.2 is a superset of JSON, so any RFC 7951 document can be written as YAML and converted back without loss. Teams use YAML for what people edit, such as intent files, Ansible variables and pull request reviews, and JSON for what goes on the wire.\n\nTwo designs are common:\n\n1. **Model-shaped YAML.** The file mirrors the YANG tree, with prefixes, and is converted to JSON as is. It is precise but verbose.\n2. **Intent YAML plus a builder.** The file holds only what varies, such as the loopback number, description and address. A Python script or a Jinja2 template maps it to the model. People edit short files, and the code applies the encoding rules once.\n\n### YAML traps\n\nPyYAML follows YAML 1.1 implicit typing, which can change a value before your code sees it:\n\n- `enabled: no`, `on` and `yes` become booleans. A description of `off` stops being a string.\n- `0755` becomes an octal number, and `10:30` may become a number in base 60.\n- An IP address stays a string, but a VLAN ID such as `0100` does not.\n\nQuote string values, use `yaml.safe_load`, and cast types deliberately in the builder. Never use `yaml.load` on untrusted files."
+    },
+    {
+      "id": "intent",
+      "type": "code",
+      "language": "yaml",
+      "filename": "intent/loopbacks.yml",
+      "caption": "Intent YAML: only the values that vary.",
+      "code": "# intent/loopbacks.yml - written by people, reviewed in Git\ndevice: dc1-leaf-01\nloopbacks:\n  - id: 100\n    description: \"Router ID - managed by automation\"\n    ip: 198.51.100.100\n  - id: 101\n    description: \"Probe target - parked\"\n    ip: 198.51.100.101\n    enabled: false\n"
+    },
+    {
+      "id": "builder",
+      "type": "code",
+      "language": "python",
+      "filename": "build_payload.py",
+      "caption": "The builder applies the RFC 7951 rules: the module prefix on top, the augment prefix on ipv4, a qualified identity, a real boolean and the list as an array.",
+      "code": "import json\nimport yaml\n\nwith open(\"intent/loopbacks.yml\", encoding=\"utf-8\") as f:\n    intent = yaml.safe_load(f)\n\npayload = {\"ietf-interfaces:interfaces\": {\"interface\": [\n    {\n        \"name\": f\"Loopback{lo['id']}\",\n        \"description\": lo[\"description\"],\n        \"type\": \"iana-if-type:softwareLoopback\",   # identityref = module:identity\n        \"enabled\": bool(lo.get(\"enabled\", True)),    # JSON true/false, never \"true\"\n        \"ietf-ip:ipv4\": {                            # augment from another module\n            \"address\": [{\"ip\": str(lo[\"ip\"]), \"netmask\": \"255.255.255.255\"}]\n        },\n    }\n    for lo in intent[\"loopbacks\"]\n]}}\n\nwith open(\"build/loopbacks.json\", \"w\", encoding=\"utf-8\") as f:\n    json.dump(payload, f, indent=2)\nprint(f\"wrote build/loopbacks.json ({len(intent['loopbacks'])} interfaces)\")\n",
+      "highlight": [
+        7,
+        11,
+        12,
+        13
+      ]
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "From YANG model to accepted configuration",
+      "caption": "The model shapes the payload; validation runs before any device sees it.",
+      "data": {
+        "token": "Data",
+        "nodes": [
+          {
+            "id": "yang",
+            "label": "YANG module",
+            "sub": "ietf-interfaces",
+            "icon": "file"
+          },
+          {
+            "id": "tree",
+            "label": "Tree / YANG Suite",
+            "sub": "paths and types",
+            "icon": "eye"
+          },
+          {
+            "id": "intent",
+            "label": "YAML intent",
+            "sub": "Git",
+            "icon": "file"
+          },
+          {
+            "id": "build",
+            "label": "Builder",
+            "sub": "Python",
+            "icon": "cpu"
+          },
+          {
+            "id": "lint",
+            "label": "yanglint",
+            "sub": "schema check",
+            "icon": "shield"
+          },
+          {
+            "id": "dev",
+            "label": "R1",
+            "sub": "RESTCONF",
+            "icon": "router"
+          }
+        ],
+        "steps": [
+          {
+            "at": "yang",
+            "token": "Model",
+            "caption": "The device advertises ietf-interfaces, ietf-ip and iana-if-type. You download the same revisions."
+          },
+          {
+            "at": "tree",
+            "token": "Model",
+            "caption": "The tree shows the path, the list key, the types and which nodes are rw."
+          },
+          {
+            "at": "intent",
+            "token": "Intent",
+            "caption": "An engineer adds a loopback to the YAML intent file and opens a merge request."
+          },
+          {
+            "at": "build",
+            "token": "JSON",
+            "caption": "The builder maps intent to the model and applies the RFC 7951 encoding rules."
+          },
+          {
+            "at": "lint",
+            "token": "JSON",
+            "caption": "yanglint checks the payload against the same modules. A string \"true\" would fail here.",
+            "tone": "success"
+          },
+          {
+            "at": "dev",
+            "token": "PATCH",
+            "caption": "The pipeline sends a RESTCONF PATCH, and R1 answers 204 No Content.",
+            "tone": "secure"
+          },
+          {
+            "at": "dev",
+            "token": "GET",
+            "caption": "A GET reads the data back, and the result is compared with the intent.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "build-term",
+      "type": "terminal",
+      "title": "Build, validate, send and verify",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "python build_payload.py",
+          "output": "wrote build/loopbacks.json (2 interfaces)"
+        },
+        {
+          "cmd": "yanglint -t config -F ietf-ip:ipv4-non-contiguous-netmasks ietf-interfaces.yang ietf-ip.yang iana-if-type.yang build/loopbacks.json",
+          "output": ""
+        },
+        {
+          "comment": "No output means the data is valid against the three modules. -F enables the ietf-ip feature that defines netmask."
+        },
+        {
+          "cmd": "yanglint -t config -F ietf-ip:ipv4-non-contiguous-netmasks ietf-interfaces.yang ietf-ip.yang iana-if-type.yang build/bad.json",
+          "output": "libyang err : Invalid non-boolean-encoded boolean value \"true\". (Data location \"/ietf-interfaces:interfaces/interface[name='Loopback101']/enabled\".)"
+        },
+        {
+          "comment": "The same file with \"enabled\": \"true\" fails: a JSON string is not a YANG boolean. The pipeline stops before any device is touched."
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w \"%{http_code}\\n\" -u netops:<password-placeholder> -X PATCH -H \"Content-Type: application/yang-data+json\" -d @build/loopbacks.json https://r1.example.com/restconf/data/ietf-interfaces:interfaces",
+          "output": "204"
+        },
+        {
+          "comment": "PATCH merges both loopbacks into the interfaces container. 204 means success with no body."
+        },
+        {
+          "cmd": "curl -s -u netops:<password-placeholder> -H \"Accept: application/yang-data+json\" https://r1.example.com/restconf/data/ietf-interfaces:interfaces/interface=Loopback100",
+          "output": "{\n  \"ietf-interfaces:interface\": {\n    \"name\": \"Loopback100\",\n    \"description\": \"Router ID - managed by automation\",\n    \"type\": \"iana-if-type:softwareLoopback\",\n    \"enabled\": true,\n    \"ietf-ip:ipv4\": {\n      \"address\": [\n        { \"ip\": \"198.51.100.100\", \"netmask\": \"255.255.255.255\" }\n      ]\n    },\n    \"ietf-ip:ipv6\": {}\n  }\n}"
+        },
+        {
+          "comment": "Read back, the single list entry is returned as an object. ietf-ip:ipv6 appears empty because no IPv6 data is configured."
+        }
+      ],
+      "caption": "Lab output. yanglint prints nothing on success. Use HTTPS certificate verification and a secrets store in production."
+    },
+    {
+      "id": "tools",
+      "type": "text",
+      "markdown": "## Tools that help you build payloads\n\n| Tool | What it gives you |\n|:--|:--|\n| `pyang -f tree` | A readable tree with paths, keys, types and rw/ro |\n| `pyang -f sample-xml-skeleton` | An empty XML skeleton for NETCONF |\n| **Cisco YANG Suite** | Model browsing, payload and RPC builders for NETCONF, RESTCONF and gNMI, and generated Python and Ansible |\n| `yanglint` (libyang) | Validation of JSON or XML data against the modules |\n| A RESTCONF `GET` | The device's own JSON for an object you configured once by CLI: often the fastest template |\n\nHigher-level tools hide part of this work. Ansible resource modules such as `cisco.ios.ios_interfaces` take their own YAML schema, while `ansible.netcommon.restconf_config` and `netconf_config` take model-shaped content. The CiscoDevNet `iosxe` Terraform provider maps its resources to native YANG paths, and its generic `iosxe_restconf` resource takes a path and attributes. See [Ansible for Network Configuration](/learn/network-automation-devops/ansible-for-network-configuration) and [Terraform for Network Configuration](/learn/network-automation-devops/terraform-for-network-configuration)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where engineers go wrong",
+      "markdown": "- **Writing choice or case names in the payload.** `address-choice` and `fixed-case` are schema-only nodes.\n- **Prefixing every key, or none.** Prefix the top-level node and any node from another namespace, and nothing else.\n- **Quoting a uint32 or leaving a counter64 unquoted.** 32-bit integers are numbers; 64-bit integers are strings.\n- **Sending `ro` nodes in an edit.** Copying a full `GET` reply into a `PUT` includes state leaves that the device rejects.\n- **Mixing models in one change.** Editing the same interface through the native and the IETF model in one run can cause confusing results. Choose one model per feature."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab Catalyst 8000v in Cisco Modeling Labs with RESTCONF enabled.\n\n1. Download `ietf-interfaces`, `ietf-ip` and `iana-if-type` from the YangModels GitHub repository, at the revisions the router advertises. Print the tree with `pyang -f tree`.\n2. Write `intent/loopbacks.yml` and `build_payload.py`, then validate the output with `yanglint`.\n3. Change `enabled` to the string `\"true\"` and to `no`. Note which version `yanglint` rejects and which one YAML silently turns into a boolean.\n4. Send the payload with `PATCH` and read it back with `GET`.\n5. Configure `Loopback102` by CLI, `GET` it from the native model, and use the reply as a template for a native payload. Remove every `ro` node before you reuse it."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "RFC 7951",
+          "definition": "The standard that defines how YANG-modeled data is encoded in JSON."
+        },
+        {
+          "term": "Module prefix (namespace qualification)",
+          "definition": "The module name before a node name, required on the top-level node and wherever the namespace changes."
+        },
+        {
+          "term": "Augment",
+          "definition": "A YANG mechanism that adds nodes from one module into another module's tree, such as ietf-ip:ipv4 inside an interface."
+        },
+        {
+          "term": "Choice / case",
+          "definition": "Schema-only YANG nodes that offer alternatives; only the nodes of the chosen case appear in the data."
+        },
+        {
+          "term": "Presence container",
+          "definition": "A container whose existence carries meaning, shown with ! in the tree."
+        },
+        {
+          "term": "identityref",
+          "definition": "A YANG type whose value is an identity, encoded in JSON as module:identity."
+        },
+        {
+          "term": "yanglint",
+          "definition": "The libyang command-line tool that validates JSON or XML data against YANG modules."
+        },
+        {
+          "term": "Cisco YANG Suite",
+          "definition": "A Cisco tool for browsing YANG models and building and testing NETCONF, RESTCONF and gNMI payloads."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which JSON fragment correctly encodes the empty leaf shutdown under RFC 7951?",
+          "options": [
+            "\"shutdown\": true",
+            "\"shutdown\": \"\"",
+            "\"shutdown\": [null]",
+            "\"shutdown\": null"
+          ],
+          "answer": 2,
+          "explanation": "The YANG empty type is encoded as an array that holds a single null."
+        },
+        {
+          "question": "Inside an ietf-interfaces:interface object, which keys need a module prefix? (Choose all that apply.)",
+          "options": [
+            "name",
+            "ipv4 from the ietf-ip augment",
+            "description",
+            "The value of type, which is an identityref"
+          ],
+          "answer": [
+            1,
+            3
+          ],
+          "explanation": "ipv4 comes from another namespace, so it is written ietf-ip:ipv4. An identityref value is qualified as iana-if-type:softwareLoopback. Nodes from the same module, such as name and description, are not prefixed."
+        },
+        {
+          "question": "A pyang tree shows '+--rw (address-choice)?' and under it ':(fixed-case)' and 'primary!'. How does this appear in JSON?",
+          "options": [
+            "\"address-choice\": {\"fixed-case\": {\"primary\": {...}}}",
+            "\"primary\": {...} directly under address",
+            "\"fixed-case\": {\"primary\": {...}}",
+            "\"address-choice\": \"fixed-case\""
+          ],
+          "answer": 1,
+          "explanation": "Choice and case are schema-only nodes. Only the nodes of the chosen case, here the primary container, appear in the data."
+        },
+        {
+          "question": "Which values are encoded correctly under RFC 7951? (Choose all that apply.)",
+          "options": [
+            "A uint32 loopback number as 100",
+            "A counter64 as \"1529384\"",
+            "A boolean as \"false\"",
+            "A one-entry list as an array with one object"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "32-bit integers are numbers, 64-bit integers are strings, and lists are arrays. Booleans must be the literals true and false, not strings."
+        },
+        {
+          "question": "Why does a builder script cast enabled with bool() and write descriptions in quotes in the YAML intent?",
+          "options": [
+            "YAML 1.1 implicit typing can turn values such as no or off into booleans",
+            "RESTCONF accepts only quoted values",
+            "JSON does not support booleans",
+            "yanglint requires every value to be a string"
+          ],
+          "answer": 0,
+          "explanation": "PyYAML follows YAML 1.1 rules, so unquoted words such as yes, no, on and off become booleans. Quoting and explicit casting keep the types you intend."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Read the tree first: containers become objects, lists become arrays keyed by their key leaves, and choice and case never appear in the data.\n- Apply **RFC 7951**: prefix the top level and augmented nodes, use numbers up to 32 bits and strings for 64 bits, `true`/`false`, `[null]` for empty, and `module:identity` for identityrefs.\n- Use **YAML** for what people edit, and either mirror the model or keep intent short and let a builder map it. Watch YAML 1.1 implicit typing.\n- Validate with **yanglint** or YANG Suite before sending, send with RESTCONF, and read the data back to confirm it.\n\nNext, stream the same models out of the device in [Model-Driven Telemetry](/learn/network-automation-devops/model-driven-telemetry)."
+    }
+  ],
+  "ar": {
+    "title": "إعدادات YAML / JSON انطلاقًا من نماذج YANG",
+    "summary": "حوّل شجرة YANG إلى حمولات JSON وYAML صالحة: اربط العبارات ببُنى البيانات، وطبّق قواعد الترميز في RFC 7951، وتحقّق باستخدام yanglint، وأرسل عبر RESTCONF.",
+    "objectives": [
+      "ربط الحاويات والقوائم والأوراق وعُقد choice وحاويات الحضور في YANG ببُنى JSON وYAML",
+      "تطبيق قواعد RFC 7951 الخاصة ببادئات الوحدات والأنواع الرقمية والقيم المنطقية والنوعين empty وidentityref",
+      "بناء حمولات مطابقة للنموذج من ملفات نية قصيرة بصيغة YAML باستخدام Python",
+      "التحقق من الحمولات مقابل وحدات YANG قبل إرسالها",
+      "اختيار أدوات مثل pyang وCisco YANG Suite وyanglint لبناء الحمولات وفحصها"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يفشل استدعاء RESTCONF برمز `400 Bad Request` وبالرسالة `unknown element`، مع أن الحمولة بدت سليمة: فهي JSON صالح وكل قيمها صحيحة. لكنها لم تطابق **نموذج YANG**؛ إذ سقطت بادئة وحدة، وأُرسلت قيمة منطقية نصًّا، وكُتبت قائمة كائنًا مفردًا.\n\nيحدّد YANG شكل البيانات، ويجب أن تتبع الحمولة هذا الشكل بدقة. ويتوقع منك مخطط اختبار AUTOCOR أن تبني إعدادات YAML وJSON انطلاقًا من نماذج YANG: أن تقرأ الشجرة، وتطبّق قواعد الترميز، وتتحقق من النتيجة، ثم ترسلها. ويطبّق هذا الدرس ذلك على نموذج من IETF وعلى النموذج الأصلي (Native) في IOS XE."
+      },
+      {
+        "id": "map",
+        "type": "text",
+        "markdown": "## اقرأ النموذج قبل أن تكتب البيانات\n\nابدأ بعرض الشجرة الناتج عن `pyang -f tree`، أو تصفّح النموذج في **Cisco YANG Suite**. تقابل كلُّ عبارة في YANG بنيةً واحدة في JSON أو YAML:\n\n| عبارة YANG | علامتها في الشجرة | JSON | YAML |\n|:--|:--|:--|:--|\n| `container` | `+--rw ip` | كائن `{ }` | تعيين (Mapping) |\n| `list` | `Loopback* [name]` | مصفوفة كائنات يحمل كلٌّ منها مفتاحه | تسلسل من التعيينات |\n| `leaf` | `name  uint32` | قيمة مفردة | قيمة مفردة (Scalar) |\n| `leaf-list` | `server*` (دون مفتاح) | مصفوفة قيم | تسلسل من القيم المفردة |\n| حاوية الحضور (Presence container) | `primary!` | كائن حتى لو كان فارغًا | تعيين |\n| `choice` / `case` | `(address-choice)` و`:(fixed-case)` | **لا تُرمَّز**: اختر حالة واحدة واكتب عُقدها | لا تُرمَّز |\n\nوتحقّق كذلك من:\n\n- **rw أم ro.** لا تنتمي إلى حمولة الإعداد إلا عُقد `rw`؛ أمّا عُقد `ro` فهي حالة، ويرفضها الجهاز في عمليات التعديل.\n- **الإلزامي والاختياري.** تدل `?` على ورقة اختيارية، أمّا مفاتيح القوائم فإلزامية دائمًا.\n- **دعم الجهاز.** يجب أن يطبّق الجهاز الوحدة والمراجعة (Revision) اللتين تستهدفهما؛ افحص قدراته أو المسار `/restconf/data/ietf-yang-library:modules-state`."
+      },
+      {
+        "id": "tree",
+        "type": "code",
+        "language": "plain",
+        "filename": "native-loopback-tree.txt",
+        "caption": "شجرة مختصرة من النموذج الأصلي في IOS XE. لا يظهر سطرا choice وcase في الحمولة أبدًا، بل تظهر العُقد التابعة لهما.",
+        "code": "$ pyang -p ./yang -f tree --tree-path /native/interface/Loopback Cisco-IOS-XE-native.yang\nmodule: Cisco-IOS-XE-native\n  +--rw native\n     +--rw interface\n        +--rw Loopback* [name]\n           +--rw name               uint32\n           +--rw description?       string\n           +--rw shutdown?          empty\n           +--rw ip\n              +--rw address\n                 +--rw (address-choice)?\n                    +--:(fixed-case)\n                       +--rw primary!\n                          +--rw address    inet:ipv4-address\n                          +--rw mask       inet:ipv4-address\n           ... (trimmed)",
+        "highlight": [
+          5,
+          11,
+          12
+        ]
+      },
+      {
+        "id": "rfc7951",
+        "type": "text",
+        "markdown": "## RFC 7951: قواعد الترميز في JSON\n\nيرمّز RESTCONF وgNMI بيانات YANG بصيغة JSON كما يعرّفها **RFC 7951**. وهذه القواعد هي التي تُفسد معظم الحمولات:\n\n| القاعدة | الصحيح | الخطأ |\n|:--|:--|:--|\n| تحمل العقدة العليا اسم الوحدة | `\"Cisco-IOS-XE-native:interface\"` | `\"interface\"` |\n| لا تكرّر العقدة الفرعية البادئة إلا عند تغيّر فضاء الأسماء (Augment) | `\"ietf-ip:ipv4\"` داخل `ietf-interfaces` | `\"ipv4\"` |\n| الأنواع من `int8` إلى `int32` ومن `uint8` إلى `uint32` أرقام | `\"name\": 100` | `\"name\": \"100\"` |\n| الأنواع `int64` و`uint64` و`decimal64` نصوص | `\"in-octets\": \"1529384\"` | `\"in-octets\": 1529384` |\n| النوع `boolean` قيمة حرفية في JSON | `true` | `\"true\"` |\n| النوع `empty` مصفوفة تحوي null | `\"shutdown\": [null]` | `\"shutdown\": true` |\n| تُقيَّد قيمة `identityref` باسم وحدتها | `\"iana-if-type:softwareLoopback\"` | `\"softwareLoopback\"` |\n| القائمة مصفوفة حتى لو احتوت مدخلًا واحدًا | `\"Loopback\": [ { ... } ]` | `\"Loopback\": { ... }` |\n\nيسمّي جسمُ طلب RESTCONF **المورد الهدف** في عنوان URI؛ فطلب `PATCH` إلى `/restconf/data/Cisco-IOS-XE-native:native/interface` يحمل في أعلاه `Cisco-IOS-XE-native:interface`. وعندما تطلب بـ `GET` مدخلًا واحدًا من قائمة، يعيده IOS XE كائنًا، فاجعل المحلّلات لديك تقبل الشكلين. أمّا NETCONF فيحمل الشجرة نفسها بصيغة XML (RFC 7950)، مع فضاء أسماء `xmlns` بدلًا من البادئة. راجع درس [RESTCONF مع نماذج YANG](/learn/network-automation-devops/restconf-with-yang-models)."
+      },
+      {
+        "id": "native",
+        "type": "code",
+        "language": "json",
+        "filename": "loopbacks-native.json",
+        "caption": "الشجرة نفسها بصيغة JSON: ‏Loopback قائمة فهي مصفوفة، وname من النوع uint32 فهو رقم، وshutdown من النوع empty فقيمته [null].",
+        "code": "{\n  \"Cisco-IOS-XE-native:interface\": {\n    \"Loopback\": [\n      {\n        \"name\": 100,\n        \"description\": \"Router ID - managed by automation\",\n        \"ip\": {\n          \"address\": {\n            \"primary\": {\n              \"address\": \"198.51.100.100\",\n              \"mask\": \"255.255.255.255\"\n            }\n          }\n        }\n      },\n      {\n        \"name\": 101,\n        \"description\": \"Probe target - parked\",\n        \"shutdown\": [null]\n      }\n    ]\n  }\n}",
+        "highlight": [
+          2,
+          3,
+          19
+        ]
+      },
+      {
+        "id": "yaml",
+        "type": "text",
+        "markdown": "## YAML: الشجرة نفسها للبشر\n\nYAML 1.2 مجموعة شاملة (Superset) لـ JSON، لذا يمكن كتابة أي مستند RFC 7951 بصيغة YAML وإعادته إلى JSON دون فقد. وتستخدم الفرق YAML لما يحرّره البشر، كملفات النية ومتغيرات Ansible ومراجعات طلبات الدمج، وتستخدم JSON لما يُرسل عبر الشبكة.\n\nوهناك تصميمان شائعان:\n\n1. **YAML مطابق للنموذج.** يحاكي الملف شجرة YANG ببادئاتها، ويُحوَّل إلى JSON كما هو. وهو دقيق لكنه مطوّل.\n2. **YAML للنية مع مولِّد.** لا يحمل الملف إلا ما يتغير، كرقم منفذ Loopback ووصفه وعنوانه، ثم يربطه سكربت Python أو قالب Jinja2 بالنموذج. فيحرّر البشر ملفات قصيرة، وتطبّق الشيفرة قواعد الترميز مرة واحدة.\n\n### فخاخ YAML\n\nتتبع مكتبة PyYAML قواعد الأنواع الضمنية في YAML 1.1، وقد تغيّر قيمةً قبل أن تراها شيفرتك:\n\n- تصبح القيم `enabled: no` و`on` و`yes` قيمًا منطقية، فيكفّ وصفٌ قيمته `off` عن كونه نصًّا.\n- يصبح `0755` رقمًا ثمانيًا، وقد يصبح `10:30` رقمًا في النظام الستيني.\n- يبقى عنوان IP نصًّا، لكن معرّف VLAN مثل `0100` لا يبقى كذلك.\n\nضع القيم النصية بين علامتي اقتباس، واستخدم `yaml.safe_load`، وحوّل الأنواع صراحةً في المولِّد. ولا تستخدم `yaml.load` أبدًا مع ملفات غير موثوقة."
+      },
+      {
+        "id": "intent",
+        "type": "code",
+        "language": "yaml",
+        "filename": "intent/loopbacks.yml",
+        "caption": "ملف نية بصيغة YAML: القيم المتغيرة وحدها.",
+        "code": "# intent/loopbacks.yml - written by people, reviewed in Git\ndevice: dc1-leaf-01\nloopbacks:\n  - id: 100\n    description: \"Router ID - managed by automation\"\n    ip: 198.51.100.100\n  - id: 101\n    description: \"Probe target - parked\"\n    ip: 198.51.100.101\n    enabled: false\n"
+      },
+      {
+        "id": "builder",
+        "type": "code",
+        "language": "python",
+        "filename": "build_payload.py",
+        "caption": "يطبّق المولِّد قواعد RFC 7951: بادئة الوحدة في الأعلى، وبادئة الإضافة على ipv4، وهوية مقيَّدة، وقيمة منطقية حقيقية، والقائمة مصفوفة.",
+        "code": "import json\nimport yaml\n\nwith open(\"intent/loopbacks.yml\", encoding=\"utf-8\") as f:\n    intent = yaml.safe_load(f)\n\npayload = {\"ietf-interfaces:interfaces\": {\"interface\": [\n    {\n        \"name\": f\"Loopback{lo['id']}\",\n        \"description\": lo[\"description\"],\n        \"type\": \"iana-if-type:softwareLoopback\",   # identityref = module:identity\n        \"enabled\": bool(lo.get(\"enabled\", True)),    # JSON true/false, never \"true\"\n        \"ietf-ip:ipv4\": {                            # augment from another module\n            \"address\": [{\"ip\": str(lo[\"ip\"]), \"netmask\": \"255.255.255.255\"}]\n        },\n    }\n    for lo in intent[\"loopbacks\"]\n]}}\n\nwith open(\"build/loopbacks.json\", \"w\", encoding=\"utf-8\") as f:\n    json.dump(payload, f, indent=2)\nprint(f\"wrote build/loopbacks.json ({len(intent['loopbacks'])} interfaces)\")\n",
+        "highlight": [
+          7,
+          11,
+          12,
+          13
+        ]
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "من نموذج YANG إلى إعداد مقبول",
+        "caption": "يشكّل النموذجُ الحمولة، ويجري التحقق قبل أن يراها أي جهاز.",
+        "data": {
+          "token": "بيانات",
+          "nodes": [
+            {
+              "id": "yang",
+              "label": "وحدة YANG",
+              "sub": "ietf-interfaces",
+              "icon": "file"
+            },
+            {
+              "id": "tree",
+              "label": "الشجرة / YANG Suite",
+              "sub": "المسارات والأنواع",
+              "icon": "eye"
+            },
+            {
+              "id": "intent",
+              "label": "نية YAML",
+              "sub": "Git",
+              "icon": "file"
+            },
+            {
+              "id": "build",
+              "label": "المولِّد",
+              "sub": "Python",
+              "icon": "cpu"
+            },
+            {
+              "id": "lint",
+              "label": "yanglint",
+              "sub": "فحص المخطط",
+              "icon": "shield"
+            },
+            {
+              "id": "dev",
+              "label": "R1",
+              "sub": "RESTCONF",
+              "icon": "router"
+            }
+          ],
+          "steps": [
+            {
+              "at": "yang",
+              "token": "نموذج",
+              "caption": "يعلن الجهاز الوحدات ietf-interfaces وietf-ip وiana-if-type، فتنزّل المراجعات نفسها."
+            },
+            {
+              "at": "tree",
+              "token": "نموذج",
+              "caption": "تُظهر الشجرة المسار ومفتاح القائمة والأنواع وأيّ العُقد من نوع rw."
+            },
+            {
+              "at": "intent",
+              "token": "نية",
+              "caption": "يضيف مهندس منفذ Loopback إلى ملف النية بصيغة YAML ويفتح طلب دمج."
+            },
+            {
+              "at": "build",
+              "token": "JSON",
+              "caption": "يربط المولِّد النية بالنموذج ويطبّق قواعد الترميز في RFC 7951."
+            },
+            {
+              "at": "lint",
+              "token": "JSON",
+              "caption": "يفحص yanglint الحمولة مقابل الوحدات نفسها، والنص \"true\" سيفشل هنا.",
+              "tone": "success"
+            },
+            {
+              "at": "dev",
+              "token": "PATCH",
+              "caption": "يرسل خط التنفيذ طلب PATCH عبر RESTCONF، فيردّ R1 بالرمز 204 No Content.",
+              "tone": "secure"
+            },
+            {
+              "at": "dev",
+              "token": "GET",
+              "caption": "يعيد طلب GET قراءة البيانات، وتُقارن النتيجة بالنية.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "build-term",
+        "type": "terminal",
+        "title": "البناء والتحقق والإرسال والتأكد",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "python build_payload.py",
+            "output": "wrote build/loopbacks.json (2 interfaces)"
+          },
+          {
+            "cmd": "yanglint -t config -F ietf-ip:ipv4-non-contiguous-netmasks ietf-interfaces.yang ietf-ip.yang iana-if-type.yang build/loopbacks.json",
+            "output": ""
+          },
+          {
+            "comment": "غياب المخرجات يعني أن البيانات صالحة مقابل الوحدات الثلاث. ويفعّل الخيار -F ميزة ietf-ip التي تعرّف netmask."
+          },
+          {
+            "cmd": "yanglint -t config -F ietf-ip:ipv4-non-contiguous-netmasks ietf-interfaces.yang ietf-ip.yang iana-if-type.yang build/bad.json",
+            "output": "libyang err : Invalid non-boolean-encoded boolean value \"true\". (Data location \"/ietf-interfaces:interfaces/interface[name='Loopback101']/enabled\".)"
+          },
+          {
+            "comment": "يفشل الملف نفسه عندما يحمل \"enabled\": \"true\"، لأن النص في JSON ليس قيمة منطقية في YANG، فيتوقف خط التنفيذ قبل أن يُمسّ أي جهاز."
+          },
+          {
+            "cmd": "curl -s -o /dev/null -w \"%{http_code}\\n\" -u netops:<password-placeholder> -X PATCH -H \"Content-Type: application/yang-data+json\" -d @build/loopbacks.json https://r1.example.com/restconf/data/ietf-interfaces:interfaces",
+            "output": "204"
+          },
+          {
+            "comment": "يدمج طلب PATCH منفذَي Loopback في الحاوية interfaces، ويعني 204 النجاح دون جسم."
+          },
+          {
+            "cmd": "curl -s -u netops:<password-placeholder> -H \"Accept: application/yang-data+json\" https://r1.example.com/restconf/data/ietf-interfaces:interfaces/interface=Loopback100",
+            "output": "{\n  \"ietf-interfaces:interface\": {\n    \"name\": \"Loopback100\",\n    \"description\": \"Router ID - managed by automation\",\n    \"type\": \"iana-if-type:softwareLoopback\",\n    \"enabled\": true,\n    \"ietf-ip:ipv4\": {\n      \"address\": [\n        { \"ip\": \"198.51.100.100\", \"netmask\": \"255.255.255.255\" }\n      ]\n    },\n    \"ietf-ip:ipv6\": {}\n  }\n}"
+          },
+          {
+            "comment": "عند القراءة يُعاد مدخل القائمة الوحيد كائنًا، ويظهر ietf-ip:ipv6 فارغًا لعدم إعداد بيانات IPv6."
+          }
+        ],
+        "caption": "مخرجات مختبرية. لا يطبع yanglint شيئًا عند النجاح. استخدم في الإنتاج التحقق من شهادة HTTPS ومخزنًا للأسرار."
+      },
+      {
+        "id": "tools",
+        "type": "text",
+        "markdown": "## أدوات تساعدك على بناء الحمولات\n\n| الأداة | ما تقدّمه لك |\n|:--|:--|\n| `pyang -f tree` | شجرة مقروءة بالمسارات والمفاتيح والأنواع وrw/ro |\n| `pyang -f sample-xml-skeleton` | هيكل XML فارغ لاستخدامه مع NETCONF |\n| **Cisco YANG Suite** | تصفّح النماذج، ومنشئات للحمولات واستدعاءات RPC في NETCONF وRESTCONF وgNMI، وتوليد شيفرة Python وAnsible |\n| `yanglint` (من libyang) | التحقق من بيانات JSON أو XML مقابل الوحدات |\n| طلب `GET` عبر RESTCONF | JSON الخاص بالجهاز لكائن أعددته مرة عبر سطر الأوامر، وهو غالبًا أسرع قالب |\n\nتُخفي الأدوات عالية المستوى جزءًا من هذا العمل: تأخذ وحدات الموارد في Ansible، مثل `cisco.ios.ios_interfaces`، مخطط YAML خاصًا بها، بينما تأخذ `ansible.netcommon.restconf_config` و`netconf_config` محتوى مطابقًا للنموذج. ويربط مزوّد Terraform ‏`iosxe` من CiscoDevNet موارده بمسارات YANG الأصلية، ويأخذ مورده العام `iosxe_restconf` مسارًا وسمات. راجع درسَي [Ansible لإعداد الشبكات](/learn/network-automation-devops/ansible-for-network-configuration) و[Terraform لإعداد الشبكات](/learn/network-automation-devops/terraform-for-network-configuration)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة لدى المهندسين",
+        "markdown": "- **كتابة أسماء choice أو case في الحمولة.** العقدتان `address-choice` و`fixed-case` موجودتان في المخطط فقط.\n- **وضع البادئة على كل مفتاح، أو إسقاطها من الجميع.** ضع البادئة على العقدة العليا وعلى أي عقدة من فضاء أسماء آخر، ولا شيء غير ذلك.\n- **وضع uint32 بين علامتي اقتباس، أو ترك counter64 دونهما.** الأعداد الصحيحة ذات 32 بتًا أرقام، وذات 64 بتًا نصوص.\n- **إرسال عُقد `ro` في عملية تعديل.** نسخ ردّ `GET` كاملًا في طلب `PUT` يُدخل أوراق حالة يرفضها الجهاز.\n- **خلط النماذج في تغيير واحد.** تعديل المنفذ نفسه عبر النموذج الأصلي ونموذج IETF في تشغيل واحد قد يُنتج نتائج مربكة، فاختر نموذجًا واحدًا لكل ميزة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم Catalyst 8000v مختبريًا في Cisco Modeling Labs مع تفعيل RESTCONF.\n\n1. نزّل `ietf-interfaces` و`ietf-ip` و`iana-if-type` من مستودع YangModels على GitHub بالمراجعات التي يعلنها الموجّه، واطبع الشجرة بالأمر `pyang -f tree`.\n2. اكتب `intent/loopbacks.yml` و`build_payload.py`، ثم تحقّق من الناتج باستخدام `yanglint`.\n3. غيّر قيمة `enabled` إلى النص `\"true\"` ثم إلى `no`، ولاحظ أيّ النسختين يرفضها `yanglint`، وأيّهما يحوّلها YAML بصمت إلى قيمة منطقية.\n4. أرسل الحمولة بطلب `PATCH`، واقرأها مجددًا بطلب `GET`.\n5. أعدّ `Loopback102` عبر سطر الأوامر، واطلبه بـ `GET` من النموذج الأصلي، واستخدم الرد قالبًا لحمولة أصلية، مع حذف كل عُقد `ro` قبل إعادة استخدامه."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "RFC 7951",
+            "definition": "المعيار الذي يحدّد كيفية ترميز البيانات المنمذجة بـ YANG بصيغة JSON."
+          },
+          {
+            "term": "بادئة الوحدة (Module prefix)",
+            "definition": "اسم الوحدة قبل اسم العقدة، ويلزم على العقدة العليا وحيثما تغيّر فضاء الأسماء."
+          },
+          {
+            "term": "الإضافة (Augment)",
+            "definition": "آلية في YANG تضيف عُقدًا من وحدة إلى شجرة وحدة أخرى، مثل ietf-ip:ipv4 داخل المنفذ."
+          },
+          {
+            "term": "Choice / case",
+            "definition": "عُقد في المخطط فقط تقدّم بدائل، ولا تظهر في البيانات إلا عُقد الحالة المختارة."
+          },
+          {
+            "term": "حاوية الحضور (Presence container)",
+            "definition": "حاوية لوجودها معنى بحد ذاته، وتظهر في الشجرة بالعلامة !."
+          },
+          {
+            "term": "identityref",
+            "definition": "نوع في YANG قيمته هوية (Identity)، ويُرمَّز في JSON بالشكل module:identity."
+          },
+          {
+            "term": "yanglint",
+            "definition": "أداة سطر الأوامر في libyang للتحقق من بيانات JSON أو XML مقابل وحدات YANG."
+          },
+          {
+            "term": "Cisco YANG Suite",
+            "definition": "أداة من Cisco لتصفّح نماذج YANG وبناء حمولات NETCONF وRESTCONF وgNMI واختبارها."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أيّ مقطع JSON يرمّز الورقة shutdown من النوع empty ترميزًا صحيحًا وفق RFC 7951؟",
+            "options": [
+              "\"shutdown\": true",
+              "\"shutdown\": \"\"",
+              "\"shutdown\": [null]",
+              "\"shutdown\": null"
+            ],
+            "answer": 2,
+            "explanation": "يُرمَّز النوع empty في YANG مصفوفةً تحوي قيمة null واحدة."
+          },
+          {
+            "question": "داخل الكائن ietf-interfaces:interface، أيّ المفاتيح تحتاج إلى بادئة وحدة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "name",
+              "ipv4 القادم من إضافة ietf-ip",
+              "description",
+              "قيمة type، وهي من النوع identityref"
+            ],
+            "answer": [
+              1,
+              3
+            ],
+            "explanation": "يأتي ipv4 من فضاء أسماء آخر فيُكتب ietf-ip:ipv4، وتُقيَّد قيمة identityref بالشكل iana-if-type:softwareLoopback. أمّا عُقد الوحدة نفسها مثل name وdescription فلا تحمل بادئة."
+          },
+          {
+            "question": "تُظهر شجرة pyang السطر '+--rw (address-choice)?' وتحته ':(fixed-case)' و'primary!'. كيف يظهر ذلك في JSON؟",
+            "options": [
+              "\"address-choice\": {\"fixed-case\": {\"primary\": {...}}}",
+              "\"primary\": {...} مباشرةً تحت address",
+              "\"fixed-case\": {\"primary\": {...}}",
+              "\"address-choice\": \"fixed-case\""
+            ],
+            "answer": 1,
+            "explanation": "العقدتان choice وcase موجودتان في المخطط فقط، ولا يظهر في البيانات إلا عُقد الحالة المختارة، وهي هنا الحاوية primary."
+          },
+          {
+            "question": "أيّ القيم مرمَّزة ترميزًا صحيحًا وفق RFC 7951؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "رقم Loopback من النوع uint32 بالشكل 100",
+              "قيمة counter64 بالشكل \"1529384\"",
+              "قيمة منطقية بالشكل \"false\"",
+              "قائمة بمدخل واحد في صورة مصفوفة تحوي كائنًا واحدًا"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الأعداد الصحيحة ذات 32 بتًا أرقام، وذات 64 بتًا نصوص، والقوائم مصفوفات. أمّا القيم المنطقية فيجب أن تكون الحرفيتين true وfalse لا نصوصًا."
+          },
+          {
+            "question": "لماذا يحوّل سكربت المولِّد القيمة enabled بالدالة bool() ويضع الأوصاف بين علامتي اقتباس في ملف النية؟",
+            "options": [
+              "لأن قواعد الأنواع الضمنية في YAML 1.1 قد تحوّل قيمًا مثل no أو off إلى قيم منطقية",
+              "لأن RESTCONF لا يقبل إلا القيم المقتبسة",
+              "لأن JSON لا يدعم القيم المنطقية",
+              "لأن yanglint يشترط أن تكون كل القيم نصوصًا"
+            ],
+            "answer": 0,
+            "explanation": "تتبع PyYAML قواعد YAML 1.1، فتصبح الكلمات غير المقتبسة مثل yes وno وon وoff قيمًا منطقية. والاقتباس والتحويل الصريح يحفظان الأنواع التي تقصدها."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- اقرأ الشجرة أولًا: تصبح الحاويات كائنات، والقوائم مصفوفات تميّزها أوراق المفاتيح، ولا تظهر choice وcase في البيانات أبدًا.\n- طبّق **RFC 7951**: ضع البادئة على المستوى الأعلى وعلى العُقد المضافة، واستخدم الأرقام حتى 32 بتًا والنصوص لـ 64 بتًا، و`true`/`false`، و`[null]` للنوع empty، والشكل `module:identity` لقيم identityref.\n- استخدم **YAML** لما يحرّره البشر، وإمّا أن تحاكي النموذج وإمّا أن تُبقي النية قصيرة وتدع مولِّدًا يربطها به، مع الانتباه إلى الأنواع الضمنية في YAML 1.1.\n- تحقّق باستخدام **yanglint** أو YANG Suite قبل الإرسال، وأرسل عبر RESTCONF، ثم اقرأ البيانات مجددًا للتأكيد.\n\nتابع لترى كيف تُبثّ النماذج نفسها من الجهاز في درس [القياس عن بُعد القائم على النماذج](/learn/network-automation-devops/model-driven-telemetry)."
+      }
+    ]
+  }
+}

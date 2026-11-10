@@ -1,0 +1,652 @@
+{
+ "slug": "building-an-mcp-server-with-python-fastmcp",
+ "title": "Building an MCP Server with Python FastMCP",
+ "summary": "Build a Model Context Protocol server in Python with FastMCP that exposes safe, validated network tools over RESTCONF, then test it with MCP Inspector before any AI model uses it.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Describe the MCP host, client and server roles and the tool, resource and prompt primitives",
+  "Compare the stdio and Streamable HTTP transports and choose one for a use case",
+  "Build a FastMCP server whose tools wrap IOS XE RESTCONF calls",
+  "Test a server with MCP Inspector and read the JSON-RPC exchange",
+  "Apply allowlists, input validation, dry-run defaults and least privilege to MCP tools"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "Your NOC wants an AI assistant that can answer \"Is GigabitEthernet0/0/1 on edge-rtr1 up, and is it taking errors?\" without anyone pasting `show` output into a chat window. The obvious shortcut, giving the model SSH access to the router, is also the most dangerous one. What you really want is a small, well-defined set of actions the model may request, each backed by code you wrote, tested and can audit.\n\nThe **Model Context Protocol (MCP)** is an open standard for exactly that. You write an **MCP server** that exposes tools, and any MCP-capable AI application can discover and call them. The AUTOCOR 350-901 v2.0 blueprint expects you to build such a server, and the fastest route in Python is **FastMCP**. In this lesson you will build a read-mostly server for IOS XE routers on top of RESTCONF."
+  },
+  {
+   "id": "what",
+   "type": "text",
+   "markdown": "## What MCP is\n\nMCP separates the AI application from the systems it talks to. Three roles take part:\n\n- **Host**: the AI application the engineer uses, such as a chat client, an IDE or a ChatOps bot. It owns the language model and the conversation.\n- **Client**: a connector inside the host. Each client keeps a one-to-one session with one server.\n- **Server**: your program. It offers capabilities and runs the code behind them.\n\nMessages are **JSON-RPC 2.0** requests, responses and notifications. A session starts with `initialize`, where both sides agree on a protocol version and capabilities, followed by an `initialized` notification. After that the client can list and use what the server offers.\n\n### Server primitives\n\n| Primitive | Controlled by | Network example |\n|:--|:--|:--|\n| **Tool** | The model decides when to call it | `get_interface_status(hostname, interface)` |\n| **Resource** | The application reads it as context | `inventory://devices`, a golden config |\n| **Prompt** | The user picks it as a template | \"Troubleshoot an interface\" |\n\n### Transports\n\n- **stdio**: the host starts the server as a child process and exchanges messages over stdin and stdout. It is simple and local, and the server inherits only the environment you give it.\n- **Streamable HTTP**: the server runs as a long-lived web service that many clients can share. It needs TLS, authentication and network access control like any other API."
+  },
+  {
+   "id": "fastmcp",
+   "type": "text",
+   "markdown": "## FastMCP in the Python SDK\n\nThe official MCP Python SDK (`pip install \"mcp[cli]\"`) includes **FastMCP**, a high-level API that turns ordinary functions into MCP primitives with decorators. A separate, community-maintained `fastmcp` package extends the same ideas with extra features; the code here uses the SDK version, imported from `mcp.server.fastmcp`.\n\nFastMCP does three useful things for you:\n\n1. **Schema from type hints.** `hostname: str` and `dry_run: bool = True` become a JSON Schema, so the model knows the argument names, types and which ones are required.\n2. **Description from the docstring.** The model reads the docstring to decide *when* to use a tool, so write it for the model: what the tool does, valid argument formats and an example.\n3. **Protocol plumbing.** It handles `initialize`, `tools/list`, `tools/call`, serialization and errors. If your function raises an exception, the client receives a result with `isError: true` and the message, instead of a crashed server.\n\nThe server below wraps RESTCONF on IOS XE. It keeps credentials in environment variables, refuses unknown devices and malformed interface names, and makes its only write tool a dry run by default. For the RESTCONF details, see [RESTCONF with YANG Models](/learn/network-automation-devops/restconf-with-yang-models)."
+  },
+  {
+   "id": "server",
+   "type": "code",
+   "language": "python",
+   "filename": "netops_server.py",
+   "highlight": [
+    9,
+    14,
+    16,
+    22,
+    33,
+    34,
+    40,
+    53,
+    70,
+    85,
+    93
+   ],
+   "caption": "Every capability is a decorated Python function. The inventory allowlist, input checks and dry-run default are enforced in code, not in the prompt.",
+   "code": "\"\"\"netops_server.py - a read-mostly MCP server for IOS XE routers.\"\"\"\nimport json\nimport logging\nimport os\nimport re\nfrom urllib.parse import quote\n\nimport requests\nfrom mcp.server.fastmcp import FastMCP\n\nlogging.basicConfig(level=logging.INFO)          # logs go to stderr, never stdout\nlog = logging.getLogger(\"netops\")\n\nmcp = FastMCP(\"netops\")\n\nINVENTORY = {\"edge-rtr1\": \"192.0.2.11\", \"edge-rtr2\": \"192.0.2.12\"}\nIFACE_RE = re.compile(r\"^(GigabitEthernet|TenGigabitEthernet|Loopback)\\d+(/\\d+){0,2}$\")\nHEADERS = {\"Accept\": \"application/yang-data+json\",\n           \"Content-Type\": \"application/yang-data+json\"}\n\n\ndef _check(hostname, interface):\n    if hostname not in INVENTORY:\n        raise ValueError(f\"unknown device {hostname!r}; call list_devices first\")\n    if not IFACE_RE.match(interface):\n        raise ValueError(\"interface must be a full name such as GigabitEthernet0/0/1\")\n\n\ndef _restconf(method, hostname, path, body=None):\n    resp = requests.request(\n        method, f\"https://{INVENTORY[hostname]}/restconf/data/{path}\",\n        headers=HEADERS, json=body, timeout=10,\n        auth=(os.environ[\"NETOPS_USER\"], os.environ[\"NETOPS_PASS\"]),\n        verify=os.environ.get(\"NETOPS_CA_BUNDLE\", True),\n    )\n    resp.raise_for_status()\n    return resp.json() if resp.content else {}\n\n\n@mcp.resource(\"inventory://devices\")\ndef inventory() -> str:\n    \"\"\"The devices this server is allowed to reach.\"\"\"\n    return json.dumps(INVENTORY)\n\n\n@mcp.tool()\ndef list_devices() -> list[str]:\n    \"\"\"List the hostnames this server can query.\"\"\"\n    return sorted(INVENTORY)\n\n\n@mcp.tool()\ndef get_interface_status(hostname: str, interface: str) -> dict:\n    \"\"\"Return the admin status, oper status and input errors of one interface.\n\n    hostname: a name returned by list_devices, for example edge-rtr1\n    interface: the full IOS XE name, for example GigabitEthernet0/0/1\n    \"\"\"\n    _check(hostname, interface)\n    path = f\"ietf-interfaces:interfaces-state/interface={quote(interface, safe='')}\"\n    data = _restconf(\"GET\", hostname, path)[\"ietf-interfaces:interface\"]\n    return {\"interface\": data[\"name\"],\n            \"admin_status\": data[\"admin-status\"],\n            \"oper_status\": data[\"oper-status\"],\n            \"in_errors\": int(data[\"statistics\"][\"in-errors\"])}\n\n\n@mcp.tool()\ndef set_interface_description(hostname: str, interface: str,\n                              description: str, dry_run: bool = True) -> dict:\n    \"\"\"Set an interface description. Defaults to a dry run that changes nothing.\"\"\"\n    _check(hostname, interface)\n    if not re.fullmatch(r\"[\\w .:/-]{1,80}\", description):\n        raise ValueError(\"description: 1-80 letters, digits, spaces or . : / - _\")\n    path = f\"ietf-interfaces:interfaces/interface={quote(interface, safe='')}\"\n    body = {\"ietf-interfaces:interface\": {\"name\": interface,\n                                          \"description\": description}}\n    if dry_run:\n        return {\"dry_run\": True, \"would_patch\": path, \"body\": body}\n    _restconf(\"PATCH\", hostname, path, body)\n    log.info(\"description changed on %s %s\", hostname, interface)\n    return {\"dry_run\": False, \"changed\": True}\n\n\n@mcp.prompt()\ndef troubleshoot_interface(hostname: str, interface: str) -> str:\n    \"\"\"A reusable, read-only troubleshooting prompt.\"\"\"\n    return (f\"Check {interface} on {hostname} with get_interface_status. \"\n            \"Report admin status, oper status and input errors. Change nothing.\")\n\n\nif __name__ == \"__main__\":\n    mcp.run()                     # stdio transport by default\n"
+  },
+  {
+   "id": "mcp-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "One question, one tool call",
+   "caption": "The model never touches the router. It asks the host to call a tool, and your server decides what actually happens.",
+   "data": {
+    "actors": [
+     {
+      "id": "eng",
+      "label": "Engineer",
+      "icon": "user"
+     },
+     {
+      "id": "host",
+      "label": "AI host",
+      "sub": "LLM + MCP client",
+      "icon": "laptop"
+     },
+     {
+      "id": "srv",
+      "label": "MCP server",
+      "sub": "netops_server.py",
+      "icon": "server"
+     },
+     {
+      "id": "rtr",
+      "label": "edge-rtr1",
+      "sub": "192.0.2.11 RESTCONF",
+      "icon": "router"
+     }
+    ],
+    "steps": [
+     {
+      "from": "host",
+      "to": "srv",
+      "label": "initialize",
+      "detail": "protocolVersion, capabilities",
+      "note": "The host starts the server over stdio and the two sides negotiate a protocol version and capabilities."
+     },
+     {
+      "from": "host",
+      "to": "srv",
+      "label": "tools/list",
+      "note": "The client asks which tools exist. FastMCP returns names, docstrings and JSON Schemas."
+     },
+     {
+      "from": "eng",
+      "to": "host",
+      "label": "Is Gi0/0/1 on edge-rtr1 up?",
+      "note": "The engineer asks in plain language. The host passes the question and the tool list to the model."
+     },
+     {
+      "from": "host",
+      "to": "srv",
+      "label": "tools/call get_interface_status",
+      "detail": "hostname=edge-rtr1 interface=GigabitEthernet0/0/1",
+      "tone": "secure",
+      "note": "The model chooses a tool and arguments. Your code validates both before anything leaves the server."
+     },
+     {
+      "from": "srv",
+      "to": "rtr",
+      "label": "GET /restconf/data/ietf-interfaces:interfaces-state/...",
+      "note": "The server uses its own read-only credentials and verifies the router's TLS certificate."
+     },
+     {
+      "from": "rtr",
+      "to": "srv",
+      "label": "200 OK",
+      "detail": "admin-status up, oper-status down",
+      "tone": "success",
+      "note": "The router returns YANG-modeled JSON."
+     },
+     {
+      "from": "srv",
+      "to": "host",
+      "label": "result",
+      "detail": "isError=false, 4 fields",
+      "note": "The server returns a short, structured summary instead of the full payload, which keeps the model's context small."
+     },
+     {
+      "from": "host",
+      "to": "eng",
+      "label": "Admin up, oper down, 0 input errors",
+      "tone": "warning",
+      "note": "The model writes the answer and suggests checking the cable or the far end. It changed nothing."
+     }
+    ]
+   }
+  },
+  {
+   "id": "run",
+   "type": "text",
+   "markdown": "## Running and testing the server\n\nDuring development, run the server under **MCP Inspector** with `mcp dev`. The Inspector is a local web UI that connects as a client, lists your tools, resources and prompts, lets you call them with your own arguments, and shows the raw JSON-RPC traffic. Test every tool here before you connect a model, because a bug that the Inspector shows plainly is much harder to spot through an LLM's paraphrase.\n\nTo connect a desktop AI host, you register a command such as `uv run python netops_server.py` in the host's configuration; the host then starts the server over stdio when needed. To share one server across a team, switch the transport with `mcp.run(transport=\"streamable-http\")` and put it behind TLS and authentication. For tool-level testing in CI, call the plain Python functions with `unittest` or `pytest` and mock `requests`, exactly as you would test any other automation code."
+  },
+  {
+   "id": "run-term",
+   "type": "terminal",
+   "title": "Set up, inspect and run",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "uv init netops-mcp && cd netops-mcp",
+     "comment": "Create a project with uv (pip install \"mcp[cli]\" works too)"
+    },
+    {
+     "cmd": "uv add \"mcp[cli]\" requests",
+     "output": "Resolved 32 packages in 1.21s\nInstalled 30 packages in 410ms\n + mcp==1.x.x\n + requests==2.x.x\n ...",
+     "comment": "Install the official MCP Python SDK, which includes FastMCP and the mcp CLI"
+    },
+    {
+     "cmd": "export NETOPS_USER=netops-ro NETOPS_PASS='<lab-password>'",
+     "comment": "Read-only lab credentials; never hard-code them in the server"
+    },
+    {
+     "cmd": "uv run mcp dev netops_server.py",
+     "output": "Starting MCP inspector...\nProxy server listening on port 6277\nMCP Inspector is up and running at http://127.0.0.1:6274",
+     "comment": "Start the server under MCP Inspector: list tools, call them and see the raw JSON-RPC"
+    },
+    {
+     "cmd": "uv run python netops_server.py",
+     "comment": "Run it directly over stdio: it prints nothing and waits for JSON-RPC on stdin (Ctrl+C to stop)"
+    }
+   ],
+   "caption": "Output is abbreviated; package versions and Inspector ports depend on your SDK release."
+  },
+  {
+   "id": "wire",
+   "type": "code",
+   "language": "json",
+   "filename": "jsonrpc-exchange.json",
+   "caption": "What the Inspector shows on the wire: discovery with tools/list, then one tools/call. Comments are added for reading; real JSON-RPC has none.",
+   "code": "// Client -> server: which tools exist?\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\"}\n\n// Server -> client (one tool shown). The schema comes from the type hints.\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"result\": {\"tools\": [{\n  \"name\": \"get_interface_status\",\n  \"description\": \"Return the admin status, oper status and input errors of one interface. ...\",\n  \"inputSchema\": {\"type\": \"object\",\n    \"properties\": {\"hostname\": {\"title\": \"Hostname\", \"type\": \"string\"},\n                   \"interface\": {\"title\": \"Interface\", \"type\": \"string\"}},\n    \"required\": [\"hostname\", \"interface\"]}}]}}\n\n// Client -> server: the model chose a tool and its arguments\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",\n \"params\": {\"name\": \"get_interface_status\",\n            \"arguments\": {\"hostname\": \"edge-rtr1\", \"interface\": \"GigabitEthernet0/0/1\"}}}\n\n// Server -> client: the result the model will read\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"result\": {\n  \"content\": [{\"type\": \"text\", \"text\": \"{\\\"interface\\\": \\\"GigabitEthernet0/0/1\\\", \\\"admin_status\\\": \\\"up\\\", \\\"oper_status\\\": \\\"down\\\", \\\"in_errors\\\": 0}\"}],\n  \"isError\": false}}"
+  },
+  {
+   "id": "design",
+   "type": "text",
+   "markdown": "## Designing tools that are safe to hand to a model\n\nA model will call your tools with whatever arguments it thinks are right, including wrong ones. Treat every argument as untrusted input.\n\n- **Read-only first.** Start with tools that only observe. Add write tools later, one narrow action at a time, never \"run any CLI command\".\n- **Allowlists and validation.** Accept only known hostnames, well-formed interface names and bounded strings. Reject anything else with a clear error the model can act on.\n- **Safe defaults.** A `dry_run: bool = True` parameter means the model must ask explicitly for a change, and the host can require human approval for that call.\n- **Least-privilege credentials.** The server account should have exactly the RESTCONF rights its tools need, preferably through TACACS+ command authorization or a restricted role. Load secrets from the environment or a vault.\n- **Concise, structured results.** Return the fields that answer the question, not 2,000 lines of running config. Large outputs waste context and bury the facts.\n- **Audit trail.** Log every write call with who, what and when. Tool annotations such as `readOnlyHint` and `destructiveHint` help hosts decide when to ask for confirmation, but they are hints: your code must still enforce the rules.\n\nTool results flow back into the model, so a hostile interface description could carry injected instructions. That risk is covered in [Security Risks in AI-Based Automation](/learn/network-automation-devops/security-risks-in-ai-based-automation)."
+  },
+  {
+   "id": "pitfalls",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Where learners go wrong",
+   "markdown": "- **Printing to stdout in a stdio server.** stdout *is* the protocol channel. A stray `print()` corrupts the JSON-RPC stream. Log to stderr instead.\n- **Vague docstrings.** If the docstring does not say that `interface` must be a full name, the model will send `Gi0/0/1` and fail.\n- **Raw device output as the result.** Parse and summarize; the model reasons better over four fields than over a page of text.\n- **`verify=False` \"just for the lab\".** It tends to reach production. Point `verify` at your CA bundle instead."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a lab router you own, for example a Catalyst 8000V in Cisco Modeling Labs with `restconf` enabled and a read-only local user.\n\n1. Create the project with `uv init` and `uv add \"mcp[cli]\" requests`, then save `netops_server.py` with your lab router's address in `INVENTORY`.\n2. Run `uv run mcp dev netops_server.py`. In the Inspector, call `list_devices`, then `get_interface_status` with a valid interface.\n3. Call it again with `interface` set to `Gi0/0/1` and with a hostname that is not in the inventory. Confirm that both return `isError: true` with a helpful message.\n4. Call `set_interface_description` without `dry_run` and confirm nothing changes on the router.\n5. Add a read-only tool `get_ospf_neighbors(hostname)` that returns neighbor ID, state and interface only. Test it in the Inspector."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Model Context Protocol (MCP)",
+     "definition": "An open standard that lets AI applications discover and use tools, resources and prompts offered by external servers."
+    },
+    {
+     "term": "MCP host",
+     "definition": "The AI application, such as a chat client, IDE or bot, that owns the model and runs one MCP client per server."
+    },
+    {
+     "term": "MCP server",
+     "definition": "A program that exposes capabilities over MCP and runs the code behind them."
+    },
+    {
+     "term": "Tool",
+     "definition": "A function the model can ask to call, described by a name, a description and a JSON Schema for its arguments."
+    },
+    {
+     "term": "Resource",
+     "definition": "Read-only data identified by a URI that the application can load into the model's context."
+    },
+    {
+     "term": "Prompt (MCP)",
+     "definition": "A reusable, parameterized message template that a user can select."
+    },
+    {
+     "term": "FastMCP",
+     "definition": "The high-level Python API in the MCP SDK that turns decorated functions into tools, resources and prompts."
+    },
+    {
+     "term": "stdio transport",
+     "definition": "The host launches the server as a subprocess and exchanges JSON-RPC messages over stdin and stdout."
+    },
+    {
+     "term": "Streamable HTTP",
+     "definition": "The MCP transport for remote, shared servers, carried over HTTP and secured like any web API."
+    },
+    {
+     "term": "MCP Inspector",
+     "definition": "A developer tool, started with mcp dev, for listing and calling a server's capabilities and viewing raw JSON-RPC."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "In FastMCP, where does the JSON Schema for a tool's arguments come from?",
+     "options": [
+      "A YAML file you write next to the server",
+      "The Python type hints and default values of the decorated function",
+      "The model infers it from the docstring at run time",
+      "The MCP host generates it from previous calls"
+     ],
+     "answer": 1,
+     "explanation": "FastMCP builds the inputSchema from the function signature: types become JSON types, and parameters without defaults become required. The docstring becomes the description."
+    },
+    {
+     "question": "Which MCP primitive is chosen by the model during a conversation?",
+     "options": [
+      "Resource",
+      "Prompt",
+      "Tool",
+      "Transport"
+     ],
+     "answer": 2,
+     "explanation": "Tools are model-controlled: the model decides when to call them. Resources are application-controlled context, and prompts are user-selected templates."
+    },
+    {
+     "question": "Your stdio server works in unit tests but the host reports invalid JSON after the first call. What is the most likely cause?",
+     "options": [
+      "The server uses type hints",
+      "A print() statement writes to stdout, which is the protocol channel",
+      "logging is configured to write to stderr",
+      "The tool returns a dict"
+     ],
+     "answer": 1,
+     "explanation": "With the stdio transport, stdout carries JSON-RPC messages. Any other text on stdout corrupts the stream, so diagnostics must go to stderr."
+    },
+    {
+     "question": "Which design choices make a network MCP server safer to expose to a model? (Choose all that apply.)",
+     "options": [
+      "An allowlist of devices and validated argument formats",
+      "A single run_cli(command) tool for flexibility",
+      "Write tools that default to dry_run=True",
+      "Credentials loaded from the environment or a vault",
+      "Returning the full running configuration for every query"
+     ],
+     "answer": [
+      0,
+      2,
+      3
+     ],
+     "explanation": "Allowlists, validation, safe defaults and externalized least-privilege credentials limit what a wrong or manipulated call can do. A generic CLI tool and huge raw outputs do the opposite."
+    },
+    {
+     "question": "When should you choose the Streamable HTTP transport instead of stdio? (Choose all that apply.)",
+     "options": [
+      "When several users or hosts must share one central server",
+      "When the server must run on a different machine from the host",
+      "When you want to avoid any authentication",
+      "When you only test locally in MCP Inspector"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "Streamable HTTP suits remote and shared servers, and it must then be protected with TLS and authentication. For local development and single-user desktop hosts, stdio is simpler."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- **MCP** standardizes how AI hosts discover and call external capabilities. Hosts run clients; your code is the **server**.\n- Servers offer **tools** (model-controlled), **resources** (application-controlled) and **prompts** (user-selected), over JSON-RPC 2.0 on **stdio** or **Streamable HTTP**.\n- **FastMCP** turns decorated functions into tools, deriving the schema from type hints and the description from the docstring.\n- Test with **MCP Inspector** (`mcp dev`) and ordinary unit tests before connecting a model.\n- Make the server safe in code: read-only tools first, allowlists, input validation, `dry_run` defaults, least-privilege credentials, short structured results and logging. Never write to stdout in a stdio server."
+  }
+ ],
+ "ar": {
+  "title": "بناء خادم MCP باستخدام Python FastMCP",
+  "summary": "ابنِ خادمًا لبروتوكول سياق النموذج (MCP) في Python باستخدام FastMCP يعرض أدوات شبكية آمنة ومُتحقَّقًا منها فوق RESTCONF، ثم اختبره باستخدام MCP Inspector قبل أن يستخدمه أي نموذج ذكاء اصطناعي.",
+  "objectives": [
+   "وصف أدوار المضيف والعميل والخادم في MCP، وعناصر الأدوات والموارد والقوالب",
+   "المقارنة بين وسيلتي النقل stdio وStreamable HTTP واختيار المناسبة لكل حالة",
+   "بناء خادم FastMCP تغلّف أدواته استدعاءات RESTCONF على IOS XE",
+   "اختبار الخادم باستخدام MCP Inspector وقراءة تبادل رسائل JSON-RPC",
+   "تطبيق قوائم السماح والتحقق من المدخلات والتشغيل التجريبي الافتراضي ومبدأ أقل الصلاحيات على أدوات MCP"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يريد مركز عمليات الشبكة (NOC) لديك مساعدًا ذكيًا يجيب عن سؤال مثل: «هل الواجهة GigabitEthernet0/0/1 على الموجّه edge-rtr1 تعمل، وهل تظهر عليها أخطاء؟» من دون أن يلصق أحدٌ مخرجات `show` في نافذة المحادثة. والطريق المختصر الواضح، أي منح النموذج وصولًا عبر SSH إلى الموجّه، هو أخطر الطرق أيضًا. ما تحتاجه فعلًا هو مجموعة صغيرة ومحددة من الإجراءات التي يحق للنموذج طلبها، وكل إجراء منها تقف خلفه شيفرة كتبتَها واختبرتَها وتستطيع تدقيقها.\n\nهذا بالضبط ما يقدمه **بروتوكول سياق النموذج (Model Context Protocol - MCP)**، وهو معيار مفتوح: تكتب **خادم MCP** يعرض أدوات، فيستطيع أي تطبيق ذكاء اصطناعي يدعم MCP اكتشافها واستدعاءها. ويتوقع منهج AUTOCOR 350-901 v2.0 أن تبني خادمًا كهذا، وأسرع طريق إلى ذلك في Python هو **FastMCP**. ستبني في هذا الدرس خادمًا يغلب عليه طابع القراءة لموجّهات IOS XE فوق RESTCONF."
+   },
+   {
+    "id": "what",
+    "type": "text",
+    "markdown": "## ما هو MCP؟\n\nيفصل MCP تطبيق الذكاء الاصطناعي عن الأنظمة التي يتعامل معها، وتشارك فيه ثلاثة أدوار:\n\n- **المضيف (Host)**: تطبيق الذكاء الاصطناعي الذي يستخدمه المهندس، كعميل محادثة أو بيئة تطوير (IDE) أو روبوت ChatOps. وهو يملك النموذج اللغوي والمحادثة.\n- **العميل (Client)**: موصِّل داخل المضيف، يحتفظ كل عميل بجلسة واحدة مع خادم واحد.\n- **الخادم (Server)**: برنامجك أنت، يعرض القدرات وينفّذ الشيفرة التي خلفها.\n\nالرسائل طلبات واستجابات وإشعارات بصيغة **JSON-RPC 2.0**. تبدأ الجلسة بطلب `initialize` يتفق فيه الطرفان على إصدار البروتوكول والقدرات، يليه إشعار `initialized`. بعد ذلك يستطيع العميل سرد ما يعرضه الخادم واستخدامه.\n\n### العناصر الأساسية في الخادم\n\n| العنصر | من يتحكم فيه | مثال شبكي |\n|:--|:--|:--|\n| **الأداة (Tool)** | النموذج يقرر متى يستدعيها | `get_interface_status(hostname, interface)` |\n| **المورد (Resource)** | التطبيق يقرؤه سياقًا | `inventory://devices`، أو إعداد مرجعي |\n| **القالب (Prompt)** | المستخدم يختاره | «تشخيص مشكلة واجهة» |\n\n### وسائل النقل (Transports)\n\n- **stdio**: يشغّل المضيف الخادم عملية فرعية ويتبادل معه الرسائل عبر المدخل والمخرج القياسيين. وهي بسيطة ومحلية، ولا يرث الخادم إلا البيئة التي تمنحه إياها.\n- **Streamable HTTP**: يعمل الخادم خدمة ويب دائمة يتشاركها عملاء كثيرون، فيحتاج إلى TLS والمصادقة والتحكم في الوصول الشبكي كأي واجهة برمجة (API) أخرى."
+   },
+   {
+    "id": "fastmcp",
+    "type": "text",
+    "markdown": "## FastMCP في حزمة Python الرسمية\n\nتتضمن حزمة MCP الرسمية لـ Python (`pip install \"mcp[cli]\"`) واجهة **FastMCP**، وهي واجهة عالية المستوى تحوّل الدوال العادية إلى عناصر MCP باستخدام المزخرفات (Decorators). وهناك حزمة مستقلة اسمها `fastmcp` يطورها المجتمع وتوسّع الأفكار نفسها بميزات إضافية؛ أما الشيفرة هنا فتستخدم نسخة الحزمة الرسمية المستوردة من `mcp.server.fastmcp`.\n\nتؤدي FastMCP عنك ثلاث مهام مفيدة:\n\n1. **المخطط من تلميحات الأنواع (Type hints).** يتحول `hostname: str` و`dry_run: bool = True` إلى مخطط JSON Schema، فيعرف النموذج أسماء الوسائط وأنواعها والإلزامي منها.\n2. **الوصف من سلسلة التوثيق (Docstring).** يقرأ النموذج سلسلة التوثيق ليقرر *متى* يستخدم الأداة، فاكتبها للنموذج: ماذا تفعل الأداة، والصيغ المقبولة للوسائط، ومثالًا.\n3. **تفاصيل البروتوكول.** تتولى `initialize` و`tools/list` و`tools/call` والتسلسل ومعالجة الأخطاء. فإذا رفعت دالتك استثناءً، يتلقى العميل نتيجة فيها `isError: true` مع رسالة الخطأ، بدلًا من انهيار الخادم.\n\nيغلّف الخادم التالي واجهة RESTCONF على IOS XE. فهو يحفظ بيانات الاعتماد في متغيرات البيئة، ويرفض الأجهزة المجهولة وأسماء الواجهات غير الصحيحة، ويجعل أداة الكتابة الوحيدة فيه تشغيلًا تجريبيًا افتراضيًا. ولتفاصيل RESTCONF راجع [RESTCONF with YANG Models](/learn/network-automation-devops/restconf-with-yang-models)."
+   },
+   {
+    "id": "server",
+    "type": "code",
+    "language": "python",
+    "filename": "netops_server.py",
+    "highlight": [
+     9,
+     14,
+     16,
+     22,
+     33,
+     34,
+     40,
+     53,
+     70,
+     85,
+     93
+    ],
+    "caption": "كل قدرة هي دالة Python مزخرفة. وتُفرض قائمة الأجهزة المسموح بها وفحوص المدخلات والتشغيل التجريبي الافتراضي في الشيفرة، لا في التعليمات النصية للنموذج.",
+    "code": "\"\"\"netops_server.py - a read-mostly MCP server for IOS XE routers.\"\"\"\nimport json\nimport logging\nimport os\nimport re\nfrom urllib.parse import quote\n\nimport requests\nfrom mcp.server.fastmcp import FastMCP\n\nlogging.basicConfig(level=logging.INFO)          # logs go to stderr, never stdout\nlog = logging.getLogger(\"netops\")\n\nmcp = FastMCP(\"netops\")\n\nINVENTORY = {\"edge-rtr1\": \"192.0.2.11\", \"edge-rtr2\": \"192.0.2.12\"}\nIFACE_RE = re.compile(r\"^(GigabitEthernet|TenGigabitEthernet|Loopback)\\d+(/\\d+){0,2}$\")\nHEADERS = {\"Accept\": \"application/yang-data+json\",\n           \"Content-Type\": \"application/yang-data+json\"}\n\n\ndef _check(hostname, interface):\n    if hostname not in INVENTORY:\n        raise ValueError(f\"unknown device {hostname!r}; call list_devices first\")\n    if not IFACE_RE.match(interface):\n        raise ValueError(\"interface must be a full name such as GigabitEthernet0/0/1\")\n\n\ndef _restconf(method, hostname, path, body=None):\n    resp = requests.request(\n        method, f\"https://{INVENTORY[hostname]}/restconf/data/{path}\",\n        headers=HEADERS, json=body, timeout=10,\n        auth=(os.environ[\"NETOPS_USER\"], os.environ[\"NETOPS_PASS\"]),\n        verify=os.environ.get(\"NETOPS_CA_BUNDLE\", True),\n    )\n    resp.raise_for_status()\n    return resp.json() if resp.content else {}\n\n\n@mcp.resource(\"inventory://devices\")\ndef inventory() -> str:\n    \"\"\"The devices this server is allowed to reach.\"\"\"\n    return json.dumps(INVENTORY)\n\n\n@mcp.tool()\ndef list_devices() -> list[str]:\n    \"\"\"List the hostnames this server can query.\"\"\"\n    return sorted(INVENTORY)\n\n\n@mcp.tool()\ndef get_interface_status(hostname: str, interface: str) -> dict:\n    \"\"\"Return the admin status, oper status and input errors of one interface.\n\n    hostname: a name returned by list_devices, for example edge-rtr1\n    interface: the full IOS XE name, for example GigabitEthernet0/0/1\n    \"\"\"\n    _check(hostname, interface)\n    path = f\"ietf-interfaces:interfaces-state/interface={quote(interface, safe='')}\"\n    data = _restconf(\"GET\", hostname, path)[\"ietf-interfaces:interface\"]\n    return {\"interface\": data[\"name\"],\n            \"admin_status\": data[\"admin-status\"],\n            \"oper_status\": data[\"oper-status\"],\n            \"in_errors\": int(data[\"statistics\"][\"in-errors\"])}\n\n\n@mcp.tool()\ndef set_interface_description(hostname: str, interface: str,\n                              description: str, dry_run: bool = True) -> dict:\n    \"\"\"Set an interface description. Defaults to a dry run that changes nothing.\"\"\"\n    _check(hostname, interface)\n    if not re.fullmatch(r\"[\\w .:/-]{1,80}\", description):\n        raise ValueError(\"description: 1-80 letters, digits, spaces or . : / - _\")\n    path = f\"ietf-interfaces:interfaces/interface={quote(interface, safe='')}\"\n    body = {\"ietf-interfaces:interface\": {\"name\": interface,\n                                          \"description\": description}}\n    if dry_run:\n        return {\"dry_run\": True, \"would_patch\": path, \"body\": body}\n    _restconf(\"PATCH\", hostname, path, body)\n    log.info(\"description changed on %s %s\", hostname, interface)\n    return {\"dry_run\": False, \"changed\": True}\n\n\n@mcp.prompt()\ndef troubleshoot_interface(hostname: str, interface: str) -> str:\n    \"\"\"A reusable, read-only troubleshooting prompt.\"\"\"\n    return (f\"Check {interface} on {hostname} with get_interface_status. \"\n            \"Report admin status, oper status and input errors. Change nothing.\")\n\n\nif __name__ == \"__main__\":\n    mcp.run()                     # stdio transport by default\n"
+   },
+   {
+    "id": "mcp-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "سؤال واحد واستدعاء أداة واحد",
+    "caption": "لا يلمس النموذج الموجّه أبدًا؛ بل يطلب من المضيف استدعاء أداة، وخادمك هو من يقرر ما يحدث فعلًا.",
+    "data": {
+     "actors": [
+      {
+       "id": "eng",
+       "label": "المهندس",
+       "icon": "user"
+      },
+      {
+       "id": "host",
+       "label": "مضيف الذكاء الاصطناعي",
+       "sub": "LLM + عميل MCP",
+       "icon": "laptop"
+      },
+      {
+       "id": "srv",
+       "label": "خادم MCP",
+       "sub": "netops_server.py",
+       "icon": "server"
+      },
+      {
+       "id": "rtr",
+       "label": "edge-rtr1",
+       "sub": "192.0.2.11 RESTCONF",
+       "icon": "router"
+      }
+     ],
+     "steps": [
+      {
+       "from": "host",
+       "to": "srv",
+       "label": "initialize",
+       "detail": "protocolVersion, capabilities",
+       "note": "يشغّل المضيف الخادم عبر stdio، ويتفاوض الطرفان على إصدار البروتوكول والقدرات."
+      },
+      {
+       "from": "host",
+       "to": "srv",
+       "label": "tools/list",
+       "note": "يسأل العميل عن الأدوات المتاحة، فتعيد FastMCP الأسماء وسلاسل التوثيق ومخططات JSON Schema."
+      },
+      {
+       "from": "eng",
+       "to": "host",
+       "label": "هل Gi0/0/1 على edge-rtr1 تعمل؟",
+       "note": "يطرح المهندس سؤاله بلغة طبيعية، فيمرر المضيف السؤال وقائمة الأدوات إلى النموذج."
+      },
+      {
+       "from": "host",
+       "to": "srv",
+       "label": "tools/call get_interface_status",
+       "detail": "hostname=edge-rtr1 interface=GigabitEthernet0/0/1",
+       "tone": "secure",
+       "note": "يختار النموذج أداة ووسائط، وتتحقق شيفرتك من كليهما قبل أن يغادر أي طلب الخادم."
+      },
+      {
+       "from": "srv",
+       "to": "rtr",
+       "label": "GET /restconf/data/ietf-interfaces:interfaces-state/...",
+       "note": "يستخدم الخادم بيانات اعتماده الخاصة للقراءة فقط، ويتحقق من شهادة TLS الخاصة بالموجّه."
+      },
+      {
+       "from": "rtr",
+       "to": "srv",
+       "label": "200 OK",
+       "detail": "admin-status up, oper-status down",
+       "tone": "success",
+       "note": "يعيد الموجّه بيانات JSON مبنية على نماذج YANG."
+      },
+      {
+       "from": "srv",
+       "to": "host",
+       "label": "النتيجة",
+       "detail": "isError=false, 4 fields",
+       "note": "يعيد الخادم ملخصًا قصيرًا منظّمًا بدلًا من الحمولة كاملة، فيبقى سياق النموذج صغيرًا."
+      },
+      {
+       "from": "host",
+       "to": "eng",
+       "label": "مفعّلة إداريًا، متوقفة تشغيليًا، 0 أخطاء إدخال",
+       "tone": "warning",
+       "note": "يصوغ النموذج الإجابة ويقترح فحص الكابل أو الطرف المقابل، من دون أن يغيّر شيئًا."
+      }
+     ]
+    }
+   },
+   {
+    "id": "run",
+    "type": "text",
+    "markdown": "## تشغيل الخادم واختباره\n\nفي أثناء التطوير، شغّل الخادم تحت **MCP Inspector** باستخدام `mcp dev`. وهو واجهة ويب محلية تتصل بالخادم بصفتها عميلًا، فتعرض أدواتك ومواردك وقوالبك، وتتيح لك استدعاءها بوسائط من اختيارك، وتُظهر حركة JSON-RPC الخام. اختبر كل أداة هنا قبل ربط أي نموذج، لأن الخطأ الذي يظهر بوضوح في Inspector يصعب كثيرًا اكتشافه من خلال إعادة صياغة النموذج اللغوي له.\n\nلربط مضيف ذكاء اصطناعي على سطح المكتب، تسجّل في إعداداته أمرًا مثل `uv run python netops_server.py`، فيشغّل المضيف الخادم عبر stdio عند الحاجة. ولمشاركة خادم واحد بين أعضاء الفريق، غيّر وسيلة النقل باستخدام `mcp.run(transport=\"streamable-http\")` وضعه خلف TLS والمصادقة. أما لاختبار الأدوات في خط CI، فاستدعِ دوال Python العادية باستخدام `unittest` أو `pytest` مع محاكاة `requests`، تمامًا كما تختبر أي شيفرة أتمتة أخرى."
+   },
+   {
+    "id": "run-term",
+    "type": "terminal",
+    "title": "الإعداد والفحص والتشغيل",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "uv init netops-mcp && cd netops-mcp",
+      "comment": "أنشئ مشروعًا باستخدام uv (يعمل الأمر pip install \"mcp[cli]\" أيضًا)"
+     },
+     {
+      "cmd": "uv add \"mcp[cli]\" requests",
+      "output": "Resolved 32 packages in 1.21s\nInstalled 30 packages in 410ms\n + mcp==1.x.x\n + requests==2.x.x\n ...",
+      "comment": "ثبّت حزمة MCP الرسمية لـ Python، وهي تتضمن FastMCP وأداة سطر الأوامر mcp"
+     },
+     {
+      "cmd": "export NETOPS_USER=netops-ro NETOPS_PASS='<lab-password>'",
+      "comment": "بيانات اعتماد مختبرية للقراءة فقط؛ لا تكتبها أبدًا داخل شيفرة الخادم"
+     },
+     {
+      "cmd": "uv run mcp dev netops_server.py",
+      "output": "Starting MCP inspector...\nProxy server listening on port 6277\nMCP Inspector is up and running at http://127.0.0.1:6274",
+      "comment": "شغّل الخادم تحت MCP Inspector: اعرض الأدوات واستدعِها وشاهد رسائل JSON-RPC الخام"
+     },
+     {
+      "cmd": "uv run python netops_server.py",
+      "comment": "شغّله مباشرة عبر stdio: لا يطبع شيئًا وينتظر رسائل JSON-RPC على مدخله القياسي (Ctrl+C للإيقاف)"
+     }
+    ],
+    "caption": "المخرجات مختصرة؛ وتعتمد إصدارات الحزم ومنافذ Inspector على إصدار الحزمة لديك."
+   },
+   {
+    "id": "wire",
+    "type": "code",
+    "language": "json",
+    "filename": "jsonrpc-exchange.json",
+    "caption": "ما يعرضه Inspector على السلك: الاكتشاف عبر tools/list ثم استدعاء tools/call واحد. أُضيفت التعليقات لتسهيل القراءة، ولا تحتوي رسائل JSON-RPC الحقيقية على تعليقات.",
+    "code": "// Client -> server: which tools exist?\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\"}\n\n// Server -> client (one tool shown). The schema comes from the type hints.\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"result\": {\"tools\": [{\n  \"name\": \"get_interface_status\",\n  \"description\": \"Return the admin status, oper status and input errors of one interface. ...\",\n  \"inputSchema\": {\"type\": \"object\",\n    \"properties\": {\"hostname\": {\"title\": \"Hostname\", \"type\": \"string\"},\n                   \"interface\": {\"title\": \"Interface\", \"type\": \"string\"}},\n    \"required\": [\"hostname\", \"interface\"]}}]}}\n\n// Client -> server: the model chose a tool and its arguments\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",\n \"params\": {\"name\": \"get_interface_status\",\n            \"arguments\": {\"hostname\": \"edge-rtr1\", \"interface\": \"GigabitEthernet0/0/1\"}}}\n\n// Server -> client: the result the model will read\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"result\": {\n  \"content\": [{\"type\": \"text\", \"text\": \"{\\\"interface\\\": \\\"GigabitEthernet0/0/1\\\", \\\"admin_status\\\": \\\"up\\\", \\\"oper_status\\\": \\\"down\\\", \\\"in_errors\\\": 0}\"}],\n  \"isError\": false}}"
+   },
+   {
+    "id": "design",
+    "type": "text",
+    "markdown": "## تصميم أدوات آمنة لتسليمها إلى نموذج\n\nسيستدعي النموذج أدواتك بأي وسائط يظنها صحيحة، بما فيها الخاطئة. لذا عامل كل وسيط على أنه مُدخل غير موثوق.\n\n- **القراءة أولًا.** ابدأ بأدوات تقتصر على المراقبة، ثم أضف أدوات الكتابة لاحقًا، إجراءً ضيقًا واحدًا في كل مرة، ولا تُنشئ أبدًا أداة «نفّذ أي أمر CLI».\n- **قوائم السماح والتحقق.** لا تقبل إلا أسماء أجهزة معروفة وأسماء واجهات سليمة الصيغة ونصوصًا محدودة الطول، وارفض ما عداها برسالة خطأ واضحة يستطيع النموذج التصرف بناءً عليها.\n- **قيم افتراضية آمنة.** يعني الوسيط `dry_run: bool = True` أن على النموذج أن يطلب التغيير صراحة، ويستطيع المضيف عندئذ اشتراط موافقة بشرية على ذلك الاستدعاء.\n- **بيانات اعتماد بأقل الصلاحيات.** ينبغي أن يملك حساب الخادم صلاحيات RESTCONF التي تحتاجها أدواته فقط، ويُفضَّل ضبطها عبر تفويض الأوامر في TACACS+ أو دور مقيَّد. وحمّل الأسرار من البيئة أو من خزنة أسرار (Vault).\n- **نتائج موجزة ومنظمة.** أعد الحقول التي تجيب عن السؤال، لا ألفي سطر من الإعداد الجاري؛ فالمخرجات الضخمة تهدر السياق وتطمر الحقائق.\n- **سجل تدقيق.** سجّل كل استدعاء كتابة: من ومتى وماذا. وتساعد توصيفات الأدوات (Tool annotations) مثل `readOnlyHint` و`destructiveHint` المضيفَ على تقرير متى يطلب التأكيد، لكنها مجرد تلميحات؛ فشيفرتك هي التي يجب أن تفرض القواعد.\n\nتعود نتائج الأدوات إلى النموذج، لذا قد يحمل وصف واجهة خبيث تعليمات محقونة. يتناول هذا الخطر درس [Security Risks in AI-Based Automation](/learn/network-automation-devops/security-risks-in-ai-based-automation)."
+   },
+   {
+    "id": "pitfalls",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أين يخطئ المتعلمون",
+    "markdown": "- **الطباعة على stdout في خادم stdio.** المخرج القياسي *هو* قناة البروتوكول، وأي `print()` عابر يُفسد تدفق JSON-RPC. اكتب السجلات إلى stderr بدلًا من ذلك.\n- **سلاسل توثيق مبهمة.** إن لم تذكر سلسلة التوثيق أن `interface` يجب أن يكون اسمًا كاملًا، فسيرسل النموذج `Gi0/0/1` ويفشل الاستدعاء.\n- **إعادة مخرجات الجهاز الخام نتيجةً.** حلّل المخرجات ولخّصها؛ فالنموذج يستنتج بصورة أفضل من أربعة حقول منه من صفحة نصوص.\n- **`verify=False` «للمختبر فقط».** غالبًا ما يتسلل إلى بيئة الإنتاج. وجّه `verify` إلى حزمة شهادات الجهة المصدِّرة (CA bundle) بدلًا من ذلك."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم موجّهًا مختبريًا تملكه، مثل Catalyst 8000V في Cisco Modeling Labs مع تفعيل `restconf` ومستخدم محلي للقراءة فقط.\n\n1. أنشئ المشروع بالأمرين `uv init` و`uv add \"mcp[cli]\" requests`، ثم احفظ `netops_server.py` بعد وضع عنوان موجّهك المختبري في `INVENTORY`.\n2. شغّل `uv run mcp dev netops_server.py`، ثم استدعِ في Inspector الأداة `list_devices`، ثم `get_interface_status` بواجهة صحيحة.\n3. استدعِها مجددًا مع ضبط `interface` على `Gi0/0/1`، ثم باسم جهاز غير موجود في قائمة الأجهزة. وتأكد أن كلا الاستدعاءين يعيد `isError: true` مع رسالة مفيدة.\n4. استدعِ `set_interface_description` دون تمرير `dry_run`، وتأكد أن شيئًا لم يتغير على الموجّه.\n5. أضف أداة قراءة فقط باسم `get_ospf_neighbors(hostname)` تعيد معرّف الجار وحالته والواجهة فقط، واختبرها في Inspector."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "بروتوكول سياق النموذج (MCP)",
+      "definition": "معيار مفتوح يتيح لتطبيقات الذكاء الاصطناعي اكتشاف الأدوات والموارد والقوالب التي تعرضها خوادم خارجية واستخدامها."
+     },
+     {
+      "term": "مضيف MCP (Host)",
+      "definition": "تطبيق الذكاء الاصطناعي، كعميل محادثة أو بيئة تطوير أو روبوت، الذي يملك النموذج ويشغّل عميل MCP لكل خادم."
+     },
+     {
+      "term": "خادم MCP (Server)",
+      "definition": "برنامج يعرض قدرات عبر MCP وينفّذ الشيفرة التي خلفها."
+     },
+     {
+      "term": "الأداة (Tool)",
+      "definition": "دالة يستطيع النموذج طلب استدعائها، يصفها اسم ووصف ومخطط JSON Schema لوسائطها."
+     },
+     {
+      "term": "المورد (Resource)",
+      "definition": "بيانات للقراءة فقط يعرّفها مُعرِّف URI، يستطيع التطبيق تحميلها في سياق النموذج."
+     },
+     {
+      "term": "القالب (Prompt) في MCP",
+      "definition": "قالب رسالة قابل لإعادة الاستخدام وذو معاملات، يختاره المستخدم."
+     },
+     {
+      "term": "FastMCP",
+      "definition": "واجهة Python عالية المستوى في حزمة MCP تحوّل الدوال المزخرفة إلى أدوات وموارد وقوالب."
+     },
+     {
+      "term": "النقل عبر stdio",
+      "definition": "يشغّل المضيف الخادم عملية فرعية ويتبادل معه رسائل JSON-RPC عبر المدخل والمخرج القياسيين."
+     },
+     {
+      "term": "Streamable HTTP",
+      "definition": "وسيلة نقل MCP للخوادم البعيدة والمشتركة، تعمل فوق HTTP وتُؤمَّن كأي واجهة برمجة ويب."
+     },
+     {
+      "term": "MCP Inspector",
+      "definition": "أداة للمطورين تُشغَّل بالأمر mcp dev، لسرد قدرات الخادم واستدعائها ومشاهدة رسائل JSON-RPC الخام."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "في FastMCP، من أين يأتي مخطط JSON Schema لوسائط الأداة؟",
+      "options": [
+       "من ملف YAML تكتبه بجوار الخادم",
+       "من تلميحات الأنواع والقيم الافتراضية في توقيع الدالة المزخرفة",
+       "يستنتجه النموذج من سلسلة التوثيق في وقت التشغيل",
+       "يولّده مضيف MCP من الاستدعاءات السابقة"
+      ],
+      "answer": 1,
+      "explanation": "تبني FastMCP الحقل inputSchema من توقيع الدالة: تتحول الأنواع إلى أنواع JSON، وتصبح المعاملات التي لا قيمة افتراضية لها إلزامية. أما سلسلة التوثيق فتصبح الوصف."
+     },
+     {
+      "question": "أي عنصر من عناصر MCP يختاره النموذج في أثناء المحادثة؟",
+      "options": [
+       "المورد (Resource)",
+       "القالب (Prompt)",
+       "الأداة (Tool)",
+       "وسيلة النقل (Transport)"
+      ],
+      "answer": 2,
+      "explanation": "الأدوات يتحكم فيها النموذج، فهو الذي يقرر متى يستدعيها. أما الموارد فسياق يتحكم فيه التطبيق، والقوالب يختارها المستخدم."
+     },
+     {
+      "question": "يعمل خادم stdio لديك في اختبارات الوحدات، لكن المضيف يبلّغ عن JSON غير صالح بعد أول استدعاء. ما السبب الأرجح؟",
+      "options": [
+       "يستخدم الخادم تلميحات الأنواع",
+       "تكتب عبارة print() إلى stdout، وهو قناة البروتوكول",
+       "ضُبطت مكتبة logging للكتابة إلى stderr",
+       "تعيد الأداة قاموسًا (dict)"
+      ],
+      "answer": 1,
+      "explanation": "في النقل عبر stdio يحمل المخرج القياسي رسائل JSON-RPC، وأي نص آخر عليه يُفسد التدفق؛ لذا يجب أن تذهب رسائل التشخيص إلى stderr."
+     },
+     {
+      "question": "أي خيارات التصميم تجعل خادم MCP الشبكي أكثر أمانًا عند عرضه على نموذج؟ (اختر كل ما ينطبق)",
+      "options": [
+       "قائمة سماح للأجهزة والتحقق من صيغ الوسائط",
+       "أداة واحدة run_cli(command) من أجل المرونة",
+       "أدوات كتابة قيمتها الافتراضية dry_run=True",
+       "تحميل بيانات الاعتماد من البيئة أو من خزنة أسرار",
+       "إعادة الإعداد الجاري كاملًا مع كل استعلام"
+      ],
+      "answer": [
+       0,
+       2,
+       3
+      ],
+      "explanation": "تحدّ قوائم السماح والتحقق والقيم الافتراضية الآمنة وبيانات الاعتماد الخارجية ذات الصلاحيات الدنيا مما يمكن أن يفعله استدعاء خاطئ أو متلاعَب به. أما أداة CLI العامة والمخرجات الخام الضخمة فتفعل العكس."
+     },
+     {
+      "question": "متى تختار وسيلة النقل Streamable HTTP بدلًا من stdio؟ (اختر كل ما ينطبق)",
+      "options": [
+       "عندما يجب أن يتشارك عدة مستخدمين أو مضيفين خادمًا مركزيًا واحدًا",
+       "عندما يجب أن يعمل الخادم على جهاز غير جهاز المضيف",
+       "عندما تريد تجنب أي مصادقة",
+       "عندما تختبر محليًا فقط في MCP Inspector"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "تناسب Streamable HTTP الخوادم البعيدة والمشتركة، ويجب عندئذ حمايتها بـ TLS والمصادقة. أما للتطوير المحلي ولمضيفي سطح المكتب أحاديي المستخدم، فـ stdio أبسط."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يوحّد **MCP** طريقة اكتشاف مضيفي الذكاء الاصطناعي للقدرات الخارجية واستدعائها؛ فالمضيفون يشغّلون العملاء، وشيفرتك هي **الخادم**.\n- تعرض الخوادم **أدوات** (يتحكم فيها النموذج) و**موارد** (يتحكم فيها التطبيق) و**قوالب** (يختارها المستخدم)، عبر JSON-RPC 2.0 فوق **stdio** أو **Streamable HTTP**.\n- تحوّل **FastMCP** الدوال المزخرفة إلى أدوات، فتستمد المخطط من تلميحات الأنواع والوصف من سلسلة التوثيق.\n- اختبر باستخدام **MCP Inspector** (`mcp dev`) واختبارات الوحدات العادية قبل ربط أي نموذج.\n- اجعل الخادم آمنًا في الشيفرة: أدوات القراءة أولًا، وقوائم السماح، والتحقق من المدخلات، والقيمة الافتراضية `dry_run`، وبيانات اعتماد بأقل الصلاحيات، ونتائج قصيرة منظمة، وتسجيل الأحداث. ولا تكتب أبدًا إلى stdout في خادم stdio."
+   }
+  ]
+ }
+}

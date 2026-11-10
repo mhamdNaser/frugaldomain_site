@@ -15,9 +15,9 @@
 | | العدد |
 |:--|--:|
 | دروس المنهج | **655** |
-| دروس مكتوبة باللغتين | **71** |
+| دروس مكتوبة باللغتين | **227** |
 | دروس مراجعة (تُولَّد تلقائياً وتحيل إلى الدرس الأصلي) | **90** |
-| **دروس متبقية للكتابة** | **494** |
+| **دروس متبقية للكتابة** | **338** |
 
 > **ملاحظة:** درس المراجعة لا يُكتب له محتوى. يُنشر تلقائياً عند كتابة الدرس
 > الأصلي الذي يحيل إليه وإعادة تشغيل الـ seeder. لذلك ترتيب الدفعات أدناه
@@ -28,6 +28,13 @@
 - [x] Cisco CCST Cybersecurity (17)
 - [x] Cisco CCNA Cybersecurity (19)
 - [x] Cisco CCNA 200-301 (27) — الدفعة 1
+- [x] Cisco CCNA Automation 200-901 (26) — الدفعة 2
+- [x] Cisco CCNP Security SCOR (27) — الدفعة 3
+- [x] Cisco CCNP Cybersecurity CBRCOR (27) — الدفعة 4
+- [x] Ethical Hacking (15) + OT Security (12) — الدفعة 5
+- [x] Cisco CCNP Automation 350-901 (23) — الدفعة 18
+- [x] Cisco CCNP Enterprise ENCOR + ENARSI (25) — الدفعة 19
+- [ ] متبقٍّ من Cisco: CCNP Data Center (22)، CCIE Security (22)، CCIE Data Center (23)
 
 ---
 
@@ -43,10 +50,10 @@
 | # | الدورة | المرحلة | الدروس | تفتح مراجعات في | تم |
 |--:|:--|:--|--:|:--|:-:|
 | 1 | Networking Foundations | Cisco CCNA (200-301) | 27 | الأساسيات، أمن الشبكات | [x] |
-| 2 | Network Automation & DevOps | Cisco CCNA Automation (200-901) | 26 | الأتمتة والهندسة الأمنية | [ ] |
-| 3 | Cisco Security Track | Cisco CCNP Security (SCOR 350-701) | 27 | أمن الشبكات، الهوية، الويب | [ ] |
-| 4 | Cisco Security Track | Cisco CCNP Cybersecurity (CBRCOR 350-201) | 27 | المراقبة، الاستجابة للحوادث | [ ] |
-| 5 | Offensive Security / OT | Ethical Hacking (15) + OT Security (12) | 27 | اكتشاف الثغرات، الاختبار الهجومي | [ ] |
+| 2 | Network Automation & DevOps | Cisco CCNA Automation (200-901) | 26 | الأتمتة والهندسة الأمنية | [x] |
+| 3 | Cisco Security Track | Cisco CCNP Security (SCOR 350-701) | 27 | أمن الشبكات، الهوية، الويب | [x] |
+| 4 | Cisco Security Track | Cisco CCNP Cybersecurity (CBRCOR 350-201) | 27 | المراقبة، الاستجابة للحوادث | [x] |
+| 5 | Offensive Security / OT | Ethical Hacking (15) + OT Security (12) | 27 | اكتشاف الثغرات، الاختبار الهجومي | [x] |
 | 6 | Systems & Infrastructure | Secure Systems Administration (19) + Professional Network Security (8) | 27 | المراقبة، الأتمتة | [ ] |
 | 7 | Systems & Infrastructure | Proxmox & Virtualization Security | 23 | النسخ الاحتياطي | [ ] |
 | 8 | Systems & Infrastructure | Database Security | 21 | — | [ ] |
@@ -59,8 +66,8 @@
 | 15 | Architecture / Labs | Security Engineering & Design (15) + Career Paths (12) | 27 | — | [ ] |
 | 16 | Security Operations & DFIR | Advanced Professional Specialization | 18 | — | [ ] |
 | 17 | Hands-On Labs | Hands-On Labs & Building Experience | 20 | — | [ ] |
-| 18 | Network Automation & DevOps | Cisco CCNP Automation (350-901) | 23 | — | [ ] |
-| 19 | Enterprise & Data Center | Cisco CCNP Enterprise (ENCOR + ENARSI) | 25 | — | [ ] |
+| 18 | Network Automation & DevOps | Cisco CCNP Automation (350-901) | 23 | — | [x] |
+| 19 | Enterprise & Data Center | Cisco CCNP Enterprise (ENCOR + ENARSI) | 25 | — | [x] |
 | 20 | Enterprise & Data Center | Cisco CCNP Data Center (DCCOR 350-601) | 23 | — | [ ] |
 | 21 | Cisco Security Track | Cisco CCIE Security (v6.1 Lab) | 22 | — | [ ] |
 | 22 | Enterprise & Data Center | Cisco CCIE Data Center (v3.1 Lab) | 23 | — | [ ] |

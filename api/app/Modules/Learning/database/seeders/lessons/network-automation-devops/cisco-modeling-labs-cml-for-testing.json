@@ -1,0 +1,638 @@
+{
+ "slug": "cisco-modeling-labs-cml-for-testing",
+ "title": "Cisco Modeling Labs (CML) for Testing",
+ "summary": "Use Cisco Modeling Labs as a disposable test network in CI/CD: define topologies as code, create and remove labs from a pipeline, reach lab devices and design labs that give trustworthy results.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Identify which network changes CML can validate and where its fidelity ends",
+  "Describe a CML topology file and keep it in version control",
+  "Create, test and remove an ephemeral lab with the REST API, virl2_client or cmlutils",
+  "Compare console, external connector and port translation access to lab nodes",
+  "Apply design practices for parallel pipelines, cleanup and readiness"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "Your pipeline already lints YAML and runs unit tests on Jinja2 templates. Neither tells you whether OSPF adjacencies survive the change, whether the RESTCONF payload is accepted by IOS XE 17.12, or whether the rollback actually restores the network. To answer those questions you need devices, and production is the wrong place to find out.\n\n**Cisco Modeling Labs (CML)** fills that gap. Used well, it becomes a **disposable test network** that the pipeline creates from a file in Git, tests against with pyATS or Ansible, and deletes afterward. This lesson focuses on that use: topology as code, controlling CML from a pipeline, reaching lab devices, and designing labs that give trustworthy results."
+  },
+  {
+   "id": "fit",
+   "type": "text",
+   "markdown": "## What CML can and cannot prove\n\nCML runs the **real control-plane software** of Cisco platforms as virtual machines: IOS XE (`cat8000v`), classic IOS (`iosv`, `iosvl2`), NX-OS (`nxosv9000`), IOS XR (`iosxrv9000`), ASAv and FTDv, plus Linux hosts. CLI parsing, routing protocols, NETCONF/RESTCONF and YANG models behave as they do on hardware running the same release.\n\n| Good fit for CML | Poor fit for CML |\n|:--|:--|\n| Configuration syntax and ordering | Throughput, latency and QoS under load |\n| Routing protocol behavior and convergence logic | ASIC-specific features and hardware limits |\n| API payloads against a specific OS release | Optics, PoE, stacking and physical failures |\n| Rollback and idempotence of playbooks | Exact scale of a large production fabric |\n| Upgrade rehearsal with the target image | Platform features missing from the virtual image |\n\nThe rule: test **logic and configuration** in CML, and test **performance and hardware** elsewhere. When a feature is not supported by the virtual image, record that gap explicitly instead of letting a test silently skip it.\n\nCML editions limit the number of running nodes (CML-Free is the smallest; CML-Enterprise is licensed per node count), so lab size is a design constraint, not an afterthought."
+  },
+  {
+   "id": "topo-text",
+   "type": "text",
+   "markdown": "## Topology as code\n\nA CML lab can be exported as a **YAML topology file** that describes nodes, interfaces, links and each node's **day-0 configuration**. Store this file in Git next to your playbooks and tests. Then every pipeline run starts from the same known state, and a reviewer can see in a merge request when the test topology changes.\n\nKey parts of the file:\n\n- `nodes`: each with an `id`, `label`, `node_definition`, canvas position and optional `configuration` applied at first boot.\n- `interfaces`: per node, with `slot` numbers that map to interface names such as `GigabitEthernet2`.\n- `links`: pairs of node and interface ids (`n1`/`i1` to `n2`/`i2`).\n- An **external connector** node, which bridges a lab interface to a network on the CML host so runners can reach lab devices over SSH or RESTCONF.\n\nKeep day-0 configs minimal: hostname, management address, SSH and credentials sourced at runtime. Let your automation apply the rest; otherwise you are testing a hand-written config instead of your pipeline."
+  },
+  {
+   "id": "topo",
+   "type": "code",
+   "language": "yaml",
+   "filename": "topology/ospf-core.yaml",
+   "code": "lab:\n  title: ospf-core\n  description: Two-router OSPF lab used by the ospf-cost pipeline\n  version: 0.2.2\nnodes:\n  - id: n0\n    label: R1\n    node_definition: cat8000v\n    x: -200\n    y: 0\n    configuration: |-\n      hostname R1\n      interface GigabitEthernet1\n       ip address 192.0.2.11 255.255.255.0\n       no shutdown\n      interface GigabitEthernet2\n       ip address 10.0.12.1 255.255.255.252\n       ip ospf 1 area 0\n       no shutdown\n      ip ssh version 2\n    interfaces:\n      - id: i0\n        label: GigabitEthernet1\n        slot: 0\n        type: physical\n      - id: i1\n        label: GigabitEthernet2\n        slot: 1\n        type: physical\n  - id: n1\n    label: R2\n    node_definition: cat8000v\n    x: 200\n    y: 0\n    configuration: |-\n      hostname R2\n      ! ... same pattern, 192.0.2.12 and 10.0.12.2 ...\n    interfaces:\n      - id: i0\n        label: GigabitEthernet1\n        slot: 0\n        type: physical\n      - id: i1\n        label: GigabitEthernet2\n        slot: 1\n        type: physical\n  - id: n2\n    label: mgmt-bridge\n    node_definition: external_connector\n    x: 0\n    y: -150\n    configuration: bridge0\n    interfaces:\n      - id: i0\n        label: port\n        slot: 0\n        type: physical\nlinks:\n  - id: l0\n    n1: n0\n    i1: i1\n    n2: n1\n    i2: i1\n  - id: l1\n    n1: n0\n    i1: i0\n    n2: n2\n    i2: i0\n",
+   "highlight": [
+    8,
+    11,
+    49,
+    52
+   ]
+  },
+  {
+   "id": "control",
+   "type": "text",
+   "markdown": "## Driving CML from a pipeline\n\nEverything in the CML web interface is backed by a **REST API** under `/api/v0/`. A client authenticates with `POST /api/v0/authenticate` and sends the returned token as a bearer token on later calls. The controller also serves interactive API documentation for its exact version. You rarely call the raw API in CI; four tools wrap it:\n\n| Tool | Best for |\n|:--|:--|\n| `virl2_client` (Python) | Custom logic: dynamic topologies, waiting, cleanup by title |\n| `cmlutils` (`cml` CLI) | Simple pipeline steps: `cml up`, `cml generate pyats`, `cml down` |\n| Terraform provider `CiscoDevNet/cml2` | Labs managed as declarative IaC with state |\n| Ansible collection `cisco.cml` | Teams that already orchestrate everything with Ansible |\n\nA useful feature for testing is the **generated pyATS testbed**: the controller can produce a testbed YAML for a running lab (`GET .../labs/{id}/pyats_testbed`, `lab.get_pyats_testbed()` or `cml generate pyats`). Generated testbeds reach nodes through the CML **terminal server**, that is, through the node consoles, so tests work even before the management interface is configured. You still supply credentials at runtime."
+  },
+  {
+   "id": "api-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "One pipeline run with an ephemeral CML lab",
+   "caption": "The lab exists only for the duration of the test job.",
+   "data": {
+    "actors": [
+     {
+      "id": "ci",
+      "label": "CI runner",
+      "sub": "test job",
+      "icon": "server"
+     },
+     {
+      "id": "cml",
+      "label": "CML controller",
+      "sub": "cml.example.com",
+      "icon": "cloud"
+     },
+     {
+      "id": "lab",
+      "label": "Lab nodes",
+      "sub": "R1, R2",
+      "icon": "router"
+     }
+    ],
+    "steps": [
+     {
+      "from": "ci",
+      "to": "cml",
+      "label": "POST /api/v0/authenticate",
+      "detail": "username + password",
+      "note": "The runner logs in with a dedicated CI account whose password is a masked variable.",
+      "tone": "secure"
+     },
+     {
+      "from": "cml",
+      "to": "ci",
+      "label": "Bearer token",
+      "note": "Later calls send this token in the Authorization header."
+     },
+     {
+      "from": "ci",
+      "to": "cml",
+      "label": "POST /api/v0/import",
+      "detail": "ospf-core.yaml",
+      "note": "The topology file from Git becomes a new lab with a unique title per pipeline."
+     },
+     {
+      "from": "cml",
+      "to": "lab",
+      "label": "Start nodes",
+      "detail": "day-0 config",
+      "note": "The controller boots each VM and applies its day-0 configuration."
+     },
+     {
+      "from": "ci",
+      "to": "cml",
+      "label": "GET .../check_if_converged",
+      "detail": "true",
+      "note": "The runner waits until every node reports it has booted.",
+      "tone": "success"
+     },
+     {
+      "from": "ci",
+      "to": "cml",
+      "label": "GET .../pyats_testbed",
+      "note": "The controller returns a testbed that reaches nodes through its terminal server."
+     },
+     {
+      "from": "ci",
+      "to": "lab",
+      "label": "pyATS / Ansible tests",
+      "detail": "SSH, RESTCONF",
+      "note": "The change is applied and verified against the lab devices."
+     },
+     {
+      "from": "ci",
+      "to": "cml",
+      "label": "stop, wipe, DELETE",
+      "note": "Cleanup runs even if the tests failed, so node licenses are freed.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "id": "labctl",
+   "type": "code",
+   "language": "python",
+   "filename": "ci/lab_ctl.py",
+   "code": "\"\"\"Create, test and remove a throwaway CML lab for one pipeline run.\"\"\"\nimport os\nimport sys\nfrom virl2_client import ClientLibrary\n\n\ndef client():\n    return ClientLibrary(os.environ[\"CML_URL\"],          # https://cml.example.com\n                         os.environ[\"CML_USERNAME\"],\n                         os.environ[\"CML_PASSWORD\"],     # masked CI/CD variable\n                         ssl_verify=os.environ.get(\"CML_CA_BUNDLE\", True))\n\n\ndef up(topology):\n    title = f\"ci-{os.environ['CI_PIPELINE_ID']}-ospf-core\"   # unique per pipeline\n    lab = client().import_lab_from_path(topology, title=title)\n    lab.start(wait=True)                 # blocks until every node has converged\n    with open(\"testbed.yaml\", \"w\") as f:\n        f.write(lab.get_pyats_testbed())  # testbed generated by the CML controller\n    print(f\"lab {lab.id} {lab.state()}\")\n\n\ndef down():\n    title = f\"ci-{os.environ['CI_PIPELINE_ID']}-ospf-core\"\n    for lab in client().find_labs_by_title(title):\n        lab.stop(wait=True)\n        lab.wipe(wait=True)              # discard disk state\n        lab.remove()                     # free the node licenses\n\n\nif __name__ == \"__main__\":\n    up(sys.argv[2]) if sys.argv[1] == \"up\" else down()\n",
+   "caption": "Called as `python ci/lab_ctl.py up topology/ospf-core.yaml` in the job script and `python ci/lab_ctl.py down` in `after_script`, which runs even when the job fails."
+  },
+  {
+   "id": "cmlutils",
+   "type": "terminal",
+   "title": "The same workflow with cmlutils",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "export VIRL_HOST=cml.example.com VIRL_USERNAME=ci-bot",
+     "comment": "The password comes from VIRL_PASSWORD, set as a masked CI/CD variable, never typed on the command line."
+    },
+    {
+     "cmd": "cml up -f topology/ospf-core.yaml",
+     "output": "Importing lab ospf-core from file topology/ospf-core.yaml\nStarting lab ospf-core (ID: 3f9a1c)"
+    },
+    {
+     "cmd": "cml nodes",
+     "output": "Here is a list of nodes in this lab\n+-------+-------------+------------+--------+-------+---------------+\n| ID    | Label       | Type       | State  | Wiped | L3 Address(es)|\n+-------+-------------+------------+--------+-------+---------------+\n| 8a1e2 | R1          | cat8000v   | BOOTED | False | 192.0.2.11    |\n| 51c07 | R2          | cat8000v   | BOOTED | False | 192.0.2.12    |\n| d44b9 | mgmt-bridge | ext-conn   | BOOTED | False |               |\n+-------+-------------+------------+--------+-------+---------------+"
+    },
+    {
+     "comment": "All nodes are BOOTED. R1 and R2 have management addresses on the bridged network."
+    },
+    {
+     "cmd": "cml generate pyats -o testbed.yaml",
+     "output": "Writing testbed.yaml"
+    },
+    {
+     "cmd": "cml command R1 \"show ip ospf neighbor\"",
+     "output": "Neighbor ID     Pri   State           Dead Time   Address         Interface\n192.0.2.12        1   FULL/DR         00:00:36    10.0.12.2       GigabitEthernet2"
+    },
+    {
+     "comment": "The adjacency is FULL, so the lab is ready for the change under test."
+    },
+    {
+     "cmd": "cml down",
+     "output": "Shutting down lab ospf-core (ID: 3f9a1c)....\nSUCCESS"
+    }
+   ],
+   "caption": "Output abbreviated; the cml command needs pyATS installed. cmlutils reads its connection settings from VIRL_* environment variables."
+  },
+  {
+   "id": "reach",
+   "type": "text",
+   "markdown": "## Reaching lab devices\n\nA test runner can reach lab nodes in three ways:\n\n1. **Console through the terminal server.** No lab addressing is needed, and it works during boot or after a bad change breaks management access. It is slower and serial, which suits verification more than bulk configuration.\n2. **External connector (bridge or NAT).** A lab interface is bridged to a host network, so nodes get reachable management addresses such as 192.0.2.11. This is the closest match to production, where automation uses SSH, NETCONF or RESTCONF over the management network.\n3. **Port address translation (PATty).** Recent CML releases can map a port on the CML host to a port on a node, which avoids exposing a whole bridged network.\n\nTest the same transport you use in production. A playbook that passes over the console but uses RESTCONF in production has not been tested."
+  },
+  {
+   "id": "design",
+   "type": "text",
+   "markdown": "## Designing labs that give trustworthy results\n\n- **Match roles and releases, not size.** Two routers per role, with the **same OS image version** as production, beat a 40-node replica that does not fit your license.\n- **One lab per pipeline.** Include `CI_PIPELINE_ID` in the title so parallel pipelines never test against each other's labs.\n- **Serialize when capacity is tight.** A GitLab `resource_group` lets only one job at a time use the CML server.\n- **Always clean up.** Remove labs in `after_script` and schedule a job that deletes labs older than a few hours whose title starts with `ci-`.\n- **Wait for real readiness.** A node can be *BOOTED* while OSPF is still forming adjacencies. Your test must poll for the state it needs (see [Change Validation with pyATS](/learn/network-automation-devops/change-validation-with-pyats)).\n- **Keep secrets out of the topology file.** It lives in Git; inject credentials at runtime."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Where learners go wrong",
+   "markdown": "- **Leaving labs running after a failed job.** Cleanup in the main `script` never runs when an earlier line fails. Use `after_script` or a `finally` block.\n- **Testing a different OS release.** A RESTCONF payload that works on one IOS XE release may fail on another. Keep CML image definitions aligned with production.\n- **Treating BOOTED as ready.** Converged means the VM booted, not that protocols or APIs are up.\n- **Putting production credentials into day-0 configs.** Lab devices should use lab-only accounts."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use CML-Free on your own computer or a CML instance you are authorized to use.\n\n1. Build two `cat8000v` or `iosv` routers with one link, add OSPF in the day-0 configurations, and export the lab as YAML.\n2. Delete the lab, then recreate it with `cml up -f <file>` and confirm with `cml nodes` that both nodes are booted.\n3. Run `cml generate pyats -o testbed.yaml`, open the file and find the terminal server entry.\n4. Write a small `virl2_client` script that imports the file with a unique title, starts it, prints the lab id, and removes the lab in a `finally` block.\n5. Make the script fail deliberately before the cleanup line and confirm that the lab is still removed."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Ephemeral lab",
+     "definition": "A lab created for one pipeline run and deleted afterward, so every run starts from a known state."
+    },
+    {
+     "term": "Topology file",
+     "definition": "A YAML export of a CML lab with nodes, interfaces, links and day-0 configurations, stored in Git."
+    },
+    {
+     "term": "Node definition",
+     "definition": "The CML template for a device type, such as cat8000v, nxosv9000 or external_connector."
+    },
+    {
+     "term": "Day-0 configuration",
+     "definition": "The startup configuration CML applies to a node on its first boot."
+    },
+    {
+     "term": "External connector",
+     "definition": "A CML node that bridges or NATs a lab link to a network on the CML host."
+    },
+    {
+     "term": "Terminal server",
+     "definition": "The CML service that gives console access to every node; generated pyATS testbeds use it."
+    },
+    {
+     "term": "virl2_client",
+     "definition": "Cisco's Python library for the CML REST API."
+    },
+    {
+     "term": "cmlutils",
+     "definition": "A command-line tool (cml) for importing, starting, stopping labs and generating testbeds."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which tests are a good fit for a CML lab? (Choose all that apply.)",
+     "options": [
+      "Whether a RESTCONF payload is accepted by a specific IOS XE release",
+      "Whether OSPF adjacencies survive a configuration change",
+      "Maximum forwarding throughput of a new platform",
+      "Whether a playbook's rollback restores the previous state"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "CML runs real control-plane software, so configuration, protocols, APIs and rollback logic are realistic. Virtual data planes are not suitable for performance testing."
+    },
+    {
+     "question": "Why include CI_PIPELINE_ID in the title of a lab created by a pipeline?",
+     "options": [
+      "CML requires numeric titles",
+      "So parallel pipelines create and clean up their own labs without colliding",
+      "To license the lab",
+      "To enable the terminal server"
+     ],
+     "answer": 1,
+     "explanation": "A unique title per run lets each pipeline find and remove only its own lab."
+    },
+    {
+     "question": "A test job fails halfway, and the lab is never deleted. What is the best fix?",
+     "options": [
+      "Move cleanup to after_script or a finally block",
+      "Increase the job timeout",
+      "Use a bigger CML server",
+      "Mark the job allow_failure: true"
+     ],
+     "answer": 0,
+     "explanation": "Commands in the main script stop at the first failure. after_script and finally blocks run regardless of the outcome."
+    },
+    {
+     "question": "How do testbeds generated by the CML controller reach the nodes?",
+     "options": [
+      "Through SNMP",
+      "Through the CML terminal server, using the node consoles",
+      "Only through RESTCONF",
+      "Through the GitLab runner's Docker network"
+     ],
+     "answer": 1,
+     "explanation": "Generated testbeds connect through the terminal server, so they work even before management addressing is configured."
+    },
+    {
+     "question": "Which statements about the CML topology file are true? (Choose all that apply.)",
+     "options": [
+      "It can include each node's day-0 configuration",
+      "It should be stored in Git with the automation code",
+      "It is the right place for production passwords",
+      "Links refer to node and interface ids"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "The file holds nodes, interfaces, links and day-0 configs, and belongs in version control. Because it lives in Git, credentials must be injected at runtime instead."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- CML runs real Cisco control-plane software, so it proves **configuration, protocol and API logic**, not performance or hardware behavior.\n- Store the **topology file** in Git, with minimal day-0 configs, and let the pipeline apply the rest.\n- Drive CML with the REST API, `virl2_client`, `cmlutils`, Terraform or Ansible; create one **ephemeral lab per pipeline** and always clean up.\n- Generated pyATS testbeds use the **terminal server**; an **external connector** gives runners production-like management access.\n- Match OS releases to production, wait for real readiness, and keep secrets out of lab files.\n\nNext, package the tools around your tests with [Docker Compose](/learn/network-automation-devops/docker-compose)."
+  }
+ ],
+ "ar": {
+  "title": "Cisco Modeling Labs (CML) للاختبار",
+  "summary": "استخدم Cisco Modeling Labs شبكةَ اختبار مؤقتة في CI/CD: عرِّف الطوبولوجيات بوصفها شيفرة، وأنشئ المختبرات واحذفها من الخط، وصِل إلى أجهزة المختبر، وصمِّم مختبرات تعطي نتائج جديرة بالثقة.",
+  "objectives": [
+   "تحديد تغييرات الشبكة التي تستطيع CML التحقق منها وحدود دقتها",
+   "وصف ملف طوبولوجيا CML وحفظه في نظام التحكم في الإصدارات",
+   "إنشاء مختبر مؤقت واختباره وحذفه عبر الواجهة البرمجية أو virl2_client أو cmlutils",
+   "المقارنة بين الوصول إلى عُقد المختبر عبر وحدة التحكم والموصِّل الخارجي وترجمة المنافذ",
+   "تطبيق ممارسات التصميم للخطوط المتوازية والتنظيف والجاهزية"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يفحص خطّك بالفعل ملفات YAML فحصًا ساكنًا ويشغّل اختبارات الوحدات على قوالب Jinja2، لكنّ أيًّا منهما لا يخبرك هل ستصمد تجاورات OSPF بعد التغيير، أو هل يقبل الإصدار IOS XE 17.12 حمولة RESTCONF، أو هل يعيد التراجع (Rollback) الشبكة فعلًا إلى حالتها. للإجابة عن هذه الأسئلة تحتاج إلى أجهزة، وشبكة الإنتاج هي المكان الخطأ لاكتشاف ذلك.\n\nتسدّ **Cisco Modeling Labs (CML)** هذه الفجوة. وإذا أُحسن استخدامها صارت **شبكة اختبار مؤقتة (Disposable)** ينشئها الخط من ملف في Git، ويختبرها بـ pyATS أو Ansible، ثم يحذفها. يركّز هذا الدرس على هذا الاستخدام: الطوبولوجيا بوصفها شيفرة، والتحكم في CML من الخط، والوصول إلى أجهزة المختبر، وتصميم مختبرات تعطي نتائج جديرة بالثقة."
+   },
+   {
+    "id": "fit",
+    "type": "text",
+    "markdown": "## ما الذي تستطيع CML إثباته وما الذي لا تستطيعه\n\nتشغّل CML **برمجيات مستوى التحكم (Control plane) الحقيقية** لمنصات Cisco بوصفها أجهزة افتراضية: IOS XE (`cat8000v`)، وIOS الكلاسيكي (`iosv`، `iosvl2`)، وNX-OS (`nxosv9000`)، وIOS XR (`iosxrv9000`)، وASAv وFTDv، إضافةً إلى مضيفات Linux. فتحليل أوامر CLI وبروتوكولات التوجيه وNETCONF/RESTCONF ونماذج YANG تتصرف كما تتصرف على العتاد الذي يشغّل الإصدار نفسه.\n\n| مناسب لـ CML | غير مناسب لـ CML |\n|:--|:--|\n| صياغة الإعدادات وترتيبها | الإنتاجية والكمون وجودة الخدمة (QoS) تحت الحمل |\n| سلوك بروتوكولات التوجيه ومنطق التقارب | الميزات الخاصة بالدوائر المتكاملة (ASIC) وحدود العتاد |\n| حمولات واجهات البرمجة على إصدار محدد من النظام | الوحدات البصرية وPoE والتكديس والأعطال المادية |\n| التراجع وخاصية تساوي الأثر (Idempotence) في كتيّبات التشغيل | الحجم الفعلي لنسيج إنتاج كبير |\n| التمرّن على الترقية بالصورة المستهدفة | ميزات المنصة غير الموجودة في الصورة الافتراضية |\n\nالقاعدة: اختبر **المنطق والإعدادات** في CML، واختبر **الأداء والعتاد** في مكان آخر. وحين لا تدعم الصورة الافتراضية ميزةً ما، فسجّل هذه الفجوة صراحةً بدلًا من ترك الاختبار يتخطاها بصمت.\n\nتحدّ إصدارات CML من عدد العُقد العاملة (CML-Free هو الأصغر، وCML-Enterprise مرخَّص بحسب عدد العُقد)، فحجم المختبر قيدٌ تصميمي لا أمرٌ ثانوي."
+   },
+   {
+    "id": "topo-text",
+    "type": "text",
+    "markdown": "## الطوبولوجيا بوصفها شيفرة\n\nيمكن تصدير مختبر CML في صورة **ملف طوبولوجيا بصيغة YAML** يصف العُقد والواجهات والوصلات و**إعدادات اليوم صفر (Day-0 configuration)** لكل عقدة. احفظ هذا الملف في Git بجوار كتيّبات التشغيل والاختبارات؛ فيبدأ كل تشغيل للخط من الحالة المعروفة ذاتها، ويرى المراجِع في طلب الدمج متى تغيّرت طوبولوجيا الاختبار.\n\nالأجزاء الأساسية في الملف:\n\n- `nodes`: لكلٍّ منها `id` و`label` و`node_definition` وموضع على اللوحة، و`configuration` اختيارية تُطبَّق عند الإقلاع الأول.\n- `interfaces`: لكل عقدة، بأرقام `slot` تقابل أسماء واجهات مثل `GigabitEthernet2`.\n- `links`: أزواج من معرّفات العُقد والواجهات (`n1`/`i1` إلى `n2`/`i2`).\n- عقدة **موصِّل خارجي (External connector)** تجسِّر واجهةً في المختبر إلى شبكة على مضيف CML، كي تصل المشغّلات إلى أجهزة المختبر عبر SSH أو RESTCONF.\n\nاجعل إعدادات اليوم صفر في حدّها الأدنى: اسم المضيف، وعنوان الإدارة، وSSH، وبيانات اعتماد تُجلَب وقت التشغيل. ودع أداة الأتمتة تطبّق الباقي، وإلا فأنت تختبر إعدادات مكتوبة يدويًا لا خطّك."
+   },
+   {
+    "id": "topo",
+    "type": "code",
+    "language": "yaml",
+    "filename": "topology/ospf-core.yaml",
+    "code": "lab:\n  title: ospf-core\n  description: Two-router OSPF lab used by the ospf-cost pipeline\n  version: 0.2.2\nnodes:\n  - id: n0\n    label: R1\n    node_definition: cat8000v\n    x: -200\n    y: 0\n    configuration: |-\n      hostname R1\n      interface GigabitEthernet1\n       ip address 192.0.2.11 255.255.255.0\n       no shutdown\n      interface GigabitEthernet2\n       ip address 10.0.12.1 255.255.255.252\n       ip ospf 1 area 0\n       no shutdown\n      ip ssh version 2\n    interfaces:\n      - id: i0\n        label: GigabitEthernet1\n        slot: 0\n        type: physical\n      - id: i1\n        label: GigabitEthernet2\n        slot: 1\n        type: physical\n  - id: n1\n    label: R2\n    node_definition: cat8000v\n    x: 200\n    y: 0\n    configuration: |-\n      hostname R2\n      ! ... same pattern, 192.0.2.12 and 10.0.12.2 ...\n    interfaces:\n      - id: i0\n        label: GigabitEthernet1\n        slot: 0\n        type: physical\n      - id: i1\n        label: GigabitEthernet2\n        slot: 1\n        type: physical\n  - id: n2\n    label: mgmt-bridge\n    node_definition: external_connector\n    x: 0\n    y: -150\n    configuration: bridge0\n    interfaces:\n      - id: i0\n        label: port\n        slot: 0\n        type: physical\nlinks:\n  - id: l0\n    n1: n0\n    i1: i1\n    n2: n1\n    i2: i1\n  - id: l1\n    n1: n0\n    i1: i0\n    n2: n2\n    i2: i0\n",
+    "highlight": [
+     8,
+     11,
+     49,
+     52
+    ]
+   },
+   {
+    "id": "control",
+    "type": "text",
+    "markdown": "## التحكم في CML من الخط\n\nكل ما في واجهة الويب لـ CML تقف خلفه **واجهة REST برمجية** تحت `/api/v0/`. يصادق العميل عبر `POST /api/v0/authenticate` ثم يرسل الرمز المُعاد بوصفه رمز حامل (Bearer token) في الاستدعاءات اللاحقة. ويقدّم المتحكم كذلك توثيقًا تفاعليًا لواجهته البرمجية يطابق إصداره بالضبط. ونادرًا ما تستدعي الواجهة الخام في CI؛ إذ تغلّفها أربع أدوات:\n\n| الأداة | الأنسب لـ |\n|:--|:--|\n| `virl2_client` (Python) | المنطق المخصّص: طوبولوجيات ديناميكية، والانتظار، والتنظيف بحسب العنوان |\n| `cmlutils` (أداة `cml`) | خطوات خط بسيطة: `cml up` و`cml generate pyats` و`cml down` |\n| مزوّد Terraform ‏`CiscoDevNet/cml2` | مختبرات تُدار بوصفها بنية تحتية كشيفرة (IaC) تصريحية ذات حالة |\n| مجموعة Ansible ‏`cisco.cml` | الفرق التي تنسّق كل شيء أصلًا بـ Ansible |\n\nومن الميزات المفيدة للاختبار **ملف pyATS المولَّد**: إذ يستطيع المتحكم إنتاج ملف منصة اختبار (Testbed) لمختبر قيد التشغيل (`GET .../labs/{id}/pyats_testbed` أو `lab.get_pyats_testbed()` أو `cml generate pyats`). تصل هذه الملفات المولَّدة إلى العُقد عبر **خادم الطرفيات (Terminal server)** في CML، أي عبر منافذ وحدة التحكم (Console)، فتعمل الاختبارات حتى قبل إعداد واجهة الإدارة. لكنك تظل مسؤولًا عن تقديم بيانات الاعتماد وقت التشغيل."
+   },
+   {
+    "id": "api-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "تشغيل واحد للخط مع مختبر CML مؤقت",
+    "caption": "لا يوجد المختبر إلا طوال مدة مهمة الاختبار.",
+    "data": {
+     "actors": [
+      {
+       "id": "ci",
+       "label": "مشغّل CI",
+       "sub": "مهمة الاختبار",
+       "icon": "server"
+      },
+      {
+       "id": "cml",
+       "label": "متحكم CML",
+       "sub": "cml.example.com",
+       "icon": "cloud"
+      },
+      {
+       "id": "lab",
+       "label": "عُقد المختبر",
+       "sub": "R1، R2",
+       "icon": "router"
+      }
+     ],
+     "steps": [
+      {
+       "from": "ci",
+       "to": "cml",
+       "label": "POST /api/v0/authenticate",
+       "detail": "اسم المستخدم + كلمة المرور",
+       "note": "يسجّل المشغّل الدخول بحساب مخصّص لـ CI، وكلمة مروره متغير مقنَّع.",
+       "tone": "secure"
+      },
+      {
+       "from": "cml",
+       "to": "ci",
+       "label": "رمز حامل (Bearer token)",
+       "note": "ترسل الاستدعاءات اللاحقة هذا الرمز في الترويسة Authorization."
+      },
+      {
+       "from": "ci",
+       "to": "cml",
+       "label": "POST /api/v0/import",
+       "detail": "ospf-core.yaml",
+       "note": "يصبح ملف الطوبولوجيا القادم من Git مختبرًا جديدًا بعنوان فريد لكل خط."
+      },
+      {
+       "from": "cml",
+       "to": "lab",
+       "label": "تشغيل العُقد",
+       "detail": "إعدادات اليوم صفر",
+       "note": "يُقلع المتحكم كل جهاز افتراضي ويطبّق عليه إعدادات اليوم صفر."
+      },
+      {
+       "from": "ci",
+       "to": "cml",
+       "label": "GET .../check_if_converged",
+       "detail": "true",
+       "note": "ينتظر المشغّل حتى تُبلغ كل العُقد باكتمال إقلاعها.",
+       "tone": "success"
+      },
+      {
+       "from": "ci",
+       "to": "cml",
+       "label": "GET .../pyats_testbed",
+       "note": "يعيد المتحكم ملف منصة اختبار يصل إلى العُقد عبر خادم الطرفيات."
+      },
+      {
+       "from": "ci",
+       "to": "lab",
+       "label": "اختبارات pyATS / Ansible",
+       "detail": "SSH، RESTCONF",
+       "note": "يُطبَّق التغيير ويُتحقَّق منه على أجهزة المختبر."
+      },
+      {
+       "from": "ci",
+       "to": "cml",
+       "label": "إيقاف، مسح، DELETE",
+       "note": "يُنفَّذ التنظيف حتى لو فشلت الاختبارات، فتُحرَّر تراخيص العُقد.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "id": "labctl",
+    "type": "code",
+    "language": "python",
+    "filename": "ci/lab_ctl.py",
+    "code": "\"\"\"Create, test and remove a throwaway CML lab for one pipeline run.\"\"\"\nimport os\nimport sys\nfrom virl2_client import ClientLibrary\n\n\ndef client():\n    return ClientLibrary(os.environ[\"CML_URL\"],          # https://cml.example.com\n                         os.environ[\"CML_USERNAME\"],\n                         os.environ[\"CML_PASSWORD\"],     # masked CI/CD variable\n                         ssl_verify=os.environ.get(\"CML_CA_BUNDLE\", True))\n\n\ndef up(topology):\n    title = f\"ci-{os.environ['CI_PIPELINE_ID']}-ospf-core\"   # unique per pipeline\n    lab = client().import_lab_from_path(topology, title=title)\n    lab.start(wait=True)                 # blocks until every node has converged\n    with open(\"testbed.yaml\", \"w\") as f:\n        f.write(lab.get_pyats_testbed())  # testbed generated by the CML controller\n    print(f\"lab {lab.id} {lab.state()}\")\n\n\ndef down():\n    title = f\"ci-{os.environ['CI_PIPELINE_ID']}-ospf-core\"\n    for lab in client().find_labs_by_title(title):\n        lab.stop(wait=True)\n        lab.wipe(wait=True)              # discard disk state\n        lab.remove()                     # free the node licenses\n\n\nif __name__ == \"__main__\":\n    up(sys.argv[2]) if sys.argv[1] == \"up\" else down()\n",
+    "caption": "يُستدعى بالأمر `python ci/lab_ctl.py up topology/ospf-core.yaml` في سكربت المهمة، وبالأمر `python ci/lab_ctl.py down` في `after_script` الذي يُنفَّذ حتى عند فشل المهمة."
+   },
+   {
+    "id": "cmlutils",
+    "type": "terminal",
+    "title": "سير العمل نفسه باستخدام cmlutils",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "export VIRL_HOST=cml.example.com VIRL_USERNAME=ci-bot",
+      "comment": "تأتي كلمة المرور من VIRL_PASSWORD، المعرَّف متغيرَ CI/CD مقنَّعًا، ولا تُكتب أبدًا في سطر الأوامر."
+     },
+     {
+      "cmd": "cml up -f topology/ospf-core.yaml",
+      "output": "Importing lab ospf-core from file topology/ospf-core.yaml\nStarting lab ospf-core (ID: 3f9a1c)"
+     },
+     {
+      "cmd": "cml nodes",
+      "output": "Here is a list of nodes in this lab\n+-------+-------------+------------+--------+-------+---------------+\n| ID    | Label       | Type       | State  | Wiped | L3 Address(es)|\n+-------+-------------+------------+--------+-------+---------------+\n| 8a1e2 | R1          | cat8000v   | BOOTED | False | 192.0.2.11    |\n| 51c07 | R2          | cat8000v   | BOOTED | False | 192.0.2.12    |\n| d44b9 | mgmt-bridge | ext-conn   | BOOTED | False |               |\n+-------+-------------+------------+--------+-------+---------------+"
+     },
+     {
+      "comment": "كل العُقد في حالة BOOTED، ولكلٍّ من R1 وR2 عنوان إدارة على الشبكة المجسَّرة."
+     },
+     {
+      "cmd": "cml generate pyats -o testbed.yaml",
+      "output": "Writing testbed.yaml"
+     },
+     {
+      "cmd": "cml command R1 \"show ip ospf neighbor\"",
+      "output": "Neighbor ID     Pri   State           Dead Time   Address         Interface\n192.0.2.12        1   FULL/DR         00:00:36    10.0.12.2       GigabitEthernet2"
+     },
+     {
+      "comment": "التجاور في حالة FULL، فالمختبر جاهز لاستقبال التغيير قيد الاختبار."
+     },
+     {
+      "cmd": "cml down",
+      "output": "Shutting down lab ospf-core (ID: 3f9a1c)....\nSUCCESS"
+     }
+    ],
+    "caption": "المخرجات مختصرة، ويحتاج الأمر cml command إلى تثبيت pyATS. تقرأ cmlutils إعدادات الاتصال من متغيرات البيئة VIRL_*."
+   },
+   {
+    "id": "reach",
+    "type": "text",
+    "markdown": "## الوصول إلى أجهزة المختبر\n\nيمكن لمشغّل الاختبارات الوصول إلى عُقد المختبر بثلاث طرق:\n\n1. **وحدة التحكم عبر خادم الطرفيات.** لا تحتاج إلى أي عنونة في المختبر، وتعمل أثناء الإقلاع أو بعد أن يقطع تغييرٌ خاطئ الوصولَ الإداري. لكنها أبطأ وتسلسلية، فتناسب التحقق أكثر من الإعداد الجماعي.\n2. **الموصِّل الخارجي (جسر أو NAT).** تُجسَّر واجهة من المختبر إلى شبكة على المضيف، فتحصل العُقد على عناوين إدارة يمكن الوصول إليها مثل 192.0.2.11. وهذا أقرب ما يكون إلى الإنتاج، حيث تستخدم الأتمتة SSH أو NETCONF أو RESTCONF عبر شبكة الإدارة.\n3. **ترجمة عناوين المنافذ (PATty).** تستطيع إصدارات CML الحديثة ربط منفذ على مضيف CML بمنفذ على عقدة، فتتجنب كشف شبكة مجسَّرة كاملة.\n\nاختبر عبر وسيلة النقل نفسها التي تستخدمها في الإنتاج؛ فكتيّب التشغيل الذي ينجح عبر وحدة التحكم بينما يستخدم RESTCONF في الإنتاج لم يُختبَر فعلًا."
+   },
+   {
+    "id": "design",
+    "type": "text",
+    "markdown": "## تصميم مختبرات تعطي نتائج جديرة بالثقة\n\n- **طابِق الأدوار والإصدارات لا الحجم.** موجّهان لكل دور، بـ **إصدار نظام التشغيل نفسه** المستخدم في الإنتاج، خيرٌ من نسخة طبق الأصل من 40 عقدة لا تتسع لها رخصتك.\n- **مختبر واحد لكل خط.** ضمِّن `CI_PIPELINE_ID` في العنوان كي لا تختبر الخطوط المتوازية على مختبرات بعضها.\n- **اجعل التنفيذ تسلسليًا حين تضيق السعة.** تتيح `resource_group` في GitLab لمهمة واحدة فقط في كل مرة استخدام خادم CML.\n- **نظِّف دائمًا.** احذف المختبرات في `after_script`، وجدوِل مهمة تحذف المختبرات الأقدم من بضع ساعات التي يبدأ عنوانها بـ `ci-`.\n- **انتظر الجاهزية الحقيقية.** قد تكون العقدة في حالة *BOOTED* بينما لا يزال OSPF يبني تجاوراته، فعلى اختبارك أن يستطلع الحالة التي يحتاجها (راجع درس [التحقق من التغييرات باستخدام pyATS](/learn/network-automation-devops/change-validation-with-pyats)).\n- **أبقِ الأسرار خارج ملف الطوبولوجيا.** فهو محفوظ في Git، فاحقن بيانات الاعتماد وقت التشغيل."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة لدى المتعلّمين",
+    "markdown": "- **ترك المختبرات تعمل بعد فشل المهمة.** لا يُنفَّذ التنظيف الموضوع في `script` الرئيسي إذا فشل سطر قبله، فاستخدم `after_script` أو كتلة `finally`.\n- **الاختبار على إصدار مختلف من نظام التشغيل.** قد تنجح حمولة RESTCONF على إصدار من IOS XE وتفشل على آخر، فأبقِ تعريفات الصور في CML متوافقة مع الإنتاج.\n- **اعتبار BOOTED مرادفًا للجاهزية.** يعني التقارب أنّ الجهاز الافتراضي أقلع، لا أنّ البروتوكولات أو واجهات البرمجة تعمل.\n- **وضع بيانات اعتماد الإنتاج في إعدادات اليوم صفر.** ينبغي أن تستخدم أجهزة المختبر حسابات خاصة بالمختبر فقط."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم CML-Free على حاسوبك أو نسخة CML مصرَّحًا لك باستخدامها.\n\n1. ابنِ موجّهَين من نوع `cat8000v` أو `iosv` تربطهما وصلة واحدة، وأضِف OSPF في إعدادات اليوم صفر، ثم صدِّر المختبر بصيغة YAML.\n2. احذف المختبر، ثم أعِد إنشاءه بالأمر `cml up -f <file>`، وتأكد بالأمر `cml nodes` من إقلاع العقدتين.\n3. نفّذ `cml generate pyats -o testbed.yaml`، وافتح الملف، واعثر على مُدخَل خادم الطرفيات.\n4. اكتب سكربت `virl2_client` صغيرًا يستورد الملف بعنوان فريد، ويشغّله، ويطبع معرّف المختبر، ثم يحذفه داخل كتلة `finally`.\n5. اجعل السكربت يفشل عمدًا قبل سطر التنظيف، وتأكد من أنّ المختبر يُحذف مع ذلك."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "مختبر مؤقت (Ephemeral lab)",
+      "definition": "مختبر يُنشأ لتشغيل واحد من الخط ثم يُحذف، فيبدأ كل تشغيل من حالة معروفة."
+     },
+     {
+      "term": "ملف الطوبولوجيا (Topology file)",
+      "definition": "تصدير بصيغة YAML لمختبر CML يضم العُقد والواجهات والوصلات وإعدادات اليوم صفر، ويُحفظ في Git."
+     },
+     {
+      "term": "تعريف العقدة (Node definition)",
+      "definition": "قالب CML لنوع الجهاز، مثل cat8000v أو nxosv9000 أو external_connector."
+     },
+     {
+      "term": "إعدادات اليوم صفر (Day-0 configuration)",
+      "definition": "إعدادات بدء التشغيل التي تطبّقها CML على العقدة عند إقلاعها الأول."
+     },
+     {
+      "term": "الموصِّل الخارجي (External connector)",
+      "definition": "عقدة في CML تجسِّر وصلةً من المختبر أو تمرّرها عبر NAT إلى شبكة على مضيف CML."
+     },
+     {
+      "term": "خادم الطرفيات (Terminal server)",
+      "definition": "خدمة في CML توفّر الوصول إلى وحدة التحكم لكل عقدة، وتستخدمها ملفات pyATS المولَّدة."
+     },
+     {
+      "term": "virl2_client",
+      "definition": "مكتبة Python من Cisco للتعامل مع واجهة REST البرمجية في CML."
+     },
+     {
+      "term": "cmlutils",
+      "definition": "أداة سطر أوامر (cml) لاستيراد المختبرات وتشغيلها وإيقافها وتوليد ملفات منصات الاختبار."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أيّ الاختبارات الآتية مناسبة لمختبر CML؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "هل يقبل إصدارٌ محدد من IOS XE حمولة RESTCONF",
+       "هل تصمد تجاورات OSPF بعد تغيير في الإعدادات",
+       "أقصى إنتاجية تمرير لمنصة جديدة",
+       "هل يعيد التراجع في كتيّب التشغيل الحالة السابقة"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تشغّل CML برمجيات مستوى التحكم الحقيقية، فالإعدادات والبروتوكولات وواجهات البرمجة ومنطق التراجع واقعية فيها، أمّا مستويات البيانات الافتراضية فلا تصلح لاختبار الأداء."
+     },
+     {
+      "question": "لماذا يُضمَّن CI_PIPELINE_ID في عنوان المختبر الذي ينشئه الخط؟",
+      "options": [
+       "لأنّ CML تشترط عناوين رقمية",
+       "كي تنشئ الخطوط المتوازية مختبراتها وتنظّفها دون تصادم",
+       "لترخيص المختبر",
+       "لتفعيل خادم الطرفيات"
+      ],
+      "answer": 1,
+      "explanation": "العنوان الفريد لكل تشغيل يتيح لكل خط أن يجد مختبره وحده ويحذفه."
+     },
+     {
+      "question": "فشلت مهمة اختبار في منتصفها ولم يُحذف المختبر قط. ما أفضل إصلاح؟",
+      "options": [
+       "نقل التنظيف إلى after_script أو كتلة finally",
+       "زيادة مهلة المهمة",
+       "استخدام خادم CML أكبر",
+       "وسم المهمة بـ allow_failure: true"
+      ],
+      "answer": 0,
+      "explanation": "تتوقف أوامر السكربت الرئيسي عند أول إخفاق، أمّا after_script وكتل finally فتُنفَّذ أيًّا كانت النتيجة."
+     },
+     {
+      "question": "كيف تصل ملفات منصة الاختبار التي يولّدها متحكم CML إلى العُقد؟",
+      "options": [
+       "عبر SNMP",
+       "عبر خادم الطرفيات في CML باستخدام منافذ وحدة التحكم في العُقد",
+       "عبر RESTCONF فقط",
+       "عبر شبكة Docker الخاصة بمشغّل GitLab"
+      ],
+      "answer": 1,
+      "explanation": "تتصل الملفات المولَّدة عبر خادم الطرفيات، فتعمل حتى قبل إعداد عناوين الإدارة."
+     },
+     {
+      "question": "أيّ العبارات الآتية عن ملف طوبولوجيا CML صحيحة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "يمكن أن يتضمن إعدادات اليوم صفر لكل عقدة",
+       "ينبغي حفظه في Git مع شيفرة الأتمتة",
+       "هو المكان المناسب لكلمات مرور الإنتاج",
+       "تشير الوصلات فيه إلى معرّفات العُقد والواجهات"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يضم الملف العُقد والواجهات والوصلات وإعدادات اليوم صفر، ومكانه نظام التحكم في الإصدارات. ولأنه محفوظ في Git، يجب حقن بيانات الاعتماد وقت التشغيل."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تشغّل CML برمجيات مستوى التحكم الحقيقية من Cisco، فهي تثبت **منطق الإعدادات والبروتوكولات وواجهات البرمجة**، لا الأداء ولا سلوك العتاد.\n- احفظ **ملف الطوبولوجيا** في Git بإعدادات يوم صفر في حدّها الأدنى، ودع الخط يطبّق الباقي.\n- تحكّم في CML عبر الواجهة البرمجية أو `virl2_client` أو `cmlutils` أو Terraform أو Ansible، وأنشئ **مختبرًا مؤقتًا لكل خط**، ونظِّف دائمًا.\n- تستخدم ملفات pyATS المولَّدة **خادم الطرفيات**، ويمنح **الموصِّل الخارجي** المشغّلاتِ وصولًا إداريًا شبيهًا بالإنتاج.\n- طابِق إصدارات النظام مع الإنتاج، وانتظر الجاهزية الحقيقية، وأبقِ الأسرار خارج ملفات المختبر.\n\nتابع لتجمع الأدوات المحيطة باختباراتك في درس [Docker Compose](/learn/network-automation-devops/docker-compose)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,564 @@
+{
+ "slug": "python-network-automation-solutions",
+ "title": "Python Network Automation Solutions",
+ "summary": "Design a Python network automation solution that is idempotent, secure, concurrent and testable, and choose the right library for each device interface.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Choose between requests, ncclient, Netmiko and Nornir for a given interface",
+  "Structure a solution into inventory, desired state, logic and reporting",
+  "Apply idempotency, timeouts, retries and per-device error handling",
+  "Run device tasks concurrently without overloading the target",
+  "Test automation code with mocks and CI"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A change request arrives: point 40 branch routers at a new NTP server. Doing it by hand takes an afternoon and invites typos. A short Python script can do it in a minute, but a script that works on your laptop is not yet a *solution*. If it stores a password in the code, crashes on the first unreachable router, or makes the same change twice, it creates more risk than it removes.\n\nThis lesson shows what separates a quick script from a Python network automation solution you can trust in production: the right library for each interface, a clear structure, idempotent behavior, error handling, concurrency and tests."
+  },
+  {
+   "id": "libs",
+   "type": "text",
+   "markdown": "## Choose the library for the interface\n\nThe interface your device exposes decides the library. Pick the highest-level option that the device supports.\n\n| Interface | Common Python library | Typical use |\n|:--|:--|:--|\n| SSH CLI | Netmiko, Scrapli | Legacy devices, `show` commands, text config |\n| NETCONF (XML over SSH) | ncclient | Model-driven config and state with YANG |\n| RESTCONF or REST (HTTPS) | requests | IOS XE, Catalyst Center, Meraki, ACI |\n| Multi-vendor abstraction | NAPALM, Nornir | One API across platforms, inventory and threading |\n| CLI parsing | Genie parsers, TextFSM | Turn `show` output into dictionaries |\n\nCLI scraping is the last resort. Output text changes between releases, while a YANG model over [RESTCONF](/learn/network-automation-devops/restconf-with-yang-models) gives structured data with a stable schema. Use the CLI only when no API exists, and parse its output into data as early as possible."
+  },
+  {
+   "id": "struct",
+   "type": "text",
+   "markdown": "## Structure of a solution\n\nA maintainable solution separates four concerns:\n\n1. **Inventory (what):** a YAML or JSON file, or a source of truth such as NetBox, listing devices and their variables. No device names inside code. See [Source of Truth Integration](/learn/network-automation-devops/source-of-truth-integration).\n2. **Desired state (how it should look):** variables and Jinja2 templates that render configuration or JSON payloads.\n3. **Logic (what to do):** small functions with one job each: connect, read, compare, change, verify.\n4. **Reporting (what happened):** logging and a result per device. See [Logging for Automation Solutions](/learn/network-automation-devops/logging-for-automation-solutions).\n\nPackage the logic as modules with type hints and docstrings, keep configuration in environment variables or a vault, and pin dependencies in `requirements.txt` so the CI runner and your laptop behave the same."
+  },
+  {
+   "id": "code",
+   "type": "code",
+   "language": "python",
+   "filename": "ntp_sync.py",
+   "code": "import logging\nimport os\nfrom concurrent.futures import ThreadPoolExecutor, as_completed\n\nimport requests\nimport yaml\nfrom requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\nlog = logging.getLogger(\"ntp-sync\")\nJSON = \"application/yang-data+json\"\n\n\ndef make_session():\n    s = requests.Session()\n    s.auth = (os.environ[\"NET_USER\"], os.environ[\"NET_PASS\"])  # never hard-code\n    s.headers.update({\"Accept\": JSON, \"Content-Type\": JSON})\n    s.verify = \"/etc/ssl/certs/lab-ca.pem\"                      # keep TLS checks on\n    retry = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])\n    s.mount(\"https://\", HTTPAdapter(max_retries=retry))\n    return s\n\n\ndef ensure_ntp(host, server):\n    url = f\"https://{host}/restconf/data/Cisco-IOS-XE-native:native\"\n    with make_session() as s:\n        r = s.get(url + \"/ntp\", timeout=10)\n        if r.status_code == 200 and server in r.text:\n            return host, \"unchanged\"                            # idempotent\n        body = {\"Cisco-IOS-XE-ntp:ntp\": {\"server\": {\"server-list\": [{\"ip-address\": server}]}}}\n        r = s.patch(url + \"/ntp\", json=body, timeout=10)\n        r.raise_for_status()\n        return host, \"changed\"\n\n\ndef main():\n    inv = yaml.safe_load(open(\"inventory.yaml\"))\n    with ThreadPoolExecutor(max_workers=5) as pool:\n        jobs = {pool.submit(ensure_ntp, h, inv[\"ntp_server\"]): h for h in inv[\"hosts\"]}\n        for job in as_completed(jobs):\n            try:\n                host, state = job.result()\n                log.info(\"%s %s\", host, state)\n            except requests.RequestException as exc:\n                log.error(\"%s FAILED %s\", jobs[job], exc)\n\n\nif __name__ == \"__main__\":\n    logging.basicConfig(level=logging.INFO, format=\"%(asctime)s %(levelname)s %(message)s\")\n    main()\n",
+   "caption": "A small RESTCONF solution: credentials from the environment, TLS verification, retries, an idempotency check, threads and per-device results.",
+   "highlight": [
+    16,
+    17,
+    18,
+    24,
+    28,
+    29,
+    41
+   ]
+  },
+  {
+   "id": "inv",
+   "type": "code",
+   "language": "yaml",
+   "filename": "inventory.yaml",
+   "code": "ntp_server: 192.0.2.123\nhosts:\n  - 198.51.100.11\n  - 198.51.100.12\n  - 198.51.100.13\n",
+   "caption": "The inventory is data, so the same code runs against a lab or production."
+  },
+  {
+   "id": "run",
+   "type": "terminal",
+   "title": "python ntp_sync.py",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "export NET_USER=automation NET_PASS='<from-vault>'"
+    },
+    {
+     "cmd": "python ntp_sync.py",
+     "output": "2026-03-02 09:14:01,220 INFO 198.51.100.11 changed\n2026-03-02 09:14:01,305 INFO 198.51.100.13 changed\n2026-03-02 09:14:11,873 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+     "comment": "One unreachable router is logged and does not stop the other two."
+    },
+    {
+     "cmd": "python ntp_sync.py",
+     "output": "2026-03-02 09:15:40,114 INFO 198.51.100.11 unchanged\n2026-03-02 09:15:40,201 INFO 198.51.100.13 unchanged\n2026-03-02 09:15:50,630 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+     "comment": "A second run changes nothing: the script is idempotent."
+    }
+   ],
+   "caption": "The result lists each device separately, so a partial failure is visible and safe to re-run."
+  },
+  {
+   "id": "props",
+   "type": "text",
+   "markdown": "## Properties of a production-grade script\n\n- **Idempotent:** read the current state first and change only what differs. Re-running after a failure must be safe. The script above checks for the server before it patches.\n- **Fail per device, not per run:** catch the narrowest exceptions (`requests.RequestException`, not bare `except`), record the failure and continue. Return a result object so the caller can set the exit code.\n- **Timeouts and retries:** every network call needs a `timeout`. Retry only transient errors (502, 503, 504, connection resets) with back-off. Never retry a `400` or `401`.\n- **Concurrency:** network calls wait on I/O, so threads help. Use a bounded pool (`max_workers=5`) so you do not overwhelm a controller and trip its rate limits. See [Advanced REST APIs](/learn/network-automation-devops/advanced-rest-apis-pagination-auth-and-rate-limits).\n- **Secrets and TLS:** read credentials from the environment or a vault and verify certificates with a CA bundle. Never set `verify=False` to silence an error. See [Secure Coding](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n- **Dry run:** a `--check` mode that prints the intended change makes review easy."
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Life of an automation run",
+   "caption": "Each stage has one job and can be tested alone.",
+   "data": {
+    "token": "Change",
+    "nodes": [
+     {
+      "id": "inv",
+      "label": "Inventory",
+      "sub": "YAML / NetBox",
+      "icon": "file"
+     },
+     {
+      "id": "code",
+      "label": "Python",
+      "sub": "requests / ncclient",
+      "icon": "cpu"
+     },
+     {
+      "id": "dev",
+      "label": "Device",
+      "sub": "RESTCONF",
+      "icon": "router"
+     },
+     {
+      "id": "log",
+      "label": "Result log",
+      "sub": "per device",
+      "icon": "log"
+     }
+    ],
+    "steps": [
+     {
+      "at": "inv",
+      "caption": "Hosts and variables are loaded from data, not from code."
+     },
+     {
+      "at": "code",
+      "caption": "The script builds one session with credentials, TLS and retries."
+     },
+     {
+      "at": "dev",
+      "token": "GET",
+      "caption": "It reads the current state first."
+     },
+     {
+      "at": "code",
+      "token": "Diff",
+      "caption": "It compares the state with the desired value and decides if a change is needed."
+     },
+     {
+      "at": "dev",
+      "token": "PATCH",
+      "caption": "Only a difference triggers a write.",
+      "tone": "success"
+     },
+     {
+      "at": "log",
+      "caption": "The outcome (changed, unchanged or failed) is logged for each device.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "scale",
+   "type": "text",
+   "markdown": "## From one script to a team tool\n\nA script that one person runs becomes a tool when other people depend on it. At that point add a few habits.\n\n- **A command-line interface.** Use `argparse` or `click` so users pass the inventory, the target group and flags such as `--check` instead of editing the code.\n- **Meaningful exit codes.** Return `0` only if every device succeeded, so a pipeline can stop on failure.\n- **Versioned releases.** Keep the code in Git, tag releases and pin the dependency versions so a run can be reproduced months later. See [Advanced Git](/learn/network-automation-devops/advanced-git-merge-squash-cherry-pick-reset-and-revert).\n- **Documentation.** A short README with the purpose, inputs, required environment variables and an example run saves hours for the next engineer.\n\n### Choosing a data model\n\nPrefer structured data over string building. Build the RESTCONF body as a Python dictionary and let `json` serialize it, instead of concatenating text. For CLI configuration, render a Jinja2 template from variables and validate the variables first (for example with `pydantic` or a JSON Schema), so a typo in the inventory fails before it reaches a router."
+  },
+  {
+   "id": "test",
+   "type": "text",
+   "markdown": "## Test before you trust\n\nBusiness logic that talks to devices is hard to test, so keep it thin and put decisions in pure functions that take data and return data. Unit-test those with `pytest`, and replace the network with a mock (`unittest.mock` or the `responses` library). Run the tests, a linter such as `flake8` and a formatter check in CI on every commit. Then validate against a simulated network before production, using [Cisco Modeling Labs](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing), and verify the result with [pyATS](/learn/network-automation-devops/change-validation-with-pyats). See also [Python Unit Testing](/learn/network-automation-devops/python-unit-testing)."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "Do not log request bodies or headers: they contain credentials. Do not catch `Exception` and `pass`: a silent failure looks like success. Do not disable certificate checks to \"make it work\". Fix the trust chain instead."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Using a DevNet Sandbox IOS XE device or a CML router that you are authorized to use:\n\n1. Copy `ntp_sync.py` and `inventory.yaml`, replace the inventory with your device, and export `NET_USER` and `NET_PASS`.\n2. Run it twice. Confirm the first run says `changed` and the second says `unchanged`.\n3. Add a `--check` option that prints the planned change without sending the `PATCH`.\n4. Write a `pytest` test for a function `needs_change(current_json, server)` that returns `True` or `False`."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Idempotent",
+     "definition": "An operation that gives the same result however many times it runs."
+    },
+    {
+     "term": "Netmiko",
+     "definition": "A Python library that automates SSH CLI sessions on network devices."
+    },
+    {
+     "term": "ncclient",
+     "definition": "A Python NETCONF client for model-driven configuration and state."
+    },
+    {
+     "term": "Nornir",
+     "definition": "A Python framework for inventory and threaded task execution across devices."
+    },
+    {
+     "term": "Retry with back-off",
+     "definition": "Repeating a failed call after growing delays, for transient errors only."
+    },
+    {
+     "term": "Mock",
+     "definition": "A test double that replaces a network call with a controlled response."
+    },
+    {
+     "term": "Dry run",
+     "definition": "A mode that reports the intended change without applying it."
+    },
+    {
+     "term": "requirements.txt",
+     "definition": "A file that pins the exact package versions a project needs."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why does the script read the NTP configuration before patching?",
+     "options": [
+      "To make the script idempotent and avoid needless changes",
+      "Because RESTCONF forbids writes without a read",
+      "To speed up TLS negotiation",
+      "To avoid using credentials"
+     ],
+     "answer": 0,
+     "explanation": "Comparing current and desired state means a re-run changes nothing."
+    },
+    {
+     "question": "Which are good practices for a production Python automation script? Choose all that apply.",
+     "options": [
+      "Read credentials from environment variables or a vault",
+      "Set a timeout on every request",
+      "Use verify=False to avoid certificate errors",
+      "Catch narrow exceptions and continue with other devices"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Disabling certificate verification removes TLS protection. The other three improve safety and resilience."
+    },
+    {
+     "question": "Which library suits a device that supports NETCONF with YANG models?",
+     "options": [
+      "ncclient",
+      "TextFSM only",
+      "Netmiko screen scraping",
+      "smtplib"
+     ],
+     "answer": 0,
+     "explanation": "ncclient speaks NETCONF and returns structured data. Scraping the CLI is a last resort."
+    },
+    {
+     "question": "Which error should be retried automatically with back-off?",
+     "options": [
+      "401 Unauthorized",
+      "400 Bad Request",
+      "503 Service Unavailable",
+      "404 Not Found for a wrong path"
+     ],
+     "answer": 2,
+     "explanation": "503 is transient. 400, 401 and 404 will fail the same way every time."
+    },
+    {
+     "question": "Why use a bounded thread pool?",
+     "options": [
+      "To avoid overloading controllers and hitting rate limits",
+      "Because Python cannot create more than five threads",
+      "To encrypt traffic",
+      "To skip logging"
+     ],
+     "answer": 0,
+     "explanation": "Unbounded parallelism can overwhelm an API and trigger throttling."
+    }
+   ]
+  },
+  {
+   "id": "sum",
+   "type": "text",
+   "markdown": "## Summary\n\n- Choose the library by interface: requests for RESTCONF/REST, ncclient for NETCONF, Netmiko or Scrapli for CLI, Nornir or NAPALM for multi-vendor work.\n- Separate inventory, desired state, logic and reporting.\n- Make every run idempotent, bounded in time and concurrency, and isolated per device.\n- Keep secrets out of code, keep TLS verification on, and log each result.\n- Unit-test the logic, simulate in CML, and verify changes with pyATS."
+  }
+ ],
+ "ar": {
+  "title": "حلول أتمتة الشبكات باستخدام Python",
+  "summary": "صمّم حلَّ أتمتة شبكات بلغة Python متماثلَ العملية وآمنًا ومتزامنًا وقابلًا للاختبار، واختر المكتبة المناسبة لكل واجهة جهاز.",
+  "objectives": [
+   "الاختيار بين requests وncclient وNetmiko وNornir بحسب الواجهة",
+   "تقسيم الحلّ إلى جرد وحالة مطلوبة ومنطق وتقارير",
+   "تطبيق تماثل العملية والمهلات وإعادة المحاولة ومعالجة الأخطاء لكل جهاز",
+   "تشغيل مهامّ الأجهزة بالتزامن دون إرهاق الهدف",
+   "اختبار شيفرة الأتمتة بالمحاكاة وCI"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يصلكَ طلبُ تغيير: توجيهُ 40 موجّهًا في الفروع إلى خادم NTP جديد. تنفيذُ ذلك يدويًّا يستغرق نصفَ يوم ويفتح البابَ للأخطاء المطبعية. يستطيع سكربتُ Python قصيرٌ إنجازَ المهمّة في دقيقة، لكنّ سكربتًا يعمل على حاسوبكَ ليس بعدُ *حلًّا* موثوقًا. فإذا خزّن كلمةَ المرور داخل الشيفرة، أو انهار عند أول موجّه يتعذّر الوصول إليه، أو كرّر التغيير نفسَه مرّتين، فإنه يُنشئ من المخاطر أكثر مما يُزيل.\n\nيوضّح هذا الدرسُ ما يفصل السكربتَ السريع عن حلّ أتمتة شبكات بلغة Python يمكن الوثوق به في بيئة الإنتاج: المكتبةُ المناسبة لكل واجهة، والبنيةُ الواضحة، وسلوكُ العمليات المتماثلة (Idempotent)، ومعالجةُ الأخطاء، والتزامن، والاختبارات."
+   },
+   {
+    "id": "libs",
+    "type": "text",
+    "markdown": "## اختر المكتبة بحسب الواجهة\n\nتحدّد الواجهةُ التي يعرضها الجهازُ المكتبةَ المناسبة. اختر أعلى مستوًى تدعمه الأجهزة.\n\n| الواجهة | مكتبة Python الشائعة | الاستخدام النموذجي |\n|:--|:--|:--|\n| سطر أوامر SSH | Netmiko وScrapli | الأجهزة القديمة وأوامر `show` والإعداد النصي |\n| NETCONF (XML عبر SSH) | ncclient | الإعداد والحالة القائمان على النماذج مع YANG |\n| RESTCONF أو REST (عبر HTTPS) | requests | IOS XE وCatalyst Center وMeraki وACI |\n| طبقة تجريد متعددة المورّدين | NAPALM وNornir | واجهة واحدة لعدّة منصّات مع جرد وتعدّد خيوط |\n| تحليل مخرجات CLI | محلّلات Genie وTextFSM | تحويل مخرجات `show` إلى قواميس |\n\nيُعدّ كشطُ سطر الأوامر الملاذَ الأخير، فنصّ المخرجات يتغيّر بين الإصدارات، بينما يوفّر نموذجُ YANG عبر [RESTCONF](/learn/network-automation-devops/restconf-with-yang-models) بياناتٍ منظّمة ذات مخطّط ثابت. لا تستخدم CLI إلا حين لا توجد واجهة برمجية، وحوّل مخرجاته إلى بيانات في أبكر وقت."
+   },
+   {
+    "id": "struct",
+    "type": "text",
+    "markdown": "## بنية الحلّ\n\nيفصل الحلُّ القابل للصيانة بين أربعة اهتمامات:\n\n1. **الجرد (ماذا):** ملفّ YAML أو JSON، أو مصدرُ حقيقة (Source of Truth) مثل NetBox، يسرد الأجهزةَ ومتغيّراتها. لا تُكتب أسماءُ الأجهزة داخل الشيفرة. راجع [التكامل مع مصدر الحقيقة](/learn/network-automation-devops/source-of-truth-integration).\n2. **الحالة المطلوبة (كيف ينبغي أن تبدو):** متغيّرات وقوالب Jinja2 تُنتج الإعدادَ أو حمولاتِ JSON.\n3. **المنطق (ماذا نفعل):** دوالُّ صغيرة لكلٍّ منها مهمّة واحدة: الاتصال، والقراءة، والمقارنة، والتغيير، والتحقّق.\n4. **التقارير (ماذا حدث):** التسجيل ونتيجةٌ لكل جهاز. راجع [التسجيل في حلول الأتمتة](/learn/network-automation-devops/logging-for-automation-solutions).\n\nضع المنطقَ في وحدات (Modules) مع تلميحات الأنواع والتوثيق، واحفظ الإعدادات في متغيّرات البيئة أو خزنة أسرار، وثبّت الاعتماديات في `requirements.txt` ليتصرّف مشغّلُ CI وحاسوبُك بالطريقة نفسها."
+   },
+   {
+    "id": "code",
+    "type": "code",
+    "language": "python",
+    "filename": "ntp_sync.py",
+    "code": "import logging\nimport os\nfrom concurrent.futures import ThreadPoolExecutor, as_completed\n\nimport requests\nimport yaml\nfrom requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\nlog = logging.getLogger(\"ntp-sync\")\nJSON = \"application/yang-data+json\"\n\n\ndef make_session():\n    s = requests.Session()\n    s.auth = (os.environ[\"NET_USER\"], os.environ[\"NET_PASS\"])  # never hard-code\n    s.headers.update({\"Accept\": JSON, \"Content-Type\": JSON})\n    s.verify = \"/etc/ssl/certs/lab-ca.pem\"                      # keep TLS checks on\n    retry = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])\n    s.mount(\"https://\", HTTPAdapter(max_retries=retry))\n    return s\n\n\ndef ensure_ntp(host, server):\n    url = f\"https://{host}/restconf/data/Cisco-IOS-XE-native:native\"\n    with make_session() as s:\n        r = s.get(url + \"/ntp\", timeout=10)\n        if r.status_code == 200 and server in r.text:\n            return host, \"unchanged\"                            # idempotent\n        body = {\"Cisco-IOS-XE-ntp:ntp\": {\"server\": {\"server-list\": [{\"ip-address\": server}]}}}\n        r = s.patch(url + \"/ntp\", json=body, timeout=10)\n        r.raise_for_status()\n        return host, \"changed\"\n\n\ndef main():\n    inv = yaml.safe_load(open(\"inventory.yaml\"))\n    with ThreadPoolExecutor(max_workers=5) as pool:\n        jobs = {pool.submit(ensure_ntp, h, inv[\"ntp_server\"]): h for h in inv[\"hosts\"]}\n        for job in as_completed(jobs):\n            try:\n                host, state = job.result()\n                log.info(\"%s %s\", host, state)\n            except requests.RequestException as exc:\n                log.error(\"%s FAILED %s\", jobs[job], exc)\n\n\nif __name__ == \"__main__\":\n    logging.basicConfig(level=logging.INFO, format=\"%(asctime)s %(levelname)s %(message)s\")\n    main()\n",
+    "caption": "حلّ RESTCONF صغير: بيانات الاعتماد من البيئة، والتحقّق من TLS، وإعادة المحاولة، وفحص تماثل العملية، والخيوط، ونتيجة لكل جهاز.",
+    "highlight": [
+     16,
+     17,
+     18,
+     24,
+     28,
+     29,
+     41
+    ]
+   },
+   {
+    "id": "inv",
+    "type": "code",
+    "language": "yaml",
+    "filename": "inventory.yaml",
+    "code": "ntp_server: 192.0.2.123\nhosts:\n  - 198.51.100.11\n  - 198.51.100.12\n  - 198.51.100.13\n",
+    "caption": "الجردُ بيانات، فتعمل الشيفرة نفسها على المختبر أو الإنتاج."
+   },
+   {
+    "id": "run",
+    "type": "terminal",
+    "title": "python ntp_sync.py",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "export NET_USER=automation NET_PASS='<from-vault>'"
+     },
+     {
+      "cmd": "python ntp_sync.py",
+      "output": "2026-03-02 09:14:01,220 INFO 198.51.100.11 changed\n2026-03-02 09:14:01,305 INFO 198.51.100.13 changed\n2026-03-02 09:14:11,873 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+      "comment": "موجّه واحد غير متاح يُسجَّل خطؤه دون أن يوقف الموجّهين الآخرين."
+     },
+     {
+      "cmd": "python ntp_sync.py",
+      "output": "2026-03-02 09:15:40,114 INFO 198.51.100.11 unchanged\n2026-03-02 09:15:40,201 INFO 198.51.100.13 unchanged\n2026-03-02 09:15:50,630 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+      "comment": "التشغيل الثاني لا يغيّر شيئًا: السكربت متماثل العملية (Idempotent)."
+     }
+    ],
+    "caption": "تُسرد نتيجةُ كل جهاز على حدة، فيظهر الإخفاق الجزئي ويكون إعادةُ التشغيل آمنة."
+   },
+   {
+    "id": "props",
+    "type": "text",
+    "markdown": "## خصائص السكربت الصالح للإنتاج\n\n- **متماثل العملية (Idempotent):** اقرأ الحالةَ الحالية أولًا وغيّر ما يختلف فقط. يجب أن تكون إعادةُ التشغيل بعد الإخفاق آمنة. يتحقّق السكربتُ أعلاه من وجود الخادم قبل إرسال `PATCH`.\n- **الإخفاق لكل جهاز لا لكل تشغيل:** التقط أضيقَ الاستثناءات (`requests.RequestException` لا `except` المجرّدة)، وسجّل الإخفاق، وتابع. أعِد كائنَ نتيجة ليحدّد المستدعي رمزَ الخروج.\n- **المهلات وإعادة المحاولة:** كل نداء شبكي يحتاج `timeout`. أعِد المحاولةَ للأخطاء العابرة فقط (502 و503 و504 وانقطاع الاتصال) مع تأخير متزايد. لا تعِد محاولةَ `400` أو `401` أبدًا.\n- **التزامن:** تنتظر النداءاتُ الشبكية عمليات الإدخال والإخراج، فتفيد الخيوط. استخدم مجمّعًا محدودًا (`max_workers=5`) كي لا تُرهق المتحكّمَ وتتجاوز حدودَ المعدّل. راجع [واجهات REST المتقدمة](/learn/network-automation-devops/advanced-rest-apis-pagination-auth-and-rate-limits).\n- **الأسرار وTLS:** اقرأ بيانات الاعتماد من البيئة أو من خزنة وتحقّق من الشهادات بحزمة CA. لا تضبط `verify=False` لإسكات خطأ. راجع [الترميز الآمن](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n- **التشغيل التجريبي:** وضعُ `--check` الذي يطبع التغييرَ المقصود يسهّل المراجعة."
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "دورة حياة تشغيل الأتمتة",
+    "caption": "لكل مرحلة مهمّة واحدة ويمكن اختبارها منفردة.",
+    "data": {
+     "token": "تغيير",
+     "nodes": [
+      {
+       "id": "inv",
+       "label": "الجرد",
+       "sub": "YAML / NetBox",
+       "icon": "file"
+      },
+      {
+       "id": "code",
+       "label": "Python",
+       "sub": "requests / ncclient",
+       "icon": "cpu"
+      },
+      {
+       "id": "dev",
+       "label": "الجهاز",
+       "sub": "RESTCONF",
+       "icon": "router"
+      },
+      {
+       "id": "log",
+       "label": "سجلّ النتائج",
+       "sub": "لكل جهاز",
+       "icon": "log"
+      }
+     ],
+     "steps": [
+      {
+       "at": "inv",
+       "caption": "تُحمَّل المضيفات والمتغيّرات من البيانات لا من الشيفرة."
+      },
+      {
+       "at": "code",
+       "caption": "ينشئ السكربتُ جلسةً واحدة بالاعتماد وTLS وإعادة المحاولة."
+      },
+      {
+       "at": "dev",
+       "token": "GET",
+       "caption": "يقرأ الحالةَ الحالية أولًا."
+      },
+      {
+       "at": "code",
+       "token": "فرق",
+       "caption": "يقارن الحالةَ بالقيمة المطلوبة ويقرّر إن كان التغيير لازمًا."
+      },
+      {
+       "at": "dev",
+       "token": "PATCH",
+       "caption": "الفرقُ وحده يُطلق عمليةَ الكتابة.",
+       "tone": "success"
+      },
+      {
+       "at": "log",
+       "caption": "تُسجَّل النتيجة (تغيّر أو لم يتغيّر أو أخفق) لكل جهاز.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "scale",
+    "type": "text",
+    "markdown": "## من سكربت واحد إلى أداة للفريق\n\nيصبح السكربتُ الذي يشغّله شخص واحد أداةً حين يعتمد عليه آخرون. عندئذ أضف بعض العادات.\n\n- **واجهة سطر أوامر.** استخدم `argparse` أو `click` ليمرّر المستخدمون الجردَ والمجموعةَ المستهدفة وخياراتٍ مثل `--check` بدل تعديل الشيفرة.\n- **رموز خروج ذات معنى.** أعِد `0` فقط إن نجحت كل الأجهزة، ليتوقف خطّ الأنابيب عند الفشل.\n- **إصدارات موسومة.** احفظ الشيفرة في Git، ووسِم الإصدارات، وثبّت إصدارات الاعتماديات ليمكن إعادةُ التشغيل بعد أشهر. راجع [Git المتقدم](/learn/network-automation-devops/advanced-git-merge-squash-cherry-pick-reset-and-revert).\n- **التوثيق.** ملفّ README قصير يبيّن الغرض والمدخلات ومتغيّرات البيئة المطلوبة ومثال تشغيل يوفّر ساعات على المهندس التالي.\n\n### اختيار نموذج البيانات\n\nفضّل البيانات المنظّمة على بناء النصوص. ابنِ جسمَ RESTCONF قاموسًا في Python ودع `json` يسلسله بدل ضمّ النصوص. وللإعداد عبر CLI، ولّد قالب Jinja2 من المتغيّرات وتحقّق من المتغيّرات أولًا (مثلًا بـ `pydantic` أو JSON Schema) كي يفشل الخطأ المطبعي في الجرد قبل أن يصل إلى الموجّه."
+   },
+   {
+    "id": "test",
+    "type": "text",
+    "markdown": "## اختبر قبل أن تثق\n\nيصعب اختبارُ المنطق الذي يتحدّث إلى الأجهزة، لذا اجعله رقيقًا وضع القراراتِ في دوالَّ نقية تستقبل بياناتٍ وتُعيد بيانات. اختبرها بـ `pytest` واستبدل الشبكةَ بمحاكاة (`unittest.mock` أو مكتبة `responses`). شغّل الاختبارات وأداةَ تدقيق مثل `flake8` وفحصَ التنسيق في CI عند كل إيداع. ثم تحقّق على شبكة محاكاة قبل الإنتاج باستخدام [Cisco Modeling Labs](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing)، وتأكّد من النتيجة بـ [pyATS](/learn/network-automation-devops/change-validation-with-pyats). راجع أيضًا [اختبار الوحدات في Python](/learn/network-automation-devops/python-unit-testing)."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "لا تسجّل أجسامَ الطلبات أو ترويساتِها فهي تحوي بيانات الاعتماد. لا تلتقط `Exception` ثم تتجاهلها: الإخفاقُ الصامت يبدو نجاحًا. لا تعطّل فحصَ الشهادات لـ«تشغيل الشيء»، بل أصلِح سلسلةَ الثقة."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "باستخدام جهاز IOS XE من DevNet Sandbox أو موجّه CML مصرّح لك باستخدامه:\n\n1. انسخ `ntp_sync.py` و`inventory.yaml`، واستبدل الجردَ بجهازك، وصدّر `NET_USER` و`NET_PASS`.\n2. شغّله مرّتين وتأكّد أن الأولى تُظهر `changed` والثانية `unchanged`.\n3. أضف الخيار `--check` الذي يطبع التغييرَ المخطَّط دون إرسال `PATCH`.\n4. اكتب اختبار `pytest` للدالة `needs_change(current_json, server)` التي تُعيد `True` أو `False`."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "Idempotent",
+      "definition": "عملية تُعطي النتيجةَ نفسها مهما تكرّر تشغيلها."
+     },
+     {
+      "term": "Netmiko",
+      "definition": "مكتبة Python تؤتمت جلسات SSH لسطر الأوامر على أجهزة الشبكة."
+     },
+     {
+      "term": "ncclient",
+      "definition": "عميل NETCONF بلغة Python للإعداد والحالة القائمين على النماذج."
+     },
+     {
+      "term": "Nornir",
+      "definition": "إطار عمل Python للجرد وتنفيذ المهام متعدّدة الخيوط على الأجهزة."
+     },
+     {
+      "term": "Retry with back-off",
+      "definition": "إعادة النداء الفاشل بعد فواصل متزايدة، للأخطاء العابرة فقط."
+     },
+     {
+      "term": "Mock",
+      "definition": "بديل اختباري يستبدل نداءً شبكيًّا باستجابة مضبوطة."
+     },
+     {
+      "term": "Dry run",
+      "definition": "وضع يعرض التغييرَ المقصود دون تطبيقه."
+     },
+     {
+      "term": "requirements.txt",
+      "definition": "ملفّ يثبّت الإصدارات الدقيقة للحزم التي يحتاجها المشروع."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يقرأ السكربتُ إعدادَ NTP قبل إرسال PATCH؟",
+      "options": [
+       "ليكون متماثلَ العملية ويتجنّب تغييراتٍ غير لازمة",
+       "لأن RESTCONF تمنع الكتابة دون قراءة",
+       "لتسريع التفاوض على TLS",
+       "لتجنّب استخدام بيانات الاعتماد"
+      ],
+      "answer": 0,
+      "explanation": "مقارنةُ الحالة الحالية بالمطلوبة تعني أن إعادة التشغيل لا تغيّر شيئًا."
+     },
+     {
+      "question": "أيٌّ مما يلي ممارساتٌ جيدة لسكربت أتمتة Python في الإنتاج؟ اختر كل ما ينطبق.",
+      "options": [
+       "قراءة بيانات الاعتماد من متغيّرات البيئة أو خزنة",
+       "ضبط مهلة لكل طلب",
+       "استخدام verify=False لتفادي أخطاء الشهادات",
+       "التقاط استثناءات ضيقة ومتابعة بقية الأجهزة"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تعطيل التحقّق من الشهادات يزيل حمايةَ TLS. أما الثلاثة الأخرى فتحسّن الأمانَ والمرونة."
+     },
+     {
+      "question": "أيّ مكتبة تناسب جهازًا يدعم NETCONF مع نماذج YANG؟",
+      "options": [
+       "ncclient",
+       "TextFSM وحدها",
+       "كشط الشاشة عبر Netmiko",
+       "smtplib"
+      ],
+      "answer": 0,
+      "explanation": "يتحدّث ncclient بروتوكولَ NETCONF ويُعيد بياناتٍ منظّمة، أما كشط CLI فملاذ أخير."
+     },
+     {
+      "question": "أيّ الأخطاء ينبغي إعادةُ محاولته تلقائيًّا مع تأخير متزايد؟",
+      "options": [
+       "401 Unauthorized",
+       "400 Bad Request",
+       "503 Service Unavailable",
+       "404 Not Found لمسار خاطئ"
+      ],
+      "answer": 2,
+      "explanation": "الخطأ 503 عابر، أما 400 و401 و404 فتفشل بالطريقة نفسها في كل مرّة."
+     },
+     {
+      "question": "لماذا نستخدم مجمّع خيوط محدودًا؟",
+      "options": [
+       "لتجنّب إرهاق المتحكّمات وبلوغ حدود المعدّل",
+       "لأن Python لا تنشئ أكثر من خمسة خيوط",
+       "لتشفير الحركة",
+       "لتخطّي التسجيل"
+      ],
+      "answer": 0,
+      "explanation": "التوازي غير المحدود قد يُرهق الواجهةَ البرمجية ويُفعّل التقييد."
+     }
+    ]
+   },
+   {
+    "id": "sum",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- اختر المكتبةَ بحسب الواجهة: requests لـ RESTCONF/REST، وncclient لـ NETCONF، وNetmiko أو Scrapli لسطر الأوامر، وNornir أو NAPALM للعمل متعدّد المورّدين.\n- افصل بين الجرد والحالة المطلوبة والمنطق والتقارير.\n- اجعل كل تشغيل متماثلَ العملية، محدودًا بالزمن والتزامن، ومعزولًا لكل جهاز.\n- أبقِ الأسرارَ خارج الشيفرة، وأبقِ التحقّق من TLS مفعّلًا، وسجّل كل نتيجة.\n- اختبر المنطقَ بوحدات اختبار، وحاكِ في CML، وتحقّق من التغييرات بـ pyATS."
+   }
+  ]
+ }
+}

@@ -1,0 +1,602 @@
+{
+ "slug": "webhooks-and-api-constraints",
+ "title": "Webhooks and API Constraints",
+ "summary": "Learn how webhooks push events to your application instead of making it poll, how to receive them safely, and how to work within real API constraints: rate limits, pagination, timeouts, asynchronous tasks and token lifetimes.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Compare polling with webhooks and describe common webhook use cases",
+  "Describe how a webhook is registered, delivered, verified and acknowledged",
+  "Identify constraints when consuming APIs: rate limits, pagination, payload size, timeouts and asynchronous jobs",
+  "Handle HTTP 429 and paginated responses correctly in Python"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A network team wants a chat message within seconds whenever a branch uplink goes down. The first version of their script asks the Meraki Dashboard API for the status of every device once a minute. With 300 branches it soon receives `429 Too Many Requests`, misses events between polls, and still lags behind reality.\n\nThe fix is to turn the conversation around. With a **webhook**, the platform calls *your* application the moment the event happens. And whichever direction the calls flow, every real API has **constraints**: rate limits, page sizes, timeouts and tokens that expire. The CCNA Automation (200-901) blueprint asks you to describe webhook usage patterns and to identify these constraints, because ignoring them is the most common reason automation fails in production."
+  },
+  {
+   "id": "webhooks",
+   "type": "text",
+   "markdown": "## Polling versus webhooks\n\n**Polling** means your client repeatedly asks \"has anything changed?\" It is simple and works through any firewall, but most requests return nothing new, each one counts against the rate limit, and an event is only seen at the next poll.\n\nA **webhook** is a user-defined **HTTP callback**. You register a URL with the platform; when a chosen event occurs, the platform sends an HTTP **POST** with a JSON payload to that URL. This is an **event-driven**, asynchronous pattern (see [API Styles](/learn/network-automation-devops/api-styles-rest-rpc-synchronous-and-asynchronous)).\n\n| | Polling | Webhook |\n|:--|:--|:--|\n| Who starts the call | Your client | The platform |\n| Latency | Up to one polling interval | Near real time |\n| API calls used | Many, mostly empty | One per event |\n| Receiver requirements | None | A reachable HTTPS endpoint |\n| Missed events | Possible between polls | Possible if the receiver is down; platforms usually retry |\n\n### Common usage patterns\n\n- **Alerting and ChatOps**: Meraki alerts or Catalyst Center events post into a Webex space or open a ticket in ServiceNow.\n- **Automated remediation**: a \"port down\" event triggers a script that collects diagnostics.\n- **CI/CD triggers**: a Git push sends a webhook to the pipeline server, which starts tests (see [CI/CD Pipeline Components](/learn/network-automation-devops/ci-cd-pipeline-components)).\n- **Chatbots**: Webex sends a webhook for every new message to a bot, and the bot replies through the REST API.\n\n### Receiving webhooks safely\n\n1. **Expose HTTPS only**, with a valid certificate. During development, a tunnel service can forward a temporary public URL to your laptop.\n2. **Verify the sender.** Configure a **shared secret**. Many platforms sign the body with it using an **HMAC**, for example Webex puts an HMAC-SHA1 signature in the `X-Spark-Signature` header, and Meraki includes a `sharedSecret` value in the payload. Reject anything that does not match.\n3. **Acknowledge fast.** Return `200` or `204` within a few seconds and do the slow work in a background queue. A slow receiver looks like a failure, and the platform retries.\n4. **Expect duplicates and disorder.** Retries can deliver the same event twice. Store the event ID and process each one only once."
+  },
+  {
+   "id": "wh-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "A webhook from registration to action",
+   "caption": "The receiver verifies the signature and acknowledges before doing slow work.",
+   "data": {
+    "actors": [
+     {
+      "id": "app",
+      "label": "Receiver app",
+      "sub": "hooks.example.com",
+      "icon": "server"
+     },
+     {
+      "id": "plat",
+      "label": "Platform",
+      "sub": "Webex / Meraki",
+      "icon": "cloud"
+     },
+     {
+      "id": "sw",
+      "label": "Branch switch",
+      "icon": "switch"
+     },
+     {
+      "id": "itsm",
+      "label": "Ticketing",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "from": "app",
+      "to": "plat",
+      "label": "POST /webhooks",
+      "detail": "targetUrl, event, secret",
+      "note": "One-time setup: the app registers its HTTPS URL, the events it wants and a shared secret."
+     },
+     {
+      "from": "plat",
+      "to": "app",
+      "label": "201 Created",
+      "tone": "success",
+      "note": "The platform stores the subscription."
+     },
+     {
+      "from": "sw",
+      "to": "plat",
+      "label": "Uplink down",
+      "tone": "warning",
+      "note": "Later, a real event occurs on the network."
+     },
+     {
+      "from": "plat",
+      "to": "app",
+      "label": "POST /hooks/net",
+      "detail": "JSON + signature",
+      "note": "The platform pushes the event as JSON, signed with the shared secret."
+     },
+     {
+      "from": "app",
+      "to": "app",
+      "label": "Verify HMAC",
+      "tone": "secure",
+      "note": "The app recomputes the HMAC of the raw body and compares it in constant time."
+     },
+     {
+      "from": "app",
+      "to": "plat",
+      "label": "204 No Content",
+      "tone": "success",
+      "note": "Acknowledged within milliseconds, so the platform will not retry."
+     },
+     {
+      "from": "app",
+      "to": "itsm",
+      "label": "Open ticket",
+      "detail": "POST /incidents",
+      "note": "A background worker does the slow part: it opens a ticket and posts a chat message."
+     },
+     {
+      "from": "plat",
+      "to": "app",
+      "label": "Forged POST",
+      "tone": "attack",
+      "note": "A request with a wrong or missing signature..."
+     },
+     {
+      "from": "app",
+      "to": "plat",
+      "label": "401 Unauthorized",
+      "tone": "blocked",
+      "note": "...is rejected and logged, never processed."
+     }
+    ]
+   }
+  },
+  {
+   "id": "receiver",
+   "type": "code",
+   "language": "python",
+   "filename": "webhook_receiver.py",
+   "highlight": [
+    11,
+    12,
+    13,
+    14,
+    15
+   ],
+   "caption": "Verify the HMAC over the raw body, acknowledge quickly, and drop duplicates by event ID.",
+   "code": "import hashlib, hmac, os, queue\nfrom flask import Flask, request, abort\n\napp = Flask(__name__)\nSECRET = os.environ[\"WEBHOOK_SECRET\"].encode()   # same value registered on the platform\njobs = queue.Queue()                             # a worker thread consumes this\nseen_ids = set()\n\n@app.post(\"/hooks/net\")\ndef net_event():\n    body = request.get_data()                    # raw bytes, before JSON parsing\n    sent = request.headers.get(\"X-Signature\", \"\")\n    expected = hmac.new(SECRET, body, hashlib.sha256).hexdigest()\n    if not hmac.compare_digest(sent, expected):  # constant-time comparison\n        abort(401)\n\n    event = request.get_json()\n    if event[\"id\"] in seen_ids:                  # retried delivery: ignore\n        return \"\", 204\n    seen_ids.add(event[\"id\"])\n    jobs.put(event)                              # slow work happens elsewhere\n    return \"\", 204\n"
+  },
+  {
+   "id": "constraints",
+   "type": "text",
+   "markdown": "## Constraints when consuming APIs\n\nEvery API protects itself and its users. Read the constraints section of the documentation before you write the loop.\n\n### Rate limiting\n\nThe server allows a fixed number of requests per time window, per key, user or organization. The Meraki Dashboard API, for example, allows about **10 requests per second per organization**. Over the limit, the server returns **`429 Too Many Requests`**, usually with a **`Retry-After`** header that says how many seconds to wait. Correct behavior: wait at least that long, then retry, adding **exponential backoff** if 429s continue. Better still, avoid the limit: cache results, request only the fields you need, and use webhooks instead of polling.\n\n### Pagination\n\nLarge collections are split into pages. Common styles:\n\n- **Offset/limit**: `?offset=1&limit=500`. Catalyst Center's network-device API uses this, with a maximum page size per call.\n- **Cursor or token based**: Meraki uses `perPage` and `startingAfter`, and returns the next page's URL in an RFC 8288 **`Link`** header with `rel=next`.\n\nA script that reads only the first page silently misses devices. Keep requesting until there is no next link or the page comes back short.\n\n### Other constraints\n\n- **Payload size**: requests and responses have maximum sizes; bulk operations may need to be split into batches.\n- **Timeouts**: long requests can be cut off by the server or a proxy. Always set a client `timeout`.\n- **Asynchronous jobs**: some calls return **`202 Accepted`** with a task ID instead of the result. Catalyst Center intent APIs do this; you then poll the task resource until it completes.\n- **Token lifetime**: a Catalyst Center token is valid for about an hour. Long jobs must renew tokens when they get `401`.\n- **Versioning and deprecation**: `/api/v1` may be retired. Pin the version, watch change logs and test upgrades."
+  },
+  {
+   "id": "term",
+   "type": "terminal",
+   "title": "Seeing pagination and rate limits in the headers",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "curl -s -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \\\n  \"https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3\"",
+     "output": "HTTP/1.1 200 OK\nContent-Type: application/json; charset=utf-8\nLink: <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3>; rel=first, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=Q2XX-AAAA-0003>; rel=next, <https://api.meraki.com/api/v1/organizations/123456/devices?endingBefore=zzzzzzzz&perPage=3>; rel=last\n\n[{\"serial\":\"Q2XX-AAAA-0001\",\"name\":\"br12-sw01\"},{\"serial\":\"Q2XX-AAAA-0002\",\"name\":\"br12-ap01\"},{\"serial\":\"Q2XX-AAAA-0003\",\"name\":\"br12-mx01\"}]"
+    },
+    {
+     "comment": "Only three devices came back. The Link header's rel=next URL fetches the next page."
+    },
+    {
+     "cmd": "for i in $(seq 1 30); do curl -s -o /dev/null -w \"%{http_code} \" -H \"Authorization: Bearer $MERAKI_API_KEY\" https://api.meraki.com/api/v1/organizations/123456/networks; done; echo",
+     "output": "200 200 200 200 200 200 200 200 200 200 200 200 429 429 200 429 429 429 200 429 429 429 429 200 429 429 429 429 429 200"
+    },
+    {
+     "comment": "A tight loop exceeds the per-organization limit. Each 429 carries a Retry-After header; a well-behaved client waits."
+    }
+   ],
+   "caption": "Run this only against your own lab organization; 123456 and the serials are placeholders."
+  },
+  {
+   "id": "client",
+   "type": "code",
+   "language": "python",
+   "filename": "paged_get.py",
+   "caption": "requests parses the Link header into resp.links; Retry-After drives the wait on 429.",
+   "code": "import os, time, requests\n\nsession = requests.Session()\nsession.headers[\"Authorization\"] = f\"Bearer {os.environ['MERAKI_API_KEY']}\"\n\ndef get_all(url, params=None, max_retries=5):\n    items = []\n    while url:\n        for attempt in range(max_retries):\n            resp = session.get(url, params=params, timeout=15)\n            if resp.status_code != 429:\n                break\n            wait = int(resp.headers.get(\"Retry-After\", 2 ** attempt))\n            time.sleep(wait)                      # honor the server's hint\n        resp.raise_for_status()\n        items.extend(resp.json())\n        url = resp.links.get(\"next\", {}).get(\"url\")  # None on the last page\n        params = None                             # the next URL already has them\n    return items\n\ndevices = get_all(\"https://api.meraki.com/api/v1/organizations/123456/devices\",\n                  params={\"perPage\": 1000})\nprint(len(devices), \"devices\")\n"
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Where learners go wrong",
+   "markdown": "- **Retrying 429 immediately in a tight loop.** It extends the throttling for everyone sharing the limit. Honor `Retry-After`.\n- **Reading only page one** and reporting \"all devices are compliant.\"\n- **Doing slow work inside the webhook handler**, causing timeouts, retries and duplicate tickets.\n- **Trusting any POST to the webhook URL.** Verify the signature or shared secret; the URL alone is not a secret.\n- **Treating `202 Accepted` as success.** The job has only been queued; check the task result."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On your own laptop, with no external platform required:\n\n1. Install Flask, set `WEBHOOK_SECRET` to any test value and run `webhook_receiver.py` with `flask --app webhook_receiver run`.\n2. In Python, compute `hmac.new(b\"<your-secret>\", body, hashlib.sha256).hexdigest()` for a small JSON body such as `{\"id\": \"evt-1\", \"type\": \"port_down\"}`.\n3. Send it with `curl -X POST` to `http://127.0.0.1:5000/hooks/net`, with the `X-Signature` header and `Content-Type: application/json`. Expect `204`.\n4. Change one character of the body without updating the signature and confirm you get `401`.\n5. Send the valid request twice and confirm the second is ignored as a duplicate.\n6. Optional: with a DevNet sandbox or your own Meraki lab organization, run `paged_get.py` with a small `perPage` and count the pages."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Webhook",
+     "definition": "A user-registered HTTP callback: the platform sends a POST to your URL when a subscribed event occurs."
+    },
+    {
+     "term": "Polling",
+     "definition": "Repeatedly requesting a resource at intervals to detect changes."
+    },
+    {
+     "term": "HMAC",
+     "definition": "A hash-based message authentication code computed with a shared secret, used to prove a webhook came from the expected sender and was not modified."
+    },
+    {
+     "term": "Rate limiting",
+     "definition": "A cap on how many requests a client may send per time window; exceeding it returns HTTP 429."
+    },
+    {
+     "term": "Retry-After",
+     "definition": "A response header that tells the client how long to wait before retrying, often sent with 429 or 503."
+    },
+    {
+     "term": "Exponential backoff",
+     "definition": "A retry strategy that doubles the wait after each failed attempt."
+    },
+    {
+     "term": "Pagination",
+     "definition": "Splitting a large result set into pages fetched with offset/limit or cursor parameters."
+    },
+    {
+     "term": "202 Accepted",
+     "definition": "A status code meaning the request was queued for asynchronous processing, not yet completed."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What is the main advantage of a webhook over polling?",
+     "options": [
+      "It works without any network connectivity",
+      "Events are pushed in near real time without repeated empty requests",
+      "It removes the need for authentication",
+      "It guarantees events are never duplicated"
+     ],
+     "answer": 1,
+     "explanation": "The platform calls you when the event happens, saving API calls and latency. Webhooks still need security and can deliver duplicates on retry."
+    },
+    {
+     "question": "Which practices should a webhook receiver follow? (Choose all that apply.)",
+     "options": [
+      "Verify the signature or shared secret",
+      "Return 2xx quickly and process in the background",
+      "Accept plain HTTP on the internet for simplicity",
+      "Ignore events whose ID was already processed"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Receivers authenticate the sender, acknowledge fast to avoid retries and deduplicate by event ID. Public endpoints must use HTTPS."
+    },
+    {
+     "question": "Your script receives HTTP 429 with 'Retry-After: 2'. What should it do?",
+     "options": [
+      "Retry immediately until it succeeds",
+      "Re-authenticate, because the token expired",
+      "Wait at least 2 seconds, then retry the same request",
+      "Treat the data as empty and continue"
+     ],
+     "answer": 2,
+     "explanation": "429 means the rate limit was exceeded. Retry-After gives the minimum wait. An expired token would return 401."
+    },
+    {
+     "question": "A Meraki API response includes a Link header with rel=next. What does that tell you?",
+     "options": [
+      "The request was redirected to another server",
+      "More results exist; request that URL to get the next page",
+      "The API version is deprecated",
+      "The rate limit has been reached"
+     ],
+     "answer": 1,
+     "explanation": "Meraki uses RFC 8288 Link headers for pagination. Keep following rel=next until it disappears."
+    },
+    {
+     "question": "Which are common API constraints you must design for? (Choose all that apply.)",
+     "options": [
+      "Rate limits",
+      "Maximum page size",
+      "Token expiry",
+      "Asynchronous tasks returning 202"
+     ],
+     "answer": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "explanation": "All four are real constraints: throttle requests, follow pagination, renew tokens and poll task results."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- **Polling** asks repeatedly; a **webhook** is an HTTP callback that pushes events to your URL as they happen.\n- Typical uses: alerting and ChatOps, automated remediation, CI/CD triggers and chatbots.\n- A safe receiver uses **HTTPS**, verifies an **HMAC signature or shared secret**, acknowledges quickly with **2xx**, works asynchronously and **deduplicates** retried events.\n- APIs impose **rate limits** (`429` plus `Retry-After`), **pagination** (offset/limit or `Link` headers), **payload and timeout limits**, **asynchronous tasks** (`202`), **token lifetimes** and **versioning**.\n- Robust clients honor `Retry-After`, follow every page, set timeouts and renew tokens.\n\nNext, decode every status code and authentication scheme in [HTTP Response Codes and API Authentication](/learn/network-automation-devops/http-response-codes-and-api-authentication)."
+  }
+ ],
+ "ar": {
+  "title": "Webhooks وقيود واجهات البرمجة",
+  "summary": "تعرّف كيف تدفع webhooks الأحداث إلى تطبيقك بدل أن يستطلعها، وكيف تستقبلها بأمان، وكيف تعمل ضمن القيود الفعلية لواجهات البرمجة: حدود معدل الطلبات، والتقسيم إلى صفحات، والمهل الزمنية، والمهام غير المتزامنة، وأعمار الرموز المميزة.",
+  "objectives": [
+   "المقارنة بين الاستطلاع الدوري (Polling) وwebhooks ووصف حالات استخدام webhooks الشائعة",
+   "وصف كيفية تسجيل webhook وتسليمه والتحقق منه والإقرار باستلامه",
+   "تحديد القيود عند استهلاك واجهات البرمجة: حدود المعدل، والتقسيم إلى صفحات، وحجم الحمولة، والمهل الزمنية، والمهام غير المتزامنة",
+   "معالجة الرمز HTTP 429 والاستجابات المقسّمة إلى صفحات بصورة صحيحة في Python"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يريد فريق شبكات أن تصله رسالة محادثة خلال ثوانٍ كلما انقطع الخط الصاعد (Uplink) لأحد الفروع. كانت النسخة الأولى من سكربتهم تسأل Meraki Dashboard API عن حالة كل جهاز مرة كل دقيقة. ومع 300 فرع سرعان ما بدأ السكربت يتلقى `429 Too Many Requests`، ويفوّت الأحداث بين عمليات الاستطلاع، ويظل متأخرًا عن الواقع.\n\nالحل هو عكس اتجاه الحوار. فمع **webhook** تستدعي المنصةُ *تطبيقك* لحظةَ وقوع الحدث. وأيًّا كان اتجاه الاستدعاءات، فلكل واجهة برمجة حقيقية **قيود (Constraints)**: حدود لمعدل الطلبات، وأحجام للصفحات، ومهل زمنية، ورموز مميزة تنتهي صلاحيتها. ويطلب منهج CCNA Automation (200-901) أن تصف أنماط استخدام webhooks وأن تحدد هذه القيود، لأن تجاهلها هو السبب الأكثر شيوعًا لإخفاق الأتمتة في بيئة الإنتاج."
+   },
+   {
+    "id": "webhooks",
+    "type": "text",
+    "markdown": "## الاستطلاع الدوري مقابل webhooks\n\nيعني **الاستطلاع الدوري (Polling)** أن يسأل عميلك مرارًا: «هل تغيّر شيء؟». إنه بسيط ويعمل عبر أي جدار حماية، لكن معظم الطلبات لا تعيد جديدًا، وكلٌّ منها يُحتسب من حدّ المعدل، ولا يُرى الحدث إلا عند الاستطلاع التالي.\n\nأما **webhook** فهو **استدعاء HTTP راجع (HTTP callback)** يحدده المستخدم. تسجّل عنوان URL لدى المنصة، وعند وقوع الحدث المختار ترسل المنصة طلب HTTP من نوع **POST** يحمل حمولة JSON إلى ذلك العنوان. وهذا نمط **قائم على الأحداث (Event-driven)** وغير متزامن (راجع درس [أنماط واجهات البرمجة](/learn/network-automation-devops/api-styles-rest-rpc-synchronous-and-asynchronous)).\n\n| | الاستطلاع الدوري | Webhook |\n|:--|:--|:--|\n| من يبدأ الاستدعاء | عميلك | المنصة |\n| زمن التأخير | حتى فترة استطلاع كاملة | شبه فوري |\n| استدعاءات API المستهلكة | كثيرة، ومعظمها فارغ | استدعاء واحد لكل حدث |\n| متطلبات المستقبِل | لا شيء | نقطة HTTPS يمكن الوصول إليها |\n| الأحداث الفائتة | ممكنة بين عمليات الاستطلاع | ممكنة إذا توقف المستقبِل، وعادةً تعيد المنصات المحاولة |\n\n### أنماط الاستخدام الشائعة\n\n- **التنبيه وChatOps**: تُنشر تنبيهات Meraki أو أحداث Catalyst Center في مساحة Webex، أو تفتح تذكرة في ServiceNow.\n- **المعالجة التلقائية (Automated remediation)**: يطلق حدث «انقطاع المنفذ» سكربتًا يجمع بيانات التشخيص.\n- **مشغّلات CI/CD**: يرسل الدفع إلى Git طلب webhook إلى خادم خط الإنتاج فيبدأ الاختبارات (راجع درس [مكوّنات خط CI/CD](/learn/network-automation-devops/ci-cd-pipeline-components)).\n- **روبوتات المحادثة (Chatbots)**: ترسل Webex طلب webhook إلى الروبوت عند كل رسالة جديدة، فيرد الروبوت عبر REST API.\n\n### استقبال webhooks بأمان\n\n1. **لا تكشف إلا HTTPS** بشهادة صالحة. وفي أثناء التطوير يمكن لخدمة أنفاق (Tunnel) أن تحوّل عنوانًا عامًا مؤقتًا إلى حاسوبك.\n2. **تحقّق من المرسِل**. اضبط **سرًّا مشتركًا (Shared secret)**؛ إذ توقّع منصات كثيرة الجسم به باستخدام **HMAC**، فمثلًا تضع Webex توقيع HMAC-SHA1 في الترويسة `X-Spark-Signature`، وتُدرج Meraki القيمة `sharedSecret` في الحمولة. وارفض كل ما لا يطابق.\n3. **أقِرّ بالاستلام سريعًا**. أعِد `200` أو `204` خلال ثوانٍ، ونفّذ العمل البطيء في طابور خلفي (Background queue). فالمستقبِل البطيء يبدو كأنه أخفق، فتعيد المنصة المحاولة.\n4. **توقّع التكرار واختلال الترتيب**. قد تسلّم إعادةُ المحاولة الحدثَ نفسه مرتين، فاحفظ معرّف الحدث وعالج كل حدث مرة واحدة فقط."
+   },
+   {
+    "id": "wh-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "رحلة webhook من التسجيل إلى التنفيذ",
+    "caption": "يتحقق المستقبِل من التوقيع ويُقِرّ بالاستلام قبل تنفيذ العمل البطيء.",
+    "data": {
+     "actors": [
+      {
+       "id": "app",
+       "label": "تطبيق المستقبِل",
+       "sub": "hooks.example.com",
+       "icon": "server"
+      },
+      {
+       "id": "plat",
+       "label": "المنصة",
+       "sub": "Webex / Meraki",
+       "icon": "cloud"
+      },
+      {
+       "id": "sw",
+       "label": "محوّل الفرع",
+       "icon": "switch"
+      },
+      {
+       "id": "itsm",
+       "label": "نظام التذاكر",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "from": "app",
+       "to": "plat",
+       "label": "POST /webhooks",
+       "detail": "targetUrl, event, secret",
+       "note": "إعداد لمرة واحدة: يسجّل التطبيق عنوان HTTPS الخاص به، والأحداث التي يريدها، وسرًّا مشتركًا."
+      },
+      {
+       "from": "plat",
+       "to": "app",
+       "label": "201 Created",
+       "tone": "success",
+       "note": "تخزّن المنصة الاشتراك."
+      },
+      {
+       "from": "sw",
+       "to": "plat",
+       "label": "انقطاع الخط الصاعد",
+       "tone": "warning",
+       "note": "لاحقًا، يقع حدث فعلي على الشبكة."
+      },
+      {
+       "from": "plat",
+       "to": "app",
+       "label": "POST /hooks/net",
+       "detail": "JSON + signature",
+       "note": "تدفع المنصة الحدث بصيغة JSON موقّعًا بالسر المشترك."
+      },
+      {
+       "from": "app",
+       "to": "app",
+       "label": "التحقق من HMAC",
+       "tone": "secure",
+       "note": "يعيد التطبيق حساب HMAC للجسم الخام ويقارنه بمقارنة ثابتة الزمن."
+      },
+      {
+       "from": "app",
+       "to": "plat",
+       "label": "204 No Content",
+       "tone": "success",
+       "note": "يُقَرّ بالاستلام خلال أجزاء من الثانية، فلا تعيد المنصة المحاولة."
+      },
+      {
+       "from": "app",
+       "to": "itsm",
+       "label": "فتح تذكرة",
+       "detail": "POST /incidents",
+       "note": "ينفّذ عامل في الخلفية الجزء البطيء: يفتح تذكرة وينشر رسالة محادثة."
+      },
+      {
+       "from": "plat",
+       "to": "app",
+       "label": "طلب POST مزوَّر",
+       "tone": "attack",
+       "note": "طلب بتوقيع خاطئ أو مفقود..."
+      },
+      {
+       "from": "app",
+       "to": "plat",
+       "label": "401 Unauthorized",
+       "tone": "blocked",
+       "note": "...يُرفض ويُسجَّل، ولا يُعالَج أبدًا."
+      }
+     ]
+    }
+   },
+   {
+    "id": "receiver",
+    "type": "code",
+    "language": "python",
+    "filename": "webhook_receiver.py",
+    "highlight": [
+     11,
+     12,
+     13,
+     14,
+     15
+    ],
+    "caption": "تحقّق من HMAC على الجسم الخام، وأقِرّ بالاستلام سريعًا، وأسقط الأحداث المكررة بحسب معرّف الحدث.",
+    "code": "import hashlib, hmac, os, queue\nfrom flask import Flask, request, abort\n\napp = Flask(__name__)\nSECRET = os.environ[\"WEBHOOK_SECRET\"].encode()   # same value registered on the platform\njobs = queue.Queue()                             # a worker thread consumes this\nseen_ids = set()\n\n@app.post(\"/hooks/net\")\ndef net_event():\n    body = request.get_data()                    # raw bytes, before JSON parsing\n    sent = request.headers.get(\"X-Signature\", \"\")\n    expected = hmac.new(SECRET, body, hashlib.sha256).hexdigest()\n    if not hmac.compare_digest(sent, expected):  # constant-time comparison\n        abort(401)\n\n    event = request.get_json()\n    if event[\"id\"] in seen_ids:                  # retried delivery: ignore\n        return \"\", 204\n    seen_ids.add(event[\"id\"])\n    jobs.put(event)                              # slow work happens elsewhere\n    return \"\", 204\n"
+   },
+   {
+    "id": "constraints",
+    "type": "text",
+    "markdown": "## القيود عند استهلاك واجهات البرمجة\n\nتحمي كل واجهة برمجة نفسها ومستخدميها. فاقرأ قسم القيود في التوثيق قبل أن تكتب حلقة التكرار.\n\n### تحديد معدل الطلبات (Rate limiting)\n\nيسمح الخادم بعدد ثابت من الطلبات في نافذة زمنية محددة، لكل مفتاح أو مستخدم أو مؤسسة. فمثلًا تسمح Meraki Dashboard API بنحو **10 طلبات في الثانية لكل مؤسسة**. وعند تجاوز الحد يعيد الخادم **`429 Too Many Requests`**، وغالبًا ما يرفق الترويسة **`Retry-After`** التي تحدد عدد الثواني الواجب انتظارها. والسلوك الصحيح أن تنتظر تلك المدة على الأقل ثم تعيد المحاولة، مع إضافة **تراجع أُسّي (Exponential backoff)** إذا استمرت رموز 429. والأفضل من ذلك أن تتجنب الحد أصلًا: خزّن النتائج مؤقتًا، واطلب الحقول التي تحتاجها فقط، واستخدم webhooks بدل الاستطلاع.\n\n### التقسيم إلى صفحات (Pagination)\n\nتُقسَّم المجموعات الكبيرة إلى صفحات، ومن أشهر الأساليب:\n\n- **الإزاحة والحد (Offset/limit)**: `?offset=1&limit=500`. وتستخدم واجهة network-device في Catalyst Center هذا الأسلوب، مع حد أقصى لحجم الصفحة في كل استدعاء.\n- **المؤشر أو الرمز (Cursor/token)**: تستخدم Meraki المعاملين `perPage` و`startingAfter`، وتعيد عنوان الصفحة التالية في الترويسة **`Link`** وفق RFC 8288 مع `rel=next`.\n\nالسكربت الذي لا يقرأ إلا الصفحة الأولى يُغفل أجهزة دون أن ينبّهك. فاستمر في الطلب حتى يختفي رابط الصفحة التالية أو تعود صفحة أقصر من الحجم المطلوب.\n\n### قيود أخرى\n\n- **حجم الحمولة (Payload size)**: للطلبات والاستجابات أحجام قصوى، وقد تحتاج العمليات الجماعية إلى تقسيمها على دفعات.\n- **المهل الزمنية (Timeouts)**: قد يقطع الخادم أو الوكيل الطلبات الطويلة، فاضبط دائمًا قيمة `timeout` لدى العميل.\n- **المهام غير المتزامنة (Asynchronous jobs)**: تعيد بعض الاستدعاءات **`202 Accepted`** مع معرّف مهمة بدل النتيجة. وهذا ما تفعله واجهات intent في Catalyst Center، فتستطلع بعدها مورد المهمة حتى تكتمل.\n- **عمر الرمز المميز (Token lifetime)**: يصلح رمز Catalyst Center لنحو ساعة، وعلى المهام الطويلة تجديد الرموز عند تلقي `401`.\n- **الإصدارات والإيقاف (Versioning and deprecation)**: قد يُسحب المسار `/api/v1`؛ فثبّت الإصدار، وتابع سجلات التغيير، واختبر الترقيات."
+   },
+   {
+    "id": "term",
+    "type": "terminal",
+    "title": "رؤية التقسيم إلى صفحات وحدود المعدل في الترويسات",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "curl -s -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \\\n  \"https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3\"",
+      "output": "HTTP/1.1 200 OK\nContent-Type: application/json; charset=utf-8\nLink: <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3>; rel=first, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=Q2XX-AAAA-0003>; rel=next, <https://api.meraki.com/api/v1/organizations/123456/devices?endingBefore=zzzzzzzz&perPage=3>; rel=last\n\n[{\"serial\":\"Q2XX-AAAA-0001\",\"name\":\"br12-sw01\"},{\"serial\":\"Q2XX-AAAA-0002\",\"name\":\"br12-ap01\"},{\"serial\":\"Q2XX-AAAA-0003\",\"name\":\"br12-mx01\"}]"
+     },
+     {
+      "comment": "عادت ثلاثة أجهزة فقط. ويجلب العنوان المقرون بـ rel=next في الترويسة Link الصفحة التالية."
+     },
+     {
+      "cmd": "for i in $(seq 1 30); do curl -s -o /dev/null -w \"%{http_code} \" -H \"Authorization: Bearer $MERAKI_API_KEY\" https://api.meraki.com/api/v1/organizations/123456/networks; done; echo",
+      "output": "200 200 200 200 200 200 200 200 200 200 200 200 429 429 200 429 429 429 200 429 429 429 429 200 429 429 429 429 429 200"
+     },
+     {
+      "comment": "تتجاوز الحلقة السريعة حد المؤسسة. ويحمل كل رمز 429 الترويسة Retry-After، والعميل المنضبط ينتظر."
+     }
+    ],
+    "caption": "نفّذ هذا على مؤسسة المختبر الخاصة بك فقط؛ فالرقم 123456 والأرقام التسلسلية قيم بديلة."
+   },
+   {
+    "id": "client",
+    "type": "code",
+    "language": "python",
+    "filename": "paged_get.py",
+    "caption": "تحلّل مكتبة requests الترويسة Link إلى resp.links، وتحدد Retry-After مدة الانتظار عند 429.",
+    "code": "import os, time, requests\n\nsession = requests.Session()\nsession.headers[\"Authorization\"] = f\"Bearer {os.environ['MERAKI_API_KEY']}\"\n\ndef get_all(url, params=None, max_retries=5):\n    items = []\n    while url:\n        for attempt in range(max_retries):\n            resp = session.get(url, params=params, timeout=15)\n            if resp.status_code != 429:\n                break\n            wait = int(resp.headers.get(\"Retry-After\", 2 ** attempt))\n            time.sleep(wait)                      # honor the server's hint\n        resp.raise_for_status()\n        items.extend(resp.json())\n        url = resp.links.get(\"next\", {}).get(\"url\")  # None on the last page\n        params = None                             # the next URL already has them\n    return items\n\ndevices = get_all(\"https://api.meraki.com/api/v1/organizations/123456/devices\",\n                  params={\"perPage\": 1000})\nprint(len(devices), \"devices\")\n"
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة لدى المتعلمين",
+    "markdown": "- **إعادة المحاولة فورًا بعد 429 في حلقة سريعة**: يطيل ذلك التقييد على كل من يتشاركون الحد نفسه. التزم بالترويسة `Retry-After`.\n- **قراءة الصفحة الأولى فقط** ثم الإبلاغ بأن «كل الأجهزة متوافقة».\n- **تنفيذ العمل البطيء داخل معالج webhook**، مما يسبب انتهاء المهل وإعادة المحاولات وتكرار التذاكر.\n- **الوثوق بأي طلب POST يصل إلى عنوان webhook**: تحقّق من التوقيع أو السر المشترك، فالعنوان وحده ليس سرًّا.\n- **عدّ `202 Accepted` نجاحًا**: لقد وُضعت المهمة في الطابور فحسب، فتحقّق من نتيجتها."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على حاسوبك الشخصي، دون الحاجة إلى أي منصة خارجية:\n\n1. ثبّت Flask، واضبط `WEBHOOK_SECRET` على أي قيمة اختبارية، ثم شغّل `webhook_receiver.py` بالأمر `flask --app webhook_receiver run`.\n2. احسب في Python القيمة `hmac.new(b\"<your-secret>\", body, hashlib.sha256).hexdigest()` لجسم JSON صغير مثل `{\"id\": \"evt-1\", \"type\": \"port_down\"}`.\n3. أرسله باستخدام `curl -X POST` إلى `http://127.0.0.1:5000/hooks/net` مع الترويسة `X-Signature` والترويسة `Content-Type: application/json`، وتوقّع الرمز `204`.\n4. غيّر محرفًا واحدًا في الجسم دون تحديث التوقيع، وتأكد أنك تتلقى `401`.\n5. أرسل الطلب الصالح مرتين، وتأكد أن الثاني يُتجاهل بوصفه مكررًا.\n6. اختياري: باستخدام بيئة DevNet Sandbox أو مؤسسة Meraki خاصة بمختبرك، شغّل `paged_get.py` بقيمة صغيرة لـ `perPage` وعُدّ الصفحات."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "Webhook",
+      "definition": "استدعاء HTTP راجع يسجّله المستخدم: ترسل المنصة طلب POST إلى عنوانك عند وقوع حدث مشترَك فيه."
+     },
+     {
+      "term": "الاستطلاع الدوري (Polling)",
+      "definition": "طلب مورد ما مرارًا على فترات منتظمة لاكتشاف التغييرات."
+     },
+     {
+      "term": "HMAC",
+      "definition": "رمز مصادقة رسائل قائم على التجزئة يُحسب بسر مشترك، ويُستخدم لإثبات أن webhook صادر عن المرسِل المتوقع ولم يُعدَّل."
+     },
+     {
+      "term": "تحديد معدل الطلبات (Rate limiting)",
+      "definition": "سقف لعدد الطلبات التي يُسمح للعميل بإرسالها في نافذة زمنية؛ وتجاوزه يعيد الرمز HTTP 429."
+     },
+     {
+      "term": "Retry-After",
+      "definition": "ترويسة استجابة تخبر العميل بمدة الانتظار قبل إعادة المحاولة، وتُرسل غالبًا مع 429 أو 503."
+     },
+     {
+      "term": "التراجع الأُسّي (Exponential backoff)",
+      "definition": "استراتيجية لإعادة المحاولة تضاعف مدة الانتظار بعد كل محاولة فاشلة."
+     },
+     {
+      "term": "التقسيم إلى صفحات (Pagination)",
+      "definition": "تقسيم مجموعة نتائج كبيرة إلى صفحات تُجلب بمعاملات الإزاحة والحد أو بمعاملات المؤشر."
+     },
+     {
+      "term": "202 Accepted",
+      "definition": "رمز حالة يعني أن الطلب وُضع في طابور للمعالجة غير المتزامنة ولم يكتمل بعد."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما الميزة الرئيسية لـ webhook مقارنةً بالاستطلاع الدوري؟",
+      "options": [
+       "يعمل دون أي اتصال بالشبكة",
+       "تُدفع الأحداث بشكل شبه فوري دون طلبات فارغة متكررة",
+       "يلغي الحاجة إلى المصادقة",
+       "يضمن عدم تكرار الأحداث أبدًا"
+      ],
+      "answer": 1,
+      "explanation": "تستدعيك المنصة عند وقوع الحدث، فتوفّر استدعاءات API وزمن التأخير. لكن webhooks تظل بحاجة إلى الحماية، وقد تسلّم أحداثًا مكررة عند إعادة المحاولة."
+     },
+     {
+      "question": "أيّ الممارسات ينبغي أن يتبعها مستقبِل webhook؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "التحقق من التوقيع أو السر المشترك",
+       "إعادة رمز 2xx سريعًا والمعالجة في الخلفية",
+       "قبول HTTP غير المشفّر عبر الإنترنت تبسيطًا للأمور",
+       "تجاهل الأحداث التي سبقت معالجة معرّفاتها"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يصادق المستقبِل على المرسِل، ويُقِرّ بالاستلام سريعًا لتجنب إعادة المحاولة، ويزيل التكرار بحسب معرّف الحدث. ويجب أن تستخدم النقاط العامة HTTPS."
+     },
+     {
+      "question": "تلقّى سكربتك الرمز HTTP 429 مع 'Retry-After: 2'. ماذا ينبغي أن يفعل؟",
+      "options": [
+       "إعادة المحاولة فورًا حتى ينجح",
+       "إعادة المصادقة لأن الرمز المميز انتهت صلاحيته",
+       "الانتظار ثانيتين على الأقل ثم إعادة الطلب نفسه",
+       "اعتبار البيانات فارغة والمتابعة"
+      ],
+      "answer": 2,
+      "explanation": "يعني 429 تجاوز حد المعدل، وتحدد Retry-After أدنى مدة انتظار. أما الرمز المميز المنتهي فيعيد 401."
+     },
+     {
+      "question": "تتضمن استجابة Meraki API الترويسة Link مع rel=next. ماذا يخبرك ذلك؟",
+      "options": [
+       "أُعيد توجيه الطلب إلى خادم آخر",
+       "توجد نتائج إضافية؛ اطلب ذلك العنوان للحصول على الصفحة التالية",
+       "إصدار الواجهة متوقف",
+       "تم بلوغ حد المعدل"
+      ],
+      "answer": 1,
+      "explanation": "تستخدم Meraki ترويسات Link وفق RFC 8288 للتقسيم إلى صفحات، فاستمر في تتبّع rel=next حتى يختفي."
+     },
+     {
+      "question": "أيٌّ مما يلي من القيود الشائعة لواجهات البرمجة التي يجب أن تصمم شيفرتك لمراعاتها؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "حدود معدل الطلبات",
+       "الحد الأقصى لحجم الصفحة",
+       "انتهاء صلاحية الرمز المميز",
+       "المهام غير المتزامنة التي تعيد 202"
+      ],
+      "answer": [
+       0,
+       1,
+       2,
+       3
+      ],
+      "explanation": "القيود الأربعة كلها حقيقية: خفّف وتيرة الطلبات، وتتبّع الصفحات، وجدّد الرموز المميزة، واستطلع نتائج المهام."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- **الاستطلاع الدوري** يسأل مرارًا، أما **webhook** فاستدعاء HTTP راجع يدفع الأحداث إلى عنوانك فور وقوعها.\n- من الاستخدامات الشائعة: التنبيه وChatOps، والمعالجة التلقائية، ومشغّلات CI/CD، وروبوتات المحادثة.\n- يستخدم المستقبِل الآمن **HTTPS**، ويتحقق من **توقيع HMAC أو السر المشترك**، ويُقِرّ بالاستلام سريعًا برمز **2xx**، ويعمل بصورة غير متزامنة، و**يزيل تكرار** الأحداث المعاد إرسالها.\n- تفرض واجهات البرمجة **حدودًا لمعدل الطلبات** (`429` مع `Retry-After`)، و**تقسيمًا إلى صفحات** (الإزاحة والحد أو ترويسات `Link`)، و**حدودًا لحجم الحمولة والمهل الزمنية**، و**مهامَّ غير متزامنة** (`202`)، و**أعمارًا للرموز المميزة**، و**إصدارات**.\n- يلتزم العميل المتين بـ `Retry-After`، ويتتبّع كل الصفحات، ويضبط المهل الزمنية، ويجدّد الرموز المميزة.\n\nتابع لتفكّ رموز الحالة وأساليب المصادقة كلها في درس [رموز استجابة HTTP والمصادقة في واجهات البرمجة](/learn/network-automation-devops/http-response-codes-and-api-authentication)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,400 @@
+{
+ "slug": "gitlab-ci-cd-pipelines-build-validate-and-deploy",
+ "title": "GitLab CI/CD Pipelines: Build, Validate and Deploy",
+ "summary": "Build a GitLab CI/CD pipeline for network automation: package the tools in a container image, lint and unit-test every change, test it in Cisco Modeling Labs, and deploy to production through a protected, manual job with verification.",
+ "duration_minutes": 45,
+ "objectives": [
+  "Read and write a .gitlab-ci.yml file with stages, jobs, images, rules, artifacts and environments",
+  "Explain how GitLab runners execute jobs and why their network placement matters for automation",
+  "Design build, validate, test and deploy stages for Ansible-based network changes",
+  "Protect production with protected branches, protected and masked variables, manual jobs and resource groups",
+  "Read a job log to confirm what a pipeline did"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "Your team already keeps its playbooks and templates in GitLab and reviews every change in a merge request. Yet the deployment is still manual: after the merge, an engineer runs `ansible-playbook` from a laptop, with whatever Ansible version and credentials happen to be there. One Friday, a template with a YAML indentation error reaches 60 switches before anyone notices.\n\nA **CI/CD pipeline** removes the laptop from the path. Every push triggers the same steps, in the same container, with the same checks: lint, unit tests, a test deployment in a lab, then a controlled production deployment and a verification. The AUTOCOR 350-901 blueprint expects you to build such a pipeline and to understand each stage. This lesson builds one in GitLab, step by step."
+  },
+  {
+   "id": "anatomy",
+   "type": "text",
+   "markdown": "## Anatomy of .gitlab-ci.yml\n\nA pipeline is defined in a file named `.gitlab-ci.yml` at the root of the repository. GitLab reads it on every push and creates a pipeline of **jobs** grouped into **stages**.\n\n| Keyword | Purpose |\n|:--|:--|\n| `stages` | The ordered list of stages. All jobs in a stage run in parallel; the next stage starts when they all succeed. |\n| `image` | The container image in which a job's script runs. |\n| `script` | The shell commands of the job. A non-zero exit code fails the job. |\n| `variables` | Values available to the scripts as environment variables. |\n| `rules` | Conditions that decide whether a job is added to a pipeline, and how (for example `when: manual`). |\n| `needs` | Lets a job start as soon as specific jobs finish, instead of waiting for the whole previous stage. |\n| `artifacts` | Files kept after the job: reports, logs, rendered configurations. `reports: junit` shows test results in the merge request. |\n| `environment` | Records deployments to a named environment such as `production`, with history in the GitLab UI. |\n| `resource_group` | Ensures that only one job at a time uses a shared resource, such as a lab or the production network. |\n| `tags` | Selects which runners may pick up the job. |\n\nGitLab also provides **predefined variables**, such as `$CI_COMMIT_BRANCH`, `$CI_DEFAULT_BRANCH`, `$CI_COMMIT_SHORT_SHA` and `$CI_REGISTRY_IMAGE`, that scripts and rules can use."
+  },
+  {
+   "id": "runners",
+   "type": "text",
+   "markdown": "## Runners: where jobs actually run\n\nGitLab itself only schedules jobs. A **GitLab Runner**, an agent you install on a server or in Kubernetes, picks up jobs and runs them, usually with the **Docker executor**, which starts a fresh container from the job's `image` for every job.\n\nFor network automation, the runner's **placement** matters as much as its configuration:\n\n- The runner must **reach the devices** or controllers it changes: management VLANs, Catalyst Center, the CML server. A shared cloud runner usually cannot.\n- Deploy a dedicated **project runner** inside the management network, register it with a tag such as `netauto`, and add `tags: [netauto]` to jobs that need it.\n- Treat the runner as a privileged system. It holds production credentials while jobs run, so restrict who can register runners and run jobs on protected branches."
+  },
+  {
+   "id": "pipeline-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A template change travels through the pipeline",
+   "caption": "Every stage is a gate. A failure stops the change long before it reaches production.",
+   "data": {
+    "token": "Change",
+    "nodes": [
+     { "id": "push", "label": "Git push", "sub": "feature branch", "icon": "laptop" },
+     { "id": "build", "label": "Build", "sub": "tools image", "icon": "cpu" },
+     { "id": "validate", "label": "Validate", "sub": "lint + unit tests", "icon": "file" },
+     { "id": "test", "label": "Test in CML", "sub": "deploy + pyATS", "icon": "router" },
+     { "id": "mr", "label": "Merge request", "sub": "review + approval", "icon": "user" },
+     { "id": "deploy", "label": "Deploy", "sub": "production, manual", "icon": "server" },
+     { "id": "verify", "label": "Verify", "sub": "pyATS checks", "icon": "eye" }
+    ],
+    "steps": [
+     { "at": "push", "caption": "An engineer pushes a new SNMP template to a feature branch. A pipeline starts automatically." },
+     { "at": "build", "caption": "The build job creates a container image with pinned versions of Ansible, collections and pyATS." },
+     { "at": "validate", "token": "Bad indent", "caption": "First attempt: yamllint finds an indentation error. The pipeline fails and the merge request is blocked.", "tone": "blocked" },
+     { "at": "validate", "token": "Fixed", "caption": "After a fix, yamllint, ansible-lint, a syntax check and unit tests all pass.", "tone": "success" },
+     { "at": "test", "caption": "The playbook runs against a CML topology, and pyATS confirms SNMP and routing state.", "tone": "success" },
+     { "at": "mr", "caption": "A reviewer approves. The merge to main starts a new pipeline on the protected branch." },
+     { "at": "deploy", "caption": "The deploy job waits for a person to start it. It runs --check --diff, then applies the change.", "tone": "warning" },
+     { "at": "verify", "caption": "pyATS compares the post-change state with expectations. The deployment is recorded under the production environment.", "tone": "success" }
+    ]
+   }
+  },
+  {
+   "id": "stages",
+   "type": "text",
+   "markdown": "## Designing the stages\n\n### Build\n\nPackage your tools into a **container image**: a `Dockerfile` that installs pinned versions from `requirements.txt` (`ansible-core`, `cisco.ios`, `pyats[full]`, `yamllint`, `ansible-lint`). Push it to the GitLab container registry and run every later job in it. Then the lab test and the production deployment use exactly the same versions.\n\n### Validate: fast, offline checks\n\n- `yamllint` for YAML syntax and style\n- `ansible-lint` for playbook best practices\n- `ansible-playbook --syntax-check`\n- `terraform fmt -check` and `terraform validate` if you use Terraform\n- `pytest` unit tests for custom filters, modules and data validation, published as a JUnit report\n\nThese take seconds and catch most mistakes, so they run on **every push** to every branch.\n\n### Test: a real deployment in a lab\n\nDeploy the change to a **Cisco Modeling Labs** topology that mirrors production, then run **pyATS** tests that check operational state (interfaces up, OSPF neighbors full, SNMP configured). See [Cisco Modeling Labs (CML) for Testing](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing) and [Change Validation with pyATS](/learn/network-automation-devops/change-validation-with-pyats). A `resource_group` stops two pipelines from changing the lab at once.\n\n### Deploy: controlled and verified\n\nThe production job runs **only on the default branch**, is **manual** (`when: manual`), uses `resource_group: production` so that deployments never overlap, previews with `--check --diff`, applies the change and then verifies it. If verification fails, the fix is a `git revert` on `main`, which flows through the same pipeline."
+  },
+  {
+   "id": "pipeline-code",
+   "type": "code",
+   "language": "yaml",
+   "filename": ".gitlab-ci.yml",
+   "caption": "A complete pipeline. The Docker-in-Docker build needs a privileged runner; Kaniko or Buildah are common alternatives. Device credentials come from protected, masked CI/CD variables that the inventory reads from the environment.",
+   "highlight": [53, 54, 55, 56, 61, 62, 63],
+   "code": "stages:\n  - build\n  - validate\n  - test\n  - deploy\n\nvariables:\n  TOOLS_IMAGE: \"$CI_REGISTRY_IMAGE/netauto-tools:$CI_COMMIT_SHORT_SHA\"\n\ndefault:\n  image: $TOOLS_IMAGE\n  tags: [netauto]\n\nbuild-tools-image:\n  stage: build\n  image: docker:27\n  services: [\"docker:27-dind\"]\n  script:\n    - echo \"$CI_REGISTRY_PASSWORD\" | docker login -u \"$CI_REGISTRY_USER\" --password-stdin \"$CI_REGISTRY\"\n    - docker build -t \"$TOOLS_IMAGE\" .\n    - docker push \"$TOOLS_IMAGE\"\n\nlint:\n  stage: validate\n  script:\n    - yamllint .\n    - ansible-lint playbooks/\n    - ansible-playbook playbooks/site.yml --syntax-check\n\nunit-tests:\n  stage: validate\n  script:\n    - pytest -q tests/unit --junitxml=report.xml\n  artifacts:\n    when: always\n    reports:\n      junit: report.xml\n\ncml-test:\n  stage: test\n  resource_group: cml-lab\n  script:\n    - ansible-playbook -i inventories/cml playbooks/site.yml\n    - pyats run job tests/pyats/post_change_job.py --testbed-file inventories/cml/testbed.yaml --archive-dir archive\n  artifacts:\n    when: always\n    paths: [archive/]\n    expire_in: 1 week\n\ndeploy-production:\n  stage: deploy\n  environment:\n    name: production\n  resource_group: production\n  rules:\n    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH\n      when: manual\n  script:\n    - ansible-playbook -i inventories/prod playbooks/site.yml --check --diff\n    - ansible-playbook -i inventories/prod playbooks/site.yml\n    - pyats run job tests/pyats/post_change_job.py --testbed-file inventories/prod/testbed.yaml --archive-dir archive\n  artifacts:\n    when: always\n    paths: [archive/]"
+  },
+  {
+   "id": "secrets",
+   "type": "text",
+   "markdown": "## Securing the pipeline\n\nA pipeline that can change production is a high-value target. Apply these controls:\n\n- **Protected branches.** Only maintainers can merge to `main`, merges require approval and a successful pipeline, and force pushes are disabled.\n- **Protected variables.** Store production credentials under **Settings > CI/CD > Variables** as *protected*, so they are exposed only to pipelines on protected branches. A feature branch pipeline cannot read them, even if someone edits `.gitlab-ci.yml` on that branch.\n- **Masked variables.** Mark secrets as *masked* so that GitLab replaces their values with `[MASKED]` in job logs. Never `echo` a secret or run scripts with `set -x` around it.\n- **Pinned images and dependencies.** Use exact versions, so a new upstream release cannot change behavior without review.\n- **Least privilege.** The automation account should have only the device privileges the playbooks need, with accounting enabled on the devices (TACACS+), so every change is traceable to the pipeline.\n\nFor a deeper treatment of secret handling, see [Secure Coding: Input Validation and Secret Management](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)."
+  },
+  {
+   "id": "job-log",
+   "type": "terminal",
+   "title": "Excerpts from two job logs",
+   "prompt": "$",
+   "lines": [
+    { "comment": "Job: lint (stage validate)" },
+    { "output": "Running with gitlab-runner 17.5.0\n  on netauto-runner-01, system ID: s_4b9e21c7d0a3\nPreparing the \"docker\" executor\nUsing docker image registry.gitlab.example.com/netops/automation/netauto-tools:4f2a91c ..." },
+    { "cmd": "yamllint .", "comment": "no output means no problems" },
+    { "cmd": "ansible-lint playbooks/", "output": "Passed: 0 failure(s), 0 warning(s) on 14 files. Last profile that met the validation criteria was 'production'." },
+    { "cmd": "ansible-playbook playbooks/site.yml --syntax-check", "output": "playbook: playbooks/site.yml" },
+    { "output": "Job succeeded" },
+    { "comment": "Job: deploy-production (manual, started by a maintainer)" },
+    { "cmd": "ansible-playbook -i inventories/prod playbooks/site.yml", "output": "...\nPLAY RECAP *********************************************************\nbr-sw-001   : ok=6  changed=1  unreachable=0  failed=0  skipped=0\nbr-sw-002   : ok=6  changed=1  unreachable=0  failed=0  skipped=0\n..." },
+    { "comment": "changed=1 on each switch: only the SNMP template was applied" },
+    { "output": "Job succeeded" }
+   ],
+   "caption": "Read the runner name and image tag first: they tell you where the job ran and with which tool versions."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Validate the file itself",
+   "markdown": "Before pushing changes to `.gitlab-ci.yml`, open **Build > Pipeline editor** in GitLab. It validates the syntax, shows a visualization of stages and jobs, and can show the merged configuration when you use `include`. Many \"pipeline did not start\" problems are simply rule conditions that never match."
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common pipeline mistakes",
+   "markdown": "- Running the lab test and production deployment with different tool versions, so that \"it passed in CML\" proves nothing.\n- Making production credentials unprotected variables, so that any branch pipeline can use them.\n- Forgetting `resource_group`, so that two merges deploy to the same devices at the same time.\n- Deploying without verification. A job that exits with code 0 only means that the commands ran, not that the network is healthy."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. Create a project on a GitLab instance you control and register a project runner with the Docker executor and the tag `netauto`.\n2. Add a `Dockerfile` that installs `ansible-core`, `cisco.ios`, `yamllint` and `ansible-lint`, and commit the pipeline above (remove the CML and pyATS jobs at first).\n3. Push a playbook with a deliberate YAML indentation error and confirm that the `lint` job fails. Fix it and watch the pipeline turn green.\n4. Add the `cml-test` job against a CML topology on the runner's network, then the manual `deploy-production` job pointed at a second lab inventory.\n5. Add device credentials as protected, masked variables and check that the job log shows `[MASKED]`. Use only lab devices you are authorized to change."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    { "term": ".gitlab-ci.yml", "definition": "The YAML file at the root of a repository that defines a GitLab pipeline." },
+    { "term": "Stage", "definition": "A group of jobs that run in parallel; stages run in the order listed in stages." },
+    { "term": "Job", "definition": "A named set of script commands that a runner executes, usually inside a container image." },
+    { "term": "GitLab Runner", "definition": "The agent that picks up and executes jobs; its network placement decides which devices jobs can reach." },
+    { "term": "Artifact", "definition": "A file kept after a job, such as a test report, log or rendered configuration." },
+    { "term": "rules", "definition": "Conditions that decide whether a job runs in a pipeline and how, for example only on main and only manually." },
+    { "term": "Protected variable", "definition": "A CI/CD variable exposed only to pipelines that run on protected branches or tags." },
+    { "term": "Masked variable", "definition": "A CI/CD variable whose value GitLab hides in job logs." },
+    { "term": "resource_group", "definition": "A setting that allows only one job at a time to use a named resource, preventing overlapping deployments." }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Two jobs, lint and unit-tests, are both in the validate stage. How does GitLab run them?",
+     "options": [
+      "lint first, then unit-tests, in file order",
+      "In parallel; the next stage starts only when both succeed",
+      "Only the first job in the stage runs",
+      "They run after the deploy stage"
+     ],
+     "answer": 1,
+     "explanation": "Jobs in the same stage run in parallel when runners are available. The pipeline moves to the next stage only when all jobs in the current stage succeed (unless needs is used)."
+    },
+    {
+     "question": "Why should production device credentials be stored as protected CI/CD variables?",
+     "options": [
+      "Protected variables are encrypted with a stronger algorithm",
+      "They are exposed only to pipelines running on protected branches, so feature branch pipelines cannot read them",
+      "They are hidden in the job log",
+      "They are automatically rotated"
+     ],
+     "answer": 1,
+     "explanation": "The protected flag limits which pipelines receive the variable. Hiding values in logs is what the masked flag does; use both."
+    },
+    {
+     "question": "Which settings belong on a production deployment job? (Choose all that apply.)",
+     "options": [
+      "rules that limit it to the default branch",
+      "when: manual",
+      "resource_group: production",
+      "allow_failure: true so that the pipeline always passes"
+     ],
+     "answer": [0, 1, 2],
+     "explanation": "Limiting the job to main, requiring a person to start it and preventing overlapping deployments are standard controls. Allowing failure would hide a broken deployment."
+    },
+    {
+     "question": "A pipeline job cannot connect to switches on 10.20.0.0/24, but the same playbook works from an engineer's laptop. What is the most likely cause?",
+     "options": [
+      "The .gitlab-ci.yml file uses the wrong stage names",
+      "The runner that picked up the job has no network path to the management network",
+      "GitLab blocks SSH in all pipelines",
+      "The job has no artifacts"
+     ],
+     "answer": 1,
+     "explanation": "Jobs run on the runner, not on GitLab or the laptop. Use a project runner placed in the management network and select it with tags."
+    },
+    {
+     "question": "Which checks are suitable for the fast validate stage that runs on every push? (Choose all that apply.)",
+     "options": [
+      "yamllint and ansible-lint",
+      "ansible-playbook --syntax-check",
+      "pytest unit tests for custom filters",
+      "Applying the change to production switches"
+     ],
+     "answer": [0, 1, 2],
+     "explanation": "Linting, syntax checks and unit tests are fast and need no devices. Production changes belong only in the protected, manual deploy stage."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- `.gitlab-ci.yml` defines **stages** of **jobs**. Jobs run in containers on **runners**, and the runner must be able to reach the network it changes.\n- **Build** a pinned tools image, **validate** with linting, syntax checks and unit tests on every push, **test** in CML with pyATS, then **deploy** to production.\n- Protect production with **protected branches**, **protected and masked variables**, a **manual** job limited to the default branch, a **resource_group** and post-deployment **verification**.\n- Roll back with `git revert`, which flows through the same tested pipeline.\n\nNext, learn to read failing jobs and fix them in [Diagnosing CI/CD Pipeline Failures](/learn/network-automation-devops/diagnosing-ci-cd-pipeline-failures)."
+  }
+ ],
+ "ar": {
+  "title": "خطوط GitLab CI/CD: البناء والتحقق والنشر",
+  "summary": "ابنِ خط GitLab CI/CD لأتمتة الشبكات: حزّم الأدوات في صورة حاوية، وافحص كل تغيير بأدوات التدقيق واختبارات الوحدات، واختبره في Cisco Modeling Labs، ثم انشره في الإنتاج عبر مهمة يدوية محمية يتبعها تحقّق.",
+  "objectives": [
+   "قراءة ملف .gitlab-ci.yml وكتابته بالمراحل والمهام والصور والقواعد والمخرجات والبيئات",
+   "شرح كيفية تنفيذ مشغّلات GitLab للمهام وأهمية موقعها الشبكي في الأتمتة",
+   "تصميم مراحل البناء والتحقق والاختبار والنشر لتغييرات الشبكة المعتمدة على Ansible",
+   "حماية الإنتاج بالفروع المحمية والمتغيرات المحمية والمقنّعة والمهام اليدوية ومجموعات الموارد",
+   "قراءة سجل المهمة للتأكد مما فعله خط CI/CD"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يحفظ فريقك أدلة التشغيل والقوالب في GitLab ويراجع كل تغيير في طلب دمج. ومع ذلك ما زال النشر يدويًا: بعد الدمج يشغّل مهندس `ansible-playbook` من حاسوبه المحمول، بأي إصدار من Ansible وبأي بيانات اعتماد تصادف وجودها عليه. وفي أحد أيام الجمعة يصل قالب فيه خطأ في المسافات البادئة (Indentation) بصيغة YAML إلى 60 مبدّلًا قبل أن ينتبه أحد.\n\nيُخرج **خط CI/CD (Pipeline)** الحاسوبَ المحمول من المسار. فكل دفع (Push) يُطلق الخطوات نفسها، في الحاوية نفسها، بالفحوص نفسها: التدقيق (Lint)، واختبارات الوحدات، ونشر تجريبي في مختبر، ثم نشر مضبوط في الإنتاج يتبعه تحقّق. ويتوقّع مخطط اختبار AUTOCOR 350-901 أن تبني خطًّا كهذا وأن تفهم كل مرحلة فيه. يبني هذا الدرس واحدًا في GitLab خطوة بخطوة."
+   },
+   {
+    "id": "anatomy",
+    "type": "text",
+    "markdown": "## بنية ملف .gitlab-ci.yml\n\nيُعرَّف الخط في ملف اسمه `.gitlab-ci.yml` في جذر المستودع. يقرؤه GitLab مع كل دفع، وينشئ خطًّا من **المهام (Jobs)** المجمّعة في **مراحل (Stages)**.\n\n| الكلمة المفتاحية | الغرض |\n|:--|:--|\n| `stages` | القائمة المرتّبة للمراحل. تعمل كل مهام المرحلة بالتوازي، وتبدأ المرحلة التالية حين تنجح جميعها. |\n| `image` | صورة الحاوية التي يعمل فيها سكربت المهمة. |\n| `script` | أوامر الصدفة (Shell) الخاصة بالمهمة. ورمز الخروج غير الصفري يُفشل المهمة. |\n| `variables` | قيم متاحة للسكربتات بوصفها متغيرات بيئة. |\n| `rules` | شروط تحدّد ما إذا كانت المهمة تُضاف إلى الخط وكيف (مثل `when: manual`). |\n| `needs` | تتيح للمهمة أن تبدأ فور انتهاء مهام محدّدة، بدلًا من انتظار المرحلة السابقة كلها. |\n| `artifacts` | ملفات تُحفظ بعد المهمة: تقارير وسجلات وإعدادات مولَّدة. ويعرض `reports: junit` نتائج الاختبارات في طلب الدمج. |\n| `environment` | يسجّل عمليات النشر في بيئة مسمّاة مثل `production`، مع سجل تاريخي في واجهة GitLab. |\n| `resource_group` | يضمن ألّا تستخدم موردًا مشتركًا، كالمختبر أو شبكة الإنتاج، إلا مهمة واحدة في كل مرة. |\n| `tags` | يحدّد المشغّلات التي يجوز لها التقاط المهمة. |\n\nويوفّر GitLab أيضًا **متغيرات معرَّفة مسبقًا (Predefined Variables)** مثل `$CI_COMMIT_BRANCH` و`$CI_DEFAULT_BRANCH` و`$CI_COMMIT_SHORT_SHA` و`$CI_REGISTRY_IMAGE`، يمكن للسكربتات والقواعد استخدامها."
+   },
+   {
+    "id": "runners",
+    "type": "text",
+    "markdown": "## المشغّلات: أين تعمل المهام فعلًا\n\nلا يفعل GitLab نفسه سوى جدولة المهام. أما **مشغّل GitLab (GitLab Runner)**، وهو وكيل تثبّته على خادم أو في Kubernetes، فيلتقط المهام وينفّذها، غالبًا عبر **منفّذ Docker (Docker Executor)** الذي يشغّل حاوية جديدة من `image` الخاصة بكل مهمة.\n\nوفي أتمتة الشبكات، يهمّ **موقع** المشغّل بقدر ما يهمّ إعداده:\n\n- يجب أن **يصل المشغّل إلى الأجهزة** أو وحدات التحكم التي يغيّرها: شبكات VLAN الإدارية، وCatalyst Center، وخادم CML. والمشغّل السحابي المشترك لا يستطيع ذلك عادةً.\n- انشر **مشغّل مشروع (Project Runner)** مخصّصًا داخل شبكة الإدارة، وسجّله بوسم مثل `netauto`، وأضف `tags: [netauto]` إلى المهام التي تحتاج إليه.\n- عامل المشغّل بوصفه نظامًا ذا امتيازات؛ فهو يحمل بيانات اعتماد الإنتاج أثناء تشغيل المهام، لذا قيّد من يستطيع تسجيل المشغّلات وتشغيل المهام على الفروع المحمية."
+   },
+   {
+    "id": "pipeline-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "تغيير قالب يعبر خط CI/CD",
+    "caption": "كل مرحلة بوابة، والإخفاق يوقف التغيير قبل وصوله إلى الإنتاج بوقت طويل.",
+    "data": {
+     "token": "تغيير",
+     "nodes": [
+      { "id": "push", "label": "Git push", "sub": "فرع ميزة", "icon": "laptop" },
+      { "id": "build", "label": "البناء", "sub": "صورة الأدوات", "icon": "cpu" },
+      { "id": "validate", "label": "التحقق", "sub": "تدقيق + اختبارات وحدات", "icon": "file" },
+      { "id": "test", "label": "الاختبار في CML", "sub": "نشر + pyATS", "icon": "router" },
+      { "id": "mr", "label": "طلب الدمج", "sub": "مراجعة + موافقة", "icon": "user" },
+      { "id": "deploy", "label": "النشر", "sub": "الإنتاج، يدويًا", "icon": "server" },
+      { "id": "verify", "label": "التحقّق اللاحق", "sub": "فحوص pyATS", "icon": "eye" }
+     ],
+     "steps": [
+      { "at": "push", "caption": "يدفع مهندس قالب SNMP جديدًا إلى فرع ميزة، فيبدأ خط CI/CD تلقائيًا." },
+      { "at": "build", "caption": "تنشئ مهمة البناء صورة حاوية بإصدارات مثبّتة من Ansible والمجموعات وpyATS." },
+      { "at": "validate", "token": "مسافة خاطئة", "caption": "المحاولة الأولى: يجد yamllint خطأً في المسافات البادئة، فيفشل الخط ويُحجب طلب الدمج.", "tone": "blocked" },
+      { "at": "validate", "token": "تم الإصلاح", "caption": "بعد الإصلاح تنجح فحوص yamllint وansible-lint وفحص الصياغة واختبارات الوحدات كلها.", "tone": "success" },
+      { "at": "test", "caption": "يعمل دليل التشغيل على طوبولوجيا في CML، ويؤكّد pyATS حالة SNMP والتوجيه.", "tone": "success" },
+      { "at": "mr", "caption": "يوافق المراجع، فيُطلق الدمج في main خطًّا جديدًا على الفرع المحمي." },
+      { "at": "deploy", "caption": "تنتظر مهمة النشر أن يبدأها شخص. تنفّذ --check --diff ثم تطبّق التغيير.", "tone": "warning" },
+      { "at": "verify", "caption": "يقارن pyATS الحالة بعد التغيير بالمتوقّع، ويُسجَّل النشر تحت بيئة production.", "tone": "success" }
+     ]
+    }
+   },
+   {
+    "id": "stages",
+    "type": "text",
+    "markdown": "## تصميم المراحل\n\n### البناء (Build)\n\nحزّم أدواتك في **صورة حاوية (Container Image)**: ملف `Dockerfile` يثبّت إصدارات محدّدة من `requirements.txt` (`ansible-core` و`cisco.ios` و`pyats[full]` و`yamllint` و`ansible-lint`). ادفعها إلى سجل حاويات GitLab (Container Registry) وشغّل فيها كل المهام اللاحقة، فيستخدم الاختبار في المختبر والنشر في الإنتاج الإصدارات نفسها تمامًا.\n\n### التحقق (Validate): فحوص سريعة دون اتصال\n\n- `yamllint` لصياغة YAML وأسلوبها\n- `ansible-lint` لأفضل ممارسات أدلة التشغيل\n- `ansible-playbook --syntax-check`\n- `terraform fmt -check` و`terraform validate` إن كنت تستخدم Terraform\n- اختبارات الوحدات بـ `pytest` للمرشّحات والوحدات المخصّصة والتحقق من البيانات، مع نشرها تقريرًا بصيغة JUnit\n\nتستغرق هذه الفحوص ثوانيَ وتكشف معظم الأخطاء، لذا تعمل مع **كل دفع** إلى أي فرع.\n\n### الاختبار (Test): نشر حقيقي في مختبر\n\nانشر التغيير على طوبولوجيا في **Cisco Modeling Labs** تحاكي الإنتاج، ثم شغّل اختبارات **pyATS** التي تفحص الحالة التشغيلية (الواجهات عاملة، وجيران OSPF في الحالة Full، وSNMP مُعَدّ). راجع [Cisco Modeling Labs (CML) for Testing](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing) و[Change Validation with pyATS](/learn/network-automation-devops/change-validation-with-pyats). ويمنع `resource_group` خطّين من تغيير المختبر في الوقت نفسه.\n\n### النشر (Deploy): مضبوط ومتحقَّق منه\n\nتعمل مهمة الإنتاج **على الفرع الافتراضي فقط**، وهي **يدوية** (`when: manual`)، وتستخدم `resource_group: production` كي لا تتداخل عمليات النشر أبدًا، وتعاين بـ `--check --diff`، ثم تطبّق التغيير وتتحقّق منه. وإن فشل التحقّق فالإصلاح هو `git revert` على `main`، الذي يمرّ عبر الخط نفسه."
+   },
+   {
+    "id": "pipeline-code",
+    "type": "code",
+    "language": "yaml",
+    "filename": ".gitlab-ci.yml",
+    "caption": "خط كامل. يحتاج البناء بأسلوب Docker-in-Docker إلى مشغّل ذي امتيازات، وKaniko وBuildah بديلان شائعان. وتأتي بيانات اعتماد الأجهزة من متغيرات CI/CD محمية ومقنّعة يقرؤها ملف الجرد من البيئة.",
+    "highlight": [53, 54, 55, 56, 61, 62, 63],
+    "code": "stages:\n  - build\n  - validate\n  - test\n  - deploy\n\nvariables:\n  TOOLS_IMAGE: \"$CI_REGISTRY_IMAGE/netauto-tools:$CI_COMMIT_SHORT_SHA\"\n\ndefault:\n  image: $TOOLS_IMAGE\n  tags: [netauto]\n\nbuild-tools-image:\n  stage: build\n  image: docker:27\n  services: [\"docker:27-dind\"]\n  script:\n    - echo \"$CI_REGISTRY_PASSWORD\" | docker login -u \"$CI_REGISTRY_USER\" --password-stdin \"$CI_REGISTRY\"\n    - docker build -t \"$TOOLS_IMAGE\" .\n    - docker push \"$TOOLS_IMAGE\"\n\nlint:\n  stage: validate\n  script:\n    - yamllint .\n    - ansible-lint playbooks/\n    - ansible-playbook playbooks/site.yml --syntax-check\n\nunit-tests:\n  stage: validate\n  script:\n    - pytest -q tests/unit --junitxml=report.xml\n  artifacts:\n    when: always\n    reports:\n      junit: report.xml\n\ncml-test:\n  stage: test\n  resource_group: cml-lab\n  script:\n    - ansible-playbook -i inventories/cml playbooks/site.yml\n    - pyats run job tests/pyats/post_change_job.py --testbed-file inventories/cml/testbed.yaml --archive-dir archive\n  artifacts:\n    when: always\n    paths: [archive/]\n    expire_in: 1 week\n\ndeploy-production:\n  stage: deploy\n  environment:\n    name: production\n  resource_group: production\n  rules:\n    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH\n      when: manual\n  script:\n    - ansible-playbook -i inventories/prod playbooks/site.yml --check --diff\n    - ansible-playbook -i inventories/prod playbooks/site.yml\n    - pyats run job tests/pyats/post_change_job.py --testbed-file inventories/prod/testbed.yaml --archive-dir archive\n  artifacts:\n    when: always\n    paths: [archive/]"
+   },
+   {
+    "id": "secrets",
+    "type": "text",
+    "markdown": "## تأمين خط CI/CD\n\nالخط القادر على تغيير الإنتاج هدف عالي القيمة، فطبّق الضوابط التالية:\n\n- **الفروع المحمية (Protected Branches).** لا يدمج في `main` إلا المشرفون (Maintainers)، ويشترط الدمج موافقةً ونجاحَ الخط، والدفع القسري معطّل.\n- **المتغيرات المحمية (Protected Variables).** احفظ بيانات اعتماد الإنتاج في **Settings > CI/CD > Variables** بوصفها *محمية*، فلا تُكشف إلا للخطوط العاملة على الفروع المحمية. ولا يستطيع خط فرع الميزة قراءتها، حتى لو عدّل أحدهم `.gitlab-ci.yml` في ذلك الفرع.\n- **المتغيرات المقنّعة (Masked Variables).** وسِم الأسرار بأنها *مقنّعة* ليستبدل GitLab قيمها بـ `[MASKED]` في سجلات المهام. ولا تنفّذ `echo` على سرّ أبدًا، ولا تشغّل سكربتات مع `set -x` حوله.\n- **صور وتبعيات مثبّتة الإصدار.** استخدم إصدارات دقيقة كي لا يغيّر إصدار جديد من المصدر السلوكَ دون مراجعة.\n- **أقل الامتيازات (Least Privilege).** يجب ألّا يملك حساب الأتمتة من صلاحيات الأجهزة إلا ما تحتاج إليه أدلة التشغيل، مع تفعيل المحاسبة (Accounting) على الأجهزة عبر TACACS+، فيُنسب كل تغيير إلى الخط.\n\nولتناول أعمق لإدارة الأسرار راجع [Secure Coding: Input Validation and Secret Management](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)."
+   },
+   {
+    "id": "job-log",
+    "type": "terminal",
+    "title": "مقتطفات من سجلّي مهمتين",
+    "prompt": "$",
+    "lines": [
+     { "comment": "المهمة: lint (مرحلة validate)" },
+     { "output": "Running with gitlab-runner 17.5.0\n  on netauto-runner-01, system ID: s_4b9e21c7d0a3\nPreparing the \"docker\" executor\nUsing docker image registry.gitlab.example.com/netops/automation/netauto-tools:4f2a91c ..." },
+     { "cmd": "yamllint .", "comment": "غياب المخرجات يعني عدم وجود مشكلات" },
+     { "cmd": "ansible-lint playbooks/", "output": "Passed: 0 failure(s), 0 warning(s) on 14 files. Last profile that met the validation criteria was 'production'." },
+     { "cmd": "ansible-playbook playbooks/site.yml --syntax-check", "output": "playbook: playbooks/site.yml" },
+     { "output": "Job succeeded" },
+     { "comment": "المهمة: deploy-production (يدوية، بدأها أحد المشرفين)" },
+     { "cmd": "ansible-playbook -i inventories/prod playbooks/site.yml", "output": "...\nPLAY RECAP *********************************************************\nbr-sw-001   : ok=6  changed=1  unreachable=0  failed=0  skipped=0\nbr-sw-002   : ok=6  changed=1  unreachable=0  failed=0  skipped=0\n..." },
+     { "comment": "القيمة changed=1 على كل مبدّل: طُبّق قالب SNMP وحده" },
+     { "output": "Job succeeded" }
+    ],
+    "caption": "اقرأ اسم المشغّل ووسم الصورة أولًا؛ فهما يخبرانك أين عملت المهمة وبأي إصدارات من الأدوات."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "تحقّق من الملف نفسه",
+    "markdown": "قبل دفع تغييرات على `.gitlab-ci.yml` افتح **Build > Pipeline editor** في GitLab؛ فهو يتحقّق من الصياغة، ويعرض تصوّرًا للمراحل والمهام، ويستطيع عرض الإعداد المدمج حين تستخدم `include`. وكثير من مشكلات «الخط لم يبدأ» ليست سوى شروط قواعد لا تتحقّق أبدًا."
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة في خطوط CI/CD",
+    "markdown": "- تشغيل الاختبار في المختبر والنشر في الإنتاج بإصدارات أدوات مختلفة، فلا تُثبت عبارة «نجح في CML» شيئًا.\n- جعل بيانات اعتماد الإنتاج متغيرات غير محمية، فيستطيع خط أي فرع استخدامها.\n- نسيان `resource_group`، فينشر دمجان على الأجهزة نفسها في الوقت نفسه.\n- النشر دون تحقّق لاحق. فخروج المهمة بالرمز 0 يعني فقط أن الأوامر نُفّذت، لا أن الشبكة سليمة."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. أنشئ مشروعًا على خادم GitLab تتحكّم فيه، وسجّل مشغّل مشروع بمنفّذ Docker والوسم `netauto`.\n2. أضف ملف `Dockerfile` يثبّت `ansible-core` و`cisco.ios` و`yamllint` و`ansible-lint`، وأودع الخط أعلاه (احذف مهام CML وpyATS في البداية).\n3. ادفع دليل تشغيل فيه خطأ متعمّد في المسافات البادئة، وتأكّد من فشل المهمة `lint`. ثم أصلحه وراقب الخط يتحوّل إلى الأخضر.\n4. أضف المهمة `cml-test` على طوبولوجيا CML في شبكة المشغّل، ثم المهمة اليدوية `deploy-production` موجّهةً إلى ملف جرد مختبري ثانٍ.\n5. أضف بيانات اعتماد الأجهزة متغيرات محمية ومقنّعة، وتحقّق من أن سجل المهمة يعرض `[MASKED]`. استخدم فقط أجهزة مختبر مخوَّل بتغييرها."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     { "term": ".gitlab-ci.yml", "definition": "ملف YAML في جذر المستودع يعرّف خط GitLab CI/CD." },
+     { "term": "المرحلة (Stage)", "definition": "مجموعة مهام تعمل بالتوازي، وتعمل المراحل بالترتيب المذكور في stages." },
+     { "term": "المهمة (Job)", "definition": "مجموعة مسمّاة من أوامر السكربت ينفّذها المشغّل، عادةً داخل صورة حاوية." },
+     { "term": "مشغّل GitLab (GitLab Runner)", "definition": "الوكيل الذي يلتقط المهام وينفّذها، ويحدّد موقعه الشبكي الأجهزة التي تستطيع المهام الوصول إليها." },
+     { "term": "المُخرَج (Artifact)", "definition": "ملف يُحفظ بعد المهمة، مثل تقرير اختبار أو سجل أو إعداد مولَّد." },
+     { "term": "rules", "definition": "شروط تحدّد ما إذا كانت المهمة تعمل في الخط وكيف، مثل التشغيل على main فقط ويدويًا فقط." },
+     { "term": "المتغير المحمي (Protected Variable)", "definition": "متغير CI/CD لا يُكشف إلا للخطوط العاملة على الفروع أو الوسوم المحمية." },
+     { "term": "المتغير المقنّع (Masked Variable)", "definition": "متغير CI/CD يخفي GitLab قيمته في سجلات المهام." },
+     { "term": "resource_group", "definition": "إعداد لا يسمح إلا لمهمة واحدة في كل مرة باستخدام مورد مسمّى، فيمنع تداخل عمليات النشر." }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "المهمتان lint وunit-tests كلتاهما في المرحلة validate. كيف يشغّلهما GitLab؟",
+      "options": [
+       "lint أولًا ثم unit-tests، بترتيب الملف",
+       "بالتوازي، ولا تبدأ المرحلة التالية إلا حين تنجح كلتاهما",
+       "تعمل المهمة الأولى في المرحلة فقط",
+       "تعملان بعد مرحلة deploy"
+      ],
+      "answer": 1,
+      "explanation": "تعمل مهام المرحلة الواحدة بالتوازي متى توفّرت المشغّلات، ولا ينتقل الخط إلى المرحلة التالية إلا حين تنجح كل مهام المرحلة الحالية (ما لم تُستخدم needs)."
+     },
+     {
+      "question": "لماذا يجب حفظ بيانات اعتماد أجهزة الإنتاج متغيراتِ CI/CD محمية؟",
+      "options": [
+       "لأن المتغيرات المحمية تُشفَّر بخوارزمية أقوى",
+       "لأنها لا تُكشف إلا للخطوط العاملة على الفروع المحمية، فلا تستطيع خطوط فروع الميزات قراءتها",
+       "لأنها تُخفى في سجل المهمة",
+       "لأنها تُبدَّل تلقائيًا"
+      ],
+      "answer": 1,
+      "explanation": "يحدّد وسم الحماية الخطوط التي تتلقّى المتغير. أما إخفاء القيم في السجلات فهو وظيفة وسم التقنيع؛ فاستخدم الاثنين معًا."
+     },
+     {
+      "question": "أيّ الإعدادات تنتمي إلى مهمة النشر في الإنتاج؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "قواعد rules تقصرها على الفرع الافتراضي",
+       "when: manual",
+       "resource_group: production",
+       "allow_failure: true كي ينجح الخط دائمًا"
+      ],
+      "answer": [0, 1, 2],
+      "explanation": "قصر المهمة على main، واشتراط أن يبدأها شخص، ومنع تداخل عمليات النشر ضوابط قياسية. أما السماح بالإخفاق فيخفي نشرًا معطوبًا."
+     },
+     {
+      "question": "لا تستطيع مهمة في الخط الاتصال بالمبدّلات على 10.20.0.0/24، بينما يعمل دليل التشغيل نفسه من حاسوب مهندس. ما السبب الأرجح؟",
+      "options": [
+       "ملف .gitlab-ci.yml يستخدم أسماء مراحل خاطئة",
+       "المشغّل الذي التقط المهمة لا يملك مسارًا شبكيًا إلى شبكة الإدارة",
+       "يحجب GitLab بروتوكول SSH في كل الخطوط",
+       "لا مُخرَجات للمهمة"
+      ],
+      "answer": 1,
+      "explanation": "تعمل المهام على المشغّل، لا على GitLab ولا على الحاسوب المحمول. استخدم مشغّل مشروع موضوعًا في شبكة الإدارة واختره بالوسوم."
+     },
+     {
+      "question": "أيّ الفحوص تناسب مرحلة التحقق السريعة التي تعمل مع كل دفع؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "yamllint وansible-lint",
+       "ansible-playbook --syntax-check",
+       "اختبارات الوحدات بـ pytest للمرشّحات المخصّصة",
+       "تطبيق التغيير على مبدّلات الإنتاج"
+      ],
+      "answer": [0, 1, 2],
+      "explanation": "التدقيق وفحوص الصياغة واختبارات الوحدات سريعة ولا تحتاج إلى أجهزة. أما تغييرات الإنتاج فمكانها مرحلة النشر المحمية اليدوية وحدها."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يعرّف `.gitlab-ci.yml` **مراحل** من **المهام**. تعمل المهام في حاويات على **المشغّلات**، ويجب أن يصل المشغّل إلى الشبكة التي يغيّرها.\n- **ابنِ** صورة أدوات مثبّتة الإصدارات، و**تحقّق** بالتدقيق وفحوص الصياغة واختبارات الوحدات مع كل دفع، و**اختبر** في CML باستخدام pyATS، ثم **انشر** في الإنتاج.\n- احمِ الإنتاج **بالفروع المحمية**، و**المتغيرات المحمية والمقنّعة**، ومهمة **يدوية** مقصورة على الفرع الافتراضي، و**resource_group**، و**تحقّق** بعد النشر.\n- تراجع باستخدام `git revert` الذي يمرّ عبر الخط المختبَر نفسه.\n\nتابع لتتعلّم قراءة المهام الفاشلة وإصلاحها في [Diagnosing CI/CD Pipeline Failures](/learn/network-automation-devops/diagnosing-ci-cd-pipeline-failures)."
+   }
+  ]
+ }
+}

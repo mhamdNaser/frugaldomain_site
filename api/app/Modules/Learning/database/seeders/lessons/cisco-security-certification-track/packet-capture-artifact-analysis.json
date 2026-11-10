@@ -1,0 +1,404 @@
+{
+  "slug": "packet-capture-artifact-analysis",
+  "title": "Packet Capture Artifact Analysis",
+  "summary": "Capture traffic on Cisco devices, then extract and interpret the artifacts in a packet capture: DNS queries, TLS metadata, HTTP details, beacon timing and transferred files, and turn them into indicators and conclusions.",
+  "duration_minutes": 40,
+  "objectives": [
+    "Collect a focused packet capture on Cisco IOS XE and preserve its integrity",
+    "Follow a repeatable methodology for analyzing a capture from metadata to file extraction",
+    "Extract DNS, TLS, HTTP and timing artifacts with tshark and interpret what they indicate",
+    "Recognize beaconing and suspicious transfers, and describe the limits of analysis on encrypted traffic",
+    "Handle extracted files and captured data safely and document findings as indicators"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Secure Network Analytics raises an alarm: workstation `10.20.30.57` opens a short connection to the same external host every minute, day and night. Flow records tell you *who* talked to *whom*, *when* and *how much*. They do not tell you which domain was requested, what certificate the server presented or whether a file was downloaded. For that, you need the packets.\n\nA packet capture (PCAP) is the most complete network evidence a SOC can collect, and the CBRCOR exam expects you to interpret the artifacts it contains. This lesson builds on [Network Intrusion Analysis: Packet and Protocol Analysis](/learn/cisco-security-certification-track/network-intrusion-analysis-packet-and-protocol-analysis) and moves from reading individual packets to extracting evidence from a whole capture."
+    },
+    {
+      "id": "capture",
+      "type": "text",
+      "markdown": "## Capturing at the right place\n\nThe best analysis cannot recover packets that were never captured. Before you capture, decide:\n\n- **Where.** As close to the suspect host as possible and before any NAT, so that you still see its internal address. An access switch SPAN port, the internal interface of the firewall, or the router that serves the host's subnet are typical choices.\n- **What.** Filter to the host or conversation of interest. A full-rate capture of a busy uplink fills a buffer in seconds and collects data you have no reason to hold.\n- **How long.** Long enough to see repeated behavior: for a one-minute beacon, an hour gives about 60 samples.\n\nCisco offers several capture options:\n\n| Option | Where it runs | Notes |\n|:--|:--|:--|\n| Embedded Packet Capture (EPC) | IOS XE routers and switches | `monitor capture` commands; export to `.pcap` on flash |\n| `capture` command | ASA and Firepower Threat Defense | Per-interface capture with ACL or match filters; downloadable from FMC on FTD |\n| SPAN, RSPAN, ERSPAN | Catalyst and Nexus switches | Copies traffic to a sensor or analysis host |\n| Network TAP | Inline hardware | Passive and complete, unaffected by switch load |\n\nTime matters as much as packets. Make sure the capturing device uses NTP, so that packet times line up with SIEM and EDR events. Then compute a SHA-256 hash of the exported file and record it, as described in [Evidence Handling and Chain of Custody](/learn/cisco-security-certification-track/evidence-handling-and-chain-of-custody)."
+    },
+    {
+      "id": "epc",
+      "type": "terminal",
+      "title": "Embedded Packet Capture on the IOS XE branch router",
+      "prompt": "BR1#",
+      "lines": [
+        { "comment": "Define the capture point, filter and a circular 50 MB buffer (privileged EXEC mode, not config mode)" },
+        { "cmd": "monitor capture CAP-BEACON interface GigabitEthernet0/0/1 both" },
+        { "cmd": "monitor capture CAP-BEACON match ipv4 host 10.20.30.57 any" },
+        { "cmd": "monitor capture CAP-BEACON buffer circular size 50" },
+        { "cmd": "monitor capture CAP-BEACON limit duration 3600" },
+        { "cmd": "monitor capture CAP-BEACON start", "output": "Started capture point : CAP-BEACON" },
+        { "comment": "One hour later: stop, export and remove the capture point" },
+        { "cmd": "monitor capture CAP-BEACON stop", "output": "Capture statistics collected at software:\n        Capture duration - 3600 seconds\n        Packets received - 18432\n        Packets dropped  - 0\n        Packets oversized - 0\n\nStopped capture point : CAP-BEACON" },
+        { "cmd": "monitor capture CAP-BEACON export bootflash:case-4471.pcap", "output": "Exported Successfully" },
+        { "cmd": "no monitor capture CAP-BEACON" }
+      ],
+      "caption": "Packets dropped = 0 confirms that the capture is complete. A non-zero value means the analysis may have gaps."
+    },
+    {
+      "id": "method",
+      "type": "text",
+      "markdown": "## A methodology for artifact analysis\n\nOpening a large capture and scrolling is slow and easy to bias. Work from the outside in:\n\n1. **Integrity and metadata.** Hash the file, then check its time span, packet count and drops with `capinfos`.\n2. **Overview.** Protocol hierarchy, top conversations and endpoints. What is unusual for this host?\n3. **DNS.** Which names did the host resolve, how often and with which answers? DNS is the map of intent, even when the rest is encrypted.\n4. **TLS metadata.** The Server Name Indication (SNI), the certificate subject and issuer, and the client fingerprint (JA3 or JA4) remain visible in TLS 1.2 and largely in TLS 1.3.\n5. **Cleartext application data.** HTTP methods, hosts, URIs and user agents; SMB file names; SMTP senders and recipients.\n6. **Timing.** Regular intervals and small, consistent sizes suggest automated beaconing rather than a person.\n7. **Objects.** Extract transferred files, hash them and send the hashes, not the files, to reputation services first.\n8. **Correlate and document.** Match timestamps with EDR, proxy and authentication logs, and record each finding as an indicator with its source and time.\n\nThe animation below shows which artifacts each layer of one suspicious packet exposes."
+    },
+    {
+      "id": "layers-anim",
+      "type": "animation",
+      "kind": "layers",
+      "title": "Artifacts exposed at each layer of a beacon packet",
+      "caption": "Every layer adds evidence. Even when the payload is encrypted, the outer layers still tell a story.",
+      "data": {
+        "layers": [
+          { "label": "Ethernet", "sub": "L2" },
+          { "label": "IPv4", "sub": "L3" },
+          { "label": "TCP", "sub": "L4" },
+          { "label": "TLS handshake", "sub": "Session" },
+          { "label": "HTTP or payload", "sub": "L7" }
+        ],
+        "steps": [
+          { "layer": 0, "packet": ["MAC"], "caption": "Source MAC 00:50:56:a1:3c:07 ties the frame to one network card; the switch MAC table maps it to a port." },
+          { "layer": 1, "packet": ["IP", "MAC"], "caption": "10.20.30.57 to 203.0.113.80. TTL 128 suggests a Windows sender one hop away." },
+          { "layer": 2, "packet": ["TCP", "IP", "MAC"], "caption": "Destination port 443, a new ephemeral source port each time, and a new connection every 60 seconds." },
+          { "layer": 3, "packet": ["TLS", "TCP", "IP", "MAC"], "caption": "The ClientHello reveals SNI cdn-update.example.net and a JA3 fingerprint that does not match the corporate browser." },
+          { "layer": 4, "packet": ["HTTP", "TLS", "TCP", "IP", "MAC"], "caption": "An earlier cleartext request downloaded /static/upd.bin with an outdated user agent: the likely first stage." }
+        ]
+      }
+    },
+    {
+      "id": "tshark",
+      "type": "terminal",
+      "title": "Extracting artifacts with tshark on an isolated analysis VM",
+      "prompt": "analyst@ir-vm:~/case-4471$",
+      "lines": [
+        { "cmd": "sha256sum case-4471.pcap", "output": "3b7d0c6e5f...a9c1  case-4471.pcap", "comment": "record this hash in the case notes before any analysis" },
+        { "cmd": "capinfos -M -c -u -a -e case-4471.pcap", "output": "File name:           case-4471.pcap\nNumber of packets:   18432\nCapture duration:    3599.874123 seconds\nFirst packet time:   2026-11-02 07:00:01.204511\nLast packet time:    2026-11-02 08:00:01.078634" },
+        { "comment": "DNS: which names did the host ask for, and how often?" },
+        { "cmd": "tshark -r case-4471.pcap -Y \"dns.flags.response == 0 && ip.src == 10.20.30.57\" -T fields -e dns.qry.name | sort | uniq -c | sort -rn | head -4", "output": "     60 cdn-update.example.net\n     14 time.example.com\n      9 login.example.com\n      3 wpad.corp.example.com" },
+        { "comment": "TLS ClientHello: destination, SNI and client fingerprint" },
+        { "cmd": "tshark -r case-4471.pcap -Y \"tls.handshake.type == 1 && ip.src == 10.20.30.57\" -T fields -e ip.dst -e tls.handshake.extensions_server_name -e tls.handshake.ja3 | sort | uniq -c", "output": "     60 203.0.113.80    cdn-update.example.net   a0e9f5d64349fb13191bc781f81f42e1\n      9 198.51.100.10   login.example.com        b32309a26951912be7dba376398abc3b" },
+        { "comment": "Timing: seconds between consecutive ClientHellos to the suspect server" },
+        { "cmd": "tshark -r case-4471.pcap -Y \"tls.handshake.type == 1 && ip.dst == 203.0.113.80\" -T fields -e frame.time_delta_displayed | head -5", "output": "0.000000000\n59.912334000\n60.087101000\n60.004517000\n59.968220000" },
+        { "comment": "Cleartext HTTP requests from the host" },
+        { "cmd": "tshark -r case-4471.pcap -Y \"http.request && ip.src == 10.20.30.57\" -T fields -e frame.time -e http.host -e http.request.uri -e http.user_agent", "output": "Nov  2, 2026 07:00:04.118230000 UTC   cdn-update.example.net   /static/upd.bin   Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1)" },
+        { "comment": "Extract transferred HTTP objects and identify them without executing them" },
+        { "cmd": "tshark -r case-4471.pcap -q --export-objects http,./objects" },
+        { "cmd": "sha256sum objects/* && file objects/*", "output": "c41a92e07b...7d2e  objects/upd.bin\nobjects/upd.bin: PE32+ executable (DLL) (GUI) x86-64, for MS Windows" }
+      ],
+      "caption": "Documentation addresses and example domains. The fingerprint values are illustrative. Field names follow current Wireshark releases."
+    },
+    {
+      "id": "interpret",
+      "type": "text",
+      "markdown": "## Interpreting the artifacts\n\nRead the output above as evidence, not as isolated facts:\n\n| Artifact | Observation | What it indicates |\n|:--|:--|:--|\n| DNS query count | 60 lookups of one domain in one hour | Automated, periodic resolution |\n| TLS SNI and JA3 | The same SNI each time; a fingerprint unlike the standard browser's | A non-browser client, likely a custom implant |\n| Timing | Intervals of 60 seconds with less than 0.1 second of jitter | Beaconing to a command-and-control (C2) server |\n| HTTP request | A `.bin` file fetched with an outdated user agent | A first-stage download by a script or loader |\n| Extracted file | A 64-bit Windows DLL | A payload that must be analyzed in a sandbox |\n\nTogether these support a conclusion: the host downloaded a DLL at 07:00:04 and has been beaconing to `cdn-update.example.net` (`203.0.113.80`) every 60 seconds since. The next steps are to scope (which other hosts resolve that domain or show the same JA3?), contain the host, and hand the file hash to malware analysis, as covered in [Malware Analysis: Static, Dynamic and Sandbox](/learn/cisco-security-certification-track/malware-analysis-static-dynamic-and-sandbox).\n\n### Limits you must state\n\n- **Encryption** hides content. With TLS 1.3 the server certificate is encrypted, and Encrypted Client Hello (ECH) can hide the SNI as well. Fall back on DNS, IP reputation, timing and fingerprints, or on decryption at an authorized inspection point.\n- **Fingerprints** such as JA3 are shared by every client built on the same TLS library and can be deliberately imitated. Treat them as supporting evidence.\n- **Capture gaps.** Dropped packets, asymmetric routing or a short capture window can hide parts of a conversation. State these limits in your report."
+    },
+    {
+      "id": "warn-files",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Handle extracted objects as live malware",
+      "markdown": "Work only on an isolated analysis VM. Never double-click or execute an extracted file, and do not open it on your workstation. Rename suspicious files with a harmless extension, store them in a password-protected archive, and look up their hashes before uploading anything. Captures may also contain credentials and personal data, so restrict access and follow your retention policy."
+    },
+    {
+      "id": "tip-filters",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Capture filters versus display filters",
+      "markdown": "Capture filters (BPF syntax such as `host 10.20.30.57 and port 443`, or a `match` statement on Cisco devices) decide what is *saved*; anything filtered out is gone forever. Display filters (Wireshark syntax such as `tls.handshake.type == 1`) decide what is *shown* from a saved file. When in doubt, capture slightly more and filter during analysis."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "1. On a lab machine you own, start a capture with `tshark -i <interface> -a duration:600 -w lab.pcap` and, during those ten minutes, browse a few sites and run a script that requests `https://example.com` every 30 seconds.\n2. Run `capinfos -M lab.pcap` and record the packet count, duration and SHA-256 hash.\n3. Use the DNS, TLS and timing commands from this lesson. Can you separate your script's connections from your browser's by their interval and JA3 fingerprint?\n4. If you have an IOS XE router in a lab, repeat the capture with Embedded Packet Capture, export it, and compare the two files.\n5. Write three indicators (domain, IP address, fingerprint) for your script as if it were malicious, each with its first-seen time and source file."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        { "term": "Packet capture (PCAP)", "definition": "A file that records complete network packets, including headers and payloads, with timestamps." },
+        { "term": "Embedded Packet Capture (EPC)", "definition": "An IOS XE feature that captures packets on the device itself with the monitor capture commands." },
+        { "term": "tshark", "definition": "The command-line version of Wireshark, used to filter, decode and extract fields and objects from captures." },
+        { "term": "SNI", "definition": "Server Name Indication: the TLS ClientHello extension that names the server the client wants to reach." },
+        { "term": "JA3 / JA4", "definition": "Fingerprints computed from TLS ClientHello parameters that help identify the client software." },
+        { "term": "Beaconing", "definition": "Regular, automated connections from an implant to a command-and-control server." },
+        { "term": "Jitter", "definition": "Variation in the interval between beacons, sometimes added by malware to look less regular." },
+        { "term": "Object export", "definition": "Reassembling and saving files transferred in a capture, such as HTTP or SMB objects." },
+        { "term": "Display filter", "definition": "A Wireshark expression that selects which packets in a saved capture are shown or processed." }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Where should you capture to see the internal address of a workstation that is beaconing to the internet?",
+          "options": [
+            "On the internet-facing interface after NAT",
+            "On the ISP's router",
+            "As close to the workstation as possible, before NAT, such as an access switch SPAN port or the firewall's inside interface",
+            "Anywhere, because NAT does not change addresses"
+          ],
+          "answer": 2,
+          "explanation": "After NAT, the workstation's address is replaced by the public address. Capturing close to the host preserves the internal address."
+        },
+        {
+          "question": "A host contacts the same server every 60 seconds with less than 0.1 seconds of variation, using a TLS fingerprint unlike the corporate browser. What is the most likely explanation?",
+          "options": [
+            "A user is refreshing a web page",
+            "Automated beaconing by non-browser software, possibly command-and-control",
+            "A normal TLS handshake failure",
+            "DNS cache poisoning"
+          ],
+          "answer": 1,
+          "explanation": "Machine-regular timing and an unusual client fingerprint point to automated software rather than human browsing."
+        },
+        {
+          "question": "Which artifacts can usually still be analyzed when the application payload is encrypted with TLS 1.3? (Choose all that apply.)",
+          "options": [
+            "DNS queries made before the connection",
+            "Connection timing and sizes",
+            "The full HTTP request URI",
+            "The client's TLS fingerprint from the ClientHello"
+          ],
+          "answer": [0, 1, 3],
+          "explanation": "DNS, timing, sizes and ClientHello fingerprints remain visible. The HTTP URI is inside the encrypted payload."
+        },
+        {
+          "question": "The output of monitor capture CAP-BEACON stop shows Packets dropped - 2140. What should the analyst do?",
+          "options": [
+            "Ignore it; drops never affect analysis",
+            "Note that the capture is incomplete, consider a tighter filter or larger buffer, and state the gap in the report",
+            "Delete the capture because it is invalid evidence",
+            "Re-export the same capture to recover the dropped packets"
+          ],
+          "answer": 1,
+          "explanation": "Dropped packets are lost for good. The capture is still useful, but its gaps must be documented, and the next capture should be adjusted."
+        },
+        {
+          "question": "Which actions are appropriate after extracting a suspicious executable from a capture? (Choose all that apply.)",
+          "options": [
+            "Compute its hash and check reputation using the hash first",
+            "Run it on your analyst workstation to see what it does",
+            "Store it in a password-protected archive on the isolated analysis VM",
+            "Submit it to an internal sandbox if the playbook allows"
+          ],
+          "answer": [0, 2, 3],
+          "explanation": "Hash lookups, safe storage and controlled sandboxing are standard. Executing malware on a workstation risks infecting the SOC."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Capture **close to the suspect host, filtered and time-synchronized**, check for dropped packets, and hash the file before analysis.\n- Analyze from the **outside in**: metadata, overview, DNS, TLS metadata, cleartext application data, timing, objects, then correlation.\n- **tshark** extracts fields and objects quickly and reproducibly; record every command and its output in the case notes.\n- Regular intervals, unusual fingerprints and odd user agents are strong **beaconing** artifacts; extracted files are handled as live malware.\n- Always state the limits of the evidence: **encryption, fingerprint ambiguity and capture gaps**.\n\nTurn what you found into durable detections with [IOCs and IOAs](/learn/cisco-security-certification-track/iocs-and-ioas), and follow the infection onto the host in [Endpoint Intrusion Investigation](/learn/cisco-security-certification-track/endpoint-intrusion-investigation)."
+    }
+  ],
+  "ar": {
+    "title": "تحليل آثار التقاط الحزم",
+    "summary": "التقط حركة المرور على أجهزة Cisco، ثم استخرج الآثار الموجودة في ملف التقاط الحزم وفسّرها: استعلامات DNS، وبيانات TLS الوصفية، وتفاصيل HTTP، وتوقيت الإشارات الدورية، والملفات المنقولة، وحوّلها إلى مؤشرات واستنتاجات.",
+    "objectives": [
+      "جمع التقاط حزم مُركّز على Cisco IOS XE والحفاظ على سلامته",
+      "اتّباع منهجية قابلة للتكرار في تحليل ملف الالتقاط من البيانات الوصفية حتى استخراج الملفات",
+      "استخراج آثار DNS وTLS وHTTP والتوقيت باستخدام tshark وتفسير دلالاتها",
+      "التعرّف على الإشارات الدورية وعمليات النقل المشبوهة، ووصف حدود التحليل في حركة المرور المشفّرة",
+      "التعامل الآمن مع الملفات المستخرجة والبيانات الملتقطة وتوثيق النتائج في صورة مؤشرات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يُطلق Secure Network Analytics إنذارًا: محطة العمل `10.20.30.57` تفتح اتصالًا قصيرًا بالجهاز الخارجي نفسه كل دقيقة، ليلًا ونهارًا. تخبرك سجلات التدفق (Flow records) *من* تحدّث إلى *من*، و*متى*، و*بأي حجم*، لكنها لا تخبرك بالنطاق المطلوب، ولا بالشهادة التي قدّمها الخادم، ولا بما إذا نُزّل ملف. ولمعرفة ذلك تحتاج إلى الحزم نفسها.\n\nالتقاط الحزم (PCAP) هو أكمل دليل شبكي يمكن لمركز العمليات الأمنية جمعه، ويُنتظر منك في اختبار CBRCOR أن تفسّر الآثار التي يحتويها. يبني هذا الدرس على درس [تحليل التسلل الشبكي: تحليل الحزم والبروتوكولات](/learn/cisco-security-certification-track/network-intrusion-analysis-packet-and-protocol-analysis)، وينتقل من قراءة الحزم المنفردة إلى استخراج الأدلة من ملف التقاط كامل."
+      },
+      {
+        "id": "capture",
+        "type": "text",
+        "markdown": "## الالتقاط في المكان الصحيح\n\nلا يستطيع أفضل تحليل أن يستعيد حزمًا لم تُلتقط أصلًا. قبل أن تبدأ الالتقاط، حدّد:\n\n- **المكان.** أقرب ما يمكن إلى الجهاز المشتبه به وقبل أي ترجمة عناوين (NAT)، كي يبقى عنوانه الداخلي ظاهرًا. ومن الخيارات المعتادة منفذ SPAN في مبدّل الوصول، أو الواجهة الداخلية لجدار الحماية، أو الموجّه الذي يخدم الشبكة الفرعية للجهاز.\n- **المحتوى.** رشّح الالتقاط على الجهاز أو المحادثة المعنية. فالتقاط وصلة صاعدة مزدحمة بكامل معدّلها يملأ المخزن المؤقت في ثوانٍ ويجمع بيانات لا مسوّغ للاحتفاظ بها.\n- **المدة.** مدة كافية لرؤية السلوك المتكرر: فلإشارة دورية كل دقيقة تمنحك ساعة واحدة نحو 60 عيّنة.\n\nتقدّم Cisco عدة خيارات للالتقاط:\n\n| الخيار | مكان التشغيل | ملاحظات |\n|:--|:--|:--|\n| الالتقاط المضمَّن للحزم (EPC) | موجّهات IOS XE ومبدّلاتها | أوامر `monitor capture`، والتصدير إلى ملف `.pcap` في الذاكرة الوميضية |\n| الأمر `capture` | ASA وFirepower Threat Defense | التقاط لكل واجهة مع مرشّحات ACL أو match، ويمكن تنزيله من FMC في FTD |\n| SPAN وRSPAN وERSPAN | مبدّلات Catalyst وNexus | نسخ حركة المرور إلى مستشعر أو جهاز تحليل |\n| أداة التفريع الشبكي (Network TAP) | عتاد مضمَّن في المسار | سلبية وكاملة، ولا تتأثر بحمل المبدّل |\n\nالوقت لا يقل أهمية عن الحزم. تأكّد أن جهاز الالتقاط يستخدم NTP، كي تتطابق أوقات الحزم مع أحداث SIEM وEDR. ثم احسب بصمة SHA-256 للملف المُصدَّر وسجّلها، كما يشرح درس [التعامل مع الأدلة وسلسلة الحيازة](/learn/cisco-security-certification-track/evidence-handling-and-chain-of-custody)."
+      },
+      {
+        "id": "epc",
+        "type": "terminal",
+        "title": "الالتقاط المضمَّن للحزم على موجّه الفرع العامل بنظام IOS XE",
+        "prompt": "BR1#",
+        "lines": [
+          { "comment": "تعريف نقطة الالتقاط والمرشّح ومخزن مؤقت دائري سعته 50 ميغابايت (في وضع EXEC المميّز لا وضع التهيئة)" },
+          { "cmd": "monitor capture CAP-BEACON interface GigabitEthernet0/0/1 both" },
+          { "cmd": "monitor capture CAP-BEACON match ipv4 host 10.20.30.57 any" },
+          { "cmd": "monitor capture CAP-BEACON buffer circular size 50" },
+          { "cmd": "monitor capture CAP-BEACON limit duration 3600" },
+          { "cmd": "monitor capture CAP-BEACON start", "output": "Started capture point : CAP-BEACON" },
+          { "comment": "بعد ساعة: الإيقاف ثم التصدير ثم حذف نقطة الالتقاط" },
+          { "cmd": "monitor capture CAP-BEACON stop", "output": "Capture statistics collected at software:\n        Capture duration - 3600 seconds\n        Packets received - 18432\n        Packets dropped  - 0\n        Packets oversized - 0\n\nStopped capture point : CAP-BEACON" },
+          { "cmd": "monitor capture CAP-BEACON export bootflash:case-4471.pcap", "output": "Exported Successfully" },
+          { "cmd": "no monitor capture CAP-BEACON" }
+        ],
+        "caption": "تؤكد القيمة Packets dropped = 0 أن الالتقاط كامل، وأي قيمة غير صفرية تعني أن التحليل قد تشوبه فجوات."
+      },
+      {
+        "id": "method",
+        "type": "text",
+        "markdown": "## منهجية لتحليل الآثار\n\nفتح ملف التقاط كبير والتمرير فيه بطيء ويسهل أن ينحاز. اعمل من الخارج إلى الداخل:\n\n1. **السلامة والبيانات الوصفية.** احسب بصمة الملف، ثم تحقّق من مدته الزمنية وعدد حزمه والحزم المُسقطة باستخدام `capinfos`.\n2. **النظرة العامة.** تسلسل البروتوكولات، وأكثر المحادثات ونقاط النهاية نشاطًا. ما غير المألوف بالنسبة إلى هذا الجهاز؟\n3. **DNS.** ما الأسماء التي استعلم عنها الجهاز، وكم مرة، وبأي إجابات؟ فـ DNS خريطة النوايا حتى حين يكون الباقي مشفّرًا.\n4. **بيانات TLS الوصفية.** يبقى مؤشر اسم الخادم (SNI)، واسم موضوع الشهادة ومُصدرها، وبصمة العميل (JA3 أو JA4) ظاهرةً في TLS 1.2، وظاهرةً إلى حدّ كبير في TLS 1.3.\n5. **بيانات التطبيقات غير المشفّرة.** طرق HTTP وأسماء الأجهزة والمسارات (URI) ووكلاء المستخدم؛ وأسماء ملفات SMB؛ ومرسلو SMTP ومستلموه.\n6. **التوقيت.** الفواصل المنتظمة والأحجام الصغيرة الثابتة توحي بإشارات دورية مؤتمتة (Beaconing) لا بنشاط بشري.\n7. **الكائنات.** استخرج الملفات المنقولة، واحسب بصماتها، وأرسل البصمات لا الملفات إلى خدمات السمعة أولًا.\n8. **الربط والتوثيق.** طابِق الطوابع الزمنية مع سجلات EDR والوكيل والمصادقة، وسجّل كل نتيجة مؤشرًا مع مصدرها ووقتها.\n\nتُظهر الحركة التوضيحية أدناه الآثار التي تكشفها كل طبقة من حزمة مشبوهة واحدة."
+      },
+      {
+        "id": "layers-anim",
+        "type": "animation",
+        "kind": "layers",
+        "title": "الآثار التي تكشفها كل طبقة من حزمة إشارة دورية",
+        "caption": "تضيف كل طبقة دليلًا، وحتى حين تكون الحمولة مشفّرة تظل الطبقات الخارجية تروي قصة.",
+        "data": {
+          "layers": [
+            { "label": "Ethernet", "sub": "L2" },
+            { "label": "IPv4", "sub": "L3" },
+            { "label": "TCP", "sub": "L4" },
+            { "label": "مصافحة TLS", "sub": "الجلسة" },
+            { "label": "HTTP أو الحمولة", "sub": "L7" }
+          ],
+          "steps": [
+            { "layer": 0, "packet": ["MAC"], "caption": "عنوان MAC المصدر 00:50:56:a1:3c:07 يربط الإطار ببطاقة شبكة واحدة، ويربطه جدول MAC في المبدّل بمنفذ محدد." },
+            { "layer": 1, "packet": ["IP", "MAC"], "caption": "من 10.20.30.57 إلى 203.0.113.80، وقيمة TTL تساوي 128 توحي بمرسل يعمل بنظام Windows على بُعد قفزة واحدة." },
+            { "layer": 2, "packet": ["TCP", "IP", "MAC"], "caption": "منفذ الوجهة 443، ومنفذ مصدر مؤقت جديد في كل مرة، واتصال جديد كل 60 ثانية." },
+            { "layer": 3, "packet": ["TLS", "TCP", "IP", "MAC"], "caption": "تكشف رسالة ClientHello عن SNI بقيمة cdn-update.example.net وبصمة JA3 لا تطابق متصفح الشركة." },
+            { "layer": 4, "packet": ["HTTP", "TLS", "TCP", "IP", "MAC"], "caption": "طلبٌ سابق غير مشفّر نزّل /static/upd.bin بوكيل مستخدم قديم: المرحلة الأولى على الأرجح." }
+          ]
+        }
+      },
+      {
+        "id": "tshark",
+        "type": "terminal",
+        "title": "استخراج الآثار باستخدام tshark على جهاز تحليل افتراضي معزول",
+        "prompt": "analyst@ir-vm:~/case-4471$",
+        "lines": [
+          { "cmd": "sha256sum case-4471.pcap", "output": "3b7d0c6e5f...a9c1  case-4471.pcap", "comment": "سجّل هذه البصمة في ملاحظات الحالة قبل أي تحليل" },
+          { "cmd": "capinfos -M -c -u -a -e case-4471.pcap", "output": "File name:           case-4471.pcap\nNumber of packets:   18432\nCapture duration:    3599.874123 seconds\nFirst packet time:   2026-11-02 07:00:01.204511\nLast packet time:    2026-11-02 08:00:01.078634" },
+          { "comment": "DNS: ما الأسماء التي طلبها الجهاز، وكم مرة؟" },
+          { "cmd": "tshark -r case-4471.pcap -Y \"dns.flags.response == 0 && ip.src == 10.20.30.57\" -T fields -e dns.qry.name | sort | uniq -c | sort -rn | head -4", "output": "     60 cdn-update.example.net\n     14 time.example.com\n      9 login.example.com\n      3 wpad.corp.example.com" },
+          { "comment": "رسائل TLS ClientHello: الوجهة وSNI وبصمة العميل" },
+          { "cmd": "tshark -r case-4471.pcap -Y \"tls.handshake.type == 1 && ip.src == 10.20.30.57\" -T fields -e ip.dst -e tls.handshake.extensions_server_name -e tls.handshake.ja3 | sort | uniq -c", "output": "     60 203.0.113.80    cdn-update.example.net   a0e9f5d64349fb13191bc781f81f42e1\n      9 198.51.100.10   login.example.com        b32309a26951912be7dba376398abc3b" },
+          { "comment": "التوقيت: الثواني بين رسائل ClientHello المتتالية إلى الخادم المشتبه به" },
+          { "cmd": "tshark -r case-4471.pcap -Y \"tls.handshake.type == 1 && ip.dst == 203.0.113.80\" -T fields -e frame.time_delta_displayed | head -5", "output": "0.000000000\n59.912334000\n60.087101000\n60.004517000\n59.968220000" },
+          { "comment": "طلبات HTTP غير المشفّرة الصادرة عن الجهاز" },
+          { "cmd": "tshark -r case-4471.pcap -Y \"http.request && ip.src == 10.20.30.57\" -T fields -e frame.time -e http.host -e http.request.uri -e http.user_agent", "output": "Nov  2, 2026 07:00:04.118230000 UTC   cdn-update.example.net   /static/upd.bin   Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1)" },
+          { "comment": "استخراج كائنات HTTP المنقولة وتحديد نوعها دون تشغيلها" },
+          { "cmd": "tshark -r case-4471.pcap -q --export-objects http,./objects" },
+          { "cmd": "sha256sum objects/* && file objects/*", "output": "c41a92e07b...7d2e  objects/upd.bin\nobjects/upd.bin: PE32+ executable (DLL) (GUI) x86-64, for MS Windows" }
+        ],
+        "caption": "عناوين مخصّصة للتوثيق ونطاقات أمثلة، وقيم البصمات توضيحية. وأسماء الحقول وفق إصدارات Wireshark الحالية."
+      },
+      {
+        "id": "interpret",
+        "type": "text",
+        "markdown": "## تفسير الآثار\n\nاقرأ المُخرجات أعلاه بوصفها أدلة مترابطة لا حقائق منفصلة:\n\n| الأثر | الملاحظة | الدلالة |\n|:--|:--|:--|\n| عدد استعلامات DNS | 60 استعلامًا عن نطاق واحد في ساعة | تحليل أسماء آلي ودوري |\n| SNI وJA3 في TLS | قيمة SNI نفسها كل مرة، وبصمة لا تشبه بصمة المتصفح المعتمد | عميل ليس متصفحًا، وعلى الأرجح غرسة (Implant) مخصّصة |\n| التوقيت | فواصل 60 ثانية بتفاوت (Jitter) أقل من 0.1 ثانية | إشارات دورية إلى خادم قيادة وتحكم (C2) |\n| طلب HTTP | ملف `.bin` جُلب بوكيل مستخدم قديم | تنزيل مرحلة أولى عبر سكربت أو أداة تحميل |\n| الملف المستخرج | مكتبة DLL لنظام Windows بمعمارية 64 بت | حمولة يجب تحليلها في بيئة معزولة |\n\nتدعم هذه الآثار مجتمعةً استنتاجًا واحدًا: نزّل الجهاز مكتبة DLL في الساعة 07:00:04، وهو يرسل منذئذٍ إشارات دورية إلى `cdn-update.example.net` (`203.0.113.80`) كل 60 ثانية. والخطوات التالية هي تحديد النطاق (ما الأجهزة الأخرى التي تستعلم عن هذا النطاق أو تحمل بصمة JA3 نفسها؟)، واحتواء الجهاز، وتسليم بصمة الملف لفريق تحليل البرمجيات الخبيثة، كما يشرح درس [تحليل البرمجيات الخبيثة: الثابت والديناميكي والبيئة المعزولة](/learn/cisco-security-certification-track/malware-analysis-static-dynamic-and-sandbox).\n\n### حدود يجب أن تصرّح بها\n\n- **التشفير** يُخفي المحتوى. ففي TLS 1.3 تكون شهادة الخادم مشفّرة، وقد يُخفي ClientHello المشفّر (ECH) قيمة SNI أيضًا. فاعتمد حينئذٍ على DNS وسمعة عناوين IP والتوقيت والبصمات، أو على فك التشفير في نقطة فحص مُصرَّح بها.\n- **البصمات** مثل JA3 يتشاركها كل عميل مبني على مكتبة TLS نفسها، ويمكن تقليدها عمدًا؛ فعاملها دليلًا داعمًا.\n- **فجوات الالتقاط.** قد تُخفي الحزم المُسقطة أو التوجيه غير المتماثل أو نافذة الالتقاط القصيرة أجزاءً من المحادثة، فاذكر هذه الحدود في تقريرك."
+      },
+      {
+        "id": "warn-files",
+        "type": "callout",
+        "variant": "warning",
+        "title": "تعامل مع الكائنات المستخرجة بوصفها برمجيات خبيثة حيّة",
+        "markdown": "اعمل على جهاز تحليل افتراضي معزول فقط. لا تنقر نقرًا مزدوجًا على أي ملف مستخرج ولا تشغّله، ولا تفتحه على جهازك. أعد تسمية الملفات المشبوهة بامتداد غير ضار، واحفظها في أرشيف محمي بكلمة مرور، وابحث عن بصماتها قبل رفع أي شيء. وقد تحتوي ملفات الالتقاط أيضًا على بيانات اعتماد وبيانات شخصية، فقيّد الوصول إليها والتزم بسياسة الاحتفاظ."
+      },
+      {
+        "id": "tip-filters",
+        "type": "callout",
+        "variant": "tip",
+        "title": "مرشّحات الالتقاط مقابل مرشّحات العرض",
+        "markdown": "تحدّد مرشّحات الالتقاط (بصيغة BPF مثل `host 10.20.30.57 and port 443`، أو عبارة `match` على أجهزة Cisco) ما *يُحفظ*، وكل ما يُستبعد بها يضيع إلى الأبد. أما مرشّحات العرض (بصيغة Wireshark مثل `tls.handshake.type == 1`) فتحدّد ما *يُعرض* من ملف محفوظ. وعند الشك، التقط أكثر قليلًا ورشّح أثناء التحليل."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "1. على جهاز مختبري تملكه، ابدأ التقاطًا بالأمر `tshark -i <interface> -a duration:600 -w lab.pcap`، وخلال الدقائق العشر تصفّح بضعة مواقع وشغّل سكربتًا يطلب `https://example.com` كل 30 ثانية.\n2. شغّل `capinfos -M lab.pcap` وسجّل عدد الحزم والمدة وبصمة SHA-256.\n3. استخدم أوامر DNS وTLS والتوقيت الواردة في هذا الدرس. هل تستطيع فصل اتصالات السكربت عن اتصالات متصفحك بالفاصل الزمني وبصمة JA3؟\n4. إن كان لديك موجّه IOS XE في المختبر، فكرّر الالتقاط باستخدام Embedded Packet Capture، وصدّره، وقارن بين الملفين.\n5. اكتب ثلاثة مؤشرات (نطاق، وعنوان IP، وبصمة) لسكربتك كما لو كان خبيثًا، مع وقت الرصد الأول والملف المصدر لكلٍّ منها."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          { "term": "التقاط الحزم (PCAP)", "definition": "ملف يسجّل حزم الشبكة كاملة، بترويساتها وحمولاتها، مع طوابعها الزمنية." },
+          { "term": "الالتقاط المضمَّن للحزم (EPC)", "definition": "ميزة في IOS XE تلتقط الحزم على الجهاز نفسه باستخدام أوامر monitor capture." },
+          { "term": "tshark", "definition": "إصدار سطر الأوامر من Wireshark، ويُستخدم لترشيح ملفات الالتقاط وفك ترميزها واستخراج الحقول والكائنات منها." },
+          { "term": "SNI", "definition": "مؤشر اسم الخادم (Server Name Indication): امتداد في رسالة TLS ClientHello يسمّي الخادم الذي يريد العميل الوصول إليه." },
+          { "term": "JA3 / JA4", "definition": "بصمات تُحسب من معاملات رسالة TLS ClientHello وتساعد على تحديد برنامج العميل." },
+          { "term": "الإشارات الدورية (Beaconing)", "definition": "اتصالات منتظمة ومؤتمتة من غرسة خبيثة إلى خادم قيادة وتحكم." },
+          { "term": "التفاوت (Jitter)", "definition": "التباين في الفاصل الزمني بين الإشارات الدورية، وقد تضيفه البرمجيات الخبيثة لتبدو أقل انتظامًا." },
+          { "term": "تصدير الكائنات (Object export)", "definition": "إعادة تجميع الملفات المنقولة في ملف الالتقاط وحفظها، مثل كائنات HTTP أو SMB." },
+          { "term": "مرشّح العرض (Display filter)", "definition": "تعبير في Wireshark يحدّد الحزم التي تُعرض أو تُعالَج من ملف التقاط محفوظ." }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أين ينبغي أن تلتقط الحزم لترى العنوان الداخلي لمحطة عمل ترسل إشارات دورية إلى الإنترنت؟",
+            "options": [
+              "على الواجهة المواجهة للإنترنت بعد NAT",
+              "على موجّه مزوّد خدمة الإنترنت",
+              "أقرب ما يمكن إلى محطة العمل وقبل NAT، كمنفذ SPAN في مبدّل الوصول أو الواجهة الداخلية لجدار الحماية",
+              "في أي مكان، لأن NAT لا يغيّر العناوين"
+            ],
+            "answer": 2,
+            "explanation": "بعد NAT يُستبدل عنوان محطة العمل بالعنوان العام، والالتقاط قرب الجهاز يحافظ على عنوانه الداخلي."
+          },
+          {
+            "question": "يتصل جهاز بالخادم نفسه كل 60 ثانية بتفاوت أقل من 0.1 ثانية، مستخدمًا بصمة TLS لا تشبه متصفح الشركة. ما التفسير الأرجح؟",
+            "options": [
+              "مستخدم يُحدّث صفحة ويب",
+              "إشارات دورية مؤتمتة من برنامج ليس متصفحًا، ربما لقيادة وتحكم",
+              "فشل عادي في مصافحة TLS",
+              "تسميم ذاكرة DNS المؤقتة"
+            ],
+            "answer": 1,
+            "explanation": "التوقيت المنتظم انتظام الآلة وبصمة العميل غير المألوفة يشيران إلى برنامج مؤتمت لا إلى تصفّح بشري."
+          },
+          {
+            "question": "أيّ الآثار التالية يمكن عادةً تحليلها حين تكون حمولة التطبيق مشفّرة بـ TLS 1.3؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "استعلامات DNS التي سبقت الاتصال",
+              "توقيت الاتصالات وأحجامها",
+              "المسار الكامل لطلب HTTP",
+              "بصمة TLS للعميل من رسالة ClientHello"
+            ],
+            "answer": [0, 1, 3],
+            "explanation": "تبقى استعلامات DNS والتوقيت والأحجام وبصمات ClientHello ظاهرة، أما مسار HTTP فداخل الحمولة المشفّرة."
+          },
+          {
+            "question": "يُظهر مُخرج الأمر monitor capture CAP-BEACON stop القيمة Packets dropped - 2140. ماذا ينبغي أن يفعل المحلّل؟",
+            "options": [
+              "يتجاهلها، فالحزم المُسقطة لا تؤثر في التحليل أبدًا",
+              "يدوّن أن الالتقاط غير مكتمل، ويفكّر في مرشّح أضيق أو مخزن أكبر، ويذكر الفجوة في التقرير",
+              "يحذف الالتقاط لأنه دليل غير صالح",
+              "يعيد تصدير الالتقاط نفسه لاستعادة الحزم المُسقطة"
+            ],
+            "answer": 1,
+            "explanation": "الحزم المُسقطة ضاعت نهائيًا. ويظل الالتقاط مفيدًا، لكن يجب توثيق فجواته وتعديل الالتقاط التالي."
+          },
+          {
+            "question": "أيّ الإجراءات التالية مناسبة بعد استخراج ملف تنفيذي مشبوه من ملف الالتقاط؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "حساب بصمته والتحقق من سمعته بالبصمة أولًا",
+              "تشغيله على جهاز المحلّل لمعرفة ما يفعله",
+              "حفظه في أرشيف محمي بكلمة مرور على جهاز التحليل الافتراضي المعزول",
+              "إرساله إلى بيئة معزولة داخلية إن سمح دليل التشغيل بذلك"
+            ],
+            "answer": [0, 2, 3],
+            "explanation": "البحث بالبصمة والحفظ الآمن والتحليل في بيئة معزولة مضبوطة ممارسات معيارية، أما تشغيل البرمجية الخبيثة على جهاز العمل فيعرّض مركز العمليات للإصابة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- التقط **قرب الجهاز المشتبه به، مع ترشيح وتزامن زمني**، وتحقّق من الحزم المُسقطة، واحسب بصمة الملف قبل التحليل.\n- حلّل **من الخارج إلى الداخل**: البيانات الوصفية، فالنظرة العامة، فـ DNS، فبيانات TLS الوصفية، فبيانات التطبيقات غير المشفّرة، فالتوقيت، فالكائنات، ثم الربط.\n- يستخرج **tshark** الحقول والكائنات بسرعة وبطريقة قابلة للتكرار؛ فسجّل كل أمر ومُخرجه في ملاحظات الحالة.\n- الفواصل المنتظمة والبصمات غير المألوفة ووكلاء المستخدم الغريبون آثار قوية على **الإشارات الدورية**، والملفات المستخرجة تُعامَل بوصفها برمجيات خبيثة حيّة.\n- صرّح دائمًا بحدود الأدلة: **التشفير، وغموض البصمات، وفجوات الالتقاط**.\n\nحوّل ما وجدته إلى عمليات كشف دائمة في درس [مؤشرات الاختراق ومؤشرات الهجوم (IOCs وIOAs)](/learn/cisco-security-certification-track/iocs-and-ioas)، وتتبّع الإصابة على الجهاز في درس [التحقيق في التسلل إلى الأجهزة الطرفية](/learn/cisco-security-certification-track/endpoint-intrusion-investigation)."
+      }
+    ]
+  }
+}
