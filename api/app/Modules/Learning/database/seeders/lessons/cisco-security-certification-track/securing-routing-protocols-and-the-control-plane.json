@@ -1,0 +1,594 @@
+{
+ "slug": "securing-routing-protocols-and-the-control-plane",
+ "title": "Securing Routing Protocols and the Control Plane",
+ "summary": "Protect the router control plane in both directions: authenticate OSPF, EIGRP and BGP neighbors, filter and validate routes with prefix lists and RPKI, and police traffic to the route processor with CoPP.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Identify the three control-plane threats: adjacency spoofing, route leaks and resource exhaustion",
+  "Configure cryptographic authentication for OSPF and EIGRP with key chains",
+  "Harden eBGP with GTSM, prefix filters, maximum-prefix and RPKI",
+  "Design and roll out a CoPP policy from measured baselines",
+  "Verify each protection with the right show command"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 02:14 a junior engineer at a regional ISP mistypes a route-map. Within minutes, 198.51.100.0/24 is announced from the wrong autonomous system, and a bank's traffic flows through a network that was never meant to carry it. Nothing was \"hacked\" in the classic sense. The control plane simply believed a neighbor.\n\nRouters run two planes that matter here. The **data plane** forwards packets. The **control plane** builds the tables the data plane uses: routing protocols, ARP, ICMP generation, management sessions. Every packet punted to the route processor consumes a shared, small CPU. In the CCIE Security lab you are expected to protect both what the control plane *believes* (route integrity) and what it can *survive* (resource protection)."
+  },
+  {
+   "id": "threats",
+   "type": "text",
+   "markdown": "## What you are defending against\n\nThree failure modes cover almost every control-plane incident:\n\n- **Adjacency spoofing.** An attacker on a shared segment forms a neighbor relationship and injects routes. Fix: authenticate every adjacency.\n- **Route leaks and hijacks.** A legitimate neighbor, often by mistake, advertises prefixes it does not own. Fix: filter by prefix, limit counts and validate origin.\n- **Resource exhaustion.** Floods of traffic destined to the router itself (TTL-expiry, SSH, SNMP, fragmented ICMP) starve OSPF hellos and BGP keepalives, and the adjacencies drop. Fix: Control Plane Policing (CoPP) and passive interfaces.\n\nNotice that authentication alone solves only the first. A candidate who configures keys everywhere and ignores prefix filters has secured the door and left the window open.\n\nThe first rule is also the cheapest: **do not run a routing protocol where there is no router.** Use `passive-interface default` and enable only the links that truly peer. For OSPF, the same idea extends to `ip ospf network point-to-point` on routed links, which removes the DR election that an attacker could win."
+  },
+  {
+   "id": "igp",
+   "type": "text",
+   "markdown": "## Authenticating IGP adjacencies\n\nPlain-text passwords protect nothing against a sniffer. Use cryptographic authentication with a **key chain**, which also gives you hitless key rollover through `send-lifetime` and `accept-lifetime`.\n\n| Protocol | Preferred method | Notes |\n|:--|:--|:--|\n| OSPFv2 | `ip ospf authentication key-chain` with `hmac-sha-256` | Older MD5 (`message-digest-key`) still works but has no rollover schedule |\n| OSPFv3 | `ospfv3 authentication ipsec` or the authentication trailer (RFC 7166) | IPsec AH/ESP is the classic lab answer |\n| EIGRP | Named mode, `authentication mode hmac-sha-256` or `md5` with a key chain | Classic mode supports MD5 only |\n| IS-IS | `isis authentication mode md5` or `hmac-md5` per level | Remember area versus domain authentication |\n\nTwo verification habits save lab time. First, authentication is checked **per interface**, so a missing line on one side shows up as a stuck `INIT` or `EXSTART` neighbor, not as an error message. Second, key IDs and algorithms must match on both ends, while lifetimes only need to overlap."
+  },
+  {
+   "id": "igp-cfg",
+   "type": "code",
+   "language": "cisco",
+   "filename": "igp-auth.cfg",
+   "caption": "OSPFv2 with an HMAC-SHA-256 key chain, plus a passive default.",
+   "code": "key chain OSPF-KEYS\n key 1\n  key-string <OSPF_KEY_PLACEHOLDER>\n  cryptographic-algorithm hmac-sha-256\n!\nrouter ospf 1\n router-id 10.255.0.1\n passive-interface default\n no passive-interface GigabitEthernet0/0/1\n network 10.0.12.0 0.0.0.3 area 0\n!\ninterface GigabitEthernet0/0/1\n ip address 10.0.12.1 255.255.255.252\n ip ospf network point-to-point\n ip ospf authentication key-chain OSPF-KEYS",
+   "highlight": [
+    8,
+    9,
+    15
+   ]
+  },
+  {
+   "id": "bgp",
+   "type": "text",
+   "markdown": "## BGP: the neighbor is not automatically trustworthy\n\neBGP crosses organizational boundaries, so it needs more than a password. Build four layers:\n\n1. **Session protection.** An MD5 password (`neighbor x password`) or TCP-AO where supported, plus **GTSM** (`ttl-security hops 1`), which drops packets whose TTL is below 254 and so rejects spoofed sessions from more than one hop away.\n2. **Prefix filtering.** Accept from a customer only what that customer owns. Always deny bogons, your own space, and the default route unless you asked for it.\n3. **Limits.** `maximum-prefix` converts a leak into a tripped session instead of a table flood. Set a warning threshold so operations sees it before the reset.\n4. **Origin validation.** With **RPKI** the router asks a validator over TCP (port 323 by default) whether an origin AS is authorized for a prefix. Routes come back *valid*, *invalid* or *not-found*, and a route map can drop the invalid ones.\n\nRPKI validates the **origin**, not the whole path. A hijacker who prepends the legitimate origin AS still looks valid. Path validation (BGPsec, ASPA) is the next layer and is mostly conceptual in the lab."
+  },
+  {
+   "id": "bgp-cfg",
+   "type": "code",
+   "language": "cisco",
+   "filename": "bgp-hardening.cfg",
+   "caption": "An eBGP customer session with authentication, GTSM, filtering, limits and RPKI.",
+   "code": "ip prefix-list CUST-A-IN seq 10 permit 198.51.100.0/24\n!\nroute-map RPKI-IN deny 10\n match rpki invalid\nroute-map RPKI-IN permit 20\n!\nrouter bgp 65001\n bgp rpki server tcp 203.0.113.50 port 323 refresh 600\n neighbor 192.0.2.2 remote-as 65002\n neighbor 192.0.2.2 password <BGP_KEY_PLACEHOLDER>\n neighbor 192.0.2.2 ttl-security hops 1\n !\n address-family ipv4\n  neighbor 192.0.2.2 activate\n  neighbor 192.0.2.2 prefix-list CUST-A-IN in\n  neighbor 192.0.2.2 route-map RPKI-IN in\n  neighbor 192.0.2.2 maximum-prefix 10 80\n exit-address-family",
+   "highlight": [
+    10,
+    11,
+    16
+   ]
+  },
+  {
+   "id": "copp-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A packet meets CoPP",
+   "caption": "Only traffic punted to the route processor passes through the control-plane policy.",
+   "data": {
+    "token": "Packet",
+    "nodes": [
+     {
+      "id": "in",
+      "label": "Ingress interface",
+      "icon": "router"
+     },
+     {
+      "id": "fwd",
+      "label": "Forwarding engine",
+      "sub": "Data plane",
+      "icon": "cpu"
+     },
+     {
+      "id": "copp",
+      "label": "CoPP policy",
+      "sub": "PM-COPP",
+      "icon": "shield"
+     },
+     {
+      "id": "rp",
+      "label": "Route processor",
+      "sub": "OSPF, BGP, SSH",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "at": "in",
+      "caption": "A transit packet arrives for a host behind the router."
+     },
+     {
+      "at": "fwd",
+      "caption": "The forwarding engine switches it in hardware. It never touches CoPP.",
+      "tone": "success"
+     },
+     {
+      "at": "in",
+      "token": "BGP keepalive",
+      "caption": "A BGP keepalive arrives addressed to the router itself."
+     },
+     {
+      "at": "copp",
+      "token": "BGP keepalive",
+      "caption": "It is punted to the control plane and matches CM-ROUTING, which has a generous rate.",
+      "tone": "secure"
+     },
+     {
+      "at": "rp",
+      "token": "BGP keepalive",
+      "caption": "Delivered. The adjacency stays up.",
+      "tone": "success"
+     },
+     {
+      "at": "copp",
+      "token": "ICMP flood",
+      "caption": "A flood of ICMP to the router falls into class-default and is policed.",
+      "tone": "warning"
+     },
+     {
+      "at": "copp",
+      "token": "ICMP flood",
+      "caption": "Excess traffic is dropped before it can starve the route processor.",
+      "tone": "blocked"
+     }
+    ]
+   }
+  },
+  {
+   "id": "copp",
+   "type": "text",
+   "markdown": "## Control Plane Policing\n\nCoPP applies a Modular QoS CLI policy to the **control-plane** pseudo-interface. Only traffic punted to the route processor is affected, so transit traffic is untouched. The design pattern is always the same:\n\n1. Classify protocols the router needs: routing, management, monitoring.\n2. Give each class a rate sized from observed baselines.\n3. Police everything else with a low rate in `class-default`.\n\nDeploy it in two steps. First use `exceed-action transmit` so counters show what would be dropped. Then switch to `drop` after a week of clean counters. Policing too aggressively on day one is how engineers take down their own OSPF.\n\nOn Catalyst 9000 IOS XE platforms the hardware CoPP policy `system-cpp-policy` is applied by default and tuned per class, not replaced by a hand-written policy. On ISR/ASR platforms, and in most CCIE lab topologies, you write the policy yourself. CPPr (Control Plane Protection) goes further by splitting the control plane into host, transit and cef-exception subinterfaces."
+  },
+  {
+   "id": "copp-cfg",
+   "type": "code",
+   "language": "cisco",
+   "filename": "copp.cfg",
+   "code": "ip access-list extended COPP-ROUTING\n permit ospf any any\n permit tcp any any eq bgp\n permit tcp any eq bgp any\n!\nclass-map match-all CM-ROUTING\n match access-group name COPP-ROUTING\n!\npolicy-map PM-COPP\n class CM-ROUTING\n  police 512000 conform-action transmit exceed-action drop\n class class-default\n  police 64000 conform-action transmit exceed-action drop\n!\ncontrol-plane\n service-policy input PM-COPP"
+  },
+  {
+   "id": "verify",
+   "type": "terminal",
+   "title": "Verifying authentication, RPKI and CoPP",
+   "prompt": "R1#",
+   "lines": [
+    {
+     "cmd": "show ip ospf interface GigabitEthernet0/0/1 | include Cryptographic|Sending|Neighbor Count",
+     "output": "  Cryptographic authentication enabled\n    Sending SA: Key 1, Algorithm HMAC-SHA-256 - key chain OSPF-KEYS\n  Neighbor Count is 1, Adjacent neighbor count is 1",
+     "comment": "Crypto authentication is active and the adjacency is Full."
+    },
+    {
+     "cmd": "show bgp ipv4 unicast rpki table",
+     "output": "2 BGP sourced 0 IPv4 RPKI prefixes (ROAs)\n  Network               Maxlen  Origin-AS  Source  Neighbor\n  198.51.100.0/24       24      65002      0       203.0.113.50/323",
+     "comment": "The validator supplied a ROA. A route from another origin AS would be marked invalid."
+    },
+    {
+     "cmd": "show policy-map control-plane input class class-default",
+     "output": " Control Plane\n  Service-policy input: PM-COPP\n    Class-map: class-default (match-any)\n      4210 packets, 612330 bytes\n      5 minute offered rate 1000 bps, drop rate 0000 bps\n      police:\n        cir 64000 bps, bc 2000 bytes\n        conformed 4102 packets; actions: transmit\n        exceeded 108 packets; actions: drop",
+     "comment": "108 packets were dropped. Compare this counter against your baseline before tightening further."
+    }
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Filtering only **inbound** from a customer and forgetting **outbound** filters toward peers, which turns your network into a transit leak.\n- Enabling `ttl-security hops 1` on one side only. The session will not form, because the other side still sends packets with a TTL that the protected side does not accept.\n- Writing a CoPP ACL that matches `deny` for a protocol. In CoPP, `permit` means *classify into this class*, and `deny` means *skip this class*, not *drop*.\n- Putting real keys in shared configs. Always use placeholders in examples and a secret store in production."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a virtual lab (CML or EVE-NG) with three IOS XE routers that you own.\n\n1. Bring up OSPF between R1 and R2 with no authentication, then add the key chain on R1 only. Observe the neighbor state and identify what is missing from `show ip ospf neighbor`.\n2. Add the matching key on R2 and confirm the adjacency returns to Full.\n3. Form an eBGP session from R2 to R3 with an MD5 password and GTSM. Advertise a prefix R3 does not own and confirm your inbound prefix list blocks it.\n4. Set `maximum-prefix 3 80`, advertise four prefixes from R3 and record the log message when the session resets.\n5. Apply the CoPP policy with `exceed-action transmit`, send a ping flood from a lab host to R1, and read the counters."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Control plane",
+     "definition": "The functions that build forwarding state: routing protocols, ARP and management sessions handled by the route processor."
+    },
+    {
+     "term": "Key chain",
+     "definition": "An ordered set of keys with lifetimes that routing protocols use for cryptographic authentication and hitless rollover."
+    },
+    {
+     "term": "GTSM",
+     "definition": "Generalized TTL Security Mechanism: a session is accepted only if the TTL shows the sender is within the expected number of hops."
+    },
+    {
+     "term": "Maximum-prefix",
+     "definition": "A BGP limit that warns and then resets a session when a neighbor sends too many prefixes."
+    },
+    {
+     "term": "RPKI",
+     "definition": "A public-key framework in which ROAs state which AS may originate a prefix, letting routers classify routes as valid, invalid or not-found."
+    },
+    {
+     "term": "CoPP",
+     "definition": "Control Plane Policing: a QoS policy applied to traffic punted to the route processor."
+    },
+    {
+     "term": "CPPr",
+     "definition": "Control Plane Protection: an extension of CoPP with separate host, transit and cef-exception subinterfaces."
+    },
+    {
+     "term": "Passive interface",
+     "definition": "An interface that advertises its network into a routing protocol but forms no neighbors."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "An OSPF neighbor is stuck in EXSTART after you enabled a key chain on one router. What is the most likely cause?",
+     "options": [
+      "The hello timers differ",
+      "Authentication is configured on only one side",
+      "The area ID is wrong",
+      "The router IDs are identical"
+     ],
+     "answer": 1,
+     "explanation": "Mismatched authentication prevents the adjacency from completing. Wrong area IDs or timers stop it earlier, in INIT or Down."
+    },
+    {
+     "question": "Which controls reduce the impact of a customer leaking the full Internet table into your BGP session? (Choose all that apply.)",
+     "options": [
+      "Inbound prefix list",
+      "maximum-prefix",
+      "ttl-security hops 1",
+      "RPKI origin validation"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Prefix lists, maximum-prefix and RPKI act on the routes themselves. GTSM protects the session from remote spoofing and does not examine the prefixes."
+    },
+    {
+     "question": "What does RPKI origin validation verify?",
+     "options": [
+      "That the full AS path is legitimate",
+      "That the advertising AS is authorized to originate the prefix",
+      "That the TCP session is encrypted",
+      "That the prefix is not a bogon"
+     ],
+     "answer": 1,
+     "explanation": "A ROA binds a prefix to an authorized origin AS. It does not validate the path between the origin and you."
+    },
+    {
+     "question": "In a CoPP class-map ACL, what does a deny entry do?",
+     "options": [
+      "Drops the matching packets",
+      "Excludes the packets from that class so they fall through to later classes",
+      "Logs the packets",
+      "Sends the packets to the data plane"
+     ],
+     "answer": 1,
+     "explanation": "ACLs in a class-map only classify. Dropping is decided by the policer action in the policy map."
+    },
+    {
+     "question": "Which statements about CoPP deployment are correct? (Choose all that apply.)",
+     "options": [
+      "It affects transit traffic",
+      "Start with exceed-action transmit to observe counters",
+      "Rates should be based on measured baselines",
+      "It replaces the need for routing authentication"
+     ],
+     "answer": [
+      1,
+      2
+     ],
+     "explanation": "CoPP polices only punted traffic, and it is a resource control rather than an authentication control. Baseline first, then enforce."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\nSecure the control plane in two directions. Protect **integrity** with cryptographic authentication, passive interfaces, prefix filters, `maximum-prefix`, GTSM and RPKI. Protect **availability** with CoPP, tuned from baselines and deployed in observe mode first. Verify each layer with a specific show command rather than assuming that a quiet network means a secure one.\n\nNext, see how the same defensive thinking applies to the switch fabric in [Layer 2 and First Hop Security](/learn/cisco-security-certification-track/layer-2-and-first-hop-security), and to the management plane in [Device Hardening and Infrastructure Protection](/learn/cisco-security-certification-track/device-hardening-and-infrastructure-protection)."
+  }
+ ],
+ "ar": {
+  "title": "تأمين بروتوكولات التوجيه ومستوى التحكم",
+  "summary": "تعلّم كيف تحمي مستوى التحكم (Control Plane) في الموجّهات: مصادقة جيران OSPF وEIGRP وBGP، وترشيح البادئات، والتحقق من المصدر بـ RPKI، وتقييد الحركة الموجّهة إلى الجهاز بـ CoPP.",
+  "objectives": [
+   "تحديد تهديدات مستوى التحكم الثلاثة: انتحال الجوار وتسريب المسارات واستنزاف الموارد",
+   "ضبط المصادقة المشفّرة لجوارات OSPF وEIGRP باستخدام سلاسل المفاتيح",
+   "تحصين جلسات eBGP بـ GTSM والتصفية و`maximum-prefix` والتحقق عبر RPKI",
+   "تصميم سياسة CoPP ونشرها تدريجياً بالاعتماد على خطوط أساس مقاسة",
+   "التحقق من كل طبقة حماية بأوامر show المناسبة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في الساعة 02:14 يخطئ مهندس مبتدئ في مزوّد خدمة إقليمي عند كتابة خريطة مسار (route-map). وخلال دقائق يُعلَن عن الشبكة 198.51.100.0/24 من نظام مستقل (AS) خاطئ، فتمرّ حركة مصرف عبر شبكة لم تُصمَّم لحملها. لم يحدث «اختراق» بالمعنى التقليدي؛ كل ما في الأمر أن مستوى التحكم صدّق جاراً.\n\nيعمل الموجّه بمستويين يهمّاننا هنا. **مستوى البيانات (Data plane)** يمرّر الحزم. و**مستوى التحكم (Control plane)** يبني الجداول التي يعتمد عليها مستوى البيانات: بروتوكولات التوجيه وARP وتوليد رسائل ICMP وجلسات الإدارة. وكل حزمة تُحال إلى معالج التوجيه تستهلك معالجاً صغيراً مشتركاً. ومطلوب منك في اختبار CCIE Security أن تحمي ما **يعتقده** مستوى التحكم (سلامة المسارات)، وما **يستطيع تحمّله** (حماية الموارد)."
+   },
+   {
+    "id": "threats",
+    "type": "text",
+    "markdown": "## ما الذي ندافع ضده\n\nثلاثة أنماط من الإخفاق تغطي تقريباً كل حوادث مستوى التحكم:\n\n- **انتحال الجوار (Adjacency spoofing).** مهاجم على قطاع مشترك يقيم علاقة جوار ويحقن مسارات. الحل: مصادقة كل علاقة جوار.\n- **تسريب المسارات واختطافها.** جار شرعي يعلن، غالباً عن خطأ، بادئات لا يملكها. الحل: الترشيح حسب البادئة وتحديد عددها والتحقق من المصدر.\n- **استنزاف الموارد.** سيول حركة موجّهة إلى الموجّه نفسه (انتهاء TTL وSSH وSNMP وICMP المجزأ) تُجوّع رسائل hello الخاصة بـ OSPF ورسائل keepalive الخاصة بـ BGP فتسقط علاقات الجوار. الحل: تقييد مستوى التحكم (CoPP) والواجهات السلبية.\n\nلاحظ أن المصادقة وحدها تعالج الأول فقط. فمن يضبط المفاتيح في كل مكان ويهمل مرشّحات البادئات يكون قد أحكم قفل الباب وترك النافذة مفتوحة.\n\nوالقاعدة الأولى هي أرخصها: **لا تشغّل بروتوكول توجيه حيث لا يوجد موجّه.** استخدم `passive-interface default` ولا تفعّل إلا الوصلات التي تُنشئ جواراً فعلاً. وفي OSPF تمتد الفكرة نفسها إلى `ip ospf network point-to-point` على الوصلات الموجّهة، فتزول عملية انتخاب الموجّه المعيَّن (DR) التي قد يفوز بها المهاجم."
+   },
+   {
+    "id": "igp",
+    "type": "text",
+    "markdown": "## مصادقة علاقات الجوار في بروتوكولات IGP\n\nكلمات المرور النصية لا تحمي من أي متنصّت. استخدم المصادقة المشفّرة مع **سلسلة مفاتيح (Key chain)** التي تتيح أيضاً تدوير المفاتيح دون انقطاع عبر `send-lifetime` و`accept-lifetime`.\n\n| البروتوكول | الطريقة المفضّلة | ملاحظات |\n|:--|:--|:--|\n| OSPFv2 | `ip ospf authentication key-chain` مع `hmac-sha-256` | ما زال MD5 القديم (`message-digest-key`) يعمل لكن بلا جدول زمني للتدوير |\n| OSPFv3 | `ospfv3 authentication ipsec` أو ملحق المصادقة (RFC 7166) | IPsec AH/ESP هو الجواب التقليدي في المختبر |\n| EIGRP | النمط المسمّى مع `authentication mode hmac-sha-256` أو `md5` وسلسلة مفاتيح | النمط الكلاسيكي يدعم MD5 فقط |\n| IS-IS | `isis authentication mode md5` أو `hmac-md5` لكل مستوى | تذكّر الفرق بين مصادقة المنطقة ومصادقة النطاق |\n\nعادتان في التحقق توفّران وقتاً في المختبر. الأولى أن المصادقة تُفحص **لكل واجهة**، فغياب سطر واحد على أحد الطرفين يظهر جاراً عالقاً في حالة `INIT` أو `EXSTART` لا رسالة خطأ. والثانية أن معرّفات المفاتيح والخوارزميات يجب أن تتطابق على الطرفين، أما فترات الصلاحية فيكفي أن تتداخل."
+   },
+   {
+    "id": "igp-cfg",
+    "type": "code",
+    "language": "cisco",
+    "filename": "igp-auth.cfg",
+    "caption": "OSPFv2 مع سلسلة مفاتيح HMAC-SHA-256 وواجهات سلبية افتراضياً.",
+    "code": "key chain OSPF-KEYS\n key 1\n  key-string <OSPF_KEY_PLACEHOLDER>\n  cryptographic-algorithm hmac-sha-256\n!\nrouter ospf 1\n router-id 10.255.0.1\n passive-interface default\n no passive-interface GigabitEthernet0/0/1\n network 10.0.12.0 0.0.0.3 area 0\n!\ninterface GigabitEthernet0/0/1\n ip address 10.0.12.1 255.255.255.252\n ip ospf network point-to-point\n ip ospf authentication key-chain OSPF-KEYS",
+    "highlight": [
+     8,
+     9,
+     15
+    ]
+   },
+   {
+    "id": "bgp",
+    "type": "text",
+    "markdown": "## BGP: الجار ليس موثوقاً بحكم الأمر الواقع\n\nيعبر eBGP حدود المؤسسات، ولذلك يحتاج إلى أكثر من كلمة مرور. ابنِ أربع طبقات:\n\n1. **حماية الجلسة.** كلمة مرور MD5 (`neighbor x password`) أو TCP-AO حيث يتوفر، مع **GTSM** (`ttl-security hops 1`) الذي يُسقط الحزم التي قيمة TTL فيها أقل من 254، فيرفض الجلسات المنتحلة من أكثر من قفزة واحدة.\n2. **ترشيح البادئات.** اقبل من العميل ما يملكه فقط. ارفض دائماً البادئات الوهمية (bogons) ومساحتك الخاصة والمسار الافتراضي ما لم تطلبه.\n3. **الحدود.** يحوّل `maximum-prefix` التسريب إلى إسقاط للجلسة بدلاً من إغراق الجدول. اضبط عتبة تحذير ليرى فريق التشغيل المشكلة قبل إعادة التعيين.\n4. **التحقق من المصدر.** مع **RPKI** يسأل الموجّه خادم تحقق عبر TCP (المنفذ 323 افتراضياً) هل نظام المصدر مخوّل بالبادئة. تعود المسارات *صالحة* أو *غير صالحة* أو *غير موجودة*، ويمكن لخريطة مسار إسقاط غير الصالحة.\n\nيتحقق RPKI من **المصدر** لا من المسار كاملاً. فالمخترِق الذي يُلحق نظام المصدر الشرعي بمساره يبدو صالحاً. التحقق من المسار (BGPsec وASPA) هو الطبقة التالية، وهو نظري في الغالب في المختبر."
+   },
+   {
+    "id": "bgp-cfg",
+    "type": "code",
+    "language": "cisco",
+    "filename": "bgp-hardening.cfg",
+    "caption": "جلسة eBGP مع عميل: مصادقة وGTSM وترشيح وحدود وRPKI.",
+    "code": "ip prefix-list CUST-A-IN seq 10 permit 198.51.100.0/24\n!\nroute-map RPKI-IN deny 10\n match rpki invalid\nroute-map RPKI-IN permit 20\n!\nrouter bgp 65001\n bgp rpki server tcp 203.0.113.50 port 323 refresh 600\n neighbor 192.0.2.2 remote-as 65002\n neighbor 192.0.2.2 password <BGP_KEY_PLACEHOLDER>\n neighbor 192.0.2.2 ttl-security hops 1\n !\n address-family ipv4\n  neighbor 192.0.2.2 activate\n  neighbor 192.0.2.2 prefix-list CUST-A-IN in\n  neighbor 192.0.2.2 route-map RPKI-IN in\n  neighbor 192.0.2.2 maximum-prefix 10 80\n exit-address-family",
+    "highlight": [
+     10,
+     11,
+     16
+    ]
+   },
+   {
+    "id": "copp-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "حزمة تواجه CoPP",
+    "caption": "لا تمرّ بسياسة مستوى التحكم إلا الحركة المُحالة إلى معالج التوجيه.",
+    "data": {
+     "token": "حزمة",
+     "nodes": [
+      {
+       "id": "in",
+       "label": "واجهة الدخول",
+       "icon": "router"
+      },
+      {
+       "id": "fwd",
+       "label": "محرك التمرير",
+       "sub": "مستوى البيانات",
+       "icon": "cpu"
+      },
+      {
+       "id": "copp",
+       "label": "سياسة CoPP",
+       "sub": "PM-COPP",
+       "icon": "shield"
+      },
+      {
+       "id": "rp",
+       "label": "معالج التوجيه",
+       "sub": "OSPF وBGP وSSH",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "at": "in",
+       "caption": "تصل حزمة عبور متجهة إلى مضيف خلف الموجّه."
+      },
+      {
+       "at": "fwd",
+       "caption": "يمرّرها محرك التمرير في العتاد ولا تلمس CoPP أبداً.",
+       "tone": "success"
+      },
+      {
+       "at": "in",
+       "token": "BGP keepalive",
+       "caption": "تصل رسالة BGP keepalive موجّهة إلى الموجّه نفسه."
+      },
+      {
+       "at": "copp",
+       "token": "BGP keepalive",
+       "caption": "تُحال إلى مستوى التحكم وتطابق CM-ROUTING ذا المعدل السخي.",
+       "tone": "secure"
+      },
+      {
+       "at": "rp",
+       "token": "BGP keepalive",
+       "caption": "تُسلَّم الرسالة وتبقى علاقة الجوار قائمة.",
+       "tone": "success"
+      },
+      {
+       "at": "copp",
+       "token": "سيل ICMP",
+       "caption": "سيل ICMP موجّه إلى الموجّه يقع في class-default ويُقيَّد معدله.",
+       "tone": "warning"
+      },
+      {
+       "at": "copp",
+       "token": "سيل ICMP",
+       "caption": "تُسقَط الحزم الزائدة قبل أن تجوّع معالج التوجيه.",
+       "tone": "blocked"
+      }
+     ]
+    }
+   },
+   {
+    "id": "copp",
+    "type": "text",
+    "markdown": "## تقييد مستوى التحكم (CoPP)\n\nيطبّق CoPP سياسة Modular QoS CLI على واجهة **control-plane** الافتراضية. لا يتأثر إلا ما يُحال إلى معالج التوجيه، فلا تُمسّ حركة العبور. والنمط التصميمي واحد دائماً:\n\n1. صنّف البروتوكولات التي يحتاجها الموجّه: التوجيه والإدارة والمراقبة.\n2. امنح كل صنف معدلاً محسوباً من خطوط الأساس المرصودة.\n3. قيّد كل ما عداها بمعدل منخفض في `class-default`.\n\nانشرها على خطوتين. استخدم أولاً `exceed-action transmit` لتُظهر العدّادات ما كان سيُسقَط، ثم انتقل إلى `drop` بعد أسبوع من العدّادات النظيفة. والتشديد المفرط في اليوم الأول هو الطريق الأقصر لإسقاط OSPF الخاص بك.\n\nفي منصات Catalyst 9000 بنظام IOS XE تُطبَّق سياسة العتاد `system-cpp-policy` افتراضياً وتُضبط كل فئة فيها ولا تُستبدل بسياسة مكتوبة يدوياً. أما في منصات ISR/ASR ومعظم طوبولوجيات CCIE فتكتب السياسة بنفسك. ويذهب CPPr (Control Plane Protection) أبعد بتقسيم مستوى التحكم إلى واجهات فرعية للمضيف والعبور واستثناءات CEF."
+   },
+   {
+    "id": "copp-cfg",
+    "type": "code",
+    "language": "cisco",
+    "filename": "copp.cfg",
+    "code": "ip access-list extended COPP-ROUTING\n permit ospf any any\n permit tcp any any eq bgp\n permit tcp any eq bgp any\n!\nclass-map match-all CM-ROUTING\n match access-group name COPP-ROUTING\n!\npolicy-map PM-COPP\n class CM-ROUTING\n  police 512000 conform-action transmit exceed-action drop\n class class-default\n  police 64000 conform-action transmit exceed-action drop\n!\ncontrol-plane\n service-policy input PM-COPP"
+   },
+   {
+    "id": "verify",
+    "type": "terminal",
+    "title": "التحقق من المصادقة وRPKI وCoPP",
+    "prompt": "R1#",
+    "lines": [
+     {
+      "cmd": "show ip ospf interface GigabitEthernet0/0/1 | include Cryptographic|Sending|Neighbor Count",
+      "output": "  Cryptographic authentication enabled\n    Sending SA: Key 1, Algorithm HMAC-SHA-256 - key chain OSPF-KEYS\n  Neighbor Count is 1, Adjacent neighbor count is 1",
+      "comment": "المصادقة المشفّرة فعّالة وعلاقة الجوار في حالة Full."
+     },
+     {
+      "cmd": "show bgp ipv4 unicast rpki table",
+      "output": "2 BGP sourced 0 IPv4 RPKI prefixes (ROAs)\n  Network               Maxlen  Origin-AS  Source  Neighbor\n  198.51.100.0/24       24      65002      0       203.0.113.50/323",
+      "comment": "زوّد الخادم الموجّه بـ ROA. أي مسار من نظام مصدر آخر سيوسَم بأنه غير صالح."
+     },
+     {
+      "cmd": "show policy-map control-plane input class class-default",
+      "output": " Control Plane\n  Service-policy input: PM-COPP\n    Class-map: class-default (match-any)\n      4210 packets, 612330 bytes\n      5 minute offered rate 1000 bps, drop rate 0000 bps\n      police:\n        cir 64000 bps, bc 2000 bytes\n        conformed 4102 packets; actions: transmit\n        exceeded 108 packets; actions: drop",
+      "comment": "أُسقطت 108 حزم. قارن هذا العدّاد بخط الأساس قبل التشديد أكثر."
+     }
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- ترشيح **الداخل** فقط من العميل ونسيان مرشّحات **الخارج** نحو النظراء، فتتحول شبكتك إلى مسار عبور يسرّب المسارات.\n- تفعيل `ttl-security hops 1` على طرف واحد فقط. لن تنشأ الجلسة، لأن الطرف الآخر ما زال يرسل حزماً بقيمة TTL لا يقبلها الطرف المحمي.\n- كتابة ACL في CoPP تستخدم `deny` لبروتوكول ما. في CoPP تعني `permit` «صنّف في هذا الصنف» وتعني `deny` «تخطَّ هذا الصنف» لا «أسقط».\n- وضع مفاتيح حقيقية في إعدادات مشتركة. استخدم دائماً قيماً نائبة في الأمثلة ومخزناً للأسرار في الإنتاج."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم مختبراً افتراضياً (CML أو EVE-NG) فيه ثلاثة موجّهات IOS XE تملكها.\n\n1. شغّل OSPF بين R1 وR2 دون مصادقة، ثم أضف سلسلة المفاتيح على R1 فقط. راقب حالة الجار وحدّد ما ينقص في ناتج `show ip ospf neighbor`.\n2. أضف المفتاح المطابق على R2 وتأكد من عودة العلاقة إلى Full.\n3. أنشئ جلسة eBGP من R2 إلى R3 بكلمة مرور MD5 وGTSM. أعلن بادئة لا يملكها R3 وتأكد أن قائمة البادئات الداخلة تمنعها.\n4. اضبط `maximum-prefix 3 80`، وأعلن أربع بادئات من R3، وسجّل رسالة السجل عند إعادة تعيين الجلسة.\n5. طبّق سياسة CoPP مع `exceed-action transmit`، وأرسل سيل ping من مضيف المختبر إلى R1، ثم اقرأ العدّادات."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "مستوى التحكم (Control plane)",
+      "definition": "الوظائف التي تبني حالة التمرير: بروتوكولات التوجيه وARP وجلسات الإدارة التي يعالجها معالج التوجيه."
+     },
+     {
+      "term": "سلسلة المفاتيح (Key chain)",
+      "definition": "مجموعة مرتبة من المفاتيح ذات فترات صلاحية تستخدمها بروتوكولات التوجيه للمصادقة المشفّرة وتدوير المفاتيح دون انقطاع."
+     },
+     {
+      "term": "GTSM",
+      "definition": "آلية أمان TTL المعمّمة: تُقبل الجلسة فقط إذا أثبتت قيمة TTL أن المرسل ضمن عدد القفزات المتوقع."
+     },
+     {
+      "term": "Maximum-prefix",
+      "definition": "حدّ في BGP يحذّر ثم يُعيد تعيين الجلسة عندما يرسل الجار بادئات أكثر من اللازم."
+     },
+     {
+      "term": "RPKI",
+      "definition": "إطار مفاتيح عامة تبيّن فيه شهادات ROA أي نظام مستقل يحق له إعلان بادئة، فيصنّف الموجّه المسارات صالحة أو غير صالحة أو غير موجودة."
+     },
+     {
+      "term": "CoPP",
+      "definition": "تقييد مستوى التحكم: سياسة QoS تُطبَّق على الحركة المُحالة إلى معالج التوجيه."
+     },
+     {
+      "term": "CPPr",
+      "definition": "حماية مستوى التحكم: امتداد لـ CoPP بواجهات فرعية منفصلة للمضيف والعبور واستثناءات CEF."
+     },
+     {
+      "term": "الواجهة السلبية (Passive interface)",
+      "definition": "واجهة تعلن شبكتها في بروتوكول التوجيه دون تكوين جيران."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "جار OSPF عالق في حالة EXSTART بعد أن فعّلت سلسلة مفاتيح على أحد الموجّهين. ما السبب الأرجح؟",
+      "options": [
+       "اختلاف مؤقتات hello",
+       "ضبط المصادقة على طرف واحد فقط",
+       "معرّف منطقة خاطئ",
+       "تطابق معرّفات الموجّهين"
+      ],
+      "answer": 1,
+      "explanation": "عدم تطابق المصادقة يمنع إكمال علاقة الجوار. أما خطأ معرّف المنطقة أو المؤقتات فيوقفها في مرحلة أبكر، INIT أو Down."
+     },
+     {
+      "question": "أي الضوابط تقلل أثر تسريب عميل لجدول الإنترنت الكامل في جلسة BGP عندك؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "قائمة بادئات للداخل",
+       "maximum-prefix",
+       "ttl-security hops 1",
+       "التحقق من المصدر بـ RPKI"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "قوائم البادئات و`maximum-prefix` وRPKI تعمل على المسارات نفسها. أما GTSM فيحمي الجلسة من الانتحال البعيد ولا يفحص البادئات."
+     },
+     {
+      "question": "ما الذي يتحقق منه RPKI في التحقق من المصدر؟",
+      "options": [
+       "أن مسار AS كاملاً شرعي",
+       "أن النظام المعلِن مخوّل بإصدار البادئة",
+       "أن جلسة TCP مشفّرة",
+       "أن البادئة ليست من البادئات الوهمية"
+      ],
+      "answer": 1,
+      "explanation": "تربط ROA البادئة بنظام مصدر مخوّل، ولا تتحقق من المسار بين المصدر وبينك."
+     },
+     {
+      "question": "ما أثر سطر deny في ACL الخاصة بـ class-map في CoPP؟",
+      "options": [
+       "يُسقط الحزم المطابقة",
+       "يستثني الحزم من ذلك الصنف فتنتقل إلى الأصناف اللاحقة",
+       "يسجّل الحزم",
+       "يرسل الحزم إلى مستوى البيانات"
+      ],
+      "answer": 1,
+      "explanation": "ACL داخل class-map تصنّف فقط. أما الإسقاط فيقرره إجراء المقيِّد (policer) في policy-map."
+     },
+     {
+      "question": "أي العبارات عن نشر CoPP صحيحة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "يؤثر في حركة العبور",
+       "ابدأ بـ exceed-action transmit لمراقبة العدّادات",
+       "يجب أن تستند المعدلات إلى خطوط أساس مقاسة",
+       "يغني عن مصادقة التوجيه"
+      ],
+      "answer": [
+       1,
+       2
+      ],
+      "explanation": "يقيّد CoPP الحركة المُحالة فقط، وهو ضابط موارد لا ضابط مصادقة. قِس خط الأساس أولاً ثم فعّل الإنفاذ."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\nأمّن مستوى التحكم في اتجاهين. احمِ **السلامة** بالمصادقة المشفّرة والواجهات السلبية ومرشّحات البادئات و`maximum-prefix` وGTSM وRPKI. واحمِ **التوافر** بـ CoPP مضبوطاً على خطوط أساس ومنشوراً في وضع المراقبة أولاً. وتحقق من كل طبقة بأمر show محدد بدل افتراض أن الشبكة الهادئة شبكة آمنة.\n\nثم انظر كيف ينطبق التفكير الدفاعي نفسه على نسيج المحولات في [أمن الطبقة الثانية والقفزة الأولى](/learn/cisco-security-certification-track/layer-2-and-first-hop-security)، وعلى مستوى الإدارة في [تحصين الأجهزة وحماية البنية التحتية](/learn/cisco-security-certification-track/device-hardening-and-infrastructure-protection)."
+   }
+  ]
+ }
+}

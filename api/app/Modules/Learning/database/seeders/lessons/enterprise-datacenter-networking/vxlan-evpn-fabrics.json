@@ -1,0 +1,578 @@
+{
+  "slug": "vxlan-evpn-fabrics",
+  "title": "VXLAN EVPN Fabrics",
+  "summary": "Build and troubleshoot a VXLAN BGP EVPN fabric: routed underlay, L2 and L3 VNIs, EVPN route types, anycast gateway and symmetric IRB.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Design a routed underlay for VTEP reachability and jumbo MTU",
+    "Configure L2VNI, L3VNI, NVE and the EVPN BGP session on NX-OS",
+    "Explain EVPN route types 2, 3 and 5 and BUM handling options",
+    "Describe the anycast gateway and symmetric IRB",
+    "Troubleshoot a fabric layer by layer"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A company is moving a clustered database and its web tier onto a new two-tier data center. The application owners insist that the cluster nodes sit in the same subnet on different racks, and that virtual machines keep their IP addresses when they move. A classic spanning-tree design cannot give you that at scale: it blocks links, floods broadcasts everywhere and has a single failure domain.\n\nA **VXLAN EVPN fabric** solves this by separating the network into two parts. A simple routed **underlay** carries packets between switches. A **BGP EVPN overlay** carries the tenant Layer 2 and Layer 3 information on top of it. On the CCIE Data Center lab you must design, build and troubleshoot both parts, so this lesson walks through the whole path from underlay to verification."
+    },
+    {
+      "id": "underlay",
+      "type": "text",
+      "markdown": "## The underlay\n\nThe underlay has one job: give every VTEP (VXLAN tunnel endpoint) loopback a fast, loop-free, equal-cost path to every other VTEP. A typical design is a spine-leaf topology with these rules:\n\n- **Point-to-point routed links** between every leaf and every spine, usually `ip unnumbered loopback0` or /31 addresses, with `ip ospf network point-to-point` or IS-IS. See [OSPF, IS-IS, BGP and BFD](/learn/enterprise-datacenter-networking/ospf-is-is-bgp-and-bfd) for the protocol details.\n- **Two loopbacks per leaf.** Loopback0 is the router ID and BGP peering address. Loopback1 is the NVE source, the VTEP address that appears as the outer source and destination IP.\n- **Jumbo MTU.** VXLAN adds about 50 bytes, so set the MTU to 9216 on every fabric link. A mismatch is the most common cause of \"small pings work, large transfers hang\".\n- **ECMP and BFD.** Equal-cost multipath spreads flows across spines, and BFD detects a failed link in milliseconds.\n\nIf the VTEP loopbacks cannot reach each other, nothing in the overlay can work, so always verify the underlay first with `ping 10.255.1.2 source-interface loopback1`."
+    },
+    {
+      "id": "overlay",
+      "type": "text",
+      "markdown": "## The overlay: VNIs and VTEPs\n\nVXLAN wraps an Ethernet frame in UDP (destination port 4789) and adds a 24-bit **VNI** (VXLAN network identifier), giving about 16 million segments instead of 4,094 VLANs. The device that encapsulates and decapsulates is the **VTEP**, implemented on Nexus switches as the **NVE** (network virtualization edge) interface.\n\nThere are two kinds of VNI:\n\n| VNI type | Purpose | Mapped to |\n|:--|:--|:--|\n| L2VNI | Bridged segment, one per VLAN | `vlan 10` / `vn-segment 10010` |\n| L3VNI | Routed traffic between subnets of one tenant | `vrf context` / `vni 50001` |\n\nEach tenant VRF has exactly one L3VNI, and each VLAN has one L2VNI. The Layer 3 VNI is carried on a transit VLAN (here VLAN 999) that exists only to bind the VRF to the VNI."
+    },
+    {
+      "id": "evpn",
+      "type": "text",
+      "markdown": "## BGP EVPN control plane\n\nEarly VXLAN used flood-and-learn, where every BUM (broadcast, unknown unicast, multicast) frame was flooded to all VTEPs. **MP-BGP EVPN** replaces learning by flooding with advertisement: a leaf learns a local MAC or IP and announces it to the other leaves. The spines usually act as **route reflectors** so that iBGP does not need a full mesh.\n\nThe route types you must know:\n\n- **Type 2 (MAC/IP advertisement):** a host MAC, optionally with its IP. This is how remote leaves learn endpoints and how ARP suppression works.\n- **Type 3 (inclusive multicast):** announces that a VTEP participates in a VNI. With `ingress-replication protocol bgp`, it builds the head-end replication list for BUM traffic.\n- **Type 5 (IP prefix):** an IP prefix in a VRF, used for external routes and for subnets that have no silent hosts.\n- **Type 1 and 4:** Ethernet segment routes used for multihoming and designated forwarder election.\n\nThe lab decision for BUM traffic is **ingress replication** (the source VTEP sends a unicast copy to each peer, so the underlay needs no multicast) versus **multicast underlay** (`mcast-group 239.1.1.10`, efficient for many VTEPs but requiring PIM, see [Multicast: PIM, Anycast-RP, MSDP and IGMP](/learn/enterprise-datacenter-networking/multicast-pim-anycast-rp-msdp-and-igmp))."
+    },
+    {
+      "id": "cfg",
+      "type": "code",
+      "language": "cisco",
+      "code": "feature ospf\nfeature bgp\nfeature nv overlay\nfeature vn-segment-vlan-based\nfeature interface-vlan\nnv overlay evpn\nfabric forwarding anycast-gateway-mac 0000.2222.3333\n!\nvlan 10\n  vn-segment 10010\nvlan 999\n  vn-segment 50001\n!\nvrf context TENANT1\n  vni 50001\n  rd auto\n  address-family ipv4 unicast\n    route-target both auto\n    route-target both auto evpn\n!\ninterface Vlan999\n  no shutdown\n  vrf member TENANT1\n  ip forward\n!\ninterface Vlan10\n  no shutdown\n  vrf member TENANT1\n  ip address 10.10.10.1/24\n  fabric forwarding mode anycast-gateway\n!\ninterface nve1\n  no shutdown\n  host-reachability protocol bgp\n  source-interface loopback1\n  member vni 10010\n    suppress-arp\n    ingress-replication protocol bgp\n  member vni 50001 associate-vrf\n!\nevpn\n  vni 10010 l2\n    rd auto\n    route-target import auto\n    route-target export auto\n!\nrouter bgp 65001\n  neighbor 10.255.0.1\n    remote-as 65001\n    update-source loopback0\n    address-family l2vpn evpn\n      send-community\n      send-community extended\n  vrf TENANT1\n    address-family ipv4 unicast\n      advertise l2vpn evpn",
+      "filename": "leaf1-evpn.cfg",
+      "caption": "Minimal NX-OS leaf configuration: anycast gateway, one L2VNI, one L3VNI and the EVPN session to the route reflector."
+    },
+    {
+      "id": "irb",
+      "type": "text",
+      "markdown": "## Distributed anycast gateway and symmetric IRB\n\nEvery leaf hosting VLAN 10 uses the same gateway IP (10.10.10.1) and the same virtual MAC from `fabric forwarding anycast-gateway-mac`. A VM can move to any rack and still find its gateway locally, so there is no hairpin to a central router.\n\nFor routing between subnets, Cisco uses **symmetric integrated routing and bridging (IRB)**. The ingress leaf routes the packet into the tenant's L3VNI (50001), and the egress leaf routes it out of the L3VNI into the destination VLAN. Both directions use the same VNI, so each leaf needs only the VRFs and VLANs it actually hosts. Compare this with asymmetric IRB, which requires every VLAN on every leaf and is rarely used.\n\n### Multihoming\nServers dual-connect to a **vPC** leaf pair, covered in [vPC, Port Channels and Trunking](/learn/enterprise-datacenter-networking/vpc-port-channels-and-trunking). The pair shares a secondary IP on loopback1 so that remote leaves see one **anycast VTEP**. Newer designs can use EVPN multihoming with Type 1 and 4 routes instead of vPC, which removes the peer link."
+    },
+    {
+      "id": "flow-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Host-to-host forwarding across the fabric",
+      "caption": "Host A learns Host B through EVPN Type 2 routes, then traffic is encapsulated between VTEPs.",
+      "data": {
+        "actors": [
+          {
+            "id": "ha",
+            "label": "Host A",
+            "sub": "10.10.10.11",
+            "icon": "laptop"
+          },
+          {
+            "id": "l1",
+            "label": "Leaf1",
+            "sub": "VTEP 10.255.1.1",
+            "icon": "switch"
+          },
+          {
+            "id": "rr",
+            "label": "Spine RR",
+            "sub": "10.255.0.1",
+            "icon": "router"
+          },
+          {
+            "id": "l2",
+            "label": "Leaf2",
+            "sub": "VTEP 10.255.1.2",
+            "icon": "switch"
+          },
+          {
+            "id": "hb",
+            "label": "Host B",
+            "sub": "10.10.10.22",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "hb",
+            "to": "l2",
+            "label": "ARP / GARP",
+            "note": "Host B announces itself and Leaf2 learns its MAC and IP locally."
+          },
+          {
+            "from": "l2",
+            "to": "rr",
+            "label": "BGP EVPN RT-2",
+            "detail": "MAC+IP, VNI 10010",
+            "note": "Leaf2 advertises a Type 2 route with next hop 10.255.1.2.",
+            "tone": "secure"
+          },
+          {
+            "from": "rr",
+            "to": "l1",
+            "label": "RT-2 reflected",
+            "note": "The route reflector sends the route to Leaf1, which installs the MAC in its table."
+          },
+          {
+            "from": "ha",
+            "to": "l1",
+            "label": "Ethernet frame",
+            "detail": "dst MAC = Host B",
+            "note": "Host A sends a frame to Host B in the same VLAN."
+          },
+          {
+            "from": "l1",
+            "to": "l2",
+            "label": "VXLAN",
+            "detail": "UDP 4789, VNI 10010",
+            "note": "Leaf1 encapsulates the frame with outer IPs 10.255.1.1 to 10.255.1.2 across the underlay.",
+            "tone": "secure"
+          },
+          {
+            "from": "l2",
+            "to": "hb",
+            "label": "Decapsulated frame",
+            "note": "Leaf2 removes the VXLAN header and delivers the original frame.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Leaf1# verification",
+      "lines": [
+        {
+          "cmd": "show nve peers",
+          "output": "Interface Peer-IP          State LearnType Uptime   Router-Mac\nnve1      10.255.1.2       Up    CP        00:12:41 5254.00a1.2b3c"
+        },
+        {
+          "cmd": "show bgp l2vpn evpn summary",
+          "output": "Neighbor        V    AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down  State/PfxRcd\n10.255.0.1      4 65001     412     398     27   0    0 00:12:50 18"
+        },
+        {
+          "cmd": "show l2route evpn mac all",
+          "output": "Topology  Mac Address    Prod   Flags  Seq No  Next-Hops\n10        0050.56aa.0011 Local  L,     0       Eth1/5\n10        0050.56bb.0022 BGP    SplRcv 0       10.255.1.2"
+        },
+        {
+          "cmd": "show nve vni",
+          "output": "Interface VNI   Multicast-group State Mode Type [BD/VRF]  Flags\nnve1      10010 UnicastBGP      Up    CP   L2 [10]\nnve1      50001 n/a             Up    CP   L3 [TENANT1]"
+        }
+      ],
+      "caption": "Peers up with learn type CP (control plane) and both VNIs up are the first things to check."
+    },
+    {
+      "id": "trouble",
+      "type": "text",
+      "markdown": "## Troubleshooting workflow\n\nWork from the bottom up and stop at the first failing layer:\n\n1. **Underlay reachability.** `show ip route 10.255.1.2` and a loopback-to-loopback ping with jumbo size: `ping 10.255.1.2 source-interface loopback1 packet-size 9000 df-bit`.\n2. **NVE state.** `show nve interface nve1 detail` must show `State: Up` and the right source address. A down NVE usually means loopback1 is not advertised in the underlay.\n3. **BGP EVPN.** `show bgp l2vpn evpn summary` must show Established sessions with prefixes received. If the session is up but the count is zero, check `send-community extended` and route-target import.\n4. **VNI and route targets.** A mismatch of RD or RT between leaves is silent: the session is up but the MAC never installs.\n5. **Data plane.** `show l2route evpn mac all` and `show ip route vrf TENANT1` confirm that endpoints were learned.\n\nOn the lab, also remember that `vn-segment` must be configured under the VLAN before the VNI can be added to the NVE."
+    },
+    {
+      "id": "warn-mtu",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common trap",
+      "markdown": "Do not trust a successful default-size ping across the fabric. Test with `packet-size 9000 df-bit` end to end. A single link left at MTU 1500 breaks only large frames, and the symptoms look like an application problem."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a lab (CML, Nexus 9000v or dCloud), build two leaves and one spine. Configure OSPF point-to-point underlay with loopback0 and loopback1, then apply the configuration above to both leaves, changing the VTEP and router IDs. Attach a host to VLAN 10 on each leaf.\n\n1. Confirm `show nve peers` shows the other leaf as `Up`.\n2. Ping between the hosts and read `show l2route evpn mac all`.\n3. Shut the spine link on Leaf1 and observe how long traffic stays down (add BFD to improve it).\n4. Change one route target on Leaf2 and describe what breaks while the BGP session stays up."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "VTEP / NVE",
+          "definition": "The endpoint and the Nexus interface that encapsulate and decapsulate VXLAN traffic."
+        },
+        {
+          "term": "L2VNI / L3VNI",
+          "definition": "VNI for a bridged VLAN segment / VNI for routing within a tenant VRF."
+        },
+        {
+          "term": "EVPN route type 2",
+          "definition": "Advertises a host MAC and optionally its IP."
+        },
+        {
+          "term": "EVPN route type 5",
+          "definition": "Advertises an IP prefix inside a VRF."
+        },
+        {
+          "term": "Ingress replication",
+          "definition": "BUM traffic is copied as unicast to each remote VTEP."
+        },
+        {
+          "term": "Anycast gateway",
+          "definition": "The same gateway IP and MAC on every leaf."
+        },
+        {
+          "term": "Symmetric IRB",
+          "definition": "Routing in on the ingress leaf and out on the egress leaf through the L3VNI."
+        },
+        {
+          "term": "ARP suppression",
+          "definition": "A leaf answers ARP locally from EVPN data instead of flooding it."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which EVPN route type carries a host MAC address together with its IP address?",
+          "options": [
+            "Type 1",
+            "Type 2",
+            "Type 3",
+            "Type 5"
+          ],
+          "answer": 1,
+          "explanation": "Type 2 is the MAC/IP advertisement. Type 3 builds the BUM list, Type 5 carries prefixes and Type 1 is for Ethernet segments."
+        },
+        {
+          "question": "Which statements about the underlay are correct? Choose all that apply.",
+          "options": [
+            "It should use a jumbo MTU such as 9216.",
+            "It carries tenant MAC addresses in BGP.",
+            "It provides loopback-to-loopback reachability between VTEPs.",
+            "It normally uses ECMP across the spines."
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "Tenant MACs belong to the EVPN overlay, not the routed underlay."
+        },
+        {
+          "question": "In symmetric IRB, which VNI carries routed traffic between two subnets of the same VRF?",
+          "options": [
+            "The L2VNI of the source VLAN",
+            "The L2VNI of the destination VLAN",
+            "The L3VNI of the VRF",
+            "The infra VNI"
+          ],
+          "answer": 2,
+          "explanation": "Both leaves route through the tenant's L3VNI, so each needs only the VLANs it hosts."
+        },
+        {
+          "question": "The BGP EVPN session is Established but no remote MACs appear. What should you check? Choose all that apply.",
+          "options": [
+            "send-community extended on the neighbor",
+            "Route-target import and export for the VNI",
+            "The spanning-tree root priority",
+            "That the VNI is a member of nve1"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Missing extended communities, mismatched RTs or a VNI not under the NVE all produce an up session with no usable routes. STP root priority is not involved."
+        },
+        {
+          "question": "Small pings across the fabric work but file transfers stall. What is the most likely cause?",
+          "options": [
+            "MTU mismatch on an underlay link",
+            "A wrong anycast gateway MAC",
+            "An EVPN Type 3 route is missing",
+            "An unreachable route reflector"
+          ],
+          "answer": 0,
+          "explanation": "VXLAN adds about 50 bytes, so full-size frames exceed a 1500-byte link while small ones pass."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A VXLAN EVPN fabric separates a routed **underlay** from a BGP EVPN **overlay**.\n- VNIs identify segments: L2VNI per VLAN and L3VNI per tenant VRF.\n- Type 2, 3 and 5 routes distribute MACs, replication lists and prefixes.\n- The anycast gateway and symmetric IRB keep routing local to every leaf.\n- Troubleshoot from underlay and MTU up to NVE, BGP, route targets and finally MAC and IP tables.\n\nNext, continue with the other major data center architecture, Cisco ACI, in [ACI Fabric Discovery and Architecture](/learn/enterprise-datacenter-networking/aci-fabric-discovery-and-architecture)."
+    }
+  ],
+  "ar": {
+    "title": "النسيج الشبكي في VXLAN EVPN",
+    "summary": "ابنِ نسيج VXLAN BGP EVPN واستكشف أعطاله: شبكة سفلية موجَّهة وقيم L2VNI وL3VNI وأنواع مسارات EVPN والبوابة المتعددة العناوين وIRB المتناظر.",
+    "objectives": [
+      "صمّم شبكة سفلية موجَّهة تضمن الوصول إلى VTEP وMTU كبيرة",
+      "اضبط L2VNI وL3VNI وNVE وجلسة BGP EVPN على NX-OS",
+      "اشرح مسارات EVPN من الأنواع 2 و3 و5 وخيارات التعامل مع BUM",
+      "صِف البوابة المتعددة العناوين وIRB المتناظر",
+      "استكشف أعطال النسيج طبقةً بعد طبقة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تريد شركة نقل قاعدة بيانات عنقودية وطبقة الويب إلى مركز بيانات جديد من طبقتين. يشترط أصحاب التطبيقات أن تبقى عقد العنقود في الشبكة الفرعية نفسها على رفوف مختلفة، وأن تحتفظ الأجهزة الافتراضية بعناوينها عند انتقالها. لا يستطيع تصميم قائم على بروتوكول الشجرة الممتدة (Spanning Tree) تحقيق ذلك على نطاق واسع، فهو يحجب وصلات، ويغمر الشبكة ببث الطبقة الثانية، وله نطاق عطل واحد.\n\nيحلّ **نسيج VXLAN EVPN** هذه المشكلة بفصل الشبكة إلى جزأين. تنقل **الشبكة السفلية (Underlay)** الموجَّهة البسيطة الرزم بين المحوّلات، وتحمل **الشبكة العلوية (Overlay)** المبنية على BGP EVPN معلومات الطبقتين الثانية والثالثة الخاصة بالمستأجرين. في اختبار CCIE Data Center المعملي يجب أن تصمّم الجزأين وتبنيهما وتصلح أعطالهما، لذا يتتبّع هذا الدرس المسار كاملاً من الشبكة السفلية حتى التحقق."
+      },
+      {
+        "id": "underlay",
+        "type": "text",
+        "markdown": "## الشبكة السفلية (Underlay)\n\nللشبكة السفلية مهمة واحدة: أن تمنح كل عنوان Loopback لنقطة نهاية النفق (VTEP) مساراً سريعاً خالياً من الحلقات ومتعدد المسارات متساوية الكلفة إلى كل نقطة أخرى. يعتمد التصميم المعتاد بنية الأوراق والعمود الفقري (Spine-leaf) وفق القواعد الآتية:\n\n- **وصلات موجَّهة من نقطة إلى نقطة** بين كل ورقة وكل عمود فقري، وتُستخدم عادةً `ip unnumbered loopback0` أو عناوين /31 مع `ip ospf network point-to-point` أو IS-IS. تجد تفاصيل البروتوكولات في درس [OSPF, IS-IS, BGP and BFD](/learn/enterprise-datacenter-networking/ospf-is-is-bgp-and-bfd).\n- **واجهتا Loopback في كل ورقة.** تكون Loopback0 معرّف الموجّه وعنوان اتصال BGP، وتكون Loopback1 مصدر NVE أي عنوان VTEP الذي يظهر عنواناً خارجياً للمصدر والوجهة.\n- **وحدة نقل قصوى كبيرة (Jumbo MTU).** يضيف VXLAN نحو 50 بايتاً، فاضبط MTU على 9216 في كل وصلات النسيج. وعدم التطابق هو أشيع سبب لحالة «تعمل أوامر ping الصغيرة وتتوقف النقول الكبيرة».\n- **ECMP وBFD.** يوزّع تعدد المسارات متساوية الكلفة التدفقات على الأعمدة الفقرية، ويكشف BFD تعطّل الوصلة في أجزاء من الثانية.\n\nإذا تعذّر وصول عناوين Loopback الخاصة بـ VTEP بعضها إلى بعض فلن يعمل شيء في الشبكة العلوية، فتحقّق من الشبكة السفلية أولاً بالأمر `ping 10.255.1.2 source-interface loopback1`."
+      },
+      {
+        "id": "overlay",
+        "type": "text",
+        "markdown": "## الشبكة العلوية: VNI وVTEP\n\nيغلّف VXLAN إطار إيثرنت داخل UDP (منفذ الوجهة 4789) ويضيف معرّفاً من 24 بتّاً هو **VNI** (معرّف شبكة VXLAN)، فيتيح نحو 16 مليون قطاع بدلاً من 4094 شبكة VLAN. والجهاز الذي يغلّف ويفكّ التغليف هو **VTEP** ويُنفَّذ في محوّلات Nexus بواجهة **NVE** (حافة تظهير الشبكة).\n\nوهناك نوعان من VNI:\n\n| نوع VNI | الغرض | الربط |\n|:--|:--|:--|\n| L2VNI | قطاع مجسَّر، واحد لكل VLAN | `vlan 10` / `vn-segment 10010` |\n| L3VNI | حركة موجَّهة بين الشبكات الفرعية لمستأجر واحد | `vrf context` / `vni 50001` |\n\nلكل VRF مستأجر L3VNI واحد بالضبط، ولكل VLAN قيمة L2VNI واحدة. وتُحمل L3VNI على شبكة VLAN عبورية (هي VLAN 999 هنا) لا وجود لها إلا لربط VRF بقيمة VNI."
+      },
+      {
+        "id": "evpn",
+        "type": "text",
+        "markdown": "## مستوى التحكم BGP EVPN\n\nاعتمد VXLAN في بداياته على الغمر والتعلّم (Flood-and-learn)، فكان كل إطار BUM (بثّ أو أحادي مجهول أو متعدد الوجهات) يُغمر إلى جميع نقاط VTEP. أما **MP-BGP EVPN** فيستبدل بالتعلّم بالغمر الإعلانَ: تتعلّم الورقة عنوان MAC أو IP محلياً وتعلنه لبقية الأوراق. وتعمل الأعمدة الفقرية عادةً **عاكسات مسارات (Route Reflectors)** حتى لا يحتاج iBGP إلى شبكة كاملة الترابط.\n\nأنواع المسارات التي يجب أن تعرفها:\n\n- **النوع 2 (إعلان MAC/IP):** عنوان MAC لمضيف ومعه عنوان IP اختيارياً. وبه تتعلّم الأوراق البعيدة النقاط الطرفية ويعمل كبت ARP.\n- **النوع 3 (البث المتعدد الشامل):** يعلن أن VTEP مشارك في VNI. ومع `ingress-replication protocol bgp` يبني قائمة النسخ عند المصدر لحركة BUM.\n- **النوع 5 (بادئة IP):** بادئة IP داخل VRF، وتُستخدم للمسارات الخارجية وللشبكات الفرعية التي لا تضم مضيفين صامتين.\n- **النوعان 1 و4:** مسارات قطاع إيثرنت تُستخدم في الربط المتعدد وانتخاب المرسِل المعيَّن.\n\nأما قرار حركة BUM في المختبر فهو بين **النسخ عند المدخل (Ingress replication)** حيث يرسل VTEP المصدر نسخة أحادية إلى كل نظير فلا تحتاج الشبكة السفلية إلى البث المتعدد، وبين **الشبكة السفلية متعددة البث** (`mcast-group 239.1.1.10`) وهي كفؤة مع كثرة VTEP لكنها تتطلب PIM، راجع [Multicast: PIM, Anycast-RP, MSDP and IGMP](/learn/enterprise-datacenter-networking/multicast-pim-anycast-rp-msdp-and-igmp)."
+      },
+      {
+        "id": "cfg",
+        "type": "code",
+        "language": "cisco",
+        "code": "feature ospf\nfeature bgp\nfeature nv overlay\nfeature vn-segment-vlan-based\nfeature interface-vlan\nnv overlay evpn\nfabric forwarding anycast-gateway-mac 0000.2222.3333\n!\nvlan 10\n  vn-segment 10010\nvlan 999\n  vn-segment 50001\n!\nvrf context TENANT1\n  vni 50001\n  rd auto\n  address-family ipv4 unicast\n    route-target both auto\n    route-target both auto evpn\n!\ninterface Vlan999\n  no shutdown\n  vrf member TENANT1\n  ip forward\n!\ninterface Vlan10\n  no shutdown\n  vrf member TENANT1\n  ip address 10.10.10.1/24\n  fabric forwarding mode anycast-gateway\n!\ninterface nve1\n  no shutdown\n  host-reachability protocol bgp\n  source-interface loopback1\n  member vni 10010\n    suppress-arp\n    ingress-replication protocol bgp\n  member vni 50001 associate-vrf\n!\nevpn\n  vni 10010 l2\n    rd auto\n    route-target import auto\n    route-target export auto\n!\nrouter bgp 65001\n  neighbor 10.255.0.1\n    remote-as 65001\n    update-source loopback0\n    address-family l2vpn evpn\n      send-community\n      send-community extended\n  vrf TENANT1\n    address-family ipv4 unicast\n      advertise l2vpn evpn",
+        "filename": "leaf1-evpn.cfg",
+        "caption": "ضبط مصغَّر لورقة NX-OS يتضمن البوابة المتعددة العناوين (Anycast gateway) وقيمة L2VNI وL3VNI وجلسة EVPN إلى عاكس المسارات."
+      },
+      {
+        "id": "irb",
+        "type": "text",
+        "markdown": "## البوابة الموزعة المتعددة العناوين وIRB المتناظر\n\nتستخدم كل ورقة تستضيف VLAN 10 عنوان البوابة نفسه (10.10.10.1) وعنوان MAC الافتراضي نفسه المأخوذ من `fabric forwarding anycast-gateway-mac`. ويمكن لجهاز افتراضي أن ينتقل إلى أي رف فيجد بوابته محلية دائماً، فلا يوجد التفاف نحو موجّه مركزي.\n\nوللتوجيه بين الشبكات الفرعية تستخدم Cisco **التوجيه والتجسير المتكامل المتناظر (Symmetric IRB)**. توجّه الورقة المُدخِلة الرزمة إلى L3VNI الخاصة بالمستأجر (50001)، وتوجّهها الورقة المُخرِجة من L3VNI إلى VLAN الوجهة. يستخدم الاتجاهان VNI نفسها، فلا تحتاج كل ورقة إلا إلى شبكات VRF وVLAN التي تستضيفها فعلاً. وبالمقابل يتطلب IRB غير المتناظر وجود كل VLAN في كل ورقة، ونادراً ما يُستخدم.\n\n### الربط المتعدد\nتتصل الخوادم بزوج أوراق **vPC** على وصلتين كما في درس [vPC, Port Channels and Trunking](/learn/enterprise-datacenter-networking/vpc-port-channels-and-trunking). يتشارك الزوج عنواناً ثانوياً على loopback1 ليرى بقية الأوراق **VTEP متعدد العناوين (Anycast VTEP)** واحداً. ويمكن في التصاميم الأحدث استخدام الربط المتعدد في EVPN بمسارات النوعين 1 و4 بدلاً من vPC، فتزول وصلة النظير."
+      },
+      {
+        "id": "flow-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "انتقال الإطار بين مضيفين عبر النسيج",
+        "caption": "يتعلّم المضيف A عن المضيف B عبر مسارات EVPN من النوع 2، ثم تُغلَّف الحركة بين نقطتي VTEP.",
+        "data": {
+          "actors": [
+            {
+              "id": "ha",
+              "label": "المضيف A",
+              "sub": "10.10.10.11",
+              "icon": "laptop"
+            },
+            {
+              "id": "l1",
+              "label": "Leaf1",
+              "sub": "VTEP 10.255.1.1",
+              "icon": "switch"
+            },
+            {
+              "id": "rr",
+              "label": "عاكس المسارات",
+              "sub": "10.255.0.1",
+              "icon": "router"
+            },
+            {
+              "id": "l2",
+              "label": "Leaf2",
+              "sub": "VTEP 10.255.1.2",
+              "icon": "switch"
+            },
+            {
+              "id": "hb",
+              "label": "المضيف B",
+              "sub": "10.10.10.22",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "from": "hb",
+              "to": "l2",
+              "label": "ARP / GARP",
+              "note": "يعلن المضيف B عن نفسه وتتعلّم Leaf2 عنوانَي MAC وIP محلياً."
+            },
+            {
+              "from": "l2",
+              "to": "rr",
+              "label": "BGP EVPN RT-2",
+              "detail": "MAC+IP, VNI 10010",
+              "note": "تعلن Leaf2 مساراً من النوع 2 بقفزة تالية 10.255.1.2.",
+              "tone": "secure"
+            },
+            {
+              "from": "rr",
+              "to": "l1",
+              "label": "RT-2 reflected",
+              "note": "يعكس العاكس المسار إلى Leaf1 فتثبّت العنوان في جدولها."
+            },
+            {
+              "from": "ha",
+              "to": "l1",
+              "label": "Ethernet frame",
+              "detail": "dst MAC = Host B",
+              "note": "يرسل المضيف A إطاراً إلى المضيف B في VLAN نفسها."
+            },
+            {
+              "from": "l1",
+              "to": "l2",
+              "label": "VXLAN",
+              "detail": "UDP 4789, VNI 10010",
+              "note": "تغلّف Leaf1 الإطار بعنوانين خارجيين من 10.255.1.1 إلى 10.255.1.2 عبر الشبكة السفلية.",
+              "tone": "secure"
+            },
+            {
+              "from": "l2",
+              "to": "hb",
+              "label": "الإطار بعد فك التغليف",
+              "note": "تزيل Leaf2 ترويسة VXLAN وتسلّم الإطار الأصلي.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "Leaf1# verification",
+        "lines": [
+          {
+            "cmd": "show nve peers",
+            "output": "Interface Peer-IP          State LearnType Uptime   Router-Mac\nnve1      10.255.1.2       Up    CP        00:12:41 5254.00a1.2b3c"
+          },
+          {
+            "cmd": "show bgp l2vpn evpn summary",
+            "output": "Neighbor        V    AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down  State/PfxRcd\n10.255.0.1      4 65001     412     398     27   0    0 00:12:50 18"
+          },
+          {
+            "cmd": "show l2route evpn mac all",
+            "output": "Topology  Mac Address    Prod   Flags  Seq No  Next-Hops\n10        0050.56aa.0011 Local  L,     0       Eth1/5\n10        0050.56bb.0022 BGP    SplRcv 0       10.255.1.2"
+          },
+          {
+            "cmd": "show nve vni",
+            "output": "Interface VNI   Multicast-group State Mode Type [BD/VRF]  Flags\nnve1      10010 UnicastBGP      Up    CP   L2 [10]\nnve1      50001 n/a             Up    CP   L3 [TENANT1]"
+          }
+        ],
+        "caption": "ظهور النظراء بحالة Up مع نوع التعلّم CP (مستوى التحكم) وحالة VNI كلتيهما Up هو أول ما يجب فحصه."
+      },
+      {
+        "id": "trouble",
+        "type": "text",
+        "markdown": "## منهجية استكشاف الأعطال\n\nاعمل من الأسفل إلى الأعلى وتوقف عند أول طبقة فاشلة:\n\n1. **الوصول في الشبكة السفلية.** أمر `show ip route 10.255.1.2` واختبار ping بين عنواني Loopback بحجم كبير: `ping 10.255.1.2 source-interface loopback1 packet-size 9000 df-bit`.\n2. **حالة NVE.** يجب أن يُظهر `show nve interface nve1 detail` الحالة `State: Up` وعنوان المصدر الصحيح. ويعني تعطّل NVE في الغالب أن loopback1 غير معلَن في الشبكة السفلية.\n3. **BGP EVPN.** يجب أن يُظهر `show bgp l2vpn evpn summary` جلسات في حالة Established مع بادئات مستلمة. فإذا كانت الجلسة قائمة والعدد صفراً فافحص `send-community extended` واستيراد هدف المسار (Route Target).\n4. **VNI وأهداف المسارات.** عدم تطابق RD أو RT بين الأوراق صامت: الجلسة قائمة لكن العنوان لا يُثبَّت أبداً.\n5. **مستوى البيانات.** الأمران `show l2route evpn mac all` و`show ip route vrf TENANT1` يؤكدان أنه تم تعلّم النقاط الطرفية.\n\nوتذكّر في المختبر أن `vn-segment` يجب ضبطه تحت VLAN قبل إضافة VNI إلى NVE."
+      },
+      {
+        "id": "warn-mtu",
+        "type": "callout",
+        "variant": "warning",
+        "title": "فخ شائع",
+        "markdown": "لا تطمئن إلى نجاح ping بالحجم الافتراضي عبر النسيج. اختبر من طرف إلى طرف باستخدام `packet-size 9000 df-bit`. فوصلة واحدة بقيت على MTU 1500 تُفسد الإطارات الكبيرة وحدها، وتبدو الأعراض كأنها مشكلة في التطبيق."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في مختبر (CML أو Nexus 9000v أو dCloud) ابنِ ورقتين وعموداً فقرياً واحداً. اضبط شبكة سفلية بـ OSPF من نقطة إلى نقطة مع loopback0 وloopback1، ثم طبّق الضبط الوارد أعلاه على الورقتين مع تغيير عنواني VTEP ومعرّف الموجّه. صِل مضيفاً بـ VLAN 10 في كل ورقة.\n\n1. تأكد أن `show nve peers` يُظهر الورقة الأخرى بحالة `Up`.\n2. نفّذ ping بين المضيفين واقرأ ناتج `show l2route evpn mac all`.\n3. أوقف وصلة العمود الفقري في Leaf1 وراقب مدة انقطاع الحركة (أضف BFD لتحسينها).\n4. غيّر هدف مسار واحداً في Leaf2 وصِف ما يتعطل مع بقاء جلسة BGP قائمة."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "VTEP / NVE",
+            "definition": "نقطة النهاية وواجهة Nexus التي تغلّف حركة VXLAN وتفك تغليفها."
+          },
+          {
+            "term": "L2VNI / L3VNI",
+            "definition": "قيمة VNI لقطاع VLAN مجسَّر / قيمة VNI للتوجيه داخل VRF مستأجر."
+          },
+          {
+            "term": "مسار EVPN من النوع 2",
+            "definition": "يعلن عنوان MAC لمضيف وقد يرفقه بعنوان IP."
+          },
+          {
+            "term": "مسار EVPN من النوع 5",
+            "definition": "يعلن بادئة IP داخل VRF."
+          },
+          {
+            "term": "النسخ عند المدخل",
+            "definition": "تُنسخ حركة BUM بصيغة أحادية إلى كل VTEP بعيدة."
+          },
+          {
+            "term": "البوابة المتعددة العناوين",
+            "definition": "عنوان البوابة وMAC نفسهما على كل الأوراق."
+          },
+          {
+            "term": "IRB المتناظر",
+            "definition": "التوجيه عند ورقة المدخل ثم عند ورقة المخرج عبر L3VNI."
+          },
+          {
+            "term": "كبت ARP",
+            "definition": "ترد الورقة على ARP محلياً من بيانات EVPN بدلاً من غمره."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي نوع من مسارات EVPN يحمل عنوان MAC لمضيف مع عنوان IP الخاص به؟",
+            "options": [
+              "Type 1",
+              "Type 2",
+              "Type 3",
+              "Type 5"
+            ],
+            "answer": 1,
+            "explanation": "النوع 2 هو إعلان MAC/IP. أما النوع 3 فيبني قائمة BUM، والنوع 5 يحمل البادئات، والنوع 1 خاص بقطاعات إيثرنت."
+          },
+          {
+            "question": "أي العبارات الآتية عن الشبكة السفلية صحيحة؟ اختر كل ما ينطبق.",
+            "options": [
+              "يُفضّل ضبط MTU كبيرة مثل 9216.",
+              "تحمل عناوين MAC الخاصة بالمستأجرين في BGP.",
+              "توفّر الوصول بين عناوين Loopback لنقاط VTEP.",
+              "تستخدم عادةً ECMP عبر الأعمدة الفقرية."
+            ],
+            "answer": [
+              0,
+              2,
+              3
+            ],
+            "explanation": "عناوين MAC الخاصة بالمستأجرين تنتمي إلى الشبكة العلوية EVPN وليس إلى الشبكة السفلية الموجَّهة."
+          },
+          {
+            "question": "في IRB المتناظر، أي VNI تحمل الحركة الموجَّهة بين شبكتين فرعيتين في VRF نفسه؟",
+            "options": [
+              "L2VNI الخاصة بـ VLAN المصدر",
+              "L2VNI الخاصة بـ VLAN الوجهة",
+              "L3VNI الخاصة بـ VRF",
+              "VNI البنية التحتية"
+            ],
+            "answer": 2,
+            "explanation": "توجّه الورقتان عبر L3VNI الخاصة بالمستأجر، فلا تحتاج كل ورقة إلا إلى شبكات VLAN التي تستضيفها."
+          },
+          {
+            "question": "جلسة BGP EVPN قائمة لكن لا تظهر عناوين MAC بعيدة. ما الذي يجب فحصه؟ اختر كل ما ينطبق.",
+            "options": [
+              "الأمر send-community extended عند الجار",
+              "استيراد وتصدير هدف المسار للـ VNI",
+              "أولوية جذر الشجرة الممتدة",
+              "أن VNI عضو في nve1"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "غياب المجتمعات الممتدة أو عدم تطابق RT أو غياب VNI عن NVE يعطي جلسة قائمة بلا مسارات صالحة، أما أولوية جذر STP فلا علاقة لها بالأمر."
+          },
+          {
+            "question": "تنجح أوامر ping الصغيرة عبر النسيج بينما تتوقف عمليات نقل الملفات. ما السبب الأرجح؟",
+            "options": [
+              "عدم تطابق MTU على وصلة في الشبكة السفلية",
+              "عنوان MAC خاطئ للبوابة المتعددة العناوين",
+              "غياب مسار EVPN من النوع 3",
+              "عاكس مسارات لا يمكن الوصول إليه"
+            ],
+            "answer": 0,
+            "explanation": "يضيف VXLAN نحو 50 بايتاً، فتتجاوز الإطارات الكاملة وصلة MTU فيها 1500 بينما تمرّ الصغيرة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يفصل نسيج VXLAN EVPN **الشبكة السفلية** الموجَّهة عن **الشبكة العلوية** BGP EVPN.\n- تعرّف قيم VNI القطاعات: L2VNI لكل VLAN وL3VNI لكل VRF مستأجر.\n- توزّع مسارات الأنواع 2 و3 و5 عناوين MAC وقوائم النسخ والبادئات.\n- تُبقي البوابة المتعددة العناوين وIRB المتناظر التوجيه محلياً في كل ورقة.\n- استكشف الأعطال من الشبكة السفلية وMTU صعوداً إلى NVE وBGP وأهداف المسارات وأخيراً جداول MAC وIP.\n\nانتقل بعد ذلك إلى البنية الرئيسية الأخرى لمراكز البيانات، وهي Cisco ACI، في درس [ACI Fabric Discovery and Architecture](/learn/enterprise-datacenter-networking/aci-fabric-discovery-and-architecture)."
+      }
+    ]
+  }
+}

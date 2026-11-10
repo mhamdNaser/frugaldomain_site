@@ -1,0 +1,556 @@
+{
+ "slug": "aci-fabric-monitoring-and-health",
+ "title": "ACI Fabric Monitoring and Health",
+ "summary": "Read ACI health scores, faults, events and audit logs, export them through monitoring policies, and troubleshoot with a repeatable fault-driven workflow.",
+ "duration_minutes": 40,
+ "objectives": [
+  "Explain how health scores are calculated and propagated up the object tree",
+  "Distinguish faults, events and audit logs and describe the fault lifecycle",
+  "Configure monitoring policies and syslog destination groups",
+  "Use moquery, Endpoint Tracker, atomic counters, SPAN and ELAM in a fixed troubleshooting order"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 02:10 a monitoring page fires: \"application slow\". The ACI fabric shows green in the dashboard, yet one tenant complains about packet loss. In the CCIE Data Center lab you will face the same situation in a compressed form: a fault is hidden somewhere in the policy model, and you have to find it with the tools the APIC gives you, fast.\n\nACI turns operations into queries over one object tree. Health scores, faults, events, audit records and counters are all managed objects (MOs) that you can read in the GUI, with `moquery`, or through the REST API. This lesson covers how those objects relate, how to forward them to external systems, and a repeatable workflow for isolating a problem. It builds on [ACI Fabric Discovery and Architecture](/learn/enterprise-datacenter-networking/aci-fabric-discovery-and-architecture) and [ACI Access, Fabric and Tenant Policies](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies)."
+  },
+  {
+   "id": "health",
+   "type": "text",
+   "markdown": "## Health scores: one number per object\n\nEvery MO that can be monitored carries a **health score** from 0 to 100. A score of 100 means no active faults. The APIC calculates scores bottom-up:\n\n- An object starts at 100 and loses points for each active fault on it, weighted by severity. A critical fault costs far more than a warning.\n- A parent object takes the score of its **worst child** and also accounts for its own faults. A bad port therefore lowers the interface, the node, the pod and finally the **system (fabric) health**.\n- Tenants have their own scores, built from the health of their EPGs, bridge domains and VRFs.\n\nTwo practical consequences matter. First, the dashboard is a **triage tool**: start at the lowest score and drill down the tree until you reach the object that owns the fault. Second, a score never explains itself. It only tells you *where* to look; the fault list tells you *why*.\n\nHealth objects are `healthInst` children of the monitored MO. The fabric-wide value lives at `topology/health`, and each node has its own under `topology/pod-1/node-<id>/sys/health`."
+  },
+  {
+   "id": "faults",
+   "type": "text",
+   "markdown": "## Faults, events and audit logs\n\nACI keeps three different record types. Mixing them up is a classic exam trap.\n\n| Record | Class | Meaning |\n|:--|:--|:--|\n| **Fault** | `faultInst` | A *state*: something is wrong now. It has a lifecycle and clears when the cause is fixed. |\n| **Event** | `eventRecord` | A *point in time*: a link went down, a state changed. Events are kept and never clear. |\n| **Audit log** | `aaaModLR` | *Who* changed *what*, and when, through the GUI, CLI or API. |\n\n### Fault lifecycle\n\nA fault is not raised the instant a condition appears. It moves through states so that short flaps do not flood operators:\n\n1. **Soaking**: the condition was detected; a timer (120 seconds by default) runs to see whether it persists.\n2. **Raised**: the condition outlived the soak interval. The fault is now visible and counts against health.\n3. **Raised-clearing**: the condition disappeared, and a clearing timer runs.\n4. **Retaining**: the fault is cleared but kept for a retention interval (one hour by default) for reference, then deleted.\n\nSeverities run from **critical**, **major**, **minor** and **warning** down to **info**. Fault codes such as `F0467` identify the cause class; a common one is a static path binding whose VLAN is missing from the domain's VLAN pool. The **lifecycle** and **severity** fields are the first things to filter on."
+  },
+  {
+   "id": "moquery",
+   "type": "terminal",
+   "title": "Reading faults and health with moquery",
+   "prompt": "apic1#",
+   "lines": [
+    {
+     "cmd": "moquery -d topology/health | egrep 'dn|cur'",
+     "output": "dn         : topology/health\ncur        : 94"
+    },
+    {
+     "comment": "Fabric health is 94. Something is wrong somewhere; this number alone does not say where."
+    },
+    {
+     "cmd": "moquery -c faultInst -f 'fault.Inst.severity==\"critical\"' | egrep 'code|dn|descr|lc'",
+     "output": "code       : F0467\ndescr      : Configuration failed for uni/tn-Prod/ap-Shop/epg-web node 101 eth1/10 due to Invalid Path Configuration, debug message: invalid-vlan\ndn         : topology/pod-1/node-101/local/svc-policyelem-id-0/ObservedEthIf/fault-F0467\nlc         : raised"
+    },
+    {
+     "comment": "The fault names the exact EPG, node and port. The description (invalid VLAN) points to the access-policy chain: check the VLAN pool and domain."
+    },
+    {
+     "cmd": "moquery -c aaaModLR -f 'aaa.ModLR.created>\"2026-11-09\"' | egrep 'user|descr|affected'",
+     "output": "affected   : uni/infra/vlanns-[Pool-Servers]-static/from-[vlan-200]-to-[vlan-299]\ndescr      : Block from-[vlan-200]-to-[vlan-299] deleted\nuser       : jsmith"
+    },
+    {
+     "comment": "The audit log answers the question \"what changed?\": a VLAN block was deleted by user jsmith, which explains the fault above."
+    }
+   ]
+  },
+  {
+   "id": "policies",
+   "type": "text",
+   "markdown": "## Monitoring policies and exporting data\n\nWhat the fabric does with a fault or event is defined by **monitoring policies**. They are scoped, and a more specific policy overrides a general one:\n\n- **Common policy** (`monCommonPol`, in tenant `common`): the default for everything.\n- **Fabric policy** (`monFabricPol`): leaf and spine hardware, fabric ports.\n- **Access policy** (`monInfraPol`): access ports and interface policy groups.\n- **Tenant policy** (`monEPGPol`): EPGs, BDs and VRFs inside one tenant.\n\nEach policy has the same building blocks: **stats collection policies** (sampling interval and retention for 5-minute, 15-minute, hourly and longer history), **event and fault severity assignment** (you can raise or lower a code's severity), and **callhome, SNMP and syslog sources** that point at a **destination group**.\n\n### Destination groups\n\nA syslog destination group defines the receiver, severity floor and facility. An SNMP trap group defines the community or user and the receiver. Attach the group to the policy through a *source*, and every matching fault becomes a message. Remember the control plane: the APIC sends messages for fabric events, while switches send their own. Reach the collector through the **out-of-band** or **in-band** management EPG you configured, and verify the contract, or messages are silently dropped."
+  },
+  {
+   "id": "syslog",
+   "type": "code",
+   "language": "json",
+   "code": "{\"syslogGroup\": {\"attributes\": {\"name\": \"SIEM\", \"format\": \"aci\", \"includeMilliSeconds\": \"yes\"},\n \"children\": [\n  {\"syslogRemoteDest\": {\"attributes\": {\"host\": \"192.0.2.50\", \"port\": \"514\", \"severity\": \"warnings\",\n    \"forwardingFacility\": \"local7\", \"adminState\": \"enabled\"},\n   \"children\": [{\"fileRsARemoteHostToEpg\": {\"attributes\": {\"tDn\": \"uni/tn-mgmt/mgmtp-default/oob-default\"}}}]}},\n  {\"syslogProf\": {\"attributes\": {\"adminState\": \"enabled\"}}}]}}",
+   "filename": "POST https://apic.example.com/api/mo/uni/fabric/slgroup-SIEM.json",
+   "caption": "A syslog destination group sends everything at severity warnings or higher to 192.0.2.50 through the out-of-band EPG. A monitoring policy source must still reference the group.",
+   "highlight": [
+    3,
+    5
+   ]
+  },
+  {
+   "id": "trouble",
+   "type": "text",
+   "markdown": "## Troubleshooting tools\n\nWhen the fault list is clean but traffic still fails, use the tools that watch the data plane.\n\n- **Endpoint Tracker** (Operations): the history of where a MAC or IP was learned, and when it moved. Rapid moves between two ports expose a loop or a duplicate address.\n- **Visibility and Troubleshooting** (Operations): enter a source and destination endpoint and the APIC shows the path, the contracts that apply, the faults along the way, and counters. It can also launch a traceroute.\n- **Atomic counters**: leaf-to-leaf counters that compare packets *sent* with packets *received* for a flow, so you can tell whether loss happens inside the fabric or outside it.\n- **SPAN**: access SPAN copies a port, fabric SPAN copies a fabric link, and tenant SPAN copies an EPG. Send the copy to a local port or, with ERSPAN, to a remote collector (see [Telemetry, SPAN / ERSPAN, SNMP and Syslog](/learn/enterprise-datacenter-networking/telemetry-span-erspan-snmp-and-syslog)).\n- **ELAM**: an on-leaf capture of a single packet that shows the forwarding decision of the ASIC, including a contract drop. Use it when SPAN cannot show why a packet vanished.\n\nThe habit to build is a fixed order: health score, faults, audit log, then data-plane tools."
+  },
+  {
+   "id": "wf",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Fault-driven troubleshooting workflow",
+   "caption": "Each stage narrows the search before you touch a packet capture.",
+   "data": {
+    "token": "Ticket",
+    "nodes": [
+     {
+      "id": "t",
+      "label": "Ticket",
+      "sub": "web to app slow",
+      "icon": "user"
+     },
+     {
+      "id": "h",
+      "label": "Health score",
+      "sub": "tenant Prod",
+      "icon": "eye"
+     },
+     {
+      "id": "f",
+      "label": "Fault list",
+      "sub": "faultInst",
+      "icon": "alert"
+     },
+     {
+      "id": "a",
+      "label": "Audit log",
+      "sub": "aaaModLR",
+      "icon": "log"
+     },
+     {
+      "id": "d",
+      "label": "Data plane",
+      "sub": "atomic counters, ELAM",
+      "icon": "switch"
+     }
+    ],
+    "steps": [
+     {
+      "at": "t",
+      "caption": "A user reports that web-to-app traffic in tenant Prod is slow."
+     },
+     {
+      "at": "h",
+      "caption": "Tenant Prod scores 76 while the fabric scores 98. The problem is inside the tenant, not the hardware.",
+      "tone": "warning"
+     },
+     {
+      "at": "f",
+      "caption": "Drilling down, EPG web has a major fault: an invalid path binding on node 101.",
+      "tone": "danger"
+     },
+     {
+      "at": "a",
+      "caption": "The audit log shows a VLAN block was deleted 40 minutes ago. The cause is found without any capture.",
+      "tone": "warning"
+     },
+     {
+      "at": "d",
+      "caption": "If faults and audit were clean, atomic counters and ELAM would come next to locate the drop."
+     },
+     {
+      "at": "h",
+      "caption": "After the VLAN block is restored, the fault clears and the score returns to 100.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Treating a green fabric score as proof the tenant is healthy. A single EPG fault barely moves the system score.\n- Looking only at **raised** faults. A fault in *soaking* is already a clue during a live change.\n- Forgetting that stats retention is bounded. Lengthening a collection policy affects APIC storage and must be planned.\n- Sending syslog from the APIC but never opening the contract or management EPG path to the collector."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab fabric or the ACI simulator:\n\n1. Note the system health with `moquery -d topology/health | grep cur`.\n2. Create an EPG static path on an interface using a VLAN that is **not** in the domain's VLAN pool.\n3. Within three minutes, list the new fault with `moquery -c faultInst -f 'fault.Inst.code==\"F0467\"'` and note its `lc` value while it is in soaking, then when it is raised.\n4. Find your own change in the audit log with `moquery -c aaaModLR`.\n5. Fix the pool, confirm the fault moves to retaining, and confirm the score returns.\n\nExpected result: you can explain each state change and which log recorded your action."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Health score",
+     "definition": "A 0 to 100 value per managed object, derived from its active faults and its worst child."
+    },
+    {
+     "term": "faultInst",
+     "definition": "The class of a fault: a current bad state with a lifecycle and severity."
+    },
+    {
+     "term": "eventRecord",
+     "definition": "A permanent record of something that happened at one point in time."
+    },
+    {
+     "term": "Audit log",
+     "definition": "The `aaaModLR` record of who changed which object and when."
+    },
+    {
+     "term": "Soaking",
+     "definition": "The first fault state, where a timer checks whether the condition persists."
+    },
+    {
+     "term": "Monitoring policy",
+     "definition": "A scoped policy that sets stats collection, severities and export sources."
+    },
+    {
+     "term": "Atomic counter",
+     "definition": "A leaf-to-leaf packet counter used to locate loss inside the fabric."
+    },
+    {
+     "term": "ELAM",
+     "definition": "An on-switch single-packet capture that shows the ASIC forwarding decision."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "A fault condition appears and disappears within 30 seconds. With default timers, what happens?",
+     "options": [
+      "It is raised immediately and counts against health",
+      "It stays in soaking and never becomes raised",
+      "It is deleted from the database at once",
+      "It becomes an event and an audit entry"
+     ],
+     "answer": 1,
+     "explanation": "The default soaking interval is 120 seconds, so a 30-second flap never leaves soaking and never lowers the health score."
+    },
+    {
+     "question": "Which records does ACI keep that answer \"who changed what\"? Choose all that apply.",
+     "options": [
+      "Audit log (aaaModLR)",
+      "Fault (faultInst)",
+      "Event (eventRecord) for configuration-change events",
+      "Health score (healthInst)"
+     ],
+     "answer": [
+      0,
+      2
+     ],
+     "explanation": "The audit log is the main record of changes by user. Change events are also recorded as events. A fault describes a bad state, and a health score is only a number."
+    },
+    {
+     "question": "System health is 98 but tenant Prod is 76. What does this tell you?",
+     "options": [
+      "The spine hardware is failing",
+      "The problem is probably inside the tenant's policy objects",
+      "The APIC cluster is unhealthy",
+      "Nothing, because scores are unrelated"
+     ],
+     "answer": 1,
+     "explanation": "Scores are built bottom-up per scope. A low tenant score with a high fabric score points at tenant objects such as EPGs, BDs or contracts, not hardware."
+    },
+    {
+     "question": "Which tool shows the ASIC forwarding decision for one packet, including a contract drop?",
+     "options": [
+      "Atomic counters",
+      "Endpoint Tracker",
+      "ELAM",
+      "Access SPAN"
+     ],
+     "answer": 2,
+     "explanation": "ELAM captures a single packet inside the ASIC pipeline and reports the decision. SPAN copies traffic but does not explain a drop."
+    },
+    {
+     "question": "Syslog works from the leaves but nothing arrives from the APIC. What should you check? Choose all that apply.",
+     "options": [
+      "The management EPG used to reach the collector",
+      "The contract allowing UDP/514 to the collector",
+      "The destination group is attached through a monitoring policy source",
+      "The VLAN pool of the tenant"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The APIC needs a path (OOB or in-band), a contract that permits the traffic, and a source that references the destination group. Tenant VLAN pools are unrelated."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Health scores run from 0 to 100 and flow upward from the worst child. Use them to find *where*, then read the faults for *why*.\n- Faults are states with a lifecycle (soaking, raised, raised-clearing, retaining). Events are permanent points in time. The audit log records who changed what.\n- Monitoring policies set stats retention, severity and export. Destination groups reach collectors through the OOB or in-band path and need a contract.\n- Troubleshoot in a fixed order: health, faults, audit log, then Endpoint Tracker, atomic counters, SPAN and ELAM.\n\nNext, see how the fabric extends into the hypervisor in [VMM Integration with vSphere VDS](/learn/enterprise-datacenter-networking/vmm-integration-with-vsphere-vds)."
+  }
+ ],
+ "ar": {
+  "title": "مراقبة النسيج الشبكي وسلامته في ACI",
+  "summary": "قراءة درجات السلامة والأعطال والأحداث وسجلات التدقيق في ACI، وتصديرها عبر سياسات المراقبة، واستكشاف الأعطال بمنهجية متكررة تنطلق من الأعطال.",
+  "objectives": [
+   "شرح كيفية حساب درجات السلامة وانتقالها صعوداً في شجرة الكائنات",
+   "التمييز بين الأعطال والأحداث وسجلات التدقيق ووصف دورة حياة العطل",
+   "ضبط سياسات المراقبة ومجموعات وجهات syslog",
+   "استخدام moquery وEndpoint Tracker والعدّادات الذرّية وSPAN وELAM بترتيب ثابت لاستكشاف الأعطال"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في الساعة 02:10 يصدر نظام المراقبة تنبيهاً: «التطبيق بطيء». تبدو لوحة نسيج ACI خضراء، ومع ذلك يشكو مستأجر (Tenant) واحد من فقدان الحزم. في اختبار CCIE Data Center العملي ستواجه الموقف نفسه بصورة مضغوطة: عطل مخفيّ في نموذج السياسات، وعليك أن تجده بأدوات APIC بأقصى سرعة.\n\nيحوّل ACI العمليات إلى استعلامات على شجرة كائنات واحدة. درجات السلامة والأعطال (Faults) والأحداث وسجلات التدقيق والعدّادات كلها كائنات مُدارة (MOs) يمكن قراءتها من الواجهة الرسومية أو بالأمر `moquery` أو عبر واجهة REST. يشرح هذا الدرس كيف ترتبط هذه الكائنات، وكيف تُرسَل إلى أنظمة خارجية، وما منهجية العمل المتكررة لعزل المشكلة. ويبني على درسَي [ACI Fabric Discovery and Architecture](/learn/enterprise-datacenter-networking/aci-fabric-discovery-and-architecture) و[ACI Access, Fabric and Tenant Policies](/learn/enterprise-datacenter-networking/aci-access-fabric-and-tenant-policies)."
+   },
+   {
+    "id": "health",
+    "type": "text",
+    "markdown": "## درجات السلامة: رقم واحد لكل كائن\n\nيحمل كل كائن مُدار قابل للمراقبة **درجة سلامة (Health score)** بين 0 و100. تعني الدرجة 100 عدم وجود أعطال نشطة. يحسب APIC الدرجات من الأسفل إلى الأعلى:\n\n- يبدأ الكائن من 100 ويفقد نقاطاً مع كل عطل نشط عليه، بحسب خطورته. فالعطل الحرج (Critical) يكلّف أكثر بكثير من التحذير (Warning).\n- يأخذ الكائن الأب درجة **أسوأ أبنائه**، ويراعي أيضاً أعطاله الخاصة. لذلك ينعكس منفذ معطوب على الواجهة ثم العقدة ثم الـ Pod وأخيراً **سلامة النظام (النسيج)**.\n- للمستأجرين درجاتهم الخاصة، مبنيّة على سلامة مجموعات EPG ونطاقات الجسر (Bridge Domains) وشبكات VRF.\n\nولهذا نتيجتان عمليتان. الأولى أن اللوحة **أداة فرز (Triage)**: ابدأ من أدنى درجة وانزل في الشجرة حتى تصل إلى الكائن صاحب العطل. والثانية أن الدرجة لا تفسّر نفسها؛ إنها تدلّك على *مكان* البحث فقط، أما قائمة الأعطال فتخبرك *بالسبب*.\n\nكائنات السلامة هي `healthInst` تحت الكائن المراقَب. قيمة النسيج الكلية في `topology/health`، ولكل عقدة قيمتها في `topology/pod-1/node-<id>/sys/health`."
+   },
+   {
+    "id": "faults",
+    "type": "text",
+    "markdown": "## الأعطال والأحداث وسجلات التدقيق\n\nيحتفظ ACI بثلاثة أنواع مختلفة من السجلات، والخلط بينها فخّ مألوف في الاختبار.\n\n| السجل | الفئة | المعنى |\n|:--|:--|:--|\n| **عطل (Fault)** | `faultInst` | *حالة*: ثمة خلل الآن. له دورة حياة ويزول عند إصلاح السبب. |\n| **حدث (Event)** | `eventRecord` | *لحظة زمنية*: سقط رابط أو تغيّرت حالة. تُحفظ الأحداث ولا تزول. |\n| **سجل التدقيق (Audit log)** | `aaaModLR` | *من* غيّر *ماذا* ومتى، عبر الواجهة الرسومية أو CLI أو API. |\n\n### دورة حياة العطل\n\nلا يُرفَع العطل لحظة ظهور الحالة، بل ينتقل بين مراحل حتى لا تُغرق التذبذبات القصيرة المشغّلين:\n\n1. **Soaking**: رُصدت الحالة ويعمل مؤقّت (120 ثانية افتراضياً) لمعرفة هل تستمر.\n2. **Raised**: تجاوزت الحالة مهلة الانتظار، فأصبح العطل ظاهراً ويُحتسب في السلامة.\n3. **Raised-clearing**: اختفت الحالة ويعمل مؤقّت المسح.\n4. **Retaining**: زال العطل لكنه يُحفظ مدة احتفاظ (ساعة واحدة افتراضياً) للرجوع إليه ثم يُحذف.\n\nتتدرج الخطورة من **critical** و**major** و**minor** و**warning** وصولاً إلى **info**. وتدلّ رموز الأعطال مثل `F0467` على فئة السبب؛ ومن أشهرها ربط مسار ثابت (Static Path) تغيب VLAN الخاصة به عن مجمّع VLAN في النطاق (Domain). وأول ما يُرشَّح به هو حقلا **lifecycle** و**severity**."
+   },
+   {
+    "id": "moquery",
+    "type": "terminal",
+    "title": "قراءة الأعطال والسلامة بالأمر moquery",
+    "prompt": "apic1#",
+    "lines": [
+     {
+      "cmd": "moquery -d topology/health | egrep 'dn|cur'",
+      "output": "dn         : topology/health\ncur        : 94"
+     },
+     {
+      "comment": "سلامة النسيج 94. ثمة خلل في مكان ما، لكن هذا الرقم وحده لا يدلّ عليه."
+     },
+     {
+      "cmd": "moquery -c faultInst -f 'fault.Inst.severity==\"critical\"' | egrep 'code|dn|descr|lc'",
+      "output": "code       : F0467\ndescr      : Configuration failed for uni/tn-Prod/ap-Shop/epg-web node 101 eth1/10 due to Invalid Path Configuration, debug message: invalid-vlan\ndn         : topology/pod-1/node-101/local/svc-policyelem-id-0/ObservedEthIf/fault-F0467\nlc         : raised"
+     },
+     {
+      "comment": "يذكر العطل مجموعة EPG والعقدة والمنفذ بدقة. ويشير الوصف (invalid VLAN) إلى سلسلة سياسات الوصول: افحص مجمّع VLAN والنطاق."
+     },
+     {
+      "cmd": "moquery -c aaaModLR -f 'aaa.ModLR.created>\"2026-11-09\"' | egrep 'user|descr|affected'",
+      "output": "affected   : uni/infra/vlanns-[Pool-Servers]-static/from-[vlan-200]-to-[vlan-299]\ndescr      : Block from-[vlan-200]-to-[vlan-299] deleted\nuser       : jsmith"
+     },
+     {
+      "comment": "يجيب سجل التدقيق عن سؤال «ما الذي تغيّر؟»: حذف المستخدم jsmith كتلة VLAN، وهذا يفسّر العطل أعلاه."
+     }
+    ]
+   },
+   {
+    "id": "policies",
+    "type": "text",
+    "markdown": "## سياسات المراقبة وتصدير البيانات\n\nيحدّد ما يفعله النسيج مع العطل أو الحدث **سياسات المراقبة (Monitoring policies)**. وهي ذات نطاقات، وتتغلب السياسة الأخص على الأعم:\n\n- **السياسة العامة** (`monCommonPol` في المستأجر `common`): الافتراضية لكل شيء.\n- **سياسة النسيج** (`monFabricPol`): عتاد الأوراق (Leaf) والعُمُد (Spine) ومنافذ النسيج.\n- **سياسة الوصول** (`monInfraPol`): منافذ الوصول ومجموعات سياسات الواجهات.\n- **سياسة المستأجر** (`monEPGPol`): مجموعات EPG وBD وVRF داخل مستأجر واحد.\n\nلكل سياسة اللبنات نفسها: **سياسات جمع الإحصاءات** (فاصل العيّنات ومدة الاحتفاظ للسجل 5 دقائق و15 دقيقة وساعة وما فوق)، و**إسناد خطورة الأحداث والأعطال** (يمكنك رفع خطورة رمز ما أو خفضها)، و**مصادر callhome وSNMP وsyslog** التي تشير إلى **مجموعة وجهات (Destination group)**.\n\n### مجموعات الوجهات\n\nتحدّد مجموعة وجهات syslog المستقبِل وحدّ الخطورة الأدنى والمرفق (Facility). وتحدّد مجموعة SNMP Trap المجتمع أو المستخدم والمستقبِل. اربط المجموعة بالسياسة عبر *مصدر (Source)* فيتحول كل عطل مطابق إلى رسالة. وتذكّر مستوى التحكم: يرسل APIC رسائل أحداث النسيج، وترسل المحولات رسائلها بنفسها. وصِل إلى المجمّع عبر مجموعة الإدارة **خارج النطاق (Out-of-band)** أو **داخل النطاق (In-band)** التي ضبطتها، وتحقق من العقد (Contract) وإلا أُسقطت الرسائل بصمت."
+   },
+   {
+    "id": "syslog",
+    "type": "code",
+    "language": "json",
+    "code": "{\"syslogGroup\": {\"attributes\": {\"name\": \"SIEM\", \"format\": \"aci\", \"includeMilliSeconds\": \"yes\"},\n \"children\": [\n  {\"syslogRemoteDest\": {\"attributes\": {\"host\": \"192.0.2.50\", \"port\": \"514\", \"severity\": \"warnings\",\n    \"forwardingFacility\": \"local7\", \"adminState\": \"enabled\"},\n   \"children\": [{\"fileRsARemoteHostToEpg\": {\"attributes\": {\"tDn\": \"uni/tn-mgmt/mgmtp-default/oob-default\"}}}]}},\n  {\"syslogProf\": {\"attributes\": {\"adminState\": \"enabled\"}}}]}}",
+    "filename": "POST https://apic.example.com/api/mo/uni/fabric/slgroup-SIEM.json",
+    "caption": "مجموعة وجهات syslog ترسل كل ما خطورته warnings فأعلى إلى 192.0.2.50 عبر مجموعة EPG الخاصة بالإدارة خارج النطاق. ولا يزال لازماً أن يشير مصدر في سياسة المراقبة إلى هذه المجموعة.",
+    "highlight": [
+     3,
+     5
+    ]
+   },
+   {
+    "id": "trouble",
+    "type": "text",
+    "markdown": "## أدوات استكشاف الأعطال\n\nحين تكون قائمة الأعطال نظيفة وتفشل الحركة مع ذلك، استخدم الأدوات التي تراقب مستوى البيانات.\n\n- **متتبّع النقاط الطرفية (Endpoint Tracker)** في قسم Operations: سجل المكان الذي تعلّمت فيه MAC أو IP ومتى انتقلت. الانتقال السريع بين منفذين يكشف حلقة أو عنواناً مكرراً.\n- **الرؤية واستكشاف الأعطال (Visibility and Troubleshooting)**: أدخل نقطتين طرفيتين (مصدراً ووجهة) فيعرض APIC المسار والعقود المنطبقة والأعطال على الطريق والعدّادات. ويمكنه أيضاً إطلاق traceroute.\n- **العدّادات الذرّية (Atomic counters)**: عدّادات بين ورقتين تقارن الحزم *المرسلة* بالحزم *المستلمة* لتدفق ما، فتعرف هل الفقدان داخل النسيج أم خارجه.\n- **SPAN**: يَنسخ Access SPAN منفذاً، ويَنسخ Fabric SPAN رابطاً في النسيج، ويَنسخ Tenant SPAN مجموعة EPG. أرسل النسخة إلى منفذ محلي أو، عبر ERSPAN، إلى مجمّع بعيد (انظر [Telemetry, SPAN / ERSPAN, SNMP and Syslog](/learn/enterprise-datacenter-networking/telemetry-span-erspan-snmp-and-syslog)).\n- **ELAM**: التقاط على الورقة لحزمة واحدة يُظهر قرار التحويل في الشريحة (ASIC) بما فيه الإسقاط بسبب عقد. استخدمه حين لا يفسّر SPAN سبب اختفاء الحزمة.\n\nالعادة التي ينبغي ترسيخها ترتيب ثابت: درجة السلامة، ثم الأعطال، ثم سجل التدقيق، ثم أدوات مستوى البيانات."
+   },
+   {
+    "id": "wf",
+    "type": "animation",
+    "kind": "flow",
+    "title": "منهجية استكشاف الأعطال انطلاقاً من الأعطال",
+    "caption": "تضيّق كل مرحلة نطاق البحث قبل أن تلجأ إلى التقاط الحزم.",
+    "data": {
+     "token": "البلاغ",
+     "nodes": [
+      {
+       "id": "t",
+       "label": "البلاغ",
+       "sub": "web to app slow",
+       "icon": "user"
+      },
+      {
+       "id": "h",
+       "label": "درجة السلامة",
+       "sub": "tenant Prod",
+       "icon": "eye"
+      },
+      {
+       "id": "f",
+       "label": "قائمة الأعطال",
+       "sub": "faultInst",
+       "icon": "alert"
+      },
+      {
+       "id": "a",
+       "label": "سجل التدقيق",
+       "sub": "aaaModLR",
+       "icon": "log"
+      },
+      {
+       "id": "d",
+       "label": "مستوى البيانات",
+       "sub": "atomic counters, ELAM",
+       "icon": "switch"
+      }
+     ],
+     "steps": [
+      {
+       "at": "t",
+       "caption": "يبلّغ مستخدم أن حركة web إلى app في المستأجر Prod بطيئة."
+      },
+      {
+       "at": "h",
+       "caption": "درجة المستأجر Prod هي 76 والنسيج 98. المشكلة داخل المستأجر لا في العتاد.",
+       "tone": "warning"
+      },
+      {
+       "at": "f",
+       "caption": "بالنزول في الشجرة نجد عطلاً من نوع major على مجموعة EPG web: ربط مسار غير صالح على العقدة 101.",
+       "tone": "danger"
+      },
+      {
+       "at": "a",
+       "caption": "يُظهر سجل التدقيق أن كتلة VLAN حُذفت قبل 40 دقيقة. وهكذا عُرف السبب دون أي التقاط.",
+       "tone": "warning"
+      },
+      {
+       "at": "d",
+       "caption": "ولو كانت الأعطال والتدقيق نظيفة لجاء دور العدّادات الذرّية وELAM لتحديد مكان الإسقاط."
+      },
+      {
+       "at": "h",
+       "caption": "بعد استعادة كتلة VLAN يزول العطل وتعود الدرجة إلى 100.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- اعتبار درجة النسيج الخضراء دليلاً على سلامة المستأجر. عطل واحد في مجموعة EPG بالكاد يحرّك درجة النظام.\n- النظر في الأعطال من نوع **raised** فقط. العطل في طور *soaking* دليل مفيد أثناء تغيير حيّ.\n- نسيان أن الاحتفاظ بالإحصاءات محدود. إطالة سياسة جمع تؤثر في تخزين APIC ويجب التخطيط لها.\n- إرسال syslog من APIC دون فتح مسار العقد أو مجموعة الإدارة نحو المجمّع."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في نسيج مخبري أو محاكي ACI:\n\n1. دوّن سلامة النظام بالأمر `moquery -d topology/health | grep cur`.\n2. أنشئ مساراً ثابتاً لمجموعة EPG على واجهة بـ VLAN **غير موجودة** في مجمّع VLAN الخاص بالنطاق.\n3. خلال ثلاث دقائق اعرض العطل الجديد بالأمر `moquery -c faultInst -f 'fault.Inst.code==\"F0467\"'` ودوّن قيمة `lc` وهو في طور soaking ثم عند رفعه raised.\n4. اعثر على تغييرك في سجل التدقيق بالأمر `moquery -c aaaModLR`.\n5. أصلح المجمّع، وتأكد أن العطل ينتقل إلى retaining وأن الدرجة تعود.\n\nالنتيجة المتوقعة: تستطيع تفسير كل تغيّر في الحالة وأي سجل دوّن إجراءك."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "درجة السلامة",
+      "definition": "قيمة من 0 إلى 100 لكل كائن مُدار، مشتقة من أعطاله النشطة وأسوأ أبنائه."
+     },
+     {
+      "term": "faultInst",
+      "definition": "فئة العطل: حالة سيئة حالية لها دورة حياة وخطورة."
+     },
+     {
+      "term": "eventRecord",
+      "definition": "سجل دائم لشيء حدث في لحظة زمنية محددة."
+     },
+     {
+      "term": "سجل التدقيق",
+      "definition": "سجل `aaaModLR` لمن غيّر أي كائن ومتى."
+     },
+     {
+      "term": "Soaking",
+      "definition": "أول حالة للعطل، يتحقق فيها مؤقّت من استمرار الحالة."
+     },
+     {
+      "term": "سياسة المراقبة",
+      "definition": "سياسة ذات نطاق تحدّد جمع الإحصاءات والخطورة ومصادر التصدير."
+     },
+     {
+      "term": "العدّاد الذرّي",
+      "definition": "عدّاد حزم بين ورقتين يُستخدم لتحديد الفقدان داخل النسيج."
+     },
+     {
+      "term": "ELAM",
+      "definition": "التقاط حزمة واحدة على المحوّل يُظهر قرار التحويل في الشريحة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "يظهر شرط عطل ويختفي خلال 30 ثانية. ماذا يحدث بالمؤقتات الافتراضية؟",
+      "options": [
+       "يُرفع فوراً ويُحتسب في السلامة",
+       "يبقى في soaking ولا يصبح raised",
+       "يُحذف من قاعدة البيانات فوراً",
+       "يتحول إلى حدث وإدخال تدقيق"
+      ],
+      "answer": 1,
+      "explanation": "مهلة soaking الافتراضية 120 ثانية، فلا يخرج التذبذب البالغ 30 ثانية من هذه المرحلة ولا يخفض درجة السلامة."
+     },
+     {
+      "question": "أي السجلات التي يحتفظ بها ACI تجيب عن سؤال «من غيّر ماذا»؟ اختر كل ما ينطبق.",
+      "options": [
+       "سجل التدقيق (aaaModLR)",
+       "العطل (faultInst)",
+       "الحدث (eventRecord) لأحداث تغيير الإعداد",
+       "درجة السلامة (healthInst)"
+      ],
+      "answer": [
+       0,
+       2
+      ],
+      "explanation": "سجل التدقيق هو السجل الرئيسي للتغييرات بحسب المستخدم، وتُسجَّل أحداث التغيير أيضاً كأحداث. أما العطل فيصف حالة سيئة، وأما درجة السلامة فمجرد رقم."
+     },
+     {
+      "question": "سلامة النظام 98 وسلامة المستأجر Prod هي 76. ماذا يعني ذلك؟",
+      "options": [
+       "عتاد العُمُد يتعطل",
+       "المشكلة على الأرجح داخل كائنات سياسة المستأجر",
+       "مجموعة APIC غير سليمة",
+       "لا شيء، فالدرجات غير مترابطة"
+      ],
+      "answer": 1,
+      "explanation": "تُبنى الدرجات من الأسفل إلى الأعلى لكل نطاق. درجة مستأجر منخفضة مع نسيج مرتفع تشير إلى كائنات المستأجر مثل EPG وBD والعقود لا إلى العتاد."
+     },
+     {
+      "question": "أي أداة تُظهر قرار التحويل في الشريحة لحزمة واحدة، ومنه الإسقاط بسبب عقد؟",
+      "options": [
+       "العدّادات الذرّية",
+       "Endpoint Tracker",
+       "ELAM",
+       "Access SPAN"
+      ],
+      "answer": 2,
+      "explanation": "يلتقط ELAM حزمة واحدة داخل خط معالجة الشريحة ويبلّغ بالقرار. أما SPAN فينسخ الحركة دون أن يفسّر الإسقاط."
+     },
+     {
+      "question": "يعمل syslog من الأوراق لكن لا شيء يصل من APIC. ماذا تفحص؟ اختر كل ما ينطبق.",
+      "options": [
+       "مجموعة الإدارة المستخدمة للوصول إلى المجمّع",
+       "العقد الذي يسمح بـ UDP/514 إلى المجمّع",
+       "ربط مجموعة الوجهات عبر مصدر في سياسة المراقبة",
+       "مجمّع VLAN الخاص بالمستأجر"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يحتاج APIC إلى مسار (OOB أو In-band) وعقد يسمح بالحركة ومصدر يشير إلى مجموعة الوجهات. أما مجمّعات VLAN الخاصة بالمستأجر فلا علاقة لها."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تتراوح درجات السلامة بين 0 و100 وتصعد من أسوأ الأبناء. استخدمها لمعرفة *المكان*، ثم اقرأ الأعطال لمعرفة *السبب*.\n- الأعطال حالات ذات دورة حياة (soaking وraised وraised-clearing وretaining). والأحداث لحظات دائمة. وسجل التدقيق يدوّن من غيّر ماذا.\n- تحدّد سياسات المراقبة الاحتفاظ بالإحصاءات والخطورة والتصدير. وتصل مجموعات الوجهات إلى المجمّعات عبر مسار OOB أو In-band وتحتاج إلى عقد.\n- استكشف الأعطال بترتيب ثابت: السلامة، ثم الأعطال، ثم سجل التدقيق، ثم Endpoint Tracker والعدّادات الذرّية وSPAN وELAM.\n\nوفي الدرس التالي نرى كيف يمتد النسيج إلى الـ Hypervisor في [VMM Integration with vSphere VDS](/learn/enterprise-datacenter-networking/vmm-integration-with-vsphere-vds)."
+   }
+  ]
+ }
+}

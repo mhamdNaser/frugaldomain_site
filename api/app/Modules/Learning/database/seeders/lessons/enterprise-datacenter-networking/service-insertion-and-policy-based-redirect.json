@@ -1,0 +1,546 @@
+{
+ "slug": "service-insertion-and-policy-based-redirect",
+ "title": "Service Insertion and Policy-Based Redirect",
+ "summary": "How ACI inserts firewalls and load balancers with service graphs and policy-based redirect, and how to verify the redirect on the leaf.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Describe the service graph objects and the device selection policy",
+  "Explain how PBR rewrites the next hop and when it is required",
+  "Configure health tracking and symmetric hashing for stateful devices",
+  "Verify redirect state and zoning rules on a leaf"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A bank runs its web tier and database tier in one ACI tenant. Auditors require that every packet between them crosses a next-generation firewall. In a traditional network you would force that with VLAN stitching and routing tricks, and the design would break the first time someone adds a subnet. ACI solves it in policy: you attach a **service graph** to a contract, and the fabric steers matching traffic through the firewall automatically.\n\nIn the CCIE Data Center lab you must build this from scratch and prove it works. This lesson covers the service graph objects, **policy-based redirect (PBR)**, health tracking and the commands that verify the result. It assumes you know EPGs and contracts from [EPGs, ESGs, Contracts and vzAny](/learn/enterprise-datacenter-networking/epgs-esgs-contracts-and-vzany)."
+  },
+  {
+   "id": "objects",
+   "type": "text",
+   "markdown": "## Service graph building blocks\n\nA service graph is a chain of **function nodes** inserted between a consumer and a provider. Several objects cooperate:\n\n- **L4-L7 device (logical device cluster):** the firewall or load balancer, defined with its concrete devices (physical or virtual nodes), the interfaces they use and a **cluster interface** name such as `consumer` or `provider`.\n- **Service graph template:** the logical chain, for example `Consumer -> Firewall -> Provider`. Each node has a **consumer connector** and a **provider connector**.\n- **Device selection policy (logical device context):** binds a graph node to a concrete device in a tenant, and maps each connector to a cluster interface and a **bridge domain** (BD).\n- **Contract subject:** the place where you attach the graph. Only traffic matched by that subject's filters is inserted.\n\nThe device can run in **managed mode**, where APIC pushes configuration through a device package, or **unmanaged mode** (also called network-policy-only), where APIC only builds the network plumbing and you configure the firewall yourself. Unmanaged mode is by far the common choice today, and the one you should expect in the lab."
+  },
+  {
+   "id": "pbr",
+   "type": "text",
+   "markdown": "## Policy-based redirect\n\nWithout PBR, a service graph relies on the firewall being an L2 bump in the wire or the routing endpoint, which forces separate BDs and often a firewall as the default gateway. **PBR removes that constraint.** The fabric keeps normal forwarding for the endpoints and, for traffic that matches the contract, rewrites the next hop to the service node's IP and MAC address.\n\nYou define a **PBR policy** (L4-L7 redirect policy) containing one or more **destinations**, each with an IP address and a MAC address. The leaf installs the redirect in the zoning rule for the consumer-to-provider pair. The service device does not need to be the gateway, and the endpoints can stay in their original BDs.\n\nImportant constraints:\n\n- The service node connects to **service BDs** (one for one-arm mode, or two for two-arm mode). These BDs must have **unicast routing** and must not learn endpoints for redirected destinations.\n- The leaf nodes that host the consumer or provider need second-generation hardware or later (EX, FX, GX and newer); verify the compatibility matrix for your release.\n- **One-arm** puts the firewall on a single interface, so traffic enters and leaves through the same connector. **Two-arm** uses separate inside and outside interfaces."
+  },
+  {
+   "id": "pbr-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Traffic through a PBR service graph",
+   "caption": "The endpoints never learn about the firewall; only the leaf rewrites the next hop.",
+   "data": {
+    "actors": [
+     {
+      "id": "web",
+      "label": "Web EPG",
+      "sub": "198.51.100.10",
+      "icon": "laptop"
+     },
+     {
+      "id": "l1",
+      "label": "Ingress leaf",
+      "sub": "Leaf-101",
+      "icon": "switch"
+     },
+     {
+      "id": "fw",
+      "label": "Firewall",
+      "sub": "192.0.2.5",
+      "icon": "firewall"
+     },
+     {
+      "id": "db",
+      "label": "DB EPG",
+      "sub": "203.0.113.20",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "from": "web",
+      "to": "l1",
+      "label": "TCP/1433",
+      "note": "The web server sends a packet to the database through its default gateway, the BD subnet."
+     },
+     {
+      "from": "l1",
+      "to": "l1",
+      "label": "Zoning rule: redir",
+      "note": "The leaf matches the contract filter and finds the redirect action instead of a plain permit.",
+      "tone": "secure"
+     },
+     {
+      "from": "l1",
+      "to": "fw",
+      "label": "Next hop = FW MAC",
+      "detail": "VXLAN, service BD",
+      "note": "The destination MAC is rewritten to the PBR destination and the packet is sent into the service BD."
+     },
+     {
+      "from": "fw",
+      "to": "fw",
+      "label": "Inspect and permit",
+      "note": "The firewall applies its own rules and permits the flow.",
+      "tone": "success"
+     },
+     {
+      "from": "fw",
+      "to": "l1",
+      "label": "Routed back",
+      "note": "The firewall routes the packet back to the fabric on the same arm (one-arm mode)."
+     },
+     {
+      "from": "l1",
+      "to": "db",
+      "label": "Delivered",
+      "note": "The leaf forwards the packet to the provider EPG; the redirect is not applied a second time.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "health",
+   "type": "text",
+   "markdown": "## Health tracking, symmetry and scale\n\nA redirect to a dead firewall is a black hole, so you attach **health tracking** to the PBR policy. A **redirect health group** uses IP SLA probes (ICMP or TCP) from the leaf to each destination. When a probe fails, that destination is removed from the policy. With a **threshold** you decide what happens when too few destinations remain: bypass the service, deny the traffic, or keep the surviving nodes.\n\nWhen the policy lists several destinations, the leaf hashes the flow to choose one. **Symmetric PBR** hashes on a combination of source and destination IP so that the forward and return directions of one conversation reach the **same** firewall. Stateful firewalls need this. **Resilient hashing** limits re-mapping so that when one node fails, only the flows that used it move.\n\nIn the lab, always check both directions: the contract has a consumer-to-provider redirect and a separate provider-to-consumer redirect, each with its own policy and destinations."
+  },
+  {
+   "id": "pbr-cfg",
+   "type": "code",
+   "language": "cisco",
+   "filename": "APIC CLI (NX-style): PBR policy",
+   "code": "apic1(config)# tenant Bank\napic1(config-tenant)# l4l7 redir-health-group FW-HEALTH\napic1(config-redir-health)# ip 192.0.2.5\napic1(config-redir-health)# exit\napic1(config-tenant)# l4l7 cluster name FW1 type physical vlan-domain PHYS-DOM service ADC function go-to\napic1(config-cluster)# cluster-device FW1-A\napic1(config-cluster)# cluster-interface provider vlan 2001\napic1(config-cluster-interface)# member device FW1-A device-interface eth1\napic1(config-cluster-interface)# exit\napic1(config-tenant)# l4l7 graph FW-GRAPH contract WEB-TO-DB\napic1(config-graph)# service N1 device-cluster-tenant Bank device-cluster FW1 mode FW_ROUTED",
+   "caption": "The exact keywords vary by release, so many candidates build the same objects in the GUI or with REST. The key ideas are the health group, the cluster with its interface and VLAN, and the graph bound to a contract."
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Where candidates lose points",
+   "markdown": "The most common failures are a service BD with unicast routing disabled, a PBR destination MAC that is wrong or missing, a graph attached to the wrong subject, and forgetting that the redirect must also be defined for the return direction. Also remember that the service EPG is created for you by the fabric; do not try to put the firewall into a normal EPG by hand."
+  },
+  {
+   "id": "verify",
+   "type": "text",
+   "markdown": "## Verification workflow\n\nWork from the policy up to the data plane, in this order:\n\n1. **Graph deployment:** on the APIC, the graph instance must show **applied** with no faults. A fault such as `invalid-vlan` or `missing-connectivity` points to the device selection policy.\n2. **Service EPGs and BDs:** confirm the shadow EPGs exist on the leaf where the firewall attaches, and that the firewall interface VLAN is deployed.\n3. **Redirect state:** on the leaf, check that every destination is up and carries the right MAC address.\n4. **Zoning rules:** confirm a `redir` action exists for the pair of classes.\n5. **Traffic:** use `iping`, a packet capture on the firewall, and the firewall's own connection table to prove the path.\n\nBecause the redirect happens on the leaf, the *first* leaf that processes the packet matters. In an ACI fabric with policy enforcement on the egress leaf, the redirect may occur on the ingress or egress side depending on whether the destination class is known. Test with the endpoints on different leaf nodes."
+  },
+  {
+   "id": "verify-term",
+   "type": "terminal",
+   "title": "Verifying redirect state on the leaf",
+   "prompt": "leaf101#",
+   "lines": [
+    {
+     "cmd": "show service redir info",
+     "output": "============================================================================================\nLEG VRF            GrpID  Name              operSt   operStQual  HG-name\n============================================================================================\n1   Bank:Prod      1      destgrp-1         enabled  no-oper-grp FW-HEALTH\n\nName                 bdVnid     vMac               vrf         operSt    HG-name\n====                 ======     ====               ====        ======    =======\ndest-[192.0.2.5]     vxlan-16515000  00:50:56:AA:BB:01  Bank:Prod   enabled   FW-HEALTH"
+    },
+    {
+     "comment": "The destination is enabled and the health group is attached. A destination shown as disabled means the probe failed or the MAC is unresolved."
+    },
+    {
+     "cmd": "show zoning-rule scope 2850817",
+     "output": "Rule ID  SrcEPG  DstEPG  FilterID  Dir     operSt   Scope    Name       Action\n4121     49153   32770   default   bi-dir  enabled  2850817  WEB-TO-DB  redir(destgrp-1)\n4122     32770   49153   default   uni-dir-ignore enabled 2850817 WEB-TO-DB redir(destgrp-1)"
+    },
+    {
+     "comment": "The action redir(destgrp-1) proves that the contract uses the redirect. The values here are illustrative and differ on your fabric."
+    }
+   ]
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab fabric or the ACI simulator, create a tenant with two EPGs in separate BDs and a virtual firewall in one-arm mode.\n\n1. Build the L4-L7 device in unmanaged mode with one cluster interface.\n2. Create a service BD with unicast routing and a PBR policy with the firewall IP and MAC.\n3. Create a graph template and attach it to a contract subject.\n4. Ping from the consumer to the provider and confirm the firewall logs the connection.\n5. Shut down the firewall interface and observe the destination state change in `show service redir info`.\n\nExpected result: the flow is inspected, and the destination moves to disabled when health tracking fails."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Service graph",
+     "definition": "An ordered chain of function nodes attached to a contract subject."
+    },
+    {
+     "term": "L4-L7 device",
+     "definition": "A logical device cluster (firewall, load balancer) made of concrete devices."
+    },
+    {
+     "term": "Device selection policy",
+     "definition": "Maps a graph node and its connectors to a cluster, interfaces and BDs."
+    },
+    {
+     "term": "PBR",
+     "definition": "Rewrites the next hop for contract-matched traffic to a service node IP and MAC."
+    },
+    {
+     "term": "Redirect health group",
+     "definition": "IP SLA probes that remove failed PBR destinations."
+    },
+    {
+     "term": "Symmetric PBR",
+     "definition": "Hashing that sends both directions of a flow to the same service node."
+    },
+    {
+     "term": "One-arm mode",
+     "definition": "The service node uses a single interface for both directions."
+    },
+    {
+     "term": "Unmanaged mode",
+     "definition": "APIC builds the network plumbing only; you configure the device."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What does policy-based redirect change compared with a traditional service graph?",
+     "options": [
+      "It forces the firewall to be the default gateway",
+      "It rewrites the next hop so the firewall need not be the gateway or an L2 bump",
+      "It removes the need for a contract",
+      "It works only with managed mode"
+     ],
+     "answer": 1,
+     "explanation": "PBR keeps normal endpoint forwarding and redirects only matched traffic by rewriting the next hop IP and MAC."
+    },
+    {
+     "question": "Which items are required for a working one-arm PBR deployment? Choose all that apply.",
+     "options": [
+      "A service BD with unicast routing",
+      "A PBR destination with IP and MAC",
+      "A graph attached to a contract subject",
+      "An STP root bridge on the firewall"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The redirect needs the service BD, a destination with IP and MAC, and a graph bound to the subject. STP root placement is unrelated."
+    },
+    {
+     "question": "A stateful firewall pair drops return traffic after PBR is enabled with two destinations. What is the best fix?",
+     "options": [
+      "Enable symmetric PBR hashing",
+      "Disable health tracking",
+      "Change the contract to permit any",
+      "Move the firewall into the consumer EPG"
+     ],
+     "answer": 0,
+     "explanation": "Symmetric hashing sends both directions of a flow to the same firewall, which stateful inspection requires."
+    },
+    {
+     "question": "Which command on a leaf shows whether PBR destinations are enabled?",
+     "options": [
+      "show vlan extended",
+      "show service redir info",
+      "show spanning-tree",
+      "show cdp neighbors"
+     ],
+     "answer": 1,
+     "explanation": "`show service redir info` lists redirect groups and the operational state of each destination."
+    },
+    {
+     "question": "What can a redirect health threshold decide? Choose all that apply.",
+     "options": [
+      "Bypass the service when too few nodes remain",
+      "Deny traffic when too few nodes remain",
+      "Change the VXLAN VNI of the BD",
+      "Keep only the surviving nodes"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "The threshold action controls bypass, deny or keep-survivors behavior. It does not alter VNIs."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\nA service graph attached to a contract subject inserts firewalls and load balancers into the traffic path by policy. PBR makes this practical: the fabric rewrites the next hop for matched traffic, so the service node does not have to be a gateway. Health groups, thresholds and symmetric hashing keep the design resilient and compatible with stateful devices. For the lab, build in unmanaged mode, verify with `show service redir info` and the zoning rules, and always test both directions. Next, see [Multi-Site, Multi-Pod and Remote Leaf](/learn/enterprise-datacenter-networking/multi-site-multi-pod-and-remote-leaf) for how services behave across sites."
+  }
+ ],
+ "ar": {
+  "title": "إدراج الخدمات وإعادة التوجيه القائمة على السياسات",
+  "summary": "كيف تُدرج ACI جدران الحماية وموازنات الأحمال عبر الرسوم البيانية للخدمات وإعادة التوجيه القائمة على السياسات، وكيف يُتحقق من إعادة التوجيه على الـ Leaf.",
+  "objectives": [
+   "وصف كائنات الرسم البياني للخدمات وسياسة اختيار الجهاز",
+   "شرح كيف تعيد PBR كتابة القفزة التالية ومتى تلزم",
+   "ضبط تتبّع السلامة والتجزئة المتماثلة للأجهزة ذات الحالة",
+   "التحقق من حالة إعادة التوجيه وقواعد التقسيم على Leaf"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يعمل مصرف على مستوى الويب ومستوى قاعدة البيانات داخل مستأجر (Tenant) واحد في ACI، ويشترط المدقّقون أن تمرّ كل حزمة بينهما عبر جدار حماية من الجيل التالي. في الشبكات التقليدية كنت ستفرض ذلك بربط شبكات VLAN وحيل التوجيه، ثم ينهار التصميم عند إضافة شبكة فرعية جديدة. أما ACI فتحلّ المشكلة بالسياسات: تُرفق **رسماً بيانياً للخدمات (Service Graph)** بالعقد، فيوجّه النسيج الحركة المطابقة عبر جدار الحماية تلقائياً.\n\nفي مختبر CCIE Data Center عليك بناء ذلك من الصفر وإثبات عمله. يغطي هذا الدرس كائنات الرسم البياني للخدمات و**إعادة التوجيه القائمة على السياسات (PBR)** وتتبّع السلامة والأوامر التي تتحقق من النتيجة. ويفترض أنك تعرف مجموعات النقاط الطرفية (EPG) والعقود من درس [EPGs, ESGs, Contracts and vzAny](/learn/enterprise-datacenter-networking/epgs-esgs-contracts-and-vzany)."
+   },
+   {
+    "id": "objects",
+    "type": "text",
+    "markdown": "## مكوّنات الرسم البياني للخدمات\n\nالرسم البياني للخدمات سلسلة من **عقد الوظائف (Function Nodes)** تُدرج بين المستهلك (Consumer) والمزوّد (Provider). تتعاون عدة كائنات:\n\n- **جهاز L4-L7 (مجموعة الأجهزة المنطقية):** هو جدار الحماية أو موازن الأحمال، ويُعرَّف مع أجهزته الفعلية (مادية أو افتراضية) وواجهاته واسم **واجهة المجموعة (Cluster Interface)** مثل `consumer` أو `provider`.\n- **قالب الرسم البياني للخدمات:** السلسلة المنطقية، مثل `Consumer -> Firewall -> Provider`. لكل عقدة **موصّل للمستهلك** و**موصّل للمزوّد**.\n- **سياسة اختيار الجهاز (Logical Device Context):** تربط عقدة الرسم بجهاز فعلي داخل المستأجر، وتطابق كل موصّل مع واجهة مجموعة و**نطاق بث (Bridge Domain، أي BD)**.\n- **موضوع العقد (Contract Subject):** المكان الذي يُرفق فيه الرسم، ولا تُدرج إلا الحركة التي تطابق مرشّحات هذا الموضوع.\n\nيعمل الجهاز في **الوضع المُدار (Managed)** حيث يدفع APIC الإعدادات عبر حزمة الجهاز (Device Package)، أو في **الوضع غير المُدار (Unmanaged)** ويُسمى أيضاً سياسة الشبكة فقط، حيث يبني APIC بنية الشبكة فقط وتضبط أنت جدار الحماية بنفسك. الوضع غير المُدار هو الخيار الشائع اليوم، وهو المتوقع في المختبر."
+   },
+   {
+    "id": "pbr",
+    "type": "text",
+    "markdown": "## إعادة التوجيه القائمة على السياسات\n\nبدون PBR يعتمد الرسم البياني للخدمات على أن يكون جدار الحماية وصلة L2 في المسار أو نقطة التوجيه النهائية، وهذا يفرض نطاقات BD منفصلة وكثيراً ما يجعل جدار الحماية هو البوابة الافتراضية. **تزيل PBR هذا القيد.** يحتفظ النسيج بالتوجيه العادي للنقاط الطرفية، وعند مطابقة الحركة للعقد يعيد كتابة القفزة التالية إلى عنوان IP وعنوان MAC لعقدة الخدمة.\n\nتعرّف **سياسة PBR** (سياسة إعادة توجيه L4-L7) تحتوي وجهة واحدة أو أكثر، لكل منها عنوان IP وعنوان MAC. يثبّت الـ Leaf إعادة التوجيه في قاعدة التقسيم (Zoning Rule) الخاصة بزوج المستهلك والمزوّد. ولا يلزم أن يكون جهاز الخدمة هو البوابة، وتبقى النقاط الطرفية في نطاقات BD الأصلية.\n\nقيود مهمة:\n\n- تتصل عقدة الخدمة بـ **نطاقات BD للخدمة** (واحد في وضع الذراع الواحدة أو اثنان في وضع الذراعين)، ويجب أن يكون **التوجيه أحادي البث (Unicast Routing)** مفعّلاً فيها وألا تتعلّم نقاطاً طرفية للوجهات المعاد توجيهها.\n- تحتاج عقد Leaf التي تستضيف المستهلك أو المزوّد إلى عتاد من الجيل الثاني فما بعد (EX وFX وGX وأحدث)؛ راجع مصفوفة التوافق لإصدارك.\n- **الذراع الواحدة (One-arm)** تضع جدار الحماية على واجهة واحدة فتدخل الحركة وتخرج من الموصّل نفسه، أما **الذراعان (Two-arm)** فتستخدمان واجهتين داخلية وخارجية."
+   },
+   {
+    "id": "pbr-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "مسار الحركة عبر رسم خدمات PBR",
+    "caption": "لا تعرف النقاط الطرفية بوجود جدار الحماية؛ الـ Leaf وحده يعيد كتابة القفزة التالية.",
+    "data": {
+     "actors": [
+      {
+       "id": "web",
+       "label": "EPG الويب",
+       "sub": "198.51.100.10",
+       "icon": "laptop"
+      },
+      {
+       "id": "l1",
+       "label": "Leaf الدخول",
+       "sub": "Leaf-101",
+       "icon": "switch"
+      },
+      {
+       "id": "fw",
+       "label": "جدار الحماية",
+       "sub": "192.0.2.5",
+       "icon": "firewall"
+      },
+      {
+       "id": "db",
+       "label": "EPG قاعدة البيانات",
+       "sub": "203.0.113.20",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "from": "web",
+       "to": "l1",
+       "label": "TCP/1433",
+       "note": "يرسل خادم الويب حزمة إلى قاعدة البيانات عبر بوابته الافتراضية، وهي شبكة BD الفرعية."
+      },
+      {
+       "from": "l1",
+       "to": "l1",
+       "label": "قاعدة التقسيم: redir",
+       "note": "يطابق الـ Leaf مرشّح العقد فيجد إجراء إعادة التوجيه بدل السماح العادي.",
+       "tone": "secure"
+      },
+      {
+       "from": "l1",
+       "to": "fw",
+       "label": "القفزة التالية = MAC الجدار",
+       "detail": "VXLAN, service BD",
+       "note": "يُعاد كتابة MAC الوجهة إلى وجهة PBR وتُرسل الحزمة إلى BD الخدمة."
+      },
+      {
+       "from": "fw",
+       "to": "fw",
+       "label": "فحص وسماح",
+       "note": "يطبّق جدار الحماية قواعده ويسمح بالتدفق.",
+       "tone": "success"
+      },
+      {
+       "from": "fw",
+       "to": "l1",
+       "label": "عودة موجَّهة",
+       "note": "يوجّه الجدار الحزمة عائدةً إلى النسيج على الذراع نفسها (وضع الذراع الواحدة)."
+      },
+      {
+       "from": "l1",
+       "to": "db",
+       "label": "تم التسليم",
+       "note": "يمرّر الـ Leaf الحزمة إلى EPG المزوّد ولا تُطبَّق إعادة التوجيه مرة ثانية.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "health",
+    "type": "text",
+    "markdown": "## تتبّع السلامة والتماثل والتوسّع\n\nإعادة التوجيه إلى جدار حماية متوقف تصنع ثقباً أسود، لذلك تُرفق **تتبّع السلامة (Health Tracking)** بسياسة PBR. تستخدم **مجموعة سلامة إعادة التوجيه (Redirect Health Group)** فحوصات IP SLA (ICMP أو TCP) من الـ Leaf إلى كل وجهة. عند فشل الفحص تُزال تلك الوجهة من السياسة. وبفضل **العتبة (Threshold)** تحدد ما يحدث عند بقاء عدد قليل من الوجهات: تجاوز الخدمة أو رفض الحركة أو الإبقاء على العقد الناجية.\n\nعندما تسرد السياسة عدة وجهات يحسب الـ Leaf دالة تجزئة للتدفق ليختار إحداها. وتجزّئ **PBR المتماثلة (Symmetric PBR)** على مزيج من عنواني المصدر والوجهة بحيث يصل اتجاها الذهاب والعودة لمحادثة واحدة إلى جدار الحماية **نفسه**. وتحتاج جدران الحماية ذات الحالة إلى ذلك. أما **التجزئة المرنة (Resilient Hashing)** فتقلّل إعادة التعيين، فإذا تعطلت عقدة واحدة انتقلت التدفقات التي كانت تستخدمها فقط.\n\nفي المختبر افحص الاتجاهين دائماً: للعقد إعادة توجيه من المستهلك إلى المزوّد وأخرى من المزوّد إلى المستهلك، ولكل منهما سياسته ووجهاته."
+   },
+   {
+    "id": "pbr-cfg",
+    "type": "code",
+    "language": "cisco",
+    "filename": "APIC CLI (NX-style): PBR policy",
+    "code": "apic1(config)# tenant Bank\napic1(config-tenant)# l4l7 redir-health-group FW-HEALTH\napic1(config-redir-health)# ip 192.0.2.5\napic1(config-redir-health)# exit\napic1(config-tenant)# l4l7 cluster name FW1 type physical vlan-domain PHYS-DOM service ADC function go-to\napic1(config-cluster)# cluster-device FW1-A\napic1(config-cluster)# cluster-interface provider vlan 2001\napic1(config-cluster-interface)# member device FW1-A device-interface eth1\napic1(config-cluster-interface)# exit\napic1(config-tenant)# l4l7 graph FW-GRAPH contract WEB-TO-DB\napic1(config-graph)# service N1 device-cluster-tenant Bank device-cluster FW1 mode FW_ROUTED",
+    "caption": "تختلف الكلمات المفتاحية حسب الإصدار، لذا يبني كثير من المرشحين الكائنات نفسها عبر الواجهة الرسومية أو REST. الأفكار الأساسية هي مجموعة السلامة والمجموعة مع واجهتها وشبكة VLAN والرسم المرتبط بعقد."
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أين يخسر المرشحون النقاط",
+    "markdown": "أكثر الأخطاء شيوعاً: BD للخدمة معطّل فيه التوجيه أحادي البث، أو عنوان MAC خاطئ أو مفقود لوجهة PBR، أو رسم مرفق بموضوع خاطئ، أو نسيان تعريف إعادة التوجيه لاتجاه العودة. تذكّر أيضاً أن النسيج ينشئ EPG الخدمة بنفسه؛ فلا تحاول وضع جدار الحماية في EPG عادي يدوياً."
+   },
+   {
+    "id": "verify",
+    "type": "text",
+    "markdown": "## سير عمل التحقق\n\nاعمل من السياسة نزولاً إلى مستوى البيانات بهذا الترتيب:\n\n1. **نشر الرسم:** في APIC يجب أن يظهر مثيل الرسم **applied** دون أعطال. يشير عطل مثل `invalid-vlan` أو `missing-connectivity` إلى سياسة اختيار الجهاز.\n2. **EPG الخدمة وBD:** تأكد من وجود EPG الظل (Shadow EPG) على الـ Leaf الذي يتصل به جدار الحماية، ومن نشر VLAN واجهة الجدار.\n3. **حالة إعادة التوجيه:** على الـ Leaf تحقق من أن كل وجهة في الحالة up وتحمل عنوان MAC الصحيح.\n4. **قواعد التقسيم:** تأكد من وجود إجراء `redir` لزوج الفئات.\n5. **الحركة:** استخدم `iping` والتقاط الحزم على جدار الحماية وجدول الاتصالات في الجدار نفسه لإثبات المسار.\n\nولأن إعادة التوجيه تحدث على الـ Leaf، فإن الـ Leaf *الأول* الذي يعالج الحزمة هو المهم. وقد تحدث إعادة التوجيه في جهة الدخول أو الخروج بحسب معرفة فئة الوجهة. اختبر مع نقاط طرفية على عقد Leaf مختلفة."
+   },
+   {
+    "id": "verify-term",
+    "type": "terminal",
+    "title": "التحقق من حالة إعادة التوجيه على الـ Leaf",
+    "prompt": "leaf101#",
+    "lines": [
+     {
+      "cmd": "show service redir info",
+      "output": "============================================================================================\nLEG VRF            GrpID  Name              operSt   operStQual  HG-name\n============================================================================================\n1   Bank:Prod      1      destgrp-1         enabled  no-oper-grp FW-HEALTH\n\nName                 bdVnid     vMac               vrf         operSt    HG-name\n====                 ======     ====               ====        ======    =======\ndest-[192.0.2.5]     vxlan-16515000  00:50:56:AA:BB:01  Bank:Prod   enabled   FW-HEALTH"
+     },
+     {
+      "comment": "الوجهة enabled ومجموعة السلامة مرتبطة بها. أما ظهور الوجهة disabled فيعني فشل الفحص أو تعذّر حل عنوان MAC."
+     },
+     {
+      "cmd": "show zoning-rule scope 2850817",
+      "output": "Rule ID  SrcEPG  DstEPG  FilterID  Dir     operSt   Scope    Name       Action\n4121     49153   32770   default   bi-dir  enabled  2850817  WEB-TO-DB  redir(destgrp-1)\n4122     32770   49153   default   uni-dir-ignore enabled 2850817 WEB-TO-DB redir(destgrp-1)"
+     },
+     {
+      "comment": "يثبت الإجراء redir(destgrp-1) أن العقد يستخدم إعادة التوجيه. القيم هنا توضيحية وتختلف في نسيجك."
+     }
+    ]
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في نسيج مخبري أو محاكي ACI أنشئ مستأجراً فيه مجموعتا EPG في نطاقي BD منفصلين وجدار حماية افتراضياً بوضع الذراع الواحدة.\n\n1. ابنِ جهاز L4-L7 في الوضع غير المُدار بواجهة مجموعة واحدة.\n2. أنشئ BD للخدمة مع توجيه أحادي البث وسياسة PBR بعنوان IP وMAC جدار الحماية.\n3. أنشئ قالب رسم بياني وأرفقه بموضوع عقد.\n4. نفّذ ping من المستهلك إلى المزوّد وتأكد أن جدار الحماية يسجّل الاتصال.\n5. أوقف واجهة جدار الحماية ولاحظ تغيّر حالة الوجهة في `show service redir info`.\n\nالنتيجة المتوقعة: يُفحص التدفق، وتنتقل الوجهة إلى disabled عند فشل تتبّع السلامة."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الرئيسية",
+    "items": [
+     {
+      "term": "الرسم البياني للخدمات",
+      "definition": "سلسلة مرتبة من عقد الوظائف مرفقة بموضوع عقد."
+     },
+     {
+      "term": "جهاز L4-L7",
+      "definition": "مجموعة أجهزة منطقية (جدار حماية أو موازن أحمال) تتكوّن من أجهزة فعلية."
+     },
+     {
+      "term": "سياسة اختيار الجهاز",
+      "definition": "تربط عقدة الرسم وموصّلاتها بمجموعة وواجهات وBD."
+     },
+     {
+      "term": "إعادة التوجيه القائمة على السياسات",
+      "definition": "تعيد كتابة القفزة التالية للحركة المطابقة للعقد إلى IP وMAC عقدة الخدمة."
+     },
+     {
+      "term": "مجموعة سلامة إعادة التوجيه",
+      "definition": "فحوصات IP SLA تُزيل وجهات PBR الفاشلة."
+     },
+     {
+      "term": "PBR المتماثلة",
+      "definition": "تجزئة ترسل اتجاهي التدفق إلى عقدة الخدمة نفسها."
+     },
+     {
+      "term": "وضع الذراع الواحدة",
+      "definition": "تستخدم عقدة الخدمة واجهة واحدة للاتجاهين."
+     },
+     {
+      "term": "الوضع غير المُدار",
+      "definition": "يبني APIC بنية الشبكة فقط وتضبط الجهاز بنفسك."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما الذي تغيّره إعادة التوجيه القائمة على السياسات مقارنةً بالرسم البياني التقليدي للخدمات؟",
+      "options": [
+       "تفرض أن يكون جدار الحماية هو البوابة الافتراضية",
+       "تعيد كتابة القفزة التالية فلا يلزم أن يكون الجدار بوابة أو وصلة L2",
+       "تلغي الحاجة إلى عقد",
+       "تعمل مع الوضع المُدار فقط"
+      ],
+      "answer": 1,
+      "explanation": "تحافظ PBR على التوجيه العادي للنقاط الطرفية وتعيد توجيه الحركة المطابقة فقط بإعادة كتابة IP وMAC القفزة التالية."
+     },
+     {
+      "question": "ما العناصر اللازمة لنشر PBR بالذراع الواحدة يعمل؟ اختر كل ما ينطبق.",
+      "options": [
+       "BD للخدمة مع توجيه أحادي البث",
+       "وجهة PBR بعنوان IP وMAC",
+       "رسم مرفق بموضوع عقد",
+       "جسر جذر STP على جدار الحماية"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "تحتاج إعادة التوجيه إلى BD للخدمة ووجهة بعنوان IP وMAC ورسم مرتبط بالموضوع. أما موضع جذر STP فلا علاقة له."
+     },
+     {
+      "question": "يُسقط زوج جدران حماية ذات حالة حركة العودة بعد تفعيل PBR بوجهتين. ما أفضل إصلاح؟",
+      "options": [
+       "تفعيل تجزئة PBR المتماثلة",
+       "تعطيل تتبّع السلامة",
+       "تغيير العقد إلى السماح للكل",
+       "نقل جدار الحماية إلى EPG المستهلك"
+      ],
+      "answer": 0,
+      "explanation": "ترسل التجزئة المتماثلة اتجاهي التدفق إلى جدار الحماية نفسه، وهو ما يتطلبه الفحص ذو الحالة."
+     },
+     {
+      "question": "أي أمر على الـ Leaf يعرض ما إذا كانت وجهات PBR مفعّلة؟",
+      "options": [
+       "show vlan extended",
+       "show service redir info",
+       "show spanning-tree",
+       "show cdp neighbors"
+      ],
+      "answer": 1,
+      "explanation": "يعرض `show service redir info` مجموعات إعادة التوجيه والحالة التشغيلية لكل وجهة."
+     },
+     {
+      "question": "ما الذي يمكن أن تحدده عتبة سلامة إعادة التوجيه؟ اختر كل ما ينطبق.",
+      "options": [
+       "تجاوز الخدمة عند بقاء عدد قليل من العقد",
+       "رفض الحركة عند بقاء عدد قليل من العقد",
+       "تغيير VNI الخاص بـ BD",
+       "الإبقاء على العقد الناجية فقط"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يتحكم إجراء العتبة في سلوك التجاوز أو الرفض أو الإبقاء على الناجين، ولا يغيّر قيم VNI."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\nيُدرج الرسم البياني للخدمات المرفق بموضوع عقد جدران الحماية وموازنات الأحمال في مسار الحركة عبر السياسات. وتجعل PBR ذلك عملياً: يعيد النسيج كتابة القفزة التالية للحركة المطابقة فلا يلزم أن تكون عقدة الخدمة بوابة. وتحافظ مجموعات السلامة والعتبات والتجزئة المتماثلة على مرونة التصميم وتوافقه مع الأجهزة ذات الحالة. في المختبر ابنِ في الوضع غير المُدار، وتحقق بـ `show service redir info` وقواعد التقسيم، واختبر الاتجاهين دائماً. وللمتابعة راجع [Multi-Site, Multi-Pod and Remote Leaf](/learn/enterprise-datacenter-networking/multi-site-multi-pod-and-remote-leaf) لمعرفة سلوك الخدمات عبر المواقع."
+   }
+  ]
+ }
+}

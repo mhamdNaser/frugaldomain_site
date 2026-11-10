@@ -1,0 +1,540 @@
+{
+ "slug": "vpc-port-channels-and-trunking",
+ "title": "vPC, Port Channels and Trunking",
+ "summary": "Build and troubleshoot vPC on Nexus switches: peer link, keepalive, consistency rules, failure behavior and trunking details.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Describe the vPC domain, peer link, keepalive and orphan ports",
+  "Predict which peer suspends ports after a failure or a Type 1 mismatch",
+  "Configure vPC with peer-switch, peer-gateway, auto-recovery and delay restore",
+  "Verify and troubleshoot vPC with show vpc commands",
+  "Apply correct trunking and LACP on Nexus"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "A pair of Nexus switches must look like one switch to a server, yet each must keep its own control plane so that a software upgrade on one never takes the rack offline. Virtual Port Channel (vPC) solves exactly this problem. On the CCIE Data Center lab you will be asked to build it, break it, and find out why one peer suspended its member ports.\n\nThis lesson covers the vPC architecture, the consistency rules that decide whether a port channel comes up, the failure handling that prevents loops and split brain, and the trunking details that go with it. For the Layer 2 loop-prevention side, see [STP and MST in the Data Center](/learn/enterprise-datacenter-networking/stp-and-mst-in-the-data-center). For the VXLAN version of multihoming, see [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+  },
+  {
+   "type": "text",
+   "id": "arch",
+   "markdown": "## vPC building blocks\n\nA vPC domain contains exactly two peers. Three kinds of links and one protocol make it work:\n\n| Element | Purpose |\n|:--|:--|\n| Peer link | An ordinary port channel (`vpc peer-link`) that carries vPC VLAN traffic, control traffic (CFS) and orphan-port traffic between peers |\n| Peer keepalive | A separate Layer 3 path, ideally in its own VRF, that proves the other peer is alive |\n| vPC member port | A port channel that carries the same `vpc <number>` on both peers and connects to one downstream device |\n| Orphan port | Any port that is not in a vPC but lives on a vPC VLAN |\n\nThe downstream device sees one LACP partner because both peers advertise the same system ID, derived from the vPC domain. Each peer forwards locally first: a frame that arrives on a peer and is destined for a vPC member port on the same peer never crosses the peer link. This is the loop-prevention rule that matters most: **a frame received on the peer link is never forwarded out a vPC member port** when the other peer also has an active member port. The peer link therefore carries little traffic in a healthy design.\n\nThe keepalive must never ride the peer link and should not use the `default` VRF if you can avoid it. A dedicated `management` VRF or a routed point-to-point link is the usual choice. If the keepalive shared the peer link, one failure would remove both signals and you would lose the ability to tell a dead peer from a dead link."
+  },
+  {
+   "type": "animation",
+   "id": "vpc-anim",
+   "kind": "sequence",
+   "title": "Peer link failure and split-brain protection",
+   "data": {
+    "actors": [
+     {
+      "id": "p",
+      "label": "N9K-A",
+      "sub": "vPC primary",
+      "icon": "switch"
+     },
+     {
+      "id": "s",
+      "label": "N9K-B",
+      "sub": "vPC secondary",
+      "icon": "switch"
+     },
+     {
+      "id": "h",
+      "label": "Server",
+      "sub": "LACP",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "p",
+      "to": "s",
+      "label": "CFS",
+      "detail": "peer link",
+      "note": "Both peers synchronize MAC addresses, IGMP state and consistency parameters over the peer link."
+     },
+     {
+      "from": "p",
+      "to": "s",
+      "label": "keepalive",
+      "detail": "UDP 3200",
+      "note": "Keepalive messages flow every second over the separate Layer 3 path.",
+      "tone": "secure"
+     },
+     {
+      "from": "h",
+      "to": "p",
+      "label": "Traffic",
+      "detail": "Po20 member",
+      "note": "The server hashes flows across both peers."
+     },
+     {
+      "from": "s",
+      "to": "s",
+      "label": "Peer link down",
+      "note": "The peer link fails, but the keepalive still answers.",
+      "tone": "warning"
+     },
+     {
+      "from": "s",
+      "to": "p",
+      "label": "keepalive",
+      "detail": "peer alive",
+      "note": "The secondary learns the primary is alive, so this is not a dead peer."
+     },
+     {
+      "from": "s",
+      "to": "s",
+      "label": "Suspend vPC members",
+      "note": "The secondary suspends its vPC member ports and SVIs, so only the primary forwards. No split brain.",
+      "tone": "danger"
+     },
+     {
+      "from": "h",
+      "to": "p",
+      "label": "Traffic",
+      "detail": "Po20 (1 link)",
+      "note": "The server keeps working over the surviving link.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "cons",
+   "markdown": "## Consistency and role election\n\nWhen the vPC domain forms, the peers exchange configuration through CFS (Cisco Fabric Services) and compare it. Two classes of mismatch exist:\n\n- **Type 1** parameters must match or the vPC is suspended (global: STP mode, MST region, QoS network policy; per-interface: port-channel mode, speed, duplex, trunk allowed VLANs, native VLAN).\n- **Type 2** parameters mismatch only with a warning, but they can cause unexpected forwarding (for example SVI or ACL differences).\n\nWith graceful consistency check enabled (the default), a Type 1 mismatch suspends the vPC only on the **secondary** peer, so traffic continues through the primary.\n\nThe primary and secondary roles are elected by `role priority` (lower wins; default 32667). Role matters for three things: which peer keeps forwarding after a peer-link failure, which peer originates BPDUs when the vPC uses STP, and which peer is authoritative for some features. Preemption is not automatic. Set priorities explicitly so that the role you expect is the role you get after a reload.\n\n### Useful tuning commands\n\n- `peer-switch` makes both peers share a single STP bridge ID so that either can send BPDUs, which removes the topology change on a primary failure.\n- `peer-gateway` lets a peer route frames addressed to the other peer's router MAC, which protects against devices that reply to the source MAC instead of the HSRP virtual MAC.\n- `auto-recovery` lets a peer assume the primary role if it reloads and the other peer never returns.\n- `delay restore` holds vPC member ports down after a reload until routing and tables have converged (default 30 seconds, often raised to 150 or more with large FHRP or EVPN tables).\n- `ip arp synchronize` and `ipv6 nd synchronize` copy ARP and ND entries to the new peer after a restart."
+  },
+  {
+   "type": "text",
+   "id": "cfg",
+   "markdown": "## Configuration order that works\n\nEnable `feature vpc` and `feature lacp`, then build the domain, keepalive, peer link and members in this order. The keepalive source and destination use addresses from a dedicated VRF, so create it first."
+  },
+  {
+   "type": "code",
+   "id": "vpc-cfg",
+   "language": "cisco",
+   "filename": "N9K-A.cfg",
+   "caption": "N9K-B mirrors this with a different keepalive source and role priority 200.",
+   "code": "feature vpc\nfeature lacp\nvrf context VPC-KA\n!\ninterface Ethernet1/48\n  no switchport\n  vrf member VPC-KA\n  ip address 192.0.2.1/30\n  no shutdown\n!\nvpc domain 10\n  role priority 100\n  peer-keepalive destination 192.0.2.2 source 192.0.2.1 vrf VPC-KA\n  peer-switch\n  peer-gateway\n  auto-recovery\n  delay restore 150\n  ip arp synchronize\n!\ninterface port-channel1\n  switchport mode trunk\n  switchport trunk allowed vlan 10,20,30\n  spanning-tree port type network\n  vpc peer-link\n!\ninterface Ethernet1/1-2\n  switchport mode trunk\n  channel-group 1 mode active\n!\ninterface port-channel20\n  switchport mode trunk\n  switchport trunk allowed vlan 10,20\n  spanning-tree port type edge trunk\n  vpc 20\n!\ninterface Ethernet1/10\n  switchport mode trunk\n  channel-group 20 mode active"
+  },
+  {
+   "type": "terminal",
+   "id": "vpc-verify",
+   "title": "Verifying the vPC",
+   "prompt": "N9K-A#",
+   "lines": [
+    {
+     "cmd": "show vpc brief",
+     "output": "vPC domain id                     : 10\nPeer status                       : peer adjacency formed ok\nvPC keep-alive status             : peer is alive\nConfiguration consistency status  : success\nPer-vlan consistency status       : success\nType-2 consistency status         : success\nvPC role                          : primary\nNumber of vPCs configured         : 1\nPeer Gateway                      : Enabled\nAuto-recovery status              : Enabled, timer is off.(timeout = 240s)\nDelay-restore status              : Timer is off.(timeout = 150s)\n\nid    Port   Status Consistency Reason                Active vlans\n20    Po20   up     success     success               10,20",
+     "comment": "Peer adjacency, keepalive and consistency are the three lines to read first."
+    },
+    {
+     "cmd": "show vpc consistency-parameters interface port-channel 20",
+     "output": "Name                        Type  Local Value            Peer Value\nPort Mode                   1     trunk                  trunk\nSpeed                       1     10 Gb/s                10 Gb/s\nAllowed VLANs               -     10,20                  10,20",
+     "comment": "A Type 1 mismatch would appear here and explain a suspended member."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "trunk",
+   "markdown": "## Trunking and port channel details\n\nUse LACP (`channel-group N mode active`) for vPC members; `mode on` gives no negotiation and hides cabling mistakes. On a Nexus switch, a trunk carries all VLANs by default, so always prune with `switchport trunk allowed vlan`, and ensure the list is identical on both peers because it is a Type 1 parameter on member ports.\n\nRemember these points when you troubleshoot:\n\n- Dot1Q tagging is the only encapsulation on Nexus, so no `switchport trunk encapsulation` command exists. Set `switchport mode trunk` directly.\n- The peer link should have at least two members, on separate line cards when possible, and its allowed VLAN list must include every vPC VLAN. Missing a VLAN on the peer link makes that VLAN \"inconsistent\" and suspends it on the secondary.\n- The vPC \"Active vlans\" column tells you which VLANs actually forward. A VLAN that exists on one peer only shows as inconsistent.\n- Member ports facing a Layer 3 device should not carry routing adjacencies across a vPC unless you understand the peer-link detour; a routing protocol over vPC is the classic trap, because the neighbor frame can arrive on either peer.\n- Use `port-channel load-balance` globally to match your traffic: the default hash on Nexus includes source and destination IP and L4 ports.\n\nFor hosts that cannot run LACP, `mode on` is possible, but use it deliberately and document it."
+  },
+  {
+   "type": "callout",
+   "id": "pitfall",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Putting the keepalive on the peer link or in the `default` VRF with no isolation.\n- Forgetting `spanning-tree port type network` on the peer link or `edge trunk` on host-facing members.\n- Changing a Type 1 parameter on one peer only. The secondary suspends the port channel immediately.\n- Reloading both peers together with a short `delay restore`, so members come up before routing is ready."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a NX-OSv or Nexus 9000v lab you own, build two switches with a vPC domain 10.\n\n1. Cable a two-link peer link and a routed keepalive in a dedicated VRF.\n2. Configure the domain as shown and confirm `show vpc brief` says \"peer adjacency formed ok\".\n3. Create `port-channel20` with `vpc 20` on both peers and attach a host or a third switch.\n4. On one peer only, change the allowed VLAN list of `port-channel20` and read `show vpc consistency-parameters`. Which side suspends?\n5. Shut the peer link and watch the keepalive protect you. Which peer suspends its members, and why?"
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "vPC domain",
+     "definition": "The pair of Nexus peers that present one logical LACP partner."
+    },
+    {
+     "term": "Peer link",
+     "definition": "The port channel between peers that carries control and orphan traffic."
+    },
+    {
+     "term": "Peer keepalive",
+     "definition": "A Layer 3 heartbeat, separate from the peer link, that detects a dead peer."
+    },
+    {
+     "term": "Orphan port",
+     "definition": "A non-vPC port on a vPC VLAN."
+    },
+    {
+     "term": "Type 1 consistency",
+     "definition": "Parameters that must match or the vPC is suspended."
+    },
+    {
+     "term": "peer-switch",
+     "definition": "Shares one STP bridge ID across both peers."
+    },
+    {
+     "term": "peer-gateway",
+     "definition": "Lets a peer route frames sent to the other peer's router MAC."
+    },
+    {
+     "term": "delay restore",
+     "definition": "A timer that holds vPC members down after reload."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which path must carry the vPC peer keepalive?",
+     "options": [
+      "The peer link",
+      "A separate Layer 3 path, ideally in its own VRF",
+      "A vPC member port channel",
+      "The STP root port"
+     ],
+     "answer": 1,
+     "explanation": "The keepalive must be independent of the peer link, otherwise one failure removes both signals and the peers cannot distinguish a dead peer from a dead link."
+    },
+    {
+     "question": "The peer link fails but the keepalive still works. What happens?",
+     "options": [
+      "Both peers keep forwarding",
+      "The secondary suspends its vPC member ports and SVIs",
+      "The primary suspends its vPC member ports",
+      "The domain is deleted"
+     ],
+     "answer": 1,
+     "explanation": "The secondary knows the primary is alive, so it suspends its members to avoid a split brain and the primary keeps forwarding."
+    },
+    {
+     "question": "Which of these are Type 1 consistency parameters? (Choose all that apply.)",
+     "options": [
+      "Allowed VLAN list on a member port channel",
+      "STP mode",
+      "Port channel speed",
+      "The interface description"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Trunk allowed VLANs, STP mode and speed must match. A description has no forwarding effect."
+    },
+    {
+     "question": "What does `peer-gateway` protect against?",
+     "options": [
+      "Devices that reply to a peer's router MAC instead of the HSRP virtual MAC",
+      "Loops on the peer link",
+      "Keepalive loss",
+      "LACP mismatches"
+     ],
+     "answer": 0,
+     "explanation": "Without it, such frames would be bridged across the peer link rather than routed locally."
+    },
+    {
+     "question": "Which command is not valid on a Nexus trunk?",
+     "options": [
+      "switchport mode trunk",
+      "switchport trunk allowed vlan 10,20",
+      "switchport trunk encapsulation dot1q",
+      "switchport trunk native vlan 99"
+     ],
+     "answer": 2,
+     "explanation": "Nexus supports only Dot1Q, so the encapsulation command does not exist."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nvPC gives a server dual-homed, loop-free Layer 2 connectivity while each Nexus keeps an independent control plane. Read `show vpc brief` for adjacency, keepalive and consistency; remember that Type 1 mismatches suspend ports on the secondary and that a peer-link failure suspends the secondary when the keepalive is alive. Tune with `peer-switch`, `peer-gateway`, `auto-recovery` and `delay restore`, and prune trunks identically on both peers. Next, see how STP behaves around this design in [STP and MST in the Data Center](/learn/enterprise-datacenter-networking/stp-and-mst-in-the-data-center)."
+  }
+ ],
+ "ar": {
+  "title": "vPC وقنوات المنافذ والوصلات الرئيسية (Trunking)",
+  "summary": "ابنِ vPC على مبدّلات Nexus واستكشف أعطاله: وصلة النظير والنبضة وقواعد التوافق وسلوك الأعطال وتفاصيل الوصلات الرئيسية.",
+  "objectives": [
+   "وصف نطاق vPC ووصلة النظير والنبضة والمنافذ اليتيمة",
+   "توقّع أي نظير يعلّق منافذه بعد عطل أو عدم تطابق من النوع 1",
+   "إعداد vPC مع peer-switch وpeer-gateway وauto-recovery وdelay restore",
+   "التحقق من vPC واستكشاف أعطاله بأوامر show vpc",
+   "تطبيق الوصلات الرئيسية وLACP بشكل صحيح على Nexus"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "يجب أن يبدو زوجٌ من مبدّلات Nexus للخادم كأنه مبدّل واحد، ومع ذلك يحتفظ كلٌّ منهما بمستوى تحكم (control plane) خاص به حتى لا تُسقط ترقيةُ البرمجيات على أحدهما الرفَّ كلَّه. وهذه هي المشكلة التي تحلّها قناة المنافذ الافتراضية (Virtual Port Channel) المعروفة بـ vPC. في مختبر CCIE Data Center سيُطلب منك أن تبنيها وأن تتسبب في عطلها ثم تكتشف لماذا علّق أحد النظيرين منافذه الأعضاء.\n\nيغطي هذا الدرس بنية vPC، وقواعد التوافق (consistency) التي تحدد ظهور قناة المنافذ، ومعالجة الأعطال التي تمنع الحلقات وانقسام الدماغ (split brain)، وتفاصيل الوصلات الرئيسية (Trunking) المرتبطة بها. وللاطلاع على جانب منع الحلقات في الطبقة الثانية راجع [STP وMST في مراكز البيانات](/learn/enterprise-datacenter-networking/stp-and-mst-in-the-data-center)، وللنسخة المعتمدة على VXLAN راجع [VXLAN EVPN Fabrics](/learn/enterprise-datacenter-networking/vxlan-evpn-fabrics)."
+   },
+   {
+    "type": "text",
+    "id": "arch",
+    "markdown": "## مكوّنات vPC\n\nيضم نطاق vPC نظيرين اثنين فقط. وتعمل المنظومة بثلاثة أنواع من الوصلات وبروتوكول واحد:\n\n| العنصر | الغرض |\n|:--|:--|\n| وصلة النظير (Peer link) | قناة منافذ عادية (`vpc peer-link`) تحمل حركة VLAN الخاصة بـ vPC وحركة التحكم (CFS) وحركة المنافذ اليتيمة بين النظيرين |\n| نبضة النظير (Peer keepalive) | مسار مستقل من الطبقة الثالثة، ويُفضَّل أن يكون في VRF خاص، يثبت أن النظير الآخر حيّ |\n| منفذ عضو في vPC | قناة منافذ تحمل الرقم نفسه `vpc <number>` على النظيرين وتتصل بجهاز واحد في الاتجاه الأدنى |\n| المنفذ اليتيم (Orphan port) | أي منفذ ليس ضمن vPC لكنه يقع على VLAN تابعة لـ vPC |\n\nيرى الجهاز في الاتجاه الأدنى شريك LACP واحداً لأن النظيرين يعلنان معرّف النظام نفسه المشتق من نطاق vPC. ويعمل كل نظير بالتحويل المحلي أولاً: فالإطار الذي يصل إلى نظير ووجهته منفذ عضو في vPC على النظير نفسه لا يعبر وصلة النظير أبداً. وهذه أهم قاعدة لمنع الحلقات: **الإطار المستلم عبر وصلة النظير لا يُرسَل خارجاً عبر منفذ عضو في vPC** متى كان للنظير الآخر منفذ عضو فعّال. لذلك تحمل وصلة النظير حركة قليلة في التصميم السليم.\n\nيجب ألا تمرّ النبضة عبر وصلة النظير، وألا تستخدم الـ VRF الافتراضي إن أمكن تجنّب ذلك. والخيار المعتاد هو `management` VRF أو وصلة موجّهة نقطة إلى نقطة. فلو شاركت النبضةُ وصلةَ النظير لأزال عطلٌ واحد الإشارتين معاً وفقدتَ القدرة على التمييز بين نظير ميت ووصلة ميتة."
+   },
+   {
+    "type": "animation",
+    "id": "vpc-anim",
+    "kind": "sequence",
+    "title": "عطل وصلة النظير والحماية من انقسام الدماغ",
+    "data": {
+     "actors": [
+      {
+       "id": "p",
+       "label": "N9K-A",
+       "sub": "vPC أساسي",
+       "icon": "switch"
+      },
+      {
+       "id": "s",
+       "label": "N9K-B",
+       "sub": "vPC ثانوي",
+       "icon": "switch"
+      },
+      {
+       "id": "h",
+       "label": "Server",
+       "sub": "LACP",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "p",
+       "to": "s",
+       "label": "CFS",
+       "detail": "peer link",
+       "note": "يزامن النظيران عناوين MAC وحالة IGMP ومعاملات التوافق عبر وصلة النظير."
+      },
+      {
+       "from": "p",
+       "to": "s",
+       "label": "keepalive",
+       "detail": "UDP 3200",
+       "note": "تنتقل رسائل النبضة كل ثانية عبر المسار المستقل من الطبقة الثالثة.",
+       "tone": "secure"
+      },
+      {
+       "from": "h",
+       "to": "p",
+       "label": "حركة",
+       "detail": "Po20 member",
+       "note": "يوزّع الخادم التدفقات على النظيرين."
+      },
+      {
+       "from": "s",
+       "to": "s",
+       "label": "سقوط وصلة النظير",
+       "note": "تسقط وصلة النظير لكن النبضة تستمر في الرد.",
+       "tone": "warning"
+      },
+      {
+       "from": "s",
+       "to": "p",
+       "label": "keepalive",
+       "detail": "النظير حيّ",
+       "note": "يعلم الثانوي أن الأساسي حيّ، فليست الحالة موت نظير."
+      },
+      {
+       "from": "s",
+       "to": "s",
+       "label": "تعليق منافذ vPC",
+       "note": "يعلّق الثانوي منافذه الأعضاء وواجهات SVI، فيبقى الأساسي وحده يمرّر الحركة، فلا ينقسم الدماغ.",
+       "tone": "danger"
+      },
+      {
+       "from": "h",
+       "to": "p",
+       "label": "حركة",
+       "detail": "Po20 (1 link)",
+       "note": "يواصل الخادم العمل عبر الوصلة الباقية.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "cons",
+    "markdown": "## التوافق وانتخاب الأدوار\n\nعند تشكّل نطاق vPC يتبادل النظيران إعداداتهما عبر CFS (خدمات Cisco Fabric) ويقارنانها. وهناك صنفان من حالات عدم التطابق:\n\n- معاملات **النوع 1** يجب أن تتطابق وإلا عُلِّق الـ vPC (على المستوى العام: وضع STP ومنطقة MST وسياسة QoS الشبكية؛ وعلى مستوى الواجهة: وضع قناة المنافذ والسرعة والازدواج وVLAN المسموحة على الوصلة الرئيسية وVLAN الأصلية).\n- معاملات **النوع 2** يكتفي عدم تطابقها بتحذير، لكنها قد تسبب سلوك تمرير غير متوقع (مثل اختلاف SVI أو ACL).\n\nومع تفعيل فحص التوافق المتدرّج (graceful consistency check، وهو الافتراضي)، يعلّق عدمُ تطابق النوع 1 الـ vPC على النظير **الثانوي** فقط، فتستمر الحركة عبر الأساسي.\n\nيُنتخب الدور الأساسي والثانوي بحسب `role priority` (الأقل يفوز، والافتراضي 32667). وللدور أثر في ثلاثة أمور: أي نظير يواصل التمرير بعد سقوط وصلة النظير، وأي نظير يصدر وحدات BPDU عند استخدام STP، وأي نظير هو المرجع في بعض الميزات. والاستباق (preemption) غير تلقائي. لذلك اضبط الأولويات صراحةً ليكون الدور الذي تتوقعه هو الدور الذي تحصل عليه بعد إعادة التشغيل.\n\n### أوامر ضبط مفيدة\n\n- `peer-switch` يجعل النظيرين يتشاركان معرّف جسر STP واحداً فيستطيع كلٌّ منهما إرسال BPDU، فيزول تغيّر الطوبولوجيا عند سقوط الأساسي.\n- `peer-gateway` يتيح لنظير توجيه الإطارات الموجّهة إلى MAC الموجّه الخاص بالنظير الآخر، وهذا يحمي من الأجهزة التي ترد على MAC المصدر بدل MAC الافتراضي لـ HSRP.\n- `auto-recovery` يتيح لنظير تولّي الدور الأساسي إن أعاد التشغيل ولم يعد النظير الآخر.\n- `delay restore` يُبقي منافذ vPC الأعضاء معطّلة بعد إعادة التشغيل حتى تتقارب جداول التوجيه (الافتراضي 30 ثانية، ويُرفع غالباً إلى 150 أو أكثر مع جداول FHRP أو EVPN الكبيرة).\n- `ip arp synchronize` و`ipv6 nd synchronize` ينسخان مدخلات ARP وND إلى النظير بعد إعادة تشغيله."
+   },
+   {
+    "type": "text",
+    "id": "cfg",
+    "markdown": "## ترتيب الإعداد الصحيح\n\nفعّل `feature vpc` و`feature lacp`، ثم ابنِ النطاق والنبضة ووصلة النظير والأعضاء بهذا الترتيب. تستخدم النبضة عناوين من VRF مخصص، لذا أنشئه أولاً."
+   },
+   {
+    "type": "code",
+    "id": "vpc-cfg",
+    "language": "cisco",
+    "filename": "N9K-A.cfg",
+    "caption": "يطابق N9K-B هذا الإعداد مع عنوان مصدر مختلف للنبضة وأولوية دور 200.",
+    "code": "feature vpc\nfeature lacp\nvrf context VPC-KA\n!\ninterface Ethernet1/48\n  no switchport\n  vrf member VPC-KA\n  ip address 192.0.2.1/30\n  no shutdown\n!\nvpc domain 10\n  role priority 100\n  peer-keepalive destination 192.0.2.2 source 192.0.2.1 vrf VPC-KA\n  peer-switch\n  peer-gateway\n  auto-recovery\n  delay restore 150\n  ip arp synchronize\n!\ninterface port-channel1\n  switchport mode trunk\n  switchport trunk allowed vlan 10,20,30\n  spanning-tree port type network\n  vpc peer-link\n!\ninterface Ethernet1/1-2\n  switchport mode trunk\n  channel-group 1 mode active\n!\ninterface port-channel20\n  switchport mode trunk\n  switchport trunk allowed vlan 10,20\n  spanning-tree port type edge trunk\n  vpc 20\n!\ninterface Ethernet1/10\n  switchport mode trunk\n  channel-group 20 mode active"
+   },
+   {
+    "type": "terminal",
+    "id": "vpc-verify",
+    "title": "التحقق من vPC",
+    "prompt": "N9K-A#",
+    "lines": [
+     {
+      "cmd": "show vpc brief",
+      "output": "vPC domain id                     : 10\nPeer status                       : peer adjacency formed ok\nvPC keep-alive status             : peer is alive\nConfiguration consistency status  : success\nPer-vlan consistency status       : success\nType-2 consistency status         : success\nvPC role                          : primary\nNumber of vPCs configured         : 1\nPeer Gateway                      : Enabled\nAuto-recovery status              : Enabled, timer is off.(timeout = 240s)\nDelay-restore status              : Timer is off.(timeout = 150s)\n\nid    Port   Status Consistency Reason                Active vlans\n20    Po20   up     success     success               10,20",
+      "comment": "اقرأ أولاً الأسطر الثلاثة: التجاور والنبضة والتوافق."
+     },
+     {
+      "cmd": "show vpc consistency-parameters interface port-channel 20",
+      "output": "Name                        Type  Local Value            Peer Value\nPort Mode                   1     trunk                  trunk\nSpeed                       1     10 Gb/s                10 Gb/s\nAllowed VLANs               -     10,20                  10,20",
+      "comment": "سيظهر هنا أي عدم تطابق من النوع 1 ويفسّر منفذاً معلّقاً."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "trunk",
+    "markdown": "## تفاصيل الوصلات الرئيسية وقنوات المنافذ\n\nاستخدم LACP (`channel-group N mode active`) لمنافذ vPC الأعضاء؛ فالوضع `mode on` لا يجري تفاوضاً ويُخفي أخطاء التوصيل. وعلى مبدّل Nexus تحمل الوصلة الرئيسية جميع VLAN افتراضياً، فلذلك قلّم دائماً بالأمر `switchport trunk allowed vlan`، وتأكد من تطابق القائمة على النظيرين لأنها معامل من النوع 1 على المنافذ الأعضاء.\n\nتذكّر هذه النقاط عند استكشاف الأعطال:\n\n- الوسم Dot1Q هو التغليف الوحيد في Nexus، فلا يوجد الأمر `switchport trunk encapsulation`. اضبط `switchport mode trunk` مباشرة.\n- ينبغي أن تضم وصلة النظير عضوين على الأقل، وعلى بطاقتي خطوط مختلفتين إن أمكن، ويجب أن تشمل قائمة VLAN المسموحة عليها كل VLAN تابعة لـ vPC. وغياب VLAN عن وصلة النظير يجعلها «غير متوافقة» ويعلّقها على الثانوي.\n- يُظهر عمود «Active vlans» في vPC أي VLAN تمرّر فعلاً. وVLAN الموجودة على نظير واحد فقط تظهر غير متوافقة.\n- لا ينبغي أن تحمل المنافذ الأعضاء المتجهة إلى جهاز من الطبقة الثالثة تجاورات توجيه عبر vPC ما لم تفهم مسار الالتفاف عبر وصلة النظير؛ فبروتوكول التوجيه فوق vPC فخٌّ كلاسيكي لأن إطار الجار قد يصل إلى أي من النظيرين.\n- استخدم `port-channel load-balance` عاماً ليلائم حركتك: فدالة التجزئة الافتراضية في Nexus تشمل عناوين IP المصدر والوجهة ومنافذ الطبقة الرابعة.\n\nوللمضيفات التي لا تدعم LACP يمكن استخدام `mode on`، لكن استخدمه عن قصد ووثّقه."
+   },
+   {
+    "type": "callout",
+    "id": "pitfall",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- وضع النبضة على وصلة النظير أو في الـ VRF الافتراضي دون عزل.\n- نسيان `spanning-tree port type network` على وصلة النظير أو `edge trunk` على الأعضاء المتجهة إلى المضيفين.\n- تغيير معامل من النوع 1 على نظير واحد فقط، فيعلّق الثانوي قناة المنافذ فوراً.\n- إعادة تشغيل النظيرين معاً مع `delay restore` قصير، فتعمل المنافذ الأعضاء قبل أن يجهز التوجيه."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر NX-OSv أو Nexus 9000v تملكه، ابنِ مبدّلين بنطاق vPC رقم 10.\n\n1. وصّل وصلة نظير من رابطين ونبضة موجّهة في VRF مخصص.\n2. اضبط النطاق كما هو موضح وتأكد أن `show vpc brief` يعرض «peer adjacency formed ok».\n3. أنشئ `port-channel20` مع `vpc 20` على النظيرين ووصّل مضيفاً أو مبدّلاً ثالثاً.\n4. غيّر قائمة VLAN المسموحة لـ `port-channel20` على نظير واحد فقط واقرأ `show vpc consistency-parameters`. أي جانب يُعلَّق؟\n5. أسقط وصلة النظير وراقب كيف تحميك النبضة. أي نظير يعلّق أعضاءه ولماذا؟"
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "نطاق vPC",
+      "definition": "زوج نظيرَي Nexus اللذين يقدّمان شريك LACP منطقياً واحداً."
+     },
+     {
+      "term": "وصلة النظير",
+      "definition": "قناة المنافذ بين النظيرين التي تحمل حركة التحكم والحركة اليتيمة."
+     },
+     {
+      "term": "نبضة النظير",
+      "definition": "نبضة من الطبقة الثالثة مستقلة عن وصلة النظير تكشف النظير الميت."
+     },
+     {
+      "term": "المنفذ اليتيم",
+      "definition": "منفذ غير تابع لـ vPC على VLAN تابعة له."
+     },
+     {
+      "term": "توافق النوع 1",
+      "definition": "معاملات يجب أن تتطابق وإلا عُلِّق الـ vPC."
+     },
+     {
+      "term": "peer-switch",
+      "definition": "يشارك معرّف جسر STP واحداً بين النظيرين."
+     },
+     {
+      "term": "peer-gateway",
+      "definition": "يتيح لنظير توجيه الإطارات الموجّهة إلى MAC الموجّه الخاص بالنظير الآخر."
+     },
+     {
+      "term": "delay restore",
+      "definition": "مؤقت يُبقي منافذ vPC الأعضاء معطّلة بعد إعادة التشغيل."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي مسار يجب أن يحمل نبضة نظير vPC؟",
+      "options": [
+       "وصلة النظير",
+       "مسار مستقل من الطبقة الثالثة، ويُفضَّل في VRF خاص",
+       "قناة منافذ عضو في vPC",
+       "منفذ الجذر في STP"
+      ],
+      "answer": 1,
+      "explanation": "يجب أن تكون النبضة مستقلة عن وصلة النظير وإلا أزال عطلٌ واحد الإشارتين ولم يستطع النظيران التمييز بين نظير ميت ووصلة ميتة."
+     },
+     {
+      "question": "تسقط وصلة النظير لكن النبضة تعمل. ماذا يحدث؟",
+      "options": [
+       "يواصل النظيران التمرير",
+       "يعلّق الثانوي منافذ vPC الأعضاء وواجهات SVI",
+       "يعلّق الأساسي منافذه الأعضاء",
+       "يُحذف النطاق"
+      ],
+      "answer": 1,
+      "explanation": "يعلم الثانوي أن الأساسي حيّ، فيعلّق أعضاءه لتجنّب انقسام الدماغ، ويواصل الأساسي التمرير."
+     },
+     {
+      "question": "أي مما يلي من معاملات التوافق من النوع 1؟ (اختر كل ما ينطبق)",
+      "options": [
+       "قائمة VLAN المسموحة على قناة منافذ عضو",
+       "وضع STP",
+       "سرعة قناة المنافذ",
+       "وصف الواجهة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يجب أن تتطابق VLAN المسموحة ووضع STP والسرعة. أما الوصف فلا أثر له في التمرير."
+     },
+     {
+      "question": "مما يحمي `peer-gateway`؟",
+      "options": [
+       "أجهزة ترد على MAC الموجّه الخاص بالنظير بدل MAC الافتراضي لـ HSRP",
+       "الحلقات على وصلة النظير",
+       "فقدان النبضة",
+       "عدم تطابق LACP"
+      ],
+      "answer": 0,
+      "explanation": "من دونه تُعبَّر هذه الإطارات عبر وصلة النظير بدل توجيهها محلياً."
+     },
+     {
+      "question": "أي أمر غير صالح على وصلة رئيسية في Nexus؟",
+      "options": [
+       "switchport mode trunk",
+       "switchport trunk allowed vlan 10,20",
+       "switchport trunk encapsulation dot1q",
+       "switchport trunk native vlan 99"
+      ],
+      "answer": 2,
+      "explanation": "يدعم Nexus Dot1Q فقط، فلا وجود لأمر التغليف."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nيمنح vPC الخادمَ المتصل بجهازين اتصالاً خالياً من الحلقات في الطبقة الثانية، بينما يحتفظ كل Nexus بمستوى تحكم مستقل. اقرأ `show vpc brief` لمعرفة التجاور والنبضة والتوافق؛ وتذكّر أن عدم تطابق النوع 1 يعلّق المنافذ على الثانوي، وأن سقوط وصلة النظير يعلّق الثانوي ما دامت النبضة حيّة. اضبط الأداء بـ `peer-switch` و`peer-gateway` و`auto-recovery` و`delay restore`، وقلّم الوصلات الرئيسية بالتطابق على النظيرين. وللمتابعة، اطّلع على سلوك STP حول هذا التصميم في [STP وMST في مراكز البيانات](/learn/enterprise-datacenter-networking/stp-and-mst-in-the-data-center)."
+   }
+  ]
+ }
+}

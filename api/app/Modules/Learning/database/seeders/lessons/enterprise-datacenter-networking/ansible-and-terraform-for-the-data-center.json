@@ -1,0 +1,550 @@
+{
+ "slug": "ansible-and-terraform-for-the-data-center",
+ "title": "Ansible and Terraform for the Data Center",
+ "summary": "Automate Nexus and ACI with Ansible playbooks and Terraform configurations, and understand idempotency, state and safe pipelines.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain agentless Ansible, inventories, playbooks and modules",
+  "Write an idempotent NX-OS playbook and dry-run it",
+  "Describe Terraform providers, plan, apply and state",
+  "Choose between Ansible and Terraform for a task",
+  "Apply safe-automation practices"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A data center with 80 leaf switches has a problem: a new NTP server must be configured everywhere by Friday. Logging in to each switch by hand takes a day and guarantees that two switches will be typed differently. Six months later nobody can say which switches match the standard and which have drifted.\n\nAutomation tools solve this by treating the network as **code**. You describe the desired result in a text file, keep it in Git, and let a tool make reality match it. This lesson covers the two tools the DCCOR blueprint names most often: **Ansible**, which pushes configuration and runs operational tasks, and **Terraform**, which builds and tracks infrastructure through its lifecycle. For the API foundations underneath both, see [Data Center Programmability and APIs](/learn/enterprise-datacenter-networking/data-center-programmability-and-apis)."
+  },
+  {
+   "id": "ansible",
+   "type": "text",
+   "markdown": "## Ansible: agentless configuration management\n\nAnsible is **agentless**. The control node connects to each device over SSH or an API, runs a task, and disconnects. Nothing is installed on the switch. Three files matter:\n\n- **Inventory:** the list of devices, grouped by role (`leafs`, `spines`).\n- **Playbook:** a YAML file that lists *plays*, and each play lists *tasks* to run against a group.\n- **Variables and Vault:** per-device or per-group data, with secrets encrypted by `ansible-vault`.\n\nEach task calls a **module**. Cisco ships collections such as `cisco.nxos`, `cisco.aci`, `cisco.dcnm` (now used for Nexus Dashboard Fabric Controller) and `cisco.intersight`. Resource modules like `nxos_vlans` or `nxos_interfaces` take structured data and understand a `state`: `merged` adds what is missing, `replaced` and `overridden` remove what is not listed, and `deleted` removes the listed items. The generic `nxos_config` module simply sends CLI lines.\n\n### Idempotency\n\nA good task is **idempotent**: running it twice gives the same result as running it once. If VLAN 110 already exists with the right name, the module reports `ok` and changes nothing. Raw CLI through `nxos_config` is idempotent only because the module compares the lines with the running configuration first. Free-form `command` or `raw` modules are not, so use them for `show` commands only."
+  },
+  {
+   "id": "inv",
+   "type": "code",
+   "language": "ini",
+   "code": "[leafs]\nleaf01 ansible_host=192.0.2.101\nleaf02 ansible_host=192.0.2.102\n\n[leafs:vars]\nansible_user=automation\nansible_password={{ vault_leaf_password }}\n",
+   "filename": "inventory.ini",
+   "caption": "An inventory groups switches by role. The password is a Vault variable, never plain text."
+  },
+  {
+   "id": "play",
+   "type": "code",
+   "language": "yaml",
+   "code": "---\n- name: Baseline Nexus leaf switches\n  hosts: leafs\n  gather_facts: false\n  connection: ansible.netcommon.network_cli\n  vars:\n    ansible_network_os: cisco.nxos.nxos\n  tasks:\n    - name: Enable required features\n      cisco.nxos.nxos_feature:\n        feature: \"{{ item }}\"\n        state: enabled\n      loop: [bgp, nv overlay, vn-segment-vlan-based]\n\n    - name: Configure server VLANs\n      cisco.nxos.nxos_vlans:\n        config:\n          - vlan_id: 110\n            name: WEB\n          - vlan_id: 120\n            name: APP\n        state: merged\n\n    - name: Set NTP server\n      cisco.nxos.nxos_config:\n        lines:\n          - ntp server 192.0.2.10 use-vrf management\n",
+   "filename": "leaf-baseline.yml",
+   "caption": "A playbook with three tasks. Re-running it should report changed=0 on a compliant leaf."
+  },
+  {
+   "id": "run",
+   "type": "terminal",
+   "title": "Control node",
+   "lines": [
+    {
+     "cmd": "ansible-playbook -i inventory.ini leaf-baseline.yml --check --diff",
+     "output": "PLAY [Baseline Nexus leaf switches] ****\nTASK [Configure server VLANs] ****\nchanged: [leaf02]\nok: [leaf01]\n\nPLAY RECAP ****\nleaf01 : ok=3 changed=0 unreachable=0 failed=0\nleaf02 : ok=3 changed=1 unreachable=0 failed=0",
+     "comment": "--check is a dry run; leaf02 has drifted"
+    },
+    {
+     "cmd": "ansible-playbook -i inventory.ini leaf-baseline.yml",
+     "output": "PLAY RECAP ****\nleaf01 : ok=3 changed=0 unreachable=0 failed=0\nleaf02 : ok=3 changed=1 unreachable=0 failed=0",
+     "comment": "the real run fixes only leaf02"
+    }
+   ],
+   "caption": "Dry run first, then apply. The recap shows exactly which devices changed."
+  },
+  {
+   "id": "terraform",
+   "type": "text",
+   "markdown": "## Terraform: declarative infrastructure with state\n\nTerraform describes **resources** in HashiCorp Configuration Language (HCL). A **provider** plugin translates those resources into API calls. Cisco and partners publish providers for ACI (`CiscoDevNet/aci`), Nexus Dashboard, Intersight, and also for the public clouds the data center connects to.\n\nThe defining idea is **state**. Terraform records what it created in a state file. On each run it compares three things: your code, the state, and the real system. The workflow is always the same:\n\n1. `terraform init` downloads the provider.\n2. `terraform plan` shows what would be created, changed or destroyed.\n3. `terraform apply` makes the changes and updates the state.\n4. `terraform destroy` removes everything the configuration manages.\n\nResources can reference each other, as `aci_vrf.prod_vrf` references the tenant above. Terraform reads those references to build a dependency graph, so it creates the tenant first and the bridge domain last without you ordering anything.\n\nBecause the state file can contain secrets and is the source of truth, keep it in a **remote backend** with locking, never in a laptop folder or in Git. Two engineers who apply at the same time without locking can corrupt it."
+  },
+  {
+   "id": "tf",
+   "type": "code",
+   "language": "hcl",
+   "code": "terraform {\n  required_providers {\n    aci = {\n      source  = \"CiscoDevNet/aci\"\n      version = \"~> 2.0\"\n    }\n  }\n}\n\nprovider \"aci\" {\n  url      = \"https://apic.example.com\"\n  username = \"terraform\"\n  password = var.apic_password   # supplied from a secret store\n}\n\nresource \"aci_tenant\" \"prod\" {\n  name = \"PROD\"\n}\n\nresource \"aci_vrf\" \"prod_vrf\" {\n  tenant_dn = aci_tenant.prod.id\n  name      = \"PROD-VRF\"\n}\n\nresource \"aci_bridge_domain\" \"web\" {\n  tenant_dn          = aci_tenant.prod.id\n  name               = \"WEB-BD\"\n  relation_fv_rs_ctx = aci_vrf.prod_vrf.id\n}\n",
+   "filename": "main.tf",
+   "caption": "A tenant, a VRF and a bridge domain in ACI. References create the dependency order."
+  },
+  {
+   "id": "ops",
+   "type": "text",
+   "markdown": "## Operational tasks beyond configuration\n\nAutomation is not only for building. The same tools handle the daily work that consumes an operations team.\n\n- **Compliance checks:** a playbook runs `show running-config` or a structured `nxos_facts` task, compares the result with a golden template, and reports the switches that differ. Run it nightly and drift never lasts more than a day.\n- **Software upgrades:** a play can copy the NX-OS image, verify its checksum, run `install all` on one vPC peer, wait for it to return, check that the vPC is healthy, and only then move to the second peer. Serial execution (`serial: 1`) keeps a bad image from taking down both peers at once.\n- **Backups:** before each change, save the running configuration to a Git repository so a rollback is a commit away.\n- **Evidence for audits:** every run produces a log that shows who changed what and when.\n\nThe order of steps matters more than the tool. A fabric change should always follow the same loop: capture the current state, apply the change to a small group, verify with `show` commands or telemetry, and continue only if the checks pass. Tools that support a check mode and a diff make that loop cheap, and tools that keep a state file make the result auditable."
+  },
+  {
+   "id": "pipe",
+   "type": "animation",
+   "kind": "flow",
+   "title": "From Git commit to fabric change",
+   "caption": "Every change is reviewed, planned and applied from one pipeline.",
+   "data": {
+    "token": "Change",
+    "nodes": [
+     {
+      "id": "git",
+      "label": "Git repo",
+      "sub": "playbooks, HCL",
+      "icon": "file"
+     },
+     {
+      "id": "ci",
+      "label": "CI pipeline",
+      "sub": "lint, plan",
+      "icon": "cpu"
+     },
+     {
+      "id": "tool",
+      "label": "Ansible / Terraform",
+      "sub": "control node",
+      "icon": "server"
+     },
+     {
+      "id": "fab",
+      "label": "Fabric",
+      "sub": "NX-OS, ACI",
+      "icon": "switch"
+     },
+     {
+      "id": "mon",
+      "label": "Verification",
+      "sub": "show, telemetry",
+      "icon": "eye"
+     }
+    ],
+    "steps": [
+     {
+      "at": "git",
+      "caption": "An engineer opens a pull request that changes the VLAN list."
+     },
+     {
+      "at": "ci",
+      "caption": "The pipeline lints the YAML and runs terraform plan or ansible --check."
+     },
+     {
+      "at": "ci",
+      "caption": "A peer reviews the plan output and approves the merge.",
+      "tone": "success"
+     },
+     {
+      "at": "tool",
+      "caption": "The merge triggers the tool on a control node with credentials from a vault."
+     },
+     {
+      "at": "fab",
+      "caption": "Modules or the provider push the change through NX-API or the APIC REST API."
+     },
+     {
+      "at": "mon",
+      "caption": "A post-check confirms the intended state, or the pipeline rolls back.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "id": "compare",
+   "type": "text",
+   "markdown": "## Choosing between them\n\nBoth tools are declarative in spirit, but they differ in how they track the world.\n\n| Aspect | Ansible | Terraform |\n|:--|:--|:--|\n| Model | Task list run in order | Desired-state graph |\n| Tracks state | No, it inspects the device each run | Yes, in a state file |\n| Strength | Device configuration, ad hoc tasks, `show` collection | Provisioning and lifecycle of objects |\n| Removal | Explicit (`state: deleted`) | Automatic when a resource leaves the code |\n| Typical DC use | NX-OS baselines, upgrades, compliance | ACI tenants, Intersight policies, cloud networks |\n\nMany teams use both: Terraform creates the ACI tenant and policies, then Ansible configures the legacy NX-OS standalone switches around it. Cisco also provides Python and Cisco ACI Python tooling for cases where a playbook is not enough. For NX-OS, Ansible can talk through `network_cli` (SSH) or `httpapi` (NX-API); the latter is faster and returns structured data.\n\nWhatever the tool, the practices that make it safe are the same: version control for all code, peer review, a dry run before every change, secrets in a vault, and small changes rolled out to one switch pair before the whole fabric."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "State and secrets",
+   "markdown": "Never commit `terraform.tfstate` or a plain-text password to Git. The state file can contain provider credentials and object details. Use a remote backend with locking and encryption, and feed passwords from a secret store or `ansible-vault`. Also remember `terraform destroy` and `state: overridden` are destructive: run `plan` or `--check` first and read the output."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab (Cisco Modeling Labs, DevNet Sandbox or a Nexus 9000v), install Ansible and the `cisco.nxos` collection with `ansible-galaxy collection install cisco.nxos`. Write the inventory and playbook above for one switch. Run it with `--check --diff`, then without. Run it a third time and confirm `changed=0`. Finally, change VLAN 110's name by hand on the switch and run again to watch Ansible correct the drift."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Playbook",
+     "definition": "A YAML file of plays and tasks that Ansible runs against an inventory."
+    },
+    {
+     "term": "Inventory",
+     "definition": "The list of managed devices and groups."
+    },
+    {
+     "term": "Module",
+     "definition": "A unit of work Ansible calls, such as nxos_vlans."
+    },
+    {
+     "term": "Idempotency",
+     "definition": "Running a task repeatedly gives the same result as running it once."
+    },
+    {
+     "term": "Provider",
+     "definition": "A Terraform plugin that translates resources into API calls."
+    },
+    {
+     "term": "State file",
+     "definition": "The record Terraform keeps of the objects it manages."
+    },
+    {
+     "term": "Plan",
+     "definition": "A preview of the changes Terraform would make."
+    },
+    {
+     "term": "Ansible Vault",
+     "definition": "Encryption for secrets stored in playbooks and variables."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which statement best describes why Ansible is called agentless?",
+     "options": [
+      "It needs no inventory file",
+      "It connects over SSH or an API and installs nothing on the device",
+      "It only works with devices that have no operating system",
+      "It runs only on the switch itself"
+     ],
+     "answer": 1,
+     "explanation": "Ansible runs from a control node and connects with SSH or an API such as NX-API. The device needs no extra software."
+    },
+    {
+     "question": "You run the same playbook twice and the second run reports changed=0. What does this show?",
+     "options": [
+      "The playbook failed silently",
+      "The tasks are idempotent and the devices already match",
+      "The inventory is empty",
+      "Ansible Vault is disabled"
+     ],
+     "answer": 1,
+     "explanation": "changed=0 means every module found the device already in the desired state."
+    },
+    {
+     "question": "Which are valid reasons to keep the Terraform state file in a remote backend? (Choose all that apply.)",
+     "options": [
+      "It can contain sensitive values",
+      "Locking prevents two simultaneous applies",
+      "It makes HCL syntax optional",
+      "It gives the whole team one source of truth"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "A remote backend protects sensitive data, supports locking and shares one state. It has no effect on HCL syntax."
+    },
+    {
+     "question": "Which command shows what Terraform would change without changing anything?",
+     "options": [
+      "terraform init",
+      "terraform plan",
+      "terraform apply",
+      "terraform destroy"
+     ],
+     "answer": 1,
+     "explanation": "plan previews creates, changes and destroys. init only downloads providers."
+    },
+    {
+     "question": "An ACI tenant must be removed automatically when its block is deleted from the repository. Which tool fits best?",
+     "options": [
+      "Ansible with raw commands",
+      "Terraform",
+      "A manual CLI session",
+      "Ansible with ad hoc show commands"
+     ],
+     "answer": 1,
+     "explanation": "Terraform compares code with state and destroys resources that no longer appear in the configuration."
+    }
+   ]
+  },
+  {
+   "id": "sum",
+   "type": "text",
+   "markdown": "## Summary\n\n- Ansible is agentless, uses inventories, playbooks and modules, and relies on idempotent tasks.\n- Cisco collections such as `cisco.nxos` and `cisco.aci` give modules for NX-OS, ACI and Nexus Dashboard.\n- Terraform uses providers, HCL and a state file, and follows `init`, `plan`, `apply`.\n- Ansible suits device configuration; Terraform suits provisioning and lifecycle.\n- Safe automation means Git, review, dry runs, vaulted secrets and small rollouts.\n\nNext, learn how to observe the network you now automate in [Data Center Monitoring: SPAN, NetFlow and Syslog](/learn/enterprise-datacenter-networking/data-center-monitoring-span-netflow-and-syslog)."
+  }
+ ],
+ "ar": {
+  "title": "Ansible وTerraform لمراكز البيانات",
+  "summary": "أتمتة Nexus وACI باستخدام كتب Ansible وإعدادات Terraform، وفهم التكرارية والحالة ومسارات التغيير الآمنة.",
+  "objectives": [
+   "شرح Ansible دون وكيل والجرد وكتب التشغيل والوحدات",
+   "كتابة كتاب تشغيل تكراري لـ NX-OS وتجربته جافاً",
+   "وصف مزوّدات Terraform وplan وapply والحالة",
+   "الاختيار بين Ansible وTerraform بحسب المهمة",
+   "تطبيق ممارسات الأتمتة الآمنة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يحتاج مركز بيانات فيه 80 مبدّلاً ورقيّاً (Leaf) إلى إضافة خادم NTP جديد في كل مكان قبل يوم الجمعة. الدخول إلى كل مبدّل يدوياً يستغرق يوماً كاملاً، ويضمن أن يُكتب الأمر بصورة مختلفة في مبدّلين على الأقل. وبعد ستة أشهر لا يستطيع أحد أن يقول أيّ المبدّلات مطابقٌ للمعيار وأيّها انحرف عنه.\n\nتحلّ أدوات الأتمتة هذه المشكلة بمعاملة الشبكة بوصفها **شيفرة (Code)**. تصف النتيجة المطلوبة في ملف نصي، وتحفظه في Git، وتترك الأداة تُطابق الواقع به. يتناول هذا الدرس أكثر أداتين ذكرهما مخطط DCCOR: **Ansible** التي تدفع الإعدادات وتنفّذ المهام التشغيلية، و**Terraform** التي تبني البنية التحتية وتتتبّع دورة حياتها. وللاطلاع على أساسات واجهات البرمجة التي تقوم عليها الأداتان راجع [برمجة مراكز البيانات وواجهات API](/learn/enterprise-datacenter-networking/data-center-programmability-and-apis)."
+   },
+   {
+    "id": "ansible",
+    "type": "text",
+    "markdown": "تعمل Ansible **دون وكيل (Agentless)**. تتصل عقدة التحكم بكل جهاز عبر SSH أو واجهة API، وتنفّذ مهمة، ثم تقطع الاتصال، ولا يُثبَّت شيء على المبدّل. وتهمّنا ثلاثة ملفات:\n\n- **ملف الجرد (Inventory):** قائمة الأجهزة مجمّعةً بحسب الدور (`leafs` و`spines`).\n- **كتاب التشغيل (Playbook):** ملف YAML يضم عدة *مسارح (Plays)*، ويحتوي كل مسرح على *مهام (Tasks)* تُنفَّذ على مجموعة من الأجهزة.\n- **المتغيرات وVault:** بيانات خاصة بكل جهاز أو مجموعة، وتُشفَّر الأسرار بالأمر `ansible-vault`.\n\nتستدعي كل مهمة **وحدة (Module)**. تقدّم Cisco مجموعات مثل `cisco.nxos` و`cisco.aci` و`cisco.dcnm` (تُستخدم الآن مع Nexus Dashboard Fabric Controller) و`cisco.intersight`. وتأخذ وحدات الموارد مثل `nxos_vlans` و`nxos_interfaces` بياناتٍ مهيكلة وتفهم الحالة `state`: تُضيف `merged` ما ينقص، وتحذف `replaced` و`overridden` ما لم يُذكر في القائمة، وتحذف `deleted` العناصر المذكورة. أما الوحدة العامة `nxos_config` فترسل أسطر CLI فحسب.\n\n### التكرارية (Idempotency)\n\nالمهمة الجيدة **تكرارية**: تنفيذها مرتين يعطي النتيجة نفسها كتنفيذها مرة واحدة. فإذا كانت VLAN 110 موجودة بالاسم الصحيح، تُبلغ الوحدة بالحالة `ok` ولا تغيّر شيئاً. وتكون أوامر CLI الخام عبر `nxos_config` تكرارية فقط لأن الوحدة تقارن الأسطر بالإعداد الجاري أولاً. أما الوحدتان الحرّتان `command` و`raw` فليستا كذلك، فاقتصر بهما على أوامر `show`."
+   },
+   {
+    "id": "inv",
+    "type": "code",
+    "language": "ini",
+    "code": "[leafs]\nleaf01 ansible_host=192.0.2.101\nleaf02 ansible_host=192.0.2.102\n\n[leafs:vars]\nansible_user=automation\nansible_password={{ vault_leaf_password }}\n",
+    "filename": "inventory.ini",
+    "caption": "ملف جرد يجمع المبدّلات بحسب الدور. كلمة المرور متغيّر في Vault وليست نصاً صريحاً."
+   },
+   {
+    "id": "play",
+    "type": "code",
+    "language": "yaml",
+    "code": "---\n- name: Baseline Nexus leaf switches\n  hosts: leafs\n  gather_facts: false\n  connection: ansible.netcommon.network_cli\n  vars:\n    ansible_network_os: cisco.nxos.nxos\n  tasks:\n    - name: Enable required features\n      cisco.nxos.nxos_feature:\n        feature: \"{{ item }}\"\n        state: enabled\n      loop: [bgp, nv overlay, vn-segment-vlan-based]\n\n    - name: Configure server VLANs\n      cisco.nxos.nxos_vlans:\n        config:\n          - vlan_id: 110\n            name: WEB\n          - vlan_id: 120\n            name: APP\n        state: merged\n\n    - name: Set NTP server\n      cisco.nxos.nxos_config:\n        lines:\n          - ntp server 192.0.2.10 use-vrf management\n",
+    "filename": "leaf-baseline.yml",
+    "caption": "كتاب تشغيل بثلاث مهام. إعادة تشغيله على مبدّل مطابق يجب أن تُظهر changed=0."
+   },
+   {
+    "id": "run",
+    "type": "terminal",
+    "title": "Control node",
+    "lines": [
+     {
+      "cmd": "ansible-playbook -i inventory.ini leaf-baseline.yml --check --diff",
+      "output": "PLAY [Baseline Nexus leaf switches] ****\nTASK [Configure server VLANs] ****\nchanged: [leaf02]\nok: [leaf01]\n\nPLAY RECAP ****\nleaf01 : ok=3 changed=0 unreachable=0 failed=0\nleaf02 : ok=3 changed=1 unreachable=0 failed=0",
+      "comment": "--check is a dry run; leaf02 has drifted"
+     },
+     {
+      "cmd": "ansible-playbook -i inventory.ini leaf-baseline.yml",
+      "output": "PLAY RECAP ****\nleaf01 : ok=3 changed=0 unreachable=0 failed=0\nleaf02 : ok=3 changed=1 unreachable=0 failed=0",
+      "comment": "the real run fixes only leaf02"
+     }
+    ],
+    "caption": "شغّل التجربة الجافة أولاً ثم طبّق. يُظهر الملخص الأجهزة التي تغيّرت بدقة."
+   },
+   {
+    "id": "terraform",
+    "type": "text",
+    "markdown": "تصف Terraform **الموارد (Resources)** بلغة HashiCorp Configuration Language (HCL). ويترجم **المزوّد (Provider)**، وهو إضافة برمجية، تلك الموارد إلى استدعاءات API. تنشر Cisco وشركاؤها مزوّدات لـ ACI (`CiscoDevNet/aci`) وNexus Dashboard وIntersight، وكذلك للسحابات العامة التي يتصل بها مركز البيانات.\n\nالفكرة الأساسية هي **الحالة (State)**. تسجّل Terraform ما أنشأته في ملف حالة، وتقارن في كل تشغيل بين ثلاثة أمور: شيفرتك والحالة المسجّلة والنظام الفعلي. وسير العمل واحد دائماً:\n\n1. يُنزّل الأمر `terraform init` المزوّد.\n2. يُظهر الأمر `terraform plan` ما سيُنشأ أو يتغيّر أو يُحذف.\n3. ينفّذ الأمر `terraform apply` التغييرات ويحدّث الحالة.\n4. يُزيل الأمر `terraform destroy` كل ما تديره الإعدادات.\n\nيمكن للموارد أن تشير إلى بعضها، كما يشير `aci_vrf.prod_vrf` إلى المستأجر (Tenant) في المثال أعلاه. تقرأ Terraform هذه الإشارات لتبني مخطط اعتماديات، فتُنشئ المستأجر أولاً ونطاق الجسر (Bridge Domain) أخيراً دون أن ترتّب أنت شيئاً.\n\nولأن ملف الحالة قد يحوي أسراراً وهو مصدر الحقيقة، فاحفظه في **واجهة خلفية بعيدة (Remote Backend)** تدعم القفل، لا في مجلد على حاسوب محمول ولا في Git. فإذا نفّذ مهندسان `apply` معاً دون قفل فقد يتلف الملف."
+   },
+   {
+    "id": "tf",
+    "type": "code",
+    "language": "hcl",
+    "code": "terraform {\n  required_providers {\n    aci = {\n      source  = \"CiscoDevNet/aci\"\n      version = \"~> 2.0\"\n    }\n  }\n}\n\nprovider \"aci\" {\n  url      = \"https://apic.example.com\"\n  username = \"terraform\"\n  password = var.apic_password   # supplied from a secret store\n}\n\nresource \"aci_tenant\" \"prod\" {\n  name = \"PROD\"\n}\n\nresource \"aci_vrf\" \"prod_vrf\" {\n  tenant_dn = aci_tenant.prod.id\n  name      = \"PROD-VRF\"\n}\n\nresource \"aci_bridge_domain\" \"web\" {\n  tenant_dn          = aci_tenant.prod.id\n  name               = \"WEB-BD\"\n  relation_fv_rs_ctx = aci_vrf.prod_vrf.id\n}\n",
+    "filename": "main.tf",
+    "caption": "مستأجر وVRF ونطاق جسر في ACI. تُنشئ الإشارات بين الموارد ترتيب الاعتماديات."
+   },
+   {
+    "id": "ops",
+    "type": "text",
+    "markdown": "الأتمتة ليست للبناء فقط، فالأدوات نفسها تتولى العمل اليومي الذي يستهلك فريق العمليات.\n\n- **فحوص الامتثال:** يشغّل كتاب التشغيل الأمر `show running-config` أو مهمة منظمة مثل `nxos_facts`، ويقارن الناتج بقالب مرجعي، ويُبلغ عن المبدّلات المختلفة. شغّله ليلياً فلا يدوم الانحراف أكثر من يوم.\n- **ترقية البرمجيات:** يستطيع المسرح نسخ صورة NX-OS، والتحقق من المجموع الاختباري، وتنفيذ `install all` على أحد نظيري vPC، وانتظار عودته، والتأكد من سلامة vPC، ثم الانتقال إلى النظير الثاني. والتنفيذ المتسلسل (`serial: 1`) يمنع صورة معيبة من إسقاط النظيرين معاً.\n- **النسخ الاحتياطي:** احفظ الإعداد الجاري في مستودع Git قبل كل تغيير ليصبح التراجع التزاماً واحداً.\n- **أدلة التدقيق:** ينتج كل تشغيل سجلاً يبيّن من غيّر ماذا ومتى.\n\nترتيب الخطوات أهم من الأداة. ينبغي أن يتبع تغيير النسيج الحلقة نفسها دائماً: التقاط الحالة الراهنة، وتطبيق التغيير على مجموعة صغيرة، والتحقق بأوامر `show` أو بالقياس عن بُعد، ولا يستمر إلا إذا نجحت الفحوص. وتجعل الأدوات التي تدعم وضع الفحص وعرض الفروق هذه الحلقة رخيصة، وتجعل الأدوات التي تحتفظ بملف حالة النتيجة قابلة للتدقيق."
+   },
+   {
+    "id": "pipe",
+    "type": "animation",
+    "kind": "flow",
+    "title": "من الالتزام في Git إلى تغيير النسيج",
+    "caption": "يُراجَع كل تغيير ويُخطَّط ويُطبَّق من مسار واحد.",
+    "data": {
+     "token": "تغيير",
+     "nodes": [
+      {
+       "id": "git",
+       "label": "مستودع Git",
+       "sub": "playbooks, HCL",
+       "icon": "file"
+      },
+      {
+       "id": "ci",
+       "label": "مسار CI",
+       "sub": "فحص وplan",
+       "icon": "cpu"
+      },
+      {
+       "id": "tool",
+       "label": "Ansible / Terraform",
+       "sub": "عقدة التحكم",
+       "icon": "server"
+      },
+      {
+       "id": "fab",
+       "label": "النسيج",
+       "sub": "NX-OS, ACI",
+       "icon": "switch"
+      },
+      {
+       "id": "mon",
+       "label": "التحقق",
+       "sub": "show والقياس عن بُعد",
+       "icon": "eye"
+      }
+     ],
+     "steps": [
+      {
+       "at": "git",
+       "caption": "يفتح مهندس طلب دمج (Pull Request) يغيّر قائمة VLAN."
+      },
+      {
+       "at": "ci",
+       "caption": "يفحص المسار ملف YAML وينفّذ terraform plan أو ansible --check."
+      },
+      {
+       "at": "ci",
+       "caption": "يراجع زميل مخرجات الخطة ويوافق على الدمج.",
+       "tone": "success"
+      },
+      {
+       "at": "tool",
+       "caption": "يطلق الدمج الأداة على عقدة تحكم باعتمادات من خزنة أسرار."
+      },
+      {
+       "at": "fab",
+       "caption": "تدفع الوحدات أو المزوّد التغيير عبر NX-API أو واجهة REST الخاصة بـ APIC."
+      },
+      {
+       "at": "mon",
+       "caption": "يؤكد فحص لاحق الحالة المقصودة، أو يتراجع المسار عن التغيير.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "id": "compare",
+    "type": "text",
+    "markdown": "## المفاضلة بين الأداتين\n\nتتشابه الأداتان في روحهما التصريحية، لكنهما تختلفان في طريقة تتبّع الواقع.\n\n| الجانب | Ansible | Terraform |\n|:--|:--|:--|\n| النموذج | قائمة مهام تُنفَّذ بالترتيب | مخطط للحالة المطلوبة |\n| تتبّع الحالة | لا، تفحص الجهاز في كل تشغيل | نعم، في ملف حالة |\n| نقطة القوة | إعداد الأجهزة والمهام العارضة وجمع نتائج `show` | توفير الكائنات وإدارة دورة حياتها |\n| الإزالة | صريحة (`state: deleted`) | تلقائية عند حذف المورد من الشيفرة |\n| الاستخدام الشائع | خطوط الأساس لـ NX-OS والترقيات والامتثال | مستأجرو ACI وسياسات Intersight وشبكات السحابة |\n\nيجمع كثير من الفرق بين الأداتين: تُنشئ Terraform مستأجر ACI وسياساته، ثم تُعدّ Ansible مبدّلات NX-OS المستقلة القديمة حوله. وتوفّر Cisco أيضاً أدوات Python لـ ACI للحالات التي لا يكفيها كتاب التشغيل. ويمكن لـ Ansible أن تتصل بـ NX-OS عبر `network_cli` (SSH) أو `httpapi` (NX-API)، والثاني أسرع ويعيد بيانات مهيكلة.\n\nوأياً كانت الأداة، فالممارسات التي تجعلها آمنة واحدة: التحكم بالإصدارات لكل الشيفرة، والمراجعة من زميل، وتجربة جافة قبل كل تغيير، والأسرار في خزنة، وتغييرات صغيرة تُطبَّق على زوج مبدّلات واحد قبل النسيج كله."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "تحذير بشأن الحالة والأسرار",
+    "markdown": "لا ترفع `terraform.tfstate` ولا كلمة مرور بنص صريح إلى Git. فقد يحوي ملف الحالة اعتمادات المزوّد وتفاصيل الكائنات. استخدم واجهة خلفية بعيدة مع القفل والتشفير، وأمدّ كلمات المرور من مخزن أسرار أو من `ansible-vault`. وتذكّر أن `terraform destroy` و`state: overridden` مدمّران: نفّذ `plan` أو `--check` أولاً واقرأ الناتج."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر (Cisco Modeling Labs أو DevNet Sandbox أو Nexus 9000v) ثبّت Ansible ومجموعة `cisco.nxos` بالأمر `ansible-galaxy collection install cisco.nxos`. اكتب ملف الجرد وكتاب التشغيل أعلاه لمبدّل واحد. شغّله مع `--check --diff` ثم دونهما. شغّله مرة ثالثة وتأكد أن `changed=0`. وأخيراً غيّر اسم VLAN 110 يدوياً على المبدّل وأعد التشغيل لترى Ansible تصحح الانحراف."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "Playbook (كتاب التشغيل)",
+      "definition": "ملف YAML يضم مسارح ومهام تنفّذها Ansible على ملف جرد."
+     },
+     {
+      "term": "Inventory (الجرد)",
+      "definition": "قائمة الأجهزة والمجموعات المُدارة."
+     },
+     {
+      "term": "Module (الوحدة)",
+      "definition": "وحدة عمل تستدعيها Ansible مثل nxos_vlans."
+     },
+     {
+      "term": "Idempotency (التكرارية)",
+      "definition": "تكرار تنفيذ المهمة يعطي نتيجة تنفيذها مرة واحدة."
+     },
+     {
+      "term": "Provider (المزوّد)",
+      "definition": "إضافة في Terraform تترجم الموارد إلى استدعاءات API."
+     },
+     {
+      "term": "State file (ملف الحالة)",
+      "definition": "سجل Terraform للكائنات التي تديرها."
+     },
+     {
+      "term": "Plan (الخطة)",
+      "definition": "معاينة للتغييرات التي ستجريها Terraform."
+     },
+     {
+      "term": "Ansible Vault",
+      "definition": "تشفير للأسرار المخزّنة في كتب التشغيل والمتغيرات."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما العبارة الأدق في تفسير وصف Ansible بأنها دون وكيل؟",
+      "options": [
+       "لا تحتاج إلى ملف جرد",
+       "تتصل عبر SSH أو واجهة API ولا تثبّت شيئاً على الجهاز",
+       "تعمل فقط مع أجهزة بلا نظام تشغيل",
+       "تعمل على المبدّل نفسه فقط"
+      ],
+      "answer": 1,
+      "explanation": "تعمل Ansible من عقدة تحكم وتتصل عبر SSH أو واجهة مثل NX-API، ولا يحتاج الجهاز إلى برمجيات إضافية."
+     },
+     {
+      "question": "شغّلت كتاب التشغيل نفسه مرتين وأظهر التشغيل الثاني changed=0. ماذا يعني ذلك؟",
+      "options": [
+       "فشل الكتاب بصمت",
+       "المهام تكرارية والأجهزة مطابقة أصلاً",
+       "ملف الجرد فارغ",
+       "Ansible Vault معطّل"
+      ],
+      "answer": 1,
+      "explanation": "تعني changed=0 أن كل وحدة وجدت الجهاز في الحالة المطلوبة أصلاً."
+     },
+     {
+      "question": "ما الأسباب الصحيحة لحفظ ملف حالة Terraform في واجهة خلفية بعيدة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "قد يحوي قيماً حساسة",
+       "يمنع القفل تنفيذ تطبيقين في آن واحد",
+       "يجعل صياغة HCL اختيارية",
+       "يمنح الفريق كله مصدر حقيقة واحداً"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تحمي الواجهة البعيدة البيانات الحساسة وتدعم القفل وتوحّد الحالة. ولا علاقة لها بصياغة HCL."
+     },
+     {
+      "question": "أي أمر يعرض ما ستغيّره Terraform دون أن يغيّر شيئاً؟",
+      "options": [
+       "terraform init",
+       "terraform plan",
+       "terraform apply",
+       "terraform destroy"
+      ],
+      "answer": 1,
+      "explanation": "يعرض plan معاينة للإنشاء والتغيير والحذف، أما init فيُنزّل المزوّدات فقط."
+     },
+     {
+      "question": "يجب حذف مستأجر ACI تلقائياً عند إزالة كتلته من المستودع. أي أداة تناسب ذلك؟",
+      "options": [
+       "Ansible بأوامر خام",
+       "Terraform",
+       "جلسة CLI يدوية",
+       "Ansible بأوامر show العارضة"
+      ],
+      "answer": 1,
+      "explanation": "تقارن Terraform الشيفرة بالحالة وتحذف الموارد التي لم تعد في الإعدادات."
+     }
+    ]
+   },
+   {
+    "id": "sum",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- Ansible دون وكيل، وتعتمد على الجرد وكتب التشغيل والوحدات، وعلى مهام تكرارية.\n- تقدّم مجموعات Cisco مثل `cisco.nxos` و`cisco.aci` وحدات لـ NX-OS وACI وNexus Dashboard.\n- تستخدم Terraform المزوّدات وHCL وملف حالة، وتتبع التسلسل `init` ثم `plan` ثم `apply`.\n- تناسب Ansible إعداد الأجهزة، وتناسب Terraform التوفير وإدارة دورة الحياة.\n- الأتمتة الآمنة تعني Git والمراجعة والتجارب الجافة والأسرار المخزّنة وتغييرات صغيرة.\n\nانتقل الآن إلى مراقبة الشبكة التي تؤتمتها في [مراقبة مراكز البيانات: SPAN وNetFlow وSyslog](/learn/enterprise-datacenter-networking/data-center-monitoring-span-netflow-and-syslog)."
+   }
+  ]
+ }
+}

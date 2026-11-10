@@ -1,0 +1,606 @@
+{
+  "slug": "tacacs-plus-device-administration",
+  "title": "TACACS+ Device Administration",
+  "summary": "Design TACACS+ device administration with IOS XE and Cisco ISE: per-command authorization, accounting, safe fallback and a troubleshooting workflow.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Compare TACACS+ and RADIUS for device administration",
+    "Configure IOS XE method lists with command authorization and accounting",
+    "Build ISE shell profiles, command sets and policy sets",
+    "Design fallback that avoids lockouts without weakening security",
+    "Troubleshoot TACACS+ failures from reachability to command sets"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 02:00 a junior engineer pastes the wrong configuration into a core router, and the next morning nobody can say who did it. Shared local passwords, a single `enable` secret and no command log are the usual reasons. In a CCIE Security lab you are expected to remove all of that: every administrator authenticates as an individual, receives only the commands his role allows, and leaves an audit trail.\n\n**TACACS+ (Terminal Access Controller Access-Control System Plus)** is the protocol built for this job. This lesson covers how it differs from RADIUS, how to configure IOS XE and Cisco ISE for device administration, and how to troubleshoot the failures that lock engineers out of their own equipment."
+    },
+    {
+      "id": "vs",
+      "type": "text",
+      "markdown": "## TACACS+ versus RADIUS\n\nBoth protocols provide AAA (authentication, authorization and accounting), but they were designed for different problems. RADIUS grew up around network access: dial-up, 802.1X and VPN users. TACACS+ was designed for administrators logging in to devices.\n\n| Feature | TACACS+ | RADIUS |\n|:--|:--|:--|\n| Transport | TCP 49 | UDP 1812/1813 (legacy 1645/1646) |\n| Encryption | Entire packet body | Password attribute only |\n| AAA model | Authentication, authorization and accounting fully separated | Authentication and authorization combined |\n| Command authorization | Per command, per privilege level | Not practical |\n| Standard | Cisco-origin, informational RFC 8907 | IETF standard (RFC 2865) |\n| Best fit | Device administration | Network access (802.1X, VPN, guest) |\n\nThree differences matter in practice. First, TCP gives TACACS+ reliable delivery and quick failure detection, so a dead server is noticed when the connection resets instead of after a UDP timeout. Second, the encrypted body hides the username and the authorization attributes, not just the password. Third, separating authorization from authentication lets ISE answer a different question for every command: may *this* user run `show running-config` on *this* device at *this* hour?\n\nThe body is obfuscated with an MD5-based pad derived from the shared secret, so it is not modern encryption. Treat TACACS+ as traffic that belongs on a management network or inside a tunnel, and use long, unique secrets per device group."
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "An SSH login with command authorization",
+      "caption": "Each phase is a separate TACACS+ session, and each command is authorized individually.",
+      "data": {
+        "actors": [
+          {
+            "id": "adm",
+            "label": "Admin",
+            "sub": "alice",
+            "icon": "user"
+          },
+          {
+            "id": "rtr",
+            "label": "Router",
+            "sub": "R1",
+            "icon": "router"
+          },
+          {
+            "id": "ise",
+            "label": "ISE PSN",
+            "sub": "192.0.2.21",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "adm",
+            "to": "rtr",
+            "label": "SSH login",
+            "detail": "alice",
+            "note": "The administrator opens an SSH session to the router management address."
+          },
+          {
+            "from": "rtr",
+            "to": "ise",
+            "label": "AUTHEN START",
+            "detail": "TCP 49",
+            "note": "R1 opens a TACACS+ connection and starts authentication from its source interface."
+          },
+          {
+            "from": "ise",
+            "to": "rtr",
+            "label": "AUTHEN PASS",
+            "tone": "success",
+            "note": "ISE checks the password against Active Directory and passes the user."
+          },
+          {
+            "from": "rtr",
+            "to": "ise",
+            "label": "AUTHOR REQUEST",
+            "detail": "service=shell",
+            "note": "The router asks for the exec profile: which privilege level does alice get?"
+          },
+          {
+            "from": "ise",
+            "to": "rtr",
+            "label": "AUTHOR PASS_ADD",
+            "detail": "priv-lvl=15",
+            "tone": "secure",
+            "note": "The shell profile returns the privilege level and the idle timeout."
+          },
+          {
+            "from": "rtr",
+            "to": "ise",
+            "label": "AUTHOR REQUEST",
+            "detail": "cmd=configure terminal",
+            "note": "Before running each command, the router asks ISE for permission."
+          },
+          {
+            "from": "ise",
+            "to": "rtr",
+            "label": "AUTHOR PASS or FAIL",
+            "tone": "warning",
+            "note": "The command set permits or denies the command. A denied command prints an authorization failure."
+          },
+          {
+            "from": "rtr",
+            "to": "ise",
+            "label": "ACCT STOP",
+            "detail": "cmd, priv-lvl, task_id",
+            "tone": "secure",
+            "note": "The command is logged in accounting records that can be searched in ISE TACACS Live Logs."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ios",
+      "type": "text",
+      "markdown": "## Configuring IOS XE\n\nThe pattern is always the same: define the servers, group them, build **named method lists**, and apply them to lines. Named lists matter because the console and the VTY lines should not share a policy. Keep the console on a local method so a TACACS+ outage never blocks physical access.\n\nKey decisions:\n\n- **Fallback order.** `group ISE-TACACS local` means local credentials are used only when no server *responds*. If ISE responds with a reject, the router does not fall back. This is correct behavior, because a rejected user must not slip in through a local account.\n- **Break-glass account.** Keep one local privileged user with a long secret, stored offline, for outages.\n- **Source interface.** `ip tacacs source-interface Loopback0` makes the router always appear with one address, which is what ISE has in its network device list. Without it, a failover or a route change breaks authentication.\n- **single-connection.** One persistent TCP session carries many exchanges, which reduces load on ISE.\n- **Command authorization at levels 1 and 15.** Authorize both levels, or an unprivileged user can run anything at level 1. Add `aaa authorization config-commands` so configuration commands are checked too.\n- **`if-authenticated` for exec.** This fails open for the shell profile only when the server is down, so combine it with the local fallback deliberately.\n\nA wrong order of `aaa authorization` and the `line` configuration is the most common way to lock yourself out. Apply the new lists to the VTY lines *last*, and keep a second session open while you test."
+    },
+    {
+      "id": "cfg",
+      "type": "code",
+      "language": "cisco",
+      "filename": "r1-tacacs.cfg",
+      "code": "! --- TACACS+ servers and group (ISE PSNs, documentation addresses) ---\naaa new-model\ntacacs server ISE-PSN1\n address ipv4 192.0.2.21\n key <TACACS_SHARED_SECRET>\n single-connection\n timeout 3\ntacacs server ISE-PSN2\n address ipv4 192.0.2.22\n key <TACACS_SHARED_SECRET>\n single-connection\n timeout 3\naaa group server tacacs+ ISE-TACACS\n server name ISE-PSN1\n server name ISE-PSN2\nip tacacs source-interface Loopback0\n!\n! --- Break-glass account: local fallback only ---\nusername breakglass privilege 15 secret <BREAKGLASS_SECRET>\n!\n! --- Method lists ---\naaa authentication login VTY-AUTHC group ISE-TACACS local\naaa authentication login CON-AUTHC local\naaa authentication enable default group ISE-TACACS enable\naaa authorization exec VTY-AUTHZ group ISE-TACACS local if-authenticated\naaa authorization commands 1 VTY-CMD group ISE-TACACS local\naaa authorization commands 15 VTY-CMD group ISE-TACACS local\naaa authorization config-commands\naaa accounting exec VTY-ACCT start-stop group ISE-TACACS\naaa accounting commands 15 VTY-ACCT start-stop group ISE-TACACS\n!\n! --- Apply to lines ---\nline con 0\n login authentication CON-AUTHC\nline vty 0 15\n login authentication VTY-AUTHC\n authorization exec VTY-AUTHZ\n authorization commands 1 VTY-CMD\n authorization commands 15 VTY-CMD\n accounting exec VTY-ACCT\n accounting commands 15 VTY-ACCT\n transport input ssh",
+      "highlight": [
+        14,
+        15,
+        18,
+        22,
+        23,
+        24,
+        25,
+        26
+      ],
+      "caption": "IOS XE AAA for device administration with two ISE nodes. Secrets are placeholders."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not lock yourself out",
+      "markdown": "Before you apply lists to the VTY lines, confirm three things: the router can reach ISE on TCP 49 from the configured source interface, the router is defined as a network device in ISE with the same secret, and a second terminal session is already logged in. If a session is open, you can still fix the configuration. If it is not, you need console access or a reload."
+    },
+    {
+      "id": "ise",
+      "type": "text",
+      "markdown": "## Configuring ISE for device administration\n\nISE separates network access from device administration. The work happens under **Work Centers > Device Administration**, and the **Device Admin** service must be enabled on the PSN (it needs a Device Administration license in the deployment).\n\nBuild the policy from these objects:\n\n1. **Network devices.** Add each router, switch and firewall (or a subnet range), enable TACACS+ authentication settings and enter the shared secret. Use network device groups such as `Location` and `Device Type` to scope policy.\n2. **Identity source.** Active Directory or an internal group, so that authorization can use AD group membership.\n3. **TACACS profiles.** A shell profile sets the default and maximum privilege level, plus attributes such as the idle timeout. For example, a `NOC-RO` profile returns privilege 1 and a `NetAdmin` profile returns 15.\n4. **Command sets.** An ordered list of permit and deny entries matching a command and argument pattern, for example `permit show`, `permit ping`, and `deny configure`. A command set also has a *Permit any command that is not in the table below* option; leave it off for read-only roles.\n5. **Policy set.** Match `Device Type` and protocol `TACACS`, add an authentication rule, then authorization rules that map an AD group to a shell profile and a command set.\n\nISE processes command authorization rules top-down, and the first matching command entry wins. Put the specific `deny` lines for dangerous commands (`write erase`, `reload`) above a broad permit.\n\n### Other platforms\n\nNX-OS uses `feature tacacs+`, `tacacs-server host`, and `aaa group server tacacs+`, and returns roles as a `shell:roles` attribute instead of privilege levels. ASA uses `aaa-server` and `aaa authentication ssh console`, and supports command authorization with `aaa authorization command`. Secure Firewall Threat Defense administers its Linux shell separately from the management center. Check the platform's attribute names before you write the ISE profile."
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Verifying TACACS+ on the router",
+      "prompt": "R1#",
+      "lines": [
+        {
+          "cmd": "show tacacs",
+          "output": "Tacacs+ Server - public  :\n              Server name: ISE-PSN1\n           Server address: 192.0.2.21\n              Server port: 49\n          Socket opens:        412\n         Socket closes:        409\n         Socket aborts:          2\n         Socket errors:          0\n       Socket Timeouts:          1\n   Failed Connect Attempts:      0\n        Total Packets Sent:   9120\n        Total Packets Recv:   9118",
+          "comment": "Rising aborts or timeouts point to reachability, a wrong secret or a server that closes idle connections."
+        },
+        {
+          "cmd": "test aaa group ISE-TACACS testuser <TEST_PASSWORD> legacy",
+          "output": "Attempting authentication test to server-group ISE-TACACS using tacacs+\nUser was successfully authenticated.",
+          "comment": "Tests the authentication path without opening a new login session."
+        },
+        {
+          "cmd": "show aaa servers | include TACACS|State|Authen|Author|Account",
+          "output": "TACACS+: id 1, priority 1, host 192.0.2.21, port 49, hostname ISE-PSN1\n     State: current UP, duration 52113s, previous duration 0s\n     Authen: request 311, timeouts 0\n     Author: request 2840, timeouts 1\n     Account: request 2801, timeouts 0",
+          "comment": "A server marked DEAD makes the router move to the next server and then to the local method."
+        },
+        {
+          "cmd": "debug tacacs",
+          "output": "TAC+: (4017): received authen response status = PASS\nTAC+: (4018): Author request sent, service=shell cmd=\nTAC+: (4018): received author response status = PASS_ADD, priv-lvl=15",
+          "comment": "Use debugging briefly and with a filter; it exposes user names in the log."
+        }
+      ],
+      "caption": "On ISE, correlate with Operations > TACACS > Live Logs, which shows the failure reason and the matched rule."
+    },
+    {
+      "id": "trouble",
+      "type": "text",
+      "markdown": "## Troubleshooting workflow\n\nWork from the network upward and stop at the first failure:\n\n1. **Reachability.** Can R1 reach TCP 49 on the PSN from the source interface? Test with `ping` using `source Loopback0` and check ACLs, firewalls and VRF.\n2. **Device definition.** Does ISE list the exact source address? A request from an unknown address is dropped, and the Live Log shows nothing or a *Unknown NAD* message.\n3. **Secret.** A mismatched key produces garbled bodies: ISE reports *invalid TACACS+ request packet, possibly mismatched shared secrets*, and the router shows the login failing instantly.\n4. **Policy.** If authentication passes but the session lands at privilege 1, the authorization rule did not match, usually because the AD group or device type condition is wrong.\n5. **Command set.** If a command is denied, read the Live Log detail for the exact command string and argument that was evaluated. Command sets match on the *full* command and arguments, so abbreviations such as `sh run` are expanded by the device before it asks ISE.\n6. **Time.** Authentication to Active Directory fails when clocks drift beyond Kerberos tolerance. Check NTP on ISE and the domain controllers.\n\nIf a whole deployment fails, remember the fallback design: local credentials work only when ISE does not answer. A reachable but misconfigured ISE will reject users and the break-glass account is then your only way in."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab only: an ISE evaluation VM and an IOS XE router or a CML node you control.\n\n1. Add the router to ISE as a network device with a TACACS+ shared secret, and create the two shell profiles and a read-only command set described above.\n2. Create two AD or internal users and map them to the read-only and administrator roles in a Device Admin policy set.\n3. Apply the configuration in this lesson, keeping a console session open, then SSH in as the read-only user and confirm that `configure terminal` is denied.\n4. Open Operations > TACACS > Live Logs and find both the permit and the deny, including the command string.\n5. Block TCP 49 between router and ISE and confirm that only the break-glass account can log in, then restore it."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "TACACS+",
+          "definition": "A TCP 49 AAA protocol that separates authentication, authorization and accounting and encrypts the packet body."
+        },
+        {
+          "term": "Method list",
+          "definition": "An ordered set of AAA methods, such as a server group then local, applied to a line or service."
+        },
+        {
+          "term": "Shell profile",
+          "definition": "An ISE TACACS profile that returns privilege level and session attributes after login."
+        },
+        {
+          "term": "Command set",
+          "definition": "An ordered list of permitted and denied commands that ISE evaluates for command authorization."
+        },
+        {
+          "term": "Command authorization",
+          "definition": "Asking the server for permission before the device runs each command."
+        },
+        {
+          "term": "Break-glass account",
+          "definition": "A local privileged account used only when the AAA servers are unavailable."
+        },
+        {
+          "term": "single-connection",
+          "definition": "A setting that keeps one TCP session open for many TACACS+ exchanges."
+        },
+        {
+          "term": "Network device group",
+          "definition": "An ISE attribute such as location or type used to scope device administration policy."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which statement about TACACS+ is correct?",
+          "options": [
+            "It uses UDP 1812 and encrypts only the password",
+            "It uses TCP 49 and obfuscates the whole packet body",
+            "It combines authentication and authorization in one exchange",
+            "It cannot authorize individual commands"
+          ],
+          "answer": 1,
+          "explanation": "TACACS+ runs over TCP 49, encrypts the body and separates the three AAA functions, which enables per-command authorization."
+        },
+        {
+          "question": "The method list is `group ISE-TACACS local`. ISE is reachable and rejects the password. What happens?",
+          "options": [
+            "The router tries the local database",
+            "The login fails without trying local",
+            "The router tries the next method after a timeout",
+            "The user is given privilege 1"
+          ],
+          "answer": 1,
+          "explanation": "Fallback happens only when no server responds. An explicit reject ends the attempt."
+        },
+        {
+          "question": "A read-only administrator logs in successfully but receives privilege 1 and cannot run `show running-config`. Which checks are useful? (Choose all that apply.)",
+          "options": [
+            "The command set entry and its argument pattern",
+            "The authorization rule matched in TACACS Live Logs",
+            "The UDP 1813 accounting path",
+            "Whether `aaa authorization commands 1` is applied to the line"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Command authorization at each level and the ISE command set decide the result. RADIUS accounting ports are not involved in TACACS+."
+        },
+        {
+          "question": "Why configure `ip tacacs source-interface Loopback0`?",
+          "options": [
+            "To encrypt the session",
+            "To make the router appear with a stable address that matches the ISE network device entry",
+            "To select UDP rather than TCP",
+            "To enable command accounting"
+          ],
+          "answer": 1,
+          "explanation": "ISE identifies the device by source address. A stable loopback survives interface and path changes."
+        },
+        {
+          "question": "Which are good practices for device administration? (Choose all that apply.)",
+          "options": [
+            "Keep the console on a local method list",
+            "Authorize commands at both level 1 and level 15",
+            "Share one TACACS+ secret across every device in the company forever",
+            "Send command accounting to ISE"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Local console access, full command authorization and an audit trail are standard. Secrets should be unique per device group and rotated."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- TACACS+ runs on TCP 49, separates authentication, authorization and accounting, and is the right protocol for device administration. RADIUS fits network access.\n- IOS XE needs named method lists, a stable source interface, command authorization at levels 1 and 15, and command accounting.\n- Fallback to local occurs only when no server responds. Keep a break-glass account and a console on a local list.\n- ISE builds policy from network devices, shell profiles, command sets and policy sets. First match wins.\n- Troubleshoot in order: reachability, device definition, secret, authorization rule, command set, time.\n\nContinue with [Cisco ISE: 802.1X, MAB and Guest Access](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-and-guest-access), then harden the devices themselves in [Device Hardening and Infrastructure Protection](/learn/cisco-security-certification-track/device-hardening-and-infrastructure-protection)."
+    }
+  ],
+  "ar": {
+    "title": "إدارة الأجهزة باستخدام TACACS+",
+    "summary": "صمّم إدارة الأجهزة بـ TACACS+ مع IOS XE وCisco ISE: تفويض لكل أمر ومحاسبة واحتياط آمن ومنهجية لمعالجة الأعطال.",
+    "objectives": [
+      "تقارن بين TACACS+ وRADIUS في إدارة الأجهزة",
+      "تهيّئ قوائم طرائق في IOS XE مع تفويض الأوامر والمحاسبة",
+      "تبني ملفات الصدفة ومجموعات الأوامر ومجموعات السياسات في ISE",
+      "تصمّم احتياطًا يتجنب الإقفال دون إضعاف الأمان",
+      "تعالج أعطال TACACS+ من الوصول حتى مجموعات الأوامر"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الساعة الثانية فجرًا ينسخ مهندس مبتدئ تهيئةً خاطئة إلى موجّه رئيسي، وفي الصباح لا يعرف أحد من فعل ذلك. وغالبًا ما يعود السبب إلى كلمات مرور محلية مشتركة وسر `enable` واحد وغياب سجل للأوامر. في اختبار CCIE Security العملي يُنتظر منك إزالة هذا كله: يصادَق على كل مسؤول بصفته فردًا، ولا يحصل إلا على الأوامر التي يسمح بها دوره، وتبقى له آثار قابلة للتدقيق.\n\n**بروتوكول TACACS+ (Terminal Access Controller Access-Control System Plus)** مصمَّم لهذه المهمة. يشرح هذا الدرس الفرق بينه وبين RADIUS، وكيف تهيّئ IOS XE وCisco ISE لإدارة الأجهزة، وكيف تعالج الأعطال التي تُقفل المهندسين خارج أجهزتهم."
+      },
+      {
+        "id": "vs",
+        "type": "text",
+        "markdown": "## TACACS+ مقابل RADIUS\n\nيوفّر البروتوكولان نموذج AAA (المصادقة والتفويض والمحاسبة)، لكنهما صُمّما لمشكلتين مختلفتين. نشأ RADIUS حول الوصول إلى الشبكة: الاتصال الهاتفي ومعيار 802.1X ومستخدمو VPN. أما TACACS+ فصُمّم للمسؤولين الذين يسجّلون الدخول إلى الأجهزة.\n\n| الميزة | TACACS+ | RADIUS |\n|:--|:--|:--|\n| النقل | TCP 49 | UDP 1812/1813 (والقديم 1645/1646) |\n| التشفير | جسم الحزمة بالكامل | سمة كلمة المرور فقط |\n| نموذج AAA | فصل كامل بين المصادقة والتفويض والمحاسبة | المصادقة والتفويض معًا |\n| تفويض الأوامر | لكل أمر ولكل مستوى امتياز | غير عملي |\n| المعيار | أصله من Cisco، وثيقة RFC 8907 معلوماتية | معيار IETF (RFC 2865) |\n| الأنسب لـ | إدارة الأجهزة | الوصول إلى الشبكة (802.1X وVPN والضيوف) |\n\nثلاثة فروق تهمّك عمليًا. أولًا، يمنح TCP بروتوكول TACACS+ تسليمًا موثوقًا وكشفًا سريعًا للعطل، فيُلاحَظ توقف الخادم عند انقطاع الاتصال لا بعد انتهاء مهلة UDP. ثانيًا، يخفي جسم الحزمة المشفَّر اسم المستخدم وسمات التفويض، لا كلمة المرور وحدها. ثالثًا، يتيح فصل التفويض عن المصادقة أن يجيب ISE عن سؤال مختلف لكل أمر: هل يحق لهذا المستخدم أن ينفّذ `show running-config` على هذا الجهاز في هذه الساعة؟\n\nيُموَّه الجسم بقناع مبني على MD5 مشتق من السر المشترك، فهو ليس تشفيرًا حديثًا. لذا عامل حركة TACACS+ على أنها تخص شبكة الإدارة أو نفقًا محميًا، واستخدم أسرارًا طويلة وفريدة لكل مجموعة أجهزة."
+      },
+      {
+        "id": "anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "تسجيل دخول SSH مع تفويض الأوامر",
+        "caption": "كل مرحلة جلسة TACACS+ مستقلة، ويُفوَّض كل أمر على حدة.",
+        "data": {
+          "actors": [
+            {
+              "id": "adm",
+              "label": "المسؤول",
+              "sub": "alice",
+              "icon": "user"
+            },
+            {
+              "id": "rtr",
+              "label": "الموجّه",
+              "sub": "R1",
+              "icon": "router"
+            },
+            {
+              "id": "ise",
+              "label": "ISE PSN",
+              "sub": "192.0.2.21",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "from": "adm",
+              "to": "rtr",
+              "label": "SSH login",
+              "detail": "alice",
+              "note": "يفتح المسؤول جلسة SSH إلى عنوان إدارة الموجّه."
+            },
+            {
+              "from": "rtr",
+              "to": "ise",
+              "label": "AUTHEN START",
+              "detail": "TCP 49",
+              "note": "يفتح R1 اتصال TACACS+ ويبدأ المصادقة من واجهة المصدر لديه."
+            },
+            {
+              "from": "ise",
+              "to": "rtr",
+              "label": "AUTHEN PASS",
+              "tone": "success",
+              "note": "يتحقق ISE من كلمة المرور في Active Directory ويقبل المستخدم."
+            },
+            {
+              "from": "rtr",
+              "to": "ise",
+              "label": "AUTHOR REQUEST",
+              "detail": "service=shell",
+              "note": "يسأل الموجّه عن ملف الجلسة: أي مستوى امتياز يحصل عليه alice؟"
+            },
+            {
+              "from": "ise",
+              "to": "rtr",
+              "label": "AUTHOR PASS_ADD",
+              "detail": "priv-lvl=15",
+              "tone": "secure",
+              "note": "يعيد ملف الصدفة مستوى الامتياز ومهلة الخمول."
+            },
+            {
+              "from": "rtr",
+              "to": "ise",
+              "label": "AUTHOR REQUEST",
+              "detail": "cmd=configure terminal",
+              "note": "قبل تنفيذ كل أمر يطلب الموجّه إذنًا من ISE."
+            },
+            {
+              "from": "ise",
+              "to": "rtr",
+              "label": "AUTHOR PASS or FAIL",
+              "tone": "warning",
+              "note": "تسمح مجموعة الأوامر بالأمر أو ترفضه. ويُظهر الأمر المرفوض رسالة فشل تفويض."
+            },
+            {
+              "from": "rtr",
+              "to": "ise",
+              "label": "ACCT STOP",
+              "detail": "cmd, priv-lvl, task_id",
+              "tone": "secure",
+              "note": "يُسجَّل الأمر في سجلات المحاسبة التي يمكن البحث فيها في TACACS Live Logs."
+            }
+          ]
+        }
+      },
+      {
+        "id": "ios",
+        "type": "text",
+        "markdown": "## تهيئة IOS XE\n\nالنمط ثابت دائمًا: عرّف الخوادم، وضعها في مجموعة، وابنِ **قوائم طرائق مسمّاة (Method lists)**، ثم طبّقها على الخطوط. وتظهر أهمية الأسماء لأن الكونسول وخطوط VTY لا ينبغي أن تشتركا في سياسة واحدة. أبقِ الكونسول على طريقة محلية كي لا يحجب انقطاعُ TACACS+ الوصولَ المادي.\n\nأهم القرارات:\n\n- **ترتيب الاحتياط.** يعني `group ISE-TACACS local` أن بيانات الاعتماد المحلية لا تُستخدم إلا حين لا *يستجيب* أي خادم. أما إذا ردّ ISE بالرفض فلا يلجأ الموجّه إلى المحلي. وهذا السلوك صحيح، لأن المستخدم المرفوض يجب ألا يتسلل عبر حساب محلي.\n- **حساب الطوارئ (Break-glass).** احتفظ بمستخدم محلي واحد مميّز بسر طويل مخزَّن خارج الشبكة لحالات الانقطاع.\n- **واجهة المصدر.** يجعل `ip tacacs source-interface Loopback0` الموجّه يظهر دائمًا بعنوان واحد، وهو ما تحتويه قائمة أجهزة الشبكة في ISE. وبدونه يؤدي تبدّل المسار أو الاحتياط إلى كسر المصادقة.\n- **single-connection.** جلسة TCP دائمة واحدة تحمل تبادلات كثيرة، فيخف الحمل على ISE.\n- **تفويض الأوامر عند المستويين 1 و15.** فوِّض المستويين معًا، وإلا نفّذ مستخدم غير مميّز ما يشاء عند المستوى 1. وأضف `aaa authorization config-commands` لتُفحص أوامر التهيئة أيضًا.\n- **`if-authenticated` لجلسة exec.** يفتح هذا الخيار الباب لملف الصدفة وحده عند توقف الخادم، فادمجه مع الاحتياط المحلي عن قصد.\n\nأكثر أسباب الإقفال الذاتي شيوعًا خطأ في ترتيب أوامر `aaa authorization` وتهيئة `line`. طبّق القوائم الجديدة على خطوط VTY في *آخر* خطوة، وأبقِ جلسة ثانية مفتوحة أثناء الاختبار."
+      },
+      {
+        "id": "cfg",
+        "type": "code",
+        "language": "cisco",
+        "filename": "r1-tacacs.cfg",
+        "code": "! --- TACACS+ servers and group (ISE PSNs, documentation addresses) ---\naaa new-model\ntacacs server ISE-PSN1\n address ipv4 192.0.2.21\n key <TACACS_SHARED_SECRET>\n single-connection\n timeout 3\ntacacs server ISE-PSN2\n address ipv4 192.0.2.22\n key <TACACS_SHARED_SECRET>\n single-connection\n timeout 3\naaa group server tacacs+ ISE-TACACS\n server name ISE-PSN1\n server name ISE-PSN2\nip tacacs source-interface Loopback0\n!\n! --- Break-glass account: local fallback only ---\nusername breakglass privilege 15 secret <BREAKGLASS_SECRET>\n!\n! --- Method lists ---\naaa authentication login VTY-AUTHC group ISE-TACACS local\naaa authentication login CON-AUTHC local\naaa authentication enable default group ISE-TACACS enable\naaa authorization exec VTY-AUTHZ group ISE-TACACS local if-authenticated\naaa authorization commands 1 VTY-CMD group ISE-TACACS local\naaa authorization commands 15 VTY-CMD group ISE-TACACS local\naaa authorization config-commands\naaa accounting exec VTY-ACCT start-stop group ISE-TACACS\naaa accounting commands 15 VTY-ACCT start-stop group ISE-TACACS\n!\n! --- Apply to lines ---\nline con 0\n login authentication CON-AUTHC\nline vty 0 15\n login authentication VTY-AUTHC\n authorization exec VTY-AUTHZ\n authorization commands 1 VTY-CMD\n authorization commands 15 VTY-CMD\n accounting exec VTY-ACCT\n accounting commands 15 VTY-ACCT\n transport input ssh",
+        "highlight": [
+          14,
+          15,
+          18,
+          22,
+          23,
+          24,
+          25,
+          26
+        ],
+        "caption": "تهيئة AAA في IOS XE لإدارة الأجهزة مع عقدتي ISE. الأسرار عناصر نائبة."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تُقفل نفسك خارج الجهاز",
+        "markdown": "قبل تطبيق القوائم على خطوط VTY تأكد من ثلاثة أمور: أن الموجّه يصل إلى ISE عبر TCP 49 من واجهة المصدر المهيّأة، وأن الموجّه معرَّف جهازَ شبكة في ISE بالسر نفسه، وأن جلسة طرفية ثانية مفتوحة بالفعل. فإن وُجدت جلسة مفتوحة أمكنك إصلاح التهيئة، وإلا احتجت إلى الكونسول أو إعادة التشغيل."
+      },
+      {
+        "id": "ise",
+        "type": "text",
+        "markdown": "## تهيئة ISE لإدارة الأجهزة\n\nيفصل ISE الوصول إلى الشبكة عن إدارة الأجهزة. ويجري العمل ضمن **Work Centers > Device Administration**، ويجب تفعيل خدمة **Device Admin** على عقدة PSN (وتحتاج إلى ترخيص Device Administration في النشر).\n\nابنِ السياسة من هذه الكائنات:\n\n1. **أجهزة الشبكة.** أضف كل موجّه ومبدّل وجدار حماية (أو نطاق شبكة فرعية)، وفعّل إعدادات مصادقة TACACS+، وأدخل السر المشترك. استخدم مجموعات أجهزة الشبكة مثل `Location` و`Device Type` لتحديد نطاق السياسة.\n2. **مصدر الهوية.** Active Directory أو مجموعة داخلية، ليستفيد التفويض من عضوية مجموعات AD.\n3. **ملفات TACACS (TACACS profiles).** يحدد ملف الصدفة مستوى الامتياز الافتراضي والأقصى، إضافةً إلى سمات مثل مهلة الخمول. فمثلًا يعيد ملف `NOC-RO` المستوى 1، ويعيد ملف `NetAdmin` المستوى 15.\n4. **مجموعات الأوامر (Command sets).** قائمة مرتّبة من مدخلات السماح والمنع تطابق أمرًا ونمط وسائط، مثل `permit show` و`permit ping` و`deny configure`. وتتضمن المجموعة خيار *Permit any command that is not in the table below*، فاتركه معطّلًا للأدوار القرائية.\n5. **مجموعة السياسات.** طابِق `Device Type` والبروتوكول `TACACS`، وأضف قاعدة مصادقة، ثم قواعد تفويض تربط مجموعة AD بملف صدفة ومجموعة أوامر.\n\nيعالج ISE قواعد تفويض الأوامر من الأعلى إلى الأسفل، ويفوز أول مدخل مطابق. فضع أسطر `deny` المحددة للأوامر الخطرة (`write erase` و`reload`) فوق السماح العام.\n\n### منصات أخرى\n\nيستخدم NX-OS الأوامر `feature tacacs+` و`tacacs-server host` و`aaa group server tacacs+`، ويعيد الأدوار بسمة `shell:roles` بدل مستويات الامتياز. ويستخدم ASA الأمر `aaa-server` والأمر `aaa authentication ssh console`، ويدعم تفويض الأوامر بـ `aaa authorization command`. ويُدار صدفة Linux في Secure Firewall Threat Defense بمعزل عن مركز الإدارة. فتحقق من أسماء السمات الخاصة بالمنصة قبل كتابة ملف ISE."
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "التحقق من TACACS+ على الموجّه",
+        "prompt": "R1#",
+        "lines": [
+          {
+            "cmd": "show tacacs",
+            "output": "Tacacs+ Server - public  :\n              Server name: ISE-PSN1\n           Server address: 192.0.2.21\n              Server port: 49\n          Socket opens:        412\n         Socket closes:        409\n         Socket aborts:          2\n         Socket errors:          0\n       Socket Timeouts:          1\n   Failed Connect Attempts:      0\n        Total Packets Sent:   9120\n        Total Packets Recv:   9118",
+            "comment": "ارتفاع عدد الإجهاضات أو المهل يشير إلى مشكلة وصول أو سر خاطئ أو خادم يغلق الاتصالات الخاملة."
+          },
+          {
+            "cmd": "test aaa group ISE-TACACS testuser <TEST_PASSWORD> legacy",
+            "output": "Attempting authentication test to server-group ISE-TACACS using tacacs+\nUser was successfully authenticated.",
+            "comment": "يختبر مسار المصادقة دون فتح جلسة دخول جديدة."
+          },
+          {
+            "cmd": "show aaa servers | include TACACS|State|Authen|Author|Account",
+            "output": "TACACS+: id 1, priority 1, host 192.0.2.21, port 49, hostname ISE-PSN1\n     State: current UP, duration 52113s, previous duration 0s\n     Authen: request 311, timeouts 0\n     Author: request 2840, timeouts 1\n     Account: request 2801, timeouts 0",
+            "comment": "يؤدي وسم الخادم DEAD إلى انتقال الموجّه إلى الخادم التالي ثم إلى الطريقة المحلية."
+          },
+          {
+            "cmd": "debug tacacs",
+            "output": "TAC+: (4017): received authen response status = PASS\nTAC+: (4018): Author request sent, service=shell cmd=\nTAC+: (4018): received author response status = PASS_ADD, priv-lvl=15",
+            "comment": "استخدم التنقيح لفترة قصيرة وبمرشّح، فهو يكشف أسماء المستخدمين في السجل."
+          }
+        ],
+        "caption": "على ISE اربط النتائج بصفحة Operations > TACACS > Live Logs التي تعرض سبب الفشل والقاعدة المطابقة."
+      },
+      {
+        "id": "trouble",
+        "type": "text",
+        "markdown": "## منهجية معالجة الأعطال\n\nاعمل من أسفل الشبكة إلى أعلاها وتوقف عند أول إخفاق:\n\n1. **الوصول.** هل يصل R1 إلى TCP 49 على PSN من واجهة المصدر؟ اختبر بـ `ping` مع `source Loopback0` وافحص قوائم التحكم وجدران الحماية وVRF.\n2. **تعريف الجهاز.** هل يُدرج ISE عنوان المصدر بدقة؟ يُسقَط الطلب القادم من عنوان مجهول، ولا يظهر في Live Log شيء أو تظهر رسالة *Unknown NAD*.\n3. **السر.** يؤدي عدم تطابق المفتاح إلى أجسام مشوَّهة: يبلّغ ISE بالرسالة *invalid TACACS+ request packet, possibly mismatched shared secrets*، ويفشل الدخول فورًا على الموجّه.\n4. **السياسة.** إذا نجحت المصادقة لكن الجلسة هبطت عند المستوى 1، فقاعدة التفويض لم تتطابق، وغالبًا لخطأ في شرط مجموعة AD أو نوع الجهاز.\n5. **مجموعة الأوامر.** إذا رُفض أمر فاقرأ تفاصيل Live Log لمعرفة سلسلة الأمر والوسائط التي قُيّمت. تطابق مجموعات الأوامر *الأمر الكامل* ووسائطه، فيوسّع الجهاز اختصارات مثل `sh run` قبل أن يسأل ISE.\n6. **الوقت.** تفشل المصادقة إلى Active Directory حين ينحرف الوقت فوق تسامح Kerberos. افحص NTP على ISE وعلى وحدات التحكم بالنطاق.\n\nإذا فشل النشر كله فتذكّر تصميم الاحتياط: لا تعمل بيانات الاعتماد المحلية إلا حين لا يجيب ISE. أما ISE الذي يمكن الوصول إليه لكنه مهيّأ خطأً فسيرفض المستخدمين، وحينها يكون حساب الطوارئ طريقك الوحيد."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم بيئة مختبر فقط: جهازًا افتراضيًا تقييميًا لـ ISE وموجّه IOS XE أو عقدة CML تتحكم فيها.\n\n1. أضف الموجّه إلى ISE جهازَ شبكة بسر TACACS+ مشترك، وأنشئ ملفي الصدفة ومجموعة أوامر قرائية كما ورد أعلاه.\n2. أنشئ مستخدمين في AD أو داخليين واربطهما بدور القراءة ودور المسؤول في مجموعة سياسات Device Admin.\n3. طبّق التهيئة الواردة في الدرس مع إبقاء جلسة كونسول مفتوحة، ثم ادخل بـ SSH بوصفك مستخدم القراءة وتأكد من رفض `configure terminal`.\n4. افتح Operations > TACACS > Live Logs وابحث عن حالتي السماح والرفض، بما فيها سلسلة الأمر.\n5. احجب TCP 49 بين الموجّه وISE وتأكد أن حساب الطوارئ وحده يستطيع الدخول، ثم أعد فتحه."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "TACACS+",
+            "definition": "بروتوكول AAA على TCP 49 يفصل المصادقة والتفويض والمحاسبة ويشفّر جسم الحزمة."
+          },
+          {
+            "term": "قائمة الطرائق (Method list)",
+            "definition": "مجموعة مرتّبة من طرائق AAA، مثل مجموعة خوادم ثم المحلي، تُطبَّق على خط أو خدمة."
+          },
+          {
+            "term": "ملف الصدفة (Shell profile)",
+            "definition": "ملف TACACS في ISE يعيد مستوى الامتياز وسمات الجلسة بعد الدخول."
+          },
+          {
+            "term": "مجموعة الأوامر (Command set)",
+            "definition": "قائمة مرتّبة بالأوامر المسموحة والمرفوضة يقيّمها ISE في تفويض الأوامر."
+          },
+          {
+            "term": "تفويض الأوامر (Command authorization)",
+            "definition": "طلب إذن من الخادم قبل أن ينفّذ الجهاز كل أمر."
+          },
+          {
+            "term": "حساب الطوارئ (Break-glass account)",
+            "definition": "حساب محلي مميّز لا يُستخدم إلا حين تتعذر خوادم AAA."
+          },
+          {
+            "term": "single-connection",
+            "definition": "إعداد يُبقي جلسة TCP واحدة مفتوحة لتبادلات TACACS+ كثيرة."
+          },
+          {
+            "term": "مجموعة أجهزة الشبكة (NDG)",
+            "definition": "سمة في ISE مثل الموقع أو النوع تُستخدم لتحديد نطاق سياسة إدارة الأجهزة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي العبارات الآتية عن TACACS+ صحيحة؟",
+            "options": [
+              "يستخدم UDP 1812 ويشفّر كلمة المرور فقط",
+              "يستخدم TCP 49 ويموّه جسم الحزمة كله",
+              "يجمع المصادقة والتفويض في تبادل واحد",
+              "لا يستطيع تفويض أوامر منفردة"
+            ],
+            "answer": 1,
+            "explanation": "يعمل TACACS+ فوق TCP 49 ويشفّر الجسم ويفصل وظائف AAA الثلاث، مما يتيح تفويض كل أمر."
+          },
+          {
+            "question": "قائمة الطرائق هي `group ISE-TACACS local`. ISE يمكن الوصول إليه ويرفض كلمة المرور. ماذا يحدث؟",
+            "options": [
+              "يجرّب الموجّه قاعدة البيانات المحلية",
+              "يفشل الدخول دون تجربة المحلي",
+              "يجرّب الموجّه الطريقة التالية بعد مهلة",
+              "يمنح المستخدم المستوى 1"
+            ],
+            "answer": 1,
+            "explanation": "لا يحدث الاحتياط إلا حين لا يستجيب أي خادم. أما الرفض الصريح فينهي المحاولة."
+          },
+          {
+            "question": "يسجّل مسؤول قرائي الدخول بنجاح لكنه يحصل على المستوى 1 ولا يستطيع تنفيذ `show running-config`. أي الفحوص مفيدة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "مدخل مجموعة الأوامر ونمط وسائطه",
+              "قاعدة التفويض المطابقة في TACACS Live Logs",
+              "مسار المحاسبة على UDP 1813",
+              "هل طُبّق `aaa authorization commands 1` على الخط"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "يحسم النتيجة تفويض الأوامر عند كل مستوى ومجموعة الأوامر في ISE. ولا علاقة لمنافذ محاسبة RADIUS بـ TACACS+."
+          },
+          {
+            "question": "لماذا نهيّئ `ip tacacs source-interface Loopback0`؟",
+            "options": [
+              "لتشفير الجلسة",
+              "ليظهر الموجّه بعنوان ثابت يطابق مدخل جهاز الشبكة في ISE",
+              "لاختيار UDP بدل TCP",
+              "لتفعيل محاسبة الأوامر"
+            ],
+            "answer": 1,
+            "explanation": "يتعرّف ISE على الجهاز بعنوان المصدر. والواجهة الاسترجاعية الثابتة تصمد أمام تغيّر الواجهات والمسارات."
+          },
+          {
+            "question": "أي الممارسات الآتية جيدة لإدارة الأجهزة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "إبقاء الكونسول على قائمة طرائق محلية",
+              "تفويض الأوامر عند المستويين 1 و15",
+              "مشاركة سر TACACS+ واحد بين كل أجهزة الشركة دائمًا",
+              "إرسال محاسبة الأوامر إلى ISE"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الكونسول المحلي وتفويض الأوامر الكامل وسجل التدقيق ممارسات معيارية. ويجب أن تكون الأسرار فريدة لكل مجموعة أجهزة وتُدوَّر."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يعمل TACACS+ على TCP 49 ويفصل المصادقة والتفويض والمحاسبة، وهو البروتوكول الأنسب لإدارة الأجهزة، بينما يناسب RADIUS الوصول إلى الشبكة.\n- يحتاج IOS XE إلى قوائم طرائق مسمّاة وواجهة مصدر ثابتة وتفويض أوامر عند المستويين 1 و15 ومحاسبة للأوامر.\n- لا يحدث الاحتياط إلى المحلي إلا حين لا يستجيب أي خادم. أبقِ حساب طوارئ وكونسول على قائمة محلية.\n- يبني ISE السياسة من أجهزة الشبكة وملفات الصدفة ومجموعات الأوامر ومجموعات السياسات، ويفوز أول تطابق.\n- عالج الأعطال بالترتيب: الوصول، فتعريف الجهاز، فالسر، فقاعدة التفويض، فمجموعة الأوامر، فالوقت.\n\nتابع مع درس [Cisco ISE: معيار 802.1X وMAB ووصول الضيوف](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-and-guest-access)، ثم حصّن الأجهزة نفسها في درس [تحصين الأجهزة وحماية البنية التحتية](/learn/cisco-security-certification-track/device-hardening-and-infrastructure-protection)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,552 @@
+{
+  "slug": "eap-chaining-and-teap",
+  "title": "EAP Chaining and TEAP",
+  "summary": "Prove both the machine and the user in one 802.1X session with TEAP or EAP-FAST chaining, and write ISE policy against the combined result.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain why separate machine and user authentications are weak",
+    "Describe the TEAP phases and TLVs that enable chaining",
+    "Configure ISE Allowed Protocols and authorization rules for chaining",
+    "Troubleshoot a chained session from Live Logs"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A laptop boots at 8:55 and the user signs in at 9:00. For five minutes the machine authenticates alone; then a person appears. Most 802.1X designs treat these as two unrelated events, so policy can say \"this is a domain computer\" or \"this is an employee\", but never \"this employee is using this corporate computer\".\n\nIn the CCIE Security lab, that gap matters. A stolen password used from a personal laptop, or a managed laptop used by an unknown account, should not receive the same access as the real pairing. **EAP chaining** closes the gap: one authentication session proves both identities, and ISE can write a rule against the combined result. This lesson covers how TEAP and EAP-FAST do it, how to configure ISE, and how to troubleshoot it. It builds on [Cisco ISE: 802.1X, MAB and Guest Access](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-and-guest-access)."
+    },
+    {
+      "id": "why",
+      "type": "text",
+      "markdown": "## The problem with two separate authentications\n\nWindows can run **machine authentication** (the computer account, usually EAP-TLS with a machine certificate) and **user authentication** (the person, often PEAP or EAP-TLS with a user certificate). Without chaining, each is a separate RADIUS session, and the switch holds only the latest one.\n\nThat creates three weaknesses:\n\n- **No binding.** ISE sees \"machine OK\" at boot and \"user OK\" at logon, with no proof that they came from the same endpoint.\n- **Session churn.** Each transition reauthenticates the port, and the VLAN or SGT may flap between the two results.\n- **Fragile rules.** Policy has to lean on `WasMachineAuthenticated`, an ISE attribute that depends on a cache of recent machine sessions and breaks across PSNs or after a reboot.\n\nWith chaining, the supplicant runs both inner authentications inside **one** TLS tunnel. ISE returns a single Access-Accept and exposes the outcome in the dictionary attribute `Network Access:EapChainingResult`."
+    },
+    {
+      "id": "teap",
+      "type": "text",
+      "markdown": "## TEAP and EAP-FAST chaining\n\n**TEAP** (Tunnel Extensible Authentication Protocol, RFC 7170) is the standards-based successor to the Cisco-proprietary **EAP-FAST**. Both build a TLS tunnel first (phase 1), then carry TLV-encoded inner methods in it (phase 2).\n\n| Property | PEAP | EAP-FAST | TEAP |\n|:--|:--|:--|:--|\n| Standard | Microsoft/Cisco draft | Cisco, RFC 4851 | IETF RFC 7170 |\n| Inner methods | One (MSCHAPv2) | One or two (chaining) | One or two, any mix |\n| Chaining | No | Yes | Yes |\n| Tunnel provisioning | Server certificate | PAC or server certificate | Server certificate |\n| Native Windows supplicant | Yes | No (needs Cisco Secure Client NAM) | Windows 11 and Server 2022 |\n\nChaining relies on TLVs that EAP-FAST and TEAP share:\n\n- **Identity-Type TLV** tells ISE whether the next inner exchange is for the *machine* or the *user*.\n- **Intermediate-Result TLV** reports success or failure of each inner method.\n- **Crypto-Binding TLV** cryptographically ties the inner results to the outer tunnel, so a man-in-the-middle cannot splice a stolen user exchange onto another machine's tunnel.\n- **Result TLV** carries the final outcome.\n\nA common inner pairing is EAP-TLS for the machine and EAP-TLS or MSCHAPv2 for the user. Pure certificate chains are strongest, because there is no password to phish."
+    },
+    {
+      "id": "teap-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "TEAP with machine and user chaining",
+      "caption": "One tunnel carries two inner authentications and returns one result.",
+      "data": {
+        "actors": [
+          {
+            "id": "sup",
+            "label": "Supplicant",
+            "sub": "TEAP",
+            "icon": "laptop"
+          },
+          {
+            "id": "sw",
+            "label": "Switch",
+            "sub": "Gi1/0/12",
+            "icon": "switch"
+          },
+          {
+            "id": "ise",
+            "label": "ISE PSN",
+            "sub": "192.0.2.21",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "sup",
+            "to": "ise",
+            "label": "TLS ClientHello",
+            "detail": "via EAPoL",
+            "note": "Phase 1 starts. The switch relays everything inside RADIUS."
+          },
+          {
+            "from": "ise",
+            "to": "sup",
+            "label": "ServerHello + certificate",
+            "tone": "secure",
+            "note": "The supplicant validates the ISE certificate against its trusted roots."
+          },
+          {
+            "from": "ise",
+            "to": "sup",
+            "label": "Identity-Type: Machine",
+            "detail": "inner EAP-TLS",
+            "note": "Phase 2: ISE asks first for the computer identity."
+          },
+          {
+            "from": "sup",
+            "to": "ise",
+            "label": "Machine certificate",
+            "tone": "success",
+            "note": "ISE validates the machine certificate and checks the CA chain."
+          },
+          {
+            "from": "ise",
+            "to": "sup",
+            "label": "Intermediate-Result: Success",
+            "detail": "Identity-Type: User",
+            "note": "The machine leg passed; ISE now asks for the user identity."
+          },
+          {
+            "from": "sup",
+            "to": "ise",
+            "label": "User credential",
+            "detail": "inner EAP-TLS / MSCHAPv2",
+            "tone": "success",
+            "note": "The user leg runs inside the same tunnel."
+          },
+          {
+            "from": "ise",
+            "to": "sup",
+            "label": "Crypto-Binding + Result: Success",
+            "tone": "secure",
+            "note": "Both results are bound to the tunnel keys."
+          },
+          {
+            "from": "ise",
+            "to": "sw",
+            "label": "Access-Accept",
+            "detail": "VLAN 20, SGT 5",
+            "tone": "success",
+            "note": "EapChainingResult = User and machine both succeeded, so the Employee-Managed rule matches."
+          }
+        ]
+      }
+    },
+    {
+      "id": "ise",
+      "type": "text",
+      "markdown": "## Configuring ISE\n\n1. **Allowed Protocols.** In *Policy > Policy Elements > Results > Authentication > Allowed Protocols*, enable **Allow TEAP** (ISE 3.0 and later) and set the inner methods. Tick **Enable EAP Chaining** and, under it, **Allow EAP-TLS** for the machine and user legs.\n2. **Certificates.** The ISE EAP certificate must chain to a root that endpoints trust. Use a template with the Server Authentication EKU and the PSN's FQDN in the SAN.\n3. **Identity sources.** Point the certificate authentication profile at an Active Directory join point, and map the certificate subject to the AD account.\n4. **Supplicant.** Windows: *Wired AutoConfig*, TEAP, **Enable chaining** (called \"Machine and user\" in the profile). Cisco Secure Client NAM: choose EAP-FAST or TEAP with **EAP Chaining** and a machine and user inner method.\n5. **Authorization.** Write rules from the most specific to the least specific.\n\nThe authorization rules are the payoff:\n\n| Rule | Condition | Result |\n|:--|:--|:--|\n| Employee-Managed | `EapChainingResult` = User and machine both succeeded | VLAN 20, SGT Employees, permit-all |\n| Machine-Only | `EapChainingResult` = User failed and machine succeeded | Pre-logon ACL, SGT Quarantine |\n| User-Only | `EapChainingResult` = User succeeded and machine failed | Internet-only dACL, SGT BYOD |\n| Default | none | DenyAccess |\n\nTag-based enforcement for these results is covered in [Segmentation with VRF, TrustSec and SGTs](/learn/cisco-security-certification-track/segmentation-with-vrf-trustsec-and-sgts)."
+    },
+    {
+      "id": "switch",
+      "type": "code",
+      "language": "cisco",
+      "filename": "access-switch.cfg",
+      "caption": "Switch side: nothing special is needed for chaining; the switch only relays EAP.",
+      "code": "aaa new-model\nradius server ISE-PSN1\n address ipv4 192.0.2.21 auth-port 1812 acct-port 1813\n key <RADIUS_SHARED_SECRET>\naaa group server radius ISE-GROUP\n server name ISE-PSN1\naaa authentication dot1x default group ISE-GROUP\naaa authorization network default group ISE-GROUP\naaa accounting dot1x default start-stop group ISE-GROUP\ndot1x system-auth-control\n!\ninterface GigabitEthernet1/0/12\n switchport mode access\n authentication host-mode multi-auth\n authentication order dot1x mab\n authentication priority dot1x mab\n authentication port-control auto\n mab\n dot1x pae authenticator\n spanning-tree portfast"
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Verifying the chained session",
+      "prompt": "SW1#",
+      "lines": [
+        {
+          "cmd": "show authentication sessions interface GigabitEthernet1/0/12 details",
+          "output": "            Interface:  GigabitEthernet1/0/12\n          MAC Address:  0050.56a1.2b3c\n         IPv4 Address:  10.20.20.41\n            User-Name:  host/pc017.example.com\n               Status:  Authorized\n               Domain:  DATA\n       Oper host mode:  multi-auth\n    Common Session ID:  C000020A0000001F3A2B1C\nServer Policies:\n           Vlan Group:  Vlan: 20\n            SGT Value:  5\nMethod status list:\n       Method           State\n       dot1x            Authc Success",
+          "comment": "The switch shows one authorized session. The user name is the outer identity; the chaining result is visible only in ISE Live Logs."
+        }
+      ]
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## Design trade-offs\n\n- **TEAP versus EAP-FAST.** TEAP is the long-term choice because Windows supports it natively and it needs no PAC. Use EAP-FAST chaining only where Secure Client NAM is already standard.\n- **Certificate-only chains versus passwords.** Inner EAP-TLS for both legs removes password risk but requires a user-certificate lifecycle (enrollment, renewal, revocation checks).\n- **Machine-only fallback.** Be explicit about the pre-logon state. Machines need AD, DHCP and software-update access before anyone signs in, so give the \"Machine-Only\" result a narrow, useful ACL rather than a deny.\n- **Dual identity cost.** The ISE PSN does two certificate validations and, if configured, two OCSP checks per session. Size PSNs accordingly and keep the OCSP responder close.\n- **Wireless.** The same policy works on a WLC, but roaming across controllers must preserve the PMK-cached session or the chain restarts."
+    },
+    {
+      "id": "trouble",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Troubleshooting chained sessions",
+      "markdown": "- **Only machine or only user matches.** The supplicant is not sending the second identity. Confirm chaining is enabled in the profile and that the user session has started (the user must sign in).\n- **Result stays \"User failed and machine succeeded\".** Check the user certificate: EKU, expiry, and that AD can map it. Review the Live Log step list for the inner failure code.\n- **Tunnel fails before any inner method.** The supplicant does not trust the ISE EAP certificate, or the time is wrong on the endpoint.\n- **Works on one PSN, not another.** The EAP certificate or identity-store reachability differs between PSNs.\n- **Do not rely on `WasMachineAuthenticated` for new designs.** Use `EapChainingResult` instead."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use an ISE evaluation node, a Windows 11 VM joined to a lab Active Directory, and a lab switch or CML Catalyst image.\n\n1. Issue a machine certificate and a user certificate from your lab CA.\n2. Enable **Allow TEAP** with chaining in an Allowed Protocols list, then build the four authorization rules from the table above.\n3. Configure the Windows wired profile for TEAP with \"Machine and user\" and connect.\n4. In Live Logs, open the detail of the session and read `EapChainingResult`.\n5. Revoke or delete the user certificate, reconnect, and confirm the **Machine-Only** rule now matches."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "EAP chaining",
+          "definition": "Proving machine and user identities inside one EAP tunnel and one RADIUS session."
+        },
+        {
+          "term": "TEAP",
+          "definition": "RFC 7170 tunneled EAP method that carries one or two inner methods in TLVs."
+        },
+        {
+          "term": "EAP-FAST",
+          "definition": "Cisco tunneled EAP method, the predecessor of TEAP, that also supports chaining."
+        },
+        {
+          "term": "Crypto-Binding TLV",
+          "definition": "Field that ties the inner method results to the outer tunnel keys."
+        },
+        {
+          "term": "Identity-Type TLV",
+          "definition": "Field that says whether the next inner exchange is for machine or user."
+        },
+        {
+          "term": "EapChainingResult",
+          "definition": "ISE dictionary attribute that records the combined machine and user outcome."
+        },
+        {
+          "term": "PAC",
+          "definition": "Protected Access Credential used by EAP-FAST to establish its tunnel."
+        },
+        {
+          "term": "Allowed Protocols",
+          "definition": "The ISE list that decides which authentication methods a policy accepts."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What does the Crypto-Binding TLV in TEAP protect against?",
+          "options": [
+            "Password guessing against the user",
+            "A man-in-the-middle splicing inner results onto a different tunnel",
+            "Expired ISE certificates",
+            "DHCP starvation"
+          ],
+          "answer": 1,
+          "explanation": "It binds inner method results to the outer tunnel keys, so results cannot be moved to another tunnel."
+        },
+        {
+          "question": "Which ISE attribute should new policies use to match a successful machine plus user authentication?",
+          "options": [
+            "WasMachineAuthenticated",
+            "Network Access:EapChainingResult",
+            "Radius:Service-Type",
+            "Endpoint:EndPointPolicy"
+          ],
+          "answer": 1,
+          "explanation": "EapChainingResult is set from the single chained session. WasMachineAuthenticated relies on a cache of earlier sessions."
+        },
+        {
+          "question": "Choose all that apply. Which are advantages of TEAP over EAP-FAST?",
+          "options": [
+            "Standardized in RFC 7170",
+            "Native support in Windows 11",
+            "It does not require a PAC",
+            "It needs no TLS tunnel"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "TEAP is an IETF standard, ships in modern Windows, and uses the server certificate instead of PACs. Both still build a TLS tunnel."
+        },
+        {
+          "question": "A laptop is at the logon screen and no user has signed in. Which chaining result is expected?",
+          "options": [
+            "User and machine both succeeded",
+            "User failed and machine succeeded",
+            "User and machine both failed",
+            "User succeeded and machine failed"
+          ],
+          "answer": 1,
+          "explanation": "Only the machine leg can complete before logon, so the result is machine succeeded and user failed or absent."
+        },
+        {
+          "question": "Choose all that apply. A chained session never reaches the Employee-Managed rule. Which checks make sense?",
+          "options": [
+            "Chaining is enabled in the supplicant profile",
+            "The user certificate EKU and expiry",
+            "The Live Log inner failure code",
+            "Whether the switch supports VTP"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "These checks target the second identity. VTP is unrelated to EAP."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- EAP chaining proves the machine and the user in one tunnel, giving ISE a single, bound result.\n- TEAP (RFC 7170) is the standard method; EAP-FAST chaining is the Cisco predecessor.\n- TLVs carry identity type, intermediate results and the crypto-binding that prevents splicing.\n- In ISE, use `EapChainingResult` in authorization rules and give the machine-only state a narrow, working ACL.\n- Troubleshoot from the supplicant profile, then certificates, then the Live Log inner failure code."
+    }
+  ],
+  "ar": {
+    "title": "تسلسل EAP (EAP Chaining) وTEAP",
+    "summary": "أثبت هويتي الآلة والمستخدم في جلسة 802.1X واحدة بتسلسل TEAP أو EAP-FAST، واكتب سياسة ISE على النتيجة المركّبة.",
+    "objectives": [
+      "اشرح لماذا تُعدّ مصادقتا الآلة والمستخدم المنفصلتان ضعيفتين",
+      "صِف مراحل TEAP وحقول TLV التي تتيح التسلسل",
+      "اضبط البروتوكولات المسموحة وقواعد التفويض في ISE للتسلسل",
+      "شخّص جلسة متسلسلة من السجلات الحية"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يُشغَّل حاسوب محمول عند الثامنة وخمس وخمسين دقيقة، ويسجّل المستخدم دخوله عند التاسعة. وخلال الدقائق الخمس تُصادَق الآلة وحدها، ثم يظهر الشخص. تعامل معظم تصاميم 802.1X هذين الحدثين كأنهما منفصلان، فتستطيع السياسة أن تقول «هذا حاسوب مرتبط بالنطاق» أو «هذا موظف»، لكنها لا تستطيع أن تقول «هذا الموظف يستخدم هذا الحاسوب المؤسسي».\n\nوفي مختبر CCIE Security تهمّ هذه الفجوة. فكلمة مرور مسروقة تُستخدم من حاسوب شخصي، أو حاسوب مُدار يستخدمه حساب مجهول، يجب ألا يحصلا على وصول الثنائي الحقيقي. يسدّ **تسلسل EAP (EAP Chaining)** هذه الفجوة: جلسة مصادقة واحدة تُثبت الهويتين، ويستطيع ISE كتابة قاعدة على النتيجة المركّبة. يشرح هذا الدرس كيف يفعل ذلك كلٌّ من TEAP وEAP-FAST، وكيف يُضبط ISE، وكيف يُشخَّص الخلل. وهو يبني على درس [Cisco ISE: 802.1X, MAB and Guest Access](/learn/cisco-security-certification-track/cisco-ise-802-1x-mab-and-guest-access)."
+      },
+      {
+        "id": "why",
+        "type": "text",
+        "markdown": "## مشكلة المصادقتين المنفصلتين\n\nيستطيع Windows تنفيذ **مصادقة الآلة (Machine Authentication)** وهي حساب الحاسوب، وغالبًا بـ EAP-TLS وشهادة آلة، و**مصادقة المستخدم (User Authentication)** وهي الشخص، وغالبًا بـ PEAP أو EAP-TLS وشهادة مستخدم. وبلا تسلسل تكون كل منهما جلسة RADIUS مستقلة، ولا يحتفظ المحوّل إلا بالأحدث.\n\nوينتج عن ذلك ثلاث نقاط ضعف:\n\n- **غياب الربط.** يرى ISE «الآلة سليمة» عند الإقلاع و«المستخدم سليم» عند الدخول، دون دليل على أنهما صادران عن الجهاز نفسه.\n- **اضطراب الجلسات.** يعيد كل انتقال مصادقة المنفذ، وقد تتبدّل VLAN أو SGT بين النتيجتين.\n- **قواعد هشّة.** تعتمد السياسة على السمة `WasMachineAuthenticated`، وهي تقوم على ذاكرة مؤقتة لجلسات الآلة الحديثة وتنكسر عبر عدة PSN أو بعد إعادة التشغيل.\n\nأما مع التسلسل فيُنفّذ المُستجدّ (Supplicant) المصادقتين الداخليتين داخل نفق TLS **واحد**. يُرجع ISE رسالة Access-Accept واحدة، ويعرض النتيجة في سمة القاموس `Network Access:EapChainingResult`."
+      },
+      {
+        "id": "teap",
+        "type": "text",
+        "markdown": "## تسلسل TEAP وEAP-FAST\n\n**TEAP** (بروتوكول المصادقة الموسّع المُنفَّق، RFC 7170) هو الخَلَف القياسي لبروتوكول **EAP-FAST** الخاص بـ Cisco. يبني كلاهما نفق TLS أولًا (المرحلة 1)، ثم ينقل فيه طرقًا داخلية مرمّزة بحقول TLV (المرحلة 2).\n\n| الخاصية | PEAP | EAP-FAST | TEAP |\n|:--|:--|:--|:--|\n| المعيار | مسودة Microsoft/Cisco | Cisco، RFC 4851 | IETF RFC 7170 |\n| الطرق الداخلية | واحدة (MSCHAPv2) | واحدة أو اثنتان (تسلسل) | واحدة أو اثنتان، بأي مزيج |\n| التسلسل | لا | نعم | نعم |\n| تهيئة النفق | شهادة الخادم | PAC أو شهادة الخادم | شهادة الخادم |\n| المُستجدّ الأصلي في Windows | نعم | لا (يحتاج Cisco Secure Client NAM) | Windows 11 وServer 2022 |\n\nيعتمد التسلسل على حقول TLV يشترك فيها EAP-FAST وTEAP:\n\n- **Identity-Type TLV** يخبر ISE هل التبادل الداخلي التالي للآلة أم للمستخدم.\n- **Intermediate-Result TLV** يُبلغ نجاح كل طريقة داخلية أو فشلها.\n- **Crypto-Binding TLV** يربط النتائج الداخلية بالنفق الخارجي تشفيريًا، فلا يستطيع وسيط مهاجم وصل تبادل مستخدم مسروق بنفق آلة أخرى.\n- **Result TLV** يحمل النتيجة النهائية.\n\nوالمزيج الداخلي الشائع هو EAP-TLS للآلة وEAP-TLS أو MSCHAPv2 للمستخدم. وسلاسل الشهادات الخالصة أقوى، لأنه لا توجد كلمة مرور يمكن اصطيادها."
+      },
+      {
+        "id": "teap-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "TEAP مع تسلسل الآلة والمستخدم",
+        "caption": "نفق واحد يحمل مصادقتين داخليتين ويُرجع نتيجة واحدة.",
+        "data": {
+          "actors": [
+            {
+              "id": "sup",
+              "label": "المُستجدّ",
+              "sub": "TEAP",
+              "icon": "laptop"
+            },
+            {
+              "id": "sw",
+              "label": "المحوّل",
+              "sub": "Gi1/0/12",
+              "icon": "switch"
+            },
+            {
+              "id": "ise",
+              "label": "ISE PSN",
+              "sub": "192.0.2.21",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "from": "sup",
+              "to": "ise",
+              "label": "TLS ClientHello",
+              "detail": "via EAPoL",
+              "note": "تبدأ المرحلة 1. يمرّر المحوّل كل شيء داخل RADIUS."
+            },
+            {
+              "from": "ise",
+              "to": "sup",
+              "label": "ServerHello + certificate",
+              "tone": "secure",
+              "note": "يتحقق المُستجدّ من شهادة ISE مقابل الجذور الموثوقة لديه."
+            },
+            {
+              "from": "ise",
+              "to": "sup",
+              "label": "Identity-Type: Machine",
+              "detail": "inner EAP-TLS",
+              "note": "المرحلة 2: يطلب ISE أولًا هوية الحاسوب."
+            },
+            {
+              "from": "sup",
+              "to": "ise",
+              "label": "Machine certificate",
+              "tone": "success",
+              "note": "يتحقق ISE من شهادة الآلة وسلسلة المرجع المصدِّر."
+            },
+            {
+              "from": "ise",
+              "to": "sup",
+              "label": "Intermediate-Result: Success",
+              "detail": "Identity-Type: User",
+              "note": "نجح جزء الآلة؛ والآن يطلب ISE هوية المستخدم."
+            },
+            {
+              "from": "sup",
+              "to": "ise",
+              "label": "User credential",
+              "detail": "inner EAP-TLS / MSCHAPv2",
+              "tone": "success",
+              "note": "يجري جزء المستخدم داخل النفق نفسه."
+            },
+            {
+              "from": "ise",
+              "to": "sup",
+              "label": "Crypto-Binding + Result: Success",
+              "tone": "secure",
+              "note": "تُربط النتيجتان بمفاتيح النفق."
+            },
+            {
+              "from": "ise",
+              "to": "sw",
+              "label": "Access-Accept",
+              "detail": "VLAN 20, SGT 5",
+              "tone": "success",
+              "note": "EapChainingResult = User and machine both succeeded، فتنطبق قاعدة Employee-Managed."
+            }
+          ]
+        }
+      },
+      {
+        "id": "ise",
+        "type": "text",
+        "markdown": "## ضبط ISE\n\n1. **البروتوكولات المسموحة (Allowed Protocols).** في *Policy > Policy Elements > Results > Authentication > Allowed Protocols* فعّل **Allow TEAP** (ISE 3.0 وما بعده) وحدّد الطرق الداخلية. فعّل **Enable EAP Chaining** وتحته **Allow EAP-TLS** لجزأي الآلة والمستخدم.\n2. **الشهادات.** يجب أن ترتبط شهادة EAP في ISE بجذر تثق به الأجهزة الطرفية. استخدم قالبًا يحمل الاستخدام الممتد Server Authentication واسم PSN الكامل (FQDN) في الحقل SAN.\n3. **مصادر الهوية.** اجعل ملف مصادقة الشهادة يشير إلى نقطة انضمام Active Directory، واربط موضوع الشهادة بحساب AD.\n4. **المُستجدّ.** في Windows: خدمة *Wired AutoConfig* وبروتوكول TEAP وخيار **Enable chaining** (يسمى «Machine and user» في الملف التعريفي). وفي Cisco Secure Client NAM: اختر EAP-FAST أو TEAP مع **EAP Chaining** وطريقة داخلية للآلة والمستخدم.\n5. **التفويض.** اكتب القواعد من الأكثر تحديدًا إلى الأقل.\n\nوقواعد التفويض هي الثمرة:\n\n| القاعدة | الشرط | النتيجة |\n|:--|:--|:--|\n| Employee-Managed | `EapChainingResult` = User and machine both succeeded | VLAN 20 وSGT Employees وسماح كامل |\n| Machine-Only | `EapChainingResult` = User failed and machine succeeded | قائمة وصول لما قبل الدخول وSGT Quarantine |\n| User-Only | `EapChainingResult` = User succeeded and machine failed | dACL للإنترنت فقط وSGT BYOD |\n| Default | لا شيء | DenyAccess |\n\nويغطي درس [Segmentation with VRF, TrustSec and SGTs](/learn/cisco-security-certification-track/segmentation-with-vrf-trustsec-and-sgts) فرض السياسة المبنية على الوسوم لهذه النتائج."
+      },
+      {
+        "id": "switch",
+        "type": "code",
+        "language": "cisco",
+        "filename": "access-switch.cfg",
+        "caption": "جهة المحوّل: لا يلزم شيء خاص للتسلسل؛ فالمحوّل يمرّر EAP فقط.",
+        "code": "aaa new-model\nradius server ISE-PSN1\n address ipv4 192.0.2.21 auth-port 1812 acct-port 1813\n key <RADIUS_SHARED_SECRET>\naaa group server radius ISE-GROUP\n server name ISE-PSN1\naaa authentication dot1x default group ISE-GROUP\naaa authorization network default group ISE-GROUP\naaa accounting dot1x default start-stop group ISE-GROUP\ndot1x system-auth-control\n!\ninterface GigabitEthernet1/0/12\n switchport mode access\n authentication host-mode multi-auth\n authentication order dot1x mab\n authentication priority dot1x mab\n authentication port-control auto\n mab\n dot1x pae authenticator\n spanning-tree portfast"
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "التحقق من الجلسة المتسلسلة",
+        "prompt": "SW1#",
+        "lines": [
+          {
+            "cmd": "show authentication sessions interface GigabitEthernet1/0/12 details",
+            "output": "            Interface:  GigabitEthernet1/0/12\n          MAC Address:  0050.56a1.2b3c\n         IPv4 Address:  10.20.20.41\n            User-Name:  host/pc017.example.com\n               Status:  Authorized\n               Domain:  DATA\n       Oper host mode:  multi-auth\n    Common Session ID:  C000020A0000001F3A2B1C\nServer Policies:\n           Vlan Group:  Vlan: 20\n            SGT Value:  5\nMethod status list:\n       Method           State\n       dot1x            Authc Success",
+            "comment": "يعرض المحوّل جلسة واحدة مخوَّلة. اسم المستخدم هو الهوية الخارجية؛ أما نتيجة التسلسل فتظهر في سجلات ISE الحية فقط."
+          }
+        ]
+      },
+      {
+        "id": "design",
+        "type": "text",
+        "markdown": "## مفاضلات التصميم\n\n- **TEAP مقابل EAP-FAST.** TEAP هو الخيار بعيد المدى لأن Windows يدعمه أصلًا ولا يحتاج إلى PAC. استخدم تسلسل EAP-FAST فقط حيث يكون Secure Client NAM معيارًا قائمًا.\n- **سلاسل الشهادات مقابل كلمات المرور.** يزيل EAP-TLS الداخلي في الجزأين خطر كلمات المرور، لكنه يتطلب إدارة دورة حياة شهادات المستخدم (التسجيل والتجديد وفحص الإلغاء).\n- **الرجوع إلى الآلة فقط.** كن صريحًا في حالة ما قبل الدخول. تحتاج الأجهزة إلى AD وDHCP وتحديثات البرمجيات قبل أن يسجّل أحد دخوله، فامنح نتيجة «Machine-Only» قائمة وصول ضيقة ومفيدة لا رفضًا.\n- **كلفة الهويتين.** ينفّذ ISE PSN تحققين من الشهادات وفحصي OCSP عند ضبطهما في كل جلسة. حدّد حجم PSN وفق ذلك واجعل مستجيب OCSP قريبًا.\n- **الشبكة اللاسلكية.** تعمل السياسة نفسها على WLC، لكن التنقل بين المتحكمات يجب أن يحافظ على الجلسة المخزَّنة بـ PMK وإلا بدأ التسلسل من جديد."
+      },
+      {
+        "id": "trouble",
+        "type": "callout",
+        "variant": "warning",
+        "title": "تشخيص الجلسات المتسلسلة",
+        "markdown": "- **تطابق الآلة فقط أو المستخدم فقط.** المُستجدّ لا يرسل الهوية الثانية. تأكد من تفعيل التسلسل في الملف التعريفي ومن بدء جلسة المستخدم (يجب أن يسجّل دخوله).\n- **تبقى النتيجة «User failed and machine succeeded».** افحص شهادة المستخدم: الاستخدام الممتد وانتهاء الصلاحية وقدرة AD على ربطها. راجع قائمة الخطوات في السجل الحي لمعرفة رمز الفشل الداخلي.\n- **يفشل النفق قبل أي طريقة داخلية.** المُستجدّ لا يثق بشهادة EAP في ISE، أو أن وقت الجهاز الطرفي خاطئ.\n- **يعمل على PSN ولا يعمل على آخر.** تختلف شهادة EAP أو إمكانية الوصول إلى مخزن الهوية بين الـ PSN.\n- **لا تعتمد على `WasMachineAuthenticated` في التصاميم الجديدة.** استخدم `EapChainingResult` بدلًا منها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم عقدة ISE تجريبية وآلة Windows 11 افتراضية منضمّة إلى Active Directory مخبري ومحوّلًا مخبريًا أو صورة Catalyst في CML.\n\n1. أصدر شهادة آلة وشهادة مستخدم من المرجع المصدِّر المخبري.\n2. فعّل **Allow TEAP** مع التسلسل في قائمة البروتوكولات المسموحة، ثم ابنِ قواعد التفويض الأربع من الجدول أعلاه.\n3. اضبط ملف Windows السلكي على TEAP مع «Machine and user» ثم اتصل.\n4. في السجلات الحية افتح تفاصيل الجلسة واقرأ `EapChainingResult`.\n5. ألغِ شهادة المستخدم أو احذفها، وأعد الاتصال، وتأكد أن قاعدة **Machine-Only** هي التي تنطبق الآن."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "EAP chaining",
+            "definition": "إثبات هويتي الآلة والمستخدم داخل نفق EAP واحد وجلسة RADIUS واحدة."
+          },
+          {
+            "term": "TEAP",
+            "definition": "طريقة EAP مُنفَّقة وفق RFC 7170 تحمل طريقة داخلية أو اثنتين في حقول TLV."
+          },
+          {
+            "term": "EAP-FAST",
+            "definition": "طريقة EAP مُنفَّقة من Cisco، سبقت TEAP وتدعم التسلسل أيضًا."
+          },
+          {
+            "term": "Crypto-Binding TLV",
+            "definition": "حقل يربط نتائج الطرق الداخلية بمفاتيح النفق الخارجي."
+          },
+          {
+            "term": "Identity-Type TLV",
+            "definition": "حقل يحدد هل التبادل الداخلي التالي للآلة أم للمستخدم."
+          },
+          {
+            "term": "EapChainingResult",
+            "definition": "سمة قاموس في ISE تسجّل النتيجة المركّبة للآلة والمستخدم."
+          },
+          {
+            "term": "PAC",
+            "definition": "بيانات اعتماد وصول محمية يستخدمها EAP-FAST لإنشاء نفقه."
+          },
+          {
+            "term": "Allowed Protocols",
+            "definition": "قائمة في ISE تحدد طرق المصادقة التي تقبلها السياسة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ممّ يحمي الحقل Crypto-Binding TLV في TEAP؟",
+            "options": [
+              "تخمين كلمة مرور المستخدم",
+              "وسيط مهاجم يصل النتائج الداخلية بنفق مختلف",
+              "شهادات ISE المنتهية",
+              "استنزاف DHCP"
+            ],
+            "answer": 1,
+            "explanation": "يربط نتائج الطرق الداخلية بمفاتيح النفق الخارجي فلا يمكن نقلها إلى نفق آخر."
+          },
+          {
+            "question": "أي سمة في ISE ينبغي أن تستخدمها السياسات الجديدة لمطابقة مصادقة ناجحة للآلة والمستخدم معًا؟",
+            "options": [
+              "WasMachineAuthenticated",
+              "Network Access:EapChainingResult",
+              "Radius:Service-Type",
+              "Endpoint:EndPointPolicy"
+            ],
+            "answer": 1,
+            "explanation": "تُحدَّد EapChainingResult من الجلسة المتسلسلة الواحدة، أما WasMachineAuthenticated فتعتمد على ذاكرة مؤقتة لجلسات سابقة."
+          },
+          {
+            "question": "اختر كل ما ينطبق. ما مزايا TEAP على EAP-FAST؟",
+            "options": [
+              "موحَّد في RFC 7170",
+              "دعم أصلي في Windows 11",
+              "لا يتطلب PAC",
+              "لا يحتاج إلى نفق TLS"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "TEAP معيار IETF ومضمَّن في Windows الحديث ويستخدم شهادة الخادم بدل PAC. وكلاهما يبني نفق TLS."
+          },
+          {
+            "question": "حاسوب محمول عند شاشة الدخول ولم يسجّل أي مستخدم دخوله. ما نتيجة التسلسل المتوقعة؟",
+            "options": [
+              "User and machine both succeeded",
+              "User failed and machine succeeded",
+              "User and machine both failed",
+              "User succeeded and machine failed"
+            ],
+            "answer": 1,
+            "explanation": "لا يكتمل قبل الدخول إلا جزء الآلة، فتكون النتيجة نجاح الآلة وفشل المستخدم أو غيابه."
+          },
+          {
+            "question": "اختر كل ما ينطبق. جلسة متسلسلة لا تصل إلى قاعدة Employee-Managed. أي الفحوص منطقي؟",
+            "options": [
+              "التسلسل مفعّل في ملف المُستجدّ",
+              "الاستخدام الممتد لشهادة المستخدم وانتهاؤها",
+              "رمز الفشل الداخلي في السجل الحي",
+              "هل يدعم المحوّل VTP"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "هذه الفحوص تستهدف الهوية الثانية، أما VTP فلا علاقة له بـ EAP."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يُثبت تسلسل EAP هويتي الآلة والمستخدم في نفق واحد، فيحصل ISE على نتيجة واحدة مترابطة.\n- TEAP (RFC 7170) هو الطريقة القياسية، وتسلسل EAP-FAST هو سلفها من Cisco.\n- تحمل حقول TLV نوع الهوية والنتائج الوسيطة والربط التشفيري الذي يمنع الوصل المزيّف.\n- في ISE استخدم `EapChainingResult` في قواعد التفويض، وامنح حالة الآلة فقط قائمة وصول ضيقة تعمل.\n- شخّص الخلل بدءًا من الملف التعريفي للمُستجدّ، ثم الشهادات، ثم رمز الفشل الداخلي في السجل الحي."
+      }
+    ]
+  }
+}
