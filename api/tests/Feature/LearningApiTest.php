@@ -146,6 +146,18 @@ class LearningApiTest extends TestCase
         $this->assertSame(1, LearningCourse::count());
     }
 
+    public function test_fill_mode_replaces_a_review_pointer_with_a_written_lesson(): void
+    {
+        $transfer = app(CourseTransfer::class);
+        $transfer->import($this->document([
+            'blocks' => [['id' => 'review', 'type' => 'callout', 'variant' => 'info', 'markdown' => 'See the other lesson.']],
+        ]));
+
+        $transfer->import($this->document(), 'fill');
+
+        $this->assertSame('## Hello', LearningLesson::where('slug', 'first')->first()->blocks[0]['markdown']);
+    }
+
     public function test_export_round_trips(): void
     {
         $transfer = app(CourseTransfer::class);
