@@ -24,6 +24,7 @@ class App extends Model
         'version',
         'updated_on',
         'accent',
+        'logo',
         'tags',
         'stack',
         'docs',

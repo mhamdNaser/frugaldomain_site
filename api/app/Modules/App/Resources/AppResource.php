@@ -51,6 +51,8 @@ class AppResource extends JsonResource
             'updated' => optional($this->updated_on)->format('Y-m-d'),
             'cover' => $this->url($cover),
             'accent' => $this->accent,
+            // A data: URI, passed through as-is (asset() would mangle it).
+            'logo' => $this->logo ?: null,
             'tags' => $this->tags ?? [],
             'preview' => [
                 'mode' => $this->preview_mode,

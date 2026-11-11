@@ -203,6 +203,12 @@ class LearningApiTest extends TestCase
             'blocks' => [['id' => 'review', 'type' => 'callout', 'variant' => 'info', 'markdown' => 'See the other lesson.']],
         ]));
 
+        // A pointer seeded as a draft (its target was not written yet) is published later.
+        LearningLesson::where('slug', 'first')->update(['status' => 'draft']);
+        $pointer = ['id' => 'review', 'type' => 'callout', 'variant' => 'info', 'markdown' => 'Now written.'];
+        $transfer->import($this->document(['status' => 'published', 'blocks' => [$pointer]]), 'fill');
+        $this->assertSame('published', LearningLesson::where('slug', 'first')->first()->status);
+
         $transfer->import($this->document(), 'fill');
 
         $this->assertSame('## Hello', LearningLesson::where('slug', 'first')->first()->blocks[0]['markdown']);

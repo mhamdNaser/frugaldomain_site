@@ -3,6 +3,7 @@
 namespace Database\Seeders;
 
 use Illuminate\Database\Seeder;
+use App\Modules\App\database\seeders\AppLogoSeeder;
 use App\Modules\Component\database\seeders\ComponentCategorySeeder;
 use App\Modules\Component\database\seeders\ComponentLibrarySeeder;
 use App\Modules\Drawing\database\seeders\DrawingTemplateLibrarySeeder;
@@ -39,6 +40,9 @@ class DatabaseSeeder extends Seeder
             // The learning curriculum. Fill-only: it never overwrites a
             // lesson that has been edited in the dashboard.
             LearningCurriculumSeeder::class,
+
+            // App logos. Fill-only: sets `logo` where it is empty, nothing else.
+            AppLogoSeeder::class,
         ]);
     }
 }

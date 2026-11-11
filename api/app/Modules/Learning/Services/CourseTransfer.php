@@ -226,12 +226,13 @@ class CourseTransfer
             // only receives content while it has none of its own.
             // The same for each language, and for a missing Arabic title.
             // The seeder's generated review pointer (one block, id "review")
-            // counts as empty, so a review topic later written in full replaces it.
+            // is not dashboard work, so it is always refreshed: it is published
+            // once the lesson it points to exists, and replaced when written in full.
             $isPointer = fn ($b) => is_array($b) && count($b) === 1 && ($b[0]['id'] ?? null) === 'review';
-            if ((empty($existing->blocks) || ($isPointer($existing->blocks) && ! $isPointer($blocks))) && $blocks) {
+            if ((empty($existing->blocks) || $isPointer($existing->blocks)) && $blocks) {
                 $existing->fill($content);
             }
-            if ((empty($existing->blocks_ar) || ($isPointer($existing->blocks_ar) && ! $isPointer($blocksAr))) && $blocksAr) {
+            if ((empty($existing->blocks_ar) || $isPointer($existing->blocks_ar)) && $blocksAr) {
                 $existing->fill(Arr::except($arabic, ['title_ar']));
             }
             if (empty($existing->title_ar) && $arabic['title_ar']) {
