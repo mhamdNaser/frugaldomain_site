@@ -1,0 +1,604 @@
+{
+  "slug": "linux-cgroups-security",
+  "title": "Linux cgroups Security",
+  "summary": "Use Linux control groups to cap memory, CPU and processes for containers and services, verify the limits in the kernel, and protect the cgroup interface.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain what cgroup controllers limit and why limits are a security control",
+    "Set and verify memory, CPU and PID limits for containers and systemd services",
+    "Read cgroup v2 files and memory.events to detect limit hits",
+    "Choose sensible limits using measurement and headroom",
+    "Identify settings that expose a writable cgroup interface"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 2 a.m., monitoring reports that your Docker host is unresponsive. SSH hangs. When you finally get in, you find one container with a memory leak that consumed all of the RAM and pushed the database on the same host into swap. Nothing was hacked. A single missing line of configuration was enough to cause an outage.\n\nThat missing line was a resource limit. Linux enforces limits through **control groups (cgroups)**. They are the availability half of container security: namespaces decide what a container can see, and cgroups decide how much of the machine it can take. In this lesson you will read cgroup settings on a live host, set limits for containers and services, and use them to contain both bugs and abuse."
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## What cgroups do\n\nA cgroup is a group of processes with a shared set of resource rules. The kernel arranges cgroups in a tree under `/sys/fs/cgroup`. Each **controller** manages one resource.\n\n| Controller | Key file (v2) | What it limits | Failure it prevents |\n|:--|:--|:--|:--|\n| memory | `memory.max`, `memory.high` | RAM (and swap with `memory.swap.max`) | One leak starving the host |\n| cpu | `cpu.max`, `cpu.weight` | CPU time and share | A busy loop slowing neighbors |\n| pids | `pids.max` | Number of processes and threads | Runaway process creation |\n| io | `io.max`, `io.weight` | Disk throughput and IOPS | One workload saturating the disk |\n| cpuset | `cpuset.cpus` | Which CPU cores are allowed | Noisy neighbors on shared cores |\n| devices | managed by the runtime | Which devices may be opened | Raw disk or hardware access |\n\n### Version 1 and version 2\n\nModern distributions (Debian 12, Ubuntu 22.04 and later, RHEL 9) use **cgroup v2**, a single unified tree with one set of files. Older hosts may still use v1 with a separate tree per controller. Check yours with `stat -fc %T /sys/fs/cgroup`: the answer `cgroup2fs` means v2. The examples here use v2, which is simpler to audit and has better memory accounting.\n\n### Limits are a security control\n\nWe often treat limits as a performance tool. They are also an **availability and containment control**. A compromised container that cannot spawn more than 100 processes, cannot use more than 256 MB, and cannot saturate the disk is far less useful for denial of service or cryptomining. Limits also give your monitoring a clear signal: a container that keeps hitting its ceiling deserves attention."
+    },
+    {
+      "id": "limits-term",
+      "type": "terminal",
+      "title": "Set limits and read them back",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "stat -fc %T /sys/fs/cgroup",
+          "output": "cgroup2fs",
+          "comment": "Confirms the unified v2 hierarchy."
+        },
+        {
+          "cmd": "docker run -d --name api --memory 256m --memory-swap 256m --cpus 1.5 --pids-limit 100 registry.example.com/team/api:2.3.0",
+          "output": "b71e0c4d9a3f5e2816c7d0a9f4b3e2d1c8a7b6e5f4d3c2b1a09f8e7d6c5b4a39",
+          "comment": "`--memory-swap` equal to `--memory` disables swap for the container, so it is killed instead of thrashing the disk."
+        },
+        {
+          "cmd": "docker inspect --format '{{.State.Pid}} {{.HostConfig.CgroupParent}}' api",
+          "output": "51207 ",
+          "comment": "The PID lets you find the cgroup path below."
+        },
+        {
+          "cmd": "cat /proc/51207/cgroup",
+          "output": "0::/system.slice/docker-b71e0c4d9a3f5e28.scope",
+          "comment": "With the systemd driver, each container is a transient scope unit."
+        },
+        {
+          "cmd": "cd /sys/fs/cgroup/system.slice/docker-b71e0c4d9a3f5e28.scope && cat memory.max pids.max cpu.max",
+          "output": "268435456\n100\n150000 100000",
+          "comment": "268435456 bytes is 256 MiB. `150000 100000` means 150 ms of CPU every 100 ms, which is 1.5 cores."
+        },
+        {
+          "cmd": "cat memory.current pids.current",
+          "output": "83984384\n7",
+          "comment": "Current use sits well under both limits. Alert when these approach the ceilings."
+        }
+      ],
+      "caption": "Docker flags become kernel files; read the files to prove the limit is real."
+    },
+    {
+      "id": "oom-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "A memory leak meets a limit",
+      "caption": "The cgroup contains the failure so the host and its neighbors stay healthy.",
+      "data": {
+        "token": "Memory use",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "Leaking app",
+            "sub": "inside container",
+            "icon": "bug"
+          },
+          {
+            "id": "high",
+            "label": "memory.high",
+            "sub": "soft limit",
+            "icon": "eye"
+          },
+          {
+            "id": "max",
+            "label": "memory.max",
+            "sub": "hard limit",
+            "icon": "lock"
+          },
+          {
+            "id": "oom",
+            "label": "cgroup OOM kill",
+            "sub": "only this container",
+            "icon": "alert"
+          },
+          {
+            "id": "host",
+            "label": "Host and neighbors",
+            "sub": "unaffected",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "The application slowly allocates more memory than it frees."
+          },
+          {
+            "at": "high",
+            "caption": "Usage crosses memory.high. The kernel throttles the cgroup and reclaims pages, so it slows down.",
+            "tone": "warning"
+          },
+          {
+            "at": "max",
+            "caption": "Usage reaches memory.max. No more memory can be granted to this cgroup.",
+            "tone": "danger"
+          },
+          {
+            "at": "oom",
+            "caption": "The kernel kills a process inside this cgroup only. The runtime may restart the container.",
+            "tone": "danger"
+          },
+          {
+            "at": "host",
+            "caption": "The database and other services never noticed. Monitoring logs an OOM event for follow-up.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tuning",
+      "type": "text",
+      "markdown": "## Choosing sensible limits\n\nLimits that are too tight cause outages. Limits that are missing cause worse ones. Use a simple method.\n\n1. **Measure.** Watch `docker stats` or `memory.peak` for a normal week, including busy periods.\n2. **Add headroom.** Set `memory.max` about 25 to 50 percent above the observed peak.\n3. **Prefer `memory.high` first** for services that can slow down gracefully, and keep `memory.max` as the hard stop.\n4. **Always limit `pids`.** 100 to 500 is typical for a web service. A value of `max` means unlimited.\n5. **Disable swap for containers** when predictable latency matters.\n6. **Document exceptions.** If a job truly needs all cores, record why.\n\nOn hosts that run services directly, apply the same ideas through **systemd**. A drop-in file can place limits on any unit without touching the package's own files."
+    },
+    {
+      "id": "dropin",
+      "type": "code",
+      "language": "ini",
+      "code": "# /etc/systemd/system/nginx.service.d/limits.conf\n[Service]\nMemoryHigh=384M\nMemoryMax=512M\nMemorySwapMax=0\nTasksMax=300\nCPUQuota=150%\nIOWeight=100\nLimitNOFILE=16384",
+      "filename": "limits.conf",
+      "caption": "A systemd drop-in applies the same cgroup controls to a normal service. Load it with `systemctl daemon-reload` and `systemctl restart nginx`."
+    },
+    {
+      "id": "sysd-term",
+      "type": "terminal",
+      "title": "Verify a service limit and watch for kills",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "systemctl show nginx -p MemoryMax -p TasksMax -p CPUQuotaPerSecUSec",
+          "output": "MemoryMax=536870912\nTasksMax=300\nCPUQuotaPerSecUSec=1.500000s",
+          "comment": "systemd translated the drop-in into cgroup values."
+        },
+        {
+          "cmd": "cat /sys/fs/cgroup/system.slice/nginx.service/memory.events",
+          "output": "low 0\nhigh 4\nmax 0\noom 0\noom_kill 0",
+          "comment": "`high 4` means the soft limit throttled the service four times. `oom_kill 0` means nothing has been killed yet."
+        },
+        {
+          "cmd": "journalctl -k --since today | grep -i 'out of memory'",
+          "output": "Nov 11 02:03:11 srv01 kernel: Memory cgroup out of memory: Killed process 51310 (java) total-vm:2874120kB",
+          "comment": "Kernel logs name the cgroup that hit its limit. Forward these lines to your central log system."
+        }
+      ],
+      "caption": "memory.events is the counter to alert on."
+    },
+    {
+      "id": "hardening",
+      "type": "text",
+      "markdown": "## Protecting the cgroup interface itself\n\nCgroup files are writable by root, and a container that can write to them can raise its own limits. Several defaults keep this safe, and several options break it.\n\n- **Read-only cgroup mount.** Docker mounts `/sys/fs/cgroup` read-only in a normal container. `--privileged` makes it writable.\n- **Cgroup namespace.** On v2, containers receive a private cgroup namespace, so they see themselves as the root of their own tree and cannot browse the host layout.\n- **Delegation.** Giving a container the right to manage sub-cgroups (needed by nested runtimes) means it can create children but should not be able to loosen the parent's limits. Review delegation before allowing it.\n- **The devices controller** decides which device nodes a container may open. Do not add `--device-cgroup-rule` entries casually.\n\nA serious class of container escape abused writable cgroup features such as the `release_agent` file on v1 hosts. The lesson is simple: keep containers unprivileged, keep the cgroup filesystem read-only, and move to cgroup v2. See [Container Escape Risks](/learn/systems-infrastructure-security/container-escape-risks) for the wider picture, and [Container Isolation and Namespaces](/learn/systems-infrastructure-security/container-isolation-and-namespaces) for the visibility side."
+    },
+    {
+      "id": "monitor",
+      "type": "text",
+      "markdown": "## Monitoring limits in production\n\nA limit that nobody watches only moves the outage somewhere else. Build three simple checks into your monitoring.\n\n- **Saturation.** Alert when `memory.current` stays above 90 percent of `memory.max`, or when `pids.current` approaches `pids.max`.\n- **Events.** Alert on any increase in `oom_kill` and on frequent `high` counts. A rising `high` counter means the workload is regularly throttled and needs either a fix or a larger limit.\n- **Restarts.** Track container restart counts. A container that restarts every few minutes after an OOM kill is a symptom, not a stable service.\n\nTools such as `cAdvisor`, node exporters and the agent of your monitoring platform read these same files. Investigate unexpected CPU spikes in a container with a tiny workload: sustained 100 percent CPU on a quiet service is a classic sign of unauthorized mining software."
+    },
+    {
+      "id": "limit-warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "A missing limit is a finding",
+      "markdown": "By default a Docker container has **no** memory, CPU or process limit. Check every long-running container with `docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.PidsLimit}}' NAME`. A result of `0` for memory, or `<nil>` or `0` for pids, means unlimited. Make limits part of your deployment templates so nobody has to remember them."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a Linux VM you own with Docker installed:\n\n1. Run `stat -fc %T /sys/fs/cgroup` and note whether the host uses v1 or v2.\n2. Start `docker run -d --name lim --memory 128m --memory-swap 128m --pids-limit 50 docker.io/library/nginx:1.27`.\n3. Find its cgroup directory and read `memory.max`, `pids.max` and `memory.events`.\n4. Run `docker exec lim cat /sys/fs/cgroup/memory.max` and compare with the host value.\n5. Create a systemd drop-in with `MemoryMax=` and `TasksMax=` for a service you own, then confirm it with `systemctl show`.\n6. Remove the container with `docker rm -f lim`."
+    },
+    {
+      "id": "kt",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "cgroup",
+          "definition": "A kernel group of processes that share resource limits and accounting."
+        },
+        {
+          "term": "Controller",
+          "definition": "A cgroup component that manages one resource, such as memory or pids."
+        },
+        {
+          "term": "memory.max",
+          "definition": "The hard memory ceiling; reaching it triggers an OOM kill in that cgroup."
+        },
+        {
+          "term": "memory.high",
+          "definition": "A soft limit that throttles a cgroup before the hard limit is hit."
+        },
+        {
+          "term": "pids.max",
+          "definition": "The maximum number of processes and threads in a cgroup."
+        },
+        {
+          "term": "OOM killer",
+          "definition": "The kernel mechanism that terminates processes when memory runs out."
+        },
+        {
+          "term": "Drop-in",
+          "definition": "A systemd override file that adds settings to a unit without editing it."
+        },
+        {
+          "term": "Delegation",
+          "definition": "Allowing a process or container to manage its own sub-cgroups."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main security value of cgroup limits?",
+          "options": [
+            "They hide host processes",
+            "They contain resource exhaustion and abuse so one workload cannot starve the host",
+            "They encrypt container memory",
+            "They replace seccomp"
+          ],
+          "answer": 1,
+          "explanation": "Cgroups are an availability and containment control. Hiding processes is the job of namespaces."
+        },
+        {
+          "question": "Which settings protect a host from a runaway container? (choose all that apply)",
+          "options": [
+            "`--memory 256m`",
+            "`--pids-limit 100`",
+            "`--privileged`",
+            "`--memory-swap` equal to `--memory`"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Memory, process and swap limits all contain the container. `--privileged` removes protections, including a read-only cgroup mount."
+        },
+        {
+          "question": "Which command tells you whether a host uses cgroup v2?",
+          "options": [
+            "`docker version`",
+            "`uname -n`",
+            "`stat -fc %T /sys/fs/cgroup`",
+            "`lsns --type pid`"
+          ],
+          "answer": 2,
+          "explanation": "The filesystem type `cgroup2fs` indicates the unified v2 hierarchy."
+        },
+        {
+          "question": "What does `memory.events` showing `oom_kill 3` tell you?",
+          "options": [
+            "Three processes in that cgroup were killed for exceeding the memory limit",
+            "Three containers were started",
+            "Three users logged in",
+            "Swap is disabled"
+          ],
+          "answer": 0,
+          "explanation": "The counter records OOM kills inside the cgroup. Alert on any increase and investigate the application or the limit."
+        },
+        {
+          "question": "Why should the cgroup filesystem be read-only inside a container?",
+          "options": [
+            "To save disk space",
+            "To speed up networking",
+            "Because cgroups do not exist in containers",
+            "So a compromised container cannot raise its own limits or abuse writable cgroup features"
+          ],
+          "answer": 3,
+          "explanation": "Writable cgroup files have been abused in escapes and let a workload remove its own ceilings."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nControl groups limit how much CPU, memory, processes and I/O a container or service may use, and on v2 they are exposed as simple files under `/sys/fs/cgroup`. By default Docker sets no limits, so you must add them: `--memory`, `--memory-swap`, `--cpus` and `--pids-limit`, or `MemoryMax=` and `TasksMax=` in a systemd drop-in.\n\nMeasure real use, add headroom, alert on `memory.events` and kernel OOM messages, and keep the cgroup filesystem read-only for containers. Limits turn a bug or an intrusion into a contained incident rather than a host outage. Next, look at what runs inside the container in [Container Image Vulnerability Scanning](/learn/systems-infrastructure-security/container-image-vulnerability-scanning)."
+    }
+  ],
+  "ar": {
+    "title": "أمن cgroups في Linux",
+    "summary": "استخدم مجموعات التحكم في Linux لتحديد الذاكرة والمعالج والعمليات للحاويات والخدمات، وتحقق من الحدود في النواة، واحمِ واجهة cgroup.",
+    "objectives": [
+      "اشرح ما تحدّه متحكّمات cgroup ولماذا تُعد الحدود أداة ضبط أمنية",
+      "اضبط حدود الذاكرة والمعالج والعمليات للحاويات وخدمات systemd وتحقق منها",
+      "اقرأ ملفات cgroup v2 وmemory.events لاكتشاف بلوغ الحدود",
+      "اختر حدودًا معقولة بالقياس وهامش أمان",
+      "حدّد الإعدادات التي تكشف واجهة cgroup قابلة للكتابة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الثانية صباحًا يبلغ نظام المراقبة أن مضيف Docker لا يستجيب. اتصال SSH معلّق. وحين تدخل أخيرًا تجد حاوية واحدة فيها تسرّب ذاكرة استهلكت كل الذاكرة العشوائية ودفعت قاعدة البيانات على المضيف نفسه إلى المبادلة (Swap). لم يخترق أحد شيئًا. سطر إعداد واحد ناقص كان كافيًا لحدوث انقطاع.\n\nكان السطر الناقص حدًّا للموارد. يفرض Linux الحدود عبر **مجموعات التحكم (cgroups)**. وهي نصف الأمن المتعلق بالتوافر في أمن الحاويات: تقرر مساحات الأسماء ما تراه الحاوية، وتقرر cgroups كم تستطيع أن تأخذ من الجهاز. ستقرأ في هذا الدرس إعدادات cgroup على مضيف حي، وتضبط حدودًا للحاويات والخدمات، وتستخدمها لاحتواء الأخطاء وسوء الاستخدام معًا."
+      },
+      {
+        "id": "what",
+        "type": "text",
+        "markdown": "## ماذا تفعل cgroups\n\nمجموعة التحكم (cgroup) مجموعة من العمليات تشترك في قواعد للموارد. ترتّب النواة هذه المجموعات في شجرة تحت `/sys/fs/cgroup`. ويدير كل **متحكّم (Controller)** موردًا واحدًا.\n\n| المتحكّم | الملف الرئيس (v2) | ما الذي يحدّه | العطل الذي يمنعه |\n|:--|:--|:--|:--|\n| memory | `memory.max` و`memory.high` | الذاكرة (والمبادلة عبر `memory.swap.max`) | تسرّب واحد يجهد المضيف |\n| cpu | `cpu.max` و`cpu.weight` | وقت المعالج وحصته | حلقة مشغولة تبطئ الجيران |\n| pids | `pids.max` | عدد العمليات والخيوط | إنشاء عمليات بلا حد |\n| io | `io.max` و`io.weight` | معدل نقل القرص وعمليات الإدخال والإخراج | حمل عمل يشبع القرص |\n| cpuset | `cpuset.cpus` | أنوية المعالج المسموح بها | الجيران المزعجون على الأنوية المشتركة |\n| devices | تديره بيئة التشغيل | الأجهزة التي يجوز فتحها | الوصول إلى القرص الخام أو العتاد |\n\n### الإصداران 1 و2\n\nتستخدم التوزيعات الحديثة (Debian 12 وUbuntu 22.04 وما بعدها وRHEL 9) **cgroup v2** وهي شجرة موحدة واحدة بمجموعة ملفات واحدة. وقد تستخدم المضيفات الأقدم الإصدار v1 بشجرة منفصلة لكل متحكّم. تحقق من مضيفك بالأمر `stat -fc %T /sys/fs/cgroup`: الجواب `cgroup2fs` يعني v2. تستخدم الأمثلة هنا v2 لأنه أبسط في التدقيق وأفضل في محاسبة الذاكرة.\n\n### الحدود أداة ضبط أمنية\n\nنعامل الحدود غالبًا كأداة للأداء، لكنها أيضًا **أداة للتوافر والاحتواء**. فالحاوية المخترَقة التي لا تستطيع إنشاء أكثر من 100 عملية ولا استخدام أكثر من 256 ميغابايت ولا إشباع القرص أقل نفعًا بكثير في هجمات الحرمان من الخدمة أو التعدين الخفي للعملات. وتعطي الحدود مراقبتك إشارة واضحة: فالحاوية التي تصطدم بسقفها باستمرار تستحق الانتباه."
+      },
+      {
+        "id": "limits-term",
+        "type": "terminal",
+        "title": "ضبط الحدود وقراءتها",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "stat -fc %T /sys/fs/cgroup",
+            "output": "cgroup2fs",
+            "comment": "يؤكد الشجرة الموحدة v2."
+          },
+          {
+            "cmd": "docker run -d --name api --memory 256m --memory-swap 256m --cpus 1.5 --pids-limit 100 registry.example.com/team/api:2.3.0",
+            "output": "b71e0c4d9a3f5e2816c7d0a9f4b3e2d1c8a7b6e5f4d3c2b1a09f8e7d6c5b4a39",
+            "comment": "جعل `--memory-swap` مساويًا لـ`--memory` يعطل المبادلة للحاوية، فتُقتل بدل أن تُتعب القرص."
+          },
+          {
+            "cmd": "docker inspect --format '{{.State.Pid}} {{.HostConfig.CgroupParent}}' api",
+            "output": "51207 ",
+            "comment": "يتيح لك معرّف العملية إيجاد مسار cgroup أدناه."
+          },
+          {
+            "cmd": "cat /proc/51207/cgroup",
+            "output": "0::/system.slice/docker-b71e0c4d9a3f5e28.scope",
+            "comment": "مع برنامج تشغيل systemd تكون كل حاوية وحدة نطاق مؤقتة."
+          },
+          {
+            "cmd": "cd /sys/fs/cgroup/system.slice/docker-b71e0c4d9a3f5e28.scope && cat memory.max pids.max cpu.max",
+            "output": "268435456\n100\n150000 100000",
+            "comment": "القيمة 268435456 بايت تساوي 256 ميبيبايت. و`150000 100000` تعني 150 ميلي ثانية من المعالج كل 100 ميلي ثانية أي 1.5 نواة."
+          },
+          {
+            "cmd": "cat memory.current pids.current",
+            "output": "83984384\n7",
+            "comment": "الاستهلاك الحالي أقل بكثير من الحدين. نبّه عندما يقترب من السقف."
+          }
+        ],
+        "caption": "تتحول خيارات Docker إلى ملفات في النواة؛ اقرأ الملفات لتثبت أن الحد فعلي."
+      },
+      {
+        "id": "oom-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "تسرّب ذاكرة يصطدم بحد",
+        "caption": "تحتوي cgroup العطل فيبقى المضيف وجيرانه بصحة جيدة.",
+        "data": {
+          "token": "استهلاك الذاكرة",
+          "nodes": [
+            {
+              "id": "app",
+              "label": "تطبيق متسرّب",
+              "sub": "inside container",
+              "icon": "bug"
+            },
+            {
+              "id": "high",
+              "label": "memory.high",
+              "sub": "حد ناعم",
+              "icon": "eye"
+            },
+            {
+              "id": "max",
+              "label": "memory.max",
+              "sub": "حد صلب",
+              "icon": "lock"
+            },
+            {
+              "id": "oom",
+              "label": "إنهاء OOM للمجموعة",
+              "sub": "only this container",
+              "icon": "alert"
+            },
+            {
+              "id": "host",
+              "label": "المضيف والجيران",
+              "sub": "unaffected",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "at": "app",
+              "caption": "يخصص التطبيق ذاكرة أكثر مما يحرر ببطء."
+            },
+            {
+              "at": "high",
+              "caption": "يتجاوز الاستهلاك memory.high فتبطئ النواة المجموعة وتستعيد الصفحات، فيتباطأ التطبيق.",
+              "tone": "warning"
+            },
+            {
+              "at": "max",
+              "caption": "يبلغ الاستهلاك memory.max فلا تُمنح المجموعة ذاكرة إضافية.",
+              "tone": "danger"
+            },
+            {
+              "at": "oom",
+              "caption": "تقتل النواة عملية داخل هذه المجموعة فقط، وقد تعيد بيئة التشغيل تشغيل الحاوية.",
+              "tone": "danger"
+            },
+            {
+              "at": "host",
+              "caption": "لم تلحظ قاعدة البيانات ولا الخدمات الأخرى شيئًا. وتسجل المراقبة حدث OOM للمتابعة.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "tuning",
+        "type": "text",
+        "markdown": "## اختيار حدود معقولة\n\nالحدود الضيقة جدًا تسبب انقطاعات، والحدود المفقودة تسبب انقطاعات أسوأ. استخدم طريقة بسيطة.\n\n1. **قِس.** راقب `docker stats` أو `memory.peak` أسبوعًا عاديًا يشمل فترات الذروة.\n2. **أضف هامشًا.** اضبط `memory.max` أعلى من الذروة المرصودة بنحو 25 إلى 50 في المئة.\n3. **فضّل `memory.high` أولًا** للخدمات التي تستطيع التباطؤ بسلاسة، وأبقِ `memory.max` حدًّا صلبًا.\n4. **حدّد `pids` دائمًا.** تتراوح القيمة المعتادة لخدمة ويب بين 100 و500. والقيمة `max` تعني بلا حد.\n5. **عطّل المبادلة للحاويات** حين يهم ثبات زمن الاستجابة.\n6. **وثّق الاستثناءات.** إذا احتاجت مهمة فعلًا إلى كل الأنوية فسجّل السبب.\n\nعلى المضيفات التي تشغّل الخدمات مباشرة، طبّق الأفكار نفسها عبر **systemd**. يستطيع ملف إضافي (drop-in) وضع حدود على أي وحدة دون المساس بملفات الحزمة نفسها."
+      },
+      {
+        "id": "dropin",
+        "type": "code",
+        "language": "ini",
+        "code": "# /etc/systemd/system/nginx.service.d/limits.conf\n[Service]\nMemoryHigh=384M\nMemoryMax=512M\nMemorySwapMax=0\nTasksMax=300\nCPUQuota=150%\nIOWeight=100\nLimitNOFILE=16384",
+        "filename": "limits.conf",
+        "caption": "يطبق ملف systemd إضافي ضوابط cgroup نفسها على خدمة عادية. حمّله بالأمرين `systemctl daemon-reload` و`systemctl restart nginx`."
+      },
+      {
+        "id": "sysd-term",
+        "type": "terminal",
+        "title": "التحقق من حد خدمة ومراقبة حالات الإنهاء",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "systemctl show nginx -p MemoryMax -p TasksMax -p CPUQuotaPerSecUSec",
+            "output": "MemoryMax=536870912\nTasksMax=300\nCPUQuotaPerSecUSec=1.500000s",
+            "comment": "ترجم systemd الملف الإضافي إلى قيم cgroup."
+          },
+          {
+            "cmd": "cat /sys/fs/cgroup/system.slice/nginx.service/memory.events",
+            "output": "low 0\nhigh 4\nmax 0\noom 0\noom_kill 0",
+            "comment": "القيمة `high 4` تعني أن الحد الناعم أبطأ الخدمة أربع مرات. و`oom_kill 0` تعني أنه لم يُقتل شيء بعد."
+          },
+          {
+            "cmd": "journalctl -k --since today | grep -i 'out of memory'",
+            "output": "Nov 11 02:03:11 srv01 kernel: Memory cgroup out of memory: Killed process 51310 (java) total-vm:2874120kB",
+            "comment": "تسمّي سجلات النواة المجموعة التي بلغت حدها. أرسل هذه الأسطر إلى نظام السجلات المركزي."
+          }
+        ],
+        "caption": "memory.events هو العداد الذي ينبغي التنبيه عليه."
+      },
+      {
+        "id": "hardening",
+        "type": "text",
+        "markdown": "## حماية واجهة cgroup نفسها\n\nملفات cgroup قابلة للكتابة بصلاحيات root، والحاوية التي تستطيع الكتابة فيها تستطيع رفع حدودها بنفسها. تحفظ عدة إعدادات افتراضية هذا الأمر، وتكسره عدة خيارات.\n\n- **تحميل cgroup للقراءة فقط.** يحمّل Docker المسار `/sys/fs/cgroup` للقراءة فقط في الحاوية العادية، ويجعله الخيار `--privileged` قابلًا للكتابة.\n- **مساحة أسماء cgroup.** على v2 تحصل الحاويات على مساحة أسماء cgroup خاصة، فترى نفسها جذر شجرتها ولا تستطيع تصفح تخطيط المضيف.\n- **التفويض (Delegation).** منح الحاوية حق إدارة المجموعات الفرعية (تحتاجه بيئات التشغيل المتداخلة) يعني أنها تنشئ أبناء لكن لا يجوز أن تخفف حدود الأب. راجع التفويض قبل السماح به.\n- **متحكّم الأجهزة (devices)** يقرر أي عقد الأجهزة يجوز للحاوية فتحها. لا تضف قواعد `--device-cgroup-rule` بلا تفكير.\n\nاستغلت فئة خطيرة من حالات الهروب ميزات cgroup القابلة للكتابة مثل الملف `release_agent` على مضيفات v1. والدرس بسيط: أبقِ الحاويات بلا امتيازات، وأبقِ نظام ملفات cgroup للقراءة فقط، وانتقل إلى cgroup v2. راجع [Container Escape Risks](/learn/systems-infrastructure-security/container-escape-risks) للصورة الأوسع، و[Container Isolation and Namespaces](/learn/systems-infrastructure-security/container-isolation-and-namespaces) لجانب الرؤية."
+      },
+      {
+        "id": "monitor",
+        "type": "text",
+        "markdown": "## مراقبة الحدود في بيئة الإنتاج\n\nالحد الذي لا يراقبه أحد ينقل الانقطاع إلى مكان آخر فقط. ضمّن مراقبتك ثلاثة فحوص بسيطة.\n\n- **التشبع.** نبّه حين يبقى `memory.current` فوق 90 في المئة من `memory.max`، أو حين يقترب `pids.current` من `pids.max`.\n- **الأحداث.** نبّه على أي زيادة في `oom_kill` وعلى تكرار عدّاد `high`. ارتفاع عدّاد `high` يعني أن حمل العمل يُبطأ باستمرار ويحتاج إلى إصلاح أو حد أكبر.\n- **إعادة التشغيل.** تتبّع عدد مرات إعادة تشغيل الحاوية. فالحاوية التي تُعاد كل بضع دقائق بعد إنهاء OOM عَرَض لا خدمة مستقرة.\n\nتقرأ أدوات مثل `cAdvisor` ومصدّرات العُقد ووكيل منصة المراقبة الملفات نفسها. وافحص ارتفاعات المعالج غير المتوقعة في حاوية ذات حمل صغير: فاستهلاك المعالج بنسبة 100 في المئة باستمرار في خدمة هادئة علامة كلاسيكية على برنامج تعدين غير مصرح به."
+      },
+      {
+        "id": "limit-warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "الحد المفقود ملاحظة تدقيق",
+        "markdown": "بشكل افتراضي لا يكون لحاوية Docker **أي** حد للذاكرة أو المعالج أو العمليات. افحص كل حاوية طويلة العمل بالأمر `docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.PidsLimit}}' NAME`. فالنتيجة `0` للذاكرة، أو `<nil>` أو `0` للعمليات، تعني بلا حد. اجعل الحدود جزءًا من قوالب النشر حتى لا يضطر أحد إلى تذكرها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة Linux افتراضية تملكها وفيها Docker:\n\n1. نفّذ `stat -fc %T /sys/fs/cgroup` ودوّن ما إذا كان المضيف يستخدم v1 أو v2.\n2. شغّل `docker run -d --name lim --memory 128m --memory-swap 128m --pids-limit 50 docker.io/library/nginx:1.27`.\n3. اعثر على مجلد cgroup الخاص بها واقرأ `memory.max` و`pids.max` و`memory.events`.\n4. نفّذ `docker exec lim cat /sys/fs/cgroup/memory.max` وقارنه بقيمة المضيف.\n5. أنشئ ملف systemd إضافيًا يحوي `MemoryMax=` و`TasksMax=` لخدمة تملكها، ثم تأكد منه بالأمر `systemctl show`.\n6. احذف الحاوية بالأمر `docker rm -f lim`."
+      },
+      {
+        "id": "kt",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "cgroup",
+            "definition": "مجموعة في النواة من العمليات تشترك في حدود الموارد ومحاسبتها."
+          },
+          {
+            "term": "المتحكّم",
+            "definition": "مكوّن في cgroup يدير موردًا واحدًا مثل الذاكرة أو العمليات."
+          },
+          {
+            "term": "memory.max",
+            "definition": "السقف الصلب للذاكرة؛ ويؤدي بلوغه إلى إنهاء OOM في تلك المجموعة."
+          },
+          {
+            "term": "memory.high",
+            "definition": "حد ناعم يبطئ المجموعة قبل بلوغ الحد الصلب."
+          },
+          {
+            "term": "pids.max",
+            "definition": "أقصى عدد من العمليات والخيوط في المجموعة."
+          },
+          {
+            "term": "قاتل OOM",
+            "definition": "آلية في النواة تنهي العمليات عند نفاد الذاكرة."
+          },
+          {
+            "term": "الملف الإضافي (Drop-in)",
+            "definition": "ملف تجاوز في systemd يضيف إعدادات إلى وحدة دون تعديلها."
+          },
+          {
+            "term": "التفويض",
+            "definition": "السماح لعملية أو حاوية بإدارة مجموعاتها الفرعية."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما القيمة الأمنية الرئيسة لحدود cgroup؟",
+            "options": [
+              "تخفي عمليات المضيف",
+              "تحتوي استنزاف الموارد وسوء الاستخدام فلا يجهد حمل عمل واحد المضيف",
+              "تشفّر ذاكرة الحاوية",
+              "تحل محل seccomp"
+            ],
+            "answer": 1,
+            "explanation": "cgroups أداة ضبط للتوافر والاحتواء. أما إخفاء العمليات فمن عمل مساحات الأسماء."
+          },
+          {
+            "question": "أي الإعدادات تحمي المضيف من حاوية منفلتة؟ (اختر كل ما ينطبق)",
+            "options": [
+              "`--memory 256m`",
+              "`--pids-limit 100`",
+              "`--privileged`",
+              "`--memory-swap` مساويًا لـ`--memory`"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تحتوي حدود الذاكرة والعمليات والمبادلة الحاوية. أما `--privileged` فيزيل الحمايات ومنها تحميل cgroup للقراءة فقط."
+          },
+          {
+            "question": "أي أمر يخبرك ما إذا كان المضيف يستخدم cgroup v2؟",
+            "options": [
+              "`docker version`",
+              "`uname -n`",
+              "`stat -fc %T /sys/fs/cgroup`",
+              "`lsns --type pid`"
+            ],
+            "answer": 2,
+            "explanation": "يدل نوع نظام الملفات `cgroup2fs` على الشجرة الموحدة v2."
+          },
+          {
+            "question": "ماذا يخبرك أن `memory.events` يعرض `oom_kill 3`؟",
+            "options": [
+              "قُتلت ثلاث عمليات في هذه المجموعة لتجاوزها حد الذاكرة",
+              "بدأت ثلاث حاويات",
+              "سجّل ثلاثة مستخدمين الدخول",
+              "المبادلة معطلة"
+            ],
+            "answer": 0,
+            "explanation": "يسجل العداد حالات الإنهاء داخل المجموعة. نبّه على أي زيادة وافحص التطبيق أو الحد."
+          },
+          {
+            "question": "لماذا ينبغي أن يكون نظام ملفات cgroup للقراءة فقط داخل الحاوية؟",
+            "options": [
+              "لتوفير مساحة القرص",
+              "لتسريع الشبكة",
+              "لأن cgroups غير موجودة في الحاويات",
+              "حتى لا تستطيع حاوية مخترَقة رفع حدودها أو إساءة استخدام ميزات cgroup القابلة للكتابة"
+            ],
+            "answer": 3,
+            "explanation": "استُغلت ملفات cgroup القابلة للكتابة في حالات هروب، وتتيح لحمل العمل إزالة سقوفه بنفسه."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتحدّ مجموعات التحكم مقدار ما تستخدمه الحاوية أو الخدمة من المعالج والذاكرة والعمليات والإدخال والإخراج، وتظهر على v2 كملفات بسيطة تحت `/sys/fs/cgroup`. لا يضع Docker حدودًا افتراضيًا، لذا عليك إضافتها: `--memory` و`--memory-swap` و`--cpus` و`--pids-limit`، أو `MemoryMax=` و`TasksMax=` في ملف systemd إضافي.\n\nقِس الاستخدام الفعلي، وأضف هامشًا، ونبّه على `memory.events` ورسائل OOM في النواة، وأبقِ نظام ملفات cgroup للقراءة فقط للحاويات. تحوّل الحدود الخلل أو الاختراق إلى حادثة محتواة بدل انقطاع المضيف. والخطوة التالية النظر فيما يعمل داخل الحاوية في [Container Image Vulnerability Scanning](/learn/systems-infrastructure-security/container-image-vulnerability-scanning)."
+      }
+    ]
+  }
+}

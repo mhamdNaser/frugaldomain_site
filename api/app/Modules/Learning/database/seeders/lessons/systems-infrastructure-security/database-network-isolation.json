@@ -1,0 +1,534 @@
+{
+ "slug": "database-network-isolation",
+ "title": "Database Network Isolation",
+ "summary": "Design a zoned network for databases, enforce it with firewalls and container controls, and verify it from the outside.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Design a data zone with controlled access paths",
+  "Write a default-drop host firewall for a database server",
+  "Avoid Docker and container port-publishing pitfalls",
+  "Verify isolation from allowed and blocked hosts"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A team deploys PostgreSQL in a container with `docker run -p 5432:5432 postgres`. It works on the first try, so nobody looks further. Docker publishes the port on every host interface and, on many Linux setups, inserts its own firewall rules ahead of the host firewall. The database is now reachable from the internet, and the \"deny all\" rule the administrator wrote never applied.\n\nThe safest database port is the one nobody can reach. Network isolation reduces the number of machines that can even attempt a connection, which shrinks the effect of weak passwords, new vulnerabilities and mistakes in `pg_hba.conf`. In this lesson you will design a network layout for databases, enforce it at several points, and verify from the outside that it works."
+  },
+  {
+   "id": "design",
+   "type": "text",
+   "markdown": "## A zoned network design\n\nPlace databases in their own **data zone**, separate from the zones that face users. A typical layout has four zones:\n\n| Zone | Example subnet | Contains | May initiate to |\n|:--|:--|:--|:--|\n| Public / DMZ | 203.0.113.0/24 | Reverse proxy, load balancer | App zone |\n| App | 10.20.1.0/24 | Application servers | Data zone, on the database port only |\n| Data | 10.20.2.0/24 | PostgreSQL, MySQL | Backup zone, log collector |\n| Management | 10.20.9.0/24 | Jump host, monitoring | Data zone (SSH, metrics) |\n\nThree rules follow from the table:\n\n1. **No route from the internet to the data zone.** Databases get private addresses only and no public IP.\n2. **App servers reach only the database port.** They do not need SSH to the database host.\n3. **Administration goes through a jump host.** Humans never connect directly from their laptops.\n\nEgress matters too. A database server rarely needs to reach the internet. Blocking outbound connections limits data theft and stops a compromised host from downloading tools. Allow only what is required, such as your package mirror, NTP and log collector."
+  },
+  {
+   "id": "zones",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A request crossing network zones",
+   "caption": "Each hop is allowed by a specific rule; direct paths are absent.",
+   "data": {
+    "token": "Request",
+    "nodes": [
+     {
+      "id": "net",
+      "label": "Internet",
+      "sub": "198.51.100.0/24",
+      "icon": "cloud"
+     },
+     {
+      "id": "lb",
+      "label": "Load balancer",
+      "sub": "DMZ",
+      "icon": "firewall"
+     },
+     {
+      "id": "app",
+      "label": "App server",
+      "sub": "10.20.1.10",
+      "icon": "server"
+     },
+     {
+      "id": "db",
+      "label": "Database",
+      "sub": "10.20.2.5:5432",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "at": "net",
+      "caption": "A user sends an HTTPS request."
+     },
+     {
+      "at": "lb",
+      "caption": "Only TCP 443 is allowed into the DMZ.",
+      "tone": "secure"
+     },
+     {
+      "at": "app",
+      "caption": "The balancer reaches the app tier on its service port."
+     },
+     {
+      "at": "db",
+      "caption": "The app tier reaches TCP 5432 on the data zone.",
+      "tone": "success"
+     },
+     {
+      "at": "net",
+      "token": "TCP/5432",
+      "caption": "A scanner probes the database port directly from the internet."
+     },
+     {
+      "at": "lb",
+      "token": "TCP/5432",
+      "caption": "No rule allows it: the packet is dropped before the data zone.",
+      "tone": "blocked"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enforce",
+   "type": "text",
+   "markdown": "## Enforce at several points\n\nOne control can be removed by one mistake, so enforce isolation in layers:\n\n- **Network level:** VLANs or separate virtual networks, with routing between zones controlled by a firewall. On Proxmox VE, assign the database VM to its own bridge or VLAN and enable the VM firewall.\n- **Host firewall:** `nftables`, `ufw` or Windows Defender Firewall on the database host itself. This protects you when the network firewall is misconfigured.\n- **Database level:** `listen_addresses` bound to the private interface, and `pg_hba.conf` rules from [PostgreSQL pg_hba.conf Security](/learn/systems-infrastructure-security/postgresql-pg-hba-conf-security).\n- **Container level:** publish ports to a specific address, such as `127.0.0.1:5432:5432`, or do not publish at all and use a private Docker network.\n- **Orchestrator level:** in Kubernetes, a `NetworkPolicy` that allows only pods with a given label to reach the database pod.\n\nThe host firewall below uses `nftables`. It allows the database port only from the application subnet and SSH only from the management subnet, and drops everything else by default."
+  },
+  {
+   "id": "nft",
+   "type": "code",
+   "language": "bash",
+   "filename": "/etc/nftables.conf",
+   "caption": "Host firewall for a database server (default drop). Subnets are private examples.",
+   "code": "#!/usr/sbin/nft -f\nflush ruleset\n\ntable inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n\n    ct state established,related accept\n    iif lo accept\n\n    # PostgreSQL only from the app subnet and the reporting host\n    ip saddr 10.20.1.0/24 tcp dport 5432 accept\n    ip saddr 10.20.2.15   tcp dport 5432 accept\n\n    # SSH and metrics only from management\n    ip saddr 10.20.9.0/24 tcp dport { 22, 9187 } accept\n\n    # log what we drop, rate limited\n    limit rate 5/minute log prefix \"nft-drop: \" level info\n  }\n  chain forward { type filter hook forward priority 0; policy drop; }\n  chain output  { type filter hook output  priority 0; policy accept; }\n}",
+   "highlight": [
+    5,
+    10,
+    11,
+    14,
+    17
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Docker can bypass your host firewall",
+   "markdown": "Docker writes its own rules into the `nat` and `FORWARD` paths, so a published port can be reachable even when your input chain drops it. Bind published ports to `127.0.0.1` or a private address, put your policy in the `DOCKER-USER` chain, and always verify from outside."
+  },
+  {
+   "id": "verify",
+   "type": "text",
+   "markdown": "## Verify from the outside\n\nA rule you have not tested is a belief, not a control. Verify from two vantage points on systems you own:\n\n1. **From an allowed host**, such as an application server, confirm the database port answers.\n2. **From a host that should be blocked**, such as your laptop or a server in another zone, confirm it does not.\n3. **From the database host**, list listening sockets with `ss -tlnp` and compare against your design.\n\nUse `nmap` only against your own address ranges, and run it from outside the data zone so you see what an attacker would see. An open result on port 5432 from the wrong zone means isolation has failed somewhere, even if authentication would still stop the login."
+  },
+  {
+   "id": "verify-term",
+   "type": "terminal",
+   "title": "Verifying isolation (lab network)",
+   "lines": [
+    {
+     "cmd": "ss -tlnp | grep 5432",
+     "output": "LISTEN 0 244 10.20.2.5:5432 0.0.0.0:* users:((\"postgres\",pid=812,fd=6))",
+     "comment": "Bound to the private address only, not 0.0.0.0."
+    },
+    {
+     "cmd": "nmap -Pn -p 5432 10.20.2.5",
+     "output": "PORT     STATE    SERVICE\n5432/tcp filtered postgresql",
+     "comment": "Run from the management laptop: dropped by the host firewall, as designed."
+    },
+    {
+     "cmd": "nc -zv 10.20.2.5 5432",
+     "output": "Connection to 10.20.2.5 5432 port [tcp/postgresql] succeeded!",
+     "comment": "Run from the app server in 10.20.1.0/24: the allowed path works."
+    }
+   ],
+   "caption": "Test both the allowed and the blocked path; filtered means dropped, closed means refused."
+  },
+  {
+   "id": "admin",
+   "type": "text",
+   "markdown": "## Safe administrator access\n\nEngineers still need to reach the database. Give them a path that is logged and revocable:\n\n- **Jump host (bastion).** One hardened host in the management zone with MFA, session logging and short-lived accounts.\n- **SSH tunnel.** `ssh -L 5433:10.20.2.5:5432 admin@jump.example.com` forwards a local port through the jump host, so the database never accepts the engineer's laptop address.\n- **Time-limited access.** Use access tools that open a firewall rule only for the duration of a ticket.\n- **No public cloud IP.** On cloud platforms, use private endpoints and security groups that reference other groups rather than address ranges.\n\nFor Kubernetes, a minimal `NetworkPolicy` that selects the database pods and allows ingress only from pods labeled as the application achieves the same default-deny design. The principle is identical in every environment: deny by default, allow by exception, document the exception and test it. Combine this with encrypted connections from [Database TLS and Encryption](/learn/systems-infrastructure-security/database-tls-and-encryption), so traffic that crosses zones cannot be read."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a lab VM **you own** that runs PostgreSQL, run `ss -tlnp | grep 5432` and note the bound address. If it shows `0.0.0.0`, change `listen_addresses` to the private address and restart.\n2. Install `nftables`, adapt the sample rule set to your lab subnets, and load it with `sudo nft -f /etc/nftables.conf`. Keep a console session open in case you lock yourself out.\n3. From a second lab VM in an allowed subnet, test with `nc -zv <db-ip> 5432`. From a VM in a different subnet, confirm the connection times out.\n4. If you use Docker, start the database with `-p 127.0.0.1:5432:5432` and prove from another host that the port is unreachable."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Network isolation",
+     "definition": "Limiting which systems can reach a service at all."
+    },
+    {
+     "term": "Data zone",
+     "definition": "A network segment reserved for databases, with no direct internet route."
+    },
+    {
+     "term": "Jump host",
+     "definition": "A hardened host that is the only path for administrators into a zone."
+    },
+    {
+     "term": "Default deny",
+     "definition": "A policy that drops all traffic not explicitly allowed."
+    },
+    {
+     "term": "Egress filtering",
+     "definition": "Restricting outbound connections from a server."
+    },
+    {
+     "term": "nftables",
+     "definition": "The modern Linux packet filtering framework replacing iptables."
+    },
+    {
+     "term": "NetworkPolicy",
+     "definition": "A Kubernetes object controlling which pods may talk to each other."
+    },
+    {
+     "term": "SSH tunnel",
+     "definition": "Forwarding a local port to a remote service through an SSH connection."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why place databases in a separate data zone?",
+     "options": [
+      "To make queries faster",
+      "To remove any direct route from untrusted networks",
+      "To avoid backups",
+      "To disable TLS"
+     ],
+     "answer": 1,
+     "explanation": "A separate zone with controlled routing means only approved systems can even reach the port."
+    },
+    {
+     "question": "A database listens on 0.0.0.0:5432. What is the best first fix?",
+     "options": [
+      "Bind listen_addresses to the private interface",
+      "Rename the database",
+      "Use a longer password",
+      "Disable logging"
+     ],
+     "answer": 0,
+     "explanation": "Reducing where the service listens shrinks the attack surface before any other control."
+    },
+    {
+     "question": "Which are good ways to enforce isolation? Choose all that apply.",
+     "options": [
+      "Host firewall on the database server",
+      "Network segmentation with VLANs",
+      "Publishing container ports on all interfaces",
+      "Kubernetes NetworkPolicy"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Layered controls reinforce each other; publishing on all interfaces does the opposite."
+    },
+    {
+     "question": "An nmap scan shows port 5432 as filtered from a blocked zone. What does this mean?",
+     "options": [
+      "Packets are dropped by a firewall",
+      "The database is down",
+      "The password is wrong",
+      "TLS is disabled"
+     ],
+     "answer": 0,
+     "explanation": "Filtered means no response, typically a drop rule; closed would mean the host actively refused."
+    },
+    {
+     "question": "Why can Docker undermine a host firewall?",
+     "options": [
+      "It inserts its own NAT and forward rules",
+      "It disables the kernel",
+      "It encrypts all traffic",
+      "It blocks all ports"
+     ],
+     "answer": 0,
+     "explanation": "Published ports use Docker's rules, which can bypass an input-chain drop. Bind to a private address and use DOCKER-USER."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Isolation shrinks the number of systems that can reach the database port, and so the impact of every other weakness.\n- Place databases in a data zone with no internet route, let only the application tier reach the database port, and send administrators through a jump host.\n- Enforce isolation in layers: network segmentation, host firewall, `listen_addresses`, `pg_hba.conf`, container port binding and Kubernetes network policy.\n- Limit outbound connections as well as inbound ones.\n- Always verify from allowed and blocked vantage points on systems you own.\n\nNext in this phase, you will protect data on the wire and on disk in [Database TLS and Encryption](/learn/systems-infrastructure-security/database-tls-and-encryption)."
+  }
+ ],
+ "ar": {
+  "title": "العزل الشبكي لقواعد البيانات",
+  "summary": "صمّم شبكة مقسّمة إلى نطاقات لقواعد البيانات، وافرضها بجدران الحماية وضوابط الحاويات، وتحقق منها من الخارج.",
+  "objectives": [
+   "تصميم نطاق بيانات بمسارات وصول مضبوطة",
+   "كتابة جدار حماية خادم بإسقاط افتراضي لخادم قاعدة بيانات",
+   "تفادي مزالق Docker ونشر منافذ الحاويات",
+   "التحقق من العزل من مضيفات مسموحة ومحجوبة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يطلق فريق PostgreSQL داخل حاوية بالأمر `docker run -p 5432:5432 postgres`. تنجح التجربة من أول مرة فلا يتعمق أحد. ينشر Docker المنفذ على كل واجهات الخادم، وفي كثير من إعدادات Linux يُدرج قواعد جدار حماية خاصة به قبل جدار حماية الخادم. فتصير قاعدة البيانات في متناول الإنترنت، ولا تُطبَّق قاعدة «منع الكل» التي كتبها المدير أصلًا.\n\nأأمن منفذ لقاعدة البيانات هو الذي لا يصل إليه أحد. يقلّل العزل الشبكي عدد الأجهزة التي تستطيع حتى محاولة الاتصال، فيصغّر أثر كلمات المرور الضعيفة والثغرات الجديدة وأخطاء `pg_hba.conf`. في هذا الدرس ستصمّم تخطيطًا شبكيًّا لقواعد البيانات، وتفرضه في عدة نقاط، وتتحقق من الخارج أنه يعمل."
+   },
+   {
+    "id": "design",
+    "type": "text",
+    "markdown": "## تصميم شبكي مقسّم إلى نطاقات\n\nضع قواعد البيانات في **نطاق بيانات** خاص بها منفصل عن النطاقات المواجهة للمستخدمين. يضم التخطيط النموذجي أربعة نطاقات:\n\n| النطاق | شبكة فرعية مثال | يحتوي | يجوز له البدء باتصال إلى |\n|:--|:--|:--|:--|\n| العام / DMZ | 203.0.113.0/24 | وكيل عكسي وموزّع أحمال | نطاق التطبيقات |\n| التطبيقات | 10.20.1.0/24 | خوادم التطبيقات | نطاق البيانات، على منفذ قاعدة البيانات فقط |\n| البيانات | 10.20.2.0/24 | PostgreSQL وMySQL | نطاق النسخ الاحتياطي وجامع السجلات |\n| الإدارة | 10.20.9.0/24 | مضيف القفز والمراقبة | نطاق البيانات (SSH ومقاييس) |\n\nتنتج ثلاث قواعد عن الجدول:\n\n1. **لا مسار من الإنترنت إلى نطاق البيانات.** تأخذ قواعد البيانات عناوين خاصة فقط ولا عنوانًا عامًّا.\n2. **تصل خوادم التطبيقات إلى منفذ قاعدة البيانات وحده.** فلا تحتاج إلى SSH إلى مضيفها.\n3. **تمر الإدارة عبر مضيف قفز.** لا يتصل البشر مباشرة من حواسيبهم المحمولة.\n\nوالاتصالات الخارجة مهمة أيضًا. فنادرًا ما يحتاج خادم قاعدة البيانات إلى الإنترنت، وحجب الاتصالات الصادرة يحدّ من سرقة البيانات ويمنع خادمًا مخترقًا من تنزيل الأدوات. اسمح بما يلزم فقط، مثل مستودع الحزم وNTP وجامع السجلات."
+   },
+   {
+    "id": "zones",
+    "type": "animation",
+    "kind": "flow",
+    "title": "طلب يعبر نطاقات الشبكة",
+    "caption": "كل قفزة مسموحة بقاعدة محددة، والمسارات المباشرة غائبة.",
+    "data": {
+     "token": "طلب",
+     "nodes": [
+      {
+       "id": "net",
+       "label": "Internet",
+       "sub": "198.51.100.0/24",
+       "icon": "cloud"
+      },
+      {
+       "id": "lb",
+       "label": "موزّع الأحمال",
+       "sub": "DMZ",
+       "icon": "firewall"
+      },
+      {
+       "id": "app",
+       "label": "خادم التطبيق",
+       "sub": "10.20.1.10",
+       "icon": "server"
+      },
+      {
+       "id": "db",
+       "label": "قاعدة البيانات",
+       "sub": "10.20.2.5:5432",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "at": "net",
+       "caption": "يرسل مستخدم طلب HTTPS."
+      },
+      {
+       "at": "lb",
+       "caption": "يُسمح بـ TCP 443 فقط إلى DMZ.",
+       "tone": "secure"
+      },
+      {
+       "at": "app",
+       "caption": "يصل الموزّع إلى طبقة التطبيقات على منفذ خدمتها."
+      },
+      {
+       "at": "db",
+       "caption": "تصل طبقة التطبيقات إلى TCP 5432 في نطاق البيانات.",
+       "tone": "success"
+      },
+      {
+       "at": "net",
+       "token": "TCP/5432",
+       "caption": "يفحص ماسح منفذ قاعدة البيانات مباشرة من الإنترنت."
+      },
+      {
+       "at": "lb",
+       "token": "TCP/5432",
+       "caption": "لا قاعدة تسمح به: تُسقط الحزمة قبل نطاق البيانات.",
+       "tone": "blocked"
+      }
+     ]
+    }
+   },
+   {
+    "id": "enforce",
+    "type": "text",
+    "markdown": "## افرض العزل في عدة نقاط\n\nيمكن لخطأ واحد أن يزيل ضابطًا واحدًا، لذا افرض العزل طبقات:\n\n- **على مستوى الشبكة:** شبكات VLAN أو شبكات افتراضية منفصلة، مع جدار حماية يتحكم بالتوجيه بين النطاقات. في Proxmox VE ضع آلة قاعدة البيانات الافتراضية على جسر أو VLAN خاص بها وفعّل جدار حماية الآلة الافتراضية.\n- **جدار حماية الخادم:** `nftables` أو `ufw` أو جدار Windows Defender على مضيف قاعدة البيانات نفسه. وهذا يحميك حين يُضبط جدار الشبكة خطأً.\n- **على مستوى قاعدة البيانات:** ربط `listen_addresses` بالواجهة الخاصة، وقواعد `pg_hba.conf` من [أمن ملف pg_hba.conf في PostgreSQL](/learn/systems-infrastructure-security/postgresql-pg-hba-conf-security).\n- **على مستوى الحاويات:** انشر المنافذ على عنوان محدد مثل `127.0.0.1:5432:5432`، أو لا تنشر إطلاقًا واستخدم شبكة Docker خاصة.\n- **على مستوى المنسّق:** في Kubernetes استخدم `NetworkPolicy` تسمح فقط للحاويات (pods) ذات وسم معين بالوصول إلى حاوية قاعدة البيانات.\n\nيستخدم جدار حماية الخادم أدناه `nftables`. يسمح بمنفذ قاعدة البيانات من شبكة التطبيقات الفرعية فقط، وبـ SSH من شبكة الإدارة فقط، ويُسقط كل ما عداه افتراضيًّا."
+   },
+   {
+    "id": "nft",
+    "type": "code",
+    "language": "bash",
+    "filename": "/etc/nftables.conf",
+    "caption": "جدار حماية لخادم قاعدة بيانات (إسقاط افتراضي). الشبكات الفرعية أمثلة خاصة.",
+    "code": "#!/usr/sbin/nft -f\nflush ruleset\n\ntable inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n\n    ct state established,related accept\n    iif lo accept\n\n    # PostgreSQL only from the app subnet and the reporting host\n    ip saddr 10.20.1.0/24 tcp dport 5432 accept\n    ip saddr 10.20.2.15   tcp dport 5432 accept\n\n    # SSH and metrics only from management\n    ip saddr 10.20.9.0/24 tcp dport { 22, 9187 } accept\n\n    # log what we drop, rate limited\n    limit rate 5/minute log prefix \"nft-drop: \" level info\n  }\n  chain forward { type filter hook forward priority 0; policy drop; }\n  chain output  { type filter hook output  priority 0; policy accept; }\n}",
+    "highlight": [
+     5,
+     10,
+     11,
+     14,
+     17
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "قد يتجاوز Docker جدار حماية الخادم",
+    "markdown": "يكتب Docker قواعده الخاصة في مساري `nat` و`FORWARD`، فقد يبقى المنفذ المنشور متاحًا وإن أسقطته سلسلة input لديك. اربط المنافذ المنشورة بـ `127.0.0.1` أو بعنوان خاص، وضع سياستك في سلسلة `DOCKER-USER`، وتحقق دائمًا من الخارج."
+   },
+   {
+    "id": "verify",
+    "type": "text",
+    "markdown": "## تحقق من الخارج\n\nالقاعدة التي لم تختبرها اعتقاد لا ضابط. تحقق من نقطتي رؤية على أنظمة تملكها:\n\n1. **من مضيف مسموح** مثل خادم تطبيق، تأكد أن منفذ قاعدة البيانات يستجيب.\n2. **من مضيف يُفترض حجبه** مثل حاسبتك المحمولة أو خادم في نطاق آخر، تأكد أنه لا يستجيب.\n3. **من مضيف قاعدة البيانات** اسرد المقابس المستمعة بـ `ss -tlnp` وقارن بتصميمك.\n\nاستخدم `nmap` فقط ضد نطاقات عناوينك أنت، وشغّله من خارج نطاق البيانات لترى ما يراه المهاجم. فنتيجة منفذ 5432 مفتوحًا من النطاق الخطأ تعني أن العزل أخفق في مكان ما حتى لو بقيت المصادقة توقف الدخول."
+   },
+   {
+    "id": "verify-term",
+    "type": "terminal",
+    "title": "Verifying isolation (lab network)",
+    "lines": [
+     {
+      "cmd": "ss -tlnp | grep 5432",
+      "output": "LISTEN 0 244 10.20.2.5:5432 0.0.0.0:* users:((\"postgres\",pid=812,fd=6))",
+      "comment": "مرتبط بالعنوان الخاص فقط لا بـ 0.0.0.0."
+     },
+     {
+      "cmd": "nmap -Pn -p 5432 10.20.2.5",
+      "output": "PORT     STATE    SERVICE\n5432/tcp filtered postgresql",
+      "comment": "مشغَّل من الحاسبة المحمولة للإدارة: أسقطه جدار الخادم كما صُمّم."
+     },
+     {
+      "cmd": "nc -zv 10.20.2.5 5432",
+      "output": "Connection to 10.20.2.5 5432 port [tcp/postgresql] succeeded!",
+      "comment": "مشغَّل من خادم التطبيق في 10.20.1.0/24: المسار المسموح يعمل."
+     }
+    ],
+    "caption": "اختبر المسارين المسموح والمحجوب؛ filtered تعني مُسقَط وclosed تعني مرفوض."
+   },
+   {
+    "id": "admin",
+    "type": "text",
+    "markdown": "## وصول آمن للمديرين\n\nما زال المهندسون يحتاجون إلى الوصول إلى قاعدة البيانات. امنحهم مسارًا مسجَّلًا وقابلًا للسحب:\n\n- **مضيف القفز (Bastion).** مضيف واحد محصَّن في نطاق الإدارة مع مصادقة متعددة العوامل وتسجيل للجلسات وحسابات قصيرة العمر.\n- **نفق SSH.** الأمر `ssh -L 5433:10.20.2.5:5432 admin@jump.example.com` يمرّر منفذًا محليًّا عبر مضيف القفز، فلا تقبل قاعدة البيانات عنوان حاسبة المهندس.\n- **وصول محدود بالزمن.** استخدم أدوات وصول تفتح قاعدة جدار حماية طوال مدة التذكرة فقط.\n- **لا عنوان سحابيًّا عامًّا.** في المنصات السحابية استخدم نقاط وصول خاصة ومجموعات أمان تشير إلى مجموعات أخرى لا إلى نطاقات عناوين.\n\nوفي Kubernetes تحقق `NetworkPolicy` بسيطة تختار حاويات قاعدة البيانات وتسمح بالدخول من الحاويات الموسومة بوسم التطبيق فقط التصميم نفسه: المنع افتراضيًّا. والمبدأ واحد في كل بيئة: امنع افتراضيًّا، واسمح بالاستثناء، ووثّق الاستثناء، واختبره. اجمع ذلك مع الاتصالات المشفّرة من [TLS والتشفير في قواعد البيانات](/learn/systems-infrastructure-security/database-tls-and-encryption) حتى لا يمكن قراءة الحركة العابرة بين النطاقات."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على آلة افتراضية مخبرية **تملكها** تشغّل PostgreSQL، شغّل `ss -tlnp | grep 5432` ولاحظ العنوان المرتبط. إن ظهر `0.0.0.0` فغيّر `listen_addresses` إلى العنوان الخاص وأعد التشغيل.\n2. ثبّت `nftables` وكيّف مجموعة القواعد النموذجية مع شبكاتك الفرعية المخبرية، وحمّلها بـ `sudo nft -f /etc/nftables.conf`. أبقِ جلسة وحدة تحكم مفتوحة تحسبًا لحجب نفسك.\n3. من آلة افتراضية ثانية في شبكة فرعية مسموحة اختبر بـ `nc -zv <db-ip> 5432`. ومن آلة في شبكة فرعية مختلفة تأكد أن الاتصال ينتهي بمهلة.\n4. إن كنت تستخدم Docker فابدأ قاعدة البيانات بـ `-p 127.0.0.1:5432:5432` وأثبت من مضيف آخر أن المنفذ غير قابل للوصول."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "العزل الشبكي",
+      "definition": "حصر الأنظمة التي تستطيع الوصول إلى خدمة ما."
+     },
+     {
+      "term": "نطاق البيانات",
+      "definition": "مقطع شبكي مخصص لقواعد البيانات بلا مسار مباشر إلى الإنترنت."
+     },
+     {
+      "term": "مضيف القفز",
+      "definition": "مضيف محصَّن هو المسار الوحيد للمديرين إلى نطاق ما."
+     },
+     {
+      "term": "المنع افتراضيًّا",
+      "definition": "سياسة تُسقط كل حركة غير مسموح بها صراحةً."
+     },
+     {
+      "term": "ترشيح الصادر",
+      "definition": "تقييد الاتصالات الصادرة من خادم."
+     },
+     {
+      "term": "nftables",
+      "definition": "إطار ترشيح الحزم الحديث في Linux الذي يحل محل iptables."
+     },
+     {
+      "term": "NetworkPolicy",
+      "definition": "كائن في Kubernetes يتحكم بالحاويات المسموح لها بالتخاطب."
+     },
+     {
+      "term": "نفق SSH",
+      "definition": "تمرير منفذ محلي إلى خدمة بعيدة عبر اتصال SSH."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا نضع قواعد البيانات في نطاق بيانات منفصل؟",
+      "options": [
+       "لتسريع الاستعلامات",
+       "لإزالة أي مسار مباشر من الشبكات غير الموثوقة",
+       "لتفادي النسخ الاحتياطي",
+       "لتعطيل TLS"
+      ],
+      "answer": 1,
+      "explanation": "النطاق المنفصل مع توجيه مضبوط يعني أن الأنظمة المعتمدة وحدها تصل إلى المنفذ."
+     },
+     {
+      "question": "قاعدة بيانات تستمع على 0.0.0.0:5432. ما أفضل إصلاح أول؟",
+      "options": [
+       "ربط listen_addresses بالواجهة الخاصة",
+       "تغيير اسم قاعدة البيانات",
+       "استخدام كلمة مرور أطول",
+       "تعطيل التسجيل"
+      ],
+      "answer": 0,
+      "explanation": "تقليل أماكن استماع الخدمة يصغّر سطح الهجوم قبل أي ضابط آخر."
+     },
+     {
+      "question": "أي مما يلي طرق جيدة لفرض العزل؟ اختر كل ما ينطبق.",
+      "options": [
+       "جدار حماية على خادم قاعدة البيانات",
+       "تقسيم الشبكة بـ VLAN",
+       "نشر منافذ الحاويات على كل الواجهات",
+       "NetworkPolicy في Kubernetes"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "الضوابط المتعددة الطبقات تعزز بعضها، أما النشر على كل الواجهات فيفعل العكس."
+     },
+     {
+      "question": "يُظهر فحص nmap المنفذ 5432 بحالة filtered من نطاق محجوب. ماذا يعني ذلك؟",
+      "options": [
+       "تُسقط الحزم بواسطة جدار حماية",
+       "قاعدة البيانات متوقفة",
+       "كلمة المرور خاطئة",
+       "TLS معطّل"
+      ],
+      "answer": 0,
+      "explanation": "تعني filtered عدم وجود استجابة، عادةً بسبب قاعدة إسقاط؛ أما closed فتعني رفضًا صريحًا من المضيف."
+     },
+     {
+      "question": "لماذا قد يقوّض Docker جدار حماية الخادم؟",
+      "options": [
+       "يُدرج قواعد NAT وإعادة توجيه خاصة به",
+       "يعطّل النواة",
+       "يشفّر كل الحركة",
+       "يحجب كل المنافذ"
+      ],
+      "answer": 0,
+      "explanation": "تستخدم المنافذ المنشورة قواعد Docker التي قد تتجاوز إسقاط سلسلة input. اربط بعنوان خاص واستخدم DOCKER-USER."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يقلّل العزل عدد الأنظمة التي تصل إلى منفذ قاعدة البيانات، وبذلك أثر كل ضعف آخر.\n- ضع قواعد البيانات في نطاق بيانات بلا مسار إلى الإنترنت، واسمح لطبقة التطبيقات وحدها بالوصول إلى المنفذ، ومرّر المديرين عبر مضيف قفز.\n- افرض العزل طبقات: تقسيم الشبكة، وجدار حماية الخادم، و`listen_addresses`، و`pg_hba.conf`، وربط منافذ الحاويات، وسياسة شبكة Kubernetes.\n- قيّد الاتصالات الصادرة كما تقيّد الواردة.\n- تحقق دائمًا من نقاط رؤية مسموحة ومحجوبة على أنظمة تملكها.\n\nفي هذه المرحلة ستحمي بعد ذلك البيانات أثناء النقل وعلى القرص في [TLS والتشفير في قواعد البيانات](/learn/systems-infrastructure-security/database-tls-and-encryption)."
+   }
+  ]
+ }
+}

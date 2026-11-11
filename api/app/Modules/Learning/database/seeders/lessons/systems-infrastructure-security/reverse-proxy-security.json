@@ -1,0 +1,560 @@
+{
+ "slug": "reverse-proxy-security",
+ "title": "Reverse Proxy Security",
+ "summary": "Place a reverse proxy in front of applications safely: terminate TLS, forward client identity correctly, restrict upstream access and filter what reaches the backend.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain what a reverse proxy protects and what it does not",
+  "Terminate TLS and forward client details safely",
+  "Prevent direct access to backends",
+  "Set timeouts, size limits and path rules at the proxy",
+  "Avoid common header and routing mistakes"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A reverse proxy accepts requests from the internet on behalf of one or more backend servers. Visitors talk to the proxy and never to the application. This gives you one hardened front door where you terminate TLS, apply limits, add logging and route traffic, while the application servers stay on a private network.\n\nThe same position is also dangerous. If the proxy trusts the wrong headers, forwards to the wrong place or exposes an internal path, it can create vulnerabilities that the applications do not have on their own. This lesson shows how to configure the proxy so it adds protection rather than risk. It builds on [Nginx](/learn/systems-infrastructure-security/nginx-security-hardening) and [Apache](/learn/systems-infrastructure-security/apache-http-server-security) hardening, and examples use Nginx with documentation addresses."
+  },
+  {
+   "id": "role",
+   "type": "text",
+   "markdown": "## What a reverse proxy does for security\n\n| Function | Benefit | Limit |\n|:--|:--|:--|\n| TLS termination | One place to manage certificates and protocols | Traffic behind it is plaintext unless re-encrypted |\n| Hiding backends | Addresses and software of the backends are not exposed | Not useful if backends are also reachable directly |\n| Request filtering | Block paths, methods, large bodies and bad clients early | Not a replacement for application validation |\n| Rate limiting | Protects slow or fragile backends | Needs the correct client address |\n| Central logging | One consistent access log | Backend logs still needed for context |\n| Caching and buffering | Absorbs slow clients | Cache mistakes can leak private pages |\n\nA proxy does **not** fix a vulnerable application. A SQL injection request that passes the proxy still reaches the database. Treat the proxy as one layer in a chain that includes a [web application firewall](/learn/systems-infrastructure-security/web-application-firewall-waf), secure code and database controls. Also remember that a proxy is a high-value target: if an attacker takes it over, they see all traffic after TLS ends. Harden it, patch it and keep its management access private."
+  },
+  {
+   "id": "proxy-conf",
+   "type": "code",
+   "language": "nginx",
+   "code": "# /etc/nginx/conf.d/app.example.com.conf\nupstream app_backend {\n    server 10.20.0.15:8080;             # private address, not reachable from the internet\n    keepalive 16;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name app.example.com;\n    ssl_certificate     /etc/nginx/ssl/app.example.com.fullchain.pem;\n    ssl_certificate_key /etc/nginx/ssl/app.example.com.key;\n\n    client_max_body_size 5m;\n    proxy_connect_timeout 5s;\n    proxy_read_timeout    30s;\n    proxy_send_timeout    30s;\n\n    # Block internal paths that must never be public\n    location ^~ /internal/ { return 404; }\n    location ~ /\\.        { return 404; }\n\n    location / {\n        proxy_pass http://app_backend;\n        proxy_http_version 1.1;\n        proxy_set_header Connection \"\";\n        proxy_set_header Host              $host;\n        proxy_set_header X-Real-IP         $remote_addr;\n        proxy_set_header X-Forwarded-For   $remote_addr;   # overwrite, do not append client input\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_hide_header X-Powered-By;\n    }\n}",
+   "filename": "app.example.com.conf",
+   "caption": "The proxy overwrites forwarding headers with values it knows, instead of trusting what the client sent."
+  },
+  {
+   "id": "headers",
+   "type": "text",
+   "markdown": "## Forwarded headers: trust only what you set\n\nThe backend cannot see the real client, only the proxy. So the proxy passes the details in headers such as `X-Forwarded-For` (client address), `X-Forwarded-Proto` (http or https) and `Host`. Two rules keep this safe.\n\n**The proxy must overwrite, not append blindly.** If a client sends `X-Forwarded-For: 192.0.2.99`, and the proxy appends to it, the backend may read the forged first value and believe it. An attacker could then bypass an IP allow list or evade rate limiting. Either overwrite the header with `$remote_addr`, or use the `real_ip` module with an explicit list of trusted proxy ranges.\n\n**The backend must trust the headers only from the proxy.** Configure the application (for example Laravel's trusted proxies) to accept forwarded headers only from the proxy's address, such as `10.20.0.10`. If the backend is reachable from elsewhere, anyone can send the same headers to it.\n\nAlso set `Host` deliberately. An application that builds links or password reset URLs from an unvalidated `Host` header can be tricked into sending users to another domain. Use a fixed `server_name`, a default server that rejects unknown hosts, and an application-level allow list."
+  },
+  {
+   "id": "proxy-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "A request through a reverse proxy",
+   "caption": "The proxy sets the identity headers and shields the backend.",
+   "data": {
+    "actors": [
+     {
+      "id": "c",
+      "label": "Client",
+      "sub": "203.0.113.25",
+      "icon": "user"
+     },
+     {
+      "id": "p",
+      "label": "Reverse proxy",
+      "sub": "198.51.100.10",
+      "icon": "shield"
+     },
+     {
+      "id": "b",
+      "label": "Backend",
+      "sub": "10.20.0.15:8080",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "c",
+      "to": "p",
+      "label": "HTTPS GET /account",
+      "detail": "X-Forwarded-For: 192.0.2.99 (forged)",
+      "tone": "attack",
+      "note": "The client sends a forged forwarding header."
+     },
+     {
+      "from": "p",
+      "to": "p",
+      "label": "Terminate TLS",
+      "tone": "secure",
+      "note": "The proxy decrypts the request and applies its filters and limits."
+     },
+     {
+      "from": "p",
+      "to": "b",
+      "label": "HTTP GET /account",
+      "detail": "X-Forwarded-For: 203.0.113.25",
+      "note": "The proxy overwrites the header with the address it really saw."
+     },
+     {
+      "from": "b",
+      "to": "p",
+      "label": "200 OK",
+      "note": "The backend answers the proxy only, on the private network.",
+      "tone": "success"
+     },
+     {
+      "from": "p",
+      "to": "c",
+      "label": "HTTPS 200 OK",
+      "tone": "secure",
+      "note": "The proxy encrypts the response and removes revealing headers."
+     },
+     {
+      "from": "c",
+      "to": "b",
+      "label": "Direct request to 10.20.0.15",
+      "tone": "blocked",
+      "note": "A direct attempt fails: the backend firewall allows only the proxy."
+     }
+    ]
+   }
+  },
+  {
+   "id": "backend",
+   "type": "text",
+   "markdown": "## Protect the path behind the proxy\n\nHiding the backend only works if the backend is actually unreachable except from the proxy. Check four things.\n\n1. **Network.** Put backends on a private subnet and allow the application port only from the proxy address in the host firewall, for example `nftables` or `ufw`. See [Linux Firewall Management](/learn/systems-infrastructure-security/linux-firewall-management-nftables-ufw-and-firewalld).\n2. **Binding.** Make the application listen on the private address or a Unix socket, not on `0.0.0.0`.\n3. **Re-encryption.** If the backend is on another host or network segment, use TLS between the proxy and the backend too, and verify the backend certificate with `proxy_ssl_verify on`. Otherwise, traffic after the proxy is readable by anyone who can sniff that segment.\n4. **Path rules.** Expose only the routes the public needs. Admin consoles, metrics endpoints such as `/metrics` and health checks should be reachable from the management network only.\n\nFinally, be careful with the ways a proxy can be misused. A `proxy_pass` that builds its target from user input, for example from a URL parameter, turns your proxy into an open relay and enables server-side request forgery. Read [Server-Side Request Forgery (SSRF)](/learn/systems-infrastructure-security/server-side-request-forgery-ssrf) to understand why. Likewise, never enable a forward proxy on a public interface."
+  },
+  {
+   "id": "proxy-term",
+   "type": "terminal",
+   "title": "Verifying the proxy from both sides",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "sudo nginx -t && sudo systemctl reload nginx",
+     "output": "nginx: configuration file /etc/nginx/nginx.conf test is successful"
+    },
+    {
+     "cmd": "curl -s -H 'X-Forwarded-For: 192.0.2.99' https://app.example.com/whoami",
+     "output": "client_ip=203.0.113.25 proto=https"
+    },
+    {
+     "comment": "The backend reports the real address, not the forged one. The proxy overwrote the header."
+    },
+    {
+     "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://app.example.com/internal/status",
+     "output": "404"
+    },
+    {
+     "cmd": "curl -s -m 5 -o /dev/null -w '%{http_code}\\n' http://10.20.0.15:8080/",
+     "output": "000"
+    },
+    {
+     "comment": "Run the last command from a machine other than the proxy. A 000 result with a timeout means the backend refuses direct connections, as intended."
+    },
+    {
+     "cmd": "sudo ss -tlnp | grep 8080",
+     "output": "LISTEN 0 511 10.20.0.15:8080 0.0.0.0:* users:((\"gunicorn\",pid=1832,fd=5))"
+    },
+    {
+     "comment": "On the backend host, the application listens on the private address only."
+    }
+   ]
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Proxy mistakes that cause real incidents",
+   "markdown": "- Letting clients append to `X-Forwarded-For` and then using the first value for allow lists.\n- Trusting `X-Forwarded-Proto` from any source, so an attacker can make the app believe a request was secure.\n- Forgetting that `proxy_pass http://backend/` with a trailing slash rewrites the path differently from one without it. Test your routes.\n- Caching responses that depend on cookies or authorization, which can serve one user's page to another.\n- Leaving the backend port open to the internet, so the proxy rules can simply be bypassed."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use two virtual machines you own on a private network: one proxy and one backend.\n\n1. On the backend, run a simple web app that prints the `X-Forwarded-For` header, and bind it to the backend's private address only.\n2. On the proxy, create the `upstream` and `server` blocks above with your own addresses and a test certificate.\n3. Send `curl -H 'X-Forwarded-For: 192.0.2.99' https://<proxy>/` and confirm that the backend shows the proxy's observed address.\n4. From a third machine, try connecting to the backend port directly. Then add a firewall rule that allows only the proxy and test again.\n5. Request a path you blocked (`/internal/`) and confirm the result is `404`.\n\nWrite down which layer stopped each test."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Reverse proxy",
+     "definition": "A server that receives client requests and forwards them to backend servers."
+    },
+    {
+     "term": "Upstream",
+     "definition": "The backend server or group that the proxy forwards to."
+    },
+    {
+     "term": "TLS termination",
+     "definition": "Decrypting HTTPS at the proxy instead of at the backend."
+    },
+    {
+     "term": "X-Forwarded-For",
+     "definition": "Header carrying the original client address through proxies."
+    },
+    {
+     "term": "Trusted proxy",
+     "definition": "A proxy whose forwarded headers the application accepts."
+    },
+    {
+     "term": "Open relay",
+     "definition": "A proxy that forwards to any destination a user chooses."
+    },
+    {
+     "term": "Re-encryption",
+     "definition": "Using TLS again between the proxy and the backend."
+    },
+    {
+     "term": "Host header",
+     "definition": "The requested host name, which applications must validate."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why should the proxy overwrite `X-Forwarded-For` with `$remote_addr`?",
+     "options": [
+      "To save bandwidth",
+      "So a client cannot forge its address by sending its own header",
+      "To enable HTTP/2",
+      "To hide the proxy"
+     ],
+     "answer": 1,
+     "explanation": "If the proxy appends to client-supplied values, the backend can be fooled by the forged first entry."
+    },
+    {
+     "question": "What makes hiding backends effective?",
+     "options": [
+      "Using a different port number",
+      "Making them unreachable except from the proxy, by firewall and binding",
+      "Removing the Server header",
+      "Using a long hostname"
+     ],
+     "answer": 1,
+     "explanation": "If the backend is reachable directly, an attacker simply skips the proxy and its rules."
+    },
+    {
+     "question": "Which of these are risks of terminating TLS at the proxy? (Choose all that apply.)",
+     "options": [
+      "Traffic to the backend may be plaintext",
+      "The proxy sees all decrypted traffic",
+      "The client loses encryption to the server",
+      "A compromised proxy exposes everything"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Clients are still encrypted to the proxy. The risk is behind and at the proxy, so protect and re-encrypt where needed."
+    },
+    {
+     "question": "A proxy_pass target built from a URL parameter creates which problem?",
+     "options": [
+      "Slow caching",
+      "An open relay and a server-side request forgery risk",
+      "TLS downgrade",
+      "Missing logs"
+     ],
+     "answer": 1,
+     "explanation": "Attackers can make your proxy request internal services on their behalf."
+    },
+    {
+     "question": "Which controls should the application apply for forwarded headers? (Choose all that apply.)",
+     "options": [
+      "Trust them only from the proxy's address",
+      "Validate the Host header against an allow list",
+      "Trust them from any source",
+      "Use the first X-Forwarded-For value without checks"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "Forwarded headers are trustworthy only when they come from a known proxy. Always validate Host."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\nA reverse proxy is a strong front door when it terminates TLS, filters requests, sets limits and overwrites identity headers with values it knows. It fails when backends are reachable directly, when forwarded headers are trusted from anyone, or when its targets come from user input. Keep backends private, bind them narrowly, re-encrypt where traffic crosses networks, and validate `Host`. This completes the web server hardening unit. Continue with application protections such as [Laravel Application Security](/learn/systems-infrastructure-security/laravel-application-security) and [Secure HTTP Headers](/learn/systems-infrastructure-security/secure-http-headers)."
+  }
+ ],
+ "ar": {
+  "title": "أمن الوكيل العكسي",
+  "summary": "ضع وكيلاً عكسياً أمام التطبيقات بأمان: أنهِ TLS ومرّر هوية العميل بشكل صحيح وقيّد الوصول إلى الخوادم الخلفية وصفِّ ما يصل إليها.",
+  "objectives": [
+   "شرح ما يحميه الوكيل العكسي وما لا يحميه",
+   "إنهاء TLS وتمرير تفاصيل العميل بأمان",
+   "منع الوصول المباشر إلى الخوادم الخلفية",
+   "ضبط المهلات وحدود الحجم وقواعد المسارات عند الوكيل",
+   "تجنب أخطاء الترويسات والتوجيه الشائعة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يقبل الوكيل العكسي (Reverse proxy) الطلبات من الإنترنت نيابةً عن خادم خلفي أو أكثر. يتكلم الزوار مع الوكيل ولا يصلون إلى التطبيق أبداً. وهذا يمنحك باباً أمامياً واحداً محصّناً تُنهي عنده TLS وتطبّق الحدود وتضيف التسجيل وتوجّه حركة المرور، بينما تبقى خوادم التطبيق في شبكة خاصة.\n\nلكن الموقع نفسه خطر أيضاً. فإذا وثق الوكيل بترويسات خاطئة، أو مرّر إلى مكان خاطئ، أو كشف مساراً داخلياً، فقد ينشئ ثغرات لا توجد في التطبيقات نفسها. يوضّح هذا الدرس كيف تضبط الوكيل ليضيف حماية لا مخاطرة. وهو يبني على تحصين [Nginx](/learn/systems-infrastructure-security/nginx-security-hardening) و[Apache](/learn/systems-infrastructure-security/apache-http-server-security)، وتستخدم الأمثلة Nginx مع عناوين التوثيق."
+   },
+   {
+    "id": "role",
+    "type": "text",
+    "markdown": "## ما يقدّمه الوكيل العكسي للأمن\n\n| الوظيفة | الفائدة | الحد |\n|:--|:--|:--|\n| إنهاء TLS | مكان واحد لإدارة الشهادات والبروتوكولات | ما وراءه بلا تشفير ما لم يُعد تشفيره |\n| إخفاء الخوادم الخلفية | لا تنكشف عناوين الخوادم الخلفية ولا برمجياتها | لا فائدة إن كانت الخوادم الخلفية قابلة للوصول مباشرة |\n| تصفية الطلبات | حجب مسارات وطرائق وأجسام كبيرة وعملاء سيئين مبكراً | ليس بديلاً عن التحقق في التطبيق |\n| تحديد المعدل | يحمي الخوادم الخلفية البطيئة أو الهشّة | يحتاج إلى عنوان العميل الصحيح |\n| التسجيل المركزي | سجل وصول موحّد | تبقى سجلات الخلفية لازمة للسياق |\n| التخزين المؤقت وتخزين الطلبات | يمتص العملاء البطيئين | أخطاء التخزين المؤقت قد تسرّب صفحات خاصة |\n\nالوكيل **لا** يصلح تطبيقاً مصاباً بثغرة. فطلب حقن SQL يعبر الوكيل ويصل إلى قاعدة البيانات. عامل الوكيل كطبقة واحدة في سلسلة تضم [جدار حماية تطبيقات الويب](/learn/systems-infrastructure-security/web-application-firewall-waf) وشيفرة آمنة وضوابط قاعدة البيانات. وتذكّر أن الوكيل هدف عالي القيمة: إن سيطر عليه مهاجم رأى كل حركة المرور بعد انتهاء TLS. فحصّنه وحدّثه وأبقِ وصول إدارته خاصاً."
+   },
+   {
+    "id": "proxy-conf",
+    "type": "code",
+    "language": "nginx",
+    "code": "# /etc/nginx/conf.d/app.example.com.conf\nupstream app_backend {\n    server 10.20.0.15:8080;             # private address, not reachable from the internet\n    keepalive 16;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name app.example.com;\n    ssl_certificate     /etc/nginx/ssl/app.example.com.fullchain.pem;\n    ssl_certificate_key /etc/nginx/ssl/app.example.com.key;\n\n    client_max_body_size 5m;\n    proxy_connect_timeout 5s;\n    proxy_read_timeout    30s;\n    proxy_send_timeout    30s;\n\n    # Block internal paths that must never be public\n    location ^~ /internal/ { return 404; }\n    location ~ /\\.        { return 404; }\n\n    location / {\n        proxy_pass http://app_backend;\n        proxy_http_version 1.1;\n        proxy_set_header Connection \"\";\n        proxy_set_header Host              $host;\n        proxy_set_header X-Real-IP         $remote_addr;\n        proxy_set_header X-Forwarded-For   $remote_addr;   # overwrite, do not append client input\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_hide_header X-Powered-By;\n    }\n}",
+    "filename": "app.example.com.conf",
+    "caption": "يستبدل الوكيل ترويسات التمرير بقيم يعرفها بدلاً من الوثوق بما أرسله العميل."
+   },
+   {
+    "id": "headers",
+    "type": "text",
+    "markdown": "## ترويسات التمرير: ثق بما ضبطته أنت فقط\n\nلا يرى الخادم الخلفي العميل الحقيقي بل الوكيل فقط. لذلك يمرر الوكيل التفاصيل في ترويسات مثل `X-Forwarded-For` (عنوان العميل) و`X-Forwarded-Proto` (http أو https) و`Host`. وقاعدتان تُبقيان ذلك آمناً.\n\n**يجب أن يستبدل الوكيل لا أن يلحق دون تدقيق.** إذا أرسل عميل `X-Forwarded-For: 192.0.2.99` وألحق الوكيل به، فقد يقرأ الخادم الخلفي القيمة الأولى المزوّرة ويصدّقها. وعندها يستطيع المهاجم تجاوز قائمة عناوين مسموحة أو التهرب من تحديد المعدل. إما أن تستبدل الترويسة بـ `$remote_addr`، أو تستخدم وحدة `real_ip` مع قائمة صريحة بنطاقات الوكلاء الموثوقين.\n\n**يجب أن يثق الخادم الخلفي بالترويسات من الوكيل فقط.** اضبط التطبيق (مثل الوكلاء الموثوقين في Laravel) على قبول ترويسات التمرير من عنوان الوكيل فقط، مثل `10.20.0.10`. فإذا كان الخادم الخلفي قابلاً للوصول من مكان آخر، استطاع أي شخص إرسال الترويسات نفسها إليه.\n\nواضبط `Host` عن قصد أيضاً. التطبيق الذي يبني الروابط أو عناوين إعادة تعيين كلمة المرور من ترويسة `Host` غير مُتحقَّق منها قد يُخدَع فيرسل المستخدمين إلى نطاق آخر. استخدم `server_name` ثابتاً، وخادماً افتراضياً يرفض المضيفات المجهولة، وقائمة سماح في التطبيق."
+   },
+   {
+    "id": "proxy-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "طلب يمر عبر وكيل عكسي",
+    "caption": "يضبط الوكيل ترويسات الهوية ويحمي الخادم الخلفي.",
+    "data": {
+     "actors": [
+      {
+       "id": "c",
+       "label": "العميل",
+       "sub": "203.0.113.25",
+       "icon": "user"
+      },
+      {
+       "id": "p",
+       "label": "الوكيل العكسي",
+       "sub": "198.51.100.10",
+       "icon": "shield"
+      },
+      {
+       "id": "b",
+       "label": "الخادم الخلفي",
+       "sub": "10.20.0.15:8080",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "c",
+       "to": "p",
+       "label": "HTTPS GET /account",
+       "detail": "X-Forwarded-For: 192.0.2.99 (مزوّرة)",
+       "tone": "attack",
+       "note": "يرسل العميل ترويسة تمرير مزوّرة."
+      },
+      {
+       "from": "p",
+       "to": "p",
+       "label": "إنهاء TLS",
+       "tone": "secure",
+       "note": "يفك الوكيل تشفير الطلب ويطبق مرشحاته وحدوده."
+      },
+      {
+       "from": "p",
+       "to": "b",
+       "label": "HTTP GET /account",
+       "detail": "X-Forwarded-For: 203.0.113.25",
+       "note": "يستبدل الوكيل الترويسة بالعنوان الذي رآه فعلاً."
+      },
+      {
+       "from": "b",
+       "to": "p",
+       "label": "200 OK",
+       "note": "يجيب الخادم الخلفي الوكيل وحده في الشبكة الخاصة.",
+       "tone": "success"
+      },
+      {
+       "from": "p",
+       "to": "c",
+       "label": "HTTPS 200 OK",
+       "tone": "secure",
+       "note": "يشفّر الوكيل الرد ويزيل الترويسات الكاشفة."
+      },
+      {
+       "from": "c",
+       "to": "b",
+       "label": "طلب مباشر إلى 10.20.0.15",
+       "tone": "blocked",
+       "note": "تفشل المحاولة المباشرة: جدار حماية الخادم الخلفي يسمح بالوكيل فقط."
+      }
+     ]
+    }
+   },
+   {
+    "id": "backend",
+    "type": "text",
+    "markdown": "## احمِ المسار خلف الوكيل\n\nلا ينفع إخفاء الخادم الخلفي إلا إذا كان فعلاً غير قابل للوصول إلا من الوكيل. تحقق من أربعة أمور.\n\n1. **الشبكة.** ضع الخوادم الخلفية في شبكة فرعية خاصة وأتح منفذ التطبيق من عنوان الوكيل فقط في جدار حماية المضيف، مثل `nftables` أو `ufw`. راجع [إدارة جدران حماية لينكس](/learn/systems-infrastructure-security/linux-firewall-management-nftables-ufw-and-firewalld).\n2. **الربط.** اجعل التطبيق يستمع على العنوان الخاص أو على مقبس يونكس، لا على `0.0.0.0`.\n3. **إعادة التشفير.** إذا كان الخادم الخلفي على مضيف أو قطاع شبكة آخر، فاستخدم TLS بين الوكيل والخادم الخلفي أيضاً، وتحقق من شهادته بالتوجيه `proxy_ssl_verify on`. وإلا فإن الحركة بعد الوكيل مقروءة لكل من يستطيع التنصت على ذلك القطاع.\n4. **قواعد المسارات.** اكشف المسارات التي يحتاجها الجمهور فقط. وحدات تحكم الإدارة ونقاط المقاييس مثل `/metrics` وفحوص الصحة يجب أن تكون قابلة للوصول من شبكة الإدارة فقط.\n\nوأخيراً، احذر من طرق إساءة استخدام الوكيل. فـ `proxy_pass` الذي يبني هدفه من مدخلات المستخدم، كمعامل في العنوان، يحوّل وكيلك إلى مرحّل مفتوح ويتيح تزوير الطلبات من جهة الخادم. اقرأ [تزوير الطلبات من جهة الخادم (SSRF)](/learn/systems-infrastructure-security/server-side-request-forgery-ssrf) لتفهم السبب. وكذلك لا تفعّل وكيلاً أمامياً (forward proxy) على واجهة عامة أبداً."
+   },
+   {
+    "id": "proxy-term",
+    "type": "terminal",
+    "title": "التحقق من الوكيل من الجهتين",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "sudo nginx -t && sudo systemctl reload nginx",
+      "output": "nginx: configuration file /etc/nginx/nginx.conf test is successful"
+     },
+     {
+      "cmd": "curl -s -H 'X-Forwarded-For: 192.0.2.99' https://app.example.com/whoami",
+      "output": "client_ip=203.0.113.25 proto=https"
+     },
+     {
+      "comment": "يُبلغ الخادم الخلفي بالعنوان الحقيقي لا المزوّر. فقد استبدل الوكيل الترويسة."
+     },
+     {
+      "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://app.example.com/internal/status",
+      "output": "404"
+     },
+     {
+      "cmd": "curl -s -m 5 -o /dev/null -w '%{http_code}\\n' http://10.20.0.15:8080/",
+      "output": "000"
+     },
+     {
+      "comment": "نفّذ الأمر الأخير من جهاز غير الوكيل. النتيجة 000 مع انتهاء المهلة تعني أن الخادم الخلفي يرفض الاتصالات المباشرة كما هو مقصود."
+     },
+     {
+      "cmd": "sudo ss -tlnp | grep 8080",
+      "output": "LISTEN 0 511 10.20.0.15:8080 0.0.0.0:* users:((\"gunicorn\",pid=1832,fd=5))"
+     },
+     {
+      "comment": "على مضيف الخادم الخلفي، يستمع التطبيق على العنوان الخاص فقط."
+     }
+    ]
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء الوكيل التي تسبب حوادث حقيقية",
+    "markdown": "- ترك العملاء يلحقون بـ `X-Forwarded-For` ثم استخدام القيمة الأولى في قوائم السماح.\n- الوثوق بـ `X-Forwarded-Proto` من أي مصدر، فيستطيع المهاجم إيهام التطبيق بأن الطلب مؤمَّن.\n- نسيان أن `proxy_pass http://backend/` بشرطة مائلة أخيرة تعيد كتابة المسار بشكل مختلف عنه دونها. اختبر مساراتك.\n- تخزين ردود تعتمد على الكوكيز أو التفويض مؤقتاً، فقد تُقدَّم صفحة مستخدم لمستخدم آخر.\n- ترك منفذ الخادم الخلفي مفتوحاً للإنترنت، فيمكن تجاوز قواعد الوكيل بسهولة."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم جهازين افتراضيين تملكهما على شبكة خاصة: وكيل وخادم خلفي.\n\n1. على الخادم الخلفي شغّل تطبيق ويب بسيطاً يطبع ترويسة `X-Forwarded-For`، واربطه بالعنوان الخاص للخادم الخلفي فقط.\n2. على الوكيل أنشئ كتلتي `upstream` و`server` أعلاه بعناوينك الخاصة وشهادة اختبار.\n3. أرسل `curl -H 'X-Forwarded-For: 192.0.2.99' https://<proxy>/` وتأكد أن الخادم الخلفي يعرض العنوان الذي رآه الوكيل.\n4. من جهاز ثالث، حاول الاتصال بمنفذ الخادم الخلفي مباشرة. ثم أضف قاعدة جدار حماية تسمح بالوكيل فقط واختبر مجدداً.\n5. اطلب مساراً حجبته (`/internal/`) وتأكد أن النتيجة `404`.\n\nدوّن أي طبقة أوقفت كل اختبار."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "الوكيل العكسي (Reverse proxy)",
+      "definition": "خادم يستقبل طلبات العملاء ويمررها إلى خوادم خلفية."
+     },
+     {
+      "term": "الخادم الخلفي (Upstream)",
+      "definition": "الخادم أو المجموعة التي يمرر الوكيل إليها."
+     },
+     {
+      "term": "إنهاء TLS",
+      "definition": "فك تشفير HTTPS عند الوكيل بدلاً من الخادم الخلفي."
+     },
+     {
+      "term": "X-Forwarded-For",
+      "definition": "ترويسة تحمل عنوان العميل الأصلي عبر الوكلاء."
+     },
+     {
+      "term": "الوكيل الموثوق (Trusted proxy)",
+      "definition": "وكيل يقبل التطبيق ترويسات التمرير منه."
+     },
+     {
+      "term": "المرحّل المفتوح (Open relay)",
+      "definition": "وكيل يمرر إلى أي وجهة يختارها المستخدم."
+     },
+     {
+      "term": "إعادة التشفير (Re-encryption)",
+      "definition": "استخدام TLS مرة أخرى بين الوكيل والخادم الخلفي."
+     },
+     {
+      "term": "ترويسة Host",
+      "definition": "اسم المضيف المطلوب، ويجب أن تتحقق منه التطبيقات."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يجب أن يستبدل الوكيل `X-Forwarded-For` بالقيمة `$remote_addr`؟",
+      "options": [
+       "لتوفير النطاق الترددي",
+       "لكي لا يستطيع العميل تزوير عنوانه بإرسال ترويسته الخاصة",
+       "لتفعيل HTTP/2",
+       "لإخفاء الوكيل"
+      ],
+      "answer": 1,
+      "explanation": "إذا ألحق الوكيل بالقيم التي يرسلها العميل فقد يُخدع الخادم الخلفي بالإدخال الأول المزوّر."
+     },
+     {
+      "question": "ما الذي يجعل إخفاء الخوادم الخلفية فعالاً؟",
+      "options": [
+       "استخدام رقم منفذ مختلف",
+       "جعلها غير قابلة للوصول إلا من الوكيل بجدار الحماية والربط",
+       "إزالة ترويسة Server",
+       "استخدام اسم مضيف طويل"
+      ],
+      "answer": 1,
+      "explanation": "إذا كان الخادم الخلفي قابلاً للوصول مباشرة، يتجاوز المهاجم الوكيل وقواعده ببساطة."
+     },
+     {
+      "question": "أي مما يلي مخاطر إنهاء TLS عند الوكيل؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "قد تكون الحركة إلى الخادم الخلفي بلا تشفير",
+       "يرى الوكيل كل الحركة بعد فك تشفيرها",
+       "يفقد العميل التشفير مع الخادم",
+       "الوكيل المخترق يكشف كل شيء"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يبقى العملاء مشفّرين حتى الوكيل. الخطر خلف الوكيل وعنده، فاحمه وأعد التشفير عند الحاجة."
+     },
+     {
+      "question": "هدف proxy_pass المبني من معامل في العنوان يسبب أي مشكلة؟",
+      "options": [
+       "تخزيناً مؤقتاً بطيئاً",
+       "مرحّلاً مفتوحاً وخطر تزوير طلبات من جهة الخادم",
+       "خفض مستوى TLS",
+       "غياب السجلات"
+      ],
+      "answer": 1,
+      "explanation": "يستطيع المهاجمون جعل وكيلك يطلب خدمات داخلية نيابةً عنهم."
+     },
+     {
+      "question": "أي الضوابط يجب أن يطبقها التطبيق على ترويسات التمرير؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "الوثوق بها من عنوان الوكيل فقط",
+       "التحقق من ترويسة Host مقابل قائمة سماح",
+       "الوثوق بها من أي مصدر",
+       "استخدام أول قيمة في X-Forwarded-For دون فحص"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "ترويسات التمرير موثوقة فقط عندما تأتي من وكيل معروف. تحقق من Host دائماً."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\nالوكيل العكسي باب أمامي قوي عندما ينهي TLS ويصفّي الطلبات ويضع الحدود ويستبدل ترويسات الهوية بقيم يعرفها. ويفشل عندما تكون الخوادم الخلفية قابلة للوصول مباشرة، أو تُصدَّق ترويسات التمرير من أي جهة، أو تأتي أهدافه من مدخلات المستخدم. أبقِ الخوادم الخلفية خاصة، واربطها بنطاق ضيق، وأعد التشفير حيث تعبر الحركة شبكات، وتحقق من `Host`. وبهذا تكتمل وحدة تحصين خوادم الويب. تابع مع حمايات التطبيق مثل [أمن تطبيقات Laravel](/learn/systems-infrastructure-security/laravel-application-security) و[ترويسات HTTP الآمنة](/learn/systems-infrastructure-security/secure-http-headers)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,608 @@
+{
+  "slug": "linux-filesystem-security",
+  "title": "Linux Filesystem Security",
+  "summary": "Harden Linux storage with partitioning, mount options, immutable attributes and LUKS encryption, and audit for risky files.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Choose mount options for key directories",
+    "Use immutable and append-only attributes appropriately",
+    "Explain how LUKS protects data at rest and what to back up",
+    "Audit for world-writable, orphaned and setuid files"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A web application has an upload feature. A bug lets a user store a file anywhere the web service can write. The service account can write to `/tmp`, and `/tmp` allows programs to execute. Within minutes a script placed there is running with the service's privileges.\n\nNone of this needed a kernel flaw. It needed a filesystem that was more permissive than the job required. Filesystem security is the practice of shaping **where** data lives, **how** each location is mounted, and **who** can protect, encrypt or alter it. Permission bits, covered in [Linux Users, Groups and Permissions](/learn/systems-infrastructure-security/linux-users-groups-and-permissions), are the first layer; this lesson adds the others."
+    },
+    {
+      "id": "layout",
+      "type": "text",
+      "markdown": "## Separate partitions and mount options\n\nA single big `/` partition forces every directory to share one set of rules. Separating key areas lets you apply stricter mount options to each. Options are set in `/etc/fstab` and can be tested with `mount -o remount`.\n\n| Mount point | Recommended options | Why |\n|:--|:--|:--|\n| `/tmp` | `nodev,nosuid,noexec` | Scratch space should never run programs or hold device files |\n| `/var/tmp` | `nodev,nosuid,noexec` | Same as `/tmp`, but it survives reboots |\n| `/home` | `nodev,nosuid` | User data should not provide setuid programs |\n| `/var` | `nodev,nosuid` | Logs and spool data |\n| `/var/log` | `nodev,nosuid,noexec` | Protects the audit trail; a full log disk will not fill `/` |\n| `/boot` | `nodev,nosuid,noexec` | Rarely written; mount read-only where possible |\n\nThree options do most of the work. `nosuid` ignores setuid and setgid bits, `nodev` ignores device files, and `noexec` blocks direct execution of binaries. Keep in mind that `noexec` is a speed bump, not a wall, because an interpreter can still run a script passed to it as an argument.\n\nSeparate partitions also contain failures. When a runaway log fills `/var/log`, the root filesystem stays healthy and the system keeps running."
+    },
+    {
+      "id": "fstab",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/fstab",
+      "caption": "Hardened mount options on a server we own (UUIDs are placeholders).",
+      "code": "# <device>                   <mount>    <type> <options>                         <dump> <pass>\nUUID=aaaa-1111-example       /          ext4   defaults,errors=remount-ro        0 1\nUUID=bbbb-2222-example       /boot      ext4   defaults,nodev,nosuid,noexec      0 2\nUUID=cccc-3333-example       /home      ext4   defaults,nodev,nosuid             0 2\nUUID=dddd-4444-example       /var/log   ext4   defaults,nodev,nosuid,noexec      0 2\ntmpfs                        /tmp       tmpfs  defaults,nodev,nosuid,noexec,size=1g,mode=1777 0 0",
+      "highlight": [
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "id": "mountterm",
+      "type": "terminal",
+      "title": "app01.example.com",
+      "prompt": "admin@app01:~$",
+      "lines": [
+        {
+          "cmd": "sudo mount -o remount /tmp && findmnt -no OPTIONS /tmp",
+          "output": "rw,nosuid,nodev,noexec,relatime,size=1048576k,mode=1777",
+          "comment": "Remount to apply fstab changes without a reboot, then confirm the active options."
+        },
+        {
+          "cmd": "printf '#!/bin/sh\\necho hi\\n' > /tmp/t.sh && chmod +x /tmp/t.sh && /tmp/t.sh",
+          "output": "bash: /tmp/t.sh: Permission denied",
+          "comment": "noexec blocks direct execution. This is the expected, healthy result."
+        },
+        {
+          "cmd": "sudo find / -xdev -type f -perm -0002 2>/dev/null | head",
+          "output": "/srv/shared/upload.log",
+          "comment": "A world-writable regular file. Decide whether it should be 660 with a group."
+        },
+        {
+          "cmd": "sudo find / -xdev -nouser -o -nogroup 2>/dev/null | head -n 3",
+          "output": "/home/olduser/.bash_history",
+          "comment": "Files whose owner no longer exists are leftovers from deleted accounts."
+        }
+      ]
+    },
+    {
+      "id": "attrs",
+      "type": "text",
+      "markdown": "## Immutable files and attributes\n\nOn ext4 and XFS, file **attributes** work below the permission bits. The most useful is **immutable** (`i`): once set with `chattr +i`, not even root can modify, delete or rename the file until the attribute is cleared. The **append-only** attribute (`a`) allows writing only at the end, which suits log files.\n\n```\nsudo chattr +i /etc/resolv.conf     # lock a critical config\nlsattr /etc/resolv.conf             # ----i---------e------- /etc/resolv.conf\nsudo chattr -i /etc/resolv.conf     # unlock before a planned change\n```\n\nTreat `chattr` as a tripwire for a few critical files, not a security boundary. An attacker with full root can clear the attribute. Pair it with change detection from [Linux File Integrity Monitoring](/learn/systems-infrastructure-security/linux-file-integrity-monitoring), and remember to unlock the file before planned changes or upgrades fail in confusing ways."
+    },
+    {
+      "id": "crypto",
+      "type": "text",
+      "markdown": "## Encryption at rest with LUKS\n\nPermissions protect data only while the operating system is running and in control. A stolen disk, a decommissioned drive or a cloned virtual machine image bypasses them completely. **Encryption at rest** protects against this. On Linux the standard is **LUKS** (Linux Unified Key Setup) using `dm-crypt`.\n\nKey points:\n\n- Encrypt data volumes, backups and portable drives. Full-disk encryption on servers needs a plan for unattended boot, such as a network-bound key server or a TPM; a passphrase typed at a console is not practical for a remote host.\n- LUKS supports several **key slots**, so you can add a recovery passphrase and revoke an individual key without re-encrypting.\n- Back up the LUKS **header** (`cryptsetup luksHeaderBackup`) and store it separately. A damaged header makes the data permanently unreadable.\n- Encryption does not replace permissions. Once the volume is unlocked, every process sees plaintext."
+    },
+    {
+      "id": "fs-layers",
+      "type": "animation",
+      "kind": "layers",
+      "title": "Layers of filesystem protection",
+      "caption": "Each layer covers a failure the one above cannot.",
+      "data": {
+        "layers": [
+          {
+            "label": "Application data",
+            "sub": "files"
+          },
+          {
+            "label": "Permissions and ACLs",
+            "sub": "who"
+          },
+          {
+            "label": "Mount options",
+            "sub": "nosuid noexec nodev"
+          },
+          {
+            "label": "Attributes",
+            "sub": "chattr +i"
+          },
+          {
+            "label": "LUKS encryption",
+            "sub": "dm-crypt"
+          },
+          {
+            "label": "Physical disk",
+            "sub": "block device"
+          }
+        ],
+        "steps": [
+          {
+            "layer": 0,
+            "packet": [
+              "Data"
+            ],
+            "caption": "A service writes an uploaded file."
+          },
+          {
+            "layer": 1,
+            "packet": [
+              "Perm",
+              "Data"
+            ],
+            "caption": "Owner, group and mode limit which accounts can read or change it."
+          },
+          {
+            "layer": 2,
+            "packet": [
+              "Mount",
+              "Perm",
+              "Data"
+            ],
+            "caption": "The mount options stop it from running as a program or acting as a setuid file."
+          },
+          {
+            "layer": 3,
+            "packet": [
+              "Attr",
+              "Mount",
+              "Perm",
+              "Data"
+            ],
+            "caption": "Critical config files are made immutable so they cannot be replaced."
+          },
+          {
+            "layer": 4,
+            "packet": [
+              "LUKS",
+              "Attr",
+              "Mount",
+              "Perm",
+              "Data"
+            ],
+            "caption": "dm-crypt encrypts every block before it is written."
+          },
+          {
+            "layer": 5,
+            "packet": [
+              "Cipher"
+            ],
+            "caption": "On the disk only ciphertext exists, so a stolen drive reveals nothing without the key."
+          }
+        ]
+      }
+    },
+    {
+      "id": "links",
+      "type": "text",
+      "markdown": "## Links, quotas and shared directories\n\nSymbolic links are a classic way to trick a privileged program. If a root-run script writes to a predictable file in a directory that users can write to, a user can replace that file with a link to something sensitive, and root will follow it. Modern kernels reduce this with `fs.protected_symlinks=1` and `fs.protected_hardlinks=1`, which are enabled by default on most distributions. Verify them with `sysctl fs.protected_symlinks fs.protected_hardlinks`, and write scripts that create files with `mktemp` inside directories only root can write.\n\n**Disk quotas** limit how much space or how many inodes an account may use. They stop one user or one runaway upload feature from filling the volume. Where quotas are not practical, give uploads their own partition so that exhaustion stays contained. For shared team directories, combine a group, the setgid bit and a restrictive umask so files stay group-owned without becoming world-readable."
+    },
+    {
+      "id": "hygiene",
+      "type": "text",
+      "markdown": "## Everyday filesystem hygiene\n\nA few routine checks catch most issues:\n\n1. **Watch capacity.** A full disk is a denial of service and can stop logging. Alert at 80 percent with `df -h` and `df -i` (inodes).\n2. **Find strays.** Review world-writable files, orphaned files and unexpected setuid programs on a schedule, and diff each result against the last.\n3. **Protect temporary data.** Create temporary files with `mktemp`, never with predictable names in `/tmp`, to avoid symlink and race attacks.\n4. **Delete with intent.** On SSDs and journaled filesystems, `shred` is unreliable. Rely on encryption and destroy the key when retiring a volume.\n5. **Back up, then test restores.** A backup you have not restored is a hope, not a control. Pair it with immutable or offline copies for ransomware resilience.\n\nMandatory access controls add confinement above all of this. See [Linux Security Modules: AppArmor and SELinux](/learn/systems-infrastructure-security/linux-security-modules-apparmor-and-selinux)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Test fstab before rebooting",
+      "markdown": "A typo in `/etc/fstab` can drop the server into emergency mode at the next boot. After every edit, run `sudo findmnt --verify` and `sudo mount -a`, and only reboot once both are silent."
+    },
+    {
+      "id": "note",
+      "type": "callout",
+      "variant": "note",
+      "title": "noexec and package managers",
+      "markdown": "Some installers run scripts from `/tmp` and fail when it is `noexec`. Point them at another directory (for example `TMPDIR=/var/tmp/pkg`, or the `DPkg::Pre-Install-Pkgs` hooks documented for your distribution) instead of weakening the mount."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a test VM you own:\n\n1. Back up `/etc/fstab`, then mount `/tmp` with `nodev,nosuid,noexec` (a tmpfs line works well).\n2. Run `sudo findmnt --verify`, then `sudo mount -a`, then `findmnt -no OPTIONS /tmp`.\n3. Copy a harmless script into `/tmp`, mark it executable and confirm it will not run directly.\n4. Create `~/notes.txt`, run `sudo chattr +i ~/notes.txt`, and verify with `lsattr` that `rm` fails. Remove the attribute afterwards.\n5. Save the output of `find / -xdev -type f -perm -0002` as your baseline."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "nosuid",
+          "definition": "A mount option that ignores setuid and setgid bits on that filesystem."
+        },
+        {
+          "term": "noexec",
+          "definition": "A mount option that blocks direct execution of binaries from the filesystem."
+        },
+        {
+          "term": "nodev",
+          "definition": "A mount option that ignores device files on the filesystem."
+        },
+        {
+          "term": "fstab",
+          "definition": "The file /etc/fstab, which defines what is mounted at boot and with which options."
+        },
+        {
+          "term": "Immutable attribute",
+          "definition": "A chattr +i flag that prevents modification, deletion or renaming, even by root."
+        },
+        {
+          "term": "LUKS",
+          "definition": "The standard Linux disk encryption format, used with dm-crypt."
+        },
+        {
+          "term": "Key slot",
+          "definition": "One of several independent passphrases or keys that can unlock a LUKS volume."
+        },
+        {
+          "term": "Encryption at rest",
+          "definition": "Protecting stored data so that a stolen disk reveals only ciphertext."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which mount options are recommended for `/tmp`?",
+          "options": [
+            "nodev,nosuid,noexec",
+            "rw,suid,exec",
+            "ro only",
+            "sync,atime"
+          ],
+          "answer": 0,
+          "explanation": "Scratch space should neither run programs, honor setuid bits nor hold device files."
+        },
+        {
+          "question": "Why is `noexec` described as a speed bump rather than a wall?",
+          "options": [
+            "It slows the disk",
+            "An interpreter can still run a script passed to it",
+            "It only works on ext4",
+            "Root cannot be blocked"
+          ],
+          "answer": 1,
+          "explanation": "Running `sh /tmp/script` executes the interpreter from elsewhere, so noexec reduces risk but does not eliminate it."
+        },
+        {
+          "question": "Which actions help protect data if a server disk is stolen? (Choose all that apply.)",
+          "options": [
+            "LUKS encryption on data volumes",
+            "Backing up the LUKS header separately",
+            "chmod 600 on every file",
+            "Destroying keys when retiring a volume"
+          ],
+          "answer": [
+            0,
+            3
+          ],
+          "explanation": "Encryption and key destruction protect offline media. Permissions do not apply to a disk read elsewhere, and the header backup is for recovery, not theft protection."
+        },
+        {
+          "question": "What does `chattr +i` do?",
+          "options": [
+            "Encrypts the file",
+            "Makes the file immutable until the flag is cleared",
+            "Hides the file from ls",
+            "Compresses the file"
+          ],
+          "answer": 1,
+          "explanation": "An immutable file cannot be changed, deleted or renamed, even by root, until `chattr -i` is run."
+        },
+        {
+          "question": "What should you run after editing `/etc/fstab` and before rebooting?",
+          "options": [
+            "shred /etc/fstab",
+            "findmnt --verify and mount -a",
+            "chattr -i /",
+            "umount -a"
+          ],
+          "answer": 1,
+          "explanation": "These commands reveal syntax and device errors that could otherwise cause emergency mode at boot."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Permissions are only one layer. Mount options, attributes and encryption add independent protection.\n- Use separate partitions for `/tmp`, `/var/tmp`, `/home` and `/var/log` with `nodev`, `nosuid` and where practical `noexec`.\n- `chattr +i` and `+a` guard a few critical files, but they are tripwires, not boundaries.\n- LUKS protects data at rest; back up the header and plan unattended boot.\n- Audit capacity, world-writable files, orphaned files and setuid programs on a schedule, and always test restores.\n\nNext: [Linux Processes and Services](/learn/systems-infrastructure-security/linux-processes-and-services)."
+    }
+  ],
+  "ar": {
+    "title": "أمن نظام الملفات في Linux",
+    "summary": "حصّن تخزين Linux بالتقسيم وخيارات التركيب والسمات الثابتة وتشفير LUKS، ودقّق بحثًا عن الملفات الخطرة.",
+    "objectives": [
+      "اختر خيارات التركيب للأدلة الأساسية",
+      "استخدم السمات الثابتة وسمات الإلحاق فقط على نحو مناسب",
+      "اشرح كيف يحمي LUKS البيانات أثناء التخزين وما ينبغي نسخه احتياطيًا",
+      "دقّق بحثًا عن الملفات القابلة للكتابة من الجميع واليتيمة وملفات setuid"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يوفّر تطبيق ويب خاصية رفع ملفات. ثغرة فيه تتيح للمستخدم تخزين ملف في أي مكان تستطيع خدمة الويب الكتابة فيه. وتستطيع حساب الخدمة الكتابة في `/tmp`، كما يسمح `/tmp` بتنفيذ البرامج. وخلال دقائق يعمل سكربت وُضع هناك بصلاحيات الخدمة.\n\nلم يحتج ذلك إلى ثغرة في النواة، بل إلى نظام ملفات أكثر تساهلًا مما تتطلبه المهمة. أمن نظام الملفات هو ممارسة تشكيل **أين** تُخزَّن البيانات و**كيف** يُركَّب (Mount) كل موضع و**من** يستطيع حمايتها أو تشفيرها أو تغييرها. وبتّات الأذونات، التي يغطيها [المستخدمون والمجموعات والأذونات في Linux](/learn/systems-infrastructure-security/linux-users-groups-and-permissions)، هي الطبقة الأولى، ويضيف هذا الدرس بقية الطبقات."
+      },
+      {
+        "id": "layout",
+        "type": "text",
+        "markdown": "## الأقسام المنفصلة وخيارات التركيب\n\nيُجبر قسم `/` واحد كبير كل الأدلة على مشاركة مجموعة قواعد واحدة. وفصل المناطق الأساسية يتيح تطبيق خيارات تركيب أشد على كل منها. تُحدَّد الخيارات في `/etc/fstab` ويمكن اختبارها بالأمر `mount -o remount`.\n\n| نقطة التركيب | الخيارات الموصى بها | السبب |\n|:--|:--|:--|\n| `/tmp` | `nodev,nosuid,noexec` | مساحة العمل المؤقتة يجب ألا تشغّل برامج ولا تحوي ملفات أجهزة |\n| `/var/tmp` | `nodev,nosuid,noexec` | مثل `/tmp` لكنه يبقى بعد إعادة التشغيل |\n| `/home` | `nodev,nosuid` | بيانات المستخدمين يجب ألا تقدّم برامج setuid |\n| `/var` | `nodev,nosuid` | السجلات وبيانات الطوابير |\n| `/var/log` | `nodev,nosuid,noexec` | يحمي مسار التدقيق، وقرص السجلات الممتلئ لن يملأ `/` |\n| `/boot` | `nodev,nosuid,noexec` | نادرًا ما يُكتب فيه، ويُركَّب للقراءة فقط حيث أمكن |\n\nثلاثة خيارات تؤدي معظم العمل. يتجاهل `nosuid` بتّات setuid وsetgid، ويتجاهل `nodev` ملفات الأجهزة، ويمنع `noexec` التنفيذ المباشر للملفات التنفيذية. وتذكّر أن `noexec` مطب تبطيء لا جدار، لأن المفسّر (Interpreter) يستطيع تشغيل سكربت يُمرَّر إليه وسيطًا.\n\nكما تحصر الأقسام المنفصلة الأعطال. فحين يملأ سجل منفلت `/var/log` يبقى نظام الجذر سليمًا ويستمر النظام بالعمل."
+      },
+      {
+        "id": "fstab",
+        "type": "code",
+        "language": "ini",
+        "filename": "/etc/fstab",
+        "caption": "خيارات تركيب محصّنة على خادم نملكه (المعرّفات UUID عناصر نائبة).",
+        "code": "# <device>                   <mount>    <type> <options>                         <dump> <pass>\nUUID=aaaa-1111-example       /          ext4   defaults,errors=remount-ro        0 1\nUUID=bbbb-2222-example       /boot      ext4   defaults,nodev,nosuid,noexec      0 2\nUUID=cccc-3333-example       /home      ext4   defaults,nodev,nosuid             0 2\nUUID=dddd-4444-example       /var/log   ext4   defaults,nodev,nosuid,noexec      0 2\ntmpfs                        /tmp       tmpfs  defaults,nodev,nosuid,noexec,size=1g,mode=1777 0 0",
+        "highlight": [
+          3,
+          4,
+          5,
+          6
+        ]
+      },
+      {
+        "id": "mountterm",
+        "type": "terminal",
+        "title": "app01.example.com",
+        "prompt": "admin@app01:~$",
+        "lines": [
+          {
+            "cmd": "sudo mount -o remount /tmp && findmnt -no OPTIONS /tmp",
+            "output": "rw,nosuid,nodev,noexec,relatime,size=1048576k,mode=1777",
+            "comment": "أعد التركيب لتطبيق تغييرات fstab دون إعادة تشغيل ثم تأكّد من الخيارات الفعالة."
+          },
+          {
+            "cmd": "printf '#!/bin/sh\\necho hi\\n' > /tmp/t.sh && chmod +x /tmp/t.sh && /tmp/t.sh",
+            "output": "bash: /tmp/t.sh: Permission denied",
+            "comment": "يمنع noexec التنفيذ المباشر، وهذه هي النتيجة المتوقعة السليمة."
+          },
+          {
+            "cmd": "sudo find / -xdev -type f -perm -0002 2>/dev/null | head",
+            "output": "/srv/shared/upload.log",
+            "comment": "ملف عادي قابل للكتابة من الجميع. قرّر هل ينبغي أن يكون 660 مع مجموعة."
+          },
+          {
+            "cmd": "sudo find / -xdev -nouser -o -nogroup 2>/dev/null | head -n 3",
+            "output": "/home/olduser/.bash_history",
+            "comment": "ملفات لم يعد مالكها موجودًا، وهي بقايا حسابات محذوفة."
+          }
+        ]
+      },
+      {
+        "id": "attrs",
+        "type": "text",
+        "markdown": "## الملفات الثابتة والسمات\n\nفي ext4 وXFS تعمل **سمات** الملفات تحت بتّات الأذونات. أنفعها السمة **الثابتة (Immutable)** (`i`): فبعد ضبطها بالأمر `chattr +i` لا يستطيع حتى root تعديل الملف أو حذفه أو إعادة تسميته إلى أن تُزال السمة. وتسمح سمة **الإلحاق فقط (Append-only)** (`a`) بالكتابة في النهاية فقط، وهو مناسب لملفات السجلات.\n\n```\nsudo chattr +i /etc/resolv.conf     # lock a critical config\nlsattr /etc/resolv.conf             # ----i---------e------- /etc/resolv.conf\nsudo chattr -i /etc/resolv.conf     # unlock before a planned change\n```\n\nتعامل مع `chattr` كسلك تنبيه لعدد قليل من الملفات الحرجة لا كحدّ أمني، فالمهاجم الذي يملك root كاملًا يستطيع إزالة السمة. اقرنه بكشف التغيير من [مراقبة سلامة الملفات في Linux](/learn/systems-infrastructure-security/linux-file-integrity-monitoring)، وتذكّر فكّ القفل عن الملف قبل التغييرات المخططة وإلا فشلت الترقيات بطرق محيّرة."
+      },
+      {
+        "id": "crypto",
+        "type": "text",
+        "markdown": "## التشفير أثناء التخزين باستخدام LUKS\n\nتحمي الأذونات البيانات فقط ما دام نظام التشغيل شغّالًا ومسيطرًا. أما القرص المسروق أو المحرّك المُخرَج من الخدمة أو صورة الآلة الافتراضية المستنسخة فتتجاوزها كليًا. ويحمي **التشفير أثناء التخزين (Encryption at rest)** من ذلك. والمعيار في Linux هو **LUKS** (إعداد مفاتيح Linux الموحّد) باستخدام `dm-crypt`.\n\nالنقاط الأساسية:\n\n- شفّر وحدات البيانات والنسخ الاحتياطية والأقراص المحمولة. ويحتاج تشفير القرص الكامل على الخوادم إلى خطة للإقلاع دون تدخل، مثل خادم مفاتيح مرتبط بالشبكة أو وحدة TPM، فكتابة عبارة مرور على لوحة التحكم غير عملية لمضيف بعيد.\n- يدعم LUKS **خانات مفاتيح** متعددة، فتستطيع إضافة عبارة مرور للاسترداد وإلغاء مفتاح بعينه دون إعادة التشفير.\n- انسخ احتياطيًا **ترويسة** LUKS (`cryptsetup luksHeaderBackup`) واحفظها منفصلة. فتلف الترويسة يجعل البيانات غير مقروءة إلى الأبد.\n- التشفير لا يغني عن الأذونات، فحين تُفتح الوحدة ترى كل العمليات النص الصريح."
+      },
+      {
+        "id": "fs-layers",
+        "type": "animation",
+        "kind": "layers",
+        "title": "طبقات حماية نظام الملفات",
+        "caption": "كل طبقة تغطي إخفاقًا لا تستطيع الطبقة التي فوقها تغطيته.",
+        "data": {
+          "layers": [
+            {
+              "label": "بيانات التطبيق",
+              "sub": "files"
+            },
+            {
+              "label": "الأذونات وقوائم ACL",
+              "sub": "who"
+            },
+            {
+              "label": "خيارات التركيب",
+              "sub": "nosuid noexec nodev"
+            },
+            {
+              "label": "السمات",
+              "sub": "chattr +i"
+            },
+            {
+              "label": "تشفير LUKS",
+              "sub": "dm-crypt"
+            },
+            {
+              "label": "القرص الفعلي",
+              "sub": "block device"
+            }
+          ],
+          "steps": [
+            {
+              "layer": 0,
+              "packet": [
+                "Data"
+              ],
+              "caption": "تكتب خدمة ملفًا مرفوعًا."
+            },
+            {
+              "layer": 1,
+              "packet": [
+                "Perm",
+                "Data"
+              ],
+              "caption": "يحدّد المالك والمجموعة والنمط الحسابات التي تقرأ الملف أو تغيّره."
+            },
+            {
+              "layer": 2,
+              "packet": [
+                "Mount",
+                "Perm",
+                "Data"
+              ],
+              "caption": "تمنع خيارات التركيب تشغيله كبرنامج أو عمله كملف setuid."
+            },
+            {
+              "layer": 3,
+              "packet": [
+                "Attr",
+                "Mount",
+                "Perm",
+                "Data"
+              ],
+              "caption": "تُجعل ملفات الإعداد الحرجة ثابتة فلا يمكن استبدالها."
+            },
+            {
+              "layer": 4,
+              "packet": [
+                "LUKS",
+                "Attr",
+                "Mount",
+                "Perm",
+                "Data"
+              ],
+              "caption": "يشفّر dm-crypt كل كتلة قبل كتابتها."
+            },
+            {
+              "layer": 5,
+              "packet": [
+                "Cipher"
+              ],
+              "caption": "على القرص نص مشفّر فقط، فالقرص المسروق لا يكشف شيئًا دون المفتاح."
+            }
+          ]
+        }
+      },
+      {
+        "id": "links",
+        "type": "text",
+        "markdown": "## الروابط والحصص والأدلة المشتركة\n\nالروابط الرمزية طريقة كلاسيكية لخداع برنامج مميّز. فإن كتب سكربت يعمل بـ root إلى ملف متوقع الاسم في دليل يستطيع المستخدمون الكتابة فيه، يستطيع مستخدم استبدال الملف برابط يشير إلى شيء حساس فيتبعه root. تقلّل النوى الحديثة ذلك عبر `fs.protected_symlinks=1` و`fs.protected_hardlinks=1`، وهما مفعّلان افتراضيًا في معظم التوزيعات. تحقّق منهما بالأمر `sysctl fs.protected_symlinks fs.protected_hardlinks`، واكتب سكربتات تنشئ الملفات بـ `mktemp` داخل أدلة لا يكتب فيها إلا root.\n\nتحدّ **حصص القرص (Quotas)** من المساحة أو عدد العُقد التي يستخدمها الحساب. وهي تمنع مستخدمًا واحدًا أو خاصية رفع منفلتة من ملء الوحدة. وحيث لا تكون الحصص عملية، أعطِ الرفع قسمه الخاص فيبقى الاستنزاف محصورًا. وللأدلة المشتركة للفرق، اجمع بين المجموعة وبت setgid وقيمة umask مقيِّدة لتبقى الملفات مملوكة للمجموعة دون أن تصبح مقروءة للجميع."
+      },
+      {
+        "id": "hygiene",
+        "type": "text",
+        "markdown": "## نظافة نظام الملفات اليومية\n\nبضعة فحوص روتينية تلتقط معظم المشكلات:\n\n1. **راقب السعة.** القرص الممتلئ حجب للخدمة وقد يوقف التسجيل. نبّه عند 80 بالمئة باستخدام `df -h` و`df -i` (العُقد Inodes).\n2. **ابحث عن الشاذ.** راجع الملفات القابلة للكتابة من الجميع واليتيمة وبرامج setuid غير المتوقعة بجدول زمني، وقارن كل نتيجة بسابقتها.\n3. **احمِ البيانات المؤقتة.** أنشئ الملفات المؤقتة بالأمر `mktemp` لا بأسماء متوقعة في `/tmp` لتفادي هجمات الروابط الرمزية وسباق الوصول.\n4. **احذف بقصد.** على أقراص SSD وأنظمة الملفات ذات السجل لا يُعتمد على `shred`. اعتمد على التشفير وأتلف المفتاح عند إخراج الوحدة من الخدمة.\n5. **انسخ احتياطيًا ثم اختبر الاستعادة.** النسخة التي لم تُستعد أمنية لا ضابط. واقرنها بنسخ ثابتة أو غير متصلة لمقاومة برمجيات الفدية.\n\nوتضيف ضوابط الوصول الإلزامية عزلًا فوق كل هذا. راجع [وحدات أمن Linux: AppArmor وSELinux](/learn/systems-infrastructure-security/linux-security-modules-apparmor-and-selinux)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "اختبر fstab قبل إعادة التشغيل",
+        "markdown": "قد يُدخل خطأ مطبعي في `/etc/fstab` الخادم في وضع الطوارئ عند الإقلاع التالي. بعد كل تعديل نفّذ `sudo findmnt --verify` و`sudo mount -a` ولا تعد التشغيل إلا بعد أن يصمتا."
+      },
+      {
+        "id": "note",
+        "type": "callout",
+        "variant": "note",
+        "title": "noexec ومديرو الحزم",
+        "markdown": "تشغّل بعض المثبّتات سكربتات من `/tmp` وتفشل حين يكون `noexec`. وجّهها إلى دليل آخر (مثل `TMPDIR=/var/tmp/pkg`) بدل إضعاف خيارات التركيب."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة افتراضية تجريبية تملكها:\n\n1. انسخ `/etc/fstab` احتياطيًا ثم ركّب `/tmp` بالخيارات `nodev,nosuid,noexec` (يناسب ذلك سطر tmpfs).\n2. نفّذ `sudo findmnt --verify` ثم `sudo mount -a` ثم `findmnt -no OPTIONS /tmp`.\n3. انسخ سكربتًا غير ضار إلى `/tmp` واجعله قابلًا للتنفيذ وتأكّد أنه لا يعمل مباشرة.\n4. أنشئ `~/notes.txt` ونفّذ `sudo chattr +i ~/notes.txt` وتحقق بـ `lsattr` أن `rm` يفشل. ثم أزل السمة.\n5. احفظ مخرجات `find / -xdev -type f -perm -0002` كخط أساس."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "nosuid",
+            "definition": "خيار تركيب يتجاهل بتّات setuid وsetgid على نظام الملفات ذاك."
+          },
+          {
+            "term": "noexec",
+            "definition": "خيار تركيب يمنع التنفيذ المباشر للملفات التنفيذية من نظام الملفات."
+          },
+          {
+            "term": "nodev",
+            "definition": "خيار تركيب يتجاهل ملفات الأجهزة على نظام الملفات."
+          },
+          {
+            "term": "fstab",
+            "definition": "الملف /etc/fstab الذي يحدد ما يُركَّب عند الإقلاع وبأي خيارات."
+          },
+          {
+            "term": "السمة الثابتة",
+            "definition": "علم chattr +i الذي يمنع التعديل والحذف وإعادة التسمية حتى على root."
+          },
+          {
+            "term": "LUKS",
+            "definition": "صيغة تشفير الأقراص القياسية في Linux وتُستخدم مع dm-crypt."
+          },
+          {
+            "term": "خانة مفتاح",
+            "definition": "إحدى عدة عبارات مرور أو مفاتيح مستقلة تفتح وحدة LUKS."
+          },
+          {
+            "term": "التشفير أثناء التخزين",
+            "definition": "حماية البيانات المخزنة بحيث لا يكشف القرص المسروق إلا نصًا مشفّرًا."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما خيارات التركيب الموصى بها لـ `/tmp`؟",
+            "options": [
+              "nodev,nosuid,noexec",
+              "rw,suid,exec",
+              "ro فقط",
+              "sync,atime"
+            ],
+            "answer": 0,
+            "explanation": "المساحة المؤقتة يجب ألا تشغّل برامج ولا تحترم بتّات setuid ولا تحوي ملفات أجهزة."
+          },
+          {
+            "question": "لماذا يوصف `noexec` بأنه مطب تبطيء لا جدار؟",
+            "options": [
+              "يبطئ القرص",
+              "ما زال المفسّر يستطيع تشغيل سكربت يُمرَّر إليه",
+              "يعمل على ext4 فقط",
+              "لا يمكن حجب root"
+            ],
+            "answer": 1,
+            "explanation": "تشغيل `sh /tmp/script` ينفّذ المفسّر من مكان آخر، فيقلّل noexec الخطر ولا يلغيه."
+          },
+          {
+            "question": "أي الإجراءات تحمي البيانات إن سُرق قرص الخادم؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تشفير LUKS على وحدات البيانات",
+              "نسخ ترويسة LUKS احتياطيًا بشكل منفصل",
+              "chmod 600 على كل ملف",
+              "إتلاف المفاتيح عند إخراج الوحدة من الخدمة"
+            ],
+            "answer": [
+              0,
+              3
+            ],
+            "explanation": "التشفير وإتلاف المفاتيح يحميان الوسائط غير المتصلة. أما الأذونات فلا تنطبق على قرص يُقرأ في مكان آخر، ونسخة الترويسة للاسترداد لا للحماية من السرقة."
+          },
+          {
+            "question": "ماذا يفعل `chattr +i`؟",
+            "options": [
+              "يشفّر الملف",
+              "يجعل الملف ثابتًا إلى أن تُزال السمة",
+              "يخفي الملف عن ls",
+              "يضغط الملف"
+            ],
+            "answer": 1,
+            "explanation": "الملف الثابت لا يمكن تغييره أو حذفه أو إعادة تسميته حتى من root إلى أن يُنفَّذ `chattr -i`."
+          },
+          {
+            "question": "ما الذي ينبغي تنفيذه بعد تحرير `/etc/fstab` وقبل إعادة التشغيل؟",
+            "options": [
+              "shred /etc/fstab",
+              "findmnt --verify و mount -a",
+              "chattr -i /",
+              "umount -a"
+            ],
+            "answer": 1,
+            "explanation": "تكشف هذه الأوامر أخطاء الصياغة والأجهزة التي قد تُسبب وضع الطوارئ عند الإقلاع."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- الأذونات طبقة واحدة فقط. وتضيف خيارات التركيب والسمات والتشفير حماية مستقلة.\n- استخدم أقسامًا منفصلة لـ `/tmp` و`/var/tmp` و`/home` و`/var/log` مع `nodev` و`nosuid` وعند الإمكان `noexec`.\n- يحرس `chattr +i` و`+a` ملفات حرجة قليلة، لكنهما أسلاك تنبيه لا حدود.\n- يحمي LUKS البيانات أثناء التخزين؛ انسخ الترويسة احتياطيًا وخطط للإقلاع دون تدخل.\n- دقّق السعة والملفات القابلة للكتابة من الجميع واليتيمة وبرامج setuid بجدول زمني، واختبر الاستعادة دائمًا.\n\nالتالي: [العمليات والخدمات في Linux](/learn/systems-infrastructure-security/linux-processes-and-services)."
+      }
+    ]
+  }
+}

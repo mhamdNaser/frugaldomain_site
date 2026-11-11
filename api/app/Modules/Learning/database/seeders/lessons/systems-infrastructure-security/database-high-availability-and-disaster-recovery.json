@@ -1,0 +1,552 @@
+{
+ "slug": "database-high-availability-and-disaster-recovery",
+ "title": "Database High Availability and Disaster Recovery",
+ "summary": "Set RPO and RTO, design failover that prevents split brain, secure the cluster control plane, and prove recovery with tests.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Set RPO and RTO and choose an architecture",
+  "Prevent split brain with quorum, leases and fencing",
+  "Secure the HA control plane",
+  "Test failover and restores"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A company builds a three-node PostgreSQL cluster with automatic failover. During a network fault the cluster splits, both halves believe they are the primary, and the application writes to both. When the network heals there are two versions of the truth, and no automated way to merge them. The high availability design that was meant to protect the data corrupted it.\n\nHigh availability (HA) keeps the database running through a component failure. Disaster recovery (DR) restores it after a site-wide loss, an attack or a destructive mistake. Both are security controls, because availability and integrity are two thirds of the classic triad. In this lesson you will define recovery objectives, design a failover that cannot split the brain, secure the cluster's control plane, and test the whole thing."
+  },
+  {
+   "id": "objectives",
+   "type": "text",
+   "markdown": "## Start with RPO and RTO\n\nTwo numbers drive every design decision. The **recovery point objective (RPO)** is how much data you can afford to lose, measured in time. The **recovery time objective (RTO)** is how long the service may be down. Ask the business for them, then choose the architecture that meets them at an acceptable cost.\n\n| Design | Typical RPO | Typical RTO | Notes |\n|:--|:--|:--|:--|\n| Nightly backup only | Up to 24 hours | Hours | Cheapest; weak for busy systems |\n| Backup plus WAL archive | Seconds to minutes | Tens of minutes | Point-in-time recovery |\n| Async replica with failover | Seconds | Minutes | May lose the last transactions |\n| Sync replica with failover | Near zero | Minutes | Writes wait for the replica |\n| Multi-site cluster | Near zero | Seconds | Needs quorum and fencing |\n\nHA does not replace backups. A replica copies a mistaken `DELETE` or ransomware encryption within seconds. Backups protect against bad changes, replication protects against failed machines, and you need both."
+  },
+  {
+   "id": "failover-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Safe automatic failover",
+   "caption": "The old primary is fenced before a replica is promoted, so only one node can write.",
+   "data": {
+    "actors": [
+     {
+      "id": "dcs",
+      "label": "Consensus store",
+      "sub": "3 members",
+      "icon": "key"
+     },
+     {
+      "id": "old",
+      "label": "Old primary",
+      "sub": "10.40.1.11",
+      "icon": "server"
+     },
+     {
+      "id": "new",
+      "label": "Replica",
+      "sub": "10.40.1.12",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "from": "old",
+      "to": "dcs",
+      "label": "Renew leader key",
+      "detail": "TTL 30s",
+      "note": "The primary must keep renewing its lease to stay primary."
+     },
+     {
+      "from": "old",
+      "to": "old",
+      "label": "Network fault",
+      "tone": "danger",
+      "note": "The primary loses contact with the store and the other nodes."
+     },
+     {
+      "from": "old",
+      "to": "old",
+      "label": "Self-demote",
+      "detail": "lease expired",
+      "tone": "secure",
+      "note": "Without a lease it stops accepting writes by itself."
+     },
+     {
+      "from": "new",
+      "to": "dcs",
+      "label": "Acquire leader key",
+      "detail": "quorum 2 of 3",
+      "note": "The replica with the least lag wins the election with a quorum."
+     },
+     {
+      "from": "dcs",
+      "to": "new",
+      "label": "Lease granted",
+      "tone": "success",
+      "note": "Only one node can hold the lease at a time."
+     },
+     {
+      "from": "new",
+      "to": "new",
+      "label": "Promote",
+      "detail": "pg_ctl promote",
+      "tone": "success",
+      "note": "The replica becomes the new primary and applications reconnect."
+     }
+    ]
+   }
+  },
+  {
+   "id": "splitbrain",
+   "type": "text",
+   "markdown": "## Prevent split brain\n\nSplit brain happens when two nodes accept writes at once. It usually follows a network partition combined with a naive failover script. Three mechanisms prevent it:\n\n- **Quorum.** A node may become primary only if it can reach a majority of the cluster. With three members, a node cut off alone can never win.\n- **Leases.** The primary holds a time-limited lock. If it cannot renew, it demotes itself, as the animation shows.\n- **Fencing.** Before promotion, the cluster makes sure the old primary cannot write. Methods include shutting it down through a management API, removing its network access, or revoking its storage.\n\nAn even number of members is a trap. Two data centers with two nodes each cannot form a majority when the link between them fails. Use an odd number and place the third voter, which may be a small witness without data, in a third location. For general cluster quorum design see [High Availability and Quorum Security](/learn/systems-infrastructure-security/high-availability-and-quorum-security)."
+  },
+  {
+   "id": "controlplane",
+   "type": "text",
+   "markdown": "## Secure the cluster control plane\n\nHA tools such as Patroni, Pacemaker or Galera coordinate through a consensus store like etcd or Consul. Whoever can write to that store can decide which node is primary, so it deserves the protection of a certificate authority.\n\n- **Mutual TLS** between cluster members and the store, with certificates from your own CA.\n- **Authentication and RBAC** on the store, so the database nodes can write only their own keys.\n- **Network isolation.** The consensus ports and the Patroni REST API on port 8008 belong on the management network, as described in [Management Network Isolation](/learn/systems-infrastructure-security/management-network-isolation).\n- **Protect the failover API.** Switchover and restart endpoints should require authentication, because they can take the database down.\n\nThe configuration below shows the security-relevant parts of a Patroni node. Addresses use documentation ranges and secrets are placeholders."
+  },
+  {
+   "id": "patroni",
+   "type": "code",
+   "language": "bash",
+   "filename": "/etc/patroni/patroni.yml",
+   "caption": "Security-relevant Patroni settings (excerpt).",
+   "code": "scope: orders-db\nname: node1\nrestapi:\n  listen: 10.40.1.11:8008\n  connect_address: 10.40.1.11:8008\n  certfile: /etc/patroni/tls/node1.pem\n  keyfile: /etc/patroni/tls/node1.key\n  cafile: /etc/patroni/tls/ca.pem\n  verify_client: required\n  authentication:\n    username: patroni\n    password: <from-secrets-store>\netcd3:\n  hosts: etcd1.example.com:2379,etcd2.example.com:2379,etcd3.example.com:2379\n  protocol: https\n  cacert: /etc/patroni/tls/ca.pem\n  cert: /etc/patroni/tls/node1.pem\n  key: /etc/patroni/tls/node1.key\nbootstrap:\n  dcs:\n    ttl: 30\n    maximum_lag_on_failover: 1048576\n    synchronous_mode: true",
+   "highlight": [
+    4,
+    9,
+    10,
+    15,
+    16,
+    23
+   ]
+  },
+  {
+   "id": "ha-warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Replication copies mistakes and malware",
+   "markdown": "If an attacker drops a table or encrypts files, the replicas faithfully do the same within seconds. Keep immutable, separately credentialed backups and a WAL archive for point-in-time recovery, as described in [Database Backup Encryption](/learn/systems-infrastructure-security/database-backup-encryption). The backup account must not be usable from the database servers to delete old backups."
+  },
+  {
+   "id": "dr",
+   "type": "text",
+   "markdown": "## Design disaster recovery\n\nDisaster recovery assumes the primary site is gone or untrustworthy. A sound DR plan has five parts:\n\n1. **Off-site, encrypted backups** in a different failure and administrative domain, following the 3-2-1 idea: three copies, two media types, one off-site.\n2. **WAL or binary log archiving** so you can restore to a point just before the incident.\n3. **A documented rebuild path.** Infrastructure as code, hardened images and configuration management let you create a clean database host quickly. See [Disaster Recovery and Recovery Testing](/learn/systems-infrastructure-security/disaster-recovery-and-recovery-testing) for the platform-wide view.\n4. **Credential independence.** The DR site needs its own secrets and certificates. A DR plan that depends on the failed site's secret store fails with it.\n5. **Clear decision rights.** Decide who may declare a disaster and trigger failover, and how failback happens.\n\nDR sites are attractive targets because they are often less monitored. Apply the same hardening, logging and access control there."
+  },
+  {
+   "id": "dr-term",
+   "type": "terminal",
+   "title": "Checking HA and backup health (lab cluster)",
+   "lines": [
+    {
+     "cmd": "patronictl -c /etc/patroni/patroni.yml list",
+     "output": "+ Cluster: orders-db ---------+--------+---------+----+-----------+\n| Member | Host        | Role   | State   | TL | Lag in MB |\n+--------+-------------+--------+---------+----+-----------+\n| node1  | 10.40.1.11  | Leader | running |  7 |           |\n| node2  | 10.40.1.12  | Sync   | running |  7 |         0 |\n| node3  | 10.40.1.13  | Replica| running |  7 |         0 |\n+--------+-------------+--------+---------+----+-----------+",
+     "comment": "One leader, a synchronous standby and zero lag on the same timeline."
+    },
+    {
+     "cmd": "pgbackrest --stanza=orders info",
+     "output": "stanza: orders\n    status: ok\n    full backup: 20260301-020005F\n        timestamp start/stop: 2026-03-01 02:00:05 / 2026-03-01 02:14:41\n        repo1: backup size: 18.2GB\n    wal archive min/max: 000000070000000000000040/0000000700000000000000A9",
+     "comment": "A recent full backup and a continuous WAL archive allow point-in-time recovery."
+    }
+   ],
+   "caption": "Outputs are illustrative; verify the format against your tool versions."
+  },
+  {
+   "id": "testing",
+   "type": "text",
+   "markdown": "## Test failover and restore\n\nAn untested recovery plan is a hope. Schedule tests at three levels:\n\n- **Switchover drill.** Move leadership to another node during a quiet period and confirm applications reconnect. Time it against your RTO.\n- **Failure injection.** In a lab, stop the primary, cut its network, and fill its disk. Check that fencing works and that no two nodes accept writes.\n- **Full restore drill.** Restore the latest backup to an isolated host, replay WAL to a chosen time, and run integrity checks, as covered in [Database Backup Integrity and Recovery](/learn/systems-infrastructure-security/database-backup-integrity-and-recovery).\n\nRecord measured RPO and RTO after each test and compare them with the targets. Also include a security scenario: assume the primary is compromised and restore a clean copy elsewhere, then rotate every credential. This ties the exercise to [Database Incident Response](/learn/systems-infrastructure-security/database-incident-response)."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. In a lab with three VMs **you own**, set up a small PostgreSQL cluster (Patroni with etcd, or plain streaming replication) and write down your target RPO and RTO.\n2. Run `patronictl switchover` during a quiet moment and measure how long a test client takes to reconnect.\n3. Simulate a partition: block traffic between the leader and the other two nodes with the host firewall. Confirm the isolated leader stops accepting writes and a new leader is elected.\n4. Take a backup, drop a lab table, and restore to a point just before the drop on a separate VM. Note the time each step took and compare with your RTO."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "RPO",
+     "definition": "Recovery point objective: the maximum tolerable data loss, measured in time."
+    },
+    {
+     "term": "RTO",
+     "definition": "Recovery time objective: the maximum tolerable downtime."
+    },
+    {
+     "term": "Split brain",
+     "definition": "Two nodes accepting writes at once after a partition."
+    },
+    {
+     "term": "Quorum",
+     "definition": "A majority of members required to make cluster decisions."
+    },
+    {
+     "term": "Fencing",
+     "definition": "Making sure a failed node can no longer write before another takes over."
+    },
+    {
+     "term": "Lease",
+     "definition": "A time-limited lock that a leader must renew."
+    },
+    {
+     "term": "Point-in-time recovery",
+     "definition": "Restoring a backup and replaying logs to a chosen moment."
+    },
+    {
+     "term": "Switchover",
+     "definition": "A planned, controlled change of the primary node."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which statement best describes RPO?",
+     "options": [
+      "How long the service may be down",
+      "How much data loss, measured in time, is acceptable",
+      "How many replicas exist",
+      "How fast queries run"
+     ],
+     "answer": 1,
+     "explanation": "RPO is about data loss; RTO is about downtime."
+    },
+    {
+     "question": "Which mechanisms help prevent split brain? Choose all that apply.",
+     "options": [
+      "Quorum",
+      "Leader leases",
+      "Fencing the old primary",
+      "Using an even number of voters in two sites"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Quorum, leases and fencing ensure one writer. An even split across two sites can leave no majority."
+    },
+    {
+     "question": "Why are synchronous replicas not a substitute for backups?",
+     "options": [
+      "They are always slower",
+      "They also copy deletions and corruption",
+      "They cannot use TLS",
+      "They do not work with PostgreSQL"
+     ],
+     "answer": 1,
+     "explanation": "A replica applies a mistaken DELETE or encryption exactly as the primary did."
+    },
+    {
+     "question": "Why should the consensus store such as etcd use mutual TLS and RBAC?",
+     "options": [
+      "It stores query results",
+      "Whoever can write to it can influence which node is primary",
+      "It holds table data",
+      "It replaces backups"
+     ],
+     "answer": 1,
+     "explanation": "Control over the store means control over leadership and failover."
+    },
+    {
+     "question": "What makes a DR test most valuable?",
+     "options": [
+      "Reading the plan aloud",
+      "Restoring to an isolated host and measuring actual RPO and RTO",
+      "Counting the backups",
+      "Skipping integrity checks"
+     ],
+     "answer": 1,
+     "explanation": "Only a real restore with measured results shows whether targets are met."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Define RPO and RTO first, then pick an architecture that meets them.\n- Prevent split brain with quorum, leases and fencing, and use an odd number of voters across sites.\n- Protect the cluster control plane: mutual TLS, authentication and a management-network-only API.\n- Replication is not a backup; keep immutable, separately credentialed backups with WAL archiving.\n- Build the DR site with its own secrets and the same hardening, and prove it with switchover, failure and restore drills.\n\nThis completes the database security phase. Return to [Database Security Fundamentals](/learn/systems-infrastructure-security/database-security-fundamentals) to review how these controls fit together."
+  }
+ ],
+ "ar": {
+  "title": "التوافرية العالية لقواعد البيانات والتعافي من الكوارث",
+  "summary": "حدّد RPO وRTO، وصمّم تحويلًا احتياطيًّا يمنع انقسام الدماغ، وأمّن مستوى التحكم في العنقود، وأثبت التعافي بالاختبارات.",
+  "objectives": [
+   "تحديد RPO وRTO واختيار المعمارية",
+   "منع انقسام الدماغ بالنصاب والعقود والعزل",
+   "تأمين مستوى التحكم في التوافرية العالية",
+   "اختبار التحويل والاستعادة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "تبني شركة عنقودًا من ثلاث عقد لـ PostgreSQL مع تحويل احتياطي تلقائي. وأثناء عطل شبكي ينقسم العنقود، وتعتقد كل نصفية أنها الخادم الرئيسي، ويكتب التطبيق في النصفين. وحين تعود الشبكة توجد نسختان من الحقيقة ولا وسيلة آلية لدمجهما. فالتصميم الذي أُريد به حماية البيانات أفسدها.\n\nتُبقي التوافرية العالية (HA) قاعدة البيانات تعمل رغم عطل مكوّن. ويعيدها التعافي من الكوارث (DR) بعد فقدان موقع كامل أو هجوم أو خطأ مدمِّر. وكلاهما ضابط أمني، لأن التوافرية والسلامة ثلثا الثالوث الكلاسيكي. في هذا الدرس ستحدد أهداف التعافي، وتصمّم تحويلًا احتياطيًّا لا يسمح بانقسام الدماغ، وتؤمّن مستوى التحكم في العنقود، وتختبر المنظومة كلها."
+   },
+   {
+    "id": "objectives",
+    "type": "text",
+    "markdown": "## ابدأ بـ RPO وRTO\n\nيقود رقمان كل قرار تصميمي. **هدف نقطة التعافي (RPO)** هو مقدار البيانات الذي تحتمل خسارته، مقيسًا بالزمن. **وهدف زمن التعافي (RTO)** هو المدة التي يجوز أن تتوقف فيها الخدمة. اسأل العمل عنهما ثم اختر المعمارية التي تحققهما بكلفة مقبولة.\n\n| التصميم | RPO المعتاد | RTO المعتاد | ملاحظات |\n|:--|:--|:--|:--|\n| نسخة احتياطية ليلية فقط | حتى 24 ساعة | ساعات | الأرخص؛ ضعيف للأنظمة المزدحمة |\n| نسخة احتياطية مع أرشيف WAL | ثوانٍ إلى دقائق | عشرات الدقائق | استرداد إلى نقطة زمنية |\n| نسخة غير متزامنة مع تحويل | ثوانٍ | دقائق | قد تضيع آخر المعاملات |\n| نسخة متزامنة مع تحويل | قريب من الصفر | دقائق | تنتظر الكتابة النسخة |\n| عنقود متعدد المواقع | قريب من الصفر | ثوانٍ | يحتاج نصابًا وعزلًا |\n\nلا تحلّ التوافرية العالية محل النسخ الاحتياطية. فالنسخة المتماثلة تنسخ `DELETE` خاطئًا أو تشفير فدية خلال ثوانٍ. تحمي النسخ الاحتياطية من التغييرات السيئة، ويحمي النسخ المتماثل من تعطل الأجهزة، وتحتاج إلى الاثنين."
+   },
+   {
+    "id": "failover-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "تحويل احتياطي تلقائي آمن",
+    "caption": "يُعزل الخادم الرئيسي القديم قبل ترقية نسخة، فلا تكتب إلا عقدة واحدة.",
+    "data": {
+     "actors": [
+      {
+       "id": "dcs",
+       "label": "مخزن التوافق",
+       "sub": "3 members",
+       "icon": "key"
+      },
+      {
+       "id": "old",
+       "label": "الرئيسي القديم",
+       "sub": "10.40.1.11",
+       "icon": "server"
+      },
+      {
+       "id": "new",
+       "label": "النسخة",
+       "sub": "10.40.1.12",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "from": "old",
+       "to": "dcs",
+       "label": "Renew leader key",
+       "detail": "TTL 30s",
+       "note": "يجب أن يجدد الخادم الرئيسي عقده باستمرار ليبقى رئيسيًّا."
+      },
+      {
+       "from": "old",
+       "to": "old",
+       "label": "Network fault",
+       "tone": "danger",
+       "note": "يفقد الخادم الرئيسي الاتصال بالمخزن وبالعقد الأخرى."
+      },
+      {
+       "from": "old",
+       "to": "old",
+       "label": "Self-demote",
+       "detail": "lease expired",
+       "tone": "secure",
+       "note": "بلا عقد يتوقف من تلقاء نفسه عن قبول الكتابة."
+      },
+      {
+       "from": "new",
+       "to": "dcs",
+       "label": "Acquire leader key",
+       "detail": "quorum 2 of 3",
+       "note": "تفوز بالانتخاب النسخة الأقل تأخرًا بنصاب."
+      },
+      {
+       "from": "dcs",
+       "to": "new",
+       "label": "Lease granted",
+       "tone": "success",
+       "note": "لا تحمل العقد إلا عقدة واحدة في كل وقت."
+      },
+      {
+       "from": "new",
+       "to": "new",
+       "label": "Promote",
+       "detail": "pg_ctl promote",
+       "tone": "success",
+       "note": "تصير النسخة الخادم الرئيسي الجديد ويعيد التطبيق الاتصال."
+      }
+     ]
+    }
+   },
+   {
+    "id": "splitbrain",
+    "type": "text",
+    "markdown": "## امنع انقسام الدماغ\n\nيحدث انقسام الدماغ حين تقبل عقدتان الكتابة في وقت واحد. ويتبع عادةً انقسامًا في الشبكة مع سكربت تحويل ساذج. تمنعه ثلاث آليات:\n\n- **النصاب.** لا تصير العقدة رئيسية إلا إذا وصلت إلى أغلبية العنقود. ومع ثلاثة أعضاء لا تفوز عقدة انقطعت وحدها أبدًا.\n- **العقود الزمنية.** يحمل الخادم الرئيسي قفلًا محدود المدة. فإن عجز عن التجديد خفّض نفسه، كما يُظهر الرسم المتحرك.\n- **العزل (Fencing).** قبل الترقية يتأكد العنقود أن الخادم الرئيسي القديم لا يستطيع الكتابة. ومن الطرق إيقافه عبر واجهة إدارة، أو سحب وصوله الشبكي، أو سحب تخزينه.\n\nالعدد الزوجي من الأعضاء فخ. فمركزا بيانات في كل منهما عقدتان لا يشكلان أغلبية حين ينقطع الرابط بينهما. استخدم عددًا فرديًّا وضع المصوّت الثالث، وقد يكون شاهدًا صغيرًا بلا بيانات، في موقع ثالث. وللتصميم العام لنصاب العناقيد راجع درس [التوافرية العالية وأمن النصاب](/learn/systems-infrastructure-security/high-availability-and-quorum-security)."
+   },
+   {
+    "id": "controlplane",
+    "type": "text",
+    "markdown": "## أمّن مستوى التحكم في العنقود\n\nتنسّق أدوات التوافرية العالية مثل Patroni وPacemaker وGalera عبر مخزن توافق مثل etcd أو Consul. ومن يستطيع الكتابة في ذلك المخزن يقرر أي العقد رئيسية، فيستحق حماية مرجع شهادات.\n\n- **TLS المتبادل** بين أعضاء العنقود والمخزن بشهادات من مرجعك الخاص.\n- **المصادقة وRBAC** في المخزن بحيث لا تكتب عقد قاعدة البيانات إلا مفاتيحها.\n- **العزل الشبكي.** تنتمي منافذ التوافق وواجهة Patroni REST على المنفذ 8008 إلى شبكة الإدارة، كما في درس [عزل شبكة الإدارة](/learn/systems-infrastructure-security/management-network-isolation).\n- **احمِ واجهة التحويل.** يجب أن تتطلب نقاط التبديل وإعادة التشغيل مصادقة لأنها قد توقف قاعدة البيانات.\n\nيُظهر الإعداد أدناه الأجزاء المهمة أمنيًّا في عقدة Patroni. العناوين من نطاقات التوثيق والأسرار نائبة."
+   },
+   {
+    "id": "patroni",
+    "type": "code",
+    "language": "bash",
+    "filename": "/etc/patroni/patroni.yml",
+    "caption": "إعدادات Patroni المهمة أمنيًّا (مقتطف).",
+    "code": "scope: orders-db\nname: node1\nrestapi:\n  listen: 10.40.1.11:8008\n  connect_address: 10.40.1.11:8008\n  certfile: /etc/patroni/tls/node1.pem\n  keyfile: /etc/patroni/tls/node1.key\n  cafile: /etc/patroni/tls/ca.pem\n  verify_client: required\n  authentication:\n    username: patroni\n    password: <from-secrets-store>\netcd3:\n  hosts: etcd1.example.com:2379,etcd2.example.com:2379,etcd3.example.com:2379\n  protocol: https\n  cacert: /etc/patroni/tls/ca.pem\n  cert: /etc/patroni/tls/node1.pem\n  key: /etc/patroni/tls/node1.key\nbootstrap:\n  dcs:\n    ttl: 30\n    maximum_lag_on_failover: 1048576\n    synchronous_mode: true",
+    "highlight": [
+     4,
+     9,
+     10,
+     15,
+     16,
+     23
+    ]
+   },
+   {
+    "id": "ha-warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "النسخ المتماثل ينسخ الأخطاء والبرمجيات الخبيثة",
+    "markdown": "إذا حذف مهاجم جدولًا أو شفّر ملفات، فإن النسخ المتماثلة تفعل الأمر نفسه بأمانة خلال ثوانٍ. احتفظ بنسخ احتياطية غير قابلة للتغيير وببيانات اعتماد منفصلة وبأرشيف WAL للاسترداد إلى نقطة زمنية، كما في درس [تشفير النسخ الاحتياطية لقواعد البيانات](/learn/systems-infrastructure-security/database-backup-encryption). ويجب ألا يتمكن حساب النسخ الاحتياطي من خوادم قاعدة البيانات من حذف النسخ القديمة."
+   },
+   {
+    "id": "dr",
+    "type": "text",
+    "markdown": "## صمّم التعافي من الكوارث\n\nيفترض التعافي من الكوارث أن الموقع الرئيسي ضاع أو لم يعد موثوقًا. وللخطة السليمة خمسة أجزاء:\n\n1. **نسخ احتياطية مشفّرة خارج الموقع** في نطاق عطل ونطاق إداري مختلفين، وفق فكرة 3-2-1: ثلاث نسخ ووسيطان ونسخة خارج الموقع.\n2. **أرشفة WAL أو السجل الثنائي** لتستعيد إلى لحظة قبل الحادث مباشرة.\n3. **مسار إعادة بناء موثّق.** تتيح البنية كشيفرة وصور محصّنة وإدارة الإعدادات إنشاء مضيف قاعدة بيانات نظيف بسرعة. راجع درس [التعافي من الكوارث واختباره](/learn/systems-infrastructure-security/disaster-recovery-and-recovery-testing) للصورة الشاملة للمنصة.\n4. **استقلال بيانات الاعتماد.** يحتاج موقع التعافي إلى أسراره وشهاداته الخاصة. فخطة تعتمد على مخزن أسرار الموقع المنكوب تفشل معه.\n5. **حقوق قرار واضحة.** حدّد من يحق له إعلان الكارثة وبدء التحويل وكيف تجري العودة.\n\nمواقع التعافي أهداف جذابة لأنها غالبًا أقل مراقبة. طبّق فيها التحصين والتسجيل وضبط الوصول نفسها."
+   },
+   {
+    "id": "dr-term",
+    "type": "terminal",
+    "title": "Checking HA and backup health (lab cluster)",
+    "lines": [
+     {
+      "cmd": "patronictl -c /etc/patroni/patroni.yml list",
+      "output": "+ Cluster: orders-db ---------+--------+---------+----+-----------+\n| Member | Host        | Role   | State   | TL | Lag in MB |\n+--------+-------------+--------+---------+----+-----------+\n| node1  | 10.40.1.11  | Leader | running |  7 |           |\n| node2  | 10.40.1.12  | Sync   | running |  7 |         0 |\n| node3  | 10.40.1.13  | Replica| running |  7 |         0 |\n+--------+-------------+--------+---------+----+-----------+",
+      "comment": "قائد واحد ونسخة متزامنة وتأخر صفر على المسار الزمني نفسه."
+     },
+     {
+      "cmd": "pgbackrest --stanza=orders info",
+      "output": "stanza: orders\n    status: ok\n    full backup: 20260301-020005F\n        timestamp start/stop: 2026-03-01 02:00:05 / 2026-03-01 02:14:41\n        repo1: backup size: 18.2GB\n    wal archive min/max: 000000070000000000000040/0000000700000000000000A9",
+      "comment": "نسخة كاملة حديثة وأرشيف WAL متواصل يتيحان الاسترداد إلى نقطة زمنية."
+     }
+    ],
+    "caption": "المخرجات توضيحية؛ تحقق من الصيغة مع إصدارات أدواتك."
+   },
+   {
+    "id": "testing",
+    "type": "text",
+    "markdown": "## اختبر التحويل والاستعادة\n\nخطة التعافي التي لم تُختبر أمنية لا أكثر. جدول اختبارات على ثلاثة مستويات:\n\n- **تمرين التبديل.** انقل القيادة إلى عقدة أخرى في فترة هادئة وتأكد أن التطبيقات تعيد الاتصال. وقس الزمن مقابل RTO.\n- **حقن الأعطال.** في المختبر أوقف الخادم الرئيسي واقطع شبكته واملأ قرصه. تحقق أن العزل يعمل وأن عقدتين لا تقبلان الكتابة معًا.\n- **تمرين الاستعادة الكاملة.** استعد أحدث نسخة احتياطية على مضيف معزول، وأعد تشغيل WAL حتى وقت مختار، ونفّذ فحوص السلامة، كما في درس [سلامة النسخ الاحتياطية لقواعد البيانات والاسترداد](/learn/systems-infrastructure-security/database-backup-integrity-and-recovery).\n\nسجّل RPO وRTO المقيسين بعد كل اختبار وقارنهما بالأهداف. وضمّن سيناريو أمنيًّا: افترض أن الخادم الرئيسي مخترق، واستعد نسخة نظيفة في موضع آخر، ثم دوّر كل بيانات الاعتماد. وهذا يربط التمرين بدرس [الاستجابة لحوادث قواعد البيانات](/learn/systems-infrastructure-security/database-incident-response)."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. في مختبر من ثلاث آلات افتراضية **تملكها** أعدّ عنقود PostgreSQL صغيرًا (Patroni مع etcd أو نسخًا متدفقًا عاديًّا) ودوّن هدفي RPO وRTO.\n2. نفّذ `patronictl switchover` في لحظة هادئة وقس المدة التي يحتاجها عميل اختبار ليعيد الاتصال.\n3. حاكِ انقسامًا: احجب الحركة بين القائد والعقدتين الأخريين بجدار حماية المضيف. تأكد أن القائد المعزول يتوقف عن قبول الكتابة وأن قائدًا جديدًا يُنتخب.\n4. خذ نسخة احتياطية واحذف جدولًا مخبريًّا واستعد إلى نقطة قبل الحذف مباشرة على آلة منفصلة. دوّن زمن كل خطوة وقارنه بـ RTO."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "RPO",
+      "definition": "هدف نقطة التعافي: أقصى خسارة مقبولة للبيانات مقيسة بالزمن."
+     },
+     {
+      "term": "RTO",
+      "definition": "هدف زمن التعافي: أقصى توقف مقبول."
+     },
+     {
+      "term": "انقسام الدماغ",
+      "definition": "قبول عقدتين للكتابة معًا بعد انقسام الشبكة."
+     },
+     {
+      "term": "النصاب",
+      "definition": "أغلبية الأعضاء المطلوبة لاتخاذ قرارات العنقود."
+     },
+     {
+      "term": "العزل",
+      "definition": "التأكد أن العقدة المتعطلة لا تستطيع الكتابة قبل أن تتولى أخرى."
+     },
+     {
+      "term": "العقد الزمني",
+      "definition": "قفل محدود المدة يجب على القائد تجديده."
+     },
+     {
+      "term": "الاسترداد إلى نقطة زمنية",
+      "definition": "استعادة نسخة احتياطية وإعادة تشغيل السجلات إلى لحظة مختارة."
+     },
+     {
+      "term": "التبديل",
+      "definition": "تغيير مخطط ومضبوط للعقدة الرئيسية."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي عبارة تصف RPO على أفضل وجه؟",
+      "options": [
+       "المدة التي يجوز أن تتوقف فيها الخدمة",
+       "مقدار خسارة البيانات المقبول مقيسًا بالزمن",
+       "عدد النسخ المتماثلة",
+       "سرعة الاستعلامات"
+      ],
+      "answer": 1,
+      "explanation": "RPO عن خسارة البيانات؛ وRTO عن زمن التوقف."
+     },
+     {
+      "question": "أي الآليات تساعد على منع انقسام الدماغ؟ اختر كل ما ينطبق.",
+      "options": [
+       "النصاب",
+       "عقود القيادة",
+       "عزل الرئيسي القديم",
+       "استخدام عدد زوجي من المصوّتين في موقعين"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "النصاب والعقود والعزل تضمن كاتبًا واحدًا. أما التقسيم الزوجي بين موقعين فقد لا يترك أغلبية."
+     },
+     {
+      "question": "لماذا لا تغني النسخ المتزامنة عن النسخ الاحتياطية؟",
+      "options": [
+       "لأنها أبطأ دائمًا",
+       "لأنها تنسخ الحذف والتلف أيضًا",
+       "لأنها لا تدعم TLS",
+       "لأنها لا تعمل مع PostgreSQL"
+      ],
+      "answer": 1,
+      "explanation": "تطبّق النسخة DELETE خاطئًا أو تشفيرًا تمامًا كما فعل الخادم الرئيسي."
+     },
+     {
+      "question": "لماذا يجب أن يستخدم مخزن التوافق مثل etcd التشفير المتبادل وRBAC؟",
+      "options": [
+       "لأنه يخزن نتائج الاستعلامات",
+       "لأن من يكتب فيه يؤثر في العقدة الرئيسية",
+       "لأنه يحمل بيانات الجداول",
+       "لأنه يحل محل النسخ الاحتياطية"
+      ],
+      "answer": 1,
+      "explanation": "التحكم بالمخزن يعني التحكم بالقيادة والتحويل."
+     },
+     {
+      "question": "ما الذي يجعل اختبار DR أكثر قيمة؟",
+      "options": [
+       "قراءة الخطة بصوت عالٍ",
+       "الاستعادة على مضيف معزول وقياس RPO وRTO الفعليين",
+       "عدّ النسخ الاحتياطية",
+       "تخطي فحوص السلامة"
+      ],
+      "answer": 1,
+      "explanation": "الاستعادة الحقيقية بنتائج مقيسة وحدها تبيّن تحقق الأهداف."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- حدّد RPO وRTO أولًا ثم اختر المعمارية التي تحققهما.\n- امنع انقسام الدماغ بالنصاب والعقود والعزل، واستخدم عددًا فرديًّا من المصوّتين عبر المواقع.\n- احمِ مستوى التحكم في العنقود: TLS متبادل ومصادقة وواجهة لا تُتاح إلا في شبكة الإدارة.\n- النسخ المتماثل ليس نسخة احتياطية؛ احتفظ بنسخ غير قابلة للتغيير وببيانات اعتماد منفصلة مع أرشفة WAL.\n- ابنِ موقع التعافي بأسراره الخاصة وبالتحصين نفسه، وأثبته بتمارين التبديل والعطل والاستعادة.\n\nبهذا تكتمل مرحلة أمن قواعد البيانات. عد إلى [أساسيات أمن قواعد البيانات](/learn/systems-infrastructure-security/database-security-fundamentals) لتراجع كيف تتكامل هذه الضوابط."
+   }
+  ]
+ }
+}

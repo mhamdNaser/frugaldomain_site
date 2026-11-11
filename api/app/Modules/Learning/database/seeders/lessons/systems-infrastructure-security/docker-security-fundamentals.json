@@ -1,0 +1,616 @@
+{
+  "slug": "docker-security-fundamentals",
+  "title": "Docker Security Fundamentals",
+  "summary": "Learn what Docker containers really isolate, which defaults protect you, and which flags such as --privileged and the Docker socket mount remove that protection.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain how namespaces, cgroups and security filters make up a container",
+    "Compare the isolation of containers and virtual machines",
+    "Identify run options that weaken isolation",
+    "Run a container with least-privilege settings and verify them",
+    "Audit a Docker host for privileged containers and exposed sockets"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A developer asks you to approve a new service. It ships as a Docker image, runs with `--privileged` \"because the app needs it,\" and mounts `/var/run/docker.sock` \"for convenience.\" Two flags later, anyone who can exploit that application owns the host, and every other container on it.\n\nDocker is safe enough when you use it carefully and risky when you copy a command from a blog post. This lesson teaches the security model behind Docker, the defaults that protect you, and the options that quietly remove that protection. You will learn what to check on every host you administer."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## What a container really is\n\nA container is **not** a small virtual machine. It is an ordinary Linux process (or group of processes) that the kernel has fenced in with three features:\n\n- **Namespaces** limit what the process can see: its own process list, network stack, mount points and hostname.\n- **Control groups (cgroups)** limit what it can consume: CPU, memory, process count and disk I/O.\n- **Security filters** limit what it can do: capabilities, seccomp system call filters and AppArmor or SELinux profiles.\n\nAll containers on a host share **one kernel**. That is why they start in milliseconds, and it is also the central security trade-off. A kernel bug reachable from inside a container can affect the whole host.\n\n| Property | Virtual machine | Container |\n|:--|:--|:--|\n| Kernel | Its own guest kernel | Shared host kernel |\n| Boundary | Hypervisor and hardware virtualization | Namespaces, cgroups and filters |\n| Start time | Seconds to minutes | Milliseconds to seconds |\n| Attack surface | Hypervisor interface | Full system call interface |\n| Typical use | Strong separation between tenants | Packaging and density for trusted workloads |\n\nThe practical rule: containers separate **applications of the same trust level** well, but they are a weaker wall than a VM between **different trust levels**. Put hostile or unknown workloads in VMs. See [Virtual Machine Isolation](/learn/systems-infrastructure-security/virtual-machine-isolation) for the comparison."
+    },
+    {
+      "id": "parts",
+      "type": "text",
+      "markdown": "## The four places Docker can go wrong\n\nSecuring Docker means securing each layer of its architecture. Think of four areas:\n\n1. **The host and kernel.** Patch the kernel, keep the host minimal and enable AppArmor or SELinux. A weak host defeats every container setting.\n2. **The Docker daemon.** `dockerd` runs as root and accepts commands over a socket. Whoever can talk to that socket controls the machine. The next lessons, starting with [Docker Daemon Security](/learn/systems-infrastructure-security/docker-daemon-security), cover this in depth.\n3. **Images and registries.** An image is code you chose to run. Use trusted base images, pin versions and scan them. See [Container Image Vulnerability Scanning](/learn/systems-infrastructure-security/container-image-vulnerability-scanning).\n4. **Container configuration at run time.** Users, capabilities, mounts, networks and limits. This is where most real mistakes happen, and it is the focus of this lesson. Deeper detail follows in [Container Runtime Security](/learn/systems-infrastructure-security/container-runtime-security).\n\nThe animation shows what happens when someone runs a container, and where each control applies."
+    },
+    {
+      "id": "run-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "What happens when you run a container",
+      "caption": "Every control is applied by the runtime and the kernel, not by the application inside.",
+      "data": {
+        "actors": [
+          {
+            "id": "a",
+            "label": "Admin",
+            "sub": "docker CLI",
+            "icon": "user"
+          },
+          {
+            "id": "d",
+            "label": "dockerd",
+            "sub": "root daemon",
+            "icon": "server"
+          },
+          {
+            "id": "r",
+            "label": "runc",
+            "sub": "low-level runtime",
+            "icon": "cpu"
+          },
+          {
+            "id": "k",
+            "label": "Linux kernel",
+            "sub": "namespaces, cgroups",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "from": "a",
+            "to": "d",
+            "label": "docker run",
+            "detail": "--cap-drop ALL --read-only",
+            "note": "The CLI sends the request over /var/run/docker.sock. Anyone allowed to use this socket is effectively root."
+          },
+          {
+            "from": "d",
+            "to": "d",
+            "label": "Pull and verify image",
+            "tone": "secure",
+            "note": "The daemon fetches layers from the registry. This is where image trust and digests matter."
+          },
+          {
+            "from": "d",
+            "to": "r",
+            "label": "Create container spec",
+            "detail": "user, caps, mounts",
+            "note": "Your flags become a runtime specification: user ID, capability set, seccomp profile and mounts."
+          },
+          {
+            "from": "r",
+            "to": "k",
+            "label": "Create namespaces",
+            "detail": "pid, net, mnt, uts, ipc",
+            "tone": "secure",
+            "note": "The kernel gives the process its own view of processes, network and filesystem."
+          },
+          {
+            "from": "r",
+            "to": "k",
+            "label": "Apply cgroup limits",
+            "detail": "memory, pids, cpu",
+            "tone": "secure",
+            "note": "Resource limits stop one container from starving the host."
+          },
+          {
+            "from": "r",
+            "to": "k",
+            "label": "Drop caps, load seccomp",
+            "detail": "AppArmor profile",
+            "tone": "secure",
+            "note": "Capabilities are removed and unneeded system calls are blocked before the app starts."
+          },
+          {
+            "from": "k",
+            "to": "k",
+            "label": "Application starts as non-root",
+            "tone": "success",
+            "note": "The process runs with a minimal set of rights. A bug in the app now has less to abuse."
+          }
+        ]
+      }
+    },
+    {
+      "id": "defaults",
+      "type": "text",
+      "markdown": "## Secure defaults and the flags that undo them\n\nDocker's defaults are reasonable. Containers get their own namespaces, a default seccomp profile that blocks around 40 dangerous system calls, a reduced set of capabilities and (on Ubuntu and Debian) an AppArmor profile named `docker-default`. Most problems come from options that switch these protections off.\n\n| Option | What it does | Risk |\n|:--|:--|:--|\n| `--privileged` | Grants all capabilities, all devices, no seccomp or AppArmor | Near-total host access; treat as root on the host |\n| `-v /var/run/docker.sock:/var/run/docker.sock` | Gives the container control of the daemon | Container can start a privileged container and own the host |\n| `-v /:/host` or `-v /etc:/etc` | Mounts host paths | Reads or rewrites host files, including `/etc/shadow` |\n| `--pid=host`, `--net=host` | Shares host namespaces | Sees host processes, sniffs host traffic |\n| `--cap-add SYS_ADMIN` | Adds a very broad capability | Close to `--privileged` in effect |\n| `--security-opt seccomp=unconfined` | Disables the system call filter | Exposes the full kernel interface |\n| Running as UID 0 | Process is root inside the container | A single escape bug becomes root on the host |\n\nThe defensive approach is the reverse: start from nothing and add only what the application proves it needs.\n\n- Run as a **non-root user** with a fixed UID.\n- Use `--cap-drop ALL`, then add back one capability at a time.\n- Use `--read-only` and mount a small `tmpfs` where the app must write.\n- Add `--security-opt no-new-privileges` so setuid binaries cannot gain rights.\n- Set `--memory`, `--cpus` and `--pids-limit` so a runaway process cannot take down the host."
+    },
+    {
+      "id": "dockerfile",
+      "type": "code",
+      "language": "dockerfile",
+      "code": "# Pin the base image by version (use a digest in production)\nFROM docker.io/library/python:3.12-slim\n\n# Create an unprivileged user with a fixed UID\nRUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app\n\nWORKDIR /srv/app\nCOPY --chown=app:app requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY --chown=app:app . .\n\n# Drop root before the process starts\nUSER 10001:10001\nEXPOSE 8080\nCMD [\"python\", \"-m\", \"app\"]",
+      "filename": "Dockerfile",
+      "caption": "A Dockerfile that builds a non-root image. The `USER` line is the control that matters most."
+    },
+    {
+      "id": "run-term",
+      "type": "terminal",
+      "title": "Run and verify a hardened container",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "docker run -d --name web --user 10001:10001 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --memory 256m --pids-limit 100 -p 8080:8080 registry.example.com/team/webapp:1.4.2",
+          "output": "3f9c1d7a52b84e0c9a6d1f2e8b7c4a35d0e9f1b2c3a4d5e6f708192a3b4c5d6e",
+          "comment": "Every restriction is explicit. The image comes from a registry you control and uses a pinned tag."
+        },
+        {
+          "cmd": "docker inspect --format 'privileged={{.HostConfig.Privileged}} readonly={{.HostConfig.ReadonlyRootfs}} capdrop={{.HostConfig.CapDrop}} user={{.Config.User}}' web",
+          "output": "privileged=false readonly=true capdrop=[ALL] user=10001:10001",
+          "comment": "Inspect proves the settings are active. Do this in audits instead of trusting the run command."
+        },
+        {
+          "cmd": "docker exec web id",
+          "output": "uid=10001(app) gid=10001(app) groups=10001(app)",
+          "comment": "The process is not root inside the container."
+        },
+        {
+          "cmd": "docker exec web touch /srv/app/test",
+          "output": "touch: cannot touch '/srv/app/test': Read-only file system",
+          "comment": "The read-only root filesystem blocks writes, so a compromised app cannot drop files."
+        }
+      ],
+      "caption": "Launch with restrictions, then verify them from outside the container."
+    },
+    {
+      "id": "audit-term",
+      "type": "terminal",
+      "title": "Audit every running container on a host",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "docker ps -q | xargs docker inspect --format '{{.Name}} privileged={{.HostConfig.Privileged}} user={{.Config.User}} pid={{.HostConfig.PidMode}} net={{.HostConfig.NetworkMode}}'",
+          "output": "/web privileged=false user=10001:10001 pid= net=bridge\n/legacy-batch privileged=true user= pid= net=host",
+          "comment": "The second line is the finding: privileged, root user (empty means root) and the host network."
+        },
+        {
+          "cmd": "docker ps -q | xargs docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}}' | grep docker.sock",
+          "output": "/ci-runner /var/run/docker.sock",
+          "comment": "A container with the Docker socket is a host-level account. Review it first."
+        }
+      ],
+      "caption": "Two read-only commands that find the riskiest containers in seconds."
+    },
+    {
+      "id": "rootless",
+      "type": "text",
+      "markdown": "## Reducing the damage of a root daemon\n\nEven a well-configured container depends on a daemon that runs as root. Two features reduce that risk.\n\n- **Rootless mode** runs `dockerd` and the containers as an ordinary user. If an attacker escapes, they land as that user, not as root. The trade-offs are limits on low ports, some network drivers and certain storage options.\n- **User namespace remapping** (`userns-remap` in `/etc/docker/daemon.json`) keeps the daemon as root but maps root inside every container to a high, unprivileged UID on the host. A process that is root in the container has no special rights on the host files.\n\nNeither feature replaces the controls above. They are a second wall behind the first. Choose rootless mode for developer machines and CI runners, and consider remapping for shared servers where all containers can use it."
+    },
+    {
+      "id": "sock-warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "The docker group is root",
+      "markdown": "Adding a user to the `docker` group gives that user root-equivalent power. They can run `docker run -v /:/host` and edit any file. Treat membership like `sudo` access: grant it rarely, review it regularly, and consider rootless Docker for developers. A mounted Docker socket gives the same power to the container."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a Linux VM you own, with Docker installed:\n\n1. Run `docker run -d --name test1 docker.io/library/nginx:1.27` and inspect it. Note the values for `Privileged`, `CapDrop` and `User`.\n2. Re-run it as `test2` with `--cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /var/cache/nginx --tmpfs /run --security-opt no-new-privileges`, and find out which extra mounts nginx needs to start.\n3. Run the audit command from this lesson and confirm `test2` looks tighter than `test1`.\n4. Run `getent group docker` and list who has root-equivalent access to the host.\n5. Remove both containers with `docker rm -f test1 test2`."
+    },
+    {
+      "id": "kt",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Container",
+          "definition": "A process isolated by namespaces, cgroups and security filters on a shared kernel."
+        },
+        {
+          "term": "Image",
+          "definition": "A read-only template of layers from which containers start."
+        },
+        {
+          "term": "dockerd",
+          "definition": "The root daemon that builds, runs and manages containers."
+        },
+        {
+          "term": "Capability",
+          "definition": "A fine-grained slice of root power, such as binding low ports."
+        },
+        {
+          "term": "seccomp",
+          "definition": "A kernel filter that blocks chosen system calls."
+        },
+        {
+          "term": "--privileged",
+          "definition": "A flag that removes most isolation. Avoid it."
+        },
+        {
+          "term": "Docker socket",
+          "definition": "The control interface of the daemon; access equals root."
+        },
+        {
+          "term": "Least privilege",
+          "definition": "Granting only the rights a workload demonstrably needs."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main security difference between containers and virtual machines?",
+          "options": [
+            "Containers cannot use a firewall",
+            "Containers share the host kernel",
+            "Containers always run as root",
+            "Containers do not use memory limits"
+          ],
+          "answer": 1,
+          "explanation": "All containers use one kernel, so a kernel flaw reachable from one container can affect the host. A VM has its own guest kernel."
+        },
+        {
+          "question": "Which options weaken container isolation? (choose all that apply)",
+          "options": [
+            "`--privileged`",
+            "Mounting `/var/run/docker.sock`",
+            "`--cap-drop ALL`",
+            "`--pid=host`"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Privileged mode, the Docker socket and sharing the host PID namespace all expose the host. `--cap-drop ALL` removes rights and strengthens the container."
+        },
+        {
+          "question": "Why is membership in the `docker` group dangerous?",
+          "options": [
+            "It slows down the host",
+            "It disables logging",
+            "It allows starting containers that mount the host filesystem, which is root-equivalent",
+            "It only affects networking"
+          ],
+          "answer": 2,
+          "explanation": "A user who controls the daemon can run `docker run -v /:/host` and change any file, so the group must be treated like `sudo`."
+        },
+        {
+          "question": "Which command shows whether a running container is privileged?",
+          "options": [
+            "`docker images`",
+            "`docker version`",
+            "`docker network ls`",
+            "`docker inspect --format '{{.HostConfig.Privileged}}' NAME`"
+          ],
+          "answer": 3,
+          "explanation": "`docker inspect` reads the live configuration, which is the reliable source for audits."
+        },
+        {
+          "question": "What does `--read-only` achieve?",
+          "options": [
+            "It makes the root filesystem unwritable, limiting what a compromised app can change",
+            "It stops the container from reading files",
+            "It encrypts the image",
+            "It blocks network access"
+          ],
+          "answer": 0,
+          "explanation": "Attackers often need to write tools or scripts. A read-only root filesystem, plus a small `tmpfs` where needed, makes that harder."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nDocker containers are processes isolated by namespaces, cgroups and kernel filters, all sharing one host kernel. That makes them efficient, and it means a weak configuration or a kernel bug can reach the host. Defend in four places: the host, the daemon, the images and the run-time configuration.\n\nFor each container, run as a non-root user, drop all capabilities and add back only what is needed, use a read-only filesystem, set `no-new-privileges`, and apply resource limits. Avoid `--privileged`, host namespaces and mounted Docker sockets, and treat the `docker` group as root. Verify with `docker inspect` rather than trust. Next, learn how the kernel builds the walls in [Container Isolation and Namespaces](/learn/systems-infrastructure-security/container-isolation-and-namespaces)."
+    }
+  ],
+  "ar": {
+    "title": "أساسيات أمن Docker",
+    "summary": "تعرّف على ما تعزله حاويات Docker فعلًا، والإعدادات الافتراضية التي تحميك، والخيارات مثل --privileged وربط مقبس Docker التي تزيل هذه الحماية.",
+    "objectives": [
+      "اشرح كيف تتكوّن الحاوية من مساحات الأسماء وcgroups والمرشِّحات الأمنية",
+      "قارن بين عزل الحاويات وعزل الآلات الافتراضية",
+      "حدّد خيارات التشغيل التي تُضعف العزل",
+      "شغّل حاوية بأقل الامتيازات وتحقق من إعداداتها",
+      "دقّق مضيف Docker بحثًا عن حاويات privileged ومقابس مكشوفة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يطلب منك مطوّر الموافقة على خدمة جديدة. الخدمة مغلّفة في صورة Docker وتعمل بالخيار `--privileged` «لأن التطبيق يحتاج ذلك»، وتربط المقبس `/var/run/docker.sock` «للتسهيل». بعد خيارين فقط، يصبح كل من يستغل ثغرة في التطبيق مالكًا للمضيف (Host) ولكل الحاويات الأخرى عليه.\n\nيكون Docker آمنًا بدرجة كافية إذا استُخدم بعناية، ويصبح محفوفًا بالمخاطر إذا نُسخت أوامره من مقال عشوائي. يشرح هذا الدرس النموذج الأمني الذي يقوم عليه Docker، والإعدادات الافتراضية التي تحميك، والخيارات التي تزيل هذه الحماية بصمت. وستتعلّم ما ينبغي فحصه على كل مضيف تديره."
+      },
+      {
+        "id": "model",
+        "type": "text",
+        "markdown": "## ما هي الحاوية فعلًا\n\nالحاوية (Container) **ليست** آلة افتراضية صغيرة. إنها عملية عادية في Linux (أو مجموعة عمليات) تحيط بها النواة (Kernel) بثلاث ميزات:\n\n- **مساحات الأسماء (Namespaces)** تحدّ ممّا تراه العملية: قائمة عملياتها وشبكتها ونقاط التحميل واسم المضيف الخاصة بها.\n- **مجموعات التحكم (cgroups)** تحدّ ممّا تستهلكه: المعالج والذاكرة وعدد العمليات والإدخال/الإخراج للقرص.\n- **المرشِّحات الأمنية** تحدّ ممّا تستطيع فعله: الصلاحيات (Capabilities) ومرشِّحات استدعاءات النظام (seccomp) وملفات AppArmor أو SELinux.\n\nتشترك جميع الحاويات على المضيف في **نواة واحدة**. ولهذا تبدأ خلال أجزاء من الثانية، وهذا أيضًا هو جوهر المفاضلة الأمنية: فأي خلل في النواة يمكن بلوغه من داخل حاوية قد يؤثر في المضيف كله.\n\n| الخاصية | الآلة الافتراضية | الحاوية |\n|:--|:--|:--|\n| النواة | نواة ضيف خاصة بها | نواة المضيف المشتركة |\n| الحاجز | المشرف (Hypervisor) والمحاكاة العتادية | مساحات الأسماء وcgroups والمرشِّحات |\n| زمن البدء | ثوانٍ إلى دقائق | أجزاء من الثانية إلى ثوانٍ |\n| سطح الهجوم | واجهة المشرف | واجهة استدعاءات النظام بالكامل |\n| الاستخدام المعتاد | فصل قوي بين المستأجرين | التغليف والكثافة لأحمال عمل موثوقة |\n\nالقاعدة العملية: تفصل الحاويات **التطبيقات ذات مستوى الثقة الواحد** فصلًا جيدًا، لكنها جدار أضعف من الآلة الافتراضية بين **مستويات ثقة مختلفة**. ضع الأحمال العدائية أو المجهولة في آلات افتراضية. راجع [Virtual Machine Isolation](/learn/systems-infrastructure-security/virtual-machine-isolation) للمقارنة."
+      },
+      {
+        "id": "parts",
+        "type": "text",
+        "markdown": "## أربعة مواضع قد يخطئ فيها Docker\n\nتأمين Docker يعني تأمين كل طبقة من بنيته. فكّر في أربعة مجالات:\n\n1. **المضيف والنواة.** حدّث النواة، وأبقِ المضيف في حدّه الأدنى، وفعّل AppArmor أو SELinux. المضيف الضعيف يُبطل كل إعدادات الحاويات.\n2. **خدمة Docker الخلفية (daemon).** تعمل `dockerd` بصلاحيات الجذر (root) وتقبل الأوامر عبر مقبس. من يستطيع التحدث إلى هذا المقبس يتحكم بالجهاز. تتناول الدروس التالية هذا بعمق، بدءًا من [Docker Daemon Security](/learn/systems-infrastructure-security/docker-daemon-security).\n3. **الصور والسجلات.** الصورة شيفرة اخترت أن تشغّلها. استخدم صورًا أساسية موثوقة، وثبّت الإصدارات، وافحصها. راجع [Container Image Vulnerability Scanning](/learn/systems-infrastructure-security/container-image-vulnerability-scanning).\n4. **إعداد الحاوية وقت التشغيل.** المستخدمون والصلاحيات ونقاط التحميل والشبكات والحدود. هنا تقع معظم الأخطاء الحقيقية، وهو محور هذا الدرس. ويأتي مزيد من التفصيل في [Container Runtime Security](/learn/systems-infrastructure-security/container-runtime-security).\n\nيعرض الرسم المتحرك ما يحدث عند تشغيل حاوية، وأين تنطبق كل أداة ضبط."
+      },
+      {
+        "id": "run-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "ماذا يحدث عند تشغيل حاوية",
+        "caption": "تُطبَّق كل أداة ضبط بواسطة بيئة التشغيل والنواة، لا بواسطة التطبيق داخل الحاوية.",
+        "data": {
+          "actors": [
+            {
+              "id": "a",
+              "label": "المسؤول",
+              "sub": "docker CLI",
+              "icon": "user"
+            },
+            {
+              "id": "d",
+              "label": "dockerd",
+              "sub": "root daemon",
+              "icon": "server"
+            },
+            {
+              "id": "r",
+              "label": "runc",
+              "sub": "بيئة التشغيل منخفضة المستوى",
+              "icon": "cpu"
+            },
+            {
+              "id": "k",
+              "label": "نواة Linux",
+              "sub": "namespaces, cgroups",
+              "icon": "shield"
+            }
+          ],
+          "steps": [
+            {
+              "from": "a",
+              "to": "d",
+              "label": "docker run",
+              "detail": "--cap-drop ALL --read-only",
+              "note": "ترسل أداة سطر الأوامر الطلب عبر /var/run/docker.sock. كل من يُسمح له باستخدام هذا المقبس هو عمليًا root."
+            },
+            {
+              "from": "d",
+              "to": "d",
+              "label": "سحب الصورة والتحقق منها",
+              "tone": "secure",
+              "note": "تجلب الخدمة الطبقات من السجل. وهنا تبرز أهمية الثقة بالصورة وبصمتها (digest)."
+            },
+            {
+              "from": "d",
+              "to": "r",
+              "label": "إنشاء مواصفات الحاوية",
+              "detail": "user, caps, mounts",
+              "note": "تتحول خياراتك إلى مواصفات تشغيل: معرّف المستخدم ومجموعة الصلاحيات وملف seccomp ونقاط التحميل."
+            },
+            {
+              "from": "r",
+              "to": "k",
+              "label": "إنشاء مساحات الأسماء",
+              "detail": "pid, net, mnt, uts, ipc",
+              "tone": "secure",
+              "note": "تمنح النواة العملية رؤيتها الخاصة للعمليات والشبكة ونظام الملفات."
+            },
+            {
+              "from": "r",
+              "to": "k",
+              "label": "تطبيق حدود cgroup",
+              "detail": "memory, pids, cpu",
+              "tone": "secure",
+              "note": "تمنع حدود الموارد حاوية واحدة من إجهاد المضيف."
+            },
+            {
+              "from": "r",
+              "to": "k",
+              "label": "إسقاط الصلاحيات وتحميل seccomp",
+              "detail": "AppArmor profile",
+              "tone": "secure",
+              "note": "تُزال الصلاحيات وتُحجب استدعاءات النظام غير اللازمة قبل بدء التطبيق."
+            },
+            {
+              "from": "k",
+              "to": "k",
+              "label": "يبدأ التطبيق بمستخدم غير root",
+              "tone": "success",
+              "note": "تعمل العملية بأدنى مجموعة من الحقوق. فأي خلل في التطبيق يجد أقل ما يمكن استغلاله."
+            }
+          ]
+        }
+      },
+      {
+        "id": "defaults",
+        "type": "text",
+        "markdown": "## الإعدادات الافتراضية الآمنة والخيارات التي تلغيها\n\nإعدادات Docker الافتراضية معقولة. تحصل الحاويات على مساحات أسماء خاصة بها، وملف seccomp افتراضي يحجب نحو أربعين استدعاء نظام خطيرًا، ومجموعة مخفّضة من الصلاحيات، وعلى Ubuntu وDebian ملف AppArmor باسم `docker-default`. تنشأ معظم المشكلات من خيارات تعطّل هذه الحمايات.\n\n| الخيار | وظيفته | الخطر |\n|:--|:--|:--|\n| `--privileged` | يمنح كل الصلاحيات وكل الأجهزة ويلغي seccomp وAppArmor | وصول شبه كامل إلى المضيف؛ اعتبره root على المضيف |\n| `-v /var/run/docker.sock:/var/run/docker.sock` | يمنح الحاوية التحكم بالخدمة الخلفية | تستطيع الحاوية تشغيل حاوية ذات امتيازات والسيطرة على المضيف |\n| `-v /:/host` أو `-v /etc:/etc` | يربط مسارات المضيف | قراءة ملفات المضيف أو تعديلها، ومنها `/etc/shadow` |\n| `--pid=host` و`--net=host` | يشارك مساحات أسماء المضيف | ترى عمليات المضيف وتلتقط حركته الشبكية |\n| `--cap-add SYS_ADMIN` | يضيف صلاحية واسعة جدًا | قريب في أثره من `--privileged` |\n| `--security-opt seccomp=unconfined` | يعطّل مرشِّح استدعاءات النظام | يكشف واجهة النواة كاملة |\n| التشغيل بالمعرّف UID 0 | العملية root داخل الحاوية | ثغرة هروب واحدة تصبح root على المضيف |\n\nالنهج الدفاعي هو العكس: ابدأ من لا شيء، وأضف فقط ما يثبت التطبيق حاجته إليه.\n\n- شغّل بمستخدم **غير root** ومعرّف UID ثابت.\n- استخدم `--cap-drop ALL` ثم أعد إضافة صلاحية واحدة في كل مرة.\n- استخدم `--read-only` واربط `tmpfs` صغيرًا حيث يجب أن يكتب التطبيق.\n- أضف `--security-opt no-new-privileges` لمنع الملفات ذات setuid من اكتساب حقوق.\n- حدّد `--memory` و`--cpus` و`--pids-limit` حتى لا تُسقط عملية منفلتة المضيف."
+      },
+      {
+        "id": "dockerfile",
+        "type": "code",
+        "language": "dockerfile",
+        "code": "# Pin the base image by version (use a digest in production)\nFROM docker.io/library/python:3.12-slim\n\n# Create an unprivileged user with a fixed UID\nRUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app\n\nWORKDIR /srv/app\nCOPY --chown=app:app requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY --chown=app:app . .\n\n# Drop root before the process starts\nUSER 10001:10001\nEXPOSE 8080\nCMD [\"python\", \"-m\", \"app\"]",
+        "filename": "Dockerfile",
+        "caption": "ملف Dockerfile يبني صورة بمستخدم غير root. سطر `USER` هو أهم أداة ضبط فيه."
+      },
+      {
+        "id": "run-term",
+        "type": "terminal",
+        "title": "تشغيل حاوية مقيّدة والتحقق منها",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "docker run -d --name web --user 10001:10001 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --memory 256m --pids-limit 100 -p 8080:8080 registry.example.com/team/webapp:1.4.2",
+            "output": "3f9c1d7a52b84e0c9a6d1f2e8b7c4a35d0e9f1b2c3a4d5e6f708192a3b4c5d6e",
+            "comment": "كل قيد معلن صراحة. الصورة من سجل تتحكم به وبوسم مثبّت."
+          },
+          {
+            "cmd": "docker inspect --format 'privileged={{.HostConfig.Privileged}} readonly={{.HostConfig.ReadonlyRootfs}} capdrop={{.HostConfig.CapDrop}} user={{.Config.User}}' web",
+            "output": "privileged=false readonly=true capdrop=[ALL] user=10001:10001",
+            "comment": "يثبت الفحص أن الإعدادات فعّالة. افعل ذلك في التدقيق بدل الاعتماد على أمر التشغيل."
+          },
+          {
+            "cmd": "docker exec web id",
+            "output": "uid=10001(app) gid=10001(app) groups=10001(app)",
+            "comment": "العملية ليست root داخل الحاوية."
+          },
+          {
+            "cmd": "docker exec web touch /srv/app/test",
+            "output": "touch: cannot touch '/srv/app/test': Read-only file system",
+            "comment": "يمنع نظام الملفات الجذري للقراءة فقط الكتابة، فلا يستطيع تطبيق مخترَق إسقاط ملفات."
+          }
+        ],
+        "caption": "شغّل مع القيود ثم تحقق منها من خارج الحاوية."
+      },
+      {
+        "id": "audit-term",
+        "type": "terminal",
+        "title": "تدقيق كل الحاويات العاملة على مضيف",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "docker ps -q | xargs docker inspect --format '{{.Name}} privileged={{.HostConfig.Privileged}} user={{.Config.User}} pid={{.HostConfig.PidMode}} net={{.HostConfig.NetworkMode}}'",
+            "output": "/web privileged=false user=10001:10001 pid= net=bridge\n/legacy-batch privileged=true user= pid= net=host",
+            "comment": "السطر الثاني هو الملاحظة: حاوية privileged بمستخدم root (الفراغ يعني root) وعلى شبكة المضيف."
+          },
+          {
+            "cmd": "docker ps -q | xargs docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}}' | grep docker.sock",
+            "output": "/ci-runner /var/run/docker.sock",
+            "comment": "الحاوية التي تملك مقبس Docker هي حساب بمستوى المضيف. راجعها أولًا."
+          }
+        ],
+        "caption": "أمران للقراءة فقط يكشفان أخطر الحاويات في ثوانٍ."
+      },
+      {
+        "id": "rootless",
+        "type": "text",
+        "markdown": "## تقليل الضرر الناتج عن خدمة تعمل بصلاحيات root\n\nحتى الحاوية المضبوطة جيدًا تعتمد على خدمة خلفية تعمل بصلاحيات root. وهناك ميزتان تخفّفان هذا الخطر.\n\n- **الوضع بلا صلاحيات root (Rootless)** يشغّل `dockerd` والحاويات بمستخدم عادي. فإذا هرب المهاجم يصل بصفة ذلك المستخدم لا بصفة root. والمقابل قيود على المنافذ المنخفضة وبعض برامج تشغيل الشبكة وخيارات التخزين.\n- **إعادة ربط مساحة أسماء المستخدمين (User namespace remapping)** بالخيار `userns-remap` في `/etc/docker/daemon.json` تُبقي الخدمة بصلاحيات root لكنها تربط root داخل كل حاوية بمعرّف مستخدم عالٍ بلا امتيازات على المضيف. فالعملية التي هي root داخل الحاوية لا تملك حقوقًا خاصة على ملفات المضيف.\n\nلا تحلّ أي من الميزتين محل الضوابط السابقة؛ فهما جدار ثانٍ خلف الأول. اختر الوضع بلا root لأجهزة المطورين وعُقد التكامل المستمر (CI)، وفكّر في إعادة الربط للخوادم المشتركة التي تستطيع كل حاوياتها استخدامها."
+      },
+      {
+        "id": "sock-warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "مجموعة docker تعني root",
+        "markdown": "إضافة مستخدم إلى مجموعة `docker` تمنحه قوة تعادل root. يستطيع تنفيذ `docker run -v /:/host` وتعديل أي ملف. تعامل مع العضوية كما تتعامل مع صلاحية `sudo`: امنحها نادرًا وراجعها دوريًا، وفكّر في Docker بلا صلاحيات root (Rootless) للمطورين. وأي مقبس Docker مربوط داخل حاوية يمنحها القوة نفسها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة Linux افتراضية تملكها وفيها Docker:\n\n1. شغّل `docker run -d --name test1 docker.io/library/nginx:1.27` ثم افحصها. دوّن قيم `Privileged` و`CapDrop` و`User`.\n2. أعد تشغيلها باسم `test2` مع `--cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /var/cache/nginx --tmpfs /run --security-opt no-new-privileges`، واكتشف نقاط التحميل الإضافية التي يحتاجها nginx ليبدأ.\n3. نفّذ أمر التدقيق من هذا الدرس وتأكد أن `test2` أكثر إحكامًا من `test1`.\n4. نفّذ `getent group docker` واكتب قائمة من يملك وصولًا يعادل root إلى المضيف.\n5. احذف الحاويتين بالأمر `docker rm -f test1 test2`."
+      },
+      {
+        "id": "kt",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "الحاوية",
+            "definition": "عملية معزولة بمساحات الأسماء وcgroups والمرشِّحات الأمنية على نواة مشتركة."
+          },
+          {
+            "term": "الصورة",
+            "definition": "قالب للقراءة فقط من الطبقات تبدأ منه الحاويات."
+          },
+          {
+            "term": "dockerd",
+            "definition": "الخدمة الخلفية بصلاحيات root التي تبني الحاويات وتشغّلها وتديرها."
+          },
+          {
+            "term": "الصلاحية (Capability)",
+            "definition": "جزء دقيق من قوة root، مثل ربط المنافذ المنخفضة."
+          },
+          {
+            "term": "seccomp",
+            "definition": "مرشِّح في النواة يحجب استدعاءات نظام محددة."
+          },
+          {
+            "term": "--privileged",
+            "definition": "خيار يزيل معظم العزل. تجنّبه."
+          },
+          {
+            "term": "مقبس Docker",
+            "definition": "واجهة التحكم بالخدمة الخلفية؛ الوصول إليها يعادل root."
+          },
+          {
+            "term": "أقل امتياز",
+            "definition": "منح الحقوق التي يثبت أن حمل العمل يحتاجها فقط."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما الفرق الأمني الرئيس بين الحاويات والآلات الافتراضية؟",
+            "options": [
+              "لا تستطيع الحاويات استخدام جدار حماية",
+              "تشترك الحاويات في نواة المضيف",
+              "تعمل الحاويات دائمًا بصلاحيات root",
+              "لا تستخدم الحاويات حدودًا للذاكرة"
+            ],
+            "answer": 1,
+            "explanation": "تستخدم كل الحاويات نواة واحدة، فأي خلل في النواة يمكن بلوغه من حاوية قد يؤثر في المضيف. أما الآلة الافتراضية فلها نواة ضيف خاصة."
+          },
+          {
+            "question": "أي الخيارات تُضعف عزل الحاوية؟ (اختر كل ما ينطبق)",
+            "options": [
+              "`--privileged`",
+              "ربط `/var/run/docker.sock`",
+              "`--cap-drop ALL`",
+              "`--pid=host`"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "يكشف الوضع privileged ومقبس Docker ومشاركة مساحة أسماء العمليات للمضيف المضيفَ. أما `--cap-drop ALL` فيزيل الحقوق ويقوّي الحاوية."
+          },
+          {
+            "question": "لماذا تُعدّ العضوية في مجموعة `docker` خطرة؟",
+            "options": [
+              "تبطئ المضيف",
+              "تعطّل التسجيل",
+              "تتيح تشغيل حاويات تربط نظام ملفات المضيف، وهذا يعادل root",
+              "تؤثر في الشبكة فقط"
+            ],
+            "answer": 2,
+            "explanation": "المستخدم الذي يتحكم بالخدمة يستطيع تنفيذ `docker run -v /:/host` وتغيير أي ملف، لذا يجب التعامل مع المجموعة كما يُتعامل مع `sudo`."
+          },
+          {
+            "question": "أي أمر يوضح ما إذا كانت حاوية عاملة privileged؟",
+            "options": [
+              "`docker images`",
+              "`docker version`",
+              "`docker network ls`",
+              "`docker inspect --format '{{.HostConfig.Privileged}}' NAME`"
+            ],
+            "answer": 3,
+            "explanation": "يقرأ `docker inspect` الإعداد الفعلي، وهو المصدر الموثوق للتدقيق."
+          },
+          {
+            "question": "ماذا يحقق الخيار `--read-only`؟",
+            "options": [
+              "يجعل نظام الملفات الجذري غير قابل للكتابة، فيحدّ ما يستطيع تطبيق مخترَق تغييره",
+              "يمنع الحاوية من قراءة الملفات",
+              "يشفّر الصورة",
+              "يحجب الوصول إلى الشبكة"
+            ],
+            "answer": 0,
+            "explanation": "يحتاج المهاجمون غالبًا إلى كتابة أدوات أو سكربتات. نظام ملفات جذري للقراءة فقط مع `tmpfs` صغير عند الحاجة يجعل ذلك أصعب."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nحاويات Docker عمليات معزولة بمساحات الأسماء وcgroups ومرشِّحات النواة، وكلها تشترك في نواة مضيف واحدة. هذا يجعلها فعّالة، ويعني أن الإعداد الضعيف أو خللًا في النواة قد يبلغ المضيف. دافع في أربعة مواضع: المضيف والخدمة الخلفية والصور وإعداد التشغيل.\n\nلكل حاوية: شغّلها بمستخدم غير root، وأسقط كل الصلاحيات وأعد إضافة اللازم فقط، واستخدم نظام ملفات للقراءة فقط، وفعّل `no-new-privileges`، وطبّق حدود الموارد. تجنّب `--privileged` ومساحات أسماء المضيف ومقابس Docker المربوطة، وعامل مجموعة `docker` كأنها root. وتحقق بـ`docker inspect` بدل الاكتفاء بالثقة. والخطوة التالية أن تتعلم كيف تبني النواة هذه الجدران في [Container Isolation and Namespaces](/learn/systems-infrastructure-security/container-isolation-and-namespaces)."
+      }
+    ]
+  }
+}

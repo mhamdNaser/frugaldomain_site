@@ -1,0 +1,578 @@
+{
+ "slug": "vlan-security-and-inter-vlan-filtering",
+ "title": "VLAN Security and Inter-VLAN Filtering",
+ "summary": "Harden switch ports and trunks against VLAN hopping, and filter traffic between VLANs with ACLs.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain access ports, trunks and the native VLAN",
+  "Close switch spoofing and double tagging with configuration",
+  "Write an inbound ACL on an SVI to filter inter-VLAN traffic",
+  "Carry VLANs to a hypervisor safely"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "A new contractor plugs a laptop into a wall port in the meeting room. The port sits in the same VLAN as the file server, because nobody changed the default. The contractor now sees the server on the local segment, with no firewall in between.\n\nVLANs are the main tool for splitting one physical switch into several logical networks. They do not secure anything by themselves, though. A VLAN is a **boundary**, and a boundary is only useful when you control who can cross it. This lesson shows how to harden the switch side, how to filter traffic between VLANs, and how to carry VLANs safely to a hypervisor."
+  },
+  {
+   "type": "text",
+   "id": "basics",
+   "markdown": "## 1. How VLANs separate traffic\n\nAn access port belongs to exactly one VLAN and sends frames **untagged**. A trunk port carries many VLANs between switches or to a server, and each frame gets an IEEE 802.1Q tag with the VLAN ID (1 to 4094). One VLAN on a trunk is the **native VLAN**, and its frames travel untagged.\n\nHosts in different VLANs cannot talk at layer 2. To talk, their traffic must pass a layer 3 device: a router, a layer 3 switch (through a switched virtual interface, SVI) or a firewall. That layer 3 hop is where you apply filtering. Without it, VLANs only separate broadcasts.\n\n| Port type | Carries | Tagged | Typical use |\n|:--|:--|:--|:--|\n| Access | One VLAN | No | Desktop, printer, camera |\n| Trunk | Many VLANs | Yes (except native) | Switch uplink, hypervisor |\n| Voice access | Data plus voice VLAN | Voice only | IP phone with a PC behind it |"
+  },
+  {
+   "type": "text",
+   "id": "threats",
+   "markdown": "## 2. Understand the two classic weaknesses\n\nAttackers who reach a switch port try to jump to another VLAN. Know the two methods so you can close both. This is a defensive overview, with no attack procedure.\n\n- **Switch spoofing.** A port left in dynamic mode may negotiate a trunk through Dynamic Trunking Protocol (DTP). If a device convinces the port to become a trunk, it can reach every allowed VLAN.\n- **Double tagging.** A frame carries two tags. The first switch strips the outer tag, which matches the native VLAN, and forwards the inner tag to a different VLAN. It works only in one direction and only when the attacker's port sits in the native VLAN.\n\nBoth depend on **defaults**: dynamic ports, VLAN 1 as the native VLAN and unused ports left enabled. The defenses are therefore plain configuration hygiene."
+  },
+  {
+   "type": "code",
+   "id": "hard",
+   "language": "cisco",
+   "filename": "switch-hardening.cfg",
+   "code": "! Access port: fixed mode, no negotiation\ninterface GigabitEthernet1/0/10\n description Meeting-room wall port\n switchport mode access\n switchport access vlan 20\n switchport nonegotiate\n spanning-tree portfast\n spanning-tree bpduguard enable\n!\n! Trunk to hypervisor: explicit, pruned, non-default native VLAN\ninterface GigabitEthernet1/0/48\n description Uplink to pve01\n switchport trunk encapsulation dot1q\n switchport mode trunk\n switchport nonegotiate\n switchport trunk native vlan 999\n switchport trunk allowed vlan 20,30,99\n!\n! Unused ports: parked and shut down\ninterface range GigabitEthernet1/0/30 - 40\n switchport mode access\n switchport access vlan 999\n shutdown\n!\nvlan 999\n name PARKING-NO-ROUTE",
+   "caption": "Replace VLAN 1 as native, prune the trunk and park unused ports in a VLAN with no SVI."
+  },
+  {
+   "type": "callout",
+   "id": "c-trunk",
+   "variant": "note",
+   "title": "Command order matters",
+   "markdown": "On many Catalyst models, `switchport trunk encapsulation dot1q` must come **before** `switchport mode trunk`. Newer models support only 802.1Q and reject the encapsulation command, so omit it there."
+  },
+  {
+   "type": "text",
+   "id": "filter",
+   "markdown": "## 3. Filter between VLANs\n\nOnce traffic must cross layer 3, write a policy. The rule of thumb is simple: users reach services, services never reach users, and nothing reaches management.\n\nOn a layer 3 switch, apply an extended ACL **inbound** on the SVI of the source VLAN. Inbound filtering stops unwanted traffic before it consumes routing resources. A stateful firewall is better when you need connection tracking, logging or application inspection, but ACLs on the SVI are a cheap and effective first layer.\n\nPlan the rules in this order:\n\n1. Permit established replies, or let a stateful device handle them.\n2. Permit the specific services each VLAN needs (DNS, HTTPS, the database port).\n3. Deny and log everything else toward other internal ranges.\n4. Permit internet access last, so the deny above wins for internal destinations."
+  },
+  {
+   "type": "code",
+   "id": "acl",
+   "language": "cisco",
+   "filename": "inter-vlan-acl.cfg",
+   "code": "ip access-list extended USERS-IN\n 10 permit udp 10.20.0.0 0.0.0.255 host 10.99.0.53 eq domain\n 20 permit tcp 10.20.0.0 0.0.0.255 host 10.30.0.10 eq 443\n 30 permit tcp 10.20.0.0 0.0.0.255 host 10.30.0.20 eq 5432\n 40 deny   ip 10.20.0.0 0.0.0.255 10.0.0.0 0.255.255.255 log\n 50 permit ip 10.20.0.0 0.0.0.255 any\n!\ninterface Vlan20\n description Users\n ip address 10.20.0.1 255.255.255.0\n ip access-group USERS-IN in",
+   "caption": "Users reach DNS, the web app and the database; every other internal destination is denied and logged."
+  },
+  {
+   "type": "animation",
+   "id": "seq-anim",
+   "kind": "sequence",
+   "title": "Inter-VLAN traffic meets the ACL",
+   "caption": "The SVI is the enforcement point: allowed flows pass, the rest are logged.",
+   "data": {
+    "actors": [
+     {
+      "id": "pc",
+      "label": "User PC",
+      "sub": "10.20.0.15 VLAN 20",
+      "icon": "laptop"
+     },
+     {
+      "id": "svi",
+      "label": "Layer 3 switch",
+      "sub": "Vlan20 ACL in",
+      "icon": "switch"
+     },
+     {
+      "id": "app",
+      "label": "Web app",
+      "sub": "10.30.0.10 VLAN 30",
+      "icon": "server"
+     },
+     {
+      "id": "mgmt",
+      "label": "Hypervisor",
+      "sub": "10.99.0.5 VLAN 99",
+      "icon": "cpu"
+     }
+    ],
+    "steps": [
+     {
+      "from": "pc",
+      "to": "svi",
+      "label": "TCP/443 to 10.30.0.10",
+      "note": "The PC sends HTTPS to its default gateway, the SVI."
+     },
+     {
+      "from": "svi",
+      "to": "svi",
+      "label": "ACL line 20 matches",
+      "tone": "success",
+      "note": "The packet is permitted."
+     },
+     {
+      "from": "svi",
+      "to": "app",
+      "label": "Routed into VLAN 30",
+      "note": "The frame is re-tagged for VLAN 30."
+     },
+     {
+      "from": "pc",
+      "to": "svi",
+      "label": "TCP/8006 to 10.99.0.5",
+      "note": "The same PC probes the hypervisor web interface."
+     },
+     {
+      "from": "svi",
+      "to": "svi",
+      "label": "ACL line 40 matches",
+      "tone": "blocked",
+      "note": "Denied and logged. The hypervisor never sees it."
+     },
+     {
+      "from": "svi",
+      "to": "pc",
+      "label": "No reply",
+      "tone": "danger",
+      "note": "The user sees a timeout, and the log entry alerts the admin."
+     }
+    ]
+   }
+  },
+  {
+   "type": "terminal",
+   "id": "verify",
+   "title": "Verify on the switch",
+   "prompt": "SW1#",
+   "lines": [
+    {
+     "cmd": "show interfaces trunk",
+     "output": "Port      Mode  Encapsulation  Status    Native vlan\nGi1/0/48  on    802.1q         trunking  999\nPort      Vlans allowed on trunk\nGi1/0/48  20,30,99",
+     "comment": "Native VLAN is 999 and only three VLANs are allowed"
+    },
+    {
+     "cmd": "show ip access-lists USERS-IN",
+     "output": "Extended IP access list USERS-IN\n    10 permit udp 10.20.0.0 0.0.0.255 host 10.99.0.53 eq domain (412 matches)\n    20 permit tcp 10.20.0.0 0.0.0.255 host 10.30.0.10 eq 443 (1873 matches)\n    40 deny ip 10.20.0.0 0.0.0.255 10.0.0.0 0.255.255.255 log (6 matches)",
+     "comment": "Six denied attempts: investigate the sources"
+    }
+   ],
+   "caption": "Match counters prove the ACL is in use. Zero matches on a deny line means nothing has tried it yet."
+  },
+  {
+   "type": "text",
+   "id": "extra",
+   "markdown": "## 4. Go beyond basic VLANs\n\n**Private VLANs (PVLANs)** isolate hosts inside the same subnet. In a DMZ with ten web servers, there is rarely a reason for one server to talk to another. Put servers in *isolated* ports that reach only the *promiscuous* port of the gateway, and a compromised web server cannot attack its neighbors.\n\n**Hypervisors.** On Proxmox VE, enable VLAN awareness on the bridge and tag each VM network interface instead of creating a bridge per VLAN. Then turn on the Proxmox firewall at the datacenter, host and VM level, because inter-VLAN filtering on the physical switch does not see two VMs on the same VLAN. Restrict the trunk to the VLANs that host actually needs.\n\n**Port security and 802.1X.** Limit the number of MAC addresses per access port, or better, authenticate the device first, as described in [Network Access and Identity Management](/learn/systems-infrastructure-security/network-access-and-identity-management). Design the overall zones first, using [Network Security Architecture](/learn/systems-infrastructure-security/network-security-architecture), and only then draw the VLANs."
+  },
+  {
+   "type": "text",
+   "id": "ops",
+   "markdown": "## 5. Operate and review the design\n\nA secure VLAN design decays unless you maintain it. Build three routines into your calendar.\n\n- **Audit the switches monthly.** Export every configuration and search for ports still in dynamic mode, trunks that allow all VLANs and ports in VLAN 1. A short script that greps `show running-config` output catches most drift.\n- **Review denied traffic weekly.** The `log` entries on your deny lines show who is probing. Repeated attempts from one user VLAN toward the management VLAN deserve a conversation with the owner of that device.\n- **Test after every change.** Before closing a change ticket, run the expected-to-pass and expected-to-fail checks. A new VLAN added to a trunk without a matching ACL is a common cause of silent exposure.\n\nName VLANs by purpose, not by number alone, for example `USERS`, `SERVERS` and `MGMT`. Clear names make reviews faster and mistakes visible. Keep the VLAN-to-subnet map in the same document as your flow matrix, so the people who read one read the other.\n\nRemember what a VLAN cannot do. It does not encrypt traffic, and it does not stop an attacker who already controls a host inside the VLAN. It reduces exposure; it does not remove the need for host firewalls, patching and monitoring."
+  },
+  {
+   "type": "callout",
+   "id": "c-vlan1",
+   "variant": "warning",
+   "title": "Do not trust VLAN 1",
+   "markdown": "VLAN 1 carries control protocols such as CDP and spanning tree by default. Never place users or servers in it, and never use it as the native VLAN. Park unused ports in a dead-end VLAN with no SVI instead."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab you own (Packet Tracer, GNS3 or two spare switches):\n\n1. Create VLANs 20 and 30 and put one host in each.\n2. Configure SVIs and confirm the hosts can ping each other.\n3. Apply an ACL that permits only TCP/443 from VLAN 20 to VLAN 30, then retest the ping.\n4. Run `show ip access-lists` and note which counters increased.\n5. Run `show interfaces trunk` and change the native VLAN to an unused ID.\n\nExplain why the ping now fails but HTTPS works."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "VLAN",
+     "definition": "A logical layer 2 network created on a switch."
+    },
+    {
+     "term": "Trunk",
+     "definition": "A port carrying several VLANs with 802.1Q tags."
+    },
+    {
+     "term": "Native VLAN",
+     "definition": "The VLAN whose frames cross a trunk untagged."
+    },
+    {
+     "term": "DTP",
+     "definition": "Cisco protocol that negotiates trunking automatically."
+    },
+    {
+     "term": "SVI",
+     "definition": "Virtual layer 3 interface for a VLAN on a switch."
+    },
+    {
+     "term": "Double tagging",
+     "definition": "Sending a frame with two 802.1Q tags to reach another VLAN."
+    },
+    {
+     "term": "Private VLAN",
+     "definition": "A feature that isolates hosts inside one subnet."
+    },
+    {
+     "term": "BPDU guard",
+     "definition": "Disables an edge port that receives spanning-tree messages."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Where should you apply filtering between two VLANs?",
+     "options": [
+      "On the access port only",
+      "At the layer 3 device that routes between them",
+      "On the DNS server",
+      "In the VLAN database"
+     ],
+     "answer": 1,
+     "explanation": "VLANs only meet at layer 3, so that hop is the enforcement point."
+    },
+    {
+     "question": "Select all configuration steps that reduce VLAN hopping risk.",
+     "options": [
+      "switchport nonegotiate on trunks",
+      "Using VLAN 1 as native",
+      "Setting a non-default native VLAN",
+      "Shutting down unused ports"
+     ],
+     "answer": [
+      0,
+      2,
+      3
+     ],
+     "explanation": "Disable negotiation, change the native VLAN and disable unused ports. VLAN 1 as native is the weak default."
+    },
+    {
+     "question": "What does double tagging depend on?",
+     "options": [
+      "A port in the native VLAN",
+      "A trunk with encryption",
+      "An ACL permitting any",
+      "A private VLAN"
+     ],
+     "answer": 0,
+     "explanation": "The outer tag must match the native VLAN so the first switch strips it."
+    },
+    {
+     "question": "Why add `log` to a deny line in an inter-VLAN ACL?",
+     "options": [
+      "It speeds up routing",
+      "It records attempts so you can investigate",
+      "It permits the traffic",
+      "It tags frames"
+     ],
+     "answer": 1,
+     "explanation": "Logged denies give you early warning of probing."
+    },
+    {
+     "question": "Select all benefits of Private VLANs in a DMZ.",
+     "options": [
+      "Servers in isolated ports cannot reach each other",
+      "A compromised server has fewer neighbors to attack",
+      "Encrypts all traffic",
+      "Keeps the single subnet design"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "PVLANs isolate hosts within one subnet; they do not encrypt anything."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\n- A VLAN separates broadcast domains; security comes from controlling the layer 3 hop between them.\n- Switch spoofing and double tagging exploit defaults. Fix the defaults: fixed port modes, `nonegotiate`, a dead-end native VLAN and shut-down unused ports.\n- Apply extended ACLs inbound on SVIs, ordered permit specific, deny and log internal, then permit internet.\n- Use Private VLANs to isolate servers in one subnet.\n- Carry VLANs to hypervisors with pruned trunks and a hypervisor firewall.\n- Verify with `show interfaces trunk` and ACL counters."
+  }
+ ],
+ "ar": {
+  "title": "أمن VLAN والتصفية بين شبكات VLAN",
+  "summary": "تحصين منافذ المحوّل والجذوع ضد القفز بين VLAN، وتصفية الحركة بين شبكات VLAN بقوائم ACL.",
+  "objectives": [
+   "شرح منافذ الوصول والجذوع وVLAN الأصلية",
+   "إغلاق انتحال المحوّل والوسم المزدوج بالإعداد",
+   "كتابة ACL داخلة على SVI لتصفية الحركة بين VLAN",
+   "نقل VLAN إلى مضيف افتراضي بأمان"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "يوصّل متعاقد جديد حاسوبه المحمول بمنفذ جداري في غرفة الاجتماعات. يقع المنفذ في VLAN نفسها التي يوجد فيها خادم الملفات، لأن أحدًا لم يغيّر الإعداد الافتراضي. فيرى المتعاقد الخادم على القطاع المحلي دون أي جدار حماية بينهما.\n\nشبكات VLAN هي الأداة الأساسية لتقسيم محوّل مادي واحد إلى عدة شبكات منطقية، لكنها لا تؤمّن شيئًا بذاتها. فالـ VLAN **حدّ** فاصل، ولا يفيد الحدّ إلا إذا ضبطتَ من يستطيع عبوره. يوضح هذا الدرس كيف تُحصّن جهة المحوّل، وكيف تصفّي الحركة بين شبكات VLAN، وكيف تنقلها بأمان إلى مضيف افتراضي."
+   },
+   {
+    "type": "text",
+    "id": "basics",
+    "markdown": "## 1. كيف تفصل VLAN الحركة\n\nينتمي منفذ الوصول (Access) إلى VLAN واحدة فقط ويرسل الإطارات **دون وسم**. أما منفذ الجذع (Trunk) فينقل عدة شبكات VLAN بين المحوّلات أو إلى خادم، ويحصل كل إطار على وسم IEEE 802.1Q يحمل معرّف VLAN (من 1 إلى 4094). وتكون إحدى الشبكات على الجذع هي **VLAN الأصلية (Native VLAN)** وتسير إطاراتها دون وسم.\n\nلا تتحادث المضيفات في VLAN مختلفة على الطبقة الثانية. ولكي تتحادث يجب أن تمرّ حركتها بجهاز من الطبقة الثالثة: موجّه، أو محوّل طبقة ثالثة عبر واجهة افتراضية (SVI)، أو جدار حماية. وهذه القفزة هي موضع تطبيق التصفية، وبدونها تفصل VLAN البث فقط.\n\n| نوع المنفذ | ما ينقله | موسوم | الاستخدام المعتاد |\n|:--|:--|:--|:--|\n| Access | VLAN واحدة | لا | حاسوب مكتبي، طابعة، كاميرا |\n| Trunk | عدة VLAN | نعم (عدا الأصلية) | وصلة بين محوّلات، مضيف افتراضي |\n| Voice access | بيانات وVLAN صوت | الصوت فقط | هاتف IP خلفه حاسوب |"
+   },
+   {
+    "type": "text",
+    "id": "threats",
+    "markdown": "## 2. افهم نقطتي الضعف الكلاسيكيتين\n\nيحاول المهاجم الذي يصل إلى منفذ في المحوّل القفز إلى VLAN أخرى. تعرّف الطريقتين لتغلق كلتيهما. هذا عرض دفاعي دون أي خطوات هجومية.\n\n- **انتحال المحوّل (Switch spoofing).** قد يتفاوض منفذ ترك في الوضع الديناميكي على جذع عبر بروتوكول DTP. وإذا أقنع جهاز المنفذ بأن يصبح جذعًا وصل إلى كل شبكات VLAN المسموحة.\n- **الوسم المزدوج (Double tagging).** يحمل الإطار وسمين. يزيل المحوّل الأول الوسم الخارجي المطابق لـ VLAN الأصلية ويمرّر الوسم الداخلي إلى VLAN أخرى. ويعمل في اتجاه واحد فقط وحين يكون منفذ المهاجم في VLAN الأصلية.\n\nتعتمد الطريقتان على **الإعدادات الافتراضية**: منافذ ديناميكية، وVLAN 1 كأصلية، ومنافذ غير مستخدمة تُركت مفعّلة. لذلك فالدفاعات مجرد نظافة في الإعداد."
+   },
+   {
+    "type": "code",
+    "id": "hard",
+    "language": "cisco",
+    "filename": "switch-hardening.cfg",
+    "code": "! Access port: fixed mode, no negotiation\ninterface GigabitEthernet1/0/10\n description Meeting-room wall port\n switchport mode access\n switchport access vlan 20\n switchport nonegotiate\n spanning-tree portfast\n spanning-tree bpduguard enable\n!\n! Trunk to hypervisor: explicit, pruned, non-default native VLAN\ninterface GigabitEthernet1/0/48\n description Uplink to pve01\n switchport trunk encapsulation dot1q\n switchport mode trunk\n switchport nonegotiate\n switchport trunk native vlan 999\n switchport trunk allowed vlan 20,30,99\n!\n! Unused ports: parked and shut down\ninterface range GigabitEthernet1/0/30 - 40\n switchport mode access\n switchport access vlan 999\n shutdown\n!\nvlan 999\n name PARKING-NO-ROUTE",
+    "caption": "استبدل VLAN 1 كأصلية، وقلّم الجذع، وأوقف المنافذ غير المستخدمة في VLAN بلا SVI."
+   },
+   {
+    "type": "callout",
+    "id": "c-trunk",
+    "variant": "note",
+    "title": "ترتيب الأوامر مهم",
+    "markdown": "في كثير من طرازات Catalyst يجب أن يأتي الأمر `switchport trunk encapsulation dot1q` **قبل** `switchport mode trunk`. وتدعم الطرازات الأحدث 802.1Q فقط وترفض أمر التغليف، فاحذفه عندها."
+   },
+   {
+    "type": "text",
+    "id": "filter",
+    "markdown": "## 3. صفِّ الحركة بين شبكات VLAN\n\nعندما يجب أن تعبر الحركة الطبقة الثالثة، اكتب سياسة. والقاعدة البسيطة: المستخدمون يصلون إلى الخدمات، والخدمات لا تصل إلى المستخدمين أبدًا، ولا شيء يصل إلى الإدارة.\n\nعلى محوّل الطبقة الثالثة، طبّق قائمة ACL ممتدة **في الاتجاه الداخل** على SVI الخاصة بـ VLAN المصدر. فالتصفية الداخلة توقف الحركة غير المرغوبة قبل أن تستهلك موارد التوجيه. جدار الحماية الحالة-الواعي أفضل عندما تحتاج إلى تتبع الاتصالات أو التسجيل أو فحص التطبيقات، لكن قوائم ACL على SVI طبقة أولى رخيصة وفعالة.\n\nخطّط القواعد بهذا الترتيب:\n\n1. اسمح بالردود المنشأة، أو اترك ذلك لجهاز حالة-واعٍ.\n2. اسمح بالخدمات المحددة التي تحتاجها كل VLAN (DNS وHTTPS ومنفذ قاعدة البيانات).\n3. امنع وسجّل كل ما عداها نحو النطاقات الداخلية الأخرى.\n4. اسمح بالإنترنت أخيرًا ليسود المنع أعلاه على الوجهات الداخلية."
+   },
+   {
+    "type": "code",
+    "id": "acl",
+    "language": "cisco",
+    "filename": "inter-vlan-acl.cfg",
+    "code": "ip access-list extended USERS-IN\n 10 permit udp 10.20.0.0 0.0.0.255 host 10.99.0.53 eq domain\n 20 permit tcp 10.20.0.0 0.0.0.255 host 10.30.0.10 eq 443\n 30 permit tcp 10.20.0.0 0.0.0.255 host 10.30.0.20 eq 5432\n 40 deny   ip 10.20.0.0 0.0.0.255 10.0.0.0 0.255.255.255 log\n 50 permit ip 10.20.0.0 0.0.0.255 any\n!\ninterface Vlan20\n description Users\n ip address 10.20.0.1 255.255.255.0\n ip access-group USERS-IN in",
+    "caption": "يصل المستخدمون إلى DNS وتطبيق الويب وقاعدة البيانات، ويُمنع ويُسجَّل كل وجهة داخلية أخرى."
+   },
+   {
+    "type": "animation",
+    "id": "seq-anim",
+    "kind": "sequence",
+    "title": "حركة بين VLAN تواجه قائمة ACL",
+    "caption": "SVI هي نقطة الفرض: تمرّ التدفقات المسموحة ويُسجَّل الباقي.",
+    "data": {
+     "actors": [
+      {
+       "id": "pc",
+       "label": "حاسوب المستخدم",
+       "sub": "10.20.0.15 VLAN 20",
+       "icon": "laptop"
+      },
+      {
+       "id": "svi",
+       "label": "محوّل الطبقة الثالثة",
+       "sub": "Vlan20 ACL داخل",
+       "icon": "switch"
+      },
+      {
+       "id": "app",
+       "label": "تطبيق الويب",
+       "sub": "10.30.0.10 VLAN 30",
+       "icon": "server"
+      },
+      {
+       "id": "mgmt",
+       "label": "المضيف الافتراضي",
+       "sub": "10.99.0.5 VLAN 99",
+       "icon": "cpu"
+      }
+     ],
+     "steps": [
+      {
+       "from": "pc",
+       "to": "svi",
+       "label": "TCP/443 إلى 10.30.0.10",
+       "note": "يرسل الحاسوب HTTPS إلى بوابته الافتراضية، أي SVI."
+      },
+      {
+       "from": "svi",
+       "to": "svi",
+       "label": "يطابق سطر ACL رقم 20",
+       "tone": "success",
+       "note": "يُسمح بالحزمة."
+      },
+      {
+       "from": "svi",
+       "to": "app",
+       "label": "تُوجَّه إلى VLAN 30",
+       "note": "يُعاد وسم الإطار لـ VLAN 30."
+      },
+      {
+       "from": "pc",
+       "to": "svi",
+       "label": "TCP/8006 إلى 10.99.0.5",
+       "note": "يحاول الحاسوب نفسه الوصول إلى واجهة ويب المضيف الافتراضي."
+      },
+      {
+       "from": "svi",
+       "to": "svi",
+       "label": "يطابق سطر ACL رقم 40",
+       "tone": "blocked",
+       "note": "يُمنع ويُسجَّل، ولا يراه المضيف الافتراضي."
+      },
+      {
+       "from": "svi",
+       "to": "pc",
+       "label": "لا رد",
+       "tone": "danger",
+       "note": "يرى المستخدم مهلة، وينبّه سجل المنع المسؤول."
+      }
+     ]
+    }
+   },
+   {
+    "type": "terminal",
+    "id": "verify",
+    "title": "التحقق على المحوّل",
+    "prompt": "SW1#",
+    "lines": [
+     {
+      "cmd": "show interfaces trunk",
+      "output": "Port      Mode  Encapsulation  Status    Native vlan\nGi1/0/48  on    802.1q         trunking  999\nPort      Vlans allowed on trunk\nGi1/0/48  20,30,99",
+      "comment": "VLAN الأصلية هي 999 ولا يُسمح إلا بثلاث شبكات VLAN"
+     },
+     {
+      "cmd": "show ip access-lists USERS-IN",
+      "output": "Extended IP access list USERS-IN\n    10 permit udp 10.20.0.0 0.0.0.255 host 10.99.0.53 eq domain (412 matches)\n    20 permit tcp 10.20.0.0 0.0.0.255 host 10.30.0.10 eq 443 (1873 matches)\n    40 deny ip 10.20.0.0 0.0.0.255 10.0.0.0 0.255.255.255 log (6 matches)",
+      "comment": "ست محاولات ممنوعة: افحص مصادرها"
+     }
+    ],
+    "caption": "تثبت عدادات المطابقة أن القائمة قيد الاستخدام. صفر عند سطر المنع يعني أن أحدًا لم يجرّبه بعد."
+   },
+   {
+    "type": "text",
+    "id": "extra",
+    "markdown": "## 4. تجاوز VLAN الأساسية\n\n**شبكات VLAN الخاصة (Private VLANs)** تعزل المضيفات داخل الشبكة الفرعية نفسها. ففي DMZ فيها عشرة خوادم ويب، نادرًا ما يلزم أن يتحدث خادم مع آخر. ضع الخوادم في منافذ *معزولة* لا تصل إلا إلى المنفذ *المختلط* للبوابة، فلا يستطيع خادم ويب مخترق مهاجمة جيرانه.\n\n**المضيفات الافتراضية.** في Proxmox VE فعّل إدراك VLAN على الجسر ووسِّم واجهة شبكة كل جهاز افتراضي بدل إنشاء جسر لكل VLAN. ثم فعّل جدار حماية Proxmox على مستوى مركز البيانات والمضيف والجهاز الافتراضي، لأن التصفية بين VLAN على المحوّل المادي لا ترى جهازين افتراضيين في VLAN نفسها. وقصر الجذع على شبكات VLAN التي يحتاجها المضيف فعلًا.\n\n**أمان المنافذ و802.1X.** حدّد عدد عناوين MAC لكل منفذ وصول، أو الأفضل أن تصادق الجهاز أولًا كما في [الوصول إلى الشبكة وإدارة الهوية](/learn/systems-infrastructure-security/network-access-and-identity-management). وصمّم المناطق العامة أولًا باستخدام [بنية أمن الشبكات](/learn/systems-infrastructure-security/network-security-architecture) ثم ارسم شبكات VLAN."
+   },
+   {
+    "type": "text",
+    "id": "ops",
+    "markdown": "## 5. شغّل التصميم وراجعه\n\nيتآكل تصميم VLAN الآمن ما لم تصُنه. ضع ثلاثة إجراءات روتينية في جدولك.\n\n- **دقّق المحوّلات شهريًا.** صدّر كل الإعدادات وابحث عن منافذ ما زالت في الوضع الديناميكي، وجذوع تسمح بكل شبكات VLAN، ومنافذ في VLAN 1. ويكشف سكربت قصير يبحث في مخرجات `show running-config` معظم الانحرافات.\n- **راجع الحركة الممنوعة أسبوعيًا.** تُظهر مدخلات `log` على أسطر المنع من يستكشف الشبكة. والمحاولات المتكررة من VLAN مستخدمين نحو VLAN الإدارة تستحق حديثًا مع مالك ذلك الجهاز.\n- **اختبر بعد كل تغيير.** قبل إغلاق تذكرة التغيير نفّذ فحوص ما يُتوقع نجاحه وما يُتوقع فشله. وإضافة VLAN جديدة إلى جذع دون ACL مطابقة سبب شائع للانكشاف الصامت.\n\nسمِّ شبكات VLAN بحسب غرضها لا برقمها فقط، مثل `USERS` و`SERVERS` و`MGMT`، فالأسماء الواضحة تُسرّع المراجعة وتُظهر الأخطاء. واحتفظ بخريطة VLAN والشبكات الفرعية في الوثيقة نفسها مع مصفوفة التدفقات، ليقرأ من يقرأ إحداهما الأخرى.\n\nوتذكّر ما لا تستطيعه VLAN. فهي لا تشفّر الحركة، ولا توقف مهاجمًا يسيطر أصلًا على مضيف داخل الـ VLAN. إنها تقلل الانكشاف، ولا تلغي الحاجة إلى جدران حماية المضيف والتحديثات والمراقبة."
+   },
+   {
+    "type": "callout",
+    "id": "c-vlan1",
+    "variant": "warning",
+    "title": "لا تثق بـ VLAN 1",
+    "markdown": "تحمل VLAN 1 بروتوكولات التحكم مثل CDP وspanning tree افتراضيًا. لا تضع فيها مستخدمين أو خوادم، ولا تستخدمها كـ VLAN أصلية. بل أوقف المنافذ غير المستخدمة في VLAN مسدودة بلا SVI."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر تملكه (Packet Tracer أو GNS3 أو محوّلين احتياطيين):\n\n1. أنشئ VLAN 20 و30 وضع مضيفًا واحدًا في كل منهما.\n2. اضبط واجهتي SVI وتأكد أن المضيفين يستجيبان لأمر ping.\n3. طبّق ACL تسمح بـ TCP/443 فقط من VLAN 20 إلى VLAN 30 ثم أعد اختبار ping.\n4. نفّذ `show ip access-lists` ولاحظ العدادات التي زادت.\n5. نفّذ `show interfaces trunk` وغيّر VLAN الأصلية إلى معرّف غير مستخدم.\n\nفسّر لماذا يفشل ping الآن بينما يعمل HTTPS."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "VLAN",
+      "definition": "شبكة منطقية من الطبقة الثانية تُنشأ على محوّل."
+     },
+     {
+      "term": "الجذع (Trunk)",
+      "definition": "منفذ ينقل عدة VLAN بوسوم 802.1Q."
+     },
+     {
+      "term": "VLAN الأصلية",
+      "definition": "VLAN التي تعبر إطاراتها الجذع دون وسم."
+     },
+     {
+      "term": "DTP",
+      "definition": "بروتوكول Cisco يتفاوض على الجذع تلقائيًا."
+     },
+     {
+      "term": "SVI",
+      "definition": "واجهة افتراضية من الطبقة الثالثة لـ VLAN على محوّل."
+     },
+     {
+      "term": "الوسم المزدوج",
+      "definition": "إرسال إطار بوسمي 802.1Q للوصول إلى VLAN أخرى."
+     },
+     {
+      "term": "VLAN الخاصة",
+      "definition": "ميزة تعزل المضيفات داخل شبكة فرعية واحدة."
+     },
+     {
+      "term": "BPDU guard",
+      "definition": "يعطّل منفذ حافة يستقبل رسائل spanning-tree."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أين يجب تطبيق التصفية بين VLAN؟",
+      "options": [
+       "على منفذ الوصول فقط",
+       "على جهاز الطبقة الثالثة الذي يوجّه بينهما",
+       "على خادم DNS",
+       "في قاعدة بيانات VLAN"
+      ],
+      "answer": 1,
+      "explanation": "تلتقي شبكات VLAN على الطبقة الثالثة فقط، فتلك القفزة هي نقطة الفرض."
+     },
+     {
+      "question": "اختر كل خطوات الإعداد التي تقلل خطر القفز بين VLAN.",
+      "options": [
+       "`switchport nonegotiate` على الجذوع",
+       "استخدام VLAN 1 كأصلية",
+       "تعيين VLAN أصلية غير افتراضية",
+       "إيقاف المنافذ غير المستخدمة"
+      ],
+      "answer": [
+       0,
+       2,
+       3
+      ],
+      "explanation": "عطّل التفاوض وغيّر VLAN الأصلية وأوقف المنافذ غير المستخدمة. أما VLAN 1 كأصلية فهي الإعداد الضعيف."
+     },
+     {
+      "question": "على ماذا يعتمد الوسم المزدوج؟",
+      "options": [
+       "منفذ في VLAN الأصلية",
+       "جذع مشفّر",
+       "ACL تسمح بكل شيء",
+       "VLAN خاصة"
+      ],
+      "answer": 0,
+      "explanation": "يجب أن يطابق الوسم الخارجي VLAN الأصلية ليزيله المحوّل الأول."
+     },
+     {
+      "question": "لماذا نضيف `log` إلى سطر منع في ACL بين VLAN؟",
+      "options": [
+       "لتسريع التوجيه",
+       "لتسجيل المحاولات وتتبعها",
+       "لأنه يسمح بالحركة",
+       "لأنه يوسم الإطارات"
+      ],
+      "answer": 1,
+      "explanation": "تمنحك سجلات المنع إنذارًا مبكرًا بمحاولات الاستكشاف."
+     },
+     {
+      "question": "اختر كل فوائد VLAN الخاصة في DMZ.",
+      "options": [
+       "الخوادم في منافذ معزولة لا تصل إلى بعضها",
+       "الخادم المخترق له جيران أقل ليهاجمهم",
+       "تشفّر كل الحركة",
+       "تبقي تصميم الشبكة الفرعية الواحدة"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تعزل PVLAN المضيفات داخل شبكة فرعية واحدة، ولا تشفّر شيئًا."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\n- تفصل VLAN نطاقات البث، أما الأمان فيأتي من التحكم بقفزة الطبقة الثالثة بينها.\n- يستغل انتحال المحوّل والوسم المزدوج الإعدادات الافتراضية. فأصلح الافتراضيات: أوضاع منافذ ثابتة، و`nonegotiate`، وVLAN أصلية مسدودة، وإيقاف المنافذ غير المستخدمة.\n- طبّق ACL ممتدة داخلة على SVI بترتيب: السماح المحدد، ثم منع وتسجيل الداخلي، ثم السماح بالإنترنت.\n- استخدم VLAN الخاصة لعزل الخوادم داخل شبكة فرعية واحدة.\n- انقل VLAN إلى المضيفات الافتراضية بجذوع مقلَّمة وجدار حماية للمضيف.\n- تحقق بالأمر `show interfaces trunk` وعدادات ACL."
+   }
+  ]
+ }
+}

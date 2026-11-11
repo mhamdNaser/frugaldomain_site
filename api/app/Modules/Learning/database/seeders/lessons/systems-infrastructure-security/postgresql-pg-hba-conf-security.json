@@ -1,0 +1,564 @@
+{
+ "slug": "postgresql-pg-hba-conf-security",
+ "title": "PostgreSQL pg_hba.conf Security",
+ "summary": "Read pg_hba.conf correctly, write tight first-match rules, validate changes safely and monitor for abuse.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Explain the first-match rule model",
+  "Write tight hostssl rules with SCRAM or certificates",
+  "Validate and reload changes without downtime",
+  "Detect rejected connections and configuration drift"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "During a migration, an administrator adds one line to `pg_hba.conf` so that the new application server can connect: `host all all 0.0.0.0/0 md5`. The migration finishes, the line stays, and the database port is also open on the firewall for \"testing\". Within a week, the server log fills with failed logins from addresses across the internet.\n\nThe file `pg_hba.conf` is PostgreSQL's front door policy. It decides who may even attempt a login, from where, and with which method. A wrong line here is worse than a weak password, because it removes the barrier before authentication starts. In this lesson you will read the file correctly, write tight rules, validate changes safely and monitor for abuse."
+  },
+  {
+   "id": "format",
+   "type": "text",
+   "markdown": "## How the file is read\n\nEach non-comment line is a **rule** with fields:\n\n`TYPE  DATABASE  USER  ADDRESS  METHOD  [OPTIONS]`\n\n| Field | Examples | Notes |\n|:--|:--|:--|\n| TYPE | `local`, `host`, `hostssl`, `hostnossl` | `hostssl` requires TLS |\n| DATABASE | `shop`, `all`, `replication` | `all` does not match replication |\n| USER | `svc_web`, `+shop_read`, `all` | `+` means members of a group role |\n| ADDRESS | `10.20.1.0/24`, `192.0.2.10/32` | CIDR range, or a host name |\n| METHOD | `scram-sha-256`, `cert`, `peer`, `reject` | How to authenticate |\n\nTwo rules govern the whole file. First, **the first matching line wins**, and PostgreSQL stops reading. Order is part of the security design. Second, **no match means rejection**. There is no hidden fallback, so a missing rule is a safe default.\n\nBecause of the first rule, a broad line placed above a narrow one makes the narrow one unreachable. Put the most specific rules first and an explicit `reject` near the end so intent is visible."
+  },
+  {
+   "id": "hba-flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Rule matching in pg_hba.conf",
+   "caption": "The first rule that matches decides; the rest are never read.",
+   "data": {
+    "token": "Connection",
+    "nodes": [
+     {
+      "id": "in",
+      "label": "Client",
+      "sub": "198.51.100.20",
+      "icon": "laptop"
+     },
+     {
+      "id": "r1",
+      "label": "Rule 1",
+      "sub": "local peer",
+      "icon": "file"
+     },
+     {
+      "id": "r2",
+      "label": "Rule 2",
+      "sub": "hostssl 10.20.1.0/24",
+      "icon": "lock"
+     },
+     {
+      "id": "r3",
+      "label": "Rule 3",
+      "sub": "reject all",
+      "icon": "shield"
+     },
+     {
+      "id": "ok",
+      "label": "Authenticate",
+      "sub": "scram-sha-256",
+      "icon": "key"
+     }
+    ],
+    "steps": [
+     {
+      "at": "in",
+      "caption": "A TCP connection arrives from 198.51.100.20 for database shop."
+     },
+     {
+      "at": "r1",
+      "caption": "Rule 1 is for local sockets only: no match."
+     },
+     {
+      "at": "r2",
+      "caption": "Rule 2 allows only 10.20.1.0/24: the address does not match."
+     },
+     {
+      "at": "r3",
+      "caption": "Rule 3 matches every address and rejects the connection.",
+      "tone": "danger"
+     },
+     {
+      "at": "in",
+      "token": "Connection",
+      "caption": "A client at 10.20.1.15 arrives instead."
+     },
+     {
+      "at": "r2",
+      "caption": "Rule 2 matches: TLS and the right subnet.",
+      "tone": "secure"
+     },
+     {
+      "at": "ok",
+      "caption": "Only now does SCRAM authentication begin.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "good",
+   "type": "text",
+   "markdown": "## Writing tight rules\n\nA good file is short, specific and boring. Follow these principles:\n\n1. **One rule per application, per source.** Name the database, the role and the exact address.\n2. **Use `hostssl`** for every remote rule, so a client that cannot use TLS is refused.\n3. **Use `scram-sha-256` or `cert`**, never `trust` or `password`.\n4. **Use the smallest address range** that works, preferably `/32` for single servers and a dedicated subnet for pools.\n5. **Keep `local` rules minimal.** Allow `peer` for the `postgres` administrator and a small set of maintenance roles.\n6. **Add a final `reject`** so the intent is visible to reviewers.\n7. **Comment each rule** with the ticket number and owner.\n\nAddress ranges should come from your network design, not from convenience. If you can use a subnet reserved for the application tier, you can also write the firewall rule to match. See [Database Network Isolation](/learn/systems-infrastructure-security/database-network-isolation) for that side of the control."
+  },
+  {
+   "id": "hba",
+   "type": "code",
+   "language": "plain",
+   "filename": "pg_hba.conf",
+   "caption": "A tight rule set. Addresses are from documentation and private ranges. Order matters: first match wins.",
+   "code": "# TYPE   DATABASE     USER          ADDRESS            METHOD\n# admin on the host itself\nlocal    all          postgres                         peer\n# web app tier  (TICKET-2041, owner: web-team)\nhostssl  shop         svc_web       10.20.1.0/24       scram-sha-256\n# reporting server  (TICKET-2077, owner: data-team)\nhostssl  shop         svc_report    10.20.2.15/32      scram-sha-256\n# replication from the standby only  (TICKET-1990)\nhostssl  replication  replicator    10.20.3.8/32       scram-sha-256\n# DBA jump host, certificate required\nhostssl  all          +dba_group    10.20.9.4/32       cert\n# everything else is refused, visibly\nhost     all          all           0.0.0.0/0          reject\nhost     all          all           ::/0               reject",
+   "highlight": [
+    4,
+    6,
+    8,
+    10,
+    12,
+    13
+   ]
+  },
+  {
+   "id": "validate",
+   "type": "text",
+   "markdown": "## Changing the file safely\n\nBecause a mistake can lock out every application, treat edits like a deployment:\n\n1. **Back up** the current file and keep it in version control.\n2. **Check the syntax before reloading.** On PostgreSQL 10 and later, the view `pg_hba_file_rules` shows how the server parsed the file, and its `error` column reports problems. Run it against the file on disk before you reload.\n3. **Reload, do not restart.** `SELECT pg_reload_conf();` applies the change without dropping existing sessions.\n4. **Keep an administrator session open** on a `local` rule while you test, so you can revert.\n5. **Test one allowed and one denied connection** from the real client networks.\n\nNever test only the allowed path. A denied connection that surprisingly succeeds is the signal that a broader rule sits above your new one."
+  },
+  {
+   "id": "hba-term",
+   "type": "terminal",
+   "title": "Validating and applying pg_hba.conf",
+   "lines": [
+    {
+     "cmd": "sudo -u postgres psql -c \"SELECT line_number, type, address, auth_method, error FROM pg_hba_file_rules ORDER BY line_number;\"",
+     "output": " line_number |  type   |   address    | auth_method | error\n-------------+---------+--------------+-------------+-------\n           4 | hostssl | 10.20.1.0/24 | scram-sha-256 |\n           6 | hostssl | 10.20.2.15   | scram-sha-256 |\n          14 | host    | 0.0.0.0      | reject      |",
+     "comment": "An empty error column means every line parsed."
+    },
+    {
+     "cmd": "sudo -u postgres psql -c \"SELECT pg_reload_conf();\"",
+     "output": " pg_reload_conf\n----------------\n t",
+     "comment": "Applies the new rules without disconnecting sessions."
+    },
+    {
+     "cmd": "psql \"host=db1.example.com dbname=shop user=svc_web sslmode=verify-full\" -c \"SELECT 1;\"",
+     "output": "psql: error: connection to server at \"db1.example.com\" (203.0.113.9), port 5432 failed: FATAL:  no pg_hba.conf entry for host \"198.51.100.20\", user \"svc_web\", database \"shop\", SSL encryption",
+     "comment": "A client outside 10.20.1.0/24 is refused: the rule works."
+    }
+   ],
+   "caption": "Validate, reload, then prove a denied connection really is denied."
+  },
+  {
+   "id": "special",
+   "type": "text",
+   "markdown": "## Special cases worth planning for\n\nA few situations deserve their own rules rather than a shortcut:\n\n- **Replication.** The word `replication` in the database field is a keyword, and `all` never matches it. Give the standby server its own `hostssl` rule, restricted to its single address and a dedicated role. See [Database Replication Security](/learn/systems-infrastructure-security/database-replication-security).\n- **Connection poolers.** If PgBouncer sits in front of PostgreSQL, the database sees the pooler's address, not the application's. Restrict the rule to the pooler and enforce application identity in the pooler's own configuration.\n- **Human administrators.** Prefer certificates or your directory over shared passwords, and allow them only from a jump host.\n- **Cloud and VPN clients.** Addresses that change are a reason to use a stable gateway, not a reason to open the range.\n\nDocument each exception with an expiry date. An exception without a date tends to outlive the project that needed it."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Never leave trust rules behind",
+   "markdown": "Recovery procedures sometimes tell you to set `trust` temporarily. Use it only on the `local` type, only while you are on the console, and remove it immediately. A forgotten `host all all 0.0.0.0/0 trust` line gives anyone who reaches the port superuser access without a password."
+  },
+  {
+   "id": "monitor",
+   "type": "text",
+   "markdown": "## Monitoring and drift\n\nRules are only as good as their continued accuracy. Three practices keep them honest:\n\n- **Log rejections.** With `log_connections = on`, refused and failed connections appear in the log with the user, database and address. A spike of `no pg_hba.conf entry` messages means scanning or a misconfigured client. Send the log to your central system as in [Database Auditing and Activity Logging](/learn/systems-infrastructure-security/database-auditing-and-activity-logging).\n- **Compare against Git.** A scheduled job can diff the live file against the approved copy and alert on any difference.\n- **Review quarterly.** Remove rules for retired applications, and confirm every remaining rule has an owner.\n\nFinally, remember that `pg_hba.conf` is one layer. The firewall, the `listen_addresses` setting and TLS enforcement from [Database TLS and Encryption](/learn/systems-infrastructure-security/database-tls-and-encryption) all work together. If one is wrong, the others should still hold."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a lab PostgreSQL server **you own**, copy the active `pg_hba.conf` to a backup file.\n2. Rewrite it using the pattern in this lesson: one `hostssl` rule per application with the smallest address range, then a final `reject`.\n3. Run `SELECT * FROM pg_hba_file_rules WHERE error IS NOT NULL;` and fix anything it reports. Then run `SELECT pg_reload_conf();`.\n4. From an allowed host connect successfully. From a different host or address, confirm the error `no pg_hba.conf entry`. Restore the backup if anything goes wrong."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "pg_hba.conf",
+     "definition": "The file that decides which clients may connect and how they authenticate."
+    },
+    {
+     "term": "First-match rule",
+     "definition": "The server applies the first line matching a connection and ignores the rest."
+    },
+    {
+     "term": "hostssl",
+     "definition": "A rule type that matches only TLS-encrypted TCP connections."
+    },
+    {
+     "term": "reject",
+     "definition": "A method that refuses the connection immediately."
+    },
+    {
+     "term": "peer",
+     "definition": "Local authentication using the operating system user name."
+    },
+    {
+     "term": "CIDR",
+     "definition": "Notation such as 10.20.1.0/24 for an address range."
+    },
+    {
+     "term": "pg_hba_file_rules",
+     "definition": "A view showing how the server parsed each rule, with errors."
+    },
+    {
+     "term": "Configuration drift",
+     "definition": "A live file diverging from the approved version."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Two rules match a connection. Which one is applied?",
+     "options": [
+      "The last one",
+      "The first one",
+      "The stricter one",
+      "Both"
+     ],
+     "answer": 1,
+     "explanation": "pg_hba.conf stops at the first matching line, so order is part of the policy."
+    },
+    {
+     "question": "A connection matches no rule. What happens?",
+     "options": [
+      "It is allowed with a password",
+      "It is rejected",
+      "It uses trust",
+      "It falls back to md5"
+     ],
+     "answer": 1,
+     "explanation": "There is no implicit fallback: no matching entry means the connection is refused."
+    },
+    {
+     "question": "Which are good practices for rules? Choose all that apply.",
+     "options": [
+      "Use hostssl for remote connections",
+      "Use the smallest workable address range",
+      "Use 0.0.0.0/0 for convenience",
+      "Comment each rule with an owner"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Narrow, encrypted and owned rules are reviewable; 0.0.0.0/0 removes the network barrier."
+    },
+    {
+     "question": "How do you check pg_hba.conf syntax before applying it?",
+     "options": [
+      "Query pg_hba_file_rules and read the error column",
+      "Restart the server",
+      "Delete the file",
+      "Disable TLS"
+     ],
+     "answer": 0,
+     "explanation": "The view parses the file and lists errors without disconnecting sessions."
+    },
+    {
+     "question": "Why keep an admin session open while editing?",
+     "options": [
+      "To speed up reloads",
+      "So you can revert if you lock yourself out",
+      "To disable logging",
+      "It is required by SCRAM"
+     ],
+     "answer": 1,
+     "explanation": "An existing session survives a bad reload and lets you restore the backup."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- `pg_hba.conf` decides who may attempt a login, from where and by which method; the first matching line wins and no match means rejection.\n- Write one specific `hostssl` rule per application with `scram-sha-256` or `cert`, then end with an explicit `reject`.\n- Never use `trust` or `0.0.0.0/0` for remote access, and remove temporary recovery rules immediately.\n- Validate with `pg_hba_file_rules`, reload with `pg_reload_conf()`, and test both allowed and denied connections.\n- Log rejections, diff the live file against version control and review rules every quarter.\n\nNext, you will move up a layer to the network itself in [Database Network Isolation](/learn/systems-infrastructure-security/database-network-isolation)."
+  }
+ ],
+ "ar": {
+  "title": "أمن ملف pg_hba.conf في PostgreSQL",
+  "summary": "اقرأ pg_hba.conf قراءة صحيحة، واكتب قواعد محكمة بمبدأ أول مطابقة، وتحقق من التغييرات بأمان، وارصد إساءة الاستخدام.",
+  "objectives": [
+   "شرح نموذج أول مطابقة",
+   "كتابة قواعد hostssl محكمة بـ SCRAM أو الشهادات",
+   "التحقق من التغييرات وإعادة تحميلها دون توقف",
+   "اكتشاف الاتصالات المرفوضة وانحراف الإعدادات"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "أثناء عملية ترحيل يضيف مدير سطرًا واحدًا إلى `pg_hba.conf` ليتصل خادم التطبيق الجديد: `host all all 0.0.0.0/0 md5`. تنتهي العملية ويبقى السطر، ويكون منفذ قاعدة البيانات مفتوحًا أيضًا في جدار الحماية «للاختبار». وخلال أسبوع يمتلئ سجل الخادم بمحاولات دخول فاشلة من عناوين عبر الإنترنت.\n\nالملف `pg_hba.conf` هو سياسة باب PostgreSQL الأمامي. فهو يقرر من يحق له حتى محاولة الدخول، ومن أين، وبأي طريقة. والسطر الخاطئ هنا أسوأ من كلمة مرور ضعيفة لأنه يزيل الحاجز قبل بدء المصادقة. في هذا الدرس ستقرأ الملف قراءة صحيحة، وتكتب قواعد محكمة، وتتحقق من التغييرات بأمان، وترصد إساءة الاستخدام."
+   },
+   {
+    "id": "format",
+    "type": "text",
+    "markdown": "## كيف يُقرأ الملف\n\nكل سطر غير تعليق هو **قاعدة** ذات حقول:\n\n`TYPE  DATABASE  USER  ADDRESS  METHOD  [OPTIONS]`\n\n| الحقل | أمثلة | ملاحظات |\n|:--|:--|:--|\n| TYPE | `local` و`host` و`hostssl` و`hostnossl` | يشترط `hostssl` استخدام TLS |\n| DATABASE | `shop` و`all` و`replication` | لا يطابق `all` الاستنساخ |\n| USER | `svc_web` و`+shop_read` و`all` | تعني `+` أعضاء دور مجموعة |\n| ADDRESS | `10.20.1.0/24` و`192.0.2.10/32` | نطاق CIDR أو اسم مضيف |\n| METHOD | `scram-sha-256` و`cert` و`peer` و`reject` | طريقة المصادقة |\n\nتحكم الملف كله قاعدتان. الأولى أن **أول سطر مطابق هو الذي يُعتمد** ويتوقف PostgreSQL عن القراءة؛ فالترتيب جزء من التصميم الأمني. والثانية أن **عدم المطابقة يعني الرفض**؛ لا بديل خفيًّا، فغياب القاعدة افتراض آمن.\n\nوبسبب القاعدة الأولى، فإن سطرًا واسعًا فوق سطر ضيق يجعل الضيق غير قابل للوصول. ضع الأكثر تحديدًا أولًا وسطر `reject` صريحًا قرب النهاية لتكون النية ظاهرة."
+   },
+   {
+    "id": "hba-flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "مطابقة القواعد في pg_hba.conf",
+    "caption": "أول قاعدة تطابق هي التي تحسم، ولا تُقرأ البقية.",
+    "data": {
+     "token": "اتصال",
+     "nodes": [
+      {
+       "id": "in",
+       "label": "العميل",
+       "sub": "198.51.100.20",
+       "icon": "laptop"
+      },
+      {
+       "id": "r1",
+       "label": "Rule 1",
+       "sub": "local peer",
+       "icon": "file"
+      },
+      {
+       "id": "r2",
+       "label": "Rule 2",
+       "sub": "hostssl 10.20.1.0/24",
+       "icon": "lock"
+      },
+      {
+       "id": "r3",
+       "label": "Rule 3",
+       "sub": "reject all",
+       "icon": "shield"
+      },
+      {
+       "id": "ok",
+       "label": "مصادقة",
+       "sub": "scram-sha-256",
+       "icon": "key"
+      }
+     ],
+     "steps": [
+      {
+       "at": "in",
+       "caption": "يصل اتصال TCP من 198.51.100.20 لقاعدة shop."
+      },
+      {
+       "at": "r1",
+       "caption": "القاعدة 1 للمقابس المحلية فقط: لا مطابقة."
+      },
+      {
+       "at": "r2",
+       "caption": "القاعدة 2 تسمح بـ 10.20.1.0/24 فقط: العنوان لا يطابق."
+      },
+      {
+       "at": "r3",
+       "caption": "القاعدة 3 تطابق كل عنوان وترفض الاتصال.",
+       "tone": "danger"
+      },
+      {
+       "at": "in",
+       "token": "اتصال",
+       "caption": "يصل بدلًا منه عميل من 10.20.1.15."
+      },
+      {
+       "at": "r2",
+       "caption": "تطابق القاعدة 2: TLS والشبكة الفرعية الصحيحة.",
+       "tone": "secure"
+      },
+      {
+       "at": "ok",
+       "caption": "الآن فقط تبدأ مصادقة SCRAM.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "good",
+    "type": "text",
+    "markdown": "## كتابة قواعد محكمة\n\nالملف الجيد قصير ومحدد وممل. اتبع هذه المبادئ:\n\n1. **قاعدة واحدة لكل تطبيق ولكل مصدر.** سمِّ قاعدة البيانات والدور والعنوان بدقة.\n2. **استخدم `hostssl`** لكل قاعدة بعيدة، فيُرفض العميل الذي لا يستطيع استخدام TLS.\n3. **استخدم `scram-sha-256` أو `cert`**، ولا تستخدم `trust` ولا `password`.\n4. **استخدم أصغر نطاق عناوين** يعمل، ويفضَّل `/32` للخوادم المفردة وشبكة فرعية مخصصة للمجمّعات.\n5. **أبقِ قواعد `local` في حدّها الأدنى.** اسمح بـ `peer` لمدير `postgres` ولمجموعة صغيرة من أدوار الصيانة.\n6. **أضف `reject` أخيرًا** لتكون النية ظاهرة للمراجعين.\n7. **علّق على كل قاعدة** برقم التذكرة والمالك.\n\nيجب أن تأتي نطاقات العناوين من تصميم شبكتك لا من الراحة. فإن أمكنك استخدام شبكة فرعية مخصصة لطبقة التطبيقات فيمكنك كتابة قاعدة جدار الحماية لتطابقها. راجع [العزل الشبكي لقواعد البيانات](/learn/systems-infrastructure-security/database-network-isolation) للاطلاع على ذلك الجانب من الضابط."
+   },
+   {
+    "id": "hba",
+    "type": "code",
+    "language": "plain",
+    "filename": "pg_hba.conf",
+    "caption": "مجموعة قواعد محكمة. العناوين من نطاقات توثيقية وخاصة. الترتيب مهم: أول مطابقة تُعتمد.",
+    "code": "# TYPE   DATABASE     USER          ADDRESS            METHOD\n# admin on the host itself\nlocal    all          postgres                         peer\n# web app tier  (TICKET-2041, owner: web-team)\nhostssl  shop         svc_web       10.20.1.0/24       scram-sha-256\n# reporting server  (TICKET-2077, owner: data-team)\nhostssl  shop         svc_report    10.20.2.15/32      scram-sha-256\n# replication from the standby only  (TICKET-1990)\nhostssl  replication  replicator    10.20.3.8/32       scram-sha-256\n# DBA jump host, certificate required\nhostssl  all          +dba_group    10.20.9.4/32       cert\n# everything else is refused, visibly\nhost     all          all           0.0.0.0/0          reject\nhost     all          all           ::/0               reject",
+    "highlight": [
+     4,
+     6,
+     8,
+     10,
+     12,
+     13
+    ]
+   },
+   {
+    "id": "validate",
+    "type": "text",
+    "markdown": "## تغيير الملف بأمان\n\nلأن الخطأ قد يحجب كل التطبيقات، عامل التعديلات كأنها عملية نشر:\n\n1. **انسخ احتياطيًّا** الملف الحالي واحفظه في نظام التحكم بالإصدارات.\n2. **افحص الصياغة قبل إعادة التحميل.** في PostgreSQL 10 وما بعده يعرض العرض `pg_hba_file_rules` كيف حلّل الخادم الملف، ويبلغ عمود `error` عن المشكلات. شغّله على الملف المحفوظ قبل إعادة التحميل.\n3. **أعد التحميل ولا تعد التشغيل.** يطبّق `SELECT pg_reload_conf();` التغيير دون قطع الجلسات القائمة.\n4. **أبقِ جلسة مدير مفتوحة** عبر قاعدة `local` أثناء الاختبار لتتمكن من التراجع.\n5. **اختبر اتصالًا مسموحًا وآخر مرفوضًا** من شبكات العملاء الحقيقية.\n\nلا تختبر المسار المسموح وحده. فالاتصال المرفوض الذي ينجح على غير المتوقع هو إشارة إلى أن قاعدة أوسع تقع فوق قاعدتك الجديدة."
+   },
+   {
+    "id": "hba-term",
+    "type": "terminal",
+    "title": "Validating and applying pg_hba.conf",
+    "lines": [
+     {
+      "cmd": "sudo -u postgres psql -c \"SELECT line_number, type, address, auth_method, error FROM pg_hba_file_rules ORDER BY line_number;\"",
+      "output": " line_number |  type   |   address    | auth_method | error\n-------------+---------+--------------+-------------+-------\n           4 | hostssl | 10.20.1.0/24 | scram-sha-256 |\n           6 | hostssl | 10.20.2.15   | scram-sha-256 |\n          14 | host    | 0.0.0.0      | reject      |",
+      "comment": "عمود error الفارغ يعني أن كل الأسطر حُلّلت بنجاح."
+     },
+     {
+      "cmd": "sudo -u postgres psql -c \"SELECT pg_reload_conf();\"",
+      "output": " pg_reload_conf\n----------------\n t",
+      "comment": "يطبّق القواعد الجديدة دون قطع الجلسات."
+     },
+     {
+      "cmd": "psql \"host=db1.example.com dbname=shop user=svc_web sslmode=verify-full\" -c \"SELECT 1;\"",
+      "output": "psql: error: connection to server at \"db1.example.com\" (203.0.113.9), port 5432 failed: FATAL:  no pg_hba.conf entry for host \"198.51.100.20\", user \"svc_web\", database \"shop\", SSL encryption",
+      "comment": "عميل خارج 10.20.1.0/24 يُرفض: القاعدة تعمل."
+     }
+    ],
+    "caption": "تحقق، ثم أعد التحميل، ثم أثبت أن الاتصال المرفوض مرفوض فعلًا."
+   },
+   {
+    "id": "special",
+    "type": "text",
+    "markdown": "## حالات خاصة تستحق التخطيط لها\n\nتستحق بعض الحالات قواعد خاصة بها بدل الاختصار:\n\n- **الاستنساخ.** الكلمة `replication` في حقل قاعدة البيانات كلمة مفتاحية ولا يطابقها `all` أبدًا. امنح الخادم الاحتياطي قاعدة `hostssl` خاصة به، محصورة في عنوانه الوحيد ودور مخصص. راجع [أمن استنساخ قواعد البيانات](/learn/systems-infrastructure-security/database-replication-security).\n- **مجمّعات الاتصال.** إذا وقف PgBouncer أمام PostgreSQL فإن قاعدة البيانات ترى عنوان المجمّع لا عنوان التطبيق. قيّد القاعدة بالمجمّع وافرض هوية التطبيق في إعدادات المجمّع نفسه.\n- **المديرون البشر.** فضّل الشهادات أو الدليل على كلمات المرور المشتركة، واسمح لهم من مضيف قفز فقط.\n- **عملاء السحابة وVPN.** العناوين المتغيرة سبب لاستخدام بوابة ثابتة، لا لفتح النطاق.\n\nوثّق كل استثناء بتاريخ انتهاء. فالاستثناء بلا تاريخ يميل إلى أن يعيش أطول من المشروع الذي احتاجه."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تترك قواعد trust خلفك",
+    "markdown": "تطلب منك إجراءات الاسترداد أحيانًا ضبط `trust` مؤقتًا. استخدمه فقط مع النوع `local` وأنت على وحدة التحكم، وأزله فورًا. السطر المنسي `host all all 0.0.0.0/0 trust` يمنح كل من يصل إلى المنفذ صلاحية المدير الأعلى دون كلمة مرور."
+   },
+   {
+    "id": "monitor",
+    "type": "text",
+    "markdown": "## الرصد والانحراف\n\nلا تكون القواعد جيدة إلا بقدر استمرار دقتها. وتحافظ ثلاث ممارسات على صدقها:\n\n- **سجّل حالات الرفض.** مع `log_connections = on` تظهر الاتصالات المرفوضة والفاشلة في السجل مع المستخدم وقاعدة البيانات والعنوان. وارتفاع رسائل `no pg_hba.conf entry` يعني فحصًا أو عميلًا مضبوطًا خطأً. أرسل السجل إلى نظامك المركزي كما في [التدقيق وتسجيل النشاط في قواعد البيانات](/learn/systems-infrastructure-security/database-auditing-and-activity-logging).\n- **قارن مع Git.** يستطيع عمل مجدول مقارنة الملف الحي بالنسخة المعتمدة والتنبيه عند أي اختلاف.\n- **راجع كل ربع سنة.** أزل قواعد التطبيقات المتقاعدة وتأكد أن لكل قاعدة متبقية مالكًا.\n\nوأخيرًا تذكّر أن `pg_hba.conf` طبقة واحدة. فجدار الحماية وإعداد `listen_addresses` وفرض TLS من [TLS والتشفير في قواعد البيانات](/learn/systems-infrastructure-security/database-tls-and-encryption) تعمل معًا. وإذا أخطأ أحدها فينبغي أن تصمد البقية."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على خادم PostgreSQL مخبري **تملكه**، انسخ `pg_hba.conf` الفعّال إلى ملف احتياطي.\n2. أعد كتابته بالنمط الوارد في هذا الدرس: قاعدة `hostssl` واحدة لكل تطبيق بأصغر نطاق عناوين، ثم `reject` أخيرة.\n3. شغّل `SELECT * FROM pg_hba_file_rules WHERE error IS NOT NULL;` وأصلح ما يبلّغ عنه. ثم شغّل `SELECT pg_reload_conf();`.\n4. من مضيف مسموح اتصل بنجاح. ومن مضيف أو عنوان آخر تأكد من ظهور الخطأ `no pg_hba.conf entry`. واستعد النسخة الاحتياطية إن حدث خلل."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "pg_hba.conf",
+      "definition": "الملف الذي يقرر أي العملاء يتصلون وكيف يصادقون."
+     },
+     {
+      "term": "قاعدة أول مطابقة",
+      "definition": "يطبّق الخادم أول سطر يطابق الاتصال ويتجاهل الباقي."
+     },
+     {
+      "term": "hostssl",
+      "definition": "نوع قاعدة يطابق اتصالات TCP المشفّرة بـ TLS فقط."
+     },
+     {
+      "term": "reject",
+      "definition": "طريقة ترفض الاتصال فورًا."
+     },
+     {
+      "term": "peer",
+      "definition": "مصادقة محلية باسم مستخدم نظام التشغيل."
+     },
+     {
+      "term": "CIDR",
+      "definition": "صيغة مثل 10.20.1.0/24 لنطاق عناوين."
+     },
+     {
+      "term": "pg_hba_file_rules",
+      "definition": "عرض يبيّن كيف حلّل الخادم كل قاعدة مع الأخطاء."
+     },
+     {
+      "term": "انحراف الإعدادات",
+      "definition": "اختلاف الملف الحي عن النسخة المعتمدة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "تطابق قاعدتان اتصالًا. أيهما تُطبَّق؟",
+      "options": [
+       "الأخيرة",
+       "الأولى",
+       "الأشد صرامة",
+       "كلتاهما"
+      ],
+      "answer": 1,
+      "explanation": "يتوقف pg_hba.conf عند أول سطر مطابق، لذا الترتيب جزء من السياسة."
+     },
+     {
+      "question": "اتصال لا يطابق أي قاعدة. ماذا يحدث؟",
+      "options": [
+       "يُسمح به بكلمة مرور",
+       "يُرفض",
+       "يستخدم trust",
+       "يعود إلى md5"
+      ],
+      "answer": 1,
+      "explanation": "لا بديل ضمنيًّا: غياب القاعدة المطابقة يعني رفض الاتصال."
+     },
+     {
+      "question": "أي مما يلي ممارسات جيدة للقواعد؟ اختر كل ما ينطبق.",
+      "options": [
+       "استخدام hostssl للاتصالات البعيدة",
+       "استخدام أصغر نطاق عناوين ممكن",
+       "استخدام 0.0.0.0/0 للراحة",
+       "التعليق على كل قاعدة بمالكها"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "القواعد الضيقة والمشفّرة وذات المالك قابلة للمراجعة، بينما 0.0.0.0/0 يزيل الحاجز الشبكي."
+     },
+     {
+      "question": "كيف تفحص صياغة pg_hba.conf قبل تطبيقه؟",
+      "options": [
+       "الاستعلام في pg_hba_file_rules وقراءة عمود error",
+       "إعادة تشغيل الخادم",
+       "حذف الملف",
+       "تعطيل TLS"
+      ],
+      "answer": 0,
+      "explanation": "يحلّل العرض الملف ويسرد الأخطاء دون قطع الجلسات."
+     },
+     {
+      "question": "لماذا نُبقي جلسة مدير مفتوحة أثناء التعديل؟",
+      "options": [
+       "لتسريع إعادة التحميل",
+       "لتتمكن من التراجع إن حجبت نفسك",
+       "لتعطيل التسجيل",
+       "تتطلبه SCRAM"
+      ],
+      "answer": 1,
+      "explanation": "تنجو الجلسة القائمة من إعادة تحميل خاطئة وتتيح لك استعادة النسخة الاحتياطية."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يقرر `pg_hba.conf` من يحق له محاولة الدخول ومن أين وبأي طريقة؛ أول سطر مطابق يُعتمد وغياب المطابقة يعني الرفض.\n- اكتب قاعدة `hostssl` محددة لكل تطبيق بطريقة `scram-sha-256` أو `cert`، ثم اختم بـ `reject` صريح.\n- لا تستخدم `trust` ولا `0.0.0.0/0` للوصول البعيد، وأزل قواعد الاسترداد المؤقتة فورًا.\n- تحقق بـ `pg_hba_file_rules` وأعد التحميل بـ `pg_reload_conf()` واختبر الاتصالات المسموحة والمرفوضة معًا.\n- سجّل حالات الرفض، وقارن الملف الحي بنظام التحكم بالإصدارات، وراجع القواعد كل ربع سنة.\n\nبعد ذلك تنتقل طبقةً إلى الشبكة نفسها في [العزل الشبكي لقواعد البيانات](/learn/systems-infrastructure-security/database-network-isolation)."
+   }
+  ]
+ }
+}

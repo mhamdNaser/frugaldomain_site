@@ -1,0 +1,544 @@
+{
+  "slug": "proxmox-ve-security-architecture",
+  "title": "Proxmox VE Security Architecture",
+  "summary": "Map the services, ports, files and trust boundaries that make up Proxmox VE so that each later hardening step has a clear purpose.",
+  "duration_minutes": 25,
+  "objectives": [
+    "Identify the layers and components of a Proxmox VE node",
+    "Match each listening service to its port and intended audience",
+    "Explain what the cluster filesystem stores and why it is sensitive",
+    "List the trust boundaries in a Proxmox deployment",
+    "Inspect services and permissions on a node you own"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "An administrator at a hosting company is asked a simple question by an auditor: \"If someone steals the root password of one Proxmox node, what can they reach?\" The honest answer is not \"one server.\" In a cluster it is every node, every guest and every stored credential. To answer such questions you need a mental map of the services that make up Proxmox VE, the ports they use, the files they trust and the boundaries between them.\n\nThis lesson walks through that map. Later lessons harden each part, but hardening without understanding is guesswork."
+    },
+    {
+      "id": "stack",
+      "type": "text",
+      "markdown": "## The layers of Proxmox VE\n\nProxmox VE is built from well-known open-source parts rather than a proprietary stack. That is good for transparency and patching, and it means you can use standard Linux tools to inspect it.\n\n| Layer | Component | Security relevance |\n|:--|:--|:--|\n| Operating system | Debian GNU/Linux | Normal package updates, SSH, `systemd`, kernel settings |\n| Virtualization | KVM and QEMU | One QEMU process per VM, running on the host |\n| Containers | LXC | Share the host kernel, so isolation is weaker than a VM |\n| Cluster filesystem | `pmxcfs` (mounted at `/etc/pve`) | Configuration, users, ACLs and secrets, replicated across nodes |\n| Cluster messaging | Corosync | Membership and quorum between nodes |\n| Management | `pvedaemon`, `pveproxy`, `pvestatd`, `pve-firewall` | Web console, API and firewall |\n| Storage | LVM, ZFS, Ceph, NFS and others | Where disk images and backups live |\n\nBecause the host is Debian, a Linux account with a shell on the host is already powerful. The right mental model is: **anyone with root on a node can read and change almost everything the node and its guests contain.**"
+    },
+    {
+      "id": "services",
+      "type": "text",
+      "markdown": "## Services, ports and trust\n\nEvery listening service is a door. Knowing the doors is the first step to deciding which should be open to whom.\n\n| Service | Port | Purpose | Who should reach it |\n|:--|:--|:--|:--|\n| `pveproxy` | TCP 8006 | HTTPS web console and API | Administrators only |\n| `sshd` | TCP 22 | Shell access and cluster tasks | Administrators and cluster nodes |\n| `spiceproxy` | TCP 3128 | SPICE console proxy | Console users, if used |\n| Corosync | UDP 5405-5412 | Cluster membership | Cluster nodes only |\n| `pvedaemon` | TCP 85 (localhost) | Privileged API worker | Local only |\n| Live migration | TCP 60000-60050 | VM memory transfer between nodes | Cluster nodes only |\n\nThe design splits privilege on purpose. `pveproxy` is the public-facing part and runs as the unprivileged user `www-data`. It forwards authenticated requests to `pvedaemon`, which runs as root and performs the real work. That separation limits the damage of a bug in the web layer, but only if you keep the software updated."
+    },
+    {
+      "id": "exposure",
+      "type": "text",
+      "markdown": "## What the network can see\n\nImagine the node from the point of view of a scanner on the same network. It sees SSH and the web console, and perhaps the SPICE proxy. It does not see `pvedaemon`, because that service listens only on localhost. If the Corosync network is separate, the scanner does not see cluster traffic either. This is the practical value of the architecture: the fewer interfaces that answer on the user network, the less there is to attack.\n\nThere are two questions to ask of every open port. First, does anyone legitimately need it from this network? Second, if it were exploited, what would the attacker gain? Port 8006 gives the most because it leads to the API. Port 22 comes second because it leads to a root-capable shell. Those two deserve the strictest controls: restricted source addresses, strong authentication and complete logging, each covered in the next lessons.\n\nThe animation that follows shows what happens to a single API request once it reaches the node."
+    },
+    {
+      "id": "login-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "An API request through the Proxmox services",
+      "caption": "Each hop is a place to authenticate, authorize or log.",
+      "data": {
+        "actors": [
+          {
+            "id": "adm",
+            "label": "Administrator",
+            "sub": "10.20.0.15",
+            "icon": "user"
+          },
+          {
+            "id": "px",
+            "label": "pveproxy",
+            "sub": "8006 / www-data",
+            "icon": "globe"
+          },
+          {
+            "id": "pd",
+            "label": "pvedaemon",
+            "sub": "root / localhost",
+            "icon": "cpu"
+          },
+          {
+            "id": "fs",
+            "label": "pmxcfs",
+            "sub": "/etc/pve",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "from": "adm",
+            "to": "px",
+            "label": "POST /access/ticket",
+            "detail": "user + password + TOTP",
+            "note": "The administrator logs in over HTTPS. The password and second factor travel inside TLS."
+          },
+          {
+            "from": "px",
+            "to": "pd",
+            "label": "Verify credentials",
+            "detail": "PAM / PVE realm",
+            "note": "The unprivileged proxy asks the root daemon to check the realm."
+          },
+          {
+            "from": "pd",
+            "to": "adm",
+            "label": "Ticket + CSRF token",
+            "detail": "cookie, 2 hours",
+            "tone": "secure",
+            "note": "On success a signed ticket is issued. It expires, so a stolen cookie has a limited life."
+          },
+          {
+            "from": "adm",
+            "to": "px",
+            "label": "POST /nodes/pve1/qemu/101/status/stop",
+            "detail": "ticket + CSRF",
+            "note": "A later request carries the ticket and a CSRF token."
+          },
+          {
+            "from": "pd",
+            "to": "fs",
+            "label": "Check ACL",
+            "detail": "user.cfg",
+            "note": "The permission check reads the ACL stored in the cluster filesystem."
+          },
+          {
+            "from": "pd",
+            "to": "adm",
+            "label": "403 Permission check failed",
+            "tone": "blocked",
+            "note": "The user lacks VM.PowerMgmt on that VM, so the request is refused and logged."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pmxcfs",
+      "type": "text",
+      "markdown": "## The cluster filesystem and its secrets\n\n`pmxcfs` is a small database exposed as a filesystem at `/etc/pve`. It is replicated to every node through Corosync, so a change on one node appears on all of them within a moment. Most Proxmox configuration lives here: VM definitions, storage definitions, firewall rules, users and permissions.\n\nSome files are especially sensitive.\n\n- `/etc/pve/user.cfg` holds users, groups, roles and ACLs.\n- `/etc/pve/priv/` is readable by root only. It holds the authentication keys, `shadow.cfg` with the hashed passwords of `@pve` users, TFA data and storage credentials.\n- `/etc/pve/corosync.conf` holds cluster membership. The shared Corosync key lives in `/etc/corosync/authkey`.\n\nThe lesson is that **a node is not an island**. Compromising one node exposes secrets that are valid on the others. The same fact explains why [cluster security](/learn/systems-infrastructure-security/proxmox-cluster-security) is treated as its own topic."
+    },
+    {
+      "id": "inspect",
+      "type": "terminal",
+      "title": "Inspecting the architecture on your own node",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "systemctl list-units 'pve*' --type=service --no-legend | awk '{print $1,$3}'",
+          "output": "pve-cluster.service active\npve-firewall.service active\npvedaemon.service active\npveproxy.service active\npvestatd.service active\nspiceproxy.service active",
+          "comment": "The management services. Anything you do not use, such as spiceproxy, can be disabled later."
+        },
+        {
+          "cmd": "ls -ld /etc/pve/priv /etc/pve/user.cfg",
+          "output": "drwx------ 2 root www-data 0 Nov  3 09:12 /etc/pve/priv\n-rw-r----- 1 root www-data 612 Nov  3 09:12 /etc/pve/user.cfg",
+          "comment": "priv is mode 700 for root. user.cfg is readable by the www-data group so the web layer can read ACLs."
+        },
+        {
+          "cmd": "pvecm status | grep -E 'Nodes|Quorate'",
+          "output": "Nodes:            3\nQuorate:          Yes",
+          "comment": "A three-node cluster with quorum. Secrets are shared across all three."
+        }
+      ],
+      "caption": "Run on a node you own. Output will differ on your system."
+    },
+    {
+      "id": "boundaries",
+      "type": "text",
+      "markdown": "## Trust boundaries to remember\n\nA **trust boundary** is a line where the level of trust changes and checks must happen. In Proxmox VE the important ones are:\n\n1. **Network to web console.** Everything arriving on port 8006 is untrusted until it authenticates.\n2. **Web layer to privileged daemon.** The proxy is unprivileged, the daemon is not.\n3. **Guest to host.** A VM is separated from the host by the CPU's virtualization features. A container is separated only by kernel namespaces, so treat containers as less isolated. See [LXC security](/learn/systems-infrastructure-security/linux-container-lxc-security).\n4. **Node to node.** Nodes trust each other through SSH keys and Corosync. A compromised node is inside that trust.\n5. **Host to storage and backup targets.** The credentials the host holds to reach storage are a way in to that storage.\n\nWhen you review a design, trace a path across each boundary and ask which control stops an attacker at that line. If the answer is \"none,\" you have found a gap. The next lesson, [Proxmox host hardening](/learn/systems-infrastructure-security/proxmox-host-hardening), addresses the host boundary directly."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Draw your own diagram",
+      "markdown": "Take ten minutes to sketch your environment: nodes, networks, storage and who can reach port 8006. A hand-drawn diagram that shows where secrets live and which networks touch the management interface will reveal more risk than a long checklist."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a lab node you own, map the trust boundaries.\n\n1. Run `systemctl list-units 'pve*' --type=service` and list the services.\n2. Run `ss -tlnp` and match each port to the table in this lesson.\n3. Run `ls -l /etc/pve/priv` and note which files exist. Do not copy or print their contents.\n4. In a notebook, write one sentence per trust boundary describing which control protects it today.\n\nMark any boundary where your answer is \"nothing\" and carry that list into the next lesson."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "pmxcfs",
+          "definition": "The cluster filesystem mounted at /etc/pve, replicated by Corosync."
+        },
+        {
+          "term": "Corosync",
+          "definition": "The messaging layer that provides cluster membership and quorum."
+        },
+        {
+          "term": "pveproxy",
+          "definition": "The unprivileged HTTPS front end for the console and API on port 8006."
+        },
+        {
+          "term": "pvedaemon",
+          "definition": "The root-level worker that performs API actions."
+        },
+        {
+          "term": "KVM/QEMU",
+          "definition": "The kernel module and emulator that run each virtual machine."
+        },
+        {
+          "term": "LXC",
+          "definition": "Linux containers that share the host kernel."
+        },
+        {
+          "term": "Quorum",
+          "definition": "The majority of nodes needed for the cluster to make changes."
+        },
+        {
+          "term": "Trust boundary",
+          "definition": "A line where trust changes and checks must be enforced."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which service is the public-facing part of the Proxmox management plane?",
+          "options": [
+            "pveproxy on TCP 8006",
+            "pvedaemon on TCP 85",
+            "corosync on UDP 5405",
+            "pvestatd"
+          ],
+          "answer": 0,
+          "explanation": "pveproxy serves the web console and API. It runs unprivileged and hands work to pvedaemon."
+        },
+        {
+          "question": "What is stored in /etc/pve? Choose all that apply.",
+          "options": [
+            "VM and storage definitions",
+            "Users, roles and ACLs",
+            "The contents of every VM disk",
+            "Firewall rules"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "pmxcfs holds configuration, not disk data. Disk images live on the storage backends."
+        },
+        {
+          "question": "Why are containers considered less isolated than VMs?",
+          "options": [
+            "They use more memory",
+            "They share the host kernel",
+            "They cannot be backed up",
+            "They have no network"
+          ],
+          "answer": 1,
+          "explanation": "A kernel flaw can affect every container because they all use the same kernel."
+        },
+        {
+          "question": "What does root access on one cluster node generally imply?",
+          "options": [
+            "Nothing beyond that node",
+            "Exposure of secrets valid on other nodes",
+            "Automatic shutdown of the cluster",
+            "Loss of quorum"
+          ],
+          "answer": 1,
+          "explanation": "Cluster configuration, keys and storage credentials are shared, so one compromised node is a risk to all."
+        },
+        {
+          "question": "Who should be able to reach Corosync ports?",
+          "options": [
+            "Everyone on the internet",
+            "Cluster nodes only",
+            "Only guests",
+            "Backup servers only"
+          ],
+          "answer": 1,
+          "explanation": "Corosync is internal cluster traffic and belongs on a dedicated, restricted network."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nProxmox VE is Debian Linux with KVM, LXC, a replicated configuration filesystem and a small set of management services. The web proxy on port 8006 faces the network and hands work to a root daemon. Secrets in `/etc/pve` are shared across the cluster, so one compromised node is a danger to all. Learn the services, ports and trust boundaries now, because every control in the coming lessons protects one of them. Next, harden the host itself in [Proxmox host hardening](/learn/systems-infrastructure-security/proxmox-host-hardening)."
+    }
+  ],
+  "ar": {
+    "title": "البنية الأمنية لـ Proxmox VE",
+    "summary": "ارسم خريطة الخدمات والمنافذ والملفات وحدود الثقة التي يتكوّن منها Proxmox VE ليكون لكل خطوة تحصين لاحقة غرض واضح.",
+    "objectives": [
+      "حدّد طبقات عقدة Proxmox VE ومكوّناتها",
+      "طابق كل خدمة مستمعة مع منفذها وجمهورها المقصود",
+      "اشرح ما يخزّنه نظام ملفات العنقود ولماذا هو حساس",
+      "عدّد حدود الثقة في نشر Proxmox",
+      "افحص الخدمات والصلاحيات على عقدة تملكها"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يسأل مدقّق مديرَ النظام في شركة استضافة سؤالًا بسيطًا: «إذا سرق أحدهم كلمة مرور root لعقدة Proxmox واحدة فماذا يستطيع أن يبلغ؟» الجواب الصادق ليس «خادمًا واحدًا». ففي العنقود يبلغ كل العقد وكل الضيوف وكل بيانات الاعتماد المخزّنة. وللإجابة عن مثل هذه الأسئلة تحتاج إلى خريطة ذهنية للخدمات التي يتألف منها Proxmox VE، ومنافذها، والملفات التي تثق بها، والحدود بينها.\n\nيمشي بك هذا الدرس عبر تلك الخريطة. تُحصّن الدروس اللاحقة كل جزء، لكن التحصين دون فهم تخمين."
+      },
+      {
+        "id": "stack",
+        "type": "text",
+        "markdown": "## طبقات Proxmox VE\n\nيُبنى Proxmox VE من مكوّنات مفتوحة المصدر معروفة لا من حزمة مغلقة. هذا جيد للشفافية والتحديث، ويعني أنك تستطيع فحصه بأدوات لينكس المعتادة.\n\n| الطبقة | المكوّن | الصلة الأمنية |\n|:--|:--|:--|\n| نظام التشغيل | Debian GNU/Linux | تحديثات الحزم المعتادة وSSH و`systemd` وإعدادات النواة |\n| المحاكاة الافتراضية | KVM وQEMU | عملية QEMU واحدة لكل جهاز افتراضي تعمل على المضيف |\n| الحاويات | LXC | تشارك نواة المضيف، فعزلها أضعف من الجهاز الافتراضي |\n| نظام ملفات العنقود | `pmxcfs` (مركّب على `/etc/pve`) | الإعدادات والمستخدمون وقوائم التحكم والأسرار، تُنسخ بين العقد |\n| مراسلة العنقود | Corosync | العضوية والنصاب (Quorum) بين العقد |\n| الإدارة | `pvedaemon` و`pveproxy` و`pvestatd` و`pve-firewall` | وحدة الويب وواجهة API وجدار الحماية |\n| التخزين | LVM وZFS وCeph وNFS وغيرها | مكان صور الأقراص والنسخ الاحتياطية |\n\nولأن المضيف Debian، فإن حساب لينكس له صدفة (Shell) على المضيف قوي أصلًا. النموذج الذهني الصحيح هو: **كل من يملك root على عقدة يستطيع قراءة وتغيير معظم ما تحويه العقدة وضيوفها.**"
+      },
+      {
+        "id": "services",
+        "type": "text",
+        "markdown": "## الخدمات والمنافذ والثقة\n\nكل خدمة مستمعة باب. ومعرفة الأبواب أول خطوة لتقرير أيها يُفتح ولمن.\n\n| الخدمة | المنفذ | الغرض | من يجب أن يصل إليها |\n|:--|:--|:--|:--|\n| `pveproxy` | TCP 8006 | وحدة الويب HTTPS وواجهة API | المدراء فقط |\n| `sshd` | TCP 22 | الوصول إلى الصدفة ومهام العنقود | المدراء وعقد العنقود |\n| `spiceproxy` | TCP 3128 | وكيل وحدة SPICE | مستخدمو الوحدة إن استُخدمت |\n| Corosync | UDP 5405-5412 | عضوية العنقود | عقد العنقود فقط |\n| `pvedaemon` | TCP 85 (المضيف المحلي) | عامل API ذو صلاحيات | محلي فقط |\n| الترحيل الحي | TCP 60000-60050 | نقل ذاكرة الجهاز بين العقد | عقد العنقود فقط |\n\nيفصل التصميم الصلاحيات عمدًا. فـ`pveproxy` هو الجزء المواجه للشبكة ويعمل بالمستخدم غير المميّز `www-data`. ويمرّر الطلبات الموثّقة إلى `pvedaemon` الذي يعمل بصلاحية root وينفّذ العمل الفعلي. يحدّ هذا الفصل من أثر خلل في طبقة الويب، لكن بشرط أن تُبقي البرمجيات محدّثة."
+      },
+      {
+        "id": "exposure",
+        "type": "text",
+        "markdown": "## ما الذي تراه الشبكة\n\nتخيّل العقدة من وجهة نظر ماسح على الشبكة نفسها. يرى SSH ووحدة الويب وربما وكيل SPICE. ولا يرى `pvedaemon` لأنه يستمع على المضيف المحلي فقط. وإن كانت شبكة Corosync منفصلة فلن يرى مرور العنقود أيضًا. هذه هي القيمة العملية للبنية: كلما قلّت الواجهات التي تجيب على شبكة المستخدمين قلّ ما يمكن مهاجمته.\n\nهناك سؤالان عن كل منفذ مفتوح. الأول: هل يحتاجه أحد فعلًا من هذه الشبكة؟ والثاني: لو استُغلّ فماذا يكسب المهاجم؟ يمنح المنفذ 8006 أكثر شيء لأنه يؤدي إلى API، ويأتي المنفذ 22 ثانيًا لأنه يؤدي إلى صدفة قادرة على استخدام root. ويستحق هذان أشدّ الضوابط: عناوين مصدر مقيّدة، ومصادقة قوية، وتسجيل كامل، وكلها تُغطّى في الدروس القادمة.\n\nيعرض الرسم المتحرك التالي ما يحدث لطلب API واحد حين يصل إلى العقدة."
+      },
+      {
+        "id": "login-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "طلب API عبر خدمات Proxmox",
+        "caption": "كل قفزة موضع للمصادقة أو التخويل أو التسجيل.",
+        "data": {
+          "actors": [
+            {
+              "id": "adm",
+              "label": "المدير",
+              "sub": "10.20.0.15",
+              "icon": "user"
+            },
+            {
+              "id": "px",
+              "label": "pveproxy",
+              "sub": "8006 / www-data",
+              "icon": "globe"
+            },
+            {
+              "id": "pd",
+              "label": "pvedaemon",
+              "sub": "root / localhost",
+              "icon": "cpu"
+            },
+            {
+              "id": "fs",
+              "label": "pmxcfs",
+              "sub": "/etc/pve",
+              "icon": "database"
+            }
+          ],
+          "steps": [
+            {
+              "from": "adm",
+              "to": "px",
+              "label": "POST /access/ticket",
+              "detail": "user + password + TOTP",
+              "note": "يسجّل المدير الدخول عبر HTTPS وتنتقل كلمة المرور والعامل الثاني داخل TLS."
+            },
+            {
+              "from": "px",
+              "to": "pd",
+              "label": "تحقق من البيانات",
+              "detail": "PAM / PVE realm",
+              "note": "يطلب الوكيل غير المميّز من الخدمة ذات الصلاحيات فحص النطاق."
+            },
+            {
+              "from": "pd",
+              "to": "adm",
+              "label": "تذكرة + رمز CSRF",
+              "detail": "كوكي، ساعتان",
+              "tone": "secure",
+              "note": "عند النجاح تصدر تذكرة موقّعة. تنتهي صلاحيتها، فعمر الكوكي المسروق محدود."
+            },
+            {
+              "from": "adm",
+              "to": "px",
+              "label": "POST /nodes/pve1/qemu/101/status/stop",
+              "detail": "ticket + CSRF",
+              "note": "يحمل طلب لاحق التذكرة ورمز CSRF."
+            },
+            {
+              "from": "pd",
+              "to": "fs",
+              "label": "فحص ACL",
+              "detail": "user.cfg",
+              "note": "يقرأ فحص الصلاحية قائمة التحكم المخزّنة في نظام ملفات العنقود."
+            },
+            {
+              "from": "pd",
+              "to": "adm",
+              "label": "403 فشل فحص الصلاحية",
+              "tone": "blocked",
+              "note": "يفتقر المستخدم إلى VM.PowerMgmt على ذلك الجهاز، فيُرفض الطلب ويُسجَّل."
+            }
+          ]
+        }
+      },
+      {
+        "id": "pmxcfs",
+        "type": "text",
+        "markdown": "## نظام ملفات العنقود وأسراره\n\n`pmxcfs` قاعدة بيانات صغيرة تُعرض كنظام ملفات عند `/etc/pve`. تُنسخ إلى كل عقدة عبر Corosync، فيظهر التغيير على عقدة في جميع العقد خلال لحظات. تعيش هنا معظم إعدادات Proxmox: تعريفات الأجهزة والتخزين وقواعد الجدار والمستخدمين والصلاحيات.\n\nبعض الملفات حساس بوجه خاص.\n\n- يحوي `/etc/pve/user.cfg` المستخدمين والمجموعات والأدوار وقوائم ACL.\n- المجلد `/etc/pve/priv/` يقرؤه root فقط، ويحوي مفاتيح المصادقة و`shadow.cfg` بتجزئات كلمات مرور مستخدمي `@pve` وبيانات TFA وبيانات اعتماد التخزين.\n- يحوي `/etc/pve/corosync.conf` عضوية العنقود، ويقع مفتاح Corosync المشترك في `/etc/corosync/authkey`.\n\nالدرس أن **العقدة ليست جزيرة**. فاختراق عقدة واحدة يكشف أسرارًا صالحة على العقد الأخرى. وهذه الحقيقة نفسها تفسّر معاملة [أمن العنقود](/learn/systems-infrastructure-security/proxmox-cluster-security) موضوعًا مستقلًا."
+      },
+      {
+        "id": "inspect",
+        "type": "terminal",
+        "title": "فحص البنية على عقدتك",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "systemctl list-units 'pve*' --type=service --no-legend | awk '{print $1,$3}'",
+            "output": "pve-cluster.service active\npve-firewall.service active\npvedaemon.service active\npveproxy.service active\npvestatd.service active\nspiceproxy.service active",
+            "comment": "خدمات الإدارة. أي خدمة لا تستخدمها مثل spiceproxy يمكن تعطيلها لاحقًا."
+          },
+          {
+            "cmd": "ls -ld /etc/pve/priv /etc/pve/user.cfg",
+            "output": "drwx------ 2 root www-data 0 Nov  3 09:12 /etc/pve/priv\n-rw-r----- 1 root www-data 612 Nov  3 09:12 /etc/pve/user.cfg",
+            "comment": "المجلد priv بصلاحية 700 لـ root. يقرأ مجموعة www-data الملف user.cfg ليقرأ مستوى الويب قوائم ACL."
+          },
+          {
+            "cmd": "pvecm status | grep -E 'Nodes|Quorate'",
+            "output": "Nodes:            3\nQuorate:          Yes",
+            "comment": "عنقود من ثلاث عقد وله نصاب. الأسرار مشتركة بين الثلاث."
+          }
+        ],
+        "caption": "شغّل على عقدة تملكها. تختلف المخرجات على نظامك."
+      },
+      {
+        "id": "boundaries",
+        "type": "text",
+        "markdown": "## حدود الثقة التي يجب تذكّرها\n\n**حدّ الثقة (Trust boundary)** خط يتغيّر عنده مستوى الثقة وتجب عنده الفحوص. وأهمها في Proxmox VE:\n\n1. **من الشبكة إلى وحدة الويب.** كل ما يصل إلى المنفذ 8006 غير موثوق حتى يُصادَق عليه.\n2. **من طبقة الويب إلى الخدمة ذات الصلاحيات.** الوكيل بلا صلاحيات أما الخدمة فبصلاحيات.\n3. **من الضيف إلى المضيف.** يفصل الجهاز الافتراضي عن المضيف مزايا المحاكاة في المعالج، أما الحاوية فتفصلها فضاءات أسماء النواة فقط، فاعتبرها أقل عزلًا. راجع [أمن حاويات LXC](/learn/systems-infrastructure-security/linux-container-lxc-security).\n4. **من عقدة إلى عقدة.** تثق العقد ببعضها عبر مفاتيح SSH وCorosync. والعقدة المخترَقة داخل هذه الثقة.\n5. **من المضيف إلى التخزين ووجهات النسخ الاحتياطي.** بيانات الاعتماد التي يحملها المضيف للوصول إلى التخزين طريق إلى ذلك التخزين.\n\nعند مراجعة تصميم تتبّع مسارًا عبر كل حدّ واسأل أي ضابط يوقف المهاجم عند ذلك الخط. فإن كان الجواب «لا شيء» فقد وجدت ثغرة. يعالج الدرس التالي [تحصين مضيف Proxmox](/learn/systems-infrastructure-security/proxmox-host-hardening) حدّ المضيف مباشرة."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "ارسم مخططك الخاص",
+        "markdown": "خصّص عشر دقائق لرسم بيئتك: العقد والشبكات والتخزين ومن يستطيع بلوغ المنفذ 8006. مخطط مرسوم باليد يبيّن أماكن الأسرار والشبكات الملامسة لواجهة الإدارة يكشف مخاطر أكثر من قائمة فحص طويلة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على عقدة مختبر تملكها ارسم خريطة حدود الثقة.\n\n1. شغّل `systemctl list-units 'pve*' --type=service` ودوّن الخدمات.\n2. شغّل `ss -tlnp` وطابق كل منفذ مع الجدول في هذا الدرس.\n3. شغّل `ls -l /etc/pve/priv` ولاحظ الملفات الموجودة. لا تنسخ محتوياتها ولا تطبعها.\n4. في دفترك اكتب جملة لكل حدّ ثقة تصف الضابط الذي يحميه حاليًا.\n\nعلّم أي حدّ جوابه «لا شيء» وانقل هذه القائمة إلى الدرس التالي."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "pmxcfs",
+            "definition": "نظام ملفات العنقود المركّب على /etc/pve والمنسوخ عبر Corosync."
+          },
+          {
+            "term": "Corosync",
+            "definition": "طبقة المراسلة التي توفّر عضوية العنقود والنصاب."
+          },
+          {
+            "term": "pveproxy",
+            "definition": "الواجهة الأمامية HTTPS غير المميّزة لوحدة الويب وAPI على المنفذ 8006."
+          },
+          {
+            "term": "pvedaemon",
+            "definition": "العامل ذو صلاحية root الذي ينفّذ إجراءات API."
+          },
+          {
+            "term": "KVM/QEMU",
+            "definition": "وحدة النواة والمحاكي اللذان يشغّلان كل جهاز افتراضي."
+          },
+          {
+            "term": "LXC",
+            "definition": "حاويات لينكس التي تشارك نواة المضيف."
+          },
+          {
+            "term": "النصاب (Quorum)",
+            "definition": "أغلبية العقد اللازمة لكي يُجري العنقود تغييرات."
+          },
+          {
+            "term": "حدّ الثقة",
+            "definition": "خط يتغيّر عنده مستوى الثقة وتجب عنده الفحوص."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي خدمة هي الجزء المواجه للشبكة من مستوى إدارة Proxmox؟",
+            "options": [
+              "pveproxy على TCP 8006",
+              "pvedaemon على TCP 85",
+              "corosync على UDP 5405",
+              "pvestatd"
+            ],
+            "answer": 0,
+            "explanation": "يقدّم pveproxy وحدة الويب وAPI، ويعمل بلا صلاحيات ويسلّم العمل إلى pvedaemon."
+          },
+          {
+            "question": "ما الذي يُخزَّن في /etc/pve؟ اختر كل ما ينطبق.",
+            "options": [
+              "تعريفات الأجهزة والتخزين",
+              "المستخدمون والأدوار وقوائم ACL",
+              "محتويات كل قرص جهاز افتراضي",
+              "قواعد الجدار"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "يحوي pmxcfs الإعدادات لا بيانات الأقراص، فصور الأقراص على مخازن التخزين."
+          },
+          {
+            "question": "لماذا تُعد الحاويات أقل عزلًا من الأجهزة الافتراضية؟",
+            "options": [
+              "تستهلك ذاكرة أكثر",
+              "تشارك نواة المضيف",
+              "لا يمكن نسخها احتياطيًا",
+              "ليس لها شبكة"
+            ],
+            "answer": 1,
+            "explanation": "قد يؤثر خلل في النواة في كل الحاويات لأنها تستخدم النواة نفسها."
+          },
+          {
+            "question": "ماذا يعني عمومًا الحصول على root على عقدة واحدة في العنقود؟",
+            "options": [
+              "لا شيء يتجاوز تلك العقدة",
+              "انكشاف أسرار صالحة على العقد الأخرى",
+              "إيقاف العنقود تلقائيًا",
+              "فقدان النصاب"
+            ],
+            "answer": 1,
+            "explanation": "الإعدادات والمفاتيح وبيانات اعتماد التخزين مشتركة، فعقدة مخترَقة واحدة خطر على الجميع."
+          },
+          {
+            "question": "من يجب أن يصل إلى منافذ Corosync؟",
+            "options": [
+              "الجميع على الإنترنت",
+              "عقد العنقود فقط",
+              "الضيوف فقط",
+              "خوادم النسخ فقط"
+            ],
+            "answer": 1,
+            "explanation": "Corosync مرور داخلي للعنقود ومكانه شبكة مخصصة ومقيّدة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nProxmox VE هو Debian Linux مع KVM وLXC ونظام ملفات إعدادات منسوخ ومجموعة صغيرة من خدمات الإدارة. يواجه وكيل الويب على المنفذ 8006 الشبكة ويسلّم العمل إلى خدمة بصلاحية root. الأسرار في `/etc/pve` مشتركة عبر العنقود، فعقدة مخترَقة واحدة خطر على الجميع. تعلّم الخدمات والمنافذ وحدود الثقة الآن، فكل ضابط في الدروس القادمة يحمي واحدًا منها. بعد ذلك حصّن المضيف نفسه في [تحصين مضيف Proxmox](/learn/systems-infrastructure-security/proxmox-host-hardening)."
+      }
+    ]
+  }
+}

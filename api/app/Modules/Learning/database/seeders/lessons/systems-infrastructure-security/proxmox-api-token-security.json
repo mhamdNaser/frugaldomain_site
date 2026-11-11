@@ -1,0 +1,658 @@
+{
+ "slug": "proxmox-api-token-security",
+ "title": "Proxmox API Token Security",
+ "summary": "Create, scope, use, audit and revoke Proxmox API tokens so automation never needs a root password.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Create a privilege-separated, expiring token for a service user",
+  "Grant a minimal role on a narrow ACL path and verify it",
+  "Call the API with certificate verification and no hard-coded secret",
+  "Audit, rotate and revoke tokens using pveum and logs"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Your backup script, your Terraform plan and your monitoring dashboard all need to talk to Proxmox VE. The lazy way is to give each of them the `root@pam` password. That password then lives in a script, a CI variable and a config file, and anyone who reads any of them owns every virtual machine on the cluster.\n\nAPI tokens exist to avoid exactly this. A token is a separate credential that belongs to a user, can be limited to a few privileges, can expire, and can be revoked without touching the user's password. In this lesson you will create tokens the safe way, scope them tightly, use them from a client, and audit them. It builds on [role-based access control](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac) and [authentication and MFA](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa)."
+  },
+  {
+   "type": "text",
+   "id": "anatomy",
+   "markdown": "## What a token is\n\nA token ID has the form `user@realm!tokenname`, for example `automation@pve!backup-bot`. The secret is a UUID that Proxmox displays exactly once, at creation. Only a hash is stored afterward, so a lost secret cannot be recovered. You can only replace it.\n\nClients send the token in an HTTP header, so no login ticket and no CSRF token are needed:\n\n`Authorization: PVEAPIToken=automation@pve!backup-bot=<secret>`\n\nTwo properties matter for security:\n\n- **Tokens skip two-factor authentication.** MFA protects interactive logins. A token is a bearer secret, so protecting it is entirely your job.\n- **Privilege separation decides the blast radius.** A token created with `--privsep 0` inherits every permission of its user. A token with `--privsep 1` (the default in the web interface) starts with no permissions and receives only what you grant it directly."
+  },
+  {
+   "type": "text",
+   "id": "compare",
+   "markdown": "## Token, ticket or password?\n\nProxmox offers three ways to authenticate an API client. Choose by how long the client lives and who operates it.\n\n| Method | Lifetime | MFA applies | Best for | Main risk |\n|:--|:--|:--|:--|:--|\n| Username and password | Until changed | Yes | Humans in the web interface | Reused or shared passwords |\n| Login ticket | About two hours | Yes | Short interactive sessions | Needs CSRF handling and a stored password |\n| API token | Until expiry or revocation | No | Unattended automation | A leaked secret works from anywhere |\n\nThe table shows why tokens are the right tool for scripts but the wrong tool for people. A script cannot answer an MFA prompt, so a token with a tiny role and a short life is safer than a stored password. A person should always use a ticket obtained with MFA."
+  },
+  {
+   "type": "text",
+   "id": "create",
+   "markdown": "## Step 1: Create a dedicated user and token\n\nNever attach automation to a human account. Create a service user in the `pve` realm, give it no password, and create the token under it. Pick an expiry: a token that never expires is a credential you will forget.\n\nCompute the expiry as a Unix timestamp. The `date` command does this on the node."
+  },
+  {
+   "type": "terminal",
+   "id": "create-term",
+   "title": "pve1 - create the token",
+   "lines": [
+    {
+     "cmd": "pveum user add automation@pve --comment 'Backup automation'",
+     "comment": "Service user with no password: it can never log in interactively."
+    },
+    {
+     "cmd": "date -d '+90 days' +%s",
+     "output": "1792000000",
+     "comment": "Expiry 90 days from now (example value)."
+    },
+    {
+     "cmd": "pveum user token add automation@pve backup-bot --privsep 1 --expire 1792000000 --comment 'nightly backup job'",
+     "output": "┌──────────────┬──────────────────────────────────────┐\n│ key          │ value                                │\n╞══════════════╪══════════════════════════════════════╡\n│ full-tokenid │ automation@pve!backup-bot            │\n├──────────────┼──────────────────────────────────────┤\n│ info         │ {\"expire\":1792000000,\"privsep\":\"1\"}   │\n├──────────────┼──────────────────────────────────────┤\n│ value        │ <secret-shown-once>                  │\n└──────────────┴──────────────────────────────────────┘",
+     "comment": "The secret in `value` appears only now. Put it straight into your secret manager."
+    }
+   ],
+   "caption": "Creating a service user and an expiring, privilege-separated token."
+  },
+  {
+   "type": "text",
+   "id": "scope",
+   "markdown": "## Step 2: Grant the minimum\n\nWith `--privsep 1` the new token can do nothing. Grant a role on a path. A path is a node in the permission tree: `/vms/105` is one machine, `/pool/backup-pool` is a resource pool, `/` is everything.\n\nThe built-in roles are a starting point:\n\n| Role | Allows | Typical use |\n|:--|:--|:--|\n| `PVEAuditor` | Read-only view | Monitoring, inventory |\n| `PVEVMUser` | Console, power on/off | Helpdesk tools |\n| `PVEDatastoreUser` | Allocate and browse storage | Backup client |\n| `PVEVMAdmin` | Full control of VMs | Provisioning pipeline |\n| `Administrator` | Everything | Almost never a token |\n\nIf no built-in role fits, create a custom role with only the privileges the job uses, for example `VM.Backup` and `Datastore.AllocateSpace`. A backup bot does not need `VM.Console`."
+  },
+  {
+   "type": "terminal",
+   "id": "scope-term",
+   "title": "pve1 - scope and verify",
+   "lines": [
+    {
+     "cmd": "pveum role add BackupOnly --privs 'VM.Audit VM.Backup Datastore.AllocateSpace Datastore.Audit'",
+     "comment": "Custom role with four privileges."
+    },
+    {
+     "cmd": "pveum acl modify /pool/backup-pool --tokens 'automation@pve!backup-bot' --roles BackupOnly",
+     "comment": "Grant on one pool, not on `/`."
+    },
+    {
+     "cmd": "pveum user permissions 'automation@pve!backup-bot' --path /vms/105",
+     "output": "┌─────────┬───────────┐\n│ path    │ privs     │\n╞═════════╪═══════════╡\n│ /vms/105│ VM.Audit  │\n│         │ VM.Backup │\n└─────────┴───────────┘",
+     "comment": "Effective permissions: verify, never assume."
+    },
+    {
+     "cmd": "pveum user permissions 'automation@pve!backup-bot' --path /nodes/pve1",
+     "output": "(empty)",
+     "comment": "Nothing on the node itself, as intended."
+    }
+   ],
+   "caption": "Granting a custom role on a pool and checking effective permissions."
+  },
+  {
+   "type": "text",
+   "id": "use",
+   "markdown": "## Step 3: Use the token safely\n\nA client sends the header on every request. Verify the server certificate: do not teach scripts to run `curl -k`. Use the cluster CA or a trusted certificate, as covered in [web interface security](/learn/systems-infrastructure-security/proxmox-web-interface-security).\n\nRead the secret from the environment or a secret store at run time. Never paste it into the script, a Git repository, a ticket or a chat message."
+  },
+  {
+   "type": "code",
+   "id": "use-code",
+   "language": "bash",
+   "code": "#!/usr/bin/env bash\nset -euo pipefail\n# PVE_TOKEN is injected by the job runner, e.g. automation@pve!backup-bot=<secret>\ncurl --silent --fail --cacert /etc/ssl/certs/example-ca.pem \\\n  -H \"Authorization: PVEAPIToken=${PVE_TOKEN}\" \\\n  https://pve1.example.com:8006/api2/json/pools/backup-pool",
+   "filename": "list-pool.sh",
+   "caption": "A client call with certificate verification and the secret taken from the environment."
+  },
+  {
+   "type": "animation",
+   "id": "token-flow",
+   "kind": "sequence",
+   "title": "Token authentication",
+   "caption": "How Proxmox evaluates a token request.",
+   "data": {
+    "actors": [
+     {
+      "id": "c",
+      "label": "Backup job",
+      "sub": "198.51.100.20",
+      "icon": "laptop"
+     },
+     {
+      "id": "p",
+      "label": "pveproxy",
+      "sub": "pve1.example.com:8006",
+      "icon": "server"
+     },
+     {
+      "id": "a",
+      "label": "Permission tree",
+      "sub": "ACL",
+      "icon": "key"
+     }
+    ],
+    "steps": [
+     {
+      "from": "c",
+      "to": "p",
+      "label": "GET /pools/backup-pool",
+      "detail": "PVEAPIToken header",
+      "note": "The client presents the token ID and secret."
+     },
+     {
+      "from": "p",
+      "to": "p",
+      "label": "Check secret and expiry",
+      "tone": "secure",
+      "note": "The secret hash is compared and the expiry date is checked."
+     },
+     {
+      "from": "p",
+      "to": "a",
+      "label": "Check privileges",
+      "detail": "path /pool/backup-pool",
+      "note": "With privilege separation, only the token's own ACLs count."
+     },
+     {
+      "from": "a",
+      "to": "p",
+      "label": "VM.Audit granted",
+      "tone": "success"
+     },
+     {
+      "from": "p",
+      "to": "c",
+      "label": "200 OK",
+      "tone": "success",
+      "note": "The request is logged with the token ID."
+     },
+     {
+      "from": "c",
+      "to": "p",
+      "label": "DELETE /vms/105",
+      "tone": "attack",
+      "note": "The same token tries an action it was never granted."
+     },
+     {
+      "from": "p",
+      "to": "c",
+      "label": "403 Permission check failed",
+      "tone": "blocked",
+      "note": "Least privilege contains the damage of a stolen token."
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "lifecycle",
+   "markdown": "## Step 4: Rotate, audit and revoke\n\nTreat tokens like any other secret with a lifecycle.\n\n1. **Rotate** before the expiry date. Create a new token, deploy its secret, confirm the job works, then remove the old token.\n2. **Audit** monthly. List every token and ask three questions: who owns it, does it still run, and is its role still the smallest that works.\n3. **Revoke** at once when a secret may have leaked, when an engineer leaves, or when a job is retired.\n4. **Watch the logs.** Each request is recorded in `/var/log/pveproxy/access.log` with the authenticated ID, so a token used from an unexpected address stands out.\n\nProxmox does not restrict a token to a source address. Enforce that with the node firewall, so only the automation host can reach TCP 8006. That is the subject of [Proxmox firewall configuration](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+  },
+  {
+   "type": "terminal",
+   "id": "audit-term",
+   "title": "pve1 - audit and revoke",
+   "lines": [
+    {
+     "cmd": "pveum user token list automation@pve",
+     "output": "┌───────────┬────────────┬─────────┬───────────────────┐\n│ tokenid   │ expire     │ privsep │ comment           │\n╞═══════════╪════════════╪═════════╪═══════════════════╡\n│ backup-bot│ 1792000000 │ 1       │ nightly backup job│\n│ old-test  │ 0          │ 0       │ temporary         │\n└───────────┴────────────┴─────────┴───────────────────┘",
+     "comment": "`old-test` never expires and has no privilege separation: a finding."
+    },
+    {
+     "cmd": "pveum user token remove automation@pve old-test",
+     "comment": "Revoke it. The secret stops working immediately."
+    },
+    {
+     "cmd": "grep 'automation@pve!backup-bot' /var/log/pveproxy/access.log | tail -2",
+     "output": "198.51.100.20 - automation@pve!backup-bot [11/Nov/2026:02:00:03 +0000] \"GET /api2/json/pools/backup-pool HTTP/1.1\" 200 412\n203.0.113.77 - automation@pve!backup-bot [11/Nov/2026:03:14:51 +0000] \"GET /api2/json/cluster/resources HTTP/1.1\" 200 9120",
+     "comment": "The second line comes from an address that is not the backup host. Investigate."
+    }
+   ],
+   "caption": "Listing tokens, revoking a stale one and reading access logs."
+  },
+  {
+   "type": "callout",
+   "id": "pitfall",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- Creating a token with `--privsep 0` for convenience. It silently inherits all rights of its user.\n- Granting `Administrator` on `/` \"just to make it work\". Start empty and add privileges until the job passes.\n- Saving the secret in shell history by typing it on a command line. Use environment variables or a file with mode `0600`.\n- Giving one token to several systems. You then cannot tell which one leaked."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab Proxmox node you own:\n\n1. Create the user `lab-audit@pve` and a token `viewer` with `--privsep 1` and a 7-day expiry.\n2. Grant `PVEAuditor` on `/` and call `/api2/json/version` with `curl`. It should succeed.\n3. Try `POST /api2/json/nodes/pve1/qemu/100/status/stop`. Confirm you get a 403.\n4. Run `pveum user permissions` for the token, then delete the token and repeat step 2 to confirm it now fails."
+  },
+  {
+   "type": "keyterms",
+   "id": "kt",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "API token",
+     "definition": "A separate credential owned by a user, with its own secret, expiry and permissions."
+    },
+    {
+     "term": "Token ID",
+     "definition": "The name `user@realm!tokenname` that identifies a token."
+    },
+    {
+     "term": "Privilege separation",
+     "definition": "Setting where a token gets only its own ACLs instead of its user's rights."
+    },
+    {
+     "term": "Bearer secret",
+     "definition": "A secret that grants access to whoever holds it, with no second factor."
+    },
+    {
+     "term": "Realm",
+     "definition": "The authentication source of a user, such as `pve` or `pam`."
+    },
+    {
+     "term": "ACL path",
+     "definition": "A node in the permission tree, such as `/vms/105`."
+    },
+    {
+     "term": "Rotation",
+     "definition": "Replacing a secret on a schedule or after exposure."
+    },
+    {
+     "term": "Role",
+     "definition": "A named set of privileges that is granted on a path."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "When is the secret of a new Proxmox API token shown?",
+     "options": [
+      "Any time through the web interface",
+      "Exactly once, at creation",
+      "Only to root@pam",
+      "Every time the token is used"
+     ],
+     "answer": 1,
+     "explanation": "Only a hash is stored afterward. A lost secret means creating a new token."
+    },
+    {
+     "question": "What does `--privsep 0` do?",
+     "options": [
+      "Disables the token",
+      "Makes the token inherit all permissions of its user",
+      "Forces MFA",
+      "Limits it to one node"
+     ],
+     "answer": 1,
+     "explanation": "Without privilege separation the token is as powerful as its user, which usually defeats least privilege."
+    },
+    {
+     "question": "Which practices reduce the risk of a stolen token? (choose all that apply)",
+     "options": [
+      "A short expiry and rotation",
+      "Using `curl -k` to avoid certificate errors",
+      "A minimal role on a narrow path",
+      "Firewalling TCP 8006 to the automation host"
+     ],
+     "answer": [
+      0,
+      2,
+      3
+     ],
+     "explanation": "Expiry, narrow roles and network restriction help. Disabling certificate checks exposes the secret to interception."
+    },
+    {
+     "question": "Does MFA protect a token request?",
+     "options": [
+      "Yes, the user is prompted",
+      "No, tokens are bearer secrets that skip MFA",
+      "Only for the pam realm",
+      "Only when privsep is 1"
+     ],
+     "answer": 1,
+     "explanation": "MFA covers interactive logins only. That is why token storage and scope matter so much."
+    },
+    {
+     "question": "A token shows requests from an unknown address in access.log. What is the first action?",
+     "options": [
+      "Wait for expiry",
+      "Revoke the token and investigate",
+      "Add a role",
+      "Restart pveproxy"
+     ],
+     "answer": 1,
+     "explanation": "Revoking stops use immediately. Then issue a new token and trace how the secret leaked."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nAPI tokens let automation reach Proxmox without sharing a human password. Create a dedicated service user, issue a token with privilege separation and an expiry, and grant a minimal role on the narrowest path. Check the result with `pveum user permissions`.\n\nRemember that tokens skip MFA, so store the secret in a secret manager, verify certificates, restrict port 8006 by firewall, and review the access log. Rotate before expiry and revoke on any doubt. Next, see how the firewall limits who can even reach the API in [Proxmox firewall configuration](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+  }
+ ],
+ "ar": {
+  "title": "أمن رموز API في Proxmox",
+  "summary": "أنشئ رموز API في Proxmox وحدّد صلاحياتها واستخدمها ودقّقها وألغِها كي لا تحتاج الأتمتة إلى كلمة مرور root.",
+  "objectives": [
+   "إنشاء رمز بفصل صلاحيات وتاريخ انتهاء لمستخدم خدمة",
+   "منح دور أدنى على مسار ضيق والتحقق منه",
+   "استدعاء API مع التحقق من الشهادة دون سرّ مكتوب في الشيفرة",
+   "تدقيق الرموز وتدويرها وإلغاؤها باستخدام pveum والسجلات"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "سكربت النسخ الاحتياطي وخطة Terraform ولوحة المراقبة، كلها تحتاج إلى التحدث مع Proxmox VE. الطريقة الكسولة أن تعطي كل واحد منها كلمة مرور `root@pam`. عندها تعيش هذه الكلمة داخل سكربت ومتغيّر في CI وملف إعدادات، ومن يقرأ أيًّا منها يملك كل جهاز افتراضي في العنقود.\n\nوُجدت رموز API (API tokens) لتجنّب ذلك تمامًا. الرمز بيانات اعتماد مستقلة تتبع مستخدمًا، ويمكن حصرها في صلاحيات قليلة، وتنتهي صلاحيتها، ويمكن إلغاؤها دون المساس بكلمة مرور المستخدم. في هذا الدرس تنشئ رموزًا بالطريقة الآمنة، وتحصر صلاحياتها، وتستخدمها من عميل، ثم تدقّقها. يبني الدرس على [التحكم بالوصول المعتمد على الأدوار](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac) و[المصادقة والتحقق متعدد العوامل](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa)."
+   },
+   {
+    "type": "text",
+    "id": "anatomy",
+    "markdown": "## ما هو الرمز\n\nمعرّف الرمز بالصيغة `user@realm!tokenname`، مثل `automation@pve!backup-bot`. أما السرّ فهو UUID يعرضه Proxmox مرة واحدة فقط عند الإنشاء. بعدها يُخزَّن ملخّص تجزئة فقط، فلا يمكن استرجاع سرّ ضاع، بل استبداله فقط.\n\nيرسل العميل الرمز في ترويسة HTTP، فلا حاجة إلى تذكرة دخول ولا إلى رمز CSRF:\n\n`Authorization: PVEAPIToken=automation@pve!backup-bot=<secret>`\n\nخاصيّتان تهمّان الأمن:\n\n- **الرموز تتجاوز المصادقة الثنائية.** يحمي التحقق متعدد العوامل عمليات الدخول التفاعلية، أما الرمز فسرّ حامله، وحمايته مسؤوليتك بالكامل.\n- **فصل الصلاحيات يحدّد حجم الضرر.** الرمز المنشأ بالخيار `--privsep 0` يرث كل صلاحيات مستخدمه. أما الرمز بالخيار `--privsep 1` فيبدأ بلا أي صلاحية ويحصل فقط على ما تمنحه إياه مباشرة."
+   },
+   {
+    "type": "text",
+    "id": "compare",
+    "markdown": "## رمز أم تذكرة أم كلمة مرور؟\n\nيقدّم Proxmox ثلاث طرق لمصادقة عميل API. اختر بحسب عمر العميل ومن يشغّله.\n\n| الطريقة | المدة | ينطبق MFA | الأنسب لـ | الخطر الرئيسي |\n|:--|:--|:--|:--|:--|\n| اسم المستخدم وكلمة المرور | حتى تُغيَّر | نعم | البشر في الواجهة الويب | كلمات مرور مكرّرة أو مشتركة |\n| تذكرة دخول | نحو ساعتين | نعم | جلسات تفاعلية قصيرة | تتطلب معالجة CSRF وكلمة مرور مخزّنة |\n| رمز API | حتى الانتهاء أو الإلغاء | لا | الأتمتة غير المراقَبة | سرّ مسرّب يعمل من أي مكان |\n\nيوضّح الجدول لماذا الرموز الأداة المناسبة للسكربتات وغير المناسبة للبشر. لا يستطيع السكربت الإجابة عن طلب التحقق متعدد العوامل، لذا فرمز بدور صغير جدًا وعمر قصير أأمن من كلمة مرور مخزّنة. أما الشخص فيجب أن يستخدم دائمًا تذكرة يحصل عليها مع التحقق متعدد العوامل."
+   },
+   {
+    "type": "text",
+    "id": "create",
+    "markdown": "## الخطوة 1: أنشئ مستخدمًا ورمزًا مخصّصين\n\nلا تربط الأتمتة بحساب بشري أبدًا. أنشئ مستخدم خدمة في النطاق `pve` دون كلمة مرور، ثم أنشئ الرمز تحته. حدّد تاريخ انتهاء، فالرمز الذي لا ينتهي بيانات اعتماد ستنساها.\n\nاحسب الانتهاء كطابع زمني Unix. يفعل الأمر `date` ذلك على العقدة."
+   },
+   {
+    "type": "terminal",
+    "id": "create-term",
+    "title": "pve1 - create the token",
+    "lines": [
+     {
+      "cmd": "pveum user add automation@pve --comment 'Backup automation'",
+      "comment": "مستخدم خدمة بلا كلمة مرور، فلا يمكنه تسجيل الدخول تفاعليًا."
+     },
+     {
+      "cmd": "date -d '+90 days' +%s",
+      "output": "1792000000",
+      "comment": "انتهاء بعد 90 يومًا (قيمة مثالية)."
+     },
+     {
+      "cmd": "pveum user token add automation@pve backup-bot --privsep 1 --expire 1792000000 --comment 'nightly backup job'",
+      "output": "┌──────────────┬──────────────────────────────────────┐\n│ key          │ value                                │\n╞══════════════╪══════════════════════════════════════╡\n│ full-tokenid │ automation@pve!backup-bot            │\n├──────────────┼──────────────────────────────────────┤\n│ info         │ {\"expire\":1792000000,\"privsep\":\"1\"}   │\n├──────────────┼──────────────────────────────────────┤\n│ value        │ <secret-shown-once>                  │\n└──────────────┴──────────────────────────────────────┘",
+      "comment": "السرّ في `value` يظهر الآن فقط. ضعه مباشرة في مدير الأسرار."
+     }
+    ],
+    "caption": "إنشاء مستخدم خدمة ورمز منتهي الصلاحية ومفصول الصلاحيات."
+   },
+   {
+    "type": "text",
+    "id": "scope",
+    "markdown": "## الخطوة 2: امنح الحد الأدنى\n\nمع `--privsep 1` لا يستطيع الرمز الجديد فعل شيء. امنحه دورًا على مسار. المسار عقدة في شجرة الصلاحيات: `/vms/105` جهاز واحد، و`/pool/backup-pool` مجموعة موارد، و`/` كل شيء.\n\nالأدوار المدمجة نقطة بداية:\n\n| الدور | يسمح بـ | الاستخدام النموذجي |\n|:--|:--|:--|\n| `PVEAuditor` | عرض للقراءة فقط | المراقبة والجرد |\n| `PVEVMUser` | الطرفية وتشغيل/إيقاف | أدوات مكتب المساعدة |\n| `PVEDatastoreUser` | حجز التخزين وتصفّحه | عميل النسخ الاحتياطي |\n| `PVEVMAdmin` | تحكم كامل بالأجهزة | خط التزويد |\n| `Administrator` | كل شيء | نادرًا ما يصلح لرمز |\n\nإن لم يناسب دور مدمج فأنشئ دورًا مخصّصًا بالصلاحيات التي تستخدمها المهمة فقط، مثل `VM.Backup` و`Datastore.AllocateSpace`. روبوت النسخ الاحتياطي لا يحتاج إلى `VM.Console`."
+   },
+   {
+    "type": "terminal",
+    "id": "scope-term",
+    "title": "pve1 - scope and verify",
+    "lines": [
+     {
+      "cmd": "pveum role add BackupOnly --privs 'VM.Audit VM.Backup Datastore.AllocateSpace Datastore.Audit'",
+      "comment": "دور مخصّص بأربع صلاحيات."
+     },
+     {
+      "cmd": "pveum acl modify /pool/backup-pool --tokens 'automation@pve!backup-bot' --roles BackupOnly",
+      "comment": "منح على مجموعة واحدة لا على `/`."
+     },
+     {
+      "cmd": "pveum user permissions 'automation@pve!backup-bot' --path /vms/105",
+      "output": "┌─────────┬───────────┐\n│ path    │ privs     │\n╞═════════╪═══════════╡\n│ /vms/105│ VM.Audit  │\n│         │ VM.Backup │\n└─────────┴───────────┘",
+      "comment": "الصلاحيات الفعلية: تحقّق ولا تفترض."
+     },
+     {
+      "cmd": "pveum user permissions 'automation@pve!backup-bot' --path /nodes/pve1",
+      "output": "(empty)",
+      "comment": "لا شيء على العقدة نفسها، كما هو مقصود."
+     }
+    ],
+    "caption": "منح دور مخصّص على مجموعة والتحقق من الصلاحيات الفعلية."
+   },
+   {
+    "type": "text",
+    "id": "use",
+    "markdown": "## الخطوة 3: استخدم الرمز بأمان\n\nيرسل العميل الترويسة مع كل طلب. تحقّق من شهادة الخادم، ولا تعلّم السكربتات استخدام `curl -k`. استخدم شهادة جهة العنقود أو شهادة موثوقة، كما في [أمن الواجهة الويب](/learn/systems-infrastructure-security/proxmox-web-interface-security).\n\nاقرأ السرّ من البيئة أو من مخزن أسرار وقت التشغيل. لا تلصقه في سكربت ولا في مستودع Git ولا في تذكرة ولا في رسالة محادثة."
+   },
+   {
+    "type": "code",
+    "id": "use-code",
+    "language": "bash",
+    "code": "#!/usr/bin/env bash\nset -euo pipefail\n# PVE_TOKEN is injected by the job runner, e.g. automation@pve!backup-bot=<secret>\ncurl --silent --fail --cacert /etc/ssl/certs/example-ca.pem \\\n  -H \"Authorization: PVEAPIToken=${PVE_TOKEN}\" \\\n  https://pve1.example.com:8006/api2/json/pools/backup-pool",
+    "filename": "list-pool.sh",
+    "caption": "نداء عميل مع التحقق من الشهادة وقراءة السرّ من البيئة."
+   },
+   {
+    "type": "animation",
+    "id": "token-flow",
+    "kind": "sequence",
+    "title": "المصادقة بالرمز",
+    "caption": "كيف يقيّم Proxmox طلب رمز.",
+    "data": {
+     "actors": [
+      {
+       "id": "c",
+       "label": "مهمة النسخ",
+       "sub": "198.51.100.20",
+       "icon": "laptop"
+      },
+      {
+       "id": "p",
+       "label": "pveproxy",
+       "sub": "pve1.example.com:8006",
+       "icon": "server"
+      },
+      {
+       "id": "a",
+       "label": "شجرة الصلاحيات",
+       "sub": "ACL",
+       "icon": "key"
+      }
+     ],
+     "steps": [
+      {
+       "from": "c",
+       "to": "p",
+       "label": "GET /pools/backup-pool",
+       "detail": "ترويسة PVEAPIToken",
+       "note": "يقدّم العميل معرّف الرمز وسرّه."
+      },
+      {
+       "from": "p",
+       "to": "p",
+       "label": "فحص السرّ والانتهاء",
+       "tone": "secure",
+       "note": "تُقارن تجزئة السرّ ويُفحص تاريخ الانتهاء."
+      },
+      {
+       "from": "p",
+       "to": "a",
+       "label": "فحص الصلاحيات",
+       "detail": "المسار /pool/backup-pool",
+       "note": "مع فصل الصلاحيات تُحتسب قوائم الوصول الخاصة بالرمز وحدها."
+      },
+      {
+       "from": "a",
+       "to": "p",
+       "label": "مُنحت VM.Audit",
+       "tone": "success"
+      },
+      {
+       "from": "p",
+       "to": "c",
+       "label": "200 OK",
+       "tone": "success",
+       "note": "يُسجَّل الطلب مع معرّف الرمز."
+      },
+      {
+       "from": "c",
+       "to": "p",
+       "label": "DELETE /vms/105",
+       "tone": "attack",
+       "note": "يحاول الرمز نفسه إجراءً لم يُمنح له أبدًا."
+      },
+      {
+       "from": "p",
+       "to": "c",
+       "label": "403 فشل فحص الصلاحيات",
+       "tone": "blocked",
+       "note": "الحد الأدنى من الصلاحيات يحصر ضرر رمز مسروق."
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "lifecycle",
+    "markdown": "## الخطوة 4: دوّر ودقّق وألغِ\n\nعامل الرموز كأي سرّ له دورة حياة.\n\n1. **دوّر** قبل تاريخ الانتهاء. أنشئ رمزًا جديدًا، وانشر سرّه، وتأكّد من عمل المهمة، ثم احذف الرمز القديم.\n2. **دقّق** شهريًا. اعرض كل الرموز واسأل ثلاثة أسئلة: من يملكه، وهل ما زال يعمل، وهل دوره ما زال الأصغر الذي يكفي.\n3. **ألغِ** فورًا عند احتمال تسرّب السرّ أو مغادرة مهندس أو إيقاف مهمة.\n4. **راقب السجلات.** يُسجَّل كل طلب في `/var/log/pveproxy/access.log` مع المعرّف المصادَق عليه، فيبرز رمز استُخدم من عنوان غير متوقع.\n\nلا يقيّد Proxmox الرمز بعنوان مصدر. افرض ذلك بجدار حماية العقدة بحيث لا يصل إلى المنفذ TCP 8006 إلا مضيف الأتمتة. وهذا موضوع [تهيئة جدار الحماية في Proxmox](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+   },
+   {
+    "type": "terminal",
+    "id": "audit-term",
+    "title": "pve1 - audit and revoke",
+    "lines": [
+     {
+      "cmd": "pveum user token list automation@pve",
+      "output": "┌───────────┬────────────┬─────────┬───────────────────┐\n│ tokenid   │ expire     │ privsep │ comment           │\n╞═══════════╪════════════╪═════════╪═══════════════════╡\n│ backup-bot│ 1792000000 │ 1       │ nightly backup job│\n│ old-test  │ 0          │ 0       │ temporary         │\n└───────────┴────────────┴─────────┴───────────────────┘",
+      "comment": "الرمز `old-test` لا ينتهي ولا يفصل الصلاحيات: ملاحظة تدقيق."
+     },
+     {
+      "cmd": "pveum user token remove automation@pve old-test",
+      "comment": "ألغِه. يتوقف السرّ عن العمل فورًا."
+     },
+     {
+      "cmd": "grep 'automation@pve!backup-bot' /var/log/pveproxy/access.log | tail -2",
+      "output": "198.51.100.20 - automation@pve!backup-bot [11/Nov/2026:02:00:03 +0000] \"GET /api2/json/pools/backup-pool HTTP/1.1\" 200 412\n203.0.113.77 - automation@pve!backup-bot [11/Nov/2026:03:14:51 +0000] \"GET /api2/json/cluster/resources HTTP/1.1\" 200 9120",
+      "comment": "السطر الثاني من عنوان ليس مضيف النسخ. حقّق فيه."
+     }
+    ],
+    "caption": "عرض الرموز وإلغاء رمز قديم وقراءة سجلات الوصول."
+   },
+   {
+    "type": "callout",
+    "id": "pitfall",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- إنشاء رمز بـ `--privsep 0` للراحة. فهو يرث بصمت كل حقوق مستخدمه.\n- منح `Administrator` على `/` «حتى يعمل الأمر». ابدأ فارغًا وأضف الصلاحيات حتى تنجح المهمة.\n- حفظ السرّ في سجل الصدفة بكتابته في سطر الأوامر. استخدم متغيرات البيئة أو ملفًا بصلاحيات `0600`.\n- إعطاء رمز واحد لعدة أنظمة. عندها لا تعرف أيها سرّب."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على عقدة Proxmox مخبرية تملكها:\n\n1. أنشئ المستخدم `lab-audit@pve` ورمزًا `viewer` بالخيار `--privsep 1` وانتهاء بعد 7 أيام.\n2. امنح `PVEAuditor` على `/` ونادِ `/api2/json/version` بـ `curl`. يجب أن ينجح.\n3. جرّب `POST /api2/json/nodes/pve1/qemu/100/status/stop` وتأكّد من حصولك على 403.\n4. نفّذ `pveum user permissions` للرمز، ثم احذفه وكرّر الخطوة 2 لتتأكد أنها تفشل الآن."
+   },
+   {
+    "type": "keyterms",
+    "id": "kt",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "رمز API (API token)",
+      "definition": "بيانات اعتماد مستقلة يملكها مستخدم، ولها سرّ وانتهاء وصلاحيات خاصة."
+     },
+     {
+      "term": "معرّف الرمز (Token ID)",
+      "definition": "الاسم `user@realm!tokenname` الذي يحدّد الرمز."
+     },
+     {
+      "term": "فصل الصلاحيات (Privilege separation)",
+      "definition": "إعداد يحصل فيه الرمز على قوائم الوصول الخاصة به فقط لا على حقوق مستخدمه."
+     },
+     {
+      "term": "سرّ حامله (Bearer secret)",
+      "definition": "سرّ يمنح الوصول لمن يحمله دون عامل ثانٍ."
+     },
+     {
+      "term": "النطاق (Realm)",
+      "definition": "مصدر مصادقة المستخدم مثل `pve` أو `pam`."
+     },
+     {
+      "term": "مسار الصلاحيات (ACL path)",
+      "definition": "عقدة في شجرة الصلاحيات مثل `/vms/105`."
+     },
+     {
+      "term": "التدوير (Rotation)",
+      "definition": "استبدال السرّ دوريًا أو بعد انكشافه."
+     },
+     {
+      "term": "الدور (Role)",
+      "definition": "مجموعة صلاحيات مسمّاة تُمنح على مسار."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "متى يُعرض سرّ رمز API الجديد في Proxmox؟",
+      "options": [
+       "في أي وقت عبر الواجهة الويب",
+       "مرة واحدة فقط عند الإنشاء",
+       "لـ root@pam فقط",
+       "عند كل استخدام للرمز"
+      ],
+      "answer": 1,
+      "explanation": "يُخزَّن بعدها ملخّص تجزئة فقط. ضياع السرّ يعني إنشاء رمز جديد."
+     },
+     {
+      "question": "ماذا يفعل `--privsep 0`؟",
+      "options": [
+       "يعطّل الرمز",
+       "يجعل الرمز يرث كل صلاحيات مستخدمه",
+       "يفرض التحقق متعدد العوامل",
+       "يحصره في عقدة واحدة"
+      ],
+      "answer": 1,
+      "explanation": "دون فصل الصلاحيات يصبح الرمز بقوة مستخدمه، وهذا يُبطل غالبًا مبدأ الحد الأدنى من الصلاحيات."
+     },
+     {
+      "question": "أي الممارسات تقلّل خطر رمز مسروق؟ (اختر كل ما ينطبق)",
+      "options": [
+       "انتهاء قصير وتدوير",
+       "استخدام `curl -k` لتجنّب أخطاء الشهادة",
+       "دور أدنى على مسار ضيق",
+       "تقييد TCP 8006 بجدار الحماية على مضيف الأتمتة"
+      ],
+      "answer": [
+       0,
+       2,
+       3
+      ],
+      "explanation": "الانتهاء والأدوار الضيقة والتقييد الشبكي تفيد. أما تعطيل فحص الشهادة فيعرّض السرّ للاعتراض."
+     },
+     {
+      "question": "هل يحمي التحقق متعدد العوامل طلب رمز؟",
+      "options": [
+       "نعم، يُطلب من المستخدم",
+       "لا، الرموز أسرار حامل تتجاوزه",
+       "فقط للنطاق pam",
+       "فقط عندما privsep يساوي 1"
+      ],
+      "answer": 1,
+      "explanation": "يغطي التحقق متعدد العوامل عمليات الدخول التفاعلية فقط. لهذا يهمّ تخزين الرمز ونطاقه كثيرًا."
+     },
+     {
+      "question": "يظهر في access.log رمز يطلب من عنوان مجهول. ما الإجراء الأول؟",
+      "options": [
+       "انتظار الانتهاء",
+       "إلغاء الرمز والتحقيق",
+       "إضافة دور",
+       "إعادة تشغيل pveproxy"
+      ],
+      "answer": 1,
+      "explanation": "الإلغاء يوقف الاستخدام فورًا. ثم أصدر رمزًا جديدًا وتتبّع كيف تسرّب السرّ."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nتتيح رموز API للأتمتة الوصول إلى Proxmox دون مشاركة كلمة مرور بشرية. أنشئ مستخدم خدمة مخصّصًا، وأصدر رمزًا بفصل صلاحيات وتاريخ انتهاء، وامنح دورًا أدنى على أضيق مسار. تحقّق من النتيجة بالأمر `pveum user permissions`.\n\nتذكّر أن الرموز تتجاوز التحقق متعدد العوامل، فخزّن السرّ في مدير أسرار، وتحقّق من الشهادات، وقيّد المنفذ 8006 بجدار الحماية، وراجع سجل الوصول. دوّر قبل الانتهاء وألغِ عند أي شك. بعد ذلك تعرّف على كيفية تحديد جدار الحماية لمن يصل إلى الواجهة أصلًا في [تهيئة جدار الحماية في Proxmox](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+   }
+  ]
+ }
+}

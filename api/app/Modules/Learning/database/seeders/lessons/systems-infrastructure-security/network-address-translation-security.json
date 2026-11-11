@@ -1,0 +1,548 @@
+{
+ "slug": "network-address-translation-security",
+ "title": "Network Address Translation Security",
+ "summary": "What NAT does and does not protect, and how to configure and audit translations and port-forwards safely.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Distinguish SNAT, PAT and DNAT",
+  "Explain why NAT is not a firewall",
+  "Write a restricted DNAT rule with a filter policy in nftables",
+  "Audit translations and published container ports"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "A small team publishes an internal admin panel by adding one port-forward rule on the edge router: external port 8443 to the panel at 10.10.0.20. The rule works, everyone is happy, and nobody remembers it six months later. Meanwhile, the panel runs an old version with a known flaw, and it is reachable from the whole internet.\n\nNetwork Address Translation (NAT) is so common that people treat it as a security feature. It is not one. NAT rewrites addresses so that private networks can share public addresses. Any protection is a side effect. In this lesson you will learn what NAT really does, where it creates risk, and how to configure and audit it safely."
+  },
+  {
+   "type": "text",
+   "id": "types",
+   "markdown": "## 1. What NAT really does\n\nNAT changes the source or destination address (and often the port) of packets as they cross a router or firewall. The device keeps a **translation table** so that replies can be mapped back.\n\n| Type | Changes | Direction | Typical use |\n|:--|:--|:--|:--|\n| Source NAT (SNAT) | Source address | Inside to outside | Give an internal subnet a public address |\n| Masquerade / PAT | Source address and port | Inside to outside | Many hosts share one dynamic address |\n| Destination NAT (DNAT) | Destination address and port | Outside to inside | Publish an internal service |\n| Static (1:1) NAT | Both directions for one host | Both | A server needs a fixed public address |\n| No-NAT (exemption) | Nothing | Both | VPN traffic that must keep real addresses |\n\nPort Address Translation (PAT) is the form most networks use. Hundreds of laptops appear as one public address, each with a different source port.\n\n### Why NAT is not a firewall\n\nOutbound PAT does block **unsolicited** inbound packets, because no table entry exists for them. That behavior comes from the stateful engine, not from address rewriting. The moment you add a DNAT rule, you have created an explicit hole. Real protection needs filter rules that name allowed sources, ports and destinations."
+  },
+  {
+   "type": "animation",
+   "id": "seq-anim",
+   "kind": "sequence",
+   "title": "SNAT and DNAT in one conversation",
+   "caption": "The translation table links the two directions. Both hold state.",
+   "data": {
+    "actors": [
+     {
+      "id": "pc",
+      "label": "Laptop",
+      "sub": "10.10.0.50",
+      "icon": "laptop"
+     },
+     {
+      "id": "gw",
+      "label": "NAT gateway",
+      "sub": "203.0.113.10",
+      "icon": "firewall"
+     },
+     {
+      "id": "ext",
+      "label": "Web site",
+      "sub": "198.51.100.80",
+      "icon": "globe"
+     },
+     {
+      "id": "web",
+      "label": "Internal web",
+      "sub": "10.10.0.20",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "pc",
+      "to": "gw",
+      "label": "src 10.10.0.50:51000",
+      "note": "A private source address leaves the LAN."
+     },
+     {
+      "from": "gw",
+      "to": "ext",
+      "label": "src 203.0.113.10:62001",
+      "tone": "secure",
+      "note": "SNAT rewrites the source and records the mapping."
+     },
+     {
+      "from": "ext",
+      "to": "gw",
+      "label": "dst 203.0.113.10:62001",
+      "note": "The reply arrives at the public address."
+     },
+     {
+      "from": "gw",
+      "to": "pc",
+      "label": "dst 10.10.0.50:51000",
+      "tone": "success",
+      "note": "The table entry maps the reply back to the laptop."
+     },
+     {
+      "from": "ext",
+      "to": "gw",
+      "label": "dst 203.0.113.10:8443",
+      "note": "A new inbound connection targets the published port."
+     },
+     {
+      "from": "gw",
+      "to": "web",
+      "label": "dst 10.10.0.20:443",
+      "tone": "warning",
+      "note": "DNAT forwards it, but only if the filter policy allows the source."
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "risks",
+   "markdown": "## 2. Where NAT creates risk\n\nNAT problems are rarely about the translation itself. They come from how people use it.\n\n- **Forgotten port-forwards.** Every DNAT rule publishes a service. Services age, and old forwards outlive the people who requested them.\n- **Broad forwards.** Forwarding a whole port range, or forwarding to an entire subnet, exposes far more than intended.\n- **Hairpin and loopback confusion.** Internal users reach the public name and loop back through NAT. If you disable filtering for the \"internal\" case, the rule may be abused from outside as well.\n- **Weak logging.** Many hosts share one public address, so an external log shows only the NAT address. Without the translation log, you cannot tell which laptop contacted a malicious site.\n- **UPnP and NAT-PMP.** Devices on the LAN can ask the router to open ports automatically. Disable both on any network you secure.\n- **False confidence.** Teams skip host firewalls and patching because \"we are behind NAT\". One phishing click behind NAT gives the attacker an outbound tunnel anyway."
+  },
+  {
+   "type": "code",
+   "id": "nat",
+   "language": "bash",
+   "filename": "/etc/nftables.conf",
+   "code": "table inet filter {\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related accept\n    # allow only the published service, only from the partner range\n    ip saddr 198.51.100.0/24 ip daddr 10.10.0.20 tcp dport 443 ct status dnat accept\n    # outbound from the LAN\n    iifname \"lan0\" oifname \"wan0\" accept\n  }\n}\ntable ip nat {\n  chain prerouting {\n    type nat hook prerouting priority -100;\n    iifname \"wan0\" ip saddr 198.51.100.0/24 tcp dport 8443 dnat to 10.10.0.20:443\n  }\n  chain postrouting {\n    type nat hook postrouting priority 100;\n    oifname \"wan0\" ip saddr 10.10.0.0/24 masquerade\n  }\n}",
+   "caption": "Two layers: the nat table translates, the filter table decides. The DNAT rule names the allowed partner range."
+  },
+  {
+   "type": "terminal",
+   "id": "conntrack",
+   "title": "Audit translations on the gateway",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "sudo nft list table ip nat",
+     "output": "table ip nat {\n  chain prerouting {\n    iifname \"wan0\" ip saddr 198.51.100.0/24 tcp dport 8443 dnat to 10.10.0.20:443\n  }\n}",
+     "comment": "Exactly one forward, restricted by source"
+    },
+    {
+     "cmd": "sudo conntrack -L -p tcp --dport 8443 2>/dev/null | head -2",
+     "output": "tcp 6 86392 ESTABLISHED src=198.51.100.7 dst=203.0.113.10 sport=40112 dport=8443 src=10.10.0.20 dst=198.51.100.7 sport=443 dport=40112 [ASSURED]",
+     "comment": "The tuple shows both the public and the translated side"
+    },
+    {
+     "cmd": "sudo conntrack -C",
+     "output": "1842",
+     "comment": "Active tracked connections: watch for sudden growth"
+    }
+   ],
+   "caption": "The conntrack output is the translation log you need during an incident."
+  },
+  {
+   "type": "text",
+   "id": "vendor",
+   "markdown": "## 3. The same ideas on other platforms\n\nThe concepts are identical everywhere. Only the syntax changes.\n\nOn Cisco IOS XE, dynamic PAT looks like `ip nat inside source list 10 interface GigabitEthernet0/0/0 overload`, with `ip nat inside` and `ip nat outside` on the right interfaces. A static publish is `ip nat inside source static tcp 10.10.0.20 443 203.0.113.10 8443`. Use `show ip nat translations` to audit. On a Cisco ASA or Firepower device, NAT is configured as objects and the **access policy still decides** what may pass; remember that rules are evaluated against the real, untranslated address in modern software versions.\n\nOn a Proxmox host, the node often performs masquerade for a private VM bridge. Keep the rule scoped to the bridge subnet, as shown above, and never apply it to every interface. For containers, Docker adds its own NAT rules for published ports, and `-p 8443:443` publishes on **all** host addresses by default. Bind to a specific address with `-p 127.0.0.1:8443:443` when only a local reverse proxy needs it.\n\nAlways pair NAT with the zone design in [Network Security Architecture](/learn/systems-infrastructure-security/network-security-architecture), and keep denied-flow logs flowing into [Network Security Monitoring](/learn/systems-infrastructure-security/network-security-monitoring)."
+  },
+  {
+   "type": "callout",
+   "id": "c-docker",
+   "variant": "warning",
+   "title": "Docker can bypass your host firewall",
+   "markdown": "Docker inserts its own NAT and forward rules ahead of many host firewall tools. A port published with `-p 8443:443` can be reachable even if your firewall seems to block it. Bind published ports to `127.0.0.1` or a private address, and test from another machine."
+  },
+  {
+   "type": "text",
+   "id": "review",
+   "markdown": "## 4. Review NAT regularly\n\nTreat every translation rule as an exposed service. Run this checklist each quarter.\n\n1. **List** all DNAT and static NAT rules from every gateway, hypervisor and container host.\n2. **Match** each rule to an owner, a ticket and a reason. Remove rules with none.\n3. **Restrict** each rule by source address where the audience is known, such as a partner range or a VPN pool.\n4. **Scan** your own public addresses from outside with a tool you are authorized to use, and compare the open ports with the rule list. Any open port without a rule is a surprise worth investigating.\n5. **Log** translations and send them to central storage with timestamps, so that an external complaint can be traced to one internal host.\n6. **Prefer a VPN** or a reverse proxy with authentication over a raw port-forward to an admin interface.\n\nFor services that must be public, place them in a DMZ, patch them quickly and put a web application firewall in front of them. If an admin panel only needs to be reached by staff, publish it over a VPN instead."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a Linux VM you own as a gateway between two VMs.\n\n1. Enable forwarding with `sudo sysctl -w net.ipv4.ip_forward=1`.\n2. Add a masquerade rule for the inside subnet and confirm the inside VM can reach the gateway's outside network.\n3. Add a DNAT rule for TCP/8080 to a simple web server on the inside VM, restricted by source address.\n4. Run `sudo conntrack -L` while you fetch the page and find the entry.\n5. Remove the source restriction and note what changes in the exposure.\n\nWrite one sentence describing why the filter policy, not NAT, protects the server."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "NAT",
+     "definition": "Rewriting packet addresses as they cross a gateway."
+    },
+    {
+     "term": "PAT",
+     "definition": "NAT that also rewrites ports so many hosts share one address."
+    },
+    {
+     "term": "SNAT",
+     "definition": "Translation of the source address."
+    },
+    {
+     "term": "DNAT",
+     "definition": "Translation of the destination, used to publish services."
+    },
+    {
+     "term": "Translation table",
+     "definition": "State kept by the gateway to map replies back."
+    },
+    {
+     "term": "Port-forward",
+     "definition": "A DNAT rule that exposes an internal service."
+    },
+    {
+     "term": "Hairpin NAT",
+     "definition": "Internal clients reaching an internal server by its public address."
+    },
+    {
+     "term": "UPnP",
+     "definition": "Protocol letting LAN devices open router ports automatically."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which statement about NAT is most accurate?",
+     "options": [
+      "NAT is a replacement for a firewall",
+      "NAT rewrites addresses; protection comes from stateful filtering",
+      "NAT encrypts traffic",
+      "NAT blocks all inbound traffic"
+     ],
+     "answer": 1,
+     "explanation": "The stateful engine blocks unsolicited inbound packets. NAT only translates."
+    },
+    {
+     "question": "Select all risks associated with port-forwards.",
+     "options": [
+      "Forgotten rules stay exposed",
+      "Broad port ranges expose extra services",
+      "They always add encryption",
+      "Devices can lose attribution in logs"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Forwards publish services, can be too broad, and shared addresses hide the true internal source without translation logs."
+    },
+    {
+     "question": "Which rule type publishes an internal web server to the internet?",
+     "options": [
+      "Masquerade",
+      "DNAT",
+      "No-NAT exemption",
+      "SNAT"
+     ],
+     "answer": 1,
+     "explanation": "Destination NAT maps a public address and port to an internal service."
+    },
+    {
+     "question": "How should you publish an admin interface that only staff need?",
+     "options": [
+      "Raw port-forward on 8443",
+      "Over a VPN or an authenticated reverse proxy",
+      "Enable UPnP",
+      "Forward all ports"
+     ],
+     "answer": 1,
+     "explanation": "VPN access avoids exposing the interface to the whole internet."
+    },
+    {
+     "question": "Select all good practices for Docker published ports.",
+     "options": [
+      "Bind to 127.0.0.1 when a local proxy suffices",
+      "Assume the host firewall always blocks them",
+      "Test from another machine",
+      "Review them like any port-forward"
+     ],
+     "answer": [
+      0,
+      2,
+      3
+     ],
+     "explanation": "Docker inserts its own rules, so verify externally and bind narrowly."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\n- NAT rewrites addresses; the stateful filter provides the protection.\n- The main types are SNAT or PAT for outbound traffic and DNAT for publishing services.\n- Port-forwards are exposed services: restrict by source, document an owner and review them.\n- Shared addresses hide internal hosts, so keep translation logs.\n- Disable UPnP, and remember that Docker adds its own NAT rules.\n- Prefer a VPN or authenticated proxy for admin interfaces."
+  }
+ ],
+ "ar": {
+  "title": "أمن ترجمة عناوين الشبكة (NAT)",
+  "summary": "ما تحميه NAT وما لا تحميه، وكيف تضبط الترجمات وتحويلات المنافذ وتدقّقها بأمان.",
+  "objectives": [
+   "التمييز بين SNAT وPAT وDNAT",
+   "شرح لماذا ليست NAT جدار حماية",
+   "كتابة قاعدة DNAT مقيَّدة مع سياسة تصفية في nftables",
+   "تدقيق الترجمات ومنافذ الحاويات المنشورة"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "يضيف فريق صغير قاعدة تحويل منفذ واحدة على موجّه الحافة لنشر لوحة إدارة داخلية: المنفذ الخارجي 8443 إلى اللوحة على 10.10.0.20. تعمل القاعدة ويرتاح الجميع، ثم ينساها الجميع بعد ستة أشهر. وفي الأثناء تعمل اللوحة بإصدار قديم فيه ثغرة معروفة وتصل إليها شبكة الإنترنت كلها.\n\nترجمة عناوين الشبكة (NAT) شائعة إلى حد أن الناس يعاملونها كميزة أمنية، وهي ليست كذلك. فهي تعيد كتابة العناوين لتتشارك الشبكات الخاصة عناوين عامة، وأي حماية فيها أثر جانبي. ستتعلم في هذا الدرس ما تفعله NAT حقًا، وأين تخلق المخاطر، وكيف تضبطها وتدقّقها بأمان."
+   },
+   {
+    "type": "text",
+    "id": "types",
+    "markdown": "## 1. ما تفعله NAT حقًا\n\nتغيّر NAT عنوان المصدر أو الوجهة (وغالبًا المنفذ) للحزم أثناء عبورها موجّهًا أو جدار حماية. ويحتفظ الجهاز **بجدول ترجمة** ليعيد ربط الردود.\n\n| النوع | ما يتغيّر | الاتجاه | الاستخدام المعتاد |\n|:--|:--|:--|:--|\n| ترجمة المصدر (SNAT) | عنوان المصدر | من الداخل إلى الخارج | إعطاء شبكة داخلية عنوانًا عامًا |\n| Masquerade / PAT | عنوان المصدر والمنفذ | من الداخل إلى الخارج | مضيفات كثيرة تتشارك عنوانًا ديناميكيًا واحدًا |\n| ترجمة الوجهة (DNAT) | عنوان الوجهة والمنفذ | من الخارج إلى الداخل | نشر خدمة داخلية |\n| NAT ثابتة (1:1) | الاتجاهان لمضيف واحد | الاتجاهان | خادم يحتاج عنوانًا عامًا ثابتًا |\n| الاستثناء (No-NAT) | لا شيء | الاتجاهان | حركة VPN التي يجب أن تحتفظ بعناوينها الحقيقية |\n\nترجمة عناوين المنافذ (PAT) هي الشكل الذي تستخدمه معظم الشبكات. تظهر مئات الحواسيب بعنوان عام واحد، لكل منها منفذ مصدر مختلف.\n\n### لماذا ليست NAT جدار حماية\n\nتحجب PAT الصادرة الحزم الواردة **غير المطلوبة** لأنه لا يوجد لها سجل في الجدول. وهذا السلوك يأتي من المحرك الحالة-الواعي لا من إعادة كتابة العناوين. وبمجرد إضافة قاعدة DNAT تكون قد فتحت ثغرة صريحة. والحماية الحقيقية تحتاج إلى قواعد تصفية تسمّي المصادر والمنافذ والوجهات المسموحة."
+   },
+   {
+    "type": "animation",
+    "id": "seq-anim",
+    "kind": "sequence",
+    "title": "SNAT وDNAT في محادثة واحدة",
+    "caption": "يربط جدول الترجمة الاتجاهين، وكلاهما يحتفظ بالحالة.",
+    "data": {
+     "actors": [
+      {
+       "id": "pc",
+       "label": "الحاسوب المحمول",
+       "sub": "10.10.0.50",
+       "icon": "laptop"
+      },
+      {
+       "id": "gw",
+       "label": "بوابة NAT",
+       "sub": "203.0.113.10",
+       "icon": "firewall"
+      },
+      {
+       "id": "ext",
+       "label": "موقع ويب",
+       "sub": "198.51.100.80",
+       "icon": "globe"
+      },
+      {
+       "id": "web",
+       "label": "الويب الداخلي",
+       "sub": "10.10.0.20",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "pc",
+       "to": "gw",
+       "label": "المصدر 10.10.0.50:51000",
+       "note": "يغادر عنوان مصدر خاص الشبكة المحلية."
+      },
+      {
+       "from": "gw",
+       "to": "ext",
+       "label": "المصدر 203.0.113.10:62001",
+       "tone": "secure",
+       "note": "تعيد SNAT كتابة المصدر وتسجّل الربط."
+      },
+      {
+       "from": "ext",
+       "to": "gw",
+       "label": "الوجهة 203.0.113.10:62001",
+       "note": "يصل الرد إلى العنوان العام."
+      },
+      {
+       "from": "gw",
+       "to": "pc",
+       "label": "الوجهة 10.10.0.50:51000",
+       "tone": "success",
+       "note": "يربط سجل الجدول الرد بالحاسوب المحمول."
+      },
+      {
+       "from": "ext",
+       "to": "gw",
+       "label": "الوجهة 203.0.113.10:8443",
+       "note": "اتصال وارد جديد يستهدف المنفذ المنشور."
+      },
+      {
+       "from": "gw",
+       "to": "web",
+       "label": "الوجهة 10.10.0.20:443",
+       "tone": "warning",
+       "note": "تمرره DNAT، لكن فقط إذا سمحت سياسة التصفية بالمصدر."
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "risks",
+    "markdown": "## 2. أين تخلق NAT المخاطر\n\nنادرًا ما تتعلق مشكلات NAT بالترجمة نفسها، وإنما بطريقة استخدام الناس لها.\n\n- **تحويلات المنافذ المنسية.** كل قاعدة DNAT تنشر خدمة. والخدمات تشيخ، وتعيش التحويلات القديمة أطول من الأشخاص الذين طلبوها.\n- **التحويلات الواسعة.** تحويل نطاق منافذ كامل، أو تحويل إلى شبكة فرعية كاملة، يكشف أكثر بكثير مما أُريد.\n- **الالتباس في hairpin والارتداد.** يصل المستخدمون الداخليون إلى الاسم العام فيرتدّون عبر NAT. وإذا عطّلت التصفية لحالة «الداخلي» فقد تُستغل القاعدة من الخارج أيضًا.\n- **تسجيل ضعيف.** تتشارك مضيفات كثيرة عنوانًا عامًا واحدًا، فيُظهر السجل الخارجي عنوان NAT فقط. وبدون سجل الترجمة لا تعرف أي حاسوب اتصل بموقع خبيث.\n- **UPnP وNAT-PMP.** تستطيع أجهزة الشبكة المحلية أن تطلب من الموجّه فتح منافذ تلقائيًا. عطّل الاثنين على أي شبكة تؤمّنها.\n- **ثقة زائفة.** تتجاوز الفرق جدران حماية المضيف والتحديثات لأنها «خلف NAT». وضغطة تصيّد واحدة خلف NAT تمنح المهاجم نفقًا صادرًا على أي حال."
+   },
+   {
+    "type": "code",
+    "id": "nat",
+    "language": "bash",
+    "filename": "/etc/nftables.conf",
+    "code": "table inet filter {\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related accept\n    # allow only the published service, only from the partner range\n    ip saddr 198.51.100.0/24 ip daddr 10.10.0.20 tcp dport 443 ct status dnat accept\n    # outbound from the LAN\n    iifname \"lan0\" oifname \"wan0\" accept\n  }\n}\ntable ip nat {\n  chain prerouting {\n    type nat hook prerouting priority -100;\n    iifname \"wan0\" ip saddr 198.51.100.0/24 tcp dport 8443 dnat to 10.10.0.20:443\n  }\n  chain postrouting {\n    type nat hook postrouting priority 100;\n    oifname \"wan0\" ip saddr 10.10.0.0/24 masquerade\n  }\n}",
+    "caption": "طبقتان: جدول nat يترجم وجدول filter يقرر. وقاعدة DNAT تسمّي نطاق الشريك المسموح."
+   },
+   {
+    "type": "terminal",
+    "id": "conntrack",
+    "title": "تدقيق الترجمات على البوابة",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "sudo nft list table ip nat",
+      "output": "table ip nat {\n  chain prerouting {\n    iifname \"wan0\" ip saddr 198.51.100.0/24 tcp dport 8443 dnat to 10.10.0.20:443\n  }\n}",
+      "comment": "تحويل واحد فقط ومقيَّد بالمصدر"
+     },
+     {
+      "cmd": "sudo conntrack -L -p tcp --dport 8443 2>/dev/null | head -2",
+      "output": "tcp 6 86392 ESTABLISHED src=198.51.100.7 dst=203.0.113.10 sport=40112 dport=8443 src=10.10.0.20 dst=198.51.100.7 sport=443 dport=40112 [ASSURED]",
+      "comment": "تُظهر المجموعة الجهتين: العامة والمترجمة"
+     },
+     {
+      "cmd": "sudo conntrack -C",
+      "output": "1842",
+      "comment": "عدد الاتصالات المتتبعة النشطة: راقب أي نمو مفاجئ"
+     }
+    ],
+    "caption": "مخرجات conntrack هي سجل الترجمة الذي تحتاجه أثناء الحوادث."
+   },
+   {
+    "type": "text",
+    "id": "vendor",
+    "markdown": "## 3. الأفكار نفسها على منصات أخرى\n\nالمفاهيم واحدة في كل مكان، وتتغير الصيغة فقط.\n\nفي Cisco IOS XE تبدو PAT الديناميكية هكذا: `ip nat inside source list 10 interface GigabitEthernet0/0/0 overload`، مع `ip nat inside` و`ip nat outside` على الواجهتين الصحيحتين. والنشر الثابت هو `ip nat inside source static tcp 10.10.0.20 443 203.0.113.10 8443`. استخدم `show ip nat translations` للتدقيق. وفي Cisco ASA أو Firepower تُضبط NAT ككائنات و**تظل سياسة الوصول هي التي تقرر** ما يمر، وتذكّر أن القواعد تُقيَّم في الإصدارات الحديثة مقابل العنوان الحقيقي غير المترجم.\n\nوعلى مضيف Proxmox كثيرًا ما تنفّذ العقدة masquerade لجسر خاص بالأجهزة الافتراضية. اجعل القاعدة محصورة بالشبكة الفرعية للجسر كما في المثال أعلاه، ولا تطبّقها على كل واجهة. أما الحاويات فيضيف Docker قواعد NAT خاصة به للمنافذ المنشورة، والأمر `-p 8443:443` ينشر على **كل** عناوين المضيف افتراضيًا. اربطه بعنوان محدد بـ `-p 127.0.0.1:8443:443` عندما يحتاجه وكيل عكسي محلي فقط.\n\nواقرن NAT دائمًا بتصميم المناطق في [بنية أمن الشبكات](/learn/systems-infrastructure-security/network-security-architecture)، وأبقِ سجلات التدفقات الممنوعة تصل إلى [مراقبة أمن الشبكات](/learn/systems-infrastructure-security/network-security-monitoring)."
+   },
+   {
+    "type": "callout",
+    "id": "c-docker",
+    "variant": "warning",
+    "title": "قد يتجاوز Docker جدار حماية المضيف",
+    "markdown": "يُدرج Docker قواعد NAT وتمرير خاصة به قبل كثير من أدوات جدار حماية المضيف. وقد يكون المنفذ المنشور بـ `-p 8443:443` قابلًا للوصول رغم أن جدار الحماية يبدو أنه يحجبه. اربط المنافذ المنشورة بـ `127.0.0.1` أو بعنوان خاص، واختبر من جهاز آخر."
+   },
+   {
+    "type": "text",
+    "id": "review",
+    "markdown": "## 4. راجع NAT بانتظام\n\nعامل كل قاعدة ترجمة على أنها خدمة مكشوفة. نفّذ هذه القائمة كل ربع سنة.\n\n1. **اسرد** كل قواعد DNAT وNAT الثابتة من كل بوابة ومضيف افتراضي ومضيف حاويات.\n2. **اربط** كل قاعدة بمالك وتذكرة وسبب. واحذف القواعد التي ليس لها شيء من ذلك.\n3. **قيّد** كل قاعدة بعنوان المصدر عندما يكون الجمهور معروفًا، مثل نطاق شريك أو مجموعة عناوين VPN.\n4. **امسح** عناوينك العامة من الخارج بأداة مصرّح لك باستخدامها، وقارن المنافذ المفتوحة بقائمة القواعد. أي منفذ مفتوح بلا قاعدة مفاجأة تستحق التحقيق.\n5. **سجّل** الترجمات وأرسلها إلى تخزين مركزي مع الطوابع الزمنية، ليمكن تتبع شكوى خارجية إلى مضيف داخلي واحد.\n6. **فضّل VPN** أو وكيلًا عكسيًا بمصادقة على تحويل منفذ خام إلى واجهة إدارة.\n\nأما الخدمات التي يجب أن تكون عامة فضعها في DMZ، وحدّثها بسرعة، وضع أمامها جدار حماية لتطبيقات الويب. وإذا كانت لوحة الإدارة يحتاجها الموظفون فقط فانشرها عبر VPN."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم جهاز Linux افتراضيًا تملكه كبوابة بين جهازين افتراضيين.\n\n1. فعّل التمرير بالأمر `sudo sysctl -w net.ipv4.ip_forward=1`.\n2. أضف قاعدة masquerade للشبكة الداخلية وتأكد أن الجهاز الداخلي يصل إلى شبكة البوابة الخارجية.\n3. أضف قاعدة DNAT للمنفذ TCP/8080 نحو خادم ويب بسيط على الجهاز الداخلي، مقيَّدة بعنوان المصدر.\n4. نفّذ `sudo conntrack -L` أثناء جلب الصفحة وابحث عن السجل.\n5. احذف قيد المصدر ولاحظ ما يتغير في الانكشاف.\n\nاكتب جملة واحدة تشرح لماذا تحمي سياسة التصفية الخادم لا NAT."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "NAT",
+      "definition": "إعادة كتابة عناوين الحزم أثناء عبورها بوابة."
+     },
+     {
+      "term": "PAT",
+      "definition": "NAT تعيد كتابة المنافذ أيضًا ليتشارك مضيفات كثيرون عنوانًا واحدًا."
+     },
+     {
+      "term": "SNAT",
+      "definition": "ترجمة عنوان المصدر."
+     },
+     {
+      "term": "DNAT",
+      "definition": "ترجمة الوجهة، وتُستخدم لنشر الخدمات."
+     },
+     {
+      "term": "جدول الترجمة",
+      "definition": "حالة تحتفظ بها البوابة لإعادة ربط الردود."
+     },
+     {
+      "term": "تحويل المنفذ (Port-forward)",
+      "definition": "قاعدة DNAT تكشف خدمة داخلية."
+     },
+     {
+      "term": "Hairpin NAT",
+      "definition": "وصول عملاء داخليين إلى خادم داخلي عبر عنوانه العام."
+     },
+     {
+      "term": "UPnP",
+      "definition": "بروتوكول يتيح لأجهزة الشبكة المحلية فتح منافذ الموجّه تلقائيًا."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي عبارة عن NAT هي الأدق؟",
+      "options": [
+       "NAT بديل عن جدار الحماية",
+       "NAT تعيد كتابة العناوين والحماية تأتي من التصفية الحالة-الواعية",
+       "NAT تشفّر الحركة",
+       "NAT تحجب كل الحركة الواردة"
+      ],
+      "answer": 1,
+      "explanation": "يحجب المحرك الحالة-الواعي الحزم الواردة غير المطلوبة، أما NAT فتترجم فقط."
+     },
+     {
+      "question": "اختر كل المخاطر المرتبطة بتحويلات المنافذ.",
+      "options": [
+       "القواعد المنسية تبقى مكشوفة",
+       "نطاقات المنافذ الواسعة تكشف خدمات إضافية",
+       "تضيف دائمًا تشفيرًا",
+       "قد تضيع نسبة الحركة إلى مصدرها في السجلات"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "التحويلات تنشر الخدمات وقد تكون واسعة، والعنوان المشترك يخفي المصدر الداخلي ما لم توجد سجلات ترجمة."
+     },
+     {
+      "question": "أي نوع قاعدة ينشر خادم ويب داخليًا إلى الإنترنت؟",
+      "options": [
+       "Masquerade",
+       "DNAT",
+       "استثناء No-NAT",
+       "SNAT"
+      ],
+      "answer": 1,
+      "explanation": "تربط ترجمة الوجهة عنوانًا ومنفذًا عامين بخدمة داخلية."
+     },
+     {
+      "question": "كيف تنشر واجهة إدارة يحتاجها الموظفون فقط؟",
+      "options": [
+       "تحويل منفذ خام على 8443",
+       "عبر VPN أو وكيل عكسي بمصادقة",
+       "تفعيل UPnP",
+       "تحويل كل المنافذ"
+      ],
+      "answer": 1,
+      "explanation": "يتجنب الوصول عبر VPN كشف الواجهة للإنترنت كله."
+     },
+     {
+      "question": "اختر كل الممارسات الجيدة لمنافذ Docker المنشورة.",
+      "options": [
+       "الربط بـ 127.0.0.1 عندما يكفي وكيل محلي",
+       "افتراض أن جدار حماية المضيف يحجبها دائمًا",
+       "الاختبار من جهاز آخر",
+       "مراجعتها كأي تحويل منفذ"
+      ],
+      "answer": [
+       0,
+       2,
+       3
+      ],
+      "explanation": "يُدرج Docker قواعده الخاصة، فتحقق من الخارج واربط بنطاق ضيق."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\n- تعيد NAT كتابة العناوين، والمرشّح الحالة-الواعي هو الذي يوفر الحماية.\n- الأنواع الرئيسية هي SNAT أو PAT للحركة الصادرة وDNAT لنشر الخدمات.\n- تحويلات المنافذ خدمات مكشوفة: قيّدها بالمصدر ووثّق مالكها وراجعها.\n- العناوين المشتركة تخفي المضيفات الداخلية، فاحتفظ بسجلات الترجمة.\n- عطّل UPnP، وتذكّر أن Docker يضيف قواعد NAT خاصة به.\n- فضّل VPN أو وكيلًا بمصادقة لواجهات الإدارة."
+   }
+  ]
+ }
+}

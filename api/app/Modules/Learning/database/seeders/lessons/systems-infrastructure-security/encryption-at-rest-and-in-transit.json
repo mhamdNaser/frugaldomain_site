@@ -1,0 +1,554 @@
+{
+ "slug": "encryption-at-rest-and-in-transit",
+ "title": "Encryption at Rest and in Transit",
+ "summary": "Match encryption layers to threats, encrypt a data volume with LUKS, add engine or column encryption where needed, and manage keys safely.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Choose an encryption layer based on the threat",
+  "Encrypt a database volume with LUKS and verify it",
+  "Apply MySQL tablespace or application-side field encryption",
+  "Design key separation, rotation and recovery"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A decommissioned database server is sent back to the leasing company. Nobody wiped the disks, and the data directory still holds a year of customer records. A different incident: an engineer copies last night's backup to a personal laptop so that a bug can be reproduced, and the laptop is stolen. In both cases the database was well configured, yet the data left the building in the clear.\n\nEncryption at rest protects data when nobody is querying it: on disks, in snapshots and in backup files. Encryption in transit protects it while it moves. Neither replaces access control, but each removes an entire class of loss. In this lesson you will compare the layers at which stored data can be encrypted, apply the practical options for PostgreSQL and MySQL, and see why key management decides whether any of it is worth anything."
+  },
+  {
+   "id": "threats",
+   "type": "text",
+   "markdown": "## Decide which threat you are defending against\n\nEncryption is a tool for specific threats, so name them first. Stored data can be exposed in five common ways:\n\n- **Lost or stolen hardware.** Disks, laptops and removed drives.\n- **Improper disposal.** Returned leases, resold servers and failed disks sent for repair.\n- **Exposed copies.** Backups, snapshots and exports on shared storage or in object buckets.\n- **A hypervisor or storage administrator** who can read virtual disks but should not read the data.\n- **An attacker with the database process's file access**, for example through a path traversal flaw.\n\nThe last two matter because they show the limit of disk encryption. When the database is running, the operating system has already unlocked the volume. Anyone who can read files as the `postgres` user sees plaintext. Disk encryption stops offline theft; it does not stop an online attacker. Matching the control to the threat avoids false confidence."
+  },
+  {
+   "id": "layers",
+   "type": "text",
+   "markdown": "## The layers of encryption at rest\n\nStored data can be encrypted at several layers. Each protects against a different set of threats and costs a different amount of effort.\n\n| Layer | Example | Protects against | Does not protect against |\n|:--|:--|:--|:--|\n| Full-disk or volume | LUKS/dm-crypt, BitLocker | Stolen or disposed disks | Anyone using the running system |\n| Database engine (TDE-style) | MySQL InnoDB tablespace encryption | Copied data files and some backups | A user with valid SQL access |\n| Column or application | `pgcrypto`, app-side AES-GCM | Admins and SQL readers without the key | Loss of the key; makes search harder |\n| Backup | Encrypted dumps, encrypted repository | Exposed backup storage | Compromise of the live database |\n\nPostgreSQL has no built-in transparent data encryption in the community edition, so the usual answer is volume encryption for the data directory plus encrypted backups, with column-level encryption for the few fields that justify it. MySQL 8 supports InnoDB tablespace encryption natively, with keys held in a keyring component. Backup protection is covered in [Database Backup Encryption](/learn/systems-infrastructure-security/database-backup-encryption)."
+  },
+  {
+   "id": "rest-flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Where data is protected on its way to disk",
+   "caption": "TLS covers the network hop; each later layer covers a different stored copy.",
+   "data": {
+    "token": "Row",
+    "nodes": [
+     {
+      "id": "app",
+      "label": "Application",
+      "sub": "10.20.1.10",
+      "icon": "server"
+     },
+     {
+      "id": "db",
+      "label": "Database engine",
+      "sub": "10.20.2.5",
+      "icon": "database"
+     },
+     {
+      "id": "vol",
+      "label": "Encrypted volume",
+      "sub": "LUKS",
+      "icon": "lock"
+     },
+     {
+      "id": "bk",
+      "label": "Backup store",
+      "sub": "192.0.2.50",
+      "icon": "cloud"
+     }
+    ],
+    "steps": [
+     {
+      "at": "app",
+      "caption": "The application encrypts one sensitive field before sending it.",
+      "tone": "secure"
+     },
+     {
+      "at": "db",
+      "caption": "The row arrives over TLS, so the network sees only ciphertext.",
+      "tone": "secure"
+     },
+     {
+      "at": "db",
+      "caption": "The engine writes the page to the data directory."
+     },
+     {
+      "at": "vol",
+      "caption": "dm-crypt encrypts every block with the volume key before it reaches the disk.",
+      "tone": "success"
+     },
+     {
+      "at": "bk",
+      "caption": "The nightly dump is encrypted before it leaves the host.",
+      "tone": "secure"
+     },
+     {
+      "at": "vol",
+      "caption": "A stolen disk now holds only ciphertext and no key.",
+      "tone": "blocked"
+     }
+    ]
+   }
+  },
+  {
+   "id": "luks",
+   "type": "text",
+   "markdown": "## Step 1: Encrypt the volume that holds the data directory\n\nVolume encryption is the broadest and cheapest layer, so start there. On Linux, LUKS with `dm-crypt` encrypts a block device transparently. The performance cost on modern CPUs with AES instructions is usually a few percent.\n\nThere is one decision that matters more than the cipher: **where the unlock key lives**. A passphrase typed at boot is safe but blocks unattended reboots. A key file stored on the same disk gives no protection. Network-bound unlocking (Clevis with Tang) or a TPM-sealed key lets servers reboot on their own network while a stolen disk stays locked. Pick the option that matches how you operate, and document the break-glass procedure.\n\nCreating a LUKS volume erases the device. Do this only on a new, empty disk or a lab VM you own."
+  },
+  {
+   "id": "luks-term",
+   "type": "terminal",
+   "title": "Encrypting a data volume (lab VM)",
+   "lines": [
+    {
+     "cmd": "sudo cryptsetup luksFormat --type luks2 /dev/vdb",
+     "output": "WARNING!\n========\nThis will overwrite data on /dev/vdb irrevocably.\n\nAre you sure? (Type 'yes' in capital letters): YES\nEnter passphrase for /dev/vdb: <passphrase placeholder>",
+     "comment": "Destroys existing data on the device. Use a new disk only."
+    },
+    {
+     "cmd": "sudo cryptsetup open /dev/vdb pgdata && sudo mkfs.ext4 /dev/mapper/pgdata",
+     "output": "Creating filesystem with 2620928 4k blocks and 655360 inodes",
+     "comment": "Open the mapping, then create the filesystem on the mapped device."
+    },
+    {
+     "cmd": "sudo mount /dev/mapper/pgdata /var/lib/postgresql && sudo cryptsetup status pgdata | head -6",
+     "output": "/dev/mapper/pgdata is active and is in use.\n  type:    LUKS2\n  cipher:  aes-xts-plain64\n  keysize: 512 bits\n  device:  /dev/vdb",
+     "comment": "AES-XTS with a 512-bit key (two 256-bit halves) is the normal default."
+    },
+    {
+     "cmd": "sudo cryptsetup luksDump /dev/vdb | grep -E \"Version|Keyslots|PBKDF\" | head -5",
+     "output": "Version:        2\nKeyslots:\n  0: luks2\n        PBKDF:      argon2id",
+     "comment": "Argon2id slows brute-force attempts on the passphrase."
+    }
+   ],
+   "caption": "Example output; device names differ per system."
+  },
+  {
+   "id": "engine",
+   "type": "text",
+   "markdown": "## Step 2: Add engine-level or column-level encryption where it earns its keep\n\nVolume encryption leaves plaintext visible to the running database and to anyone with SQL access. When a smaller group should see a field, such as national ID numbers, encrypt it at a finer grain.\n\nIn MySQL 8, load the keyring component, then create tables with `ENCRYPTION='Y'`. InnoDB then encrypts the tablespace file, and a copied `.ibd` file is unreadable without the master key. Keep the master key outside the data directory, because a key stored next to the data defeats the design.\n\nIn PostgreSQL, `pgcrypto` provides functions such as `pgp_sym_encrypt`. Be careful: the key then appears in the SQL text, which can end up in logs and `pg_stat_statements`. Prefer application-side encryption using a key from a secrets manager, and store only ciphertext. The trade-off is real. Encrypted columns cannot be indexed for range queries and cannot be searched without extra design, so encrypt the smallest set of fields that your risk assessment names. Key handling for the application is covered in [Database Secrets and Credential Management](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+  },
+  {
+   "id": "sql",
+   "type": "code",
+   "language": "sql",
+   "filename": "encryption-examples.sql",
+   "caption": "MySQL tablespace encryption and a PostgreSQL column check. Lab examples; never put real keys in SQL text.",
+   "code": "-- MySQL 8: encrypt a table's tablespace (keyring component must be loaded)\nCREATE TABLE customers (\n  id BIGINT PRIMARY KEY,\n  email VARCHAR(255) NOT NULL\n) ENCRYPTION='Y';\n\n-- MySQL 8: find tables that are NOT encrypted\nSELECT table_schema, table_name, create_options\nFROM information_schema.tables\nWHERE table_schema NOT IN ('mysql','sys','information_schema','performance_schema')\n  AND (create_options IS NULL OR create_options NOT LIKE '%ENCRYPTION=\"Y\"%');\n\n-- PostgreSQL: confirm stored values are ciphertext, not plaintext\nSELECT id, left(encode(national_id_enc, 'hex'), 24) AS stored_prefix\nFROM customers LIMIT 2;",
+   "highlight": [
+    5,
+    9,
+    10,
+    11,
+    12
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "A key next to the data is not encryption",
+   "markdown": "If the key file sits in the same directory, backup or snapshot as the encrypted data, anyone who gets the data gets the key. Store keys in a separate system with its own access control and audit trail, and test that a restored backup cannot be decrypted without fetching the key from there."
+  },
+  {
+   "id": "keys",
+   "type": "text",
+   "markdown": "## Step 3: Manage keys as carefully as the data\n\nEncryption moves the problem from protecting a lot of data to protecting a few keys. Handle those keys deliberately:\n\n- **Separate duties.** The person who administers the database should not be the only person who controls its keys.\n- **Use a key hierarchy.** A master key encrypts data keys, so you can rotate the master without re-encrypting terabytes. Cloud key services and HashiCorp Vault Transit work this way.\n- **Rotate on a schedule and after any suspected exposure.** Practice the rotation before you need it.\n- **Back up keys separately** from the data, and test recovery. A lost key means permanently lost data, which is a self-inflicted outage.\n- **Log key use.** Every decrypt request should be attributable.\n\nFinally, keep in-transit protection in place. Data encrypted on disk is plaintext inside the engine and on the wire unless you also use TLS, as covered in [Database TLS and Encryption](/learn/systems-infrastructure-security/database-tls-and-encryption). A complete design pairs TLS for connections, volume encryption for disks, selective field encryption for the most sensitive values, and encrypted, separately keyed backups."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a lab VM **you own** with a spare empty virtual disk, create a LUKS2 volume, open it, format it and mount it. Run `cryptsetup status` and note the cipher.\n2. Close the volume with `sudo umount` and `sudo cryptsetup close`, then try `sudo mount` on the raw device. Record the error.\n3. Initialize a throwaway PostgreSQL cluster on the mounted volume and create a table. Search the raw device with `sudo strings /dev/vdb | grep <your sample value>` and confirm nothing is found.\n4. Write down where your passphrase or key would live in production and who could reach it. Is any single person able to both read the disk and unlock it?"
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Encryption at rest",
+     "definition": "Protecting stored data on disks, snapshots and backups."
+    },
+    {
+     "term": "Encryption in transit",
+     "definition": "Protecting data while it crosses a network."
+    },
+    {
+     "term": "LUKS",
+     "definition": "The standard Linux disk encryption format used with dm-crypt."
+    },
+    {
+     "term": "TDE",
+     "definition": "Transparent data encryption: the engine encrypts data files without application changes."
+    },
+    {
+     "term": "Column-level encryption",
+     "definition": "Encrypting individual fields so only holders of the key can read them."
+    },
+    {
+     "term": "Master key",
+     "definition": "A key that protects other keys, enabling cheap rotation."
+    },
+    {
+     "term": "Key rotation",
+     "definition": "Replacing a key on a schedule or after exposure."
+    },
+    {
+     "term": "Break-glass",
+     "definition": "A documented emergency procedure for access when normal unlock fails."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which threat does full-volume encryption NOT stop?",
+     "options": [
+      "A stolen powered-off disk",
+      "An attacker reading files as the postgres user on the running server",
+      "A returned leased server",
+      "A lost laptop"
+     ],
+     "answer": 1,
+     "explanation": "The volume is already unlocked while the system runs, so processes with file access see plaintext."
+    },
+    {
+     "question": "Why is storing the encryption key in the same backup as the data a mistake?",
+     "options": [
+      "Keys make backups larger",
+      "Whoever obtains the backup also obtains the key",
+      "Keys cannot be backed up",
+      "It disables compression"
+     ],
+     "answer": 1,
+     "explanation": "Encryption is only useful if the key is separated from the ciphertext."
+    },
+    {
+     "question": "Which are valid layers for encrypting stored database data? Choose all that apply.",
+     "options": [
+      "LUKS on the data volume",
+      "InnoDB tablespace encryption",
+      "Application-side AES-GCM on selected fields",
+      "Renaming the database"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Volume, engine and application layers are real controls; renaming adds none."
+    },
+    {
+     "question": "What is the main benefit of a key hierarchy (master key plus data keys)?",
+     "options": [
+      "Faster queries",
+      "Rotating the master key without re-encrypting all data",
+      "No need for backups",
+      "Removes TLS"
+     ],
+     "answer": 1,
+     "explanation": "Only the small data keys are re-wrapped, so rotation is cheap."
+    },
+    {
+     "question": "Why can pgcrypto with the key in the SQL text be risky?",
+     "options": [
+      "The key can leak into logs and statement statistics",
+      "It makes tables read-only",
+      "It disables indexes entirely",
+      "It requires root"
+     ],
+     "answer": 0,
+     "explanation": "Statement logging and pg_stat_statements can store the query text, including the key."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Name the threat first: stolen or disposed hardware, exposed backups, privileged insiders or an online attacker. Each needs a different layer.\n- Volume encryption (LUKS) is the broadest, cheapest layer and stops offline theft only.\n- Engine or column encryption protects fields from people with legitimate SQL access, at the cost of flexibility.\n- Keys decide everything: separate them from data, use a hierarchy, rotate, back up and log their use.\n- Combine layers with TLS and encrypted backups for a complete design.\n\nNext, move from protecting data to limiting who may touch it in [Database Least-Privilege Access](/learn/systems-infrastructure-security/database-least-privilege-access)."
+  }
+ ],
+ "ar": {
+  "title": "تشفير البيانات المخزنة والمنقولة",
+  "summary": "طابق طبقات التشفير مع التهديدات، وشفّر مجلد البيانات بـ LUKS، وأضف تشفير المحرك أو الأعمدة عند الحاجة، وأدِر المفاتيح بأمان.",
+  "objectives": [
+   "اختيار طبقة التشفير بحسب التهديد",
+   "تشفير مجلد قاعدة بيانات بـ LUKS والتحقق منه",
+   "تطبيق تشفير فضاءات MySQL أو تشفير الحقول في التطبيق",
+   "تصميم فصل المفاتيح وتبديلها واستعادتها"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يُعاد خادم قاعدة بيانات مُخرَج من الخدمة إلى شركة التأجير. لم يمسح أحد الأقراص، وما زال دليل البيانات يحوي سنة من سجلات العملاء. وحادثة أخرى: ينسخ مهندس نسخة الليلة الاحتياطية إلى حاسوبه الشخصي ليعيد إنتاج خلل، ثم يُسرق الحاسوب. في الحالتين كانت قاعدة البيانات مضبوطة جيدًا، ومع ذلك خرجت البيانات من المبنى مكشوفة.\n\nيحمي التشفير أثناء التخزين (Encryption at rest) البيانات حين لا يستعلم عنها أحد: على الأقراص وفي اللقطات وفي ملفات النسخ الاحتياطي. ويحميها التشفير أثناء النقل (Encryption in transit) وهي تتحرك. لا يغني أيٌّ منهما عن التحكم بالوصول، لكن كلًّا منهما يزيل صنفًا كاملًا من الخسائر. في هذا الدرس ستقارن الطبقات التي يمكن تشفير البيانات المخزنة عندها، وتطبّق الخيارات العملية في PostgreSQL وMySQL، وترى لماذا تقرر إدارة المفاتيح ما إذا كان هذا كله ذا قيمة."
+   },
+   {
+    "id": "threats",
+    "type": "text",
+    "markdown": "## قرّر من أي تهديد تدافع\n\nالتشفير أداة لتهديدات محددة، فسمِّها أولًا. تتعرض البيانات المخزنة للانكشاف بخمس طرق شائعة:\n\n- **ضياع العتاد أو سرقته.** الأقراص والحواسيب المحمولة والأقراص المنزوعة.\n- **التخلص غير السليم.** عقود التأجير المعادة والخوادم المباعة والأقراص التالفة المرسلة للإصلاح.\n- **النسخ المكشوفة.** النسخ الاحتياطية واللقطات والتصديرات على تخزين مشترك أو في سلال الكائنات.\n- **مدير المحاكي (Hypervisor) أو التخزين** الذي يقرأ الأقراص الافتراضية وليس له أن يقرأ البيانات.\n- **مهاجم يملك وصول الملفات لعملية قاعدة البيانات**، مثلًا عبر ثغرة اجتياز مسارات.\n\nيهم الأخيران لأنهما يبيّنان حد تشفير القرص. فحين تعمل قاعدة البيانات يكون نظام التشغيل قد فتح المجلد المشفّر أصلًا، وكل من يقرأ الملفات بصفة المستخدم `postgres` يرى النص الصريح. يوقف تشفير القرص السرقة دون اتصال، ولا يوقف المهاجم المتصل. ومطابقة الضابط للتهديد تجنّبك الثقة الزائفة."
+   },
+   {
+    "id": "layers",
+    "type": "text",
+    "markdown": "## طبقات التشفير أثناء التخزين\n\nيمكن تشفير البيانات المخزنة عند عدة طبقات. تحمي كل طبقة من مجموعة تهديدات مختلفة وتكلّف جهدًا مختلفًا.\n\n| الطبقة | مثال | تحمي من | لا تحمي من |\n|:--|:--|:--|:--|\n| القرص أو المجلد كاملًا | LUKS/dm-crypt وBitLocker | الأقراص المسروقة أو المتخلَّص منها | من يستخدم النظام العامل |\n| محرك قاعدة البيانات (على نمط TDE) | تشفير فضاءات InnoDB في MySQL | ملفات البيانات المنسوخة وبعض النسخ الاحتياطية | مستخدم يملك وصول SQL صالحًا |\n| العمود أو التطبيق | `pgcrypto` وAES-GCM في التطبيق | المديرون وقارئو SQL دون المفتاح | ضياع المفتاح؛ ويصعّب البحث |\n| النسخ الاحتياطي | تفريغات مشفّرة ومستودع مشفّر | تخزين النسخ المكشوف | اختراق قاعدة البيانات الحية |\n\nلا يحوي إصدار PostgreSQL المجتمعي تشفيرًا شفافًا مدمجًا للبيانات، فالجواب المعتاد تشفير المجلد لدليل البيانات مع نسخ احتياطية مشفّرة، وتشفير على مستوى الأعمدة للحقول القليلة التي تستحق ذلك. أما MySQL 8 فيدعم تشفير فضاءات InnoDB أصلًا، مع حفظ المفاتيح في مكوّن سلسلة مفاتيح (keyring). وتجد حماية النسخ الاحتياطية في [تشفير النسخ الاحتياطية لقواعد البيانات](/learn/systems-infrastructure-security/database-backup-encryption)."
+   },
+   {
+    "id": "rest-flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "أين تُحمى البيانات في طريقها إلى القرص",
+    "caption": "يغطي TLS قفزة الشبكة؛ وتغطي كل طبقة لاحقة نسخة مخزنة مختلفة.",
+    "data": {
+     "token": "صف",
+     "nodes": [
+      {
+       "id": "app",
+       "label": "التطبيق",
+       "sub": "10.20.1.10",
+       "icon": "server"
+      },
+      {
+       "id": "db",
+       "label": "محرك القاعدة",
+       "sub": "10.20.2.5",
+       "icon": "database"
+      },
+      {
+       "id": "vol",
+       "label": "المجلد المشفّر",
+       "sub": "LUKS",
+       "icon": "lock"
+      },
+      {
+       "id": "bk",
+       "label": "مخزن النسخ",
+       "sub": "192.0.2.50",
+       "icon": "cloud"
+      }
+     ],
+     "steps": [
+      {
+       "at": "app",
+       "caption": "يشفّر التطبيق حقلًا حساسًا واحدًا قبل إرساله.",
+       "tone": "secure"
+      },
+      {
+       "at": "db",
+       "caption": "يصل الصف عبر TLS فلا ترى الشبكة إلا نصًّا مشفّرًا.",
+       "tone": "secure"
+      },
+      {
+       "at": "db",
+       "caption": "يكتب المحرك الصفحة في دليل البيانات."
+      },
+      {
+       "at": "vol",
+       "caption": "يشفّر dm-crypt كل كتلة بمفتاح المجلد قبل وصولها إلى القرص.",
+       "tone": "success"
+      },
+      {
+       "at": "bk",
+       "caption": "يُشفّر التفريغ الليلي قبل مغادرته المضيف.",
+       "tone": "secure"
+      },
+      {
+       "at": "vol",
+       "caption": "القرص المسروق يحوي الآن نصًّا مشفّرًا بلا مفتاح.",
+       "tone": "blocked"
+      }
+     ]
+    }
+   },
+   {
+    "id": "luks",
+    "type": "text",
+    "markdown": "## الخطوة 1: شفّر المجلد الذي يحوي دليل البيانات\n\nتشفير المجلد أوسع الطبقات وأرخصها، فابدأ به. في Linux يشفّر LUKS مع `dm-crypt` جهاز الكتل بشفافية. وكلفة الأداء على المعالجات الحديثة ذات تعليمات AES عادةً نسبة قليلة.\n\nثمة قرار أهم من الشيفرة: **أين يعيش مفتاح الفتح**. عبارة المرور المكتوبة عند الإقلاع آمنة لكنها تمنع إعادة التشغيل دون مراقبة. وملف مفتاح مخزَّن على القرص نفسه لا يوفر حماية. أما الفتح المرتبط بالشبكة (Clevis مع Tang) أو مفتاح مختوم بوحدة TPM فيدعان الخوادم تُعاد تشغيلها وحدها داخل شبكتها بينما يبقى القرص المسروق مقفلًا. اختر ما يوافق طريقة تشغيلك ووثّق إجراء الطوارئ.\n\nإنشاء مجلد LUKS يمسح الجهاز. افعله فقط على قرص جديد فارغ أو آلة مخبرية تملكها."
+   },
+   {
+    "id": "luks-term",
+    "type": "terminal",
+    "title": "تشفير مجلد بيانات (آلة مخبرية)",
+    "lines": [
+     {
+      "cmd": "sudo cryptsetup luksFormat --type luks2 /dev/vdb",
+      "output": "WARNING!\n========\nThis will overwrite data on /dev/vdb irrevocably.\n\nAre you sure? (Type 'yes' in capital letters): YES\nEnter passphrase for /dev/vdb: <passphrase placeholder>",
+      "comment": "يمسح البيانات الموجودة على الجهاز. استخدم قرصًا جديدًا فقط."
+     },
+     {
+      "cmd": "sudo cryptsetup open /dev/vdb pgdata && sudo mkfs.ext4 /dev/mapper/pgdata",
+      "output": "Creating filesystem with 2620928 4k blocks and 655360 inodes",
+      "comment": "افتح التعيين ثم أنشئ نظام الملفات على الجهاز المعيَّن."
+     },
+     {
+      "cmd": "sudo mount /dev/mapper/pgdata /var/lib/postgresql && sudo cryptsetup status pgdata | head -6",
+      "output": "/dev/mapper/pgdata is active and is in use.\n  type:    LUKS2\n  cipher:  aes-xts-plain64\n  keysize: 512 bits\n  device:  /dev/vdb",
+      "comment": "AES-XTS بمفتاح 512 بت (نصفان 256 بت) هو الافتراضي المعتاد."
+     },
+     {
+      "cmd": "sudo cryptsetup luksDump /dev/vdb | grep -E \"Version|Keyslots|PBKDF\" | head -5",
+      "output": "Version:        2\nKeyslots:\n  0: luks2\n        PBKDF:      argon2id",
+      "comment": "يبطّئ Argon2id محاولات التخمين على عبارة المرور."
+     }
+    ],
+    "caption": "مخرجات مثال؛ تختلف أسماء الأجهزة بين الأنظمة."
+   },
+   {
+    "id": "engine",
+    "type": "text",
+    "markdown": "## الخطوة 2: أضف تشفير المحرك أو الأعمدة حيث يستحق\n\nيُبقي تشفير المجلد النص الصريح ظاهرًا لقاعدة البيانات العاملة ولكل من يملك وصول SQL. وحين ينبغي أن تراه مجموعة أصغر، كأرقام الهوية الوطنية، شفّره بدرجة أدق.\n\nفي MySQL 8 حمِّل مكوّن سلسلة المفاتيح ثم أنشئ الجداول بالخيار `ENCRYPTION='Y'`. يشفّر InnoDB حينها ملف فضاء الجدول، فلا يُقرأ ملف `.ibd` منسوخ دون المفتاح الرئيسي. أبقِ المفتاح الرئيسي خارج دليل البيانات، فمفتاح محفوظ بجانب البيانات يُبطل التصميم.\n\nوفي PostgreSQL توفر `pgcrypto` دوال مثل `pgp_sym_encrypt`. احذر: يظهر المفتاح عندئذٍ في نص SQL الذي قد ينتهي في السجلات وفي `pg_stat_statements`. فضّل التشفير في جهة التطبيق بمفتاح من مدير أسرار، وخزّن النص المشفّر فقط. والمقايضة حقيقية: لا تُفهرس الأعمدة المشفّرة للاستعلامات النطاقية ولا يُبحث فيها دون تصميم إضافي، فشفّر أصغر مجموعة حقول يسمّيها تقييم المخاطر لديك. وإدارة المفاتيح للتطبيق في [إدارة أسرار قواعد البيانات وبيانات الاعتماد](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+   },
+   {
+    "id": "sql",
+    "type": "code",
+    "language": "sql",
+    "filename": "encryption-examples.sql",
+    "caption": "تشفير فضاءات MySQL وفحص عمود في PostgreSQL. أمثلة مخبرية؛ لا تضع مفاتيح حقيقية في نص SQL.",
+    "code": "-- MySQL 8: encrypt a table's tablespace (keyring component must be loaded)\nCREATE TABLE customers (\n  id BIGINT PRIMARY KEY,\n  email VARCHAR(255) NOT NULL\n) ENCRYPTION='Y';\n\n-- MySQL 8: find tables that are NOT encrypted\nSELECT table_schema, table_name, create_options\nFROM information_schema.tables\nWHERE table_schema NOT IN ('mysql','sys','information_schema','performance_schema')\n  AND (create_options IS NULL OR create_options NOT LIKE '%ENCRYPTION=\"Y\"%');\n\n-- PostgreSQL: confirm stored values are ciphertext, not plaintext\nSELECT id, left(encode(national_id_enc, 'hex'), 24) AS stored_prefix\nFROM customers LIMIT 2;",
+    "highlight": [
+     5,
+     9,
+     10,
+     11,
+     12
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "مفتاح بجانب البيانات ليس تشفيرًا",
+    "markdown": "إن كان ملف المفتاح في الدليل أو النسخة أو اللقطة نفسها مع البيانات المشفّرة، فكل من يحصل على البيانات يحصل على المفتاح. خزّن المفاتيح في نظام منفصل له ضوابط وصول وسجل تدقيق خاصان، واختبر أن نسخة مستعادة لا تُفك دون جلب المفتاح من هناك."
+   },
+   {
+    "id": "keys",
+    "type": "text",
+    "markdown": "## الخطوة 3: أدِر المفاتيح بعناية البيانات نفسها\n\nينقل التشفير المشكلة من حماية بيانات كثيرة إلى حماية مفاتيح قليلة. فتعامل معها عن قصد:\n\n- **افصل المهام.** ينبغي ألا يكون مدير قاعدة البيانات الشخص الوحيد المتحكم بمفاتيحها.\n- **استخدم هرمًا للمفاتيح.** يشفّر المفتاح الرئيسي مفاتيح البيانات، فتبدّل الرئيسي دون إعادة تشفير تيرابايتات. وهكذا تعمل خدمات المفاتيح السحابية وVault Transit من HashiCorp.\n- **بدّل وفق جدول وبعد أي اشتباه بالانكشاف.** وتمرّن على التبديل قبل أن تحتاجه.\n- **انسخ المفاتيح احتياطيًّا بمعزل** عن البيانات، واختبر الاستعادة. فضياع المفتاح يعني ضياع البيانات نهائيًّا، وهو انقطاع تسببه لنفسك.\n- **سجّل استخدام المفاتيح.** ينبغي أن يُنسب كل طلب فك تشفير إلى صاحبه.\n\nوأخيرًا أبقِ حماية النقل قائمة. فالبيانات المشفّرة على القرص نص صريح داخل المحرك وعلى السلك ما لم تستخدم TLS أيضًا، كما في [TLS والتشفير في قواعد البيانات](/learn/systems-infrastructure-security/database-tls-and-encryption). ويجمع التصميم المكتمل TLS للاتصالات، وتشفير المجلد للأقراص، وتشفيرًا انتقائيًّا للحقول الأشد حساسية، ونسخًا احتياطية مشفّرة بمفاتيح مستقلة."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على آلة مخبرية **تملكها** ولديها قرص افتراضي فارغ احتياطي، أنشئ مجلد LUKS2 وافتحه وهيّئه وركّبه. شغّل `cryptsetup status` ولاحظ الشيفرة.\n2. أغلق المجلد بـ `sudo umount` و`sudo cryptsetup close`، ثم جرّب `sudo mount` على الجهاز الخام. سجّل الخطأ.\n3. هيّئ عنقود PostgreSQL مؤقتًا على المجلد المركّب وأنشئ جدولًا. ابحث في الجهاز الخام بـ `sudo strings /dev/vdb | grep <قيمتك التجريبية>` وتأكد أنه لا يعثر على شيء.\n4. دوّن أين ستعيش عبارة المرور أو المفتاح في الإنتاج ومن يصل إليهما. هل يستطيع شخص واحد قراءة القرص وفتحه معًا؟"
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "التشفير أثناء التخزين",
+      "definition": "حماية البيانات المخزنة على الأقراص واللقطات والنسخ الاحتياطية."
+     },
+     {
+      "term": "التشفير أثناء النقل",
+      "definition": "حماية البيانات وهي تعبر الشبكة."
+     },
+     {
+      "term": "LUKS",
+      "definition": "صيغة تشفير الأقراص القياسية في Linux مع dm-crypt."
+     },
+     {
+      "term": "TDE",
+      "definition": "تشفير شفاف للبيانات: يشفّر المحرك ملفات البيانات دون تغيير التطبيقات."
+     },
+     {
+      "term": "تشفير الأعمدة",
+      "definition": "تشفير حقول بعينها فلا يقرؤها إلا من يملك المفتاح."
+     },
+     {
+      "term": "المفتاح الرئيسي",
+      "definition": "مفتاح يحمي مفاتيح أخرى ويتيح تبديلًا رخيصًا."
+     },
+     {
+      "term": "تبديل المفاتيح",
+      "definition": "استبدال مفتاح وفق جدول أو بعد انكشاف."
+     },
+     {
+      "term": "إجراء الطوارئ",
+      "definition": "إجراء موثق للوصول عند فشل الفتح المعتاد."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي تهديد لا يوقفه تشفير المجلد كاملًا؟",
+      "options": [
+       "قرص مسروق مطفأ",
+       "مهاجم يقرأ الملفات بصفة المستخدم postgres على الخادم العامل",
+       "خادم مؤجَّر معاد",
+       "حاسوب محمول ضائع"
+      ],
+      "answer": 1,
+      "explanation": "المجلد مفتوح أصلًا أثناء عمل النظام، فترى العمليات ذات وصول الملفات النص الصريح."
+     },
+     {
+      "question": "لماذا يُعد تخزين مفتاح التشفير في النسخة الاحتياطية نفسها مع البيانات خطأً؟",
+      "options": [
+       "تكبّر المفاتيح النسخ",
+       "من يحصل على النسخة يحصل على المفتاح",
+       "لا يمكن نسخ المفاتيح",
+       "يعطّل الضغط"
+      ],
+      "answer": 1,
+      "explanation": "لا يفيد التشفير إلا إذا فُصل المفتاح عن النص المشفّر."
+     },
+     {
+      "question": "أي مما يلي طبقات صالحة لتشفير بيانات قاعدة البيانات المخزنة؟ اختر كل ما ينطبق.",
+      "options": [
+       "LUKS على مجلد البيانات",
+       "تشفير فضاءات InnoDB",
+       "AES-GCM في التطبيق على حقول مختارة",
+       "إعادة تسمية قاعدة البيانات"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "طبقات المجلد والمحرك والتطبيق ضوابط حقيقية؛ وإعادة التسمية لا تضيف شيئًا."
+     },
+     {
+      "question": "ما الفائدة الرئيسية من هرم المفاتيح (مفتاح رئيسي ومفاتيح بيانات)؟",
+      "options": [
+       "استعلامات أسرع",
+       "تبديل المفتاح الرئيسي دون إعادة تشفير كل البيانات",
+       "الاستغناء عن النسخ الاحتياطية",
+       "إزالة الحاجة إلى TLS"
+      ],
+      "answer": 1,
+      "explanation": "تُعاد تغطية مفاتيح البيانات الصغيرة فقط، فيكون التبديل رخيصًا."
+     },
+     {
+      "question": "لماذا قد يكون pgcrypto مع المفتاح في نص SQL خطرًا؟",
+      "options": [
+       "قد يتسرب المفتاح إلى السجلات وإحصاءات العبارات",
+       "يجعل الجداول للقراءة فقط",
+       "يعطّل الفهارس كليًّا",
+       "يتطلب root"
+      ],
+      "answer": 0,
+      "explanation": "قد يخزن تسجيل العبارات وpg_stat_statements نص الاستعلام ومعه المفتاح."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- سمِّ التهديد أولًا: عتاد مسروق أو متخلَّص منه، أو نسخ مكشوفة، أو متنفذون من الداخل، أو مهاجم متصل. ولكل منها طبقة مختلفة.\n- تشفير المجلد (LUKS) أوسع الطبقات وأرخصها ويوقف السرقة دون اتصال فقط.\n- يحمي تشفير المحرك أو الأعمدة الحقول من أصحاب وصول SQL المشروع، على حساب المرونة.\n- المفاتيح تحسم كل شيء: افصلها عن البيانات، واستخدم هرمًا، وبدّل، وانسخ احتياطيًّا، وسجّل استخدامها.\n- اجمع الطبقات مع TLS ونسخ احتياطية مشفّرة لتصميم مكتمل.\n\nوالآن انتقل من حماية البيانات إلى تحديد من يحق له لمسها في [الوصول بأقل الامتيازات إلى قواعد البيانات](/learn/systems-infrastructure-security/database-least-privilege-access)."
+   }
+  ]
+ }
+}

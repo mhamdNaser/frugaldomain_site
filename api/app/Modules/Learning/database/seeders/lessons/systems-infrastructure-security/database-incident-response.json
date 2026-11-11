@@ -1,0 +1,520 @@
+{
+ "slug": "database-incident-response",
+ "title": "Database Incident Response",
+ "summary": "Detect, contain, scope and recover from database incidents with a rehearsed runbook that preserves evidence.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Prepare logging, runbooks and break-glass access",
+  "Triage a suspicious database session",
+  "Contain without destroying evidence",
+  "Scope the impact, remove persistence and recover"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 02:10 an alert fires: the application database is returning data to a connection from an address nobody recognizes, and a table export is running. The on-call engineer has two bad options. Pull the plug and lose the evidence and the service, or keep watching and let the copy finish. A team with a database incident plan has a third option, because the decisions were made months earlier.\n\nDatabases are where an incident turns into a breach, since the data lives there. Database incident response is the practice of detecting abuse quickly, containing it without destroying evidence, finding out exactly which records were touched, and restoring trust in the system. This lesson gives you a workflow you can rehearse on PostgreSQL and MySQL."
+  },
+  {
+   "id": "phases",
+   "type": "text",
+   "markdown": "## The database incident lifecycle\n\nThe general incident cycle applies, but each phase has database-specific questions. The table shows what to decide in advance.\n\n| Phase | Database question | Prepared answer |\n|:--|:--|:--|\n| Prepare | What can we log and who may act? | Audit logging on, runbook, break-glass account |\n| Detect | What looks abnormal? | Alerts on new clients, bulk reads, privilege changes |\n| Contain | How do we stop access without losing evidence? | Block at the firewall, revoke roles, keep the process running |\n| Eradicate | What did the attacker change? | Review roles, functions, extensions and scheduled jobs |\n| Recover | Which data and credentials can we trust? | Rotate secrets, restore from verified backups |\n| Learn | What would have caught this sooner? | Update alerts and the runbook |\n\nThe important habit is **preparing before the incident**. During a real event nobody has time to learn where the logs are or who owns the break-glass password. Rehearse the runbook as you would a fire drill, and revisit it after every change to the platform."
+  },
+  {
+   "id": "ir-cycle",
+   "type": "animation",
+   "kind": "cycle",
+   "title": "Database incident response cycle",
+   "caption": "Each pass through the cycle leaves the database better instrumented.",
+   "data": {
+    "center": "DB incident",
+    "items": [
+     {
+      "label": "Prepare",
+      "sub": "Logging, runbook, access"
+     },
+     {
+      "label": "Detect",
+      "sub": "Alerts and triage"
+     },
+     {
+      "label": "Contain",
+      "sub": "Block, revoke, preserve"
+     },
+     {
+      "label": "Eradicate",
+      "sub": "Remove persistence"
+     },
+     {
+      "label": "Recover",
+      "sub": "Restore and rotate"
+     },
+     {
+      "label": "Learn",
+      "sub": "Fix the gaps"
+     }
+    ],
+    "steps": [
+     {
+      "item": 0,
+      "caption": "Audit logs, a runbook and a break-glass account exist before anything happens."
+     },
+     {
+      "item": 1,
+      "caption": "An alert on an unknown client or bulk read starts triage."
+     },
+     {
+      "item": 2,
+      "caption": "Block the source and lock the role, but keep the server running for evidence."
+     },
+     {
+      "item": 3,
+      "caption": "Search for new roles, functions, extensions and scheduled jobs."
+     },
+     {
+      "item": 4,
+      "caption": "Rotate every credential the database held and restore clean data if needed."
+     },
+     {
+      "item": 5,
+      "caption": "Turn the lessons into new alerts and runbook changes."
+     }
+    ]
+   }
+  },
+  {
+   "id": "detect",
+   "type": "text",
+   "markdown": "## Detect and triage\n\nGood detection starts with the logs described in [Database Auditing and Activity Logging](/learn/systems-infrastructure-security/database-auditing-and-activity-logging). Useful signals include:\n\n- Logins from an address outside the application and management subnets.\n- A role reading far more rows than its baseline, or running `COPY ... TO` and `SELECT ... INTO OUTFILE`.\n- New superusers, `GRANT` statements, or `ALTER ROLE` changes outside a change window.\n- Bursts of authentication failures followed by one success.\n- Errors that look like injection probing, as discussed in [SQL Injection and Database Attack Prevention](/learn/systems-infrastructure-security/sql-injection-and-database-attack-prevention).\n\nTriage answers three questions fast: **is it real, what is the scope, and is it still happening?** Start with current sessions. The terminal below uses PostgreSQL views on a lab server you own."
+  },
+  {
+   "id": "triage-term",
+   "type": "terminal",
+   "title": "Triage on a lab PostgreSQL server",
+   "lines": [
+    {
+     "cmd": "psql -c \"SELECT pid, usename, client_addr, state, left(query,40) AS q FROM pg_stat_activity WHERE client_addr IS NOT NULL ORDER BY backend_start;\"",
+     "output": "  pid  | usename |  client_addr  | state  |                    q\n-------+---------+---------------+--------+------------------------------------------\n  4102 | webapp  | 10.20.1.10    | idle   | SELECT id FROM sessions WHERE token = $1\n  4177 | webapp  | 198.51.100.77 | active | COPY customers TO PROGRAM '/tmp/x'",
+     "comment": "The second session is from outside the app subnet and is exporting a table."
+    },
+    {
+     "cmd": "psql -c \"SELECT rolname, rolsuper, rolcreaterole, rolreplication FROM pg_roles WHERE rolname !~ '^pg_' ORDER BY oid DESC LIMIT 3;\"",
+     "output": " rolname | rolsuper | rolcreaterole | rolreplication\n---------+----------+---------------+----------------\n tmp_ops | t        | t             | f\n webapp  | f        | f             | f",
+     "comment": "A recently created superuser role nobody requested: a persistence candidate."
+    }
+   ],
+   "caption": "Two queries answer who is connected and whether privileges changed."
+  },
+  {
+   "id": "evidence-warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Preserve evidence before you fix",
+   "markdown": "Restarting the server clears `pg_stat_activity` and in-memory state. Before any restart, save the activity snapshot, copy the logs to a write-once location, and record the time and your actions. Do not run `VACUUM FULL` or drop tables to clean up, because that alters the evidence you need."
+  },
+  {
+   "id": "contain",
+   "type": "text",
+   "markdown": "## Contain without destroying evidence\n\nContainment aims to stop the damage while keeping the system inspectable. Work from the least disruptive action to the most:\n\n1. **Block the source** at the host firewall or security group. The service stays up for legitimate clients.\n2. **Terminate the session** with `pg_terminate_backend(pid)` after you have saved its details.\n3. **Lock the role**: `ALTER ROLE webapp NOLOGIN`, or change the password for MySQL accounts. Use a replacement role for the application if it must keep running.\n4. **Isolate the host** from the network if the operating system may be compromised, but leave it powered on.\n5. **Snapshot the disk or volume** for forensics. On Proxmox VE a snapshot or backup of the VM preserves disk state, as described in [VM Snapshot and Backup Security](/learn/systems-infrastructure-security/vm-snapshot-and-backup-security).\n\nIf replicas exist, decide early whether they are also affected. A compromised primary replicates attacker changes, as covered in [Database Replication Security](/learn/systems-infrastructure-security/database-replication-security)."
+  },
+  {
+   "id": "contain-code",
+   "type": "code",
+   "language": "sql",
+   "filename": "containment (lab)",
+   "caption": "Contain a suspicious session and role after saving evidence. Names are examples.",
+   "code": "-- 1. save evidence first (run from psql)\n\\copy (SELECT * FROM pg_stat_activity) TO '/secure/ir/activity-0210.csv' CSV HEADER\n\n-- 2. stop the session and lock the role\nSELECT pg_terminate_backend(4177);\nALTER ROLE webapp NOLOGIN;\n\n-- 3. remove the unrequested superuser after review\nALTER ROLE tmp_ops NOLOGIN NOSUPERUSER;",
+   "highlight": [
+    2,
+    5,
+    6
+   ]
+  },
+  {
+   "id": "scope",
+   "type": "text",
+   "markdown": "## Determine scope and eradicate\n\nThe hardest question is **which records were accessed**. Answer it from evidence, not guesses:\n\n- **Audit logs** such as `pgaudit` show statements by role and object. Filter by the attacker's role and time window.\n- **Slow-query and connection logs** show client addresses and durations.\n- **Table statistics** (`pg_stat_user_tables`) show unusual sequential-scan counts.\n- **Backups from before the event** let you compare data and find modified rows.\n\nThen look for persistence. Attackers who reach a database often leave a way back: new roles, `SECURITY DEFINER` functions, triggers, extensions, `pg_cron` jobs, MySQL events, authorized keys on the host, or changed `pg_hba.conf` entries. Compare the current state with your hardening baseline from [Database Hardening Benchmarks](/learn/systems-infrastructure-security/database-hardening-benchmarks).\n\nDo not treat the database as clean until the root cause is closed. If injection was the entry point, fix the code. If a leaked secret was the cause, rotate it as described in [Database Secrets and Credential Management](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+  },
+  {
+   "id": "recover",
+   "type": "text",
+   "markdown": "## Recover, notify and learn\n\nRecovery has three tracks that run in parallel.\n\n**Technical recovery.** Rotate application passwords, replication credentials, TLS keys and API tokens the database could read. If data was modified or encrypted, restore from a backup you have verified, as described in [Database Backup Integrity and Recovery](/learn/systems-infrastructure-security/database-backup-integrity-and-recovery). Restore to a clean host rather than the suspect one when possible.\n\n**Communication.** Tell legal, privacy and management early. Many regulations set notification deadlines, often 72 hours from awareness, so record when you first knew. Keep a timeline with UTC timestamps.\n\n**Learning.** Hold a blameless review within a week. Ask which control would have detected this sooner, add that alert, and update the runbook. A finding that never becomes a control will repeat."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a lab PostgreSQL server **you own**, create a role `suspect` with `LOGIN` and a lab-only password. Connect with it from a second lab VM and run a few `SELECT` statements.\n2. From the primary, list sessions with the `pg_stat_activity` query in this lesson. Save the output to a file before changing anything.\n3. Contain: block the second VM in the host firewall, run `pg_terminate_backend` on the session, and set `ALTER ROLE suspect NOLOGIN`.\n4. Write a one-page runbook with the five commands you used, who may run them, and where logs are stored. Ask a colleague to follow it without your help."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Runbook",
+     "definition": "A step-by-step procedure prepared before an incident."
+    },
+    {
+     "term": "Break-glass account",
+     "definition": "A tightly controlled emergency account used only during incidents."
+    },
+    {
+     "term": "Triage",
+     "definition": "Quickly judging whether an alert is real, how large it is and whether it continues."
+    },
+    {
+     "term": "Containment",
+     "definition": "Stopping the damage while preserving evidence."
+    },
+    {
+     "term": "Persistence",
+     "definition": "Changes an attacker leaves to regain access later."
+    },
+    {
+     "term": "pgaudit",
+     "definition": "A PostgreSQL extension that logs statements by role and object."
+    },
+    {
+     "term": "Blameless review",
+     "definition": "A post-incident meeting focused on fixing systems, not people."
+    },
+    {
+     "term": "Chain of custody",
+     "definition": "A record of who handled evidence and when."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "An unknown client is exporting a table. What is the best first containment step?",
+     "options": [
+      "Reboot the server immediately",
+      "Save the session details, then block the source and terminate the session",
+      "Drop the table",
+      "Run VACUUM FULL"
+     ],
+     "answer": 1,
+     "explanation": "Blocking and terminating stops the copy while the saved details preserve evidence. A reboot erases memory state and dropping data destroys evidence."
+    },
+    {
+     "question": "Which are common database persistence mechanisms? Choose all that apply.",
+     "options": [
+      "A new superuser role",
+      "A SECURITY DEFINER function",
+      "A scheduled job",
+      "A lower log_min_duration_statement"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Roles, privileged functions and jobs let an attacker return. A lower logging threshold only records more."
+    },
+    {
+     "question": "Why record the time you first became aware of an incident?",
+     "options": [
+      "To choose a backup name",
+      "Notification deadlines often start from awareness",
+      "To speed up queries",
+      "To rotate logs"
+     ],
+     "answer": 1,
+     "explanation": "Regulations commonly count hours from awareness, so the timeline is legally important."
+    },
+    {
+     "question": "After a confirmed breach, what should happen to the credentials the database could read?",
+     "options": [
+      "Keep them to avoid downtime",
+      "Rotate them",
+      "Email them to the team",
+      "Store them in the table"
+     ],
+     "answer": 1,
+     "explanation": "Anything the attacker could read must be treated as exposed and replaced."
+    },
+    {
+     "question": "Where should recovery be performed when the original host is suspected compromised?",
+     "options": [
+      "On the same host to save time",
+      "On a clean host from a verified backup",
+      "On a replica of the attacker",
+      "Without restoring"
+     ],
+     "answer": 1,
+     "explanation": "A clean host avoids inheriting hidden changes from a compromised operating system."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Plan before the incident: audit logging, a runbook and a break-glass account.\n- Detect with signals such as unknown clients, bulk reads and role changes, then triage scope and status.\n- Contain from least to most disruptive, and save evidence before you restart or clean anything.\n- Find scope from audit logs and hunt for persistence such as roles, functions and jobs.\n- Rotate credentials, restore from verified backups on clean hosts, notify on time and fix the gaps.\n\nNext you will design for resilience in [Database High Availability and Disaster Recovery](/learn/systems-infrastructure-security/database-high-availability-and-disaster-recovery)."
+  }
+ ],
+ "ar": {
+  "title": "الاستجابة لحوادث قواعد البيانات",
+  "summary": "اكشف حوادث قواعد البيانات واحتوِها وحدّد نطاقها واسترد منها بدليل تشغيل متدرَّب عليه يحفظ الأدلة.",
+  "objectives": [
+   "تجهيز التسجيل وأدلة التشغيل ووصول الطوارئ",
+   "فرز جلسة قاعدة بيانات مشبوهة",
+   "الاحتواء دون إتلاف الأدلة",
+   "تحديد الأثر وإزالة الثبات والاسترداد"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "عند الثانية والعشرة فجرًا يُطلق تنبيه: قاعدة بيانات التطبيق تعيد بيانات لاتصال من عنوان لا يعرفه أحد، ويجري تصدير لجدول. أمام المهندس المناوب خياران سيئان. إما أن يسحب القابس فيخسر الأدلة والخدمة، وإما أن يواصل المراقبة فيترك النسخ يكتمل. أما الفريق الذي لديه خطة لحوادث قواعد البيانات فله خيار ثالث، لأن القرارات اتُّخذت قبل أشهر.\n\nقواعد البيانات هي المكان الذي يتحول فيه الحادث إلى اختراق، لأن البيانات تقيم فيها. والاستجابة لحوادث قواعد البيانات ممارسة تكشف إساءة الاستخدام بسرعة، وتحتويها دون إتلاف الأدلة، وتحدد بدقة السجلات التي مُسّت، وتعيد الثقة بالنظام. يقدم هذا الدرس مسار عمل يمكنك التدرب عليه في PostgreSQL وMySQL."
+   },
+   {
+    "id": "phases",
+    "type": "text",
+    "markdown": "## دورة حياة حادث قاعدة البيانات\n\nتنطبق دورة الحوادث العامة، لكن لكل مرحلة أسئلة خاصة بقواعد البيانات. يبيّن الجدول ما يجب حسمه مسبقًا.\n\n| المرحلة | سؤال قاعدة البيانات | الجواب المُعدّ |\n|:--|:--|:--|\n| الإعداد | ما الذي نستطيع تسجيله ومن يحق له التصرف؟ | تسجيل التدقيق مفعّل، ودليل تشغيل، وحساب طوارئ |\n| الكشف | ما الذي يبدو غير طبيعي؟ | تنبيهات على عملاء جدد وقراءات ضخمة وتغييرات الصلاحيات |\n| الاحتواء | كيف نوقف الوصول دون فقدان الأدلة؟ | الحجب في جدار الحماية وسحب الأدوار وإبقاء العملية تعمل |\n| الاستئصال | ما الذي غيّره المهاجم؟ | مراجعة الأدوار والدوال والإضافات والمهام المجدولة |\n| الاسترداد | أي البيانات وبيانات الاعتماد نثق بها؟ | تدوير الأسرار والاستعادة من نسخ احتياطية موثّقة |\n| التعلم | ما الذي كان سيكشف الحادث أبكر؟ | تحديث التنبيهات ودليل التشغيل |\n\nوالعادة الأهم هي **الإعداد قبل الحادث**. ففي الحدث الحقيقي لا وقت لمعرفة مكان السجلات ولا من يملك كلمة مرور الطوارئ. تدرّب على دليل التشغيل كما تتدرب على إخلاء الحريق، وراجعه بعد كل تغيير في المنصة."
+   },
+   {
+    "id": "ir-cycle",
+    "type": "animation",
+    "kind": "cycle",
+    "title": "دورة الاستجابة لحوادث قواعد البيانات",
+    "caption": "كل دورة تترك قاعدة البيانات أفضل تجهيزًا.",
+    "data": {
+     "center": "حادث قاعدة بيانات",
+     "items": [
+      {
+       "label": "الإعداد",
+       "sub": "التسجيل ودليل التشغيل والوصول"
+      },
+      {
+       "label": "الكشف",
+       "sub": "التنبيهات والفرز"
+      },
+      {
+       "label": "الاحتواء",
+       "sub": "الحجب والسحب والحفظ"
+      },
+      {
+       "label": "الاستئصال",
+       "sub": "إزالة الثبات"
+      },
+      {
+       "label": "الاسترداد",
+       "sub": "الاستعادة والتدوير"
+      },
+      {
+       "label": "التعلم",
+       "sub": "سدّ الثغرات"
+      }
+     ],
+     "steps": [
+      {
+       "item": 0,
+       "caption": "سجلات التدقيق ودليل التشغيل وحساب الطوارئ موجودة قبل أي حدث."
+      },
+      {
+       "item": 1,
+       "caption": "يبدأ الفرز بتنبيه على عميل مجهول أو قراءة ضخمة."
+      },
+      {
+       "item": 2,
+       "caption": "احجب المصدر وأقفل الدور، وأبقِ الخادم يعمل حفاظًا على الأدلة."
+      },
+      {
+       "item": 3,
+       "caption": "ابحث عن أدوار ودوال وإضافات ومهام مجدولة جديدة."
+      },
+      {
+       "item": 4,
+       "caption": "دوّر كل بيانات الاعتماد التي حملتها القاعدة واستعد بيانات نظيفة عند الحاجة."
+      },
+      {
+       "item": 5,
+       "caption": "حوّل الدروس إلى تنبيهات جديدة وتعديلات على دليل التشغيل."
+      }
+     ]
+    }
+   },
+   {
+    "id": "detect",
+    "type": "text",
+    "markdown": "## الكشف والفرز\n\nيبدأ الكشف الجيد من السجلات الموصوفة في درس [التدقيق وتسجيل النشاط في قواعد البيانات](/learn/systems-infrastructure-security/database-auditing-and-activity-logging). ومن الإشارات المفيدة:\n\n- عمليات دخول من عنوان خارج شبكتي التطبيقات والإدارة.\n- دور يقرأ صفوفًا أكثر بكثير من خطه المرجعي، أو ينفّذ `COPY ... TO` و`SELECT ... INTO OUTFILE`.\n- مستخدمون فائقون جدد، أو أوامر `GRANT`، أو تغييرات `ALTER ROLE` خارج نافذة التغيير.\n- دفعات من إخفاقات المصادقة يليها نجاح واحد.\n- أخطاء تشبه فحص الحقن، كما في درس [الحقن في SQL والوقاية من هجمات قواعد البيانات](/learn/systems-infrastructure-security/sql-injection-and-database-attack-prevention).\n\nيجيب الفرز بسرعة عن ثلاثة أسئلة: **هل الحادث حقيقي، وما نطاقه، وهل ما زال جاريًا؟** ابدأ بالجلسات الحالية. تستخدم الطرفية أدناه واجهات PostgreSQL على خادم مخبري تملكه."
+   },
+   {
+    "id": "triage-term",
+    "type": "terminal",
+    "title": "Triage on a lab PostgreSQL server",
+    "lines": [
+     {
+      "cmd": "psql -c \"SELECT pid, usename, client_addr, state, left(query,40) AS q FROM pg_stat_activity WHERE client_addr IS NOT NULL ORDER BY backend_start;\"",
+      "output": "  pid  | usename |  client_addr  | state  |                    q\n-------+---------+---------------+--------+------------------------------------------\n  4102 | webapp  | 10.20.1.10    | idle   | SELECT id FROM sessions WHERE token = $1\n  4177 | webapp  | 198.51.100.77 | active | COPY customers TO PROGRAM '/tmp/x'",
+      "comment": "الجلسة الثانية من خارج شبكة التطبيقات وتصدّر جدولًا."
+     },
+     {
+      "cmd": "psql -c \"SELECT rolname, rolsuper, rolcreaterole, rolreplication FROM pg_roles WHERE rolname !~ '^pg_' ORDER BY oid DESC LIMIT 3;\"",
+      "output": " rolname | rolsuper | rolcreaterole | rolreplication\n---------+----------+---------------+----------------\n tmp_ops | t        | t             | f\n webapp  | f        | f             | f",
+      "comment": "دور فائق حُديث الإنشاء لم يطلبه أحد: مرشح لأن يكون وسيلة ثبات."
+     }
+    ],
+    "caption": "استعلامان يجيبان عن المتصلين وهل تغيّرت الصلاحيات."
+   },
+   {
+    "id": "evidence-warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "احفظ الأدلة قبل أن تصلح",
+    "markdown": "تمسح إعادة تشغيل الخادم `pg_stat_activity` والحالة في الذاكرة. قبل أي إعادة تشغيل احفظ لقطة النشاط، وانسخ السجلات إلى موضع للكتابة مرة واحدة، وسجّل الوقت وإجراءاتك. ولا تنفّذ `VACUUM FULL` ولا تحذف جداول بحجة التنظيف، فهذا يغيّر الأدلة التي تحتاجها."
+   },
+   {
+    "id": "contain",
+    "type": "text",
+    "markdown": "## احتوِ دون إتلاف الأدلة\n\nيهدف الاحتواء إلى وقف الضرر مع إبقاء النظام قابلًا للفحص. اعمل من الإجراء الأقل تعطيلًا إلى الأكثر:\n\n1. **احجب المصدر** في جدار حماية الخادم أو مجموعة الأمان، فتبقى الخدمة تعمل للعملاء الشرعيين.\n2. **أنهِ الجلسة** بـ `pg_terminate_backend(pid)` بعد حفظ تفاصيلها.\n3. **أقفل الدور**: `ALTER ROLE webapp NOLOGIN`، أو غيّر كلمة المرور في حسابات MySQL. استخدم دورًا بديلًا للتطبيق إن وجب أن يبقى يعمل.\n4. **اعزل المضيف** عن الشبكة إذا كان نظام التشغيل مشتبهًا باختراقه، لكن أبقه قيد التشغيل.\n5. **التقط لقطة للقرص أو الوحدة** لأغراض التحليل الجنائي. في Proxmox VE تحفظ لقطة الآلة الافتراضية أو نسختها الاحتياطية حالة القرص، كما في درس [أمن لقطات الآلات الافتراضية ونسخها الاحتياطية](/learn/systems-infrastructure-security/vm-snapshot-and-backup-security).\n\nوإن وُجدت نسخ متماثلة فقرّر مبكرًا هل هي متأثرة أيضًا. فالخادم الرئيسي المخترق ينسخ تغييرات المهاجم، كما في درس [أمن النسخ المتماثل لقواعد البيانات](/learn/systems-infrastructure-security/database-replication-security)."
+   },
+   {
+    "id": "contain-code",
+    "type": "code",
+    "language": "sql",
+    "filename": "containment (lab)",
+    "caption": "احتواء جلسة ودور مشبوهين بعد حفظ الأدلة. الأسماء أمثلة.",
+    "code": "-- 1. save evidence first (run from psql)\n\\copy (SELECT * FROM pg_stat_activity) TO '/secure/ir/activity-0210.csv' CSV HEADER\n\n-- 2. stop the session and lock the role\nSELECT pg_terminate_backend(4177);\nALTER ROLE webapp NOLOGIN;\n\n-- 3. remove the unrequested superuser after review\nALTER ROLE tmp_ops NOLOGIN NOSUPERUSER;",
+    "highlight": [
+     2,
+     5,
+     6
+    ]
+   },
+   {
+    "id": "scope",
+    "type": "text",
+    "markdown": "## حدّد النطاق واستأصل\n\nأصعب الأسئلة: **أي السجلات جرى الوصول إليها**. أجب من الأدلة لا من التخمين:\n\n- **سجلات التدقيق** مثل `pgaudit` تُظهر العبارات بحسب الدور والكائن. رشّح بدور المهاجم ونافذته الزمنية.\n- **سجلات الاستعلامات البطيئة والاتصالات** تُظهر عناوين العملاء والمدد.\n- **إحصاءات الجداول** (`pg_stat_user_tables`) تُظهر أعداد مسح تسلسلي غير معتادة.\n- **نسخ احتياطية سابقة للحدث** تتيح مقارنة البيانات وإيجاد الصفوف المعدّلة.\n\nثم ابحث عن الثبات. فالمهاجمون الذين يصلون إلى قاعدة بيانات يتركون غالبًا طريق عودة: أدوارًا جديدة، ودوالّ `SECURITY DEFINER`، ومشغّلات، وإضافات، ومهام `pg_cron`، وأحداث MySQL، ومفاتيح مصرّحة على المضيف، أو تعديلات في `pg_hba.conf`. قارن الحالة الحالية بخطك المرجعي للتحصين من درس [معايير تحصين قواعد البيانات](/learn/systems-infrastructure-security/database-hardening-benchmarks).\n\nلا تعدّ القاعدة نظيفة حتى يُغلق السبب الجذري. فإن كان الحقن نقطة الدخول فأصلح الشيفرة، وإن كان سرّ مسرّب فدوّره كما في درس [إدارة الأسرار وبيانات الاعتماد في قواعد البيانات](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+   },
+   {
+    "id": "recover",
+    "type": "text",
+    "markdown": "## استرد وبلّغ وتعلّم\n\nللاسترداد ثلاثة مسارات تسير معًا.\n\n**الاسترداد التقني.** دوّر كلمات مرور التطبيقات وبيانات اعتماد النسخ ومفاتيح TLS ورموز API التي كانت القاعدة تقرؤها. وإن عُدّلت البيانات أو شُفّرت فاستعد من نسخة احتياطية تحققت منها، كما في درس [سلامة النسخ الاحتياطية لقواعد البيانات والاسترداد](/learn/systems-infrastructure-security/database-backup-integrity-and-recovery). واستعد على مضيف نظيف لا على المضيف المشتبه به متى أمكن.\n\n**التواصل.** أبلغ الشؤون القانونية والخصوصية والإدارة مبكرًا. تضع أنظمة كثيرة مهلًا للإبلاغ، غالبًا 72 ساعة من لحظة العلم، فسجّل متى عرفت أول مرة. واحتفظ بخط زمني بتوقيت UTC.\n\n**التعلم.** اعقد مراجعة بلا لوم خلال أسبوع. اسأل أي ضابط كان سيكشف الحادث أبكر، وأضف ذلك التنبيه، وحدّث دليل التشغيل. فالاستنتاج الذي لا يصير ضابطًا سيتكرر."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على خادم PostgreSQL مخبري **تملكه** أنشئ دورًا `suspect` بخاصية `LOGIN` وكلمة مرور للمختبر فقط. اتصل به من آلة افتراضية ثانية ونفّذ بضع عبارات `SELECT`.\n2. من الخادم الرئيسي اسرد الجلسات باستعلام `pg_stat_activity` في هذا الدرس. احفظ المخرجات في ملف قبل تغيير أي شيء.\n3. احتوِ: احجب الآلة الثانية في جدار حماية المضيف، ونفّذ `pg_terminate_backend` على الجلسة، واضبط `ALTER ROLE suspect NOLOGIN`.\n4. اكتب دليل تشغيل من صفحة واحدة فيه الأوامر الخمسة التي استخدمتها ومن يحق له تنفيذها ومكان السجلات. اطلب من زميل اتباعه دون مساعدتك."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "دليل التشغيل",
+      "definition": "إجراء خطوة بخطوة يُعدّ قبل الحادث."
+     },
+     {
+      "term": "حساب الطوارئ",
+      "definition": "حساب طوارئ شديد الضبط لا يُستخدم إلا في الحوادث."
+     },
+     {
+      "term": "الفرز",
+      "definition": "الحكم السريع هل التنبيه حقيقي وما حجمه وهل يستمر."
+     },
+     {
+      "term": "الاحتواء",
+      "definition": "وقف الضرر مع حفظ الأدلة."
+     },
+     {
+      "term": "الثبات",
+      "definition": "تغييرات يتركها المهاجم ليعود بها لاحقًا."
+     },
+     {
+      "term": "pgaudit",
+      "definition": "إضافة PostgreSQL تسجّل العبارات بحسب الدور والكائن."
+     },
+     {
+      "term": "مراجعة بلا لوم",
+      "definition": "اجتماع بعد الحادث يركّز على إصلاح الأنظمة لا الأشخاص."
+     },
+     {
+      "term": "سلسلة الحيازة",
+      "definition": "سجل بمن تعامل مع الأدلة ومتى."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "عميل مجهول يصدّر جدولًا. ما أفضل خطوة احتواء أولى؟",
+      "options": [
+       "إعادة تشغيل الخادم فورًا",
+       "حفظ تفاصيل الجلسة ثم حجب المصدر وإنهاء الجلسة",
+       "حذف الجدول",
+       "تنفيذ VACUUM FULL"
+      ],
+      "answer": 1,
+      "explanation": "الحجب والإنهاء يوقفان النسخ وتحفظ التفاصيل المحفوظة الأدلة. أما إعادة التشغيل فتمسح حالة الذاكرة وحذف البيانات يتلف الأدلة."
+     },
+     {
+      "question": "أي مما يلي آليات ثبات شائعة في قواعد البيانات؟ اختر كل ما ينطبق.",
+      "options": [
+       "دور مستخدم فائق جديد",
+       "دالة SECURITY DEFINER",
+       "مهمة مجدولة",
+       "قيمة أقل للإعداد log_min_duration_statement"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "الأدوار والدوال المميزة والمهام تتيح للمهاجم العودة. أما خفض عتبة التسجيل فيسجّل أكثر فحسب."
+     },
+     {
+      "question": "لماذا تسجّل وقت علمك الأول بالحادث؟",
+      "options": [
+       "To choose a backup name",
+       "Notification deadlines often start from awareness",
+       "To speed up queries",
+       "To rotate logs"
+      ],
+      "answer": 1,
+      "explanation": "تحسب الأنظمة غالبًا الساعات من لحظة العلم، فالخط الزمني مهم قانونيًّا."
+     },
+     {
+      "question": "بعد اختراق مؤكد، ما مصير بيانات الاعتماد التي كانت القاعدة تقرؤها؟",
+      "options": [
+       "Keep them to avoid downtime",
+       "Rotate them",
+       "Email them to the team",
+       "Store them in the table"
+      ],
+      "answer": 1,
+      "explanation": "كل ما استطاع المهاجم قراءته يُعدّ مكشوفًا ويجب استبداله."
+     },
+     {
+      "question": "أين يجب أن يتم الاسترداد إذا اشتُبه باختراق المضيف الأصلي؟",
+      "options": [
+       "على المضيف نفسه لتوفير الوقت",
+       "على مضيف نظيف من نسخة احتياطية موثّقة",
+       "على نسخة تابعة للمهاجم",
+       "دون استعادة"
+      ],
+      "answer": 1,
+      "explanation": "المضيف النظيف يمنع وراثة تغييرات خفية من نظام تشغيل مخترق."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- خطّط قبل الحادث: تسجيل التدقيق ودليل التشغيل وحساب الطوارئ.\n- اكشف بإشارات مثل العملاء المجهولين والقراءات الضخمة وتغييرات الأدوار، ثم افرز النطاق والحالة.\n- احتوِ من الأقل تعطيلًا إلى الأكثر، واحفظ الأدلة قبل إعادة التشغيل أو التنظيف.\n- حدّد النطاق من سجلات التدقيق وابحث عن الثبات مثل الأدوار والدوال والمهام.\n- دوّر بيانات الاعتماد، واستعد من نسخ موثّقة على مضيفات نظيفة، وبلّغ في الوقت المناسب، وسدّ الثغرات.\n\nفي الدرس التالي ستصمّم للمرونة في [التوافرية العالية لقواعد البيانات والتعافي من الكوارث](/learn/systems-infrastructure-security/database-high-availability-and-disaster-recovery)."
+   }
+  ]
+ }
+}

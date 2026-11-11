@@ -1,0 +1,594 @@
+{
+  "slug": "virtualization-escape-risks",
+  "title": "Virtualization Escape Risks",
+  "summary": "Understand how a guest can break out of a virtual machine, which hypervisor features make it possible, and how patching, minimal hardware and separation limit the risk.",
+  "duration_minutes": 25,
+  "objectives": [
+    "Describe what a VM escape is and where it originates",
+    "Check QEMU, kernel and CPU mitigation status on a Proxmox host",
+    "Remove unnecessary virtual devices from a VM definition",
+    "Limit the blast radius with trust tiers and host monitoring"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Virtualization sells one promise: a guest cannot see or touch anything outside its own virtual machine. Your database VM, your web VM and your test VM share one physical server, and the hypervisor keeps them apart.\n\nA **virtual machine escape** is the failure of that promise. Code running inside a guest breaks through the boundary and reaches the host or a neighboring guest. Escapes are rare, but their impact is extreme, because one compromised guest can become a compromised host with every VM on it. This lesson explains where escapes come from conceptually, and gives you the defensive habits that shrink both their likelihood and their damage."
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## What an escape really is\n\nEvery guest runs on a boundary the hypervisor builds from two parts. The CPU's hardware virtualization features (Intel VT-x, AMD-V) separate memory and instructions. Software then **emulates the devices** the guest believes it owns: disk controllers, network cards, graphics, USB and timers. On Proxmox VE, QEMU/KVM provides this emulation, and each guest runs as an ordinary `qemu` process on the host.\n\nThe guest talks to that emulated hardware constantly, and it controls the data it sends. A flaw in the way the emulation code parses guest input can let a hostile guest corrupt the host process's memory. Because the `qemu` process runs on the host, taking it over is the first step toward the host.\n\n| Weak point | Why it matters |\n|:--|:--|\n| Emulated device code | Large, complex code that parses untrusted guest input |\n| Paravirtual drivers (virtio) | Faster, but still shared memory with the host |\n| Shared features (clipboard, shared folders) | Deliberate bridges between guest and host |\n| Hardware passthrough (PCI, USB) | Gives the guest direct access to real hardware |\n| Host kernel and KVM module | A flaw here affects every guest at once |\n\nThe lesson for defenders is not to memorize flaws. It is that **every feature you enable is code the guest can reach.** The wider topic of reachable code is covered in [Hypervisor Attack Surface](/learn/systems-infrastructure-security/hypervisor-attack-surface)."
+    },
+    {
+      "id": "escape-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Where the guest boundary can fail",
+      "caption": "A flaw in device emulation is the usual entry point. Patching and reduced hardware close it.",
+      "data": {
+        "actors": [
+          {
+            "id": "vm",
+            "label": "Guest VM",
+            "sub": "Untrusted code",
+            "icon": "server"
+          },
+          {
+            "id": "dev",
+            "label": "Virtual devices",
+            "sub": "virtio, USB, NIC",
+            "icon": "cpu"
+          },
+          {
+            "id": "q",
+            "label": "QEMU process",
+            "sub": "Runs on the host",
+            "icon": "shield"
+          },
+          {
+            "id": "host",
+            "label": "Host and other VMs",
+            "sub": "Proxmox VE",
+            "icon": "lock"
+          }
+        ],
+        "steps": [
+          {
+            "from": "vm",
+            "to": "dev",
+            "label": "Normal I/O",
+            "tone": "success",
+            "note": "A guest reads a disk block through the virtual controller. The emulation code handles the request."
+          },
+          {
+            "from": "vm",
+            "to": "dev",
+            "label": "Malformed request",
+            "tone": "attack",
+            "note": "A hostile guest sends input the emulation code did not expect. This is the class of flaw behind past escapes."
+          },
+          {
+            "from": "dev",
+            "to": "q",
+            "label": "Unpatched code path",
+            "tone": "warning",
+            "note": "If the QEMU build has a known flaw, the bad input can corrupt memory in the host process."
+          },
+          {
+            "from": "q",
+            "to": "host",
+            "label": "Reaches the host",
+            "tone": "danger",
+            "note": "The host process now runs attacker-controlled logic. Other guests and the management plane are exposed."
+          },
+          {
+            "from": "q",
+            "to": "q",
+            "label": "Defense: patch + minimal devices",
+            "tone": "secure",
+            "note": "A current QEMU and a guest with only the devices it needs remove the flawed code path altogether."
+          },
+          {
+            "from": "host",
+            "to": "host",
+            "label": "Defense: monitoring",
+            "tone": "secure",
+            "note": "Unusual child processes or file changes on the host reveal an escape that slipped through."
+          }
+        ]
+      }
+    },
+    {
+      "id": "reduce",
+      "type": "text",
+      "markdown": "## Defense 1: Patch the layers that enforce isolation\n\nMost published escapes were fixed in a software update well before they were widely abused. The defense is boring and effective: keep the stack current. That means the Proxmox VE packages, the `pve-qemu-kvm` package, the Linux kernel and the CPU microcode.\n\nTwo habits matter most. First, apply updates on a schedule and reboot to load the new kernel, since a running process or kernel keeps the old code until you do. Second, **restart each VM** after a QEMU update, because a running guest keeps using the QEMU binary it started with. A live migration to an updated node achieves the same result without downtime.\n\nCPU flaws such as speculative execution leaks follow the same pattern. The kernel reports which mitigations are active, and you should read that report rather than assume."
+    },
+    {
+      "id": "patch",
+      "type": "terminal",
+      "title": "Checking versions and CPU mitigations",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "pveversion -v | grep -E 'proxmox-ve|pve-qemu-kvm|pve-kernel|^proxmox-kernel'",
+          "output": "proxmox-ve: 8.2.0 (running kernel: 6.8.12-4-pve)\nproxmox-kernel-6.8: 6.8.12-4\npve-qemu-kvm: 9.0.2-3"
+        },
+        {
+          "comment": "Record these versions in your inventory so you can match them against security advisories."
+        },
+        {
+          "cmd": "apt list --upgradable 2>/dev/null | grep -E 'qemu|kernel|microcode'",
+          "output": "pve-qemu-kvm/stable 9.0.2-4 amd64 [upgradable from: 9.0.2-3]\nintel-microcode/stable 3.20240514.1 amd64 [upgradable from: 3.20240312.1]"
+        },
+        {
+          "comment": "A pending QEMU update means every running VM still uses the old binary until it is restarted or migrated."
+        },
+        {
+          "cmd": "lscpu | grep -i -E 'Vulnerability (Spectre|Meltdown|L1tf)'",
+          "output": "Vulnerability L1tf:               Not affected\nVulnerability Meltdown:           Not affected\nVulnerability Spectre v1:         Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:         Mitigation; Enhanced / Automatic IBRS; IBPB conditional"
+        },
+        {
+          "comment": "Each line says whether the kernel applies a mitigation. Any line that reads Vulnerable needs follow-up."
+        }
+      ],
+      "caption": "Run on a host you administer. Version numbers are examples."
+    },
+    {
+      "id": "minimal",
+      "type": "text",
+      "markdown": "## Defense 2: Give each guest only the hardware it needs\n\nA default VM definition often includes devices the workload never uses: a virtual CD drive, USB controllers, a sound card or a serial port. Each one is emulation code a hostile guest can reach. Removing them takes seconds.\n\nPrefer **virtio** devices for disks and networking. They are small, widely reviewed and fast. Avoid exotic emulated hardware unless a legacy guest operating system demands it. Treat these features as deliberate holes and enable them only for a reason:\n\n- **PCI and USB passthrough.** The guest talks to real hardware directly, which can expose DMA and firmware. Use it only on dedicated hosts for trusted guests.\n- **Shared folders and clipboard.** These are guest-to-host bridges by design.\n- **Nested virtualization.** It multiplies the code that runs between guest and host.\n\nA guest with a smaller hardware list has a smaller attack surface, and its configuration file doubles as documentation of what it needs."
+    },
+    {
+      "id": "qmcfg",
+      "type": "terminal",
+      "title": "Reviewing and trimming a VM definition",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "qm config 101",
+          "output": "agent: 1\nboot: order=scsi0\ncores: 2\nide2: none,media=cdrom\nmemory: 4096\nname: web01\nnet0: virtio=BC:24:11:AA:BB:01,bridge=vmbr1,tag=20,firewall=1\nostype: l26\nscsi0: local-lvm:vm-101-disk-0,size=32G\nscsihw: virtio-scsi-single\nusb0: host=1234:5678\nserial0: socket"
+        },
+        {
+          "comment": "This guest has a virtual CD drive (ide2), a passed-through USB device (usb0) and a serial port it does not need."
+        },
+        {
+          "cmd": "qm set 101 --delete ide2,usb0,serial0",
+          "output": "update VM 101: -delete ide2,usb0,serial0"
+        },
+        {
+          "comment": "The change applies at the next full stop and start of the VM, not at a reboot from inside the guest."
+        }
+      ],
+      "caption": "Run on a lab VM first. Confirm the workload does not need a device before removing it."
+    },
+    {
+      "id": "blast",
+      "type": "text",
+      "markdown": "## Defense 3: Limit the damage if an escape happens\n\nNo patch program is perfect, so design for the day it fails.\n\n**Separate by trust level.** Do not run an internet-facing web server and your domain controller on the same host. Put guests of similar sensitivity together, and place the high-value ones on separate hosts or clusters. If an escape happens, it then lands among guests of equal importance. See [Virtual Machine Isolation](/learn/systems-infrastructure-security/virtual-machine-isolation).\n\n**Prefer VMs over containers for untrusted code.** Containers share the host kernel, so a kernel flaw is enough to cross the boundary. A VM adds the hypervisor layer. For the container side, read [Linux Container (LXC) Security](/learn/systems-infrastructure-security/linux-container-lxc-security).\n\n**Watch the host.** A `qemu` process should not spawn shells, open outbound connections or write outside its image paths. Alert on those events. The monitoring topics appear in [Virtualization Security Monitoring](/learn/systems-infrastructure-security/virtualization-security-monitoring).\n\n**Keep a hardened host.** If the process escapes, the host's own protections decide how far it gets. See [Proxmox Host Hardening](/learn/systems-infrastructure-security/proxmox-host-hardening)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common mistakes",
+      "markdown": "- **\"Virtualization is a security boundary, so any guest is safe next to any other.\"** It is a strong boundary, not an absolute one. Mix trust levels carefully.\n- **Updating the package but never restarting the guests.** The old, flawed binary keeps running.\n- **Leaving passthrough devices \"for later\".** Remove what the workload does not use now.\n- **Trusting only the guest's own logs.** Compromised guests can alter their logs. Collect evidence on the host."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a lab Proxmox VE host that you own:\n\n1. Run `pveversion -v` and note the `pve-qemu-kvm` and kernel versions.\n2. Run `apt update` and `apt list --upgradable`. Do any security-relevant packages wait?\n3. Run `lscpu | grep -i vulnerab` and list any line that does not say \"Not affected\" or \"Mitigation\".\n4. Pick a test VM and run `qm config <vmid>`. List every device it does not need.\n5. Remove one unneeded device with `qm set <vmid> --delete <device>`, then stop and start the VM, and confirm the guest still works.\n6. Write a one-paragraph patch policy: how often you update, and how you restart or migrate guests afterward."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "VM escape",
+          "definition": "A failure of isolation in which code in a guest reaches the host or other guests."
+        },
+        {
+          "term": "Device emulation",
+          "definition": "Software that imitates hardware such as disk and network controllers for the guest."
+        },
+        {
+          "term": "QEMU/KVM",
+          "definition": "The emulator and kernel module that run virtual machines on Proxmox VE."
+        },
+        {
+          "term": "virtio",
+          "definition": "A standard family of paravirtual devices designed for efficient guest-host I/O."
+        },
+        {
+          "term": "Passthrough",
+          "definition": "Giving a guest direct access to a physical PCI or USB device."
+        },
+        {
+          "term": "Microcode",
+          "definition": "Low-level processor firmware updated to fix CPU flaws."
+        },
+        {
+          "term": "Live migration",
+          "definition": "Moving a running VM to another node without stopping it."
+        },
+        {
+          "term": "Trust tier",
+          "definition": "A grouping of workloads by sensitivity so that different tiers do not share a host."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why is device emulation code a common source of escape flaws?",
+          "options": [
+            "It is large and parses data controlled by the guest",
+            "It runs only inside the guest",
+            "It is written in assembly only",
+            "It has no connection to the host"
+          ],
+          "answer": 0,
+          "explanation": "Emulation runs in a host process but handles input an attacker controls, so parsing flaws matter."
+        },
+        {
+          "question": "After a QEMU package update, what is needed for already-running VMs to use the fix? (Choose all that apply.)",
+          "options": [
+            "Restart the VM with a full stop and start",
+            "Live-migrate it to an updated node",
+            "Reboot only from inside the guest",
+            "Nothing, the update is applied live"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "A running process keeps its old binary. A full stop-start or a migration launches a new QEMU process."
+        },
+        {
+          "question": "Which choice reduces the attack surface of a guest?",
+          "options": [
+            "Adding USB and sound devices for convenience",
+            "Removing unused virtual devices",
+            "Enabling nested virtualization by default",
+            "Sharing the host clipboard"
+          ],
+          "answer": 1,
+          "explanation": "Each removed device is one less piece of emulation code a guest can reach."
+        },
+        {
+          "question": "Why prefer VMs over containers for running untrusted code?",
+          "options": [
+            "Containers use more memory",
+            "Containers share the host kernel, so a kernel flaw can cross the boundary",
+            "VMs are always faster",
+            "Containers cannot be patched"
+          ],
+          "answer": 1,
+          "explanation": "A VM adds a hypervisor layer with its own hardware-enforced boundary on top of the kernel."
+        },
+        {
+          "question": "Which measures limit the damage of a successful escape? (Choose all that apply.)",
+          "options": [
+            "Separating guests by trust level across hosts",
+            "Monitoring the host for unusual qemu behavior",
+            "Running every workload on one host",
+            "A hardened host operating system"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Placing everything on one host maximizes the blast radius. The other three limit or reveal it."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- An escape happens when a guest breaks the boundary the hypervisor enforces, usually through flawed **device emulation** in the `qemu` process.\n- **Patch** QEMU, the kernel and microcode, then restart or migrate the guests so they use the new code.\n- **Remove unneeded devices** and avoid passthrough, shared folders and nesting unless you have a reason.\n- **Separate by trust level** and prefer VMs over containers for hostile code.\n- **Monitor the host**, because evidence in a compromised guest cannot be trusted.\n\nContinue with [Hypervisor Attack Surface](/learn/systems-infrastructure-security/hypervisor-attack-surface) to map everything a hypervisor exposes."
+    }
+  ],
+  "ar": {
+    "title": "مخاطر الهروب من بيئة المحاكاة الافتراضية",
+    "summary": "افهم كيف يمكن لضيف أن يخرج من جهازه الافتراضي، وما ميزات المشرف الافتراضي التي تتيح ذلك، وكيف يحدّ التحديث والعتاد الأدنى والفصل من الخطر.",
+    "objectives": [
+      "وصف الهروب من الجهاز الافتراضي ومصدره",
+      "فحص حالة QEMU والنواة ووسائل تخفيف المعالج على مضيف Proxmox",
+      "إزالة الأجهزة الافتراضية غير الضرورية من تعريف الجهاز",
+      "تقليل نطاق الضرر بمستويات الثقة ومراقبة المضيف"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يقدّم التقسيم الافتراضي وعدًا واحدًا: لا يستطيع الجهاز الضيف أن يرى أو يلمس أي شيء خارج جهازه الافتراضي. جهاز قاعدة البيانات وجهاز الويب وجهاز الاختبار تتشارك خادمًا فيزيائيًا واحدًا، والمشرف الافتراضي (Hypervisor) يفصل بينها.\n\nو**الهروب من الجهاز الافتراضي (VM escape)** هو إخفاق هذا الوعد. إذ تخترق شيفرةٌ تعمل داخل الضيف الحدَّ الفاصل فتصل إلى المضيف أو إلى ضيف مجاور. الهروب نادر، لكن أثره بالغ، لأن ضيفًا واحدًا مخترقًا قد يصير مضيفًا مخترقًا ومعه كل الأجهزة الافتراضية عليه. يشرح هذا الدرس مصادر الهروب من الناحية المفاهيمية، ويمنحك عادات دفاعية تقلّل احتماله وضرره."
+      },
+      {
+        "id": "what",
+        "type": "text",
+        "markdown": "## ما الهروب فعلًا\n\nيعمل كل ضيف داخل حدٍّ يبنيه المشرف الافتراضي من جزأين. تفصل ميزات المعالج للتقسيم الافتراضي المعتمد على العتاد (Intel VT-x وAMD-V) الذاكرة والتعليمات. ثم تقوم البرمجيات **بمحاكاة الأجهزة** التي يظن الضيف أنه يملكها: متحكمات الأقراص وبطاقات الشبكة والرسوميات وUSB والمؤقتات. وفي Proxmox VE يوفّر QEMU/KVM هذه المحاكاة، ويعمل كل ضيف عملية `qemu` عادية على المضيف.\n\nيتخاطب الضيف مع هذا العتاد المحاكى باستمرار، ويتحكم في البيانات التي يرسلها. وقد يتيح خللٌ في طريقة تحليل شيفرة المحاكاة لمدخلات الضيف أن يُفسد ضيفٌ عدائي ذاكرة عملية المضيف. ولأن عملية `qemu` تعمل على المضيف، فالاستيلاء عليها هو الخطوة الأولى نحو المضيف.\n\n| نقطة الضعف | سبب أهميتها |\n|:--|:--|\n| شيفرة محاكاة الأجهزة | شيفرة كبيرة ومعقدة تحلّل مدخلات ضيف غير موثوق |\n| مشغلات المحاكاة شبه الافتراضية (virtio) | أسرع، لكنها تتشارك الذاكرة مع المضيف |\n| الميزات المشتركة (الحافظة والمجلدات المشتركة) | جسور مقصودة بين الضيف والمضيف |\n| تمرير العتاد (PCI وUSB) | يمنح الضيف وصولًا مباشرًا إلى عتاد حقيقي |\n| نواة المضيف ووحدة KVM | خلل هنا يؤثر في كل الضيوف دفعة واحدة |\n\nالدرس للمدافع ليس حفظ الثغرات، بل أن **كل ميزة تفعّلها هي شيفرة يستطيع الضيف الوصول إليها.** ويتناول درس [سطح الهجوم للمشرف الافتراضي](/learn/systems-infrastructure-security/hypervisor-attack-surface) موضوع الشيفرة القابلة للوصول بتوسّع."
+      },
+      {
+        "id": "escape-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "أين قد ينهار حدّ الضيف",
+        "caption": "الخلل في محاكاة الأجهزة هو نقطة الدخول المعتادة. والتحديث وتقليل العتاد يغلقانها.",
+        "data": {
+          "actors": [
+            {
+              "id": "vm",
+              "label": "الضيف",
+              "sub": "شيفرة غير موثوقة",
+              "icon": "server"
+            },
+            {
+              "id": "dev",
+              "label": "الأجهزة الافتراضية",
+              "sub": "virtio, USB, NIC",
+              "icon": "cpu"
+            },
+            {
+              "id": "q",
+              "label": "QEMU process",
+              "sub": "تعمل على المضيف",
+              "icon": "shield"
+            },
+            {
+              "id": "host",
+              "label": "المضيف والضيوف الآخرون",
+              "sub": "Proxmox VE",
+              "icon": "lock"
+            }
+          ],
+          "steps": [
+            {
+              "from": "vm",
+              "to": "dev",
+              "label": "إدخال وإخراج عادي",
+              "tone": "success",
+              "note": "يقرأ الضيف كتلة من القرص عبر المتحكم الافتراضي، وتعالج شيفرة المحاكاة الطلب."
+            },
+            {
+              "from": "vm",
+              "to": "dev",
+              "label": "طلب مشوّه",
+              "tone": "attack",
+              "note": "يرسل ضيف عدائي مدخلات لم تتوقعها شيفرة المحاكاة. وهذا صنف الخلل وراء حالات هروب سابقة."
+            },
+            {
+              "from": "dev",
+              "to": "q",
+              "label": "مسار شيفرة غير محدَّث",
+              "tone": "warning",
+              "note": "إن كان إصدار QEMU فيه خلل معروف فقد تُفسد المدخلات السيئة ذاكرة عملية المضيف."
+            },
+            {
+              "from": "q",
+              "to": "host",
+              "label": "الوصول إلى المضيف",
+              "tone": "danger",
+              "note": "تشغّل عملية المضيف الآن منطقًا يتحكم فيه المهاجم، وتنكشف الضيوف الأخرى ومستوى الإدارة."
+            },
+            {
+              "from": "q",
+              "to": "q",
+              "label": "الدفاع: تحديث وأجهزة أقل",
+              "tone": "secure",
+              "note": "إصدار QEMU حديث وضيف بالأجهزة التي يحتاجها فقط يزيلان مسار الشيفرة المعيب تمامًا."
+            },
+            {
+              "from": "host",
+              "to": "host",
+              "label": "الدفاع: المراقبة",
+              "tone": "secure",
+              "note": "العمليات الفرعية غير المعتادة أو تغيّر الملفات على المضيف تكشف هروبًا تسلل رغم الدفاعات."
+            }
+          ]
+        }
+      },
+      {
+        "id": "reduce",
+        "type": "text",
+        "markdown": "## الدفاع 1: حدّث الطبقات التي تفرض العزل\n\nأُصلحت معظم حالات الهروب المنشورة في تحديث برمجي قبل إساءة استخدامها على نطاق واسع بوقت طويل. والدفاع مملّ لكنه فعّال: أبقِ الحزمة كلها محدَّثة. ويشمل ذلك حزم Proxmox VE وحزمة `pve-qemu-kvm` ونواة Linux والبرمجية الدقيقة للمعالج (Microcode).\n\nوثمة عادتان أهم من غيرهما. الأولى أن تطبّق التحديثات وفق جدول وأن تعيد التشغيل لتحميل النواة الجديدة، لأن العملية أو النواة العاملة تحتفظ بالشيفرة القديمة حتى تفعل. والثانية أن **تعيد تشغيل كل جهاز افتراضي** بعد تحديث QEMU، لأن الضيف العامل يواصل استخدام ملف QEMU التنفيذي الذي بدأ به. ويحقق الترحيل الحي إلى عقدة محدَّثة النتيجة نفسها دون توقف.\n\nوتتبع ثغرات المعالج، مثل تسريبات التنفيذ التخميني، النمط نفسه. وتبلغ النواة عن وسائل التخفيف المفعّلة، فاقرأ ذلك التقرير ولا تفترض."
+      },
+      {
+        "id": "patch",
+        "type": "terminal",
+        "title": "فحص الإصدارات ووسائل التخفيف في المعالج",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "pveversion -v | grep -E 'proxmox-ve|pve-qemu-kvm|pve-kernel|^proxmox-kernel'",
+            "output": "proxmox-ve: 8.2.0 (running kernel: 6.8.12-4-pve)\nproxmox-kernel-6.8: 6.8.12-4\npve-qemu-kvm: 9.0.2-3"
+          },
+          {
+            "comment": "سجّل هذه الإصدارات في جردك لتطابقها مع النشرات الأمنية."
+          },
+          {
+            "cmd": "apt list --upgradable 2>/dev/null | grep -E 'qemu|kernel|microcode'",
+            "output": "pve-qemu-kvm/stable 9.0.2-4 amd64 [upgradable from: 9.0.2-3]\nintel-microcode/stable 3.20240514.1 amd64 [upgradable from: 3.20240312.1]"
+          },
+          {
+            "comment": "تحديث QEMU المعلّق يعني أن كل جهاز عامل ما زال يستخدم الملف القديم حتى يُعاد تشغيله أو يُرحَّل."
+          },
+          {
+            "cmd": "lscpu | grep -i -E 'Vulnerability (Spectre|Meltdown|L1tf)'",
+            "output": "Vulnerability L1tf:               Not affected\nVulnerability Meltdown:           Not affected\nVulnerability Spectre v1:         Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:         Mitigation; Enhanced / Automatic IBRS; IBPB conditional"
+          },
+          {
+            "comment": "يبيّن كل سطر هل تطبّق النواة وسيلة تخفيف. وأي سطر يقول Vulnerable يحتاج إلى متابعة."
+          }
+        ],
+        "caption": "نفّذها على مضيف تديره. أرقام الإصدارات أمثلة."
+      },
+      {
+        "id": "minimal",
+        "type": "text",
+        "markdown": "## الدفاع 2: امنح كل ضيف العتاد الذي يحتاجه فقط\n\nكثيرًا ما يتضمن تعريف الجهاز الافتراضي الافتراضي أجهزة لا يستخدمها العمل أبدًا: قارئ أقراص مضغوطة افتراضي، ومتحكمات USB، وبطاقة صوت، ومنفذًا تسلسليًا. وكل منها شيفرة محاكاة يستطيع الضيف العدائي الوصول إليها. وإزالتها لا تستغرق سوى ثوانٍ.\n\nفضّل أجهزة **virtio** للأقراص والشبكة، فهي صغيرة ومراجَعة على نطاق واسع وسريعة. وتجنّب العتاد المحاكى الغريب ما لم يفرضه نظام ضيف قديم. وعامل الميزات التالية على أنها ثغرات مقصودة ولا تفعّلها إلا لسبب:\n\n- **تمرير PCI وUSB.** يتخاطب الضيف مع العتاد الحقيقي مباشرةً، وقد يكشف ذلك الوصول المباشر إلى الذاكرة (DMA) والبرمجية الثابتة. استخدمه فقط على مضيفات مخصصة لضيوف موثوقين.\n- **المجلدات المشتركة والحافظة.** هذه جسور بين الضيف والمضيف بحكم تصميمها.\n- **التقسيم الافتراضي المتداخل.** يضاعف الشيفرة العاملة بين الضيف والمضيف.\n\nوكلما قصرت قائمة عتاد الضيف صغر سطح الهجوم لديه، ويصبح ملف إعداده توثيقًا لما يحتاجه."
+      },
+      {
+        "id": "qmcfg",
+        "type": "terminal",
+        "title": "مراجعة تعريف جهاز افتراضي وتقليصه",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "qm config 101",
+            "output": "agent: 1\nboot: order=scsi0\ncores: 2\nide2: none,media=cdrom\nmemory: 4096\nname: web01\nnet0: virtio=BC:24:11:AA:BB:01,bridge=vmbr1,tag=20,firewall=1\nostype: l26\nscsi0: local-lvm:vm-101-disk-0,size=32G\nscsihw: virtio-scsi-single\nusb0: host=1234:5678\nserial0: socket"
+          },
+          {
+            "comment": "لدى هذا الضيف قارئ أقراص افتراضي (ide2) وجهاز USB ممرَّر (usb0) ومنفذ تسلسلي لا يحتاجها."
+          },
+          {
+            "cmd": "qm set 101 --delete ide2,usb0,serial0",
+            "output": "update VM 101: -delete ide2,usb0,serial0"
+          },
+          {
+            "comment": "يسري التغيير عند الإيقاف الكامل ثم التشغيل التالي للجهاز، لا عند إعادة التشغيل من داخل الضيف."
+          }
+        ],
+        "caption": "جرّب على جهاز تجريبي أولًا، وتأكد أن العمل لا يحتاج الجهاز قبل حذفه."
+      },
+      {
+        "id": "blast",
+        "type": "text",
+        "markdown": "## الدفاع 3: قلّل الضرر إن وقع الهروب\n\nلا يوجد برنامج تحديث كامل، فصمّم للّحظة التي يخفق فيها.\n\n**افصل بحسب مستوى الثقة.** لا تشغّل خادم ويب مواجهًا للإنترنت ومتحكم النطاق على المضيف نفسه. اجمع الضيوف المتقاربة في الحساسية، وضع الأعلى قيمة منها على مضيفات أو عناقيد منفصلة. فإن وقع هروب حطّ بين ضيوف متساوية الأهمية. راجع درس [عزل الأجهزة الافتراضية](/learn/systems-infrastructure-security/virtual-machine-isolation).\n\n**فضّل الأجهزة الافتراضية على الحاويات للشيفرة غير الموثوقة.** تتشارك الحاويات نواة المضيف، فيكفي خلل في النواة لعبور الحد. أما الجهاز الافتراضي فيضيف طبقة المشرف الافتراضي. وللجانب الخاص بالحاويات اقرأ [أمن حاويات LXC](/learn/systems-infrastructure-security/linux-container-lxc-security).\n\n**راقب المضيف.** ينبغي ألا تُنشئ عملية `qemu` أصدافًا (Shells) ولا تفتح اتصالات صادرة ولا تكتب خارج مسارات صورها. نبّه على هذه الأحداث. وتجد موضوعات المراقبة في [مراقبة أمن بيئة المحاكاة الافتراضية](/learn/systems-infrastructure-security/virtualization-security-monitoring).\n\n**أبقِ المضيف مُحصَّنًا.** فإن هربت العملية فإن حمايات المضيف نفسه هي التي تحدد إلى أين تصل. راجع [تحصين مضيف Proxmox](/learn/systems-infrastructure-security/proxmox-host-hardening)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة",
+        "markdown": "- **«التقسيم الافتراضي حد أمني، فكل ضيف آمن بجوار أي ضيف آخر».** هو حد قوي لكنه ليس مطلقًا. اخلط مستويات الثقة بحذر.\n- **تحديث الحزمة دون إعادة تشغيل الضيوف أبدًا.** يبقى الملف القديم المعيب عاملًا.\n- **ترك أجهزة التمرير «لوقت لاحق».** احذف ما لا يستخدمه العمل الآن.\n- **الاعتماد على سجلات الضيف وحدها.** يستطيع الضيف المخترق تغيير سجلاته، فاجمع الأدلة من المضيف."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على مضيف Proxmox VE تجريبي تملكه:\n\n1. نفّذ `pveversion -v` ودوّن إصداري `pve-qemu-kvm` والنواة.\n2. نفّذ `apt update` ثم `apt list --upgradable`. هل تنتظر حزم متعلقة بالأمان؟\n3. نفّذ `lscpu | grep -i vulnerab` وسجّل أي سطر لا يقول \"Not affected\" أو \"Mitigation\".\n4. اختر جهازًا افتراضيًا للاختبار ونفّذ `qm config <vmid>`، وسجّل كل جهاز لا يحتاجه.\n5. احذف جهازًا واحدًا غير لازم بالأمر `qm set <vmid> --delete <device>`، ثم أوقف الجهاز وشغّله وتأكد أن الضيف ما زال يعمل.\n6. اكتب فقرة واحدة لسياسة التحديث: كم مرة تحدّث، وكيف تعيد تشغيل الضيوف أو ترحّلها بعد ذلك."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "الهروب من الجهاز الافتراضي",
+            "definition": "إخفاق في العزل تصل فيه شيفرة داخل ضيف إلى المضيف أو إلى ضيوف آخرين."
+          },
+          {
+            "term": "محاكاة الأجهزة",
+            "definition": "برمجيات تحاكي عتادًا مثل متحكمات الأقراص والشبكة للضيف."
+          },
+          {
+            "term": "QEMU/KVM",
+            "definition": "المحاكي ووحدة النواة اللذان يشغّلان الأجهزة الافتراضية في Proxmox VE."
+          },
+          {
+            "term": "virtio",
+            "definition": "عائلة قياسية من الأجهزة شبه الافتراضية صُمّمت لإدخال وإخراج فعّالين بين الضيف والمضيف."
+          },
+          {
+            "term": "التمرير",
+            "definition": "منح الضيف وصولًا مباشرًا إلى جهاز PCI أو USB فيزيائي."
+          },
+          {
+            "term": "البرمجية الدقيقة",
+            "definition": "برمجية ثابتة منخفضة المستوى للمعالج تُحدَّث لإصلاح ثغراته."
+          },
+          {
+            "term": "الترحيل الحي",
+            "definition": "نقل جهاز افتراضي عامل إلى عقدة أخرى دون إيقافه."
+          },
+          {
+            "term": "مستوى الثقة",
+            "definition": "تجميع للأعمال بحسب الحساسية بحيث لا تتشارك المستويات المختلفة مضيفًا واحدًا."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا تُعدّ شيفرة محاكاة الأجهزة مصدرًا شائعًا لثغرات الهروب؟",
+            "options": [
+              "لأنها كبيرة وتحلّل بيانات يتحكم فيها الضيف",
+              "لأنها تعمل داخل الضيف فقط",
+              "لأنها مكتوبة بلغة التجميع فقط",
+              "لأنها لا ترتبط بالمضيف"
+            ],
+            "answer": 0,
+            "explanation": "تعمل المحاكاة في عملية على المضيف لكنها تعالج مدخلات يتحكم فيها المهاجم، فتصبح أخطاء التحليل مهمة."
+          },
+          {
+            "question": "بعد تحديث حزمة QEMU، ما الذي يلزم كي تستفيد الأجهزة العاملة من الإصلاح؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "إعادة تشغيل الجهاز بإيقاف كامل ثم تشغيل",
+              "ترحيله حيًّا إلى عقدة محدَّثة",
+              "إعادة التشغيل من داخل الضيف فقط",
+              "لا شيء، فالتحديث يُطبَّق حيًّا"
+            ],
+            "answer": [
+              0,
+              1
+            ],
+            "explanation": "تحتفظ العملية العاملة بملفها القديم، والإيقاف الكامل أو الترحيل يطلق عملية QEMU جديدة."
+          },
+          {
+            "question": "أي خيار يقلّل سطح الهجوم للضيف؟",
+            "options": [
+              "إضافة أجهزة USB وصوت للتسهيل",
+              "إزالة الأجهزة الافتراضية غير المستخدمة",
+              "تفعيل التقسيم الافتراضي المتداخل افتراضيًا",
+              "مشاركة حافظة المضيف"
+            ],
+            "answer": 1,
+            "explanation": "كل جهاز يُزال هو قطعة أقل من شيفرة المحاكاة يمكن للضيف الوصول إليها."
+          },
+          {
+            "question": "لماذا تُفضَّل الأجهزة الافتراضية على الحاويات لتشغيل شيفرة غير موثوقة؟",
+            "options": [
+              "تستهلك الحاويات ذاكرة أكثر",
+              "تتشارك الحاويات نواة المضيف، فقد يعبر خلل النواة الحد",
+              "الأجهزة الافتراضية أسرع دائمًا",
+              "لا يمكن تحديث الحاويات"
+            ],
+            "answer": 1,
+            "explanation": "يضيف الجهاز الافتراضي طبقة مشرف افتراضي بحدّ يفرضه العتاد فوق النواة."
+          },
+          {
+            "question": "أي الإجراءات تحدّ من ضرر هروب ناجح؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "فصل الضيوف بحسب مستوى الثقة على مضيفات مختلفة",
+              "مراقبة المضيف لسلوك qemu غير المعتاد",
+              "تشغيل كل الأعمال على مضيف واحد",
+              "نظام تشغيل مضيف مُحصَّن"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "وضع كل شيء على مضيف واحد يوسّع نطاق الضرر إلى أقصاه، أما الثلاثة الأخرى فتحدّه أو تكشفه."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يقع الهروب حين يكسر ضيف الحد الذي يفرضه المشرف الافتراضي، وغالبًا عبر خلل في **محاكاة الأجهزة** داخل عملية `qemu`.\n- **حدّث** QEMU والنواة والبرمجية الدقيقة، ثم أعد تشغيل الضيوف أو رحّلها لتستخدم الشيفرة الجديدة.\n- **أزل الأجهزة غير اللازمة** وتجنّب التمرير والمجلدات المشتركة والتداخل ما لم يكن لديك سبب.\n- **افصل بحسب مستوى الثقة** وفضّل الأجهزة الافتراضية على الحاويات للشيفرة العدائية.\n- **راقب المضيف**، فالأدلة في ضيف مخترق لا يُوثق بها.\n\nتابع بدرس [سطح الهجوم للمشرف الافتراضي](/learn/systems-infrastructure-security/hypervisor-attack-surface) لترسم كل ما يكشفه المشرف الافتراضي."
+      }
+    ]
+  }
+}

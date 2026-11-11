@@ -1,0 +1,548 @@
+{
+ "slug": "linux-container-lxc-security",
+ "title": "Linux Container (LXC) Security",
+ "summary": "Create unprivileged LXC containers on Proxmox, avoid settings that remove isolation, and audit container configs.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Explain why a shared kernel makes containers a weaker boundary",
+  "Create unprivileged containers and read the UID mapping",
+  "Identify risky options such as nesting and unconfined AppArmor",
+  "Audit container configs and choose between LXC and a VM"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Containers are popular on Proxmox because they start in a second and use almost no memory. A Linux container (LXC) holds a full operating system user space, but it does not hold a kernel. Every container on the node runs on the same host kernel.\n\nThat single fact drives all LXC security. A virtual machine has its own kernel behind hardware virtualization. A container has namespaces, control groups and security filters that the shared kernel enforces. If the kernel has a flaw, or if you weaken those filters, a process in one container can reach the host and all its neighbors.\n\nIn this lesson you will create an unprivileged container, understand user ID mapping, avoid the settings that remove protection, and decide when a container is the wrong tool. It follows [virtual machine isolation](/learn/systems-infrastructure-security/virtual-machine-isolation)."
+  },
+  {
+   "type": "text",
+   "id": "compare",
+   "markdown": "## Container or VM?\n\n| Property | LXC container | Virtual machine |\n|:--|:--|:--|\n| Kernel | Shared with the host | Its own |\n| Boundary | Namespaces, cgroups, AppArmor, seccomp | Hardware virtualization, device models |\n| Start time and overhead | Very low | Higher |\n| Blast radius of a kernel bug | The whole node | Usually the guest only |\n| Suitable for | Trusted internal services | Untrusted or internet-exposed workloads |\n\nContainers are not insecure by nature. They give a weaker boundary, so you should place only workloads whose owners you trust and whose software you patch. For code you do not control, use a VM."
+  },
+  {
+   "type": "text",
+   "id": "unpriv",
+   "markdown": "## Step 1: Use unprivileged containers\n\nIn a privileged container, root inside the container is root (UID 0) on the host. If an attacker escapes, they arrive with full administrative rights.\n\nIn an **unprivileged** container, the kernel maps container UIDs to a high range on the host. Container root (UID 0) becomes UID 100000 on the host, which has no special rights. The mapping is defined in `/etc/subuid` and `/etc/subgid`.\n\nCreate containers as unprivileged unless you can name a reason not to. Note the options that keep the attack surface small: no nesting, no extra features, a firewall on the interface, and a resource cap."
+  },
+  {
+   "type": "terminal",
+   "id": "create-term",
+   "title": "pve1 - create and verify",
+   "lines": [
+    {
+     "cmd": "pct create 201 local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst --hostname app01 --unprivileged 1 --cores 2 --memory 1024 --swap 0 --net0 name=eth0,bridge=vmbr0,firewall=1,ip=192.0.2.50/24,gw=192.0.2.1 --password '<set-a-strong-password>'",
+     "output": "extracting archive ...\nTotal bytes read: 450232320\nTASK OK",
+     "comment": "Unprivileged by flag, with CPU and memory caps and the firewall enabled on eth0. The template file name varies by release."
+    },
+    {
+     "cmd": "pct config 201",
+     "output": "arch: amd64\ncores: 2\nhostname: app01\nmemory: 1024\nnet0: name=eth0,bridge=vmbr0,firewall=1,gw=192.0.2.1,ip=192.0.2.50/24,type=veth\nostype: debian\nrootfs: local-lvm:vm-201-disk-0,size=8G\nswap: 0\nunprivileged: 1",
+     "comment": "`unprivileged: 1` is the line to look for in every audit."
+    },
+    {
+     "cmd": "pct start 201 && ps -eo user:12,pid,comm | grep -m3 100000",
+     "output": "100000        4821 systemd\n100000        5102 sshd\n100033        5230 nginx",
+     "comment": "Processes appear on the host under high UIDs, not root."
+    }
+   ],
+   "caption": "An unprivileged container: the config and how it appears from the host."
+  },
+  {
+   "type": "animation",
+   "id": "uidmap",
+   "kind": "sequence",
+   "title": "User ID mapping",
+   "caption": "Why root in an unprivileged container is harmless on the host.",
+   "data": {
+    "actors": [
+     {
+      "id": "p",
+      "label": "Container process",
+      "sub": "UID 0 (root)",
+      "icon": "cpu"
+     },
+     {
+      "id": "k",
+      "label": "Host kernel",
+      "sub": "/etc/subuid map",
+      "icon": "shield"
+     },
+     {
+      "id": "f",
+      "label": "Host file",
+      "sub": "/etc/shadow",
+      "icon": "file"
+     }
+    ],
+    "steps": [
+     {
+      "from": "p",
+      "to": "k",
+      "label": "open(/etc/shadow)",
+      "note": "Code inside the container acts as root and tries to read a host file."
+     },
+     {
+      "from": "k",
+      "to": "k",
+      "label": "Map UID 0 to 100000",
+      "tone": "secure",
+      "note": "The kernel translates the container UID to its real host UID."
+     },
+     {
+      "from": "k",
+      "to": "f",
+      "label": "Check owner root:shadow",
+      "note": "Permissions are checked against UID 100000."
+     },
+     {
+      "from": "f",
+      "to": "k",
+      "label": "Permission denied",
+      "tone": "blocked"
+     },
+     {
+      "from": "k",
+      "to": "p",
+      "label": "EACCES",
+      "tone": "blocked",
+      "note": "A container escape would still land as an unprivileged user."
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "danger",
+   "markdown": "## Step 2: Avoid settings that remove protection\n\nSome options are common in tutorials and quietly erase the boundary. Review `/etc/pve/lxc/<id>.conf` for them.\n\n| Setting | Why it is risky |\n|:--|:--|\n| `unprivileged: 0` | Container root equals host root |\n| `features: nesting=1` | Allows containers inside containers and loosens AppArmor; needed for Docker, but widens the surface |\n| `lxc.apparmor.profile: unconfined` | Removes the mandatory access control profile |\n| `lxc.cap.drop:` (empty) | Keeps capabilities that default profiles remove |\n| `lxc.cgroup2.devices.allow: a` | Lets the container open any device node |\n| `lxc.mount.entry` or `mp0:` of `/` or `/etc` | Exposes host files to the guest |\n| `lxc.init.cmd`/hooks run as root | Host-side code executes on container start |\n\nBind mounts deserve special care. Mount only the specific directory the service needs, mount it read-only (`ro=1`) if it does not need to write, and remember the UID shift: files owned by host UID 1000 appear to belong to nobody unless you map them deliberately."
+  },
+  {
+   "type": "code",
+   "id": "audit-code",
+   "language": "bash",
+   "code": "#!/usr/bin/env bash\n# Report risky LXC settings on this node. Read-only.\nfor f in /etc/pve/lxc/*.conf; do\n  id=$(basename \"$f\" .conf)\n  grep -q '^unprivileged: 1' \"$f\" || echo \"CT $id: privileged\"\n  grep -Eq 'nesting=1' \"$f\"       && echo \"CT $id: nesting enabled\"\n  grep -Eq 'apparmor.profile: *unconfined' \"$f\" && echo \"CT $id: AppArmor unconfined\"\n  grep -Eq 'devices.allow' \"$f\"   && echo \"CT $id: extra device access\"\ndone",
+   "filename": "audit-lxc.sh",
+   "caption": "A small audit that flags the settings from the table."
+  },
+  {
+   "type": "terminal",
+   "id": "audit-term",
+   "title": "pve1 - run the audit",
+   "lines": [
+    {
+     "cmd": "bash audit-lxc.sh",
+     "output": "CT 118: privileged\nCT 204: nesting enabled",
+     "comment": "Two findings to review. Nesting may be justified for a Docker host; a privileged CT needs a written reason."
+    }
+   ],
+   "caption": "Running the audit across all containers."
+  },
+  {
+   "type": "text",
+   "id": "harden",
+   "markdown": "## Step 3: Harden what runs inside\n\nA container is a normal Linux system, so apply normal hardening inside it.\n\n1. **Patch both layers.** Update packages inside the container and the Proxmox host kernel. The host kernel is the shared boundary, so its patch level matters most.\n2. **Cap resources.** Set `cores`, `memory`, `swap` and disk size so one noisy or compromised container cannot starve the rest.\n3. **Firewall every interface.** Use `firewall=1` and a default deny, as in [Proxmox firewall configuration](/learn/systems-infrastructure-security/proxmox-firewall-configuration).\n4. **Run services as non-root users** inside the container, and drop unneeded packages and SSH.\n5. **Keep secrets out of the template.** Inject them at start time, never bake them into the image.\n6. **Back up and test restores.** A container backup is a tar archive of its file system.\n\nFinally, ask whether the workload belongs here. Internet-facing applications, multi-tenant services and anything running code from users are better placed in a VM."
+  },
+  {
+   "type": "text",
+   "id": "detect",
+   "markdown": "## Step 4: Detect trouble early\n\nPrevention is only half of the job. Watch for signs that a container is misbehaving or probing its boundary.\n\n- **AppArmor denials.** When a profile blocks an action, the kernel logs it. Search the host log with `journalctl -k | grep apparmor` and look for `DENIED` entries naming a container profile. A burst of denials from one container is worth an investigation.\n- **Resource anomalies.** A container that suddenly uses all its CPU quota may be running a miner or a runaway job. Compare `pct status` and the Proxmox graphs against the usual pattern.\n- **Configuration drift.** Re-run the audit script from a scheduled job and alert when a new finding appears, so nobody can quietly turn on nesting.\n- **Network behavior.** Containers that start connecting to addresses they never used before should raise an alert. The logs from the container firewall are the easiest source.\n\nCombine these signals in your central logging, as discussed in [virtualization security monitoring](/learn/systems-infrastructure-security/virtualization-security-monitoring)."
+  },
+  {
+   "type": "callout",
+   "id": "docker-warn",
+   "variant": "warning",
+   "title": "Docker inside LXC",
+   "markdown": "Running Docker in a container needs `nesting=1` and often `keyctl=1`. This weakens isolation and has caused breakage after kernel updates. For production Docker hosts, prefer a dedicated VM, and treat any container with nesting as a lower trust zone."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab node you own:\n\n1. Create an unprivileged container with `pct create` and a 1 GB memory cap, then confirm `unprivileged: 1` in `pct config`.\n2. Start it and run `ps -eo user,pid,comm` on the host to see its processes under UID 100000 and above.\n3. Inside the container run `id`; on the host look up `/etc/subuid` and explain the mapping.\n4. Run the audit script, enable `nesting=1` on a throwaway container, and confirm the script reports it."
+  },
+  {
+   "type": "keyterms",
+   "id": "kt",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "LXC",
+     "definition": "Linux Containers: OS-level virtualization using kernel namespaces and cgroups."
+    },
+    {
+     "term": "Unprivileged container",
+     "definition": "A container whose UIDs are mapped to a high, rights-free range on the host."
+    },
+    {
+     "term": "User namespace",
+     "definition": "A kernel feature that maps UIDs inside a container to different UIDs outside."
+    },
+    {
+     "term": "cgroup",
+     "definition": "A control group that limits CPU, memory and I/O for a set of processes."
+    },
+    {
+     "term": "AppArmor",
+     "definition": "A mandatory access control system that confines what a process may do."
+    },
+    {
+     "term": "Nesting",
+     "definition": "Allowing containers inside a container; it loosens restrictions."
+    },
+    {
+     "term": "Bind mount",
+     "definition": "Exposing a host directory inside a container."
+    },
+    {
+     "term": "Capability",
+     "definition": "A fine-grained piece of root power, such as `CAP_NET_ADMIN`."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What is the main reason containers have a weaker boundary than VMs?",
+     "options": [
+      "They use less disk",
+      "They share the host kernel",
+      "They cannot use a firewall",
+      "They have no users"
+     ],
+     "answer": 1,
+     "explanation": "A kernel flaw reachable from a container affects the host and every other container."
+    },
+    {
+     "question": "In an unprivileged container, what host UID does container root typically have?",
+     "options": [
+      "0",
+      "100000",
+      "65534",
+      "1000"
+     ],
+     "answer": 1,
+     "explanation": "The default subuid mapping shifts UID 0 to 100000, which has no special rights on the host."
+    },
+    {
+     "question": "Which settings weaken a container's isolation? (choose all that apply)",
+     "options": [
+      "`unprivileged: 0`",
+      "`lxc.apparmor.profile: unconfined`",
+      "`firewall=1` on net0",
+      "A read-write bind mount of `/etc`"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Privileged mode, no AppArmor confinement and exposing host paths all remove protection. The firewall flag adds protection."
+    },
+    {
+     "question": "A team wants to run Docker on production hosts handling internet traffic. What is the better choice?",
+     "options": [
+      "A privileged LXC",
+      "An LXC with nesting",
+      "A dedicated VM",
+      "The Proxmox host itself"
+     ],
+     "answer": 2,
+     "explanation": "A VM provides a stronger boundary and avoids nesting workarounds."
+    },
+    {
+     "question": "Which command line shows whether a container is unprivileged?",
+     "options": [
+      "`pct config <id>`",
+      "`pct list`",
+      "`pvesm status`",
+      "`qm config <id>`"
+     ],
+     "answer": 0,
+     "explanation": "Look for `unprivileged: 1` in the config output."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nLXC containers share the host kernel, so their boundary is weaker than a VM's. Make them unprivileged so container root maps to a harmless host UID, and avoid the options that undo protection: privileged mode, nesting, unconfined AppArmor, broad device access and wide bind mounts.\n\nCap resources, firewall each interface, patch the host kernel, and audit the configuration files regularly. Place untrusted or internet-facing workloads in VMs. Next, learn how to keep guests from talking to each other in [VM-to-VM network isolation](/learn/systems-infrastructure-security/vm-to-vm-network-isolation)."
+  }
+ ],
+ "ar": {
+  "title": "أمن حاويات Linux (LXC)",
+  "summary": "أنشئ حاويات LXC غير ممتازة على Proxmox، وتجنّب الإعدادات التي تزيل العزل، ودقّق إعدادات الحاويات.",
+  "objectives": [
+   "شرح لماذا تجعل النواة المشتركة الحاويات حاجزًا أضعف",
+   "إنشاء حاويات غير ممتازة وقراءة تعيين المعرّفات",
+   "تحديد الخيارات الخطرة مثل التداخل وAppArmor غير المقيّد",
+   "تدقيق إعدادات الحاويات والاختيار بين LXC والجهاز الافتراضي"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "تحظى الحاويات بشعبية على Proxmox لأنها تبدأ في ثانية وتستهلك ذاكرة شبه معدومة. تحتوي حاوية Linux (LXC) على فضاء مستخدم كامل لنظام تشغيل، لكنها لا تحتوي نواة. كل حاوية على العقدة تعمل فوق نواة المضيف نفسها.\n\nهذه الحقيقة الواحدة تحكم كل أمن LXC. للجهاز الافتراضي نواته الخاصة خلف افتراضية العتاد. أما الحاوية ففيها فضاءات أسماء ومجموعات تحكم ومرشّحات أمان تفرضها النواة المشتركة. إن وُجد عيب في النواة، أو أضعفت تلك المرشّحات، فقد تصل عملية في حاوية إلى المضيف وكل جيرانه.\n\nفي هذا الدرس تنشئ حاوية غير ممتازة (unprivileged)، وتفهم تعيين معرّفات المستخدمين، وتتجنب الإعدادات التي تزيل الحماية، وتقرر متى تكون الحاوية الأداة الخاطئة. يتبع الدرس [عزل الأجهزة الافتراضية](/learn/systems-infrastructure-security/virtual-machine-isolation)."
+   },
+   {
+    "type": "text",
+    "id": "compare",
+    "markdown": "## حاوية أم جهاز افتراضي؟\n\n| الخاصية | حاوية LXC | جهاز افتراضي |\n|:--|:--|:--|\n| النواة | مشتركة مع المضيف | خاصة به |\n| الحاجز | فضاءات الأسماء وcgroups وAppArmor وseccomp | افتراضية العتاد ونماذج الأجهزة |\n| زمن البدء والكلفة | منخفضان جدًا | أعلى |\n| نطاق ضرر ثغرة في النواة | العقدة كلها | الضيف غالبًا فقط |\n| يناسب | الخدمات الداخلية الموثوقة | الأحمال غير الموثوقة أو المكشوفة للإنترنت |\n\nالحاويات ليست غير آمنة بطبيعتها. هي تعطي حاجزًا أضعف، فلا تضع فيها إلا أحمالًا يوثق بأصحابها وتحدّث برمجياتها. أما الشيفرة التي لا تتحكم بها فاستخدم لها جهازًا افتراضيًا."
+   },
+   {
+    "type": "text",
+    "id": "unpriv",
+    "markdown": "## الخطوة 1: استخدم الحاويات غير الممتازة\n\nفي الحاوية الممتازة (privileged) يكون root داخل الحاوية هو root بالمعرّف UID 0 على المضيف. إذا هرب المهاجم وصل بكامل الحقوق الإدارية.\n\nفي الحاوية **غير الممتازة** تعيّن النواة معرّفات المستخدمين في الحاوية إلى نطاق مرتفع على المضيف. يصبح root الحاوية (UID 0) هو UID 100000 على المضيف، وليس له أي حقوق خاصة. يُعرَّف التعيين في `/etc/subuid` و`/etc/subgid`.\n\nأنشئ الحاويات غير ممتازة ما لم تستطع تسمية سبب مخالف. لاحظ الخيارات التي تُبقي سطح الهجوم صغيرًا: بلا تداخل (nesting) ولا ميزات إضافية، مع جدار حماية على الواجهة وسقف للموارد."
+   },
+   {
+    "type": "terminal",
+    "id": "create-term",
+    "title": "pve1 - create and verify",
+    "lines": [
+     {
+      "cmd": "pct create 201 local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst --hostname app01 --unprivileged 1 --cores 2 --memory 1024 --swap 0 --net0 name=eth0,bridge=vmbr0,firewall=1,ip=192.0.2.50/24,gw=192.0.2.1 --password '<set-a-strong-password>'",
+      "output": "extracting archive ...\nTotal bytes read: 450232320\nTASK OK",
+      "comment": "غير ممتازة بالعلم، مع سقف للمعالج والذاكرة وجدار حماية على eth0. اسم ملف القالب يختلف بحسب الإصدار."
+     },
+     {
+      "cmd": "pct config 201",
+      "output": "arch: amd64\ncores: 2\nhostname: app01\nmemory: 1024\nnet0: name=eth0,bridge=vmbr0,firewall=1,gw=192.0.2.1,ip=192.0.2.50/24,type=veth\nostype: debian\nrootfs: local-lvm:vm-201-disk-0,size=8G\nswap: 0\nunprivileged: 1",
+      "comment": "السطر `unprivileged: 1` هو ما تبحث عنه في كل تدقيق."
+     },
+     {
+      "cmd": "pct start 201 && ps -eo user:12,pid,comm | grep -m3 100000",
+      "output": "100000        4821 systemd\n100000        5102 sshd\n100033        5230 nginx",
+      "comment": "تظهر العمليات على المضيف بمعرّفات مرتفعة لا root."
+     }
+    ],
+    "caption": "حاوية غير ممتازة: الإعداد وكيف تبدو من المضيف."
+   },
+   {
+    "type": "animation",
+    "id": "uidmap",
+    "kind": "sequence",
+    "title": "تعيين معرّفات المستخدمين",
+    "caption": "لماذا يكون root في الحاوية غير الممتازة غير ضار على المضيف.",
+    "data": {
+     "actors": [
+      {
+       "id": "p",
+       "label": "عملية الحاوية",
+       "sub": "UID 0 (root)",
+       "icon": "cpu"
+      },
+      {
+       "id": "k",
+       "label": "نواة المضيف",
+       "sub": "خريطة /etc/subuid",
+       "icon": "shield"
+      },
+      {
+       "id": "f",
+       "label": "ملف المضيف",
+       "sub": "/etc/shadow",
+       "icon": "file"
+      }
+     ],
+     "steps": [
+      {
+       "from": "p",
+       "to": "k",
+       "label": "open(/etc/shadow)",
+       "note": "تعمل الشيفرة داخل الحاوية كـ root وتحاول قراءة ملف من المضيف."
+      },
+      {
+       "from": "k",
+       "to": "k",
+       "label": "تعيين UID 0 إلى 100000",
+       "tone": "secure",
+       "note": "تترجم النواة معرّف الحاوية إلى معرّفه الحقيقي على المضيف."
+      },
+      {
+       "from": "k",
+       "to": "f",
+       "label": "فحص المالك root:shadow",
+       "note": "تُفحص الصلاحيات مقابل UID 100000."
+      },
+      {
+       "from": "f",
+       "to": "k",
+       "label": "رُفض الإذن",
+       "tone": "blocked"
+      },
+      {
+       "from": "k",
+       "to": "p",
+       "label": "EACCES",
+       "tone": "blocked",
+       "note": "حتى الهروب من الحاوية سيصل كمستخدم غير ممتاز."
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "danger",
+    "markdown": "## الخطوة 2: تجنّب الإعدادات التي تزيل الحماية\n\nبعض الخيارات شائعة في الشروحات وتمحو الحاجز بهدوء. راجع `/etc/pve/lxc/<id>.conf` بحثًا عنها.\n\n| الإعداد | سبب الخطورة |\n|:--|:--|\n| `unprivileged: 0` | root الحاوية يساوي root المضيف |\n| `features: nesting=1` | يسمح بحاويات داخل حاويات ويرخي AppArmor؛ مطلوب لـ Docker لكنه يوسّع السطح |\n| `lxc.apparmor.profile: unconfined` | يزيل ملف التحكم الإلزامي بالوصول |\n| `lxc.cap.drop:` (فارغ) | يُبقي قدرات تزيلها الملفات الافتراضية |\n| `lxc.cgroup2.devices.allow: a` | يتيح للحاوية فتح أي عقدة جهاز |\n| `lxc.mount.entry` أو `mp0:` للمسار `/` أو `/etc` | يكشف ملفات المضيف للضيف |\n| `lxc.init.cmd` أو الخطافات تعمل كـ root | تنفيذ شيفرة من جهة المضيف عند بدء الحاوية |\n\nتستحق عمليات الربط (bind mounts) عناية خاصة. اربط المجلد المحدد الذي تحتاجه الخدمة فقط، واربطه للقراءة فقط (`ro=1`) إن لم يحتج إلى الكتابة، وتذكّر إزاحة المعرّفات: الملفات المملوكة للمعرّف 1000 على المضيف تبدو مملوكة لمستخدم nobody ما لم تعيّنها عمدًا."
+   },
+   {
+    "type": "code",
+    "id": "audit-code",
+    "language": "bash",
+    "code": "#!/usr/bin/env bash\n# Report risky LXC settings on this node. Read-only.\nfor f in /etc/pve/lxc/*.conf; do\n  id=$(basename \"$f\" .conf)\n  grep -q '^unprivileged: 1' \"$f\" || echo \"CT $id: privileged\"\n  grep -Eq 'nesting=1' \"$f\"       && echo \"CT $id: nesting enabled\"\n  grep -Eq 'apparmor.profile: *unconfined' \"$f\" && echo \"CT $id: AppArmor unconfined\"\n  grep -Eq 'devices.allow' \"$f\"   && echo \"CT $id: extra device access\"\ndone",
+    "filename": "audit-lxc.sh",
+    "caption": "تدقيق صغير يرصد الإعدادات المذكورة في الجدول."
+   },
+   {
+    "type": "terminal",
+    "id": "audit-term",
+    "title": "pve1 - run the audit",
+    "lines": [
+     {
+      "cmd": "bash audit-lxc.sh",
+      "output": "CT 118: privileged\nCT 204: nesting enabled",
+      "comment": "ملاحظتان للمراجعة. قد يكون التداخل مبررًا لمضيف Docker، أما الحاوية الممتازة فتحتاج سببًا مكتوبًا."
+     }
+    ],
+    "caption": "تشغيل التدقيق على كل الحاويات."
+   },
+   {
+    "type": "text",
+    "id": "harden",
+    "markdown": "## الخطوة 3: قوِّ ما يعمل داخلها\n\nالحاوية نظام Linux عادي، فطبّق التقوية المعتادة داخلها.\n\n1. **حدّث الطبقتين.** حدّث الحزم داخل الحاوية ونواة مضيف Proxmox. نواة المضيف هي الحاجز المشترك، فمستوى ترقيعها هو الأهم.\n2. **حدّد الموارد.** اضبط `cores` و`memory` و`swap` وحجم القرص كي لا تجوّع حاوية مزعجة أو مخترَقة بقية الحاويات.\n3. **أحط كل واجهة بجدار حماية.** استخدم `firewall=1` ورفضًا افتراضيًا كما في [تهيئة جدار الحماية في Proxmox](/learn/systems-infrastructure-security/proxmox-firewall-configuration).\n4. **شغّل الخدمات بمستخدمين غير root** داخل الحاوية، وأزل الحزم غير اللازمة وSSH.\n5. **أبقِ الأسرار خارج القالب.** احقنها عند البدء ولا تضمّنها في الصورة أبدًا.\n6. **انسخ احتياطيًا واختبر الاستعادة.** النسخة الاحتياطية للحاوية أرشيف tar لنظام ملفاتها.\n\nوأخيرًا اسأل: هل يناسب الحمل هذا المكان؟ التطبيقات المواجهة للإنترنت والخدمات متعددة المستأجرين وكل ما ينفّذ شيفرة من المستخدمين أنسب في جهاز افتراضي."
+   },
+   {
+    "type": "text",
+    "id": "detect",
+    "markdown": "## الخطوة 4: اكتشف المشكلة مبكرًا\n\nالوقاية نصف العمل فقط. راقب علامات تدل على أن حاوية تسيء التصرف أو تتحسس حاجزها.\n\n- **رفض AppArmor.** حين يمنع الملف إجراءً تسجّل النواة ذلك. ابحث في سجل المضيف بالأمر `journalctl -k | grep apparmor` وابحث عن إدخالات `DENIED` باسم ملف حاوية. تستحق دفعة من حالات الرفض من حاوية واحدة التحقيق.\n- **شذوذ الموارد.** حاوية تستهلك فجأة كل حصتها من المعالج قد تشغّل برنامج تعدين أو مهمة منفلتة. قارن `pct status` ورسوم Proxmox بالنمط المعتاد.\n- **انحراف الإعدادات.** أعد تشغيل سكربت التدقيق من مهمة مجدولة ونبّه عند ظهور ملاحظة جديدة، كي لا يفعّل أحد التداخل بصمت.\n- **سلوك الشبكة.** الحاويات التي تبدأ الاتصال بعناوين لم تستخدمها من قبل يجب أن تثير تنبيهًا. وسجلات جدار حماية الحاوية أسهل مصدر لذلك.\n\nاجمع هذه الإشارات في التسجيل المركزي كما في [مراقبة أمن الافتراضية](/learn/systems-infrastructure-security/virtualization-security-monitoring)."
+   },
+   {
+    "type": "callout",
+    "id": "docker-warn",
+    "variant": "warning",
+    "title": "Docker داخل LXC",
+    "markdown": "يتطلب تشغيل Docker في حاوية `nesting=1` وغالبًا `keyctl=1`. يضعف ذلك العزل وقد سبّب أعطالًا بعد تحديثات النواة. لمضيفات Docker الإنتاجية فضّل جهازًا افتراضيًا مخصصًا، وعامل أي حاوية بتداخل كمنطقة ثقة أدنى."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على عقدة مخبرية تملكها:\n\n1. أنشئ حاوية غير ممتازة بالأمر `pct create` مع سقف ذاكرة 1 غيغابايت، وتأكد من `unprivileged: 1` في `pct config`.\n2. شغّلها ونفّذ `ps -eo user,pid,comm` على المضيف لترى عملياتها تحت UID 100000 وما فوق.\n3. داخل الحاوية نفّذ `id`، وعلى المضيف راجع `/etc/subuid` واشرح التعيين.\n4. شغّل سكربت التدقيق، وفعّل `nesting=1` على حاوية للتجربة، وتأكد أن السكربت يرصدها."
+   },
+   {
+    "type": "keyterms",
+    "id": "kt",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "LXC",
+      "definition": "حاويات Linux: افتراضية على مستوى نظام التشغيل تستخدم فضاءات أسماء النواة وcgroups."
+     },
+     {
+      "term": "حاوية غير ممتازة (Unprivileged container)",
+      "definition": "حاوية تُعيَّن معرّفاتها إلى نطاق مرتفع بلا حقوق على المضيف."
+     },
+     {
+      "term": "فضاء أسماء المستخدم (User namespace)",
+      "definition": "ميزة في النواة تعيّن معرّفات داخل الحاوية إلى معرّفات مختلفة خارجها."
+     },
+     {
+      "term": "مجموعة التحكم (cgroup)",
+      "definition": "تحدّ المعالج والذاكرة والإدخال/الإخراج لمجموعة عمليات."
+     },
+     {
+      "term": "AppArmor",
+      "definition": "نظام تحكم إلزامي بالوصول يحصر ما يجوز للعملية فعله."
+     },
+     {
+      "term": "التداخل (Nesting)",
+      "definition": "السماح بحاويات داخل حاوية؛ يرخي القيود."
+     },
+     {
+      "term": "الربط (Bind mount)",
+      "definition": "كشف مجلد من المضيف داخل الحاوية."
+     },
+     {
+      "term": "القدرة (Capability)",
+      "definition": "جزء دقيق من صلاحيات root مثل `CAP_NET_ADMIN`."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما السبب الرئيسي لضعف حاجز الحاويات مقارنة بالأجهزة الافتراضية؟",
+      "options": [
+       "تستخدم قرصًا أقل",
+       "تشارك نواة المضيف",
+       "لا تستطيع استخدام جدار حماية",
+       "لا مستخدمين فيها"
+      ],
+      "answer": 1,
+      "explanation": "ثغرة في النواة يمكن الوصول إليها من حاوية تؤثر على المضيف وكل الحاويات الأخرى."
+     },
+     {
+      "question": "في الحاوية غير الممتازة، ما معرّف المستخدم على المضيف الذي يحمله root الحاوية عادةً؟",
+      "options": [
+       "0",
+       "100000",
+       "65534",
+       "1000"
+      ],
+      "answer": 1,
+      "explanation": "تزيح الخريطة الافتراضية UID 0 إلى 100000 وهو بلا حقوق خاصة على المضيف."
+     },
+     {
+      "question": "أي الإعدادات تضعف عزل الحاوية؟ (اختر كل ما ينطبق)",
+      "options": [
+       "`unprivileged: 0`",
+       "`lxc.apparmor.profile: unconfined`",
+       "`firewall=1` على net0",
+       "ربط `/etc` للقراءة والكتابة"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "الوضع الممتاز وإزالة قيود AppArmor وكشف مسارات المضيف تزيل الحماية. أما علم جدار الحماية فيضيف حماية."
+     },
+     {
+      "question": "فريق يريد تشغيل Docker على مضيفات إنتاج تعالج حركة الإنترنت. ما الخيار الأفضل؟",
+      "options": [
+       "حاوية LXC ممتازة",
+       "حاوية LXC بتداخل",
+       "جهاز افتراضي مخصص",
+       "مضيف Proxmox نفسه"
+      ],
+      "answer": 2,
+      "explanation": "يوفر الجهاز الافتراضي حاجزًا أقوى ويتجنب حلول التداخل."
+     },
+     {
+      "question": "أي أمر يُظهر ما إذا كانت الحاوية غير ممتازة؟",
+      "options": [
+       "`pct config <id>`",
+       "`pct list`",
+       "`pvesm status`",
+       "`qm config <id>`"
+      ],
+      "answer": 0,
+      "explanation": "ابحث عن `unprivileged: 1` في خرج الإعداد."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nتشارك حاويات LXC نواة المضيف، فحاجزها أضعف من حاجز الجهاز الافتراضي. اجعلها غير ممتازة كي يُعيَّن root الحاوية إلى معرّف غير ضار على المضيف، وتجنّب الخيارات التي تلغي الحماية: الوضع الممتاز والتداخل وAppArmor غير المقيّد والوصول الواسع للأجهزة وعمليات الربط الواسعة.\n\nحدّد الموارد، وأحط كل واجهة بجدار حماية، وحدّث نواة المضيف، ودقّق ملفات الإعداد بانتظام. ضع الأحمال غير الموثوقة والمواجهة للإنترنت في أجهزة افتراضية. بعد ذلك تعلّم كيف تمنع الضيوف من التحدث بعضهم مع بعض في [العزل الشبكي بين الأجهزة الافتراضية](/learn/systems-infrastructure-security/vm-to-vm-network-isolation)."
+   }
+  ]
+ }
+}

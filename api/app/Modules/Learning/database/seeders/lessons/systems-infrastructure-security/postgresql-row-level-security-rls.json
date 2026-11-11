@@ -1,0 +1,536 @@
+{
+ "slug": "postgresql-row-level-security-rls",
+ "title": "PostgreSQL Row-Level Security (RLS)",
+ "summary": "Enable PostgreSQL row-level security, write tenant isolation policies, avoid bypass traps and test the result.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Explain how RLS policies filter rows with USING and WITH CHECK",
+  "Write a tenant isolation policy and bind the tenant per transaction",
+  "Identify roles and views that bypass RLS",
+  "Test, inventory and monitor RLS in production"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A multi-tenant application stores every customer's invoices in one table. Every query in the code is supposed to include `WHERE tenant_id = ...`. One developer forgets it in a new report endpoint. For a week, any logged-in user who opens that report sees invoices from all customers. Nothing was hacked; a single missing condition was enough.\n\nGrants control access to a whole table. They cannot say \"this user may read only their own rows\". PostgreSQL Row-Level Security (RLS) can. It attaches policies to a table so the database itself filters rows for every query, whatever the application code says. In this lesson you will enable RLS, write policies for a multi-tenant table, avoid the traps that quietly switch it off, and test it."
+  },
+  {
+   "id": "how",
+   "type": "text",
+   "markdown": "## How RLS works\n\nRLS adds a hidden filter to every statement that touches a table. You turn it on per table, then create **policies**. Each policy has a command it applies to (`SELECT`, `INSERT`, `UPDATE`, `DELETE` or `ALL`), a role list, and up to two expressions:\n\n- **`USING`** decides which existing rows are visible or can be updated or deleted.\n- **`WITH CHECK`** decides which new or changed rows are allowed to be written.\n\nPolicies of the same kind are combined with OR by default, and a restrictive policy is combined with AND. If RLS is enabled and no policy matches, the answer is **deny**: the user sees zero rows. That default-deny behavior is what makes RLS a sound security control rather than a convenience.\n\nTwo roles bypass RLS unless you say otherwise: superusers and roles with the `BYPASSRLS` attribute. The **table owner** bypasses it too, unless you run `ALTER TABLE ... FORCE ROW LEVEL SECURITY`. Forgetting these facts is the main reason RLS appears to \"not work\" in tests."
+  },
+  {
+   "id": "rls-flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A query passing through row-level security",
+   "caption": "The same SQL returns different rows depending on the tenant bound to the session.",
+   "data": {
+    "token": "Query",
+    "nodes": [
+     {
+      "id": "app",
+      "label": "Application",
+      "sub": "role web_app",
+      "icon": "server"
+     },
+     {
+      "id": "pol",
+      "label": "RLS policy",
+      "sub": "tenant_isolation",
+      "icon": "shield"
+     },
+     {
+      "id": "tbl",
+      "label": "invoices table",
+      "sub": "3 tenants",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "at": "app",
+      "caption": "The app opens a transaction and sets app.tenant_id = 42 for the session."
+     },
+     {
+      "at": "app",
+      "caption": "It runs SELECT * FROM invoices with no WHERE clause (a developer slip).",
+      "tone": "warning"
+     },
+     {
+      "at": "pol",
+      "caption": "PostgreSQL appends the USING expression: tenant_id = current_setting('app.tenant_id')::int.",
+      "tone": "secure"
+     },
+     {
+      "at": "tbl",
+      "caption": "Only tenant 42's rows qualify. The other tenants' rows are invisible.",
+      "tone": "success"
+     },
+     {
+      "at": "pol",
+      "caption": "An INSERT with tenant_id = 7 fails the WITH CHECK expression.",
+      "tone": "blocked"
+     },
+     {
+      "at": "app",
+      "caption": "The application gets the error, and the attempt is logged.",
+      "tone": "danger"
+     }
+    ]
+   }
+  },
+  {
+   "id": "build",
+   "type": "text",
+   "markdown": "## Step 1: Enable RLS and write policies\n\nThe pattern for a multi-tenant table has four parts. Store a tenant identifier on every row. Have the application bind the current tenant to the session after authenticating the user. Write one policy that compares the two. Enable RLS and, if the application ever connects as the table owner, force it.\n\nThe session binding uses a custom setting such as `app.tenant_id`. Use `SET LOCAL` inside a transaction, so the value is discarded at commit. This matters with connection pooling: a plain `SET` on a pooled connection can leak one tenant's context into the next request. Good pooling configuration is just as important as the policy itself.\n\nAlso keep the application role away from privileges that bypass the system. The application login should not own the table, should not be a superuser and should not have `BYPASSRLS`. This follows the separation of the migrator and the app from [Database Least-Privilege Access](/learn/systems-infrastructure-security/database-least-privilege-access)."
+  },
+  {
+   "id": "rlssql",
+   "type": "code",
+   "language": "sql",
+   "filename": "rls-tenant-isolation.sql",
+   "caption": "Row-level security for a multi-tenant invoices table (PostgreSQL 16, lab).",
+   "code": "CREATE TABLE app.invoices (\n  id         bigserial PRIMARY KEY,\n  tenant_id  integer NOT NULL,\n  amount     numeric(12,2) NOT NULL,\n  owner_note text\n);\n\nALTER TABLE app.invoices ENABLE ROW LEVEL SECURITY;\nALTER TABLE app.invoices FORCE  ROW LEVEL SECURITY;   -- applies to the owner too\n\nCREATE POLICY tenant_isolation ON app.invoices\n  AS PERMISSIVE FOR ALL TO app_rw\n  USING      (tenant_id = current_setting('app.tenant_id', true)::integer)\n  WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::integer);\n\n-- Support staff may read everything but not write\nCREATE POLICY support_read ON app.invoices\n  FOR SELECT TO support_ro USING (true);\n\n-- Application pattern, inside every request transaction:\n-- BEGIN;\n--   SET LOCAL app.tenant_id = '42';\n--   SELECT ... ;\n-- COMMIT;",
+   "highlight": [
+    8,
+    9,
+    11,
+    12,
+    13,
+    14,
+    17
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Policies fail open in three common ways",
+   "markdown": "RLS is bypassed by superusers, by `BYPASSRLS` roles and by the table owner unless you use `FORCE`. Views run with the view owner's rights by default, so a view over a protected table can expose rows; create it with `security_invoker = true` (PostgreSQL 15 and later). Also, `current_setting(..., true)` returns NULL when the setting is missing, which makes the comparison NULL and the row invisible, so an unset tenant fails closed."
+  },
+  {
+   "id": "test",
+   "type": "text",
+   "markdown": "## Step 2: Test it like an attacker would\n\nA policy you have not tested is a guess. Test from the application role, not from the owner, and cover four cases: the correct tenant reads its rows, a missing tenant setting reads nothing, writing to another tenant's id is rejected, and a role with `BYPASSRLS` sees everything (so you know who holds that power).\n\nUse `EXPLAIN` to see the policy applied. The planner adds the policy expression as a filter, which also affects performance. Index the column used in the policy, usually `tenant_id`, as the first column of composite indexes. A subquery inside a policy runs for every row and can slow a large table sharply, so prefer simple column comparisons and keep lookups out of policies.\n\nA final caution: RLS controls rows, not information leaks through side channels. Error messages, unique constraint violations and aggregate statistics can disclose that a hidden row exists. For high-sensitivity data combine RLS with the encryption options in [Encryption at Rest and in Transit](/learn/systems-infrastructure-security/encryption-at-rest-and-in-transit)."
+  },
+  {
+   "id": "rls-term",
+   "type": "terminal",
+   "title": "Testing RLS (lab database)",
+   "lines": [
+    {
+     "cmd": "psql -U web_app -d appdb -c \"SELECT count(*) FROM app.invoices;\"",
+     "output": " count\n-------\n     0\n(1 row)",
+     "comment": "No tenant is bound, so the policy matches nothing: fail closed."
+    },
+    {
+     "cmd": "psql -U web_app -d appdb -c \"BEGIN; SET LOCAL app.tenant_id='42'; SELECT tenant_id, count(*) FROM app.invoices GROUP BY 1; COMMIT;\"",
+     "output": " tenant_id | count\n-----------+-------\n        42 |    18\n(1 row)",
+     "comment": "Only tenant 42 is visible even without a WHERE clause."
+    },
+    {
+     "cmd": "psql -U web_app -d appdb -c \"BEGIN; SET LOCAL app.tenant_id='42'; INSERT INTO app.invoices(tenant_id, amount) VALUES (7, 10.00); ROLLBACK;\"",
+     "output": "ERROR:  new row violates row-level security policy for table \"invoices\"",
+     "comment": "WITH CHECK blocks writing into another tenant."
+    },
+    {
+     "cmd": "psql -U postgres -d appdb -c \"SELECT rolname FROM pg_roles WHERE rolbypassrls;\"",
+     "output": " rolname\n----------\n postgres\n(1 row)",
+     "comment": "Only the superuser bypasses RLS. Any other name here needs justification."
+    }
+   ],
+   "caption": "Example output; counts are illustrative."
+  },
+  {
+   "id": "ops",
+   "type": "text",
+   "markdown": "## Step 3: Operate RLS in production\n\nRLS is a long-term commitment. Treat it as part of your schema.\n\n- **Review policies in code review.** Keep `CREATE POLICY` statements in migrations, and have a second person read them.\n- **Inventory protected tables.** Query `pg_policies` and `pg_class.relrowsecurity` regularly. A new table with a `tenant_id` column but no RLS is a finding.\n- **Limit bypass.** Keep `BYPASSRLS` for backup and migration roles only. Dumps taken without it silently omit hidden rows, so a backup role must have it, and that role must be tightly controlled.\n- **Log policy violations.** Failed writes appear as errors in the server log. Forward them to monitoring, as described in [Database Auditing and Activity Logging](/learn/systems-infrastructure-security/database-auditing-and-activity-logging).\n- **Keep a second layer.** Application checks, least-privilege grants and RLS together mean one mistake is not fatal.\n\nWhen RLS is a poor fit, such as complex hierarchical sharing rules that change constantly, use views with `security_barrier`, separate schemas per tenant, or separate databases. RLS shines when isolation is by a simple key."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. In a lab PostgreSQL 15+ instance **you own**, create `app.invoices`, insert rows for tenants 1, 2 and 3, enable and force RLS, and create the `tenant_isolation` policy for the `app_rw` role.\n2. As a member of `app_rw`, run `SELECT count(*)` with no setting, then with `SET LOCAL app.tenant_id` inside a transaction for each tenant.\n3. Try an `INSERT` with the wrong `tenant_id` and read the error. Temporarily remove `FORCE` and connect as the owner to see the bypass, then restore it.\n4. List all tables that have a `tenant_id` column but `relrowsecurity = false` using `pg_class` and `information_schema.columns`."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Row-Level Security (RLS)",
+     "definition": "Database-enforced filtering of rows per query based on policies."
+    },
+    {
+     "term": "Policy",
+     "definition": "A rule attached to a table that defines which rows a role may see or change."
+    },
+    {
+     "term": "USING",
+     "definition": "Expression that decides which existing rows are visible or modifiable."
+    },
+    {
+     "term": "WITH CHECK",
+     "definition": "Expression that decides which new or changed rows may be written."
+    },
+    {
+     "term": "FORCE ROW LEVEL SECURITY",
+     "definition": "Makes RLS apply to the table owner as well."
+    },
+    {
+     "term": "BYPASSRLS",
+     "definition": "A role attribute that skips all row-level policies."
+    },
+    {
+     "term": "Multi-tenancy",
+     "definition": "Serving many customers from shared tables with isolation between them."
+    },
+    {
+     "term": "security_invoker",
+     "definition": "View option that runs the view with the caller's rights, preserving RLS."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What happens when RLS is enabled on a table and no policy matches the user?",
+     "options": [
+      "All rows are visible",
+      "No rows are visible (default deny)",
+      "The table is dropped",
+      "The user becomes superuser"
+     ],
+     "answer": 1,
+     "explanation": "With RLS on, access requires a matching policy; otherwise nothing is returned."
+    },
+    {
+     "question": "Which expression stops a user from inserting a row for another tenant?",
+     "options": [
+      "USING",
+      "WITH CHECK",
+      "FORCE",
+      "SET LOCAL"
+     ],
+     "answer": 1,
+     "explanation": "WITH CHECK validates rows being written; USING filters rows being read or targeted."
+    },
+    {
+     "question": "Which roles bypass RLS unless FORCE is used or the attribute is absent? Choose all that apply.",
+     "options": [
+      "Superusers",
+      "The table owner",
+      "Roles with BYPASSRLS",
+      "A normal member of app_rw"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Superusers and BYPASSRLS roles always bypass; owners bypass unless the table is forced."
+    },
+    {
+     "question": "Why use SET LOCAL instead of SET for the tenant setting with a connection pool?",
+     "options": [
+      "It is faster",
+      "The value is discarded at transaction end, so it cannot leak to the next request",
+      "It disables RLS",
+      "It encrypts the value"
+     ],
+     "answer": 1,
+     "explanation": "A session-level SET persists on the pooled connection and could apply to another tenant."
+    },
+    {
+     "question": "Why create a view over a protected table with security_invoker = true?",
+     "options": [
+      "So the view runs with the caller's rights and RLS still applies",
+      "To make the view faster",
+      "To hide the table name",
+      "To allow DDL"
+     ],
+     "answer": 0,
+     "explanation": "Otherwise the view uses its owner's rights, which can bypass the policy."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- RLS lets PostgreSQL filter rows per query using policies, so a forgotten `WHERE` clause no longer leaks data.\n- `USING` governs which rows are visible; `WITH CHECK` governs which rows may be written. No matching policy means no rows.\n- Superusers, `BYPASSRLS` roles and (without `FORCE`) the table owner skip policies. Views need `security_invoker = true`.\n- Bind the tenant with `SET LOCAL` inside a transaction, and keep the app role non-owner and non-privileged.\n- Test from the app role, index the policy column, inventory tables with and without RLS, and log violations.\n\nFinally, learn to record who did what in [Database Auditing and Activity Logging](/learn/systems-infrastructure-security/database-auditing-and-activity-logging)."
+  }
+ ],
+ "ar": {
+  "title": "الأمن على مستوى الصفوف (RLS) في PostgreSQL",
+  "summary": "فعّل الأمن على مستوى الصفوف في PostgreSQL، واكتب سياسات عزل المستأجرين، وتجنب مطبات التجاوز، واختبر النتيجة.",
+  "objectives": [
+   "شرح كيف ترشّح سياسات RLS الصفوف بـ USING وWITH CHECK",
+   "كتابة سياسة عزل مستأجرين وربط المستأجر لكل معاملة",
+   "تحديد الأدوار والعروض التي تتجاوز RLS",
+   "اختبار RLS وجرده ومراقبته في الإنتاج"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يخزن تطبيق متعدد المستأجرين فواتير كل العملاء في جدول واحد. يُفترض أن يتضمن كل استعلام في الشيفرة `WHERE tenant_id = ...`. ينساه مطوّر في نقطة تقرير جديدة. ولمدة أسبوع يرى أي مستخدم مسجَّل يفتح التقرير فواتير كل العملاء. لم يخترق أحد شيئًا؛ كفى شرط واحد ناقص.\n\nتتحكم المنح (Grants) بالوصول إلى جدول كامل، ولا تستطيع القول «يقرأ هذا المستخدم صفوفه فقط». أما الأمن على مستوى الصفوف (Row-Level Security) في PostgreSQL فيستطيع. فهو يربط سياسات بالجدول لتُرشّح قاعدة البيانات نفسها الصفوف في كل استعلام، مهما قالت شيفرة التطبيق. في هذا الدرس ستفعّل RLS، وتكتب سياسات لجدول متعدد المستأجرين، وتتجنب المطبات التي تعطّلها بصمت، وتختبرها."
+   },
+   {
+    "id": "how",
+    "type": "text",
+    "markdown": "## كيف يعمل RLS\n\nيضيف RLS مرشِّحًا خفيًّا إلى كل عبارة تمس الجدول. تفعّله لكل جدول ثم تنشئ **سياسات**. لكل سياسة أمر تنطبق عليه (`SELECT` أو `INSERT` أو `UPDATE` أو `DELETE` أو `ALL`) وقائمة أدوار وتعبيران على الأكثر:\n\n- **`USING`** يحدد أي الصفوف الموجودة مرئية أو يمكن تحديثها أو حذفها.\n- **`WITH CHECK`** يحدد أي الصفوف الجديدة أو المعدّلة يُسمح بكتابتها.\n\nتُجمع السياسات من النوع نفسه افتراضيًّا بـ OR، وتُجمع السياسة المقيِّدة (restrictive) بـ AND. وإن كان RLS مفعّلًا ولم تطابق أي سياسة فالجواب **رفض**: يرى المستخدم صفر صف. هذا السلوك الافتراضي بالرفض هو ما يجعل RLS ضابط أمن متينًا لا مجرد راحة.\n\nيتجاوز RLS دوران ما لم تقل غير ذلك: المستخدمون المتفوقون والأدوار ذات الخاصية `BYPASSRLS`. و**مالك الجدول** يتجاوزه أيضًا ما لم تنفّذ `ALTER TABLE ... FORCE ROW LEVEL SECURITY`. ونسيان هذه الحقائق هو السبب الرئيسي لظهور RLS «لا يعمل» في الاختبارات."
+   },
+   {
+    "id": "rls-flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "استعلام يمر عبر الأمن على مستوى الصفوف",
+    "caption": "يعيد SQL نفسه صفوفًا مختلفة بحسب المستأجر المرتبط بالجلسة.",
+    "data": {
+     "token": "استعلام",
+     "nodes": [
+      {
+       "id": "app",
+       "label": "التطبيق",
+       "sub": "role web_app",
+       "icon": "server"
+      },
+      {
+       "id": "pol",
+       "label": "سياسة RLS",
+       "sub": "tenant_isolation",
+       "icon": "shield"
+      },
+      {
+       "id": "tbl",
+       "label": "جدول الفواتير",
+       "sub": "3 tenants",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "at": "app",
+       "caption": "يفتح التطبيق معاملة ويضبط app.tenant_id = 42 للجلسة."
+      },
+      {
+       "at": "app",
+       "caption": "ينفّذ SELECT * FROM invoices بلا شرط WHERE (زلة مطوّر).",
+       "tone": "warning"
+      },
+      {
+       "at": "pol",
+       "caption": "يضيف PostgreSQL تعبير USING: tenant_id = current_setting('app.tenant_id')::int.",
+       "tone": "secure"
+      },
+      {
+       "at": "tbl",
+       "caption": "تتأهل صفوف المستأجر 42 فقط. وصفوف بقية المستأجرين غير مرئية.",
+       "tone": "success"
+      },
+      {
+       "at": "pol",
+       "caption": "يفشل INSERT بقيمة tenant_id = 7 في تعبير WITH CHECK.",
+       "tone": "blocked"
+      },
+      {
+       "at": "app",
+       "caption": "يتلقى التطبيق الخطأ وتُسجَّل المحاولة.",
+       "tone": "danger"
+      }
+     ]
+    }
+   },
+   {
+    "id": "build",
+    "type": "text",
+    "markdown": "## الخطوة 1: فعّل RLS واكتب السياسات\n\nلنمط الجدول متعدد المستأجرين أربعة أجزاء. خزّن معرّف المستأجر في كل صف. ودع التطبيق يربط المستأجر الحالي بالجلسة بعد مصادقة المستخدم. واكتب سياسة واحدة تقارن بينهما. ثم فعّل RLS وأجبره إن كان التطبيق يتصل يومًا بصفة مالك الجدول.\n\nيستخدم ربط الجلسة إعدادًا مخصصًا مثل `app.tenant_id`. استخدم `SET LOCAL` داخل معاملة لتُهمل القيمة عند الإنهاء. وهذا مهم مع تجميع الاتصالات: فـ `SET` العادي على اتصال مجمَّع قد يسرّب سياق مستأجر إلى الطلب التالي. وضبط التجميع الجيد لا يقل أهمية عن السياسة نفسها.\n\nوأبقِ حساب التطبيق بعيدًا عن امتيازات تتجاوز النظام. ينبغي ألا يملك دخول التطبيق الجدول، وألا يكون مستخدمًا متفوقًا، وألا يحمل `BYPASSRLS`. وهذا يتبع فصل أداة الترحيل عن التطبيق في [الوصول بأقل الامتيازات إلى قواعد البيانات](/learn/systems-infrastructure-security/database-least-privilege-access)."
+   },
+   {
+    "id": "rlssql",
+    "type": "code",
+    "language": "sql",
+    "filename": "rls-tenant-isolation.sql",
+    "caption": "الأمن على مستوى الصفوف لجدول فواتير متعدد المستأجرين (PostgreSQL 16، مخبري).",
+    "code": "CREATE TABLE app.invoices (\n  id         bigserial PRIMARY KEY,\n  tenant_id  integer NOT NULL,\n  amount     numeric(12,2) NOT NULL,\n  owner_note text\n);\n\nALTER TABLE app.invoices ENABLE ROW LEVEL SECURITY;\nALTER TABLE app.invoices FORCE  ROW LEVEL SECURITY;   -- applies to the owner too\n\nCREATE POLICY tenant_isolation ON app.invoices\n  AS PERMISSIVE FOR ALL TO app_rw\n  USING      (tenant_id = current_setting('app.tenant_id', true)::integer)\n  WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::integer);\n\n-- Support staff may read everything but not write\nCREATE POLICY support_read ON app.invoices\n  FOR SELECT TO support_ro USING (true);\n\n-- Application pattern, inside every request transaction:\n-- BEGIN;\n--   SET LOCAL app.tenant_id = '42';\n--   SELECT ... ;\n-- COMMIT;",
+    "highlight": [
+     8,
+     9,
+     11,
+     12,
+     13,
+     14,
+     17
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "تفشل السياسات مفتوحة بثلاث طرق شائعة",
+    "markdown": "يتجاوز RLS المستخدمون المتفوقون والأدوار ذات `BYPASSRLS` ومالك الجدول ما لم تستخدم `FORCE`. وتعمل العروض افتراضيًّا بحقوق مالك العرض، فقد يكشف عرض فوق جدول محمي صفوفًا؛ أنشئه بالخيار `security_invoker = true` (PostgreSQL 15 وما بعده). كما أن `current_setting(..., true)` تعيد NULL عند غياب الإعداد، فتصبح المقارنة NULL ويختفي الصف، فيفشل المستأجر غير المضبوط مغلقًا."
+   },
+   {
+    "id": "test",
+    "type": "text",
+    "markdown": "## الخطوة 2: اختبرها كما يفعل المهاجم\n\nسياسة لم تختبرها تخمين. اختبر من دور التطبيق لا من المالك، وغطِّ أربع حالات: المستأجر الصحيح يقرأ صفوفه، وغياب إعداد المستأجر لا يقرأ شيئًا، وكتابة معرّف مستأجر آخر مرفوضة، ودور ذو `BYPASSRLS` يرى كل شيء (لتعرف من يملك هذه القوة).\n\nاستخدم `EXPLAIN` لترى السياسة مطبّقة. يضيف المخطِّط تعبير السياسة مرشِّحًا، وهذا يؤثر في الأداء أيضًا. فهرس العمود المستخدم في السياسة، وهو عادةً `tenant_id`، واجعله العمود الأول في الفهارس المركّبة. أما الاستعلام الفرعي داخل السياسة فيُنفَّذ لكل صف وقد يبطّئ جدولًا كبيرًا بشدة، فالأفضل مقارنات الأعمدة البسيطة وإبعاد عمليات البحث عن السياسات.\n\nوتنبيه أخير: يتحكم RLS بالصفوف لا بتسرب المعلومات عبر القنوات الجانبية. فقد تكشف رسائل الأخطاء وانتهاكات القيود الفريدة والإحصاءات التجميعية وجود صف مخفي. وللبيانات عالية الحساسية اجمع RLS مع خيارات التشفير في [تشفير البيانات المخزنة والمنقولة](/learn/systems-infrastructure-security/encryption-at-rest-and-in-transit)."
+   },
+   {
+    "id": "rls-term",
+    "type": "terminal",
+    "title": "اختبار RLS (قاعدة مخبرية)",
+    "lines": [
+     {
+      "cmd": "psql -U web_app -d appdb -c \"SELECT count(*) FROM app.invoices;\"",
+      "output": " count\n-------\n     0\n(1 row)",
+      "comment": "لا مستأجر مرتبط، فلا تطابق السياسة شيئًا: الفشل مغلق."
+     },
+     {
+      "cmd": "psql -U web_app -d appdb -c \"BEGIN; SET LOCAL app.tenant_id='42'; SELECT tenant_id, count(*) FROM app.invoices GROUP BY 1; COMMIT;\"",
+      "output": " tenant_id | count\n-----------+-------\n        42 |    18\n(1 row)",
+      "comment": "يظهر المستأجر 42 فقط حتى دون WHERE."
+     },
+     {
+      "cmd": "psql -U web_app -d appdb -c \"BEGIN; SET LOCAL app.tenant_id='42'; INSERT INTO app.invoices(tenant_id, amount) VALUES (7, 10.00); ROLLBACK;\"",
+      "output": "ERROR:  new row violates row-level security policy for table \"invoices\"",
+      "comment": "يمنع WITH CHECK الكتابة في مستأجر آخر."
+     },
+     {
+      "cmd": "psql -U postgres -d appdb -c \"SELECT rolname FROM pg_roles WHERE rolbypassrls;\"",
+      "output": " rolname\n----------\n postgres\n(1 row)",
+      "comment": "المستخدم المتفوق وحده يتجاوز RLS. أي اسم آخر هنا يحتاج مسوّغًا."
+     }
+    ],
+    "caption": "مخرجات مثال؛ الأعداد توضيحية."
+   },
+   {
+    "id": "ops",
+    "type": "text",
+    "markdown": "## الخطوة 3: شغّل RLS في الإنتاج\n\nRLS التزام طويل الأمد. عامله جزءًا من مخططك.\n\n- **راجع السياسات في مراجعة الشيفرة.** أبقِ عبارات `CREATE POLICY` في ملفات الترحيل واجعل شخصًا ثانيًا يقرؤها.\n- **جرد الجداول المحمية.** استعلم عن `pg_policies` و`pg_class.relrowsecurity` دوريًّا. فجدول جديد فيه عمود `tenant_id` بلا RLS يُعد ملاحظة.\n- **قيّد التجاوز.** اترك `BYPASSRLS` لأدوار النسخ الاحتياطي والترحيل فقط. التفريغات المأخوذة بدونه تُسقط الصفوف المخفية بصمت، فلا بد أن يملكه دور النسخ الاحتياطي، وأن يُضبط ضبطًا شديدًا.\n- **سجّل انتهاكات السياسة.** تظهر الكتابات الفاشلة أخطاءً في سجل الخادم. أرسلها إلى المراقبة كما في [تدقيق قواعد البيانات وتسجيل النشاط](/learn/systems-infrastructure-security/database-auditing-and-activity-logging).\n- **أبقِ طبقة ثانية.** فتجتمع فحوص التطبيق ومنح أقل الامتيازات وRLS فلا يكون خطأ واحد قاتلًا.\n\nوحين لا يناسب RLS، كقواعد المشاركة الهرمية المعقدة المتغيرة باستمرار، استخدم عروضًا بالخيار `security_barrier` أو مخططات منفصلة لكل مستأجر أو قواعد بيانات منفصلة. يتألق RLS حين يكون العزل بمفتاح بسيط."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. في نسخة PostgreSQL 15+ مخبرية **تملكها**، أنشئ `app.invoices` وأدخل صفوفًا للمستأجرين 1 و2 و3، وفعّل RLS وأجبره، وأنشئ سياسة `tenant_isolation` للدور `app_rw`.\n2. بصفة عضو في `app_rw` شغّل `SELECT count(*)` دون إعداد، ثم مع `SET LOCAL app.tenant_id` داخل معاملة لكل مستأجر.\n3. جرّب `INSERT` بـ `tenant_id` خاطئ واقرأ الخطأ. أزل `FORCE` مؤقتًا واتصل بصفة المالك لترى التجاوز، ثم أعده.\n4. اسرد كل الجداول التي فيها عمود `tenant_id` و`relrowsecurity = false` باستخدام `pg_class` و`information_schema.columns`."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "الأمن على مستوى الصفوف",
+      "definition": "ترشيح الصفوف في كل استعلام بتطبيق قاعدة البيانات استنادًا إلى سياسات."
+     },
+     {
+      "term": "السياسة",
+      "definition": "قاعدة مرتبطة بجدول تحدد أي الصفوف يراها دور أو يغيرها."
+     },
+     {
+      "term": "USING",
+      "definition": "تعبير يحدد أي الصفوف الموجودة مرئية أو قابلة للتعديل."
+     },
+     {
+      "term": "WITH CHECK",
+      "definition": "تعبير يحدد أي الصفوف الجديدة أو المعدّلة يجوز كتابتها."
+     },
+     {
+      "term": "FORCE ROW LEVEL SECURITY",
+      "definition": "يجعل RLS ينطبق على مالك الجدول أيضًا."
+     },
+     {
+      "term": "BYPASSRLS",
+      "definition": "خاصية دور تتخطى كل سياسات الصفوف."
+     },
+     {
+      "term": "تعدد المستأجرين",
+      "definition": "خدمة عملاء كثر من جداول مشتركة مع عزل بينهم."
+     },
+     {
+      "term": "security_invoker",
+      "definition": "خيار للعرض يشغّله بحقوق المستدعي فيحفظ RLS."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ماذا يحدث حين يُفعَّل RLS على جدول ولا تطابق أي سياسة المستخدم؟",
+      "options": [
+       "كل الصفوف مرئية",
+       "لا صفوف مرئية (رفض افتراضي)",
+       "يُحذف الجدول",
+       "يصير المستخدم متفوقًا"
+      ],
+      "answer": 1,
+      "explanation": "مع تفعيل RLS يتطلب الوصول سياسة مطابقة وإلا لا يُعاد شيء."
+     },
+     {
+      "question": "أي تعبير يمنع المستخدم من إدخال صف لمستأجر آخر؟",
+      "options": [
+       "USING",
+       "WITH CHECK",
+       "FORCE",
+       "SET LOCAL"
+      ],
+      "answer": 1,
+      "explanation": "يتحقق WITH CHECK من الصفوف المكتوبة؛ ويرشّح USING الصفوف المقروءة أو المستهدفة."
+     },
+     {
+      "question": "أي الأدوار تتجاوز RLS ما لم يُستخدم FORCE أو تغب الخاصية؟ اختر كل ما ينطبق.",
+      "options": [
+       "المستخدمون المتفوقون",
+       "مالك الجدول",
+       "الأدوار ذات BYPASSRLS",
+       "عضو عادي في app_rw"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يتجاوز المتفوقون وأدوار BYPASSRLS دائمًا؛ ويتجاوز المالك ما لم يُجبَر الجدول."
+     },
+     {
+      "question": "لماذا يُستخدم SET LOCAL بدل SET لإعداد المستأجر مع مجمّع اتصالات؟",
+      "options": [
+       "أسرع",
+       "تُهمل القيمة عند نهاية المعاملة فلا تتسرب إلى الطلب التالي",
+       "يعطّل RLS",
+       "يشفّر القيمة"
+      ],
+      "answer": 1,
+      "explanation": "يبقى SET على مستوى الجلسة في الاتصال المجمَّع وقد ينطبق على مستأجر آخر."
+     },
+     {
+      "question": "لماذا يُنشأ عرض فوق جدول محمي بـ security_invoker = true؟",
+      "options": [
+       "ليعمل العرض بحقوق المستدعي فيبقى RLS مطبَّقًا",
+       "ليكون العرض أسرع",
+       "لإخفاء اسم الجدول",
+       "للسماح بـ DDL"
+      ],
+      "answer": 0,
+      "explanation": "وإلا استخدم العرض حقوق مالكه، وقد تتجاوز السياسة."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يتيح RLS لـ PostgreSQL ترشيح الصفوف في كل استعلام بالسياسات، فلا يسرّب شرط `WHERE` منسيّ البيانات.\n- يحكم `USING` أي الصفوف مرئية؛ ويحكم `WITH CHECK` أي الصفوف يجوز كتابتها. وعدم وجود سياسة مطابقة يعني عدم وجود صفوف.\n- يتخطى السياساتِ المستخدمون المتفوقون وأدوار `BYPASSRLS` ومالك الجدول (بلا `FORCE`). وتحتاج العروض إلى `security_invoker = true`.\n- اربط المستأجر بـ `SET LOCAL` داخل معاملة، وأبقِ دور التطبيق غير مالك وغير متميز.\n- اختبر من دور التطبيق، وفهرس عمود السياسة، وجرد الجداول التي فيها RLS وبدونه، وسجّل الانتهاكات.\n\nوأخيرًا تعلّم تسجيل من فعل ماذا في [تدقيق قواعد البيانات وتسجيل النشاط](/learn/systems-infrastructure-security/database-auditing-and-activity-logging)."
+   }
+  ]
+ }
+}

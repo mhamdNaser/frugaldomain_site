@@ -1,0 +1,582 @@
+{
+ "slug": "denial-of-service-dos-ddos-protection",
+ "title": "Denial-of-Service (DoS/DDoS) Protection",
+ "summary": "Understand how volumetric, protocol and application-layer floods work, then layer upstream scrubbing, kernel tuning, rate limits and a response runbook to keep your services available.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Classify a flood as volumetric, protocol or application-layer",
+  "Explain reflection and amplification and why spoofing makes them possible",
+  "Tune Linux kernel and Nginx settings that blunt common floods",
+  "Build a layered defense and a response runbook for an attack in progress"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "On a Tuesday afternoon a company's online ordering site becomes unreachable. The servers are healthy and the application has no bugs. The problem is that something is consuming everything the site has: its bandwidth, its connection table or its worker processes. Real customers simply cannot get in.\n\nThat is a **denial-of-service (DoS)** attack. When the traffic comes from thousands of compromised machines at once, it is a **distributed denial-of-service (DDoS)** attack. The goal is never to steal data. It is to make a service unavailable, which attacks the *availability* part of the CIA triad. Because no single device can absorb a large flood alone, defense is about **layers**: some controls sit at your provider, some at your edge, and some on the server itself."
+  },
+  {
+   "id": "types",
+   "type": "text",
+   "markdown": "## Step 1: Classify the attack\n\nYou cannot pick the right control until you know which resource is being exhausted.\n\n| Category | Resource exhausted | Examples | Typical size |\n|:--|:--|:--|:--|\n| Volumetric | Bandwidth | UDP floods, DNS and NTP amplification | Gigabits per second |\n| Protocol | State tables, CPU on firewalls and servers | SYN flood, fragment floods | Millions of packets per second |\n| Application layer | Workers, database, memory | HTTP request floods, slow connections (Slowloris) | Often small and hard to see |\n\nApplication-layer attacks are the most subtle. A few thousand legitimate-looking requests for an expensive search page can take down a site, while the total traffic looks tiny on a bandwidth graph.\n\n### Reflection and amplification\n\nIn a **reflection** attack the attacker sends a small request to a third-party server with the victim's address forged as the source. The server replies to the victim. In an **amplification** attack the reply is much larger than the request, so a tiny packet becomes a large one. Open DNS resolvers and misconfigured NTP or memcached servers are classic reflectors. This only works because networks allow **spoofed source addresses**, which is why anti-spoofing filters matter."
+  },
+  {
+   "id": "layers-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Layered DDoS defense",
+   "caption": "Each layer removes the traffic it is best able to recognize, so the origin server sees only clean requests.",
+   "data": {
+    "token": "Traffic",
+    "nodes": [
+     {
+      "id": "net",
+      "label": "Internet",
+      "sub": "botnet + customers",
+      "icon": "cloud"
+     },
+     {
+      "id": "scrub",
+      "label": "Scrubbing / CDN",
+      "sub": "absorb floods",
+      "icon": "shield"
+     },
+     {
+      "id": "edge",
+      "label": "Edge firewall",
+      "sub": "ACLs, rate limits",
+      "icon": "firewall"
+     },
+     {
+      "id": "lb",
+      "label": "Reverse proxy",
+      "sub": "limit_req, timeouts",
+      "icon": "router"
+     },
+     {
+      "id": "app",
+      "label": "Origin server",
+      "sub": "192.0.2.10",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "at": "net",
+      "caption": "A mix of real customers and attack traffic heads toward your public address."
+     },
+     {
+      "at": "scrub",
+      "caption": "Anycast capacity absorbs the volumetric flood and drops known-bad sources before it reaches your link.",
+      "tone": "blocked"
+     },
+     {
+      "at": "edge",
+      "caption": "The edge firewall drops spoofed and unwanted protocols and limits new connections per source.",
+      "tone": "blocked"
+     },
+     {
+      "at": "lb",
+      "caption": "The reverse proxy rate-limits requests per client and closes slow connections.",
+      "tone": "secure"
+     },
+     {
+      "at": "app",
+      "caption": "Only legitimate requests arrive. The service stays available.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "host",
+   "type": "text",
+   "markdown": "## Step 2: Tune the server and the proxy\n\nUpstream protection handles size. Your own servers must still survive what gets through, and they must not fall over from a small flood. Two places matter most.\n\n### The kernel\n\nA **SYN flood** sends many connection requests and never completes the handshake, filling the table of half-open connections. **SYN cookies** let the kernel answer without storing state, so legitimate clients still connect. Reverse-path filtering (`rp_filter`) drops packets whose source address could not have arrived on that interface, which blocks many spoofed floods. Raise the connection tracking limit if your firewall uses it, but watch memory.\n\n### The web server\n\nMost application-layer floods succeed because the server waits too long for slow clients. Set short timeouts, and limit the request rate and concurrent connections per address. These limits protect against a single noisy source. Against thousands of sources you still need upstream filtering."
+  },
+  {
+   "id": "sysctl",
+   "type": "code",
+   "language": "ini",
+   "filename": "/etc/sysctl.d/90-ddos.conf",
+   "caption": "Kernel settings that blunt SYN floods and spoofed traffic. Apply with sysctl --system.",
+   "code": "# Answer SYNs with cookies when the backlog fills\nnet.ipv4.tcp_syncookies = 1\nnet.ipv4.tcp_max_syn_backlog = 4096\nnet.ipv4.tcp_synack_retries = 3\n\n# Drop packets with impossible source addresses\nnet.ipv4.conf.all.rp_filter = 1\nnet.ipv4.conf.default.rp_filter = 1\n\n# Do not answer broadcast pings (smurf-style reflection)\nnet.ipv4.icmp_echo_ignore_broadcasts = 1\n\n# Room for the connection tracking table\nnet.netfilter.nf_conntrack_max = 262144",
+   "highlight": [
+    2,
+    7,
+    11
+   ]
+  },
+  {
+   "id": "nginx",
+   "type": "code",
+   "language": "nginx",
+   "filename": "/etc/nginx/conf.d/limits.conf",
+   "caption": "Nginx limits per client address. The zones are defined at the http level, which conf.d files are included into.",
+   "code": "limit_req_zone  $binary_remote_addr zone=perip:10m rate=10r/s;\nlimit_conn_zone $binary_remote_addr zone=connip:10m;\n\nserver {\n    listen 443 ssl;\n    server_name shop.example.com;\n\n    limit_req  zone=perip burst=20 nodelay;\n    limit_req_status 429;\n    limit_conn connip 20;\n\n    client_header_timeout 10s;\n    client_body_timeout   10s;\n    send_timeout          10s;\n    keepalive_timeout     15s;\n    client_max_body_size  2m;\n}",
+   "highlight": [
+    1,
+    8,
+    10,
+    12
+   ]
+  },
+  {
+   "id": "diagnose",
+   "type": "terminal",
+   "title": "Recognizing a SYN flood on your own server",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "ss -s",
+     "output": "Total: 18452\nTCP:   17980 (estab 312, closed 211, orphaned 0, timewait 205)\n\nTransport Total     IP        IPv6\nTCP       17769     17701     68",
+     "comment": "Total TCP sockets are far above the 312 established ones. Something is leaving connections half-open."
+    },
+    {
+     "cmd": "ss -tan state syn-recv | wc -l",
+     "output": "17251",
+     "comment": "Seventeen thousand connections wait for the final ACK, a classic SYN flood signature."
+    },
+    {
+     "cmd": "sudo journalctl -k --since '10 min ago' | grep -i flood",
+     "output": "kernel: TCP: request_sock_TCP: Possible SYN flooding on port 443. Sending cookies. Check SNMP counters.",
+     "comment": "The kernel switched to SYN cookies, so the service is still answering real clients."
+    },
+    {
+     "cmd": "ss -tn state syn-recv | awk 'NR>1{split($4,a,\":\"); c[a[1]]++} END{for(i in c) print c[i], i}' | sort -rn | head -3",
+     "output": "412 198.51.100.7\n398 198.51.100.15\n377 198.51.100.21",
+     "comment": "The sources are spread out, which is typical of a distributed attack. Blocking single IPs will not be enough."
+    }
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Rate limits can hurt real users",
+   "markdown": "Many offices and mobile carriers share one public address through NAT, so hundreds of real users may look like a single client. Set limits from measured traffic, return `429` rather than silently dropping, allow-list your own monitoring and partners, and review the logs after every incident. Read [Network Address Translation Security](/learn/systems-infrastructure-security/network-address-translation-security) to see why per-address counting is imperfect."
+  },
+  {
+   "id": "runbook",
+   "type": "text",
+   "markdown": "## Step 3: Prepare a response runbook\n\nDecisions made during an attack are slow and error-prone, so write the plan beforehand.\n\n1. **Detect.** Alert on sudden jumps in packets per second, new connections, error rates and latency, and compare with a known baseline.\n2. **Confirm.** Distinguish an attack from a marketing campaign or a failed deployment. Check the top sources, user agents and requested URLs.\n3. **Engage upstream.** Keep your internet provider's emergency contact and your DDoS service details where the on-call engineer can find them. Switch traffic to scrubbing if you use an on-demand service.\n4. **Contain.** Add temporary filters for clear patterns, enable stricter rate limits, and serve a cached or static version of the site.\n5. **Communicate.** Update the status page and internal stakeholders.\n6. **Review.** After the attack, record what worked, tighten the weak layer and rehearse again.\n\nAlso reduce your **attack surface** in advance. Hide the origin address behind the CDN, expose only needed ports, put management interfaces on a private network such as the one designed in [Network Security Architecture](/learn/systems-infrastructure-security/network-security-architecture), and make sure expensive endpoints are cached or require authentication.\n\nFinally, test your plan. A scheduled exercise with your provider, using agreed traffic against a test address, shows whether the contacts answer, whether the filters engage and how long the switch to scrubbing takes. Never run such a test without the written approval of every network owner involved."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Stop being the reflector",
+   "markdown": "Your network can be a weapon against others. Apply **anti-spoofing** filters at your edge (BCP 38): drop outbound packets whose source is not one of your own prefixes and inbound packets claiming a private or your own address. Close open resolvers, disable unneeded UDP services and keep NTP and memcached off the internet. The DNS hardening in [DNS Security and DNS Filtering](/learn/systems-infrastructure-security/dns-security-and-dns-filtering) removes one of the biggest reflector sources."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use two virtual machines you own on an isolated lab network. Never generate load against systems that are not yours.\n\n1. On the server VM, install Nginx and add the `limits.conf` above, using `server_name localhost`. Run `sudo nginx -t` and reload.\n2. Apply the sysctl file with `sudo sysctl --system`, then confirm with `sysctl net.ipv4.tcp_syncookies`.\n3. From the client VM, send a modest burst with `ab -n 200 -c 20 https://<server-ip>/` (or `curl` in a loop).\n4. Count the `429` responses in `/var/log/nginx/access.log`.\n5. Raise `rate` and repeat. Observe how the thresholds change what a single client can do.\n6. Write a six-line runbook for this lab service following the steps above."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "DoS / DDoS",
+     "definition": "An attack that makes a service unavailable; DDoS uses many distributed sources."
+    },
+    {
+     "term": "Volumetric attack",
+     "definition": "A flood that saturates bandwidth."
+    },
+    {
+     "term": "SYN flood",
+     "definition": "Many half-open TCP connections that fill the connection table."
+    },
+    {
+     "term": "SYN cookies",
+     "definition": "A technique that answers SYNs without storing state until the handshake completes."
+    },
+    {
+     "term": "Amplification",
+     "definition": "A reflection attack where the reply is much larger than the request."
+    },
+    {
+     "term": "Reflection",
+     "definition": "Using a third-party server to send traffic to a spoofed victim address."
+    },
+    {
+     "term": "Rate limiting",
+     "definition": "Capping how many requests a client may make in a period."
+    },
+    {
+     "term": "Scrubbing center",
+     "definition": "A provider facility that filters attack traffic and forwards clean traffic."
+    },
+    {
+     "term": "BCP 38",
+     "definition": "Best practice for ingress filtering that prevents source address spoofing."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Thousands of slow HTTP requests exhaust a web server's workers while bandwidth stays low. What category is this?",
+     "options": [
+      "Volumetric",
+      "Application layer",
+      "Reflection",
+      "Spoofed ping"
+     ],
+     "answer": 1,
+     "explanation": "The scarce resource is server workers, not bandwidth, which marks an application-layer attack."
+    },
+    {
+     "question": "Which control lets a server keep accepting clients during a SYN flood?",
+     "options": [
+      "SYN cookies",
+      "A longer keepalive timeout",
+      "Disabling rp_filter",
+      "Allowing broadcast pings"
+     ],
+     "answer": 0,
+     "explanation": "SYN cookies avoid storing state for unfinished handshakes, so real clients still complete theirs."
+    },
+    {
+     "question": "Which are required for a reflection and amplification attack? Choose all that apply.",
+     "options": [
+      "A reflector that replies to unauthenticated requests",
+      "Spoofed source addresses",
+      "A reply larger than the request",
+      "Stolen administrator credentials"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The attack needs a willing reflector, a forged source to aim the reply, and an amplified response. Credentials are not involved."
+    },
+    {
+     "question": "What is the main weakness of per-IP rate limiting alone?",
+     "options": [
+      "It cannot stop an attack spread over thousands of sources",
+      "It uses too much disk space",
+      "It breaks TLS",
+      "It requires DNSSEC"
+     ],
+     "answer": 0,
+     "explanation": "Each source may stay under the limit while the total still overwhelms you. Upstream scrubbing is needed."
+    },
+    {
+     "question": "What does BCP 38 filtering do for your network?",
+     "options": [
+      "Drops packets with spoofed source addresses",
+      "Encrypts DNS queries",
+      "Caches web pages",
+      "Blocks all UDP"
+     ],
+     "answer": 0,
+     "explanation": "Ingress and egress filtering stop forged sources, which removes the foundation of reflection attacks."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- DoS attacks target **availability**. Classify them as volumetric, protocol or application layer to choose the right control.\n- Reflection and amplification depend on **spoofed sources** and open reflectors. Apply BCP 38 and close open services.\n- Defend in **layers**: upstream scrubbing or a CDN, edge filtering, a reverse proxy with limits, and a tuned server.\n- Enable **SYN cookies** and `rp_filter`, set short timeouts, and use per-client rate and connection limits carefully.\n- Write and rehearse a **runbook** with provider contacts and clear roles before the attack arrives.\n- Next, learn to see these attacks in [Network Traffic Analysis](/learn/systems-infrastructure-security/network-traffic-analysis)."
+  }
+ ],
+ "ar": {
+  "title": "الحماية من هجمات حجب الخدمة (DoS/DDoS)",
+  "summary": "افهم كيف تعمل هجمات الإغراق الحجمية وهجمات البروتوكول وهجمات طبقة التطبيق، ثم طبّق طبقات حماية تشمل التنقية من جهة المزوّد وضبط النواة وتحديد المعدل ودليل استجابة للحفاظ على توافر خدماتك.",
+  "objectives": [
+   "تصنيف الإغراق إلى حجمي أو بروتوكولي أو على طبقة التطبيق",
+   "شرح الانعكاس والتضخيم ولماذا يجعلهما انتحال العناوين ممكنين",
+   "ضبط إعدادات نواة Linux وNginx التي تخفف الإغراق الشائع",
+   "بناء دفاع متعدد الطبقات ودليل استجابة لهجوم جارٍ"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في ظهيرة يوم ثلاثاء يصبح موقع الطلبات الإلكتروني لإحدى الشركات غير متاح. الخوادم سليمة والتطبيق خالٍ من الأخطاء. المشكلة أن شيئًا ما يستهلك كل ما يملكه الموقع: عرض النطاق الترددي أو جدول الاتصالات أو عمليات المعالجة. والعملاء الحقيقيون ببساطة لا يستطيعون الدخول.\n\nهذا هو **هجوم حجب الخدمة (DoS)**. وعندما تأتي الحركة من آلاف الأجهزة المخترَقة في وقت واحد يصبح **هجوم حجب الخدمة الموزَّع (DDoS)**. هدف الهجوم ليس سرقة البيانات أبدًا، بل جعل الخدمة غير متاحة، أي أنه يستهدف ركن *التوافر* في ثالوث CIA. ولأن جهازًا واحدًا لا يستطيع امتصاص إغراق كبير بمفرده، فإن الدفاع قائم على **الطبقات**: بعض الضوابط عند المزوّد وبعضها عند حافة الشبكة وبعضها على الخادم نفسه."
+   },
+   {
+    "id": "types",
+    "type": "text",
+    "markdown": "## الخطوة 1: صنّف الهجوم\n\nلا تستطيع اختيار الضابط الصحيح قبل أن تعرف أي مورد يُستنزف.\n\n| الفئة | المورد المستنزَف | أمثلة | الحجم المعتاد |\n|:--|:--|:--|:--|\n| حجمي (Volumetric) | عرض النطاق الترددي | إغراق UDP وتضخيم DNS وNTP | غيغابت في الثانية |\n| بروتوكولي (Protocol) | جداول الحالة ومعالج الجدران النارية والخوادم | إغراق SYN وإغراق التجزئة | ملايين الحزم في الثانية |\n| طبقة التطبيق (Application layer) | عمليات المعالجة وقاعدة البيانات والذاكرة | إغراق طلبات HTTP والاتصالات البطيئة (Slowloris) | صغير غالبًا ويصعب رصده |\n\nهجمات طبقة التطبيق هي الأدق. فبضعة آلاف من الطلبات التي تبدو مشروعة لصفحة بحث مكلفة قد تُسقط موقعًا، بينما تبدو الحركة الإجمالية ضئيلة على مخطط عرض النطاق.\n\n### الانعكاس والتضخيم\n\nفي هجوم **الانعكاس (Reflection)** يرسل المهاجم طلبًا صغيرًا إلى خادم طرف ثالث مع تزوير عنوان الضحية كعنوان مصدر، فيرد الخادم على الضحية. وفي هجوم **التضخيم (Amplification)** تكون الإجابة أكبر بكثير من الطلب، فتتحول حزمة صغيرة إلى كبيرة. تُعد محلِّلات DNS المفتوحة وخوادم NTP وmemcached سيئة الإعداد عاكسات كلاسيكية. ولا ينجح ذلك إلا لأن الشبكات تسمح **بعناوين مصدر منتحلة**، ولهذا تهم مرشحات مكافحة الانتحال."
+   },
+   {
+    "id": "layers-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "الدفاع متعدد الطبقات ضد DDoS",
+    "caption": "تزيل كل طبقة الحركة التي تتقن التعرف عليها، فلا يرى الخادم الأصلي إلا الطلبات النظيفة.",
+    "data": {
+     "token": "الحركة",
+     "nodes": [
+      {
+       "id": "net",
+       "label": "الإنترنت",
+       "sub": "شبكة الروبوتات والعملاء",
+       "icon": "cloud"
+      },
+      {
+       "id": "scrub",
+       "label": "التنقية / CDN",
+       "sub": "امتصاص الإغراق",
+       "icon": "shield"
+      },
+      {
+       "id": "edge",
+       "label": "جدار الحافة",
+       "sub": "قوائم تحكم وتحديد معدل",
+       "icon": "firewall"
+      },
+      {
+       "id": "lb",
+       "label": "الوكيل العكسي",
+       "sub": "limit_req ومهلات",
+       "icon": "router"
+      },
+      {
+       "id": "app",
+       "label": "الخادم الأصلي",
+       "sub": "192.0.2.10",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "at": "net",
+       "caption": "يتجه خليط من العملاء الحقيقيين وحركة الهجوم نحو عنوانك العام."
+      },
+      {
+       "at": "scrub",
+       "caption": "تمتص سعة Anycast الإغراق الحجمي وتُسقط المصادر الخبيثة المعروفة قبل أن تصل إلى وصلتك.",
+       "tone": "blocked"
+      },
+      {
+       "at": "edge",
+       "caption": "يسقط جدار الحافة الحزم المنتحلة والبروتوكولات غير المطلوبة ويحدّ الاتصالات الجديدة لكل مصدر.",
+       "tone": "blocked"
+      },
+      {
+       "at": "lb",
+       "caption": "يحدّ الوكيل العكسي الطلبات لكل عميل ويغلق الاتصالات البطيئة.",
+       "tone": "secure"
+      },
+      {
+       "at": "app",
+       "caption": "تصل الطلبات المشروعة فقط وتبقى الخدمة متاحة.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "host",
+    "type": "text",
+    "markdown": "## الخطوة 2: اضبط الخادم والوكيل\n\nتتولى الحماية من جهة المزوّد مسألة الحجم. لكن خوادمك يجب أن تصمد أمام ما يتسرب، وألا تسقط من إغراق صغير. هناك موضعان أساسيان.\n\n### النواة\n\nيرسل **إغراق SYN** طلبات اتصال كثيرة ولا يكمل المصافحة أبدًا، فيملأ جدول الاتصالات نصف المفتوحة. تتيح **ملفات SYN (SYN cookies)** للنواة أن ترد دون تخزين حالة، فيظل العملاء المشروعون قادرين على الاتصال. ويُسقط **المرشح العكسي للمسار** (`rp_filter`) الحزم التي لا يمكن أن يصل عنوان مصدرها عبر تلك الواجهة، وهذا يمنع كثيرًا من الإغراق المنتحل. ارفع حد تتبع الاتصالات إن كان جدار الحماية يستخدمه، لكن راقب الذاكرة.\n\n### خادم الويب\n\nينجح أغلب إغراق طبقة التطبيق لأن الخادم ينتظر العملاء البطيئين طويلًا. اضبط مهلات قصيرة، وحدّ معدل الطلبات والاتصالات المتزامنة لكل عنوان. تحمي هذه الحدود من مصدر صاخب واحد، أما أمام آلاف المصادر فتبقى بحاجة إلى التصفية من جهة المزوّد."
+   },
+   {
+    "id": "sysctl",
+    "type": "code",
+    "language": "ini",
+    "filename": "/etc/sysctl.d/90-ddos.conf",
+    "caption": "إعدادات نواة تخفف إغراق SYN والحركة المنتحلة. طبّقها بالأمر sysctl --system.",
+    "code": "# Answer SYNs with cookies when the backlog fills\nnet.ipv4.tcp_syncookies = 1\nnet.ipv4.tcp_max_syn_backlog = 4096\nnet.ipv4.tcp_synack_retries = 3\n\n# Drop packets with impossible source addresses\nnet.ipv4.conf.all.rp_filter = 1\nnet.ipv4.conf.default.rp_filter = 1\n\n# Do not answer broadcast pings (smurf-style reflection)\nnet.ipv4.icmp_echo_ignore_broadcasts = 1\n\n# Room for the connection tracking table\nnet.netfilter.nf_conntrack_max = 262144",
+    "highlight": [
+     2,
+     7,
+     11
+    ]
+   },
+   {
+    "id": "nginx",
+    "type": "code",
+    "language": "nginx",
+    "filename": "/etc/nginx/conf.d/limits.conf",
+    "caption": "حدود Nginx لكل عنوان عميل. تُعرَّف المناطق على مستوى http الذي تُضمَّن فيه ملفات conf.d.",
+    "code": "limit_req_zone  $binary_remote_addr zone=perip:10m rate=10r/s;\nlimit_conn_zone $binary_remote_addr zone=connip:10m;\n\nserver {\n    listen 443 ssl;\n    server_name shop.example.com;\n\n    limit_req  zone=perip burst=20 nodelay;\n    limit_req_status 429;\n    limit_conn connip 20;\n\n    client_header_timeout 10s;\n    client_body_timeout   10s;\n    send_timeout          10s;\n    keepalive_timeout     15s;\n    client_max_body_size  2m;\n}",
+    "highlight": [
+     1,
+     8,
+     10,
+     12
+    ]
+   },
+   {
+    "id": "diagnose",
+    "type": "terminal",
+    "title": "التعرف على إغراق SYN على خادمك",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "ss -s",
+      "output": "Total: 18452\nTCP:   17980 (estab 312, closed 211, orphaned 0, timewait 205)\n\nTransport Total     IP        IPv6\nTCP       17769     17701     68",
+      "comment": "عدد مقابس TCP الإجمالي يفوق كثيرًا الـ 312 المنشأة. شيء ما يترك الاتصالات نصف مفتوحة."
+     },
+     {
+      "cmd": "ss -tan state syn-recv | wc -l",
+      "output": "17251",
+      "comment": "سبعة عشر ألف اتصال تنتظر الإقرار الأخير، وهذه بصمة كلاسيكية لإغراق SYN."
+     },
+     {
+      "cmd": "sudo journalctl -k --since '10 min ago' | grep -i flood",
+      "output": "kernel: TCP: request_sock_TCP: Possible SYN flooding on port 443. Sending cookies. Check SNMP counters.",
+      "comment": "انتقلت النواة إلى ملفات SYN فبقيت الخدمة تجيب العملاء الحقيقيين."
+     },
+     {
+      "cmd": "ss -tn state syn-recv | awk 'NR>1{split($4,a,\":\"); c[a[1]]++} END{for(i in c) print c[i], i}' | sort -rn | head -3",
+      "output": "412 198.51.100.7\n398 198.51.100.15\n377 198.51.100.21",
+      "comment": "المصادر موزعة، وهذا نمط الهجوم الموزَّع. لن يكفي حجب عناوين مفردة."
+     }
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "حدود المعدل قد تضر المستخدمين الحقيقيين",
+    "markdown": "تتشارك مكاتب كثيرة وشركات اتصالات محمولة عنوانًا عامًا واحدًا عبر NAT، فقد يبدو مئات المستخدمين الحقيقيين كعميل واحد. ضع الحدود اعتمادًا على حركة مقيسة، وأعد `429` بدلًا من الإسقاط الصامت، وأدرج مراقبتك وشركاءك في قائمة السماح، وراجع السجلات بعد كل حادثة. اقرأ درس [أمن ترجمة عناوين الشبكة](/learn/systems-infrastructure-security/network-address-translation-security) لتعرف لماذا العدّ لكل عنوان غير مثالي."
+   },
+   {
+    "id": "runbook",
+    "type": "text",
+    "markdown": "## الخطوة 3: جهّز دليل استجابة\n\nالقرارات التي تُتخذ أثناء الهجوم بطيئة وعرضة للخطأ، لذلك اكتب الخطة مسبقًا.\n\n1. **الكشف.** نبّه عند القفزات المفاجئة في الحزم في الثانية والاتصالات الجديدة ومعدلات الأخطاء وزمن الاستجابة، وقارنها بخط أساس معروف.\n2. **التأكيد.** ميّز الهجوم من حملة تسويقية أو نشر فاشل. افحص أبرز المصادر ووكلاء المستخدم والعناوين المطلوبة.\n3. **إشراك المزوّد.** احتفظ ببيانات الطوارئ لدى مزوّد الإنترنت وخدمة DDoS في مكان يصل إليه المهندس المناوب. حوّل الحركة إلى التنقية إن كنت تستخدم خدمة عند الطلب.\n4. **الاحتواء.** أضف مرشحات مؤقتة للأنماط الواضحة، وفعّل حدود معدل أشد، وقدّم نسخة مخزَّنة أو ثابتة من الموقع.\n5. **التواصل.** حدّث صفحة الحالة وأصحاب المصلحة داخل المؤسسة.\n6. **المراجعة.** بعد الهجوم سجّل ما نجح، وشدّد الطبقة الضعيفة، وأعد التدريب.\n\nقلّل أيضًا **سطح الهجوم** مسبقًا. أخفِ عنوان الخادم الأصلي خلف CDN، واكشف المنافذ اللازمة فقط، وضع واجهات الإدارة في شبكة خاصة مثل التي صُمّمت في درس [معمارية أمن الشبكات](/learn/systems-infrastructure-security/network-security-architecture)، وتأكد من أن النقاط المكلفة مخزَّنة مؤقتًا أو تتطلب مصادقة.\n\nوأخيرًا اختبر خطتك. يُظهر تمرين مجدول مع مزوّدك، باستخدام حركة متفق عليها نحو عنوان اختباري، ما إذا كانت جهات الاتصال تجيب، وهل تعمل المرشحات، وكم يستغرق التحول إلى التنقية. لا تجرِ اختبارًا كهذا أبدًا دون موافقة خطية من كل مالكي الشبكات المعنيين."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "لا تكن أنت العاكس",
+    "markdown": "قد تصبح شبكتك سلاحًا ضد الآخرين. طبّق مرشحات **مكافحة الانتحال** عند حافتك (BCP 38): أسقط الحزم الصادرة التي لا ينتمي مصدرها إلى بادئاتك، والحزم الواردة التي تدّعي عنوانًا خاصًا أو عنوانك. أغلق المحلِّلات المفتوحة، وعطّل خدمات UDP غير اللازمة، وأبقِ NTP وmemcached بعيدًا عن الإنترنت. وتزيل تحصينات DNS في درس [أمن DNS والتصفية عبر DNS](/learn/systems-infrastructure-security/dns-security-and-dns-filtering) أحد أكبر مصادر العاكسات."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم آلتين افتراضيتين تملكهما على شبكة مخبرية معزولة. لا تولّد حملًا ضد أنظمة لا تملكها أبدًا.\n\n1. على آلة الخادم ثبّت Nginx وأضف الملف `limits.conf` أعلاه مع `server_name localhost`. نفّذ `sudo nginx -t` وأعد التحميل.\n2. طبّق ملف sysctl بالأمر `sudo sysctl --system` ثم تأكد بالأمر `sysctl net.ipv4.tcp_syncookies`.\n3. من آلة العميل أرسل دفعة معتدلة بالأمر `ab -n 200 -c 20 https://<server-ip>/` (أو `curl` ضمن حلقة).\n4. عُدّ استجابات `429` في `/var/log/nginx/access.log`.\n5. ارفع قيمة `rate` وكرر التجربة. لاحظ كيف تغيّر العتبات ما يستطيع عميل واحد فعله.\n6. اكتب دليل استجابة من ستة أسطر لخدمة المختبر هذه وفق الخطوات أعلاه."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "DoS / DDoS",
+      "definition": "هجوم يجعل الخدمة غير متاحة، ويستخدم DDoS مصادر موزعة كثيرة."
+     },
+     {
+      "term": "هجوم حجمي",
+      "definition": "إغراق يستنفد عرض النطاق الترددي."
+     },
+     {
+      "term": "إغراق SYN",
+      "definition": "اتصالات TCP نصف مفتوحة كثيرة تملأ جدول الاتصالات."
+     },
+     {
+      "term": "ملفات SYN",
+      "definition": "تقنية ترد على SYN دون تخزين حالة حتى تكتمل المصافحة."
+     },
+     {
+      "term": "التضخيم",
+      "definition": "هجوم انعكاسي تكون فيه الإجابة أكبر بكثير من الطلب."
+     },
+     {
+      "term": "الانعكاس",
+      "definition": "استخدام خادم طرف ثالث لإرسال الحركة إلى عنوان ضحية منتحل."
+     },
+     {
+      "term": "تحديد المعدل",
+      "definition": "تقييد عدد الطلبات التي يحق للعميل إجراؤها خلال فترة."
+     },
+     {
+      "term": "مركز التنقية",
+      "definition": "منشأة لدى المزوّد تُصفّي حركة الهجوم وتمرر الحركة النظيفة."
+     },
+     {
+      "term": "BCP 38",
+      "definition": "أفضل ممارسة للتصفية الواردة تمنع انتحال عناوين المصدر."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "آلاف من طلبات HTTP البطيئة تستنزف عمليات خادم الويب بينما يبقى عرض النطاق منخفضًا. ما فئة هذا الهجوم؟",
+      "options": [
+       "حجمي",
+       "طبقة التطبيق",
+       "انعكاس",
+       "ping منتحل"
+      ],
+      "answer": 1,
+      "explanation": "المورد الشحيح هو عمليات الخادم لا عرض النطاق، وهذا يميّز هجوم طبقة التطبيق."
+     },
+     {
+      "question": "أي ضابط يتيح للخادم الاستمرار في قبول العملاء أثناء إغراق SYN؟",
+      "options": [
+       "ملفات SYN",
+       "مهلة keepalive أطول",
+       "تعطيل rp_filter",
+       "السماح بـ ping البثّي"
+      ],
+      "answer": 0,
+      "explanation": "تتجنب ملفات SYN تخزين الحالة للمصافحات غير المكتملة، فيكمل العملاء الحقيقيون مصافحاتهم."
+     },
+     {
+      "question": "أي مما يلي لازم لهجوم الانعكاس والتضخيم؟ اختر كل ما ينطبق.",
+      "options": [
+       "عاكس يجيب عن طلبات غير موثَّقة",
+       "عناوين مصدر منتحلة",
+       "إجابة أكبر من الطلب",
+       "بيانات اعتماد مسؤول مسروقة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يحتاج الهجوم إلى عاكس يستجيب، ومصدر مزوّر لتوجيه الإجابة، وإجابة مضخّمة. لا علاقة لبيانات الاعتماد."
+     },
+     {
+      "question": "ما نقطة الضعف الرئيسية في تحديد المعدل لكل عنوان IP وحده؟",
+      "options": [
+       "لا يستطيع إيقاف هجوم موزع على آلاف المصادر",
+       "يستهلك مساحة قرص كبيرة",
+       "يكسر TLS",
+       "يتطلب DNSSEC"
+      ],
+      "answer": 0,
+      "explanation": "قد يبقى كل مصدر تحت الحد بينما يغمرك المجموع. تلزم التنقية من جهة المزوّد."
+     },
+     {
+      "question": "ماذا تفعل تصفية BCP 38 لشبكتك؟",
+      "options": [
+       "تُسقط الحزم ذات عناوين المصدر المنتحلة",
+       "تشفّر استعلامات DNS",
+       "تخزّن صفحات الويب مؤقتًا",
+       "تحجب كل UDP"
+      ],
+      "answer": 0,
+      "explanation": "تمنع التصفية الواردة والصادرة المصادر المزوّرة، وهذا يزيل أساس هجمات الانعكاس."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تستهدف هجمات DoS **التوافر**. صنّفها حجمية أو بروتوكولية أو على طبقة التطبيق لتختار الضابط المناسب.\n- يعتمد الانعكاس والتضخيم على **مصادر منتحلة** وعاكسات مفتوحة. طبّق BCP 38 وأغلق الخدمات المفتوحة.\n- دافع **بالطبقات**: تنقية من جهة المزوّد أو CDN، وتصفية عند الحافة، ووكيل عكسي بحدود، وخادم مضبوط.\n- فعّل **ملفات SYN** و`rp_filter`، وضع مهلات قصيرة، واستخدم حدود المعدل والاتصال لكل عميل بحذر.\n- اكتب **دليل استجابة** وتدرّب عليه مع جهات اتصال المزوّد وأدوار واضحة قبل وصول الهجوم.\n- تابع بتعلم رؤية هذه الهجمات في درس [تحليل حركة الشبكة](/learn/systems-infrastructure-security/network-traffic-analysis)."
+   }
+  ]
+ }
+}

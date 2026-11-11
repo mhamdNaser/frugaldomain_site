@@ -1,0 +1,598 @@
+{
+ "slug": "postgresql-security-architecture",
+ "title": "PostgreSQL Security Architecture",
+ "summary": "How PostgreSQL processes, files and catalogs fit together, and which setting protects each trust boundary.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Explain the postmaster and backend process model",
+  "Identify the files and permissions that protect PGDATA",
+  "Trace a connection through authentication and privilege checks",
+  "Set the key postgresql.conf options for a hardened server"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A junior administrator is asked why a new PostgreSQL server \"feels safe\" to the team. The honest answer is that nobody knows how its security actually works. Which process accepts connections? Where are passwords kept? What stops one database user from reading another's files? Without that mental model, every hardening step is a guess.\n\nPostgreSQL has a clear architecture, and each component maps to a control you can configure. In this lesson you will follow a connection from the network to a table, identify the trust boundaries along the way, and learn which files and settings protect each one."
+  },
+  {
+   "id": "process",
+   "type": "text",
+   "markdown": "## The process model\n\nPostgreSQL uses a **process-per-connection** design:\n\n- The **postmaster** is the parent process. It listens on the configured address and port, and it never touches your data directly.\n- For every accepted connection, the postmaster starts a **backend** process that serves only that client.\n- **Background processes** such as the checkpointer, WAL writer and autovacuum run beside the backends.\n\nAll of these run as one operating system account, normally `postgres`. This matters for security in two ways. First, anyone who can run commands as `postgres` on the host owns every database in the cluster, regardless of SQL permissions. Second, because each client gets its own backend, a crash or exploit in one session does not directly share memory with another, though shared buffers are still shared.\n\nTwo account types therefore exist and must not be confused:\n\n| Account type | Where it lives | What it controls |\n|:--|:--|:--|\n| Operating system user | The host (`/etc/passwd`) | Files, processes, the data directory |\n| Database role | The cluster (`pg_authid`) | Tables, functions, connections |\n\nCompromising the second is serious. Compromising the first is total."
+  },
+  {
+   "id": "conn-seq",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "A connection crossing the trust boundaries",
+   "caption": "Authentication happens before any SQL runs.",
+   "data": {
+    "actors": [
+     {
+      "id": "c",
+      "label": "App server",
+      "sub": "192.0.2.10",
+      "icon": "server"
+     },
+     {
+      "id": "pm",
+      "label": "postmaster",
+      "sub": "db1.example.com:5432",
+      "icon": "database"
+     },
+     {
+      "id": "be",
+      "label": "backend",
+      "sub": "per-session",
+      "icon": "cpu"
+     },
+     {
+      "id": "cat",
+      "label": "Catalogs",
+      "sub": "pg_authid, ACLs",
+      "icon": "file"
+     }
+    ],
+    "steps": [
+     {
+      "from": "c",
+      "to": "pm",
+      "label": "Startup",
+      "detail": "user=app_web db=shop",
+      "note": "The client sends a startup message naming a user and database."
+     },
+     {
+      "from": "pm",
+      "to": "pm",
+      "label": "pg_hba.conf",
+      "detail": "first matching rule",
+      "note": "The first rule matching address, user and database selects the auth method."
+     },
+     {
+      "from": "pm",
+      "to": "c",
+      "label": "AuthRequest",
+      "detail": "scram-sha-256",
+      "tone": "secure",
+      "note": "The server demands proof of identity, not the raw password."
+     },
+     {
+      "from": "c",
+      "to": "pm",
+      "label": "SCRAM proof",
+      "note": "The client answers the challenge."
+     },
+     {
+      "from": "pm",
+      "to": "be",
+      "label": "fork backend",
+      "tone": "success",
+      "note": "A dedicated backend process now serves this session."
+     },
+     {
+      "from": "be",
+      "to": "cat",
+      "label": "Check privileges",
+      "detail": "SELECT on orders?",
+      "note": "Every statement is checked against role grants."
+     },
+     {
+      "from": "cat",
+      "to": "be",
+      "label": "Allowed / denied",
+      "tone": "warning",
+      "note": "Permission errors are returned, never silently ignored."
+     }
+    ]
+   }
+  },
+  {
+   "id": "files",
+   "type": "text",
+   "markdown": "## Files and the data directory\n\nThe **data directory** (`PGDATA`, for example `/var/lib/postgresql/16/main`) holds everything: table files, the write-ahead log (WAL), and configuration. PostgreSQL refuses to start if the directory is readable by other users, because file access bypasses every SQL control.\n\nKey files and their roles:\n\n- `postgresql.conf` sets listening addresses, TLS, logging and resource limits.\n- `pg_hba.conf` decides who may connect and how they authenticate.\n- `pg_ident.conf` maps operating system names to database roles.\n- `pg_wal/` contains the WAL, which includes recent changes to your data. Protect it like the tables.\n- Server private keys must be readable only by the `postgres` account.\n\nDebian and Ubuntu keep configuration under `/etc/postgresql/16/main/`, while Red Hat family systems keep it inside `PGDATA`. Know which layout your servers use before you audit."
+  },
+  {
+   "id": "perm-term",
+   "type": "terminal",
+   "title": "Checking file permissions on db1.example.com",
+   "lines": [
+    {
+     "cmd": "sudo ls -ld /var/lib/postgresql/16/main",
+     "output": "drwx------ 19 postgres postgres 4096 Nov 10 08:12 /var/lib/postgresql/16/main",
+     "comment": "Mode 700 and owned by postgres: correct."
+    },
+    {
+     "cmd": "sudo ls -l /etc/ssl/private/db1.key",
+     "output": "-rw-r----- 1 root ssl-cert 1704 Nov  3 10:01 /etc/ssl/private/db1.key",
+     "comment": "Group-readable by ssl-cert; the postgres user must be a member of that group."
+    },
+    {
+     "cmd": "sudo -u postgres psql -Atc \"SHOW data_directory; SHOW hba_file;\"",
+     "output": "/var/lib/postgresql/16/main\n/etc/postgresql/16/main/pg_hba.conf",
+     "comment": "Ask the server itself where its files are rather than guessing."
+    }
+   ],
+   "caption": "PostgreSQL verifies the data directory mode at startup; key files are your responsibility."
+  },
+  {
+   "id": "catalog",
+   "type": "text",
+   "markdown": "## Roles, catalogs and the permission check\n\nAuthorization data lives in **system catalogs** inside the cluster. Roles are stored in `pg_authid` (with password hashes, readable only by superusers) and exposed through the safer `pg_roles` view. Object permissions are stored as access control lists on each object, and you can read them with `\\dp` in `psql`.\n\nFor every statement, the backend checks four things in order:\n\n1. Can this role connect to this database (`CONNECT`)?\n2. Can it reach the schema (`USAGE`)?\n3. Does it have the privilege on the object (`SELECT`, `INSERT` and so on)?\n4. If row-level security is enabled, which rows may it see? See [PostgreSQL Row-Level Security (RLS)](/learn/systems-infrastructure-security/postgresql-row-level-security-rls).\n\nA denial at any step ends the statement. This layered check is why granting only what is needed works so well. The details of building roles are in [PostgreSQL Roles, Grants and Privileges](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+  },
+  {
+   "id": "hardening",
+   "type": "text",
+   "markdown": "## Architecture-aware hardening settings\n\nKnowing the architecture tells you which settings matter. The snippet below groups the most important ones in `postgresql.conf`. Each line closes a specific gap:\n\n| Setting | Why it matters |\n|:--|:--|\n| `listen_addresses` | Limits which interfaces the postmaster opens |\n| `password_encryption` | Stores new passwords as SCRAM hashes |\n| `ssl` and key paths | Encrypts traffic between client and backend |\n| `log_connections`, `log_disconnections` | Records who connected and when |\n| `log_line_prefix` | Adds user, database and host to every log line |\n| `shared_preload_libraries` | Loads code into every backend, so keep it minimal |"
+  },
+  {
+   "id": "conf",
+   "type": "code",
+   "language": "ini",
+   "filename": "postgresql.conf",
+   "caption": "A hardened excerpt for a server on a private subnet (addresses are documentation examples).",
+   "code": "listen_addresses = '10.20.0.5'          # private interface only\nport = 5432\npassword_encryption = scram-sha-256     # no md5 for new passwords\nssl = on\nssl_cert_file = '/etc/ssl/certs/db1.crt'\nssl_key_file  = '/etc/ssl/private/db1.key'\nssl_min_protocol_version = 'TLSv1.2'\nlog_connections = on\nlog_disconnections = on\nlog_line_prefix = '%m [%p] %u@%d from %h '\nshared_preload_libraries = ''           # add only what you need",
+   "highlight": [
+    1,
+    3,
+    4,
+    7,
+    8,
+    10
+   ]
+  },
+  {
+   "id": "pitfalls",
+   "type": "text",
+   "markdown": "## Trust boundaries and common gaps\n\nEvery boundary in the architecture has a typical mistake attached to it:\n\n- **Network to postmaster:** the port is reachable from networks that have no business reaching it.\n- **Postmaster to backend:** `pg_hba.conf` contains a `trust` rule, which skips authentication entirely.\n- **Backend to catalogs:** applications use the owner or a superuser role, so the privilege check never refuses anything.\n- **Server to disk:** the data directory, backups or key files are readable by other accounts.\n- **Server to logs:** nothing records connections, so a breach leaves no trail.\n\nAudit your server by walking these five boundaries in order. For each one, write down the control that is in place and how you verified it. If you cannot show the evidence, treat the control as missing.\n\nAlso remember that managed services change who is responsible. On a cloud database you no longer control the host or `PGDATA`, but you still own roles, grants, network rules and logging. The shared-responsibility line moves, and the database layer stays yours."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Reload or restart?",
+   "markdown": "Some settings, like `log_connections` and `pg_hba.conf` changes, apply with `SELECT pg_reload_conf();`. Others, like `listen_addresses` and `ssl`, need a restart. Check the `context` column of `pg_settings` before you plan the change window."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Extensions run with real power",
+   "markdown": "Extensions are loaded into the server process. A careless `CREATE EXTENSION` or a library in `shared_preload_libraries` expands your attack surface. Install only extensions from trusted packages and review who may create them."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a PostgreSQL server **you own**, run `SHOW data_directory;` and then `ls -ld` on that path. Confirm the mode is `700` and the owner is `postgres`.\n2. Run `SELECT name, setting, context FROM pg_settings WHERE name IN ('listen_addresses','ssl','password_encryption','log_connections');` and note which settings need a restart.\n3. Check whether your TLS private key is readable only by the intended group.\n4. Draw the path of one connection on paper: client, postmaster, `pg_hba.conf`, backend, catalogs. Mark where each control from this lesson applies."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Postmaster",
+     "definition": "The parent PostgreSQL process that listens for connections and starts backends."
+    },
+    {
+     "term": "Backend process",
+     "definition": "The process that serves one client session."
+    },
+    {
+     "term": "PGDATA",
+     "definition": "The data directory holding tables, WAL and often configuration."
+    },
+    {
+     "term": "WAL",
+     "definition": "The write-ahead log that records changes before they reach table files."
+    },
+    {
+     "term": "System catalog",
+     "definition": "Internal tables storing roles, objects and permissions."
+    },
+    {
+     "term": "pg_hba.conf",
+     "definition": "The host-based authentication file that selects the auth method per connection."
+    },
+    {
+     "term": "Trust boundary",
+     "definition": "A point where data or control passes between components with different privileges."
+    },
+    {
+     "term": "SCRAM-SHA-256",
+     "definition": "A challenge-response password method that never sends the password itself."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which account owns the PostgreSQL processes and data directory?",
+     "options": [
+      "The operating system user, usually postgres",
+      "Any database role",
+      "root only",
+      "The application user"
+     ],
+     "answer": 0,
+     "explanation": "All server processes run as one OS account, so control of it means control of every database."
+    },
+    {
+     "question": "What happens first when a client connects?",
+     "options": [
+      "SQL is executed",
+      "The postmaster matches pg_hba.conf and starts authentication",
+      "The WAL is rewritten",
+      "Row-level security is evaluated"
+     ],
+     "answer": 1,
+     "explanation": "Connection rules and authentication come before any SQL runs."
+    },
+    {
+     "question": "Which settings need a server restart? Choose all that apply.",
+     "options": [
+      "listen_addresses",
+      "ssl",
+      "Edits to pg_hba.conf",
+      "shared_preload_libraries"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "pg_hba.conf reloads with pg_reload_conf(); the other three have a restart context."
+    },
+    {
+     "question": "Why is pg_wal/ sensitive?",
+     "options": [
+      "It holds only logs of errors",
+      "It contains recent data changes",
+      "It stores TLS keys",
+      "It is read by all users"
+     ],
+     "answer": 1,
+     "explanation": "WAL records changes to your data, so reading it can expose content just like reading tables."
+    },
+    {
+     "question": "What is the correct order of checks for a query?",
+     "options": [
+      "Object privilege, then CONNECT, then USAGE",
+      "CONNECT, schema USAGE, object privilege, then row-level security",
+      "Row-level security only",
+      "There are no checks"
+     ],
+     "answer": 1,
+     "explanation": "Access is checked from the database down to the individual row."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- PostgreSQL runs a postmaster that starts one backend per connection, all under a single OS account.\n- OS access to `PGDATA` bypasses SQL permissions, so lock down the directory, WAL and key files.\n- A connection passes `pg_hba.conf`, authentication and then layered privilege checks in the catalogs.\n- Key `postgresql.conf` settings control listening, password hashing, TLS and logging.\n- Check whether a setting needs a reload or a restart before you plan a change.\n\nNext, you will look at how PostgreSQL proves identity and grants access in [PostgreSQL Authentication and Authorization](/learn/systems-infrastructure-security/postgresql-authentication-and-authorization)."
+  }
+ ],
+ "ar": {
+  "title": "البنية الأمنية لـ PostgreSQL",
+  "summary": "كيف تتكامل عمليات PostgreSQL وملفاته وفهارسه، وأي إعداد يحمي كل حدّ ثقة.",
+  "objectives": [
+   "شرح نموذج العملية الأم والعمليات الخلفية",
+   "تحديد الملفات والأذونات التي تحمي PGDATA",
+   "تتبّع اتصال عبر المصادقة وفحوصات الامتيازات",
+   "ضبط أهم خيارات postgresql.conf لخادم محصَّن"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يُسأل مدير مبتدئ لماذا يبدو خادم PostgreSQL الجديد «آمنًا» لدى الفريق. والجواب الصادق أن أحدًا لا يعرف كيف يعمل أمنه فعلًا. أي عملية تقبل الاتصالات؟ أين تُحفظ كلمات المرور؟ وما الذي يمنع مستخدمًا من قراءة ملفات مستخدم آخر؟ وبلا هذا التصوّر الذهني يصير كل إجراء تحصين تخمينًا.\n\nلدى PostgreSQL بنية واضحة، ويقابل كل مكوّن فيها ضابطٌ يمكنك ضبطه. في هذا الدرس ستتبّع اتصالًا من الشبكة حتى الجدول، وتحدّد حدود الثقة على الطريق، وتعرف أي الملفات والإعدادات تحمي كل حدّ."
+   },
+   {
+    "id": "process",
+    "type": "text",
+    "markdown": "## نموذج العمليات\n\nيعتمد PostgreSQL تصميم **عملية لكل اتصال**:\n\n- **العملية الأم (postmaster)** هي العملية الرئيسة. تستمع على العنوان والمنفذ المضبوطين ولا تلمس بياناتك مباشرة.\n- عن كل اتصال مقبول تُطلق العملية الأم **عملية خلفية (backend)** تخدم ذلك العميل وحده.\n- تعمل **عمليات الخلفية المساندة** مثل نقطة التحقق وكاتب WAL وautovacuum إلى جانب العمليات الخلفية.\n\nتعمل كلها بحساب نظام تشغيل واحد، هو عادةً `postgres`. ولهذا أثران أمنيان. الأول أن كل من يستطيع تشغيل أوامر بصفة `postgres` على الخادم يملك كل قواعد البيانات في المجموعة مهما كانت أذونات SQL. والثاني أن لكل عميل عملية خلفية خاصة به، فلا يشارك عطل أو استغلال في جلسة جلسةً أخرى ذاكرتها مباشرة، وإن بقيت المخازن المؤقتة المشتركة مشتركة.\n\nلذلك يوجد نوعان من الحسابات يجب ألا يختلطا:\n\n| نوع الحساب | موضعه | ما يتحكم فيه |\n|:--|:--|:--|\n| مستخدم نظام التشغيل | الخادم (`/etc/passwd`) | الملفات والعمليات ومجلد البيانات |\n| دور قاعدة البيانات | المجموعة (`pg_authid`) | الجداول والدوال والاتصالات |\n\nاختراق الثاني خطير، أما اختراق الأول فهو خسارة كاملة."
+   },
+   {
+    "id": "conn-seq",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "اتصال يعبر حدود الثقة",
+    "caption": "تحدث المصادقة قبل تنفيذ أي استعلام SQL.",
+    "data": {
+     "actors": [
+      {
+       "id": "c",
+       "label": "خادم التطبيق",
+       "sub": "192.0.2.10",
+       "icon": "server"
+      },
+      {
+       "id": "pm",
+       "label": "postmaster",
+       "sub": "db1.example.com:5432",
+       "icon": "database"
+      },
+      {
+       "id": "be",
+       "label": "backend",
+       "sub": "per-session",
+       "icon": "cpu"
+      },
+      {
+       "id": "cat",
+       "label": "الفهارس",
+       "sub": "pg_authid, ACLs",
+       "icon": "file"
+      }
+     ],
+     "steps": [
+      {
+       "from": "c",
+       "to": "pm",
+       "label": "Startup",
+       "detail": "user=app_web db=shop",
+       "note": "يرسل العميل رسالة بدء تذكر المستخدم وقاعدة البيانات."
+      },
+      {
+       "from": "pm",
+       "to": "pm",
+       "label": "pg_hba.conf",
+       "detail": "first matching rule",
+       "note": "تحدد أول قاعدة تطابق العنوان والمستخدم والقاعدة طريقة المصادقة."
+      },
+      {
+       "from": "pm",
+       "to": "c",
+       "label": "AuthRequest",
+       "detail": "scram-sha-256",
+       "tone": "secure",
+       "note": "يطلب الخادم إثبات الهوية لا كلمة المرور الصريحة."
+      },
+      {
+       "from": "c",
+       "to": "pm",
+       "label": "SCRAM proof",
+       "note": "يجيب العميل عن التحدي."
+      },
+      {
+       "from": "pm",
+       "to": "be",
+       "label": "fork backend",
+       "tone": "success",
+       "note": "تتولى عملية خلفية مخصصة هذه الجلسة."
+      },
+      {
+       "from": "be",
+       "to": "cat",
+       "label": "Check privileges",
+       "detail": "SELECT on orders?",
+       "note": "يُفحص كل استعلام مقابل منح الدور."
+      },
+      {
+       "from": "cat",
+       "to": "be",
+       "label": "Allowed / denied",
+       "tone": "warning",
+       "note": "تُعاد أخطاء الأذونات ولا تُتجاهل بصمت."
+      }
+     ]
+    }
+   },
+   {
+    "id": "files",
+    "type": "text",
+    "markdown": "## الملفات ومجلد البيانات\n\nيحتوي **مجلد البيانات** (`PGDATA`، مثل `/var/lib/postgresql/16/main`) على كل شيء: ملفات الجداول وسجل الكتابة المسبقة (WAL) والإعدادات. يرفض PostgreSQL الإقلاع إذا كان المجلد مقروءًا لمستخدمين آخرين، لأن الوصول إلى الملفات يتجاوز كل ضوابط SQL.\n\nأهم الملفات وأدوارها:\n\n- `postgresql.conf` يضبط عناوين الاستماع وTLS والتسجيل وحدود الموارد.\n- `pg_hba.conf` يقرر من يحق له الاتصال وكيف يصادق.\n- `pg_ident.conf` يربط أسماء نظام التشغيل بأدوار قاعدة البيانات.\n- المجلد `pg_wal/` يحوي سجل WAL الذي يتضمن أحدث تغييرات بياناتك، فاحمه كما تحمي الجداول.\n- يجب ألا يقرأ المفاتيح الخاصة للخادم سوى حساب `postgres`.\n\nتحفظ Debian وUbuntu الإعدادات في `/etc/postgresql/16/main/`، بينما تحفظها عائلة Red Hat داخل `PGDATA`. اعرف أي التخطيطين تستخدمه خوادمك قبل التدقيق."
+   },
+   {
+    "id": "perm-term",
+    "type": "terminal",
+    "title": "Checking file permissions on db1.example.com",
+    "lines": [
+     {
+      "cmd": "sudo ls -ld /var/lib/postgresql/16/main",
+      "output": "drwx------ 19 postgres postgres 4096 Nov 10 08:12 /var/lib/postgresql/16/main",
+      "comment": "الأذونات 700 والمالك postgres: صحيح."
+     },
+     {
+      "cmd": "sudo ls -l /etc/ssl/private/db1.key",
+      "output": "-rw-r----- 1 root ssl-cert 1704 Nov  3 10:01 /etc/ssl/private/db1.key",
+      "comment": "مقروء لمجموعة ssl-cert؛ يجب أن يكون المستخدم postgres عضوًا فيها."
+     },
+     {
+      "cmd": "sudo -u postgres psql -Atc \"SHOW data_directory; SHOW hba_file;\"",
+      "output": "/var/lib/postgresql/16/main\n/etc/postgresql/16/main/pg_hba.conf",
+      "comment": "اسأل الخادم نفسه عن مواضع ملفاته بدل التخمين."
+     }
+    ],
+    "caption": "يتحقق PostgreSQL من أذونات مجلد البيانات عند الإقلاع، أما ملفات المفاتيح فمسؤوليتك."
+   },
+   {
+    "id": "catalog",
+    "type": "text",
+    "markdown": "## الأدوار والفهارس وفحص الأذونات\n\nتعيش بيانات التفويض في **فهارس النظام** داخل المجموعة. تُخزَّن الأدوار في `pg_authid` (مع تجزئات كلمات المرور ولا يقرؤها إلا المديرون الأعلون) وتُعرض عبر العرض الأكثر أمانًا `pg_roles`. وتُخزَّن أذونات الكائنات بصورة قوائم تحكم بالوصول على كل كائن، ويمكنك قراءتها بالأمر `\\dp` في `psql`.\n\nلكل استعلام تفحص العملية الخلفية أربعة أمور بالترتيب:\n\n1. هل يستطيع هذا الدور الاتصال بقاعدة البيانات (`CONNECT`)؟\n2. هل يصل إلى المخطط (`USAGE`)؟\n3. هل يملك الامتياز على الكائن (`SELECT` و`INSERT` وغيرهما)؟\n4. إذا كان أمان مستوى الصف مفعَّلًا، فأي الصفوف يحق له رؤيتها؟ راجع [أمان مستوى الصف في PostgreSQL](/learn/systems-infrastructure-security/postgresql-row-level-security-rls).\n\nيوقف الرفض في أي خطوة الاستعلام. وهذا الفحص متعدد الطبقات هو سبب نجاح منح ما يلزم فقط. وتجد تفاصيل بناء الأدوار في [الأدوار والمنح والامتيازات في PostgreSQL](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+   },
+   {
+    "id": "hardening",
+    "type": "text",
+    "markdown": "## إعدادات التحصين المبنية على فهم البنية\n\nيخبرك فهم البنية أي الإعدادات مهم. يجمع المقتطف أدناه أهمها في `postgresql.conf`، ويسدّ كل سطر ثغرة محددة:\n\n| الإعداد | سبب أهميته |\n|:--|:--|\n| `listen_addresses` | يحدّ من الواجهات التي تفتحها العملية الأم |\n| `password_encryption` | يخزّن كلمات المرور الجديدة بتجزئات SCRAM |\n| `ssl` ومسارات المفاتيح | يشفّر الحركة بين العميل والعملية الخلفية |\n| `log_connections` و`log_disconnections` | يسجّلان من اتصل ومتى |\n| `log_line_prefix` | يضيف المستخدم وقاعدة البيانات والمضيف إلى كل سطر سجل |\n| `shared_preload_libraries` | يحمّل شيفرة في كل عملية خلفية، فأبقِه في حدّه الأدنى |"
+   },
+   {
+    "id": "conf",
+    "type": "code",
+    "language": "ini",
+    "filename": "postgresql.conf",
+    "caption": "مقتطف محصَّن لخادم على شبكة فرعية خاصة (العناوين أمثلة توثيقية).",
+    "code": "listen_addresses = '10.20.0.5'          # private interface only\nport = 5432\npassword_encryption = scram-sha-256     # no md5 for new passwords\nssl = on\nssl_cert_file = '/etc/ssl/certs/db1.crt'\nssl_key_file  = '/etc/ssl/private/db1.key'\nssl_min_protocol_version = 'TLSv1.2'\nlog_connections = on\nlog_disconnections = on\nlog_line_prefix = '%m [%p] %u@%d from %h '\nshared_preload_libraries = ''           # add only what you need",
+    "highlight": [
+     1,
+     3,
+     4,
+     7,
+     8,
+     10
+    ]
+   },
+   {
+    "id": "pitfalls",
+    "type": "text",
+    "markdown": "## حدود الثقة والثغرات الشائعة\n\nيرتبط بكل حدّ في البنية خطأ نموذجي:\n\n- **من الشبكة إلى العملية الأم:** المنفذ متاح من شبكات لا شأن لها بالوصول إليه.\n- **من العملية الأم إلى العملية الخلفية:** يحتوي `pg_hba.conf` على قاعدة `trust` تتخطى المصادقة كليًّا.\n- **من العملية الخلفية إلى الفهارس:** تستخدم التطبيقات حساب المالك أو مديرًا أعلى، فلا يرفض فحص الامتيازات شيئًا.\n- **من الخادم إلى القرص:** مجلد البيانات أو النسخ الاحتياطية أو ملفات المفاتيح مقروءة لحسابات أخرى.\n- **من الخادم إلى السجلات:** لا شيء يسجّل الاتصالات، فيترك الاختراق بلا أثر.\n\nدقّق خادمك بالمرور على هذه الحدود الخمسة بالترتيب. دوّن لكل حدّ الضابط القائم وكيف تحققت منه. فإن لم تستطع إبراز الدليل فعامل الضابط على أنه غائب.\n\nوتذكّر أن الخدمات المُدارة تغيّر من يتحمل المسؤولية. ففي قاعدة بيانات سحابية لا تتحكم بالخادم ولا بـ `PGDATA`، لكنك تبقى مالك الأدوار والمنح وقواعد الشبكة والسجلات. يتحرك خط المسؤولية المشتركة وتبقى طبقة قاعدة البيانات لك."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "إعادة تحميل أم إعادة تشغيل؟",
+    "markdown": "بعض الإعدادات مثل `log_connections` وتغييرات `pg_hba.conf` تُطبَّق بالأمر `SELECT pg_reload_conf();`. وأخرى مثل `listen_addresses` و`ssl` تحتاج إعادة تشغيل. افحص العمود `context` في `pg_settings` قبل تخطيط نافذة التغيير."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "الإضافات تعمل بصلاحيات حقيقية",
+    "markdown": "تُحمَّل الإضافات داخل عملية الخادم. فاستخدام `CREATE EXTENSION` بلا تدقيق أو إدراج مكتبة في `shared_preload_libraries` يوسّع سطح الهجوم. ثبّت إضافات من حزم موثوقة فقط وراجع من يحق له إنشاءها."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على خادم PostgreSQL **تملكه**، شغّل `SHOW data_directory;` ثم `ls -ld` على ذلك المسار. تأكد أن الأذونات `700` وأن المالك `postgres`.\n2. شغّل `SELECT name, setting, context FROM pg_settings WHERE name IN ('listen_addresses','ssl','password_encryption','log_connections');` ولاحظ أي الإعدادات تحتاج إعادة تشغيل.\n3. تحقق من أن المفتاح الخاص لـ TLS مقروء للمجموعة المقصودة فقط.\n4. ارسم على ورقة مسار اتصال واحد: العميل، والعملية الأم، و`pg_hba.conf`، والعملية الخلفية، والفهارس. وحدّد موضع كل ضابط من هذا الدرس."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "العملية الأم (postmaster)",
+      "definition": "عملية PostgreSQL الأم التي تستمع للاتصالات وتطلق العمليات الخلفية."
+     },
+     {
+      "term": "العملية الخلفية",
+      "definition": "العملية التي تخدم جلسة عميل واحدة."
+     },
+     {
+      "term": "PGDATA",
+      "definition": "مجلد البيانات الذي يضم الجداول وWAL وغالبًا الإعدادات."
+     },
+     {
+      "term": "سجل الكتابة المسبقة (WAL)",
+      "definition": "سجل يدوّن التغييرات قبل وصولها إلى ملفات الجداول."
+     },
+     {
+      "term": "فهرس النظام",
+      "definition": "جداول داخلية تخزّن الأدوار والكائنات والأذونات."
+     },
+     {
+      "term": "pg_hba.conf",
+      "definition": "ملف المصادقة المعتمد على المضيف الذي يحدد طريقة المصادقة لكل اتصال."
+     },
+     {
+      "term": "حد الثقة",
+      "definition": "نقطة ينتقل عندها التحكم أو البيانات بين مكوّنات مختلفة الامتياز."
+     },
+     {
+      "term": "SCRAM-SHA-256",
+      "definition": "طريقة كلمة مرور بالتحدي والاستجابة لا ترسل كلمة المرور نفسها."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي حساب يملك عمليات PostgreSQL ومجلد البيانات؟",
+      "options": [
+       "مستخدم نظام التشغيل، عادةً postgres",
+       "أي دور في قاعدة البيانات",
+       "root فقط",
+       "مستخدم التطبيق"
+      ],
+      "answer": 0,
+      "explanation": "تعمل كل عمليات الخادم بحساب نظام تشغيل واحد، والتحكم به تحكّم بكل قواعد البيانات."
+     },
+     {
+      "question": "ما الذي يحدث أولًا عند اتصال عميل؟",
+      "options": [
+       "يُنفَّذ SQL",
+       "تطابق العملية الأم pg_hba.conf وتبدأ المصادقة",
+       "يُعاد كتابة WAL",
+       "يُقيَّم أمان مستوى الصف"
+      ],
+      "answer": 1,
+      "explanation": "قواعد الاتصال والمصادقة تسبقان تنفيذ أي SQL."
+     },
+     {
+      "question": "أي الإعدادات تحتاج إعادة تشغيل الخادم؟ اختر كل ما ينطبق.",
+      "options": [
+       "listen_addresses",
+       "ssl",
+       "تعديلات pg_hba.conf",
+       "shared_preload_libraries"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يُعاد تحميل pg_hba.conf بـ pg_reload_conf()؛ أما الثلاثة الأخرى فسياقها إعادة التشغيل."
+     },
+     {
+      "question": "لماذا يُعدّ pg_wal/ حساسًا؟",
+      "options": [
+       "يحوي سجلات الأخطاء فقط",
+       "يحتوي على أحدث تغييرات البيانات",
+       "يخزّن مفاتيح TLS",
+       "يقرؤه كل المستخدمين"
+      ],
+      "answer": 1,
+      "explanation": "يسجّل WAL تغييرات بياناتك، فقراءته قد تكشف المحتوى كقراءة الجداول."
+     },
+     {
+      "question": "ما الترتيب الصحيح لفحوصات الاستعلام؟",
+      "options": [
+       "امتياز الكائن ثم CONNECT ثم USAGE",
+       "CONNECT ثم USAGE على المخطط ثم امتياز الكائن ثم أمان مستوى الصف",
+       "أمان مستوى الصف فقط",
+       "لا توجد فحوصات"
+      ],
+      "answer": 1,
+      "explanation": "يُفحص الوصول من قاعدة البيانات نزولًا إلى الصف المنفرد."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يشغّل PostgreSQL عملية أمًّا تطلق عملية خلفية لكل اتصال، وكلها بحساب نظام تشغيل واحد.\n- الوصول عبر نظام التشغيل إلى `PGDATA` يتجاوز أذونات SQL، فأحكم إغلاق المجلد وWAL وملفات المفاتيح.\n- يمر الاتصال بـ `pg_hba.conf` ثم المصادقة ثم فحوصات امتيازات متدرجة في الفهارس.\n- تتحكم إعدادات `postgresql.conf` الأساسية بالاستماع وتجزئة كلمات المرور وTLS والتسجيل.\n- افحص هل يحتاج الإعداد إعادة تحميل أم إعادة تشغيل قبل تخطيط التغيير.\n\nبعد ذلك ستنظر في كيفية إثبات PostgreSQL للهوية ومنحه الوصول في [المصادقة والتفويض في PostgreSQL](/learn/systems-infrastructure-security/postgresql-authentication-and-authorization)."
+   }
+  ]
+ }
+}

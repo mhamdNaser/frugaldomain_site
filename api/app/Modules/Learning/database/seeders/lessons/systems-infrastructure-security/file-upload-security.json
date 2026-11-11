@@ -1,0 +1,590 @@
+{
+  "slug": "file-upload-security",
+  "title": "File Upload Security",
+  "summary": "Learn how to accept user uploads safely: validate content, rename and re-encode files, scan them, store them where code cannot run, and serve them with safe headers.",
+  "duration_minutes": 25,
+  "objectives": [
+    "Identify the main risks of accepting file uploads",
+    "Validate type, size and name on the server instead of trusting the client",
+    "Store uploads outside the web root with execution disabled",
+    "Serve user content from a separate origin with safe headers",
+    "Test an upload pipeline on a system you own"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A recruiting site lets candidates upload a profile photo. The developer checks that the file name ends in `.jpg` and moves the file into `/var/www/html/uploads/`. Months later, the security team finds a file there named `photo.jpg.php` that does not contain a photo. If the server executes PHP in that directory, anyone who requests the file runs code on your server.\n\nUploads are risky because you accept **data you did not create, from someone you do not control, and store it on your own machine**. The file can lie about its name, its type and its size. It can contain script that runs when another user opens it, or a path that tries to escape your folder, or a payload designed to exhaust your disk.\n\nThe good news is that defending uploads is a solved problem if you stack a few simple controls. In this lesson you will learn what can go wrong, which checks matter, how to store and serve files safely, and how to test the result on a system you own."
+    },
+    {
+      "id": "risks",
+      "type": "text",
+      "markdown": "## Step 1: Map the risks\n\nBefore choosing controls, name the harm each one prevents.\n\n| Risk | What happens | Typical root cause |\n|:--|:--|:--|\n| Server-side code execution | An uploaded script is run by the web server | Upload directory inside the web root with execution enabled |\n| Stored cross-site scripting | A file with active content runs in another user's browser | Serving HTML, SVG or a mis-typed file from your main domain |\n| Path traversal | A file name like `../../config` overwrites an important file | Using the client's file name on disk |\n| Resource exhaustion | Huge files or compressed archives fill disk or memory | No size, count or quota limits |\n| Malware distribution | Your site hosts infected files for others to download | No scanning, shared download links |\n| Information disclosure | Private documents are guessable or listed | Predictable names and open directory listing |\n\nNotice that most of these depend on **where the file is stored and how it is served**, not only on what it contains. That is why the strongest defenses are architectural: keep uploads where code cannot run and where they cannot be mistaken for part of your site."
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "A defensive upload pipeline",
+      "caption": "Each stage can reject the file. Only a file that passes every stage reaches private storage.",
+      "data": {
+        "token": "photo.png",
+        "nodes": [
+          {
+            "id": "u",
+            "label": "User",
+            "sub": "198.51.100.20",
+            "icon": "user"
+          },
+          {
+            "id": "l",
+            "label": "Limits",
+            "sub": "size, count",
+            "icon": "shield"
+          },
+          {
+            "id": "t",
+            "label": "Type check",
+            "sub": "content, not name",
+            "icon": "eye"
+          },
+          {
+            "id": "v",
+            "label": "Antivirus",
+            "sub": "ClamAV",
+            "icon": "bug"
+          },
+          {
+            "id": "s",
+            "label": "Private storage",
+            "sub": "random name",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "u",
+            "caption": "A user uploads a PNG photo through the profile form."
+          },
+          {
+            "at": "l",
+            "caption": "The size is 640 KB, under the 2 MB limit, and the user is under the daily quota.",
+            "tone": "success"
+          },
+          {
+            "at": "t",
+            "caption": "The server reads the file's first bytes, finds a PNG signature and confirms the image parses.",
+            "tone": "success"
+          },
+          {
+            "at": "v",
+            "caption": "The scanner finds no signature match.",
+            "tone": "success"
+          },
+          {
+            "at": "s",
+            "caption": "The file is saved as a random name outside the web root, with no execute permission.",
+            "tone": "secure"
+          },
+          {
+            "at": "u",
+            "token": "photo.jpg.php",
+            "caption": "Another user uploads a script renamed to look like a photo.",
+            "tone": "attack"
+          },
+          {
+            "at": "t",
+            "token": "photo.jpg.php",
+            "caption": "The content is text, not an image. The type check rejects the file whatever its name says.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "validate",
+      "type": "text",
+      "markdown": "## Step 2: Validate what you receive\n\nValidation is a set of cheap checks that run before the file is stored. None is enough alone; together they are strong.\n\n1. **Allow-list extensions.** Accept only the types you need, such as `jpg`, `png`, `webp` and `pdf`. A deny-list always misses something.\n2. **Check the content.** The `Content-Type` header and the file name are chosen by the client. Read the file's first bytes (its **magic number**) with a library such as `finfo`, and for images confirm that an image parser can open it.\n3. **Limit size and count.** Set limits in the web server, the application runtime and the code, so each layer rejects early.\n4. **Never trust the original name.** Generate a random name yourself and store the original only as display text, escaped on output.\n5. **Re-encode images.** Decoding and re-saving a picture strips hidden metadata and many embedded payloads.\n6. **Scan.** Run the file through an antivirus engine such as ClamAV before anyone else can download it.\n\nTreat **SVG** and **HTML** with extra care. They are text formats that can carry script, so unless you truly need them, do not accept them as images. Archives such as ZIP deserve limits on the number and total size of extracted files, because a small archive can expand to gigabytes."
+    },
+    {
+      "id": "php",
+      "type": "code",
+      "language": "php",
+      "filename": "upload.php",
+      "caption": "A minimal safe handler. It checks content, size and name, then stores the file outside the web root.",
+      "highlight": [
+        11,
+        15,
+        17
+      ],
+      "code": "<?php\nconst MAX_BYTES = 2_000_000;\nconst ALLOWED   = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];\n\nfunction store_upload(array $f, string $dir): string {\n    if ($f['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) {\n        throw new RuntimeException('Upload failed');\n    }\n    if ($f['size'] > MAX_BYTES) {\n        throw new RuntimeException('File too large');\n    }\n    $mime = (new finfo(FILEINFO_MIME_TYPE))->file($f['tmp_name']);   // reads the bytes\n    if (!isset(ALLOWED[$mime]) || getimagesize($f['tmp_name']) === false) {\n        throw new RuntimeException('Type not allowed');\n    }\n    $name = bin2hex(random_bytes(16)) . '.' . ALLOWED[$mime];        // our name, not theirs\n    if (!move_uploaded_file($f['tmp_name'], \"$dir/$name\")) {\n        throw new RuntimeException('Could not store file');\n    }\n    chmod(\"$dir/$name\", 0640);\n    return $name;\n}\n"
+    },
+    {
+      "id": "store",
+      "type": "text",
+      "markdown": "## Step 3: Store and serve files so they cannot hurt you\n\nValidation can fail, so assume a bad file will eventually get through and make sure it is harmless where it lands.\n\n- **Store outside the web root.** If the application must serve the file, stream it through code that checks permission, or use object storage with short-lived signed links.\n- **Disable execution.** If files must sit under the web server, configure that directory to serve static content only and never pass it to PHP or any interpreter.\n- **Use a separate origin.** Serve user content from a different registrable domain such as `usercontent.example.net`. A script in an uploaded file then cannot read your main site's cookies.\n- **Send safe headers.** Use `X-Content-Type-Options: nosniff`, a correct `Content-Type`, and `Content-Disposition: attachment` for documents that should download rather than render.\n- **Set permissions.** The web server account should read uploads but not write elsewhere, and the upload account should not own your code.\n- **Apply quotas and cleanup.** Set per-user limits, remove temporary files, and monitor free disk space.\n\nNever rely on a client-side check in JavaScript. It improves usability, but an attacker simply sends the request without your page. Headers from [Secure HTTP Headers]({C}secure-http-headers) are the final safety net."
+    },
+    {
+      "id": "nginx",
+      "type": "code",
+      "language": "nginx",
+      "filename": "/etc/nginx/sites-available/example.com",
+      "caption": "Uploads are static, non-executable and sent with safe headers. Only an exact path is passed to PHP.",
+      "highlight": [
+        2,
+        5
+      ],
+      "code": "location ^~ /uploads/ {\n    alias /srv/app-uploads/public/;\n    types { image/jpeg jpg; image/png png; image/webp webp; }\n    default_type application/octet-stream;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header Content-Security-Policy \"default-src 'none'; sandbox\" always;\n    try_files $uri =404;       # never falls through to the PHP handler\n}\n\nlocation ~ \\.php$ {\n    # Only the front controller runs PHP.\n    include fastcgi_params;\n    fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n    fastcgi_param SCRIPT_FILENAME /srv/app/public/index.php;\n}\n"
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Verify the controls on your own server",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "printf '<?php echo \"test\"; ?>' > /tmp/not-a-photo.jpg && file --mime-type /tmp/not-a-photo.jpg",
+          "output": "/tmp/not-a-photo.jpg: text/x-php",
+          "comment": "The extension says jpg, the content says PHP. This is the mismatch the type check catches."
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' -F 'photo=@/tmp/not-a-photo.jpg' https://www.example.com/profile/photo",
+          "output": "422",
+          "comment": "The application rejects the file as an invalid type."
+        },
+        {
+          "cmd": "curl -sI https://www.example.com/uploads/3f9a1c0be27d4a5f.png | grep -iE 'content-type|nosniff|content-security'",
+          "output": "content-type: image/png\nx-content-type-options: nosniff\ncontent-security-policy: default-src 'none'; sandbox"
+        },
+        {
+          "cmd": "clamscan --infected --no-summary /srv/app-uploads/incoming/",
+          "output": "/srv/app-uploads/incoming/eicar-test.txt: Eicar-Signature FOUND",
+          "comment": "The EICAR file is a standard harmless antivirus test. Never use real malware."
+        }
+      ],
+      "caption": "Example output from a test server."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Checks that look safe but are not",
+      "markdown": "- **Checking only the extension.** Names such as `a.php.jpg` or `a.jpg%00.php` confuse naive code.\n- **Trusting the `Content-Type` header.** The client controls it.\n- **Keeping the user's file name.** It enables traversal and overwrites.\n- **Allowing SVG as a picture.** It can carry script.\n- **Scanning after publishing.** Scan before the file becomes downloadable."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a lab web server you own, never a shared or production site.\n\n1. Build a small form that stores uploads in a folder under the web root, with execution enabled. Notice how this is dangerous, then undo it.\n2. Move the folder outside the web root and apply the Nginx `location` block above.\n3. Implement the `store_upload` function and try a real PNG, a text file renamed to `.jpg`, and a file larger than the limit. Record which check rejected each.\n4. Install ClamAV, download the harmless EICAR test file from the EICAR website, and confirm that `clamscan` flags it.\n5. Check the response headers of a stored file with `curl -I`."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Magic number",
+          "definition": "The first bytes of a file that identify its real format."
+        },
+        {
+          "term": "Web shell",
+          "definition": "A script on a server that lets an unauthorized user run commands through the web."
+        },
+        {
+          "term": "Path traversal",
+          "definition": "Using sequences such as ../ in a name to reach files outside the intended folder."
+        },
+        {
+          "term": "Allow-list",
+          "definition": "A rule that accepts only explicitly approved types or values."
+        },
+        {
+          "term": "Re-encoding",
+          "definition": "Decoding and re-saving a file, such as an image, to remove unexpected content."
+        },
+        {
+          "term": "Signed URL",
+          "definition": "A temporary link to a private object that carries proof it was authorized."
+        },
+        {
+          "term": "Content-Disposition",
+          "definition": "A header that tells the browser to download a file instead of displaying it."
+        },
+        {
+          "term": "EICAR test file",
+          "definition": "A harmless standard string that antivirus products detect for testing."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why is checking only the file extension insufficient?",
+          "options": [
+            "The client chooses the name, so it can lie about the content",
+            "Extensions are encrypted",
+            "Servers ignore extensions",
+            "Extensions change on upload"
+          ],
+          "answer": 0,
+          "explanation": "The name is attacker-controlled. Inspect the content and generate your own name."
+        },
+        {
+          "question": "Which storage choice best limits the damage of a file that slips through validation?",
+          "options": [
+            "A folder inside the web root with PHP enabled",
+            "A folder outside the web root, served as static non-executable content",
+            "The application's source folder",
+            "A world-writable shared folder"
+          ],
+          "answer": 1,
+          "explanation": "If the file cannot execute and is served safely, a missed check does far less harm."
+        },
+        {
+          "question": "Which controls belong in a safe upload design? (Choose all that apply.)",
+          "options": [
+            "Random server-generated file names",
+            "Size and count limits",
+            "Antivirus scanning before publication",
+            "Trusting the Content-Type sent by the browser"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Random names, limits and scanning all help. The Content-Type header is client-controlled."
+        },
+        {
+          "question": "Why serve user uploads from a separate domain?",
+          "options": [
+            "It makes downloads faster",
+            "Script inside an uploaded file cannot reach the main site's cookies or storage",
+            "It removes the need for HTTPS",
+            "It stops file scanning"
+          ],
+          "answer": 1,
+          "explanation": "Browsers isolate origins, so active content is kept away from your session cookies."
+        },
+        {
+          "question": "Which file formats need extra caution because they can carry script? (Choose all that apply.)",
+          "options": [
+            "SVG",
+            "HTML",
+            "Plain PNG that passes image decoding",
+            "PDF with active content"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "SVG and HTML are text that browsers run, and PDFs can contain actions. A properly decoded raster image is far safer."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Uploads are untrusted data stored on your system, so every property of the file must be verified by the server.\n- Validate with allow-listed types, magic-number checks, size limits, random names and image re-encoding.\n- Scan with antivirus before the file becomes available.\n- Store outside the web root, disable execution, use a separate origin and send `nosniff` and a restrictive CSP.\n- Never depend on client-side checks or on the extension alone.\n\nNext, see how another input can turn your server against internal systems in [Server-Side Request Forgery (SSRF)](/learn/systems-infrastructure-security/server-side-request-forgery-ssrf), and review the broader process in [Web Application Vulnerability Assessment](/learn/systems-infrastructure-security/web-application-vulnerability-assessment)."
+    }
+  ],
+  "ar": {
+    "title": "أمن رفع الملفات",
+    "summary": "تعلّم كيف تقبل الملفات المرفوعة بأمان: التحقق من المحتوى وتغيير الأسماء وإعادة الترميز والفحص والتخزين حيث لا تعمل الشيفرة والتقديم بترويسات آمنة.",
+    "objectives": [
+      "تحديد المخاطر الرئيسية لقبول الملفات المرفوعة",
+      "التحقق من النوع والحجم والاسم على الخادم بدل الوثوق بالعميل",
+      "تخزين الملفات المرفوعة خارج جذر الويب مع تعطيل التنفيذ",
+      "تقديم محتوى المستخدمين من أصل منفصل بترويسات آمنة",
+      "اختبار مسار رفع على نظام تملكه"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يتيح موقع توظيف للمرشحين رفع صورة شخصية. يتحقق المطوّر من أن اسم الملف ينتهي بـ`.jpg` ثم ينقل الملف إلى `/var/www/html/uploads/`. وبعد أشهر يجد فريق الأمن في هذا المجلد ملفًا اسمه `photo.jpg.php` لا يحتوي صورة. فإذا كان الخادم ينفّذ PHP في ذلك المجلد، فإن كل من يطلب الملف ينفّذ شيفرة على خادمك.\n\nتنبع خطورة الرفع من أنك تقبل **بيانات لم تنشئها من جهة لا تتحكم بها وتخزنها على جهازك**. يمكن للملف أن يكذب بشأن اسمه ونوعه وحجمه. وقد يحوي سكربتًا يعمل عندما يفتحه مستخدم آخر، أو مسارًا يحاول الخروج من مجلدك، أو حمولة مصممة لاستنزاف قرصك.\n\nوالخبر الجيد أن حماية الرفع مشكلة محلولة إذا رتّبت بضعة ضوابط بسيطة فوق بعضها. ستتعلم في هذا الدرس ما يمكن أن يسوء، وأي الفحوص مهمة، وكيف تخزّن الملفات وتقدّمها بأمان، وكيف تختبر النتيجة على نظام تملكه."
+      },
+      {
+        "id": "risks",
+        "type": "text",
+        "markdown": "## الخطوة 1: ارسم خريطة المخاطر\n\nقبل اختيار الضوابط، سمِّ الضرر الذي يمنعه كل منها.\n\n| الخطر | ما الذي يحدث | السبب الجذري المعتاد |\n|:--|:--|:--|\n| تنفيذ شيفرة على الخادم | يشغّل خادم الويب سكربتًا مرفوعًا | مجلد الرفع داخل جذر الويب مع تمكين التنفيذ |\n| البرمجة النصية العابرة للمواقع المخزَّنة | ملف ذو محتوى نشط يعمل في متصفح مستخدم آخر | تقديم HTML أو SVG أو ملف بنوع خاطئ من نطاقك الرئيسي |\n| اجتياز المسار (Path Traversal) | اسم ملف مثل `../../config` يستبدل ملفًا مهمًا | استخدام اسم العميل على القرص |\n| استنزاف الموارد | ملفات ضخمة أو أرشيفات مضغوطة تملأ القرص أو الذاكرة | غياب حدود الحجم والعدد والحصص |\n| توزيع البرمجيات الخبيثة | يستضيف موقعك ملفات مصابة ليحملها الآخرون | غياب الفحص وروابط التنزيل المشتركة |\n| كشف المعلومات | وثائق خاصة يمكن تخمينها أو سردها | أسماء متوقعة وسرد مفتوح للمجلدات |\n\nلاحظ أن معظمها يعتمد على **مكان تخزين الملف وطريقة تقديمه** لا على محتواه فقط. ولذلك فأقوى الدفاعات معمارية: أبقِ الملفات المرفوعة حيث لا تعمل الشيفرة وحيث لا يمكن الخلط بينها وبين جزء من موقعك."
+      },
+      {
+        "id": "anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "مسار رفع دفاعي",
+        "caption": "يستطيع كل طور رفض الملف. ولا يصل إلى التخزين الخاص إلا ملف اجتاز كل الأطوار.",
+        "data": {
+          "token": "photo.png",
+          "nodes": [
+            {
+              "id": "u",
+              "label": "المستخدم",
+              "sub": "198.51.100.20",
+              "icon": "user"
+            },
+            {
+              "id": "l",
+              "label": "الحدود",
+              "sub": "size, count",
+              "icon": "shield"
+            },
+            {
+              "id": "t",
+              "label": "فحص النوع",
+              "sub": "content, not name",
+              "icon": "eye"
+            },
+            {
+              "id": "v",
+              "label": "مضاد الفيروسات",
+              "sub": "ClamAV",
+              "icon": "bug"
+            },
+            {
+              "id": "s",
+              "label": "تخزين خاص",
+              "sub": "random name",
+              "icon": "database"
+            }
+          ],
+          "steps": [
+            {
+              "at": "u",
+              "caption": "يرفع مستخدم صورة PNG عبر نموذج الملف الشخصي."
+            },
+            {
+              "at": "l",
+              "caption": "الحجم 640 ك.ب، دون حد 2 م.ب، والمستخدم دون حصته اليومية.",
+              "tone": "success"
+            },
+            {
+              "at": "t",
+              "caption": "يقرأ الخادم أولى بايتات الملف فيجد توقيع PNG ويتأكد أن الصورة تُحلَّل.",
+              "tone": "success"
+            },
+            {
+              "at": "v",
+              "caption": "لا يجد الماسح تطابقًا مع أي توقيع.",
+              "tone": "success"
+            },
+            {
+              "at": "s",
+              "caption": "يُحفظ الملف باسم عشوائي خارج جذر الويب ودون صلاحية تنفيذ.",
+              "tone": "secure"
+            },
+            {
+              "at": "u",
+              "token": "photo.jpg.php",
+              "caption": "يرفع مستخدم آخر سكربتًا غُيّر اسمه ليبدو صورة.",
+              "tone": "attack"
+            },
+            {
+              "at": "t",
+              "token": "photo.jpg.php",
+              "caption": "المحتوى نص لا صورة. يرفض فحص النوع الملف أيًّا كان اسمه.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "validate",
+        "type": "text",
+        "markdown": "## الخطوة 2: تحقق مما تستقبله\n\nالتحقق مجموعة فحوص رخيصة تعمل قبل تخزين الملف. لا يكفي أحدها وحده، لكنها مجتمعة قوية.\n\n1. **قائمة سماح للامتدادات.** اقبل الأنواع التي تحتاجها فقط، مثل `jpg` و`png` و`webp` و`pdf`. فقائمة المنع تفوتها دائمًا أشياء.\n2. **افحص المحتوى.** ترويسة `Content-Type` واسم الملف يختارهما العميل. اقرأ أولى بايتات الملف (**الرقم السحري Magic Number**) بمكتبة مثل `finfo`، وللصور تأكد أن محلّل صور يستطيع فتحها.\n3. **حدّد الحجم والعدد.** ضع الحدود في خادم الويب وبيئة تشغيل التطبيق والشيفرة، فترفض كل طبقة مبكرًا.\n4. **لا تثق في الاسم الأصلي.** ولّد اسمًا عشوائيًا بنفسك واحتفظ بالأصلي نصًا للعرض فقط، مع تهريبه عند الإخراج.\n5. **أعد ترميز الصور.** فك ترميز الصورة وحفظها من جديد يزيل البيانات الوصفية الخفية وكثيرًا من الحمولات المضمّنة.\n6. **افحص.** مرّر الملف على محرك مضاد فيروسات مثل ClamAV قبل أن يستطيع أحد تنزيله.\n\nوتعامل مع **SVG** و**HTML** بحذر إضافي. فهما صيغتان نصيتان قد تحملان سكربتًا، فما لم تكن بحاجة حقيقية إليهما فلا تقبلهما صورًا. وتستحق الأرشيفات مثل ZIP حدودًا لعدد الملفات المفكوكة وحجمها الكلي، لأن أرشيفًا صغيرًا قد يتضخم إلى غيغابايتات."
+      },
+      {
+        "id": "php",
+        "type": "code",
+        "language": "php",
+        "filename": "upload.php",
+        "caption": "معالج آمن بسيط. يفحص المحتوى والحجم والاسم ثم يخزن الملف خارج جذر الويب.",
+        "highlight": [
+          11,
+          15,
+          17
+        ],
+        "code": "<?php\nconst MAX_BYTES = 2_000_000;\nconst ALLOWED   = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];\n\nfunction store_upload(array $f, string $dir): string {\n    if ($f['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) {\n        throw new RuntimeException('Upload failed');\n    }\n    if ($f['size'] > MAX_BYTES) {\n        throw new RuntimeException('File too large');\n    }\n    $mime = (new finfo(FILEINFO_MIME_TYPE))->file($f['tmp_name']);   // reads the bytes\n    if (!isset(ALLOWED[$mime]) || getimagesize($f['tmp_name']) === false) {\n        throw new RuntimeException('Type not allowed');\n    }\n    $name = bin2hex(random_bytes(16)) . '.' . ALLOWED[$mime];        // our name, not theirs\n    if (!move_uploaded_file($f['tmp_name'], \"$dir/$name\")) {\n        throw new RuntimeException('Could not store file');\n    }\n    chmod(\"$dir/$name\", 0640);\n    return $name;\n}\n"
+      },
+      {
+        "id": "store",
+        "type": "text",
+        "markdown": "## الخطوة 3: خزّن الملفات وقدّمها بحيث لا تؤذيك\n\nقد يفشل التحقق، فافترض أن ملفًا سيئًا سيمر يومًا ما، وتأكد أنه غير ضار حيث يستقر.\n\n- **خزّن خارج جذر الويب.** إذا كان على التطبيق تقديم الملف فمرّره عبر شيفرة تتحقق من الصلاحية، أو استخدم تخزين الكائنات (Object Storage) بروابط موقّعة قصيرة العمر.\n- **عطّل التنفيذ.** إذا كان لا بد أن يقع الملف تحت خادم الويب فاضبط ذلك المجلد على تقديم المحتوى الثابت فقط ولا تمرّره أبدًا إلى PHP أو أي مفسّر.\n- **استخدم أصلًا منفصلًا.** قدّم محتوى المستخدمين من نطاق مسجَّل مختلف مثل `usercontent.example.net`. عندها لا يستطيع سكربت داخل ملف مرفوع قراءة ملفات تعريف الارتباط لموقعك الرئيسي.\n- **أرسل ترويسات آمنة.** استخدم `X-Content-Type-Options: nosniff` وقيمة `Content-Type` صحيحة، و`Content-Disposition: attachment` للوثائق التي ينبغي تنزيلها لا عرضها.\n- **اضبط الصلاحيات.** يقرأ حساب خادم الويب الملفات المرفوعة دون أن يكتب في مواضع أخرى، ولا يملك حساب الرفع شيفرتك.\n- **طبّق الحصص والتنظيف.** حدّد حدودًا لكل مستخدم وأزل الملفات المؤقتة وراقب المساحة الحرة.\n\nولا تعتمد أبدًا على فحص من جهة العميل بـJavaScript. فهو يحسّن سهولة الاستخدام لكن المهاجم يرسل الطلب ببساطة دون صفحتك. أما الترويسات من درس [ترويسات HTTP الآمنة]({C}secure-http-headers) فهي شبكة الأمان الأخيرة."
+      },
+      {
+        "id": "nginx",
+        "type": "code",
+        "language": "nginx",
+        "filename": "/etc/nginx/sites-available/example.com",
+        "caption": "الملفات المرفوعة ثابتة وغير قابلة للتنفيذ وتُرسل بترويسات آمنة. ولا يُمرَّر إلى PHP إلا مسار محدد.",
+        "highlight": [
+          2,
+          5
+        ],
+        "code": "location ^~ /uploads/ {\n    alias /srv/app-uploads/public/;\n    types { image/jpeg jpg; image/png png; image/webp webp; }\n    default_type application/octet-stream;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header Content-Security-Policy \"default-src 'none'; sandbox\" always;\n    try_files $uri =404;       # never falls through to the PHP handler\n}\n\nlocation ~ \\.php$ {\n    # Only the front controller runs PHP.\n    include fastcgi_params;\n    fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n    fastcgi_param SCRIPT_FILENAME /srv/app/public/index.php;\n}\n"
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "تحقق من الضوابط على خادمك",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "printf '<?php echo \"test\"; ?>' > /tmp/not-a-photo.jpg && file --mime-type /tmp/not-a-photo.jpg",
+            "output": "/tmp/not-a-photo.jpg: text/x-php",
+            "comment": "الامتداد يقول jpg والمحتوى يقول PHP. هذا هو التضارب الذي يكشفه فحص النوع."
+          },
+          {
+            "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' -F 'photo=@/tmp/not-a-photo.jpg' https://www.example.com/profile/photo",
+            "output": "422",
+            "comment": "يرفض التطبيق الملف لأن نوعه غير صالح."
+          },
+          {
+            "cmd": "curl -sI https://www.example.com/uploads/3f9a1c0be27d4a5f.png | grep -iE 'content-type|nosniff|content-security'",
+            "output": "content-type: image/png\nx-content-type-options: nosniff\ncontent-security-policy: default-src 'none'; sandbox"
+          },
+          {
+            "cmd": "clamscan --infected --no-summary /srv/app-uploads/incoming/",
+            "output": "/srv/app-uploads/incoming/eicar-test.txt: Eicar-Signature FOUND",
+            "comment": "ملف EICAR اختبار قياسي غير ضار لمضادات الفيروسات. لا تستخدم برمجيات خبيثة حقيقية أبدًا."
+          }
+        ],
+        "caption": "مخرجات توضيحية من خادم اختبار."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "فحوص تبدو آمنة وليست كذلك",
+        "markdown": "- **فحص الامتداد وحده.** أسماء مثل `a.php.jpg` أو `a.jpg%00.php` تربك الشيفرة الساذجة.\n- **الوثوق بترويسة `Content-Type`.** العميل يتحكم بها.\n- **الاحتفاظ باسم ملف المستخدم.** يتيح الاجتياز والاستبدال.\n- **قبول SVG صورةً.** قد يحمل سكربتًا.\n- **الفحص بعد النشر.** افحص قبل أن يصبح الملف قابلًا للتنزيل."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم خادم ويب مخبريًا تملكه، ولا تستخدم أبدًا موقعًا مشتركًا أو موقع إنتاج.\n\n1. ابنِ نموذجًا صغيرًا يخزن الملفات المرفوعة في مجلد تحت جذر الويب مع تمكين التنفيذ. لاحظ خطورة ذلك ثم تراجع عنه.\n2. انقل المجلد خارج جذر الويب وطبّق كتلة `location` في Nginx أعلاه.\n3. نفّذ الدالة `store_upload` وجرّب صورة PNG حقيقية وملفًا نصيًا غُيّر اسمه إلى `.jpg` وملفًا أكبر من الحد. دوّن أي فحص رفض كلًّا منها.\n4. ثبّت ClamAV ونزّل ملف الاختبار غير الضار EICAR من موقع EICAR وتأكد أن `clamscan` يرصده.\n5. افحص ترويسات الاستجابة لملف مخزَّن بالأمر `curl -I`."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "الرقم السحري",
+            "definition": "أولى بايتات الملف التي تحدد صيغته الحقيقية."
+          },
+          {
+            "term": "قشرة الويب (Web Shell)",
+            "definition": "سكربت على الخادم يتيح لمستخدم غير مخوَّل تنفيذ أوامر عبر الويب."
+          },
+          {
+            "term": "اجتياز المسار",
+            "definition": "استخدام تسلسلات مثل ../ في اسم للوصول إلى ملفات خارج المجلد المقصود."
+          },
+          {
+            "term": "قائمة السماح",
+            "definition": "قاعدة تقبل الأنواع أو القيم المعتمدة صراحةً فقط."
+          },
+          {
+            "term": "إعادة الترميز",
+            "definition": "فك ترميز ملف، كصورة، وحفظه من جديد لإزالة المحتوى غير المتوقع."
+          },
+          {
+            "term": "رابط موقّع",
+            "definition": "رابط مؤقت إلى كائن خاص يحمل دليلًا على أنه مصرَّح به."
+          },
+          {
+            "term": "Content-Disposition",
+            "definition": "ترويسة تأمر المتصفح بتنزيل الملف بدل عرضه."
+          },
+          {
+            "term": "ملف اختبار EICAR",
+            "definition": "نص قياسي غير ضار ترصده مضادات الفيروسات لأغراض الاختبار."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا لا يكفي فحص امتداد الملف وحده؟",
+            "options": [
+              "العميل يختار الاسم فيستطيع الكذب بشأن المحتوى",
+              "الامتدادات مشفّرة",
+              "الخوادم تتجاهل الامتدادات",
+              "تتغير الامتدادات عند الرفع"
+            ],
+            "answer": 0,
+            "explanation": "الاسم تحت تحكم المهاجم. افحص المحتوى وولّد اسمك أنت."
+          },
+          {
+            "question": "أي خيارات التخزين يحدّ أكثر من ضرر ملف تسلل عبر التحقق؟",
+            "options": [
+              "مجلد داخل جذر الويب مع تمكين PHP",
+              "مجلد خارج جذر الويب يُقدَّم محتوى ثابتًا غير قابل للتنفيذ",
+              "مجلد شيفرة التطبيق",
+              "مجلد مشترك قابل للكتابة للجميع"
+            ],
+            "answer": 1,
+            "explanation": "إذا لم يكن الملف قابلًا للتنفيذ وقُدّم بأمان، فإن فحصًا فائتًا يسبب ضررًا أقل بكثير."
+          },
+          {
+            "question": "أي الضوابط تنتمي إلى تصميم رفع آمن؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "أسماء ملفات عشوائية يولّدها الخادم",
+              "حدود للحجم والعدد",
+              "فحص مضاد الفيروسات قبل النشر",
+              "الوثوق بـContent-Type المرسل من المتصفح"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الأسماء العشوائية والحدود والفحص كلها تفيد. أما ترويسة Content-Type فيتحكم بها العميل."
+          },
+          {
+            "question": "لماذا تُقدَّم الملفات المرفوعة من نطاق منفصل؟",
+            "options": [
+              "يسرّع التنزيل",
+              "لا يصل سكربت داخل ملف مرفوع إلى ملفات الارتباط أو تخزين الموقع الرئيسي",
+              "يلغي الحاجة إلى HTTPS",
+              "يوقف فحص الملفات"
+            ],
+            "answer": 1,
+            "explanation": "تعزل المتصفحات الأصول، فيبقى المحتوى النشط بعيدًا عن ملفات ارتباط جلستك."
+          },
+          {
+            "question": "أي الصيغ تتطلب حذرًا إضافيًا لأنها قد تحمل سكربتًا؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "SVG",
+              "HTML",
+              "PNG عادية تجتاز فك ترميز الصور",
+              "PDF بمحتوى نشط"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "SVG وHTML نصوص تشغّلها المتصفحات، وقد تحوي ملفات PDF إجراءات. أما الصورة النقطية المفكوكة ترميزها بشكل سليم فهي أأمن بكثير."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- الملفات المرفوعة بيانات غير موثوقة تُخزَّن على نظامك، لذا يجب أن يتحقق الخادم من كل خاصية فيها.\n- تحقق بأنواع من قائمة سماح وفحص الأرقام السحرية وحدود الحجم والأسماء العشوائية وإعادة ترميز الصور.\n- افحص بمضاد الفيروسات قبل أن يصبح الملف متاحًا.\n- خزّن خارج جذر الويب وعطّل التنفيذ واستخدم أصلًا منفصلًا وأرسل `nosniff` وسياسة CSP مقيِّدة.\n- لا تعتمد أبدًا على فحوص جهة العميل أو على الامتداد وحده.\n\nانتقل بعد ذلك لترى كيف يمكن لمدخل آخر أن يحوّل خادمك ضد الأنظمة الداخلية في [تزوير الطلبات من جانب الخادم (SSRF)](/learn/systems-infrastructure-security/server-side-request-forgery-ssrf)، وراجع العملية الأوسع في [تقييم ثغرات تطبيقات الويب](/learn/systems-infrastructure-security/web-application-vulnerability-assessment)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,568 @@
+{
+  "slug": "container-runtime-security",
+  "title": "Container Runtime Security",
+  "summary": "Restrict running containers with dropped capabilities, seccomp, AppArmor and read-only filesystems, verify them from the host, and detect suspicious behavior.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain how capabilities, seccomp, AppArmor/SELinux and no-new-privileges stack",
+    "Run a container with least-privilege runtime settings",
+    "Verify enforced restrictions through /proc and docker inspect",
+    "Choose runtime signals worth collecting and alerting on",
+    "Avoid unsafe shortcuts such as seccomp=unconfined and routine docker exec"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A scanned, signed image is deployed with every best practice. Three weeks later an attacker exploits a flaw in the web framework that no scanner knew about. What can they do next? That depends entirely on how the container runs. If it runs as root with all capabilities and a writable filesystem, they install tools and probe the host. If it runs as a limited user with a read-only filesystem and a tight system call filter, the same flaw gives them almost nothing.\n\n**Runtime security** is the set of controls that apply while the container is running: what it may do, what it may touch, and how you notice when it behaves strangely. This lesson covers the kernel features that restrict a running container, the configuration that enables them, and the signals you should watch."
+    },
+    {
+      "id": "layers",
+      "type": "text",
+      "markdown": "## Four runtime restrictions that stack\n\nLinux restricts a container process in four independent ways. A bug has to defeat all of them to hurt the host.\n\n| Control | What it restricts | Default in Docker | How to tighten |\n|:--|:--|:--|:--|\n| Capabilities | Pieces of root power | A reduced set of about 14 | `--cap-drop ALL`, then `--cap-add` only what is needed |\n| seccomp | Which system calls may be made | Default profile blocks around 40 calls | A custom, application-specific profile |\n| AppArmor / SELinux | Which files, networks and programs are allowed | `docker-default` on AppArmor hosts | Custom profile per workload |\n| no-new-privileges | Gaining rights through setuid binaries | Off | `--security-opt no-new-privileges` |\n\n### Capabilities\n\nLinux splits root into about 40 **capabilities**. A web server needs only `NET_BIND_SERVICE` to use port 80, and usually nothing at all if it listens on port 8080. Dangerous capabilities include `SYS_ADMIN` (a catch-all), `SYS_PTRACE` (inspect other processes), `NET_ADMIN` (change network configuration) and `DAC_OVERRIDE` (ignore file permissions). For the background, see [Linux Capabilities and Privilege Escalation](/learn/systems-infrastructure-security/linux-capabilities-and-privilege-escalation).\n\n### seccomp\n\nA **seccomp** profile is a list of allowed system calls. Anything else returns an error or kills the process. The default profile is a good baseline, and many kernel exploits need calls that it blocks. Never use `seccomp=unconfined` to \"make it work\"; find the specific blocked call instead.\n\n### AppArmor and SELinux\n\nMandatory access control confines the process even when it runs as root: it cannot read `/etc/shadow`, write to `/proc/sys` or mount filesystems unless the profile allows it. See [Linux Security Modules: AppArmor and SELinux](/learn/systems-infrastructure-security/linux-security-modules-apparmor-and-selinux)."
+    },
+    {
+      "id": "stack-anim",
+      "type": "animation",
+      "kind": "layers",
+      "title": "A request passes four runtime filters",
+      "caption": "Each layer can refuse an action that the layer above allowed.",
+      "data": {
+        "layers": [
+          {
+            "label": "Application action",
+            "sub": "mount, ptrace, write"
+          },
+          {
+            "label": "no-new-privileges",
+            "sub": "setuid blocked"
+          },
+          {
+            "label": "Capabilities",
+            "sub": "CAP_SYS_ADMIN?"
+          },
+          {
+            "label": "seccomp",
+            "sub": "syscall allow-list"
+          },
+          {
+            "label": "AppArmor / SELinux",
+            "sub": "path and resource rules"
+          }
+        ],
+        "steps": [
+          {
+            "layer": 0,
+            "packet": [
+              "Action"
+            ],
+            "caption": "A compromised process tries to mount a filesystem to reach host data."
+          },
+          {
+            "layer": 1,
+            "packet": [
+              "Action"
+            ],
+            "caption": "It cannot gain extra rights through a setuid helper, so it stays unprivileged."
+          },
+          {
+            "layer": 2,
+            "packet": [
+              "Cap check",
+              "Action"
+            ],
+            "caption": "The mount needs CAP_SYS_ADMIN. The capability was dropped, so the request is denied here."
+          },
+          {
+            "layer": 3,
+            "packet": [
+              "Syscall",
+              "Cap check",
+              "Action"
+            ],
+            "caption": "Even with the capability, seccomp would block the mount system call."
+          },
+          {
+            "layer": 4,
+            "packet": [
+              "MAC",
+              "Syscall",
+              "Cap check",
+              "Action"
+            ],
+            "caption": "Even if the call were allowed, the AppArmor profile denies mount and writes to sensitive paths."
+          }
+        ]
+      }
+    },
+    {
+      "id": "compose",
+      "type": "code",
+      "language": "yaml",
+      "code": "services:\n  web:\n    image: registry.example.com/team/webapp:1.4.2\n    user: \"10001:10001\"\n    read_only: true\n    tmpfs:\n      - /tmp:size=16m,noexec,nosuid\n    cap_drop: [ALL]\n    security_opt:\n      - no-new-privileges:true\n      - seccomp=/etc/docker/seccomp/webapp.json\n      - apparmor=webapp-profile\n    pids_limit: 100\n    mem_limit: 256m\n    restart: unless-stopped\n    ports:\n      - \"192.0.2.10:8080:8080\"\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"-qO-\", \"http://127.0.0.1:8080/health\"]\n      interval: 30s",
+      "filename": "compose.yaml",
+      "caption": "A Compose service that applies every runtime control from this lesson. The custom seccomp and AppArmor profiles are files you maintain."
+    },
+    {
+      "id": "verify-term",
+      "type": "terminal",
+      "title": "Verify the restrictions from the host",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "docker inspect --format '{{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.HostConfig.ReadonlyRootfs}}' web",
+          "output": "[ALL] [no-new-privileges:true seccomp=/etc/docker/seccomp/webapp.json apparmor=webapp-profile] true",
+          "comment": "The configuration the daemon applied."
+        },
+        {
+          "cmd": "docker exec web grep -E 'CapEff|NoNewPrivs|Seccomp' /proc/1/status",
+          "output": "CapEff:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2",
+          "comment": "`CapEff` all zeros means no effective capabilities. `NoNewPrivs: 1` is active. `Seccomp: 2` means a filter is loaded."
+        },
+        {
+          "cmd": "docker exec web cat /proc/1/attr/current",
+          "output": "webapp-profile (enforce)",
+          "comment": "The process is confined by the named AppArmor profile in enforce mode."
+        },
+        {
+          "cmd": "sudo aa-status | head -4",
+          "output": "apparmor module is loaded.\n38 profiles are loaded.\n36 profiles are in enforce mode.\n   webapp-profile",
+          "comment": "Host-level view of loaded profiles. On SELinux hosts use `getenforce` and `ps -eZ` instead."
+        }
+      ],
+      "caption": "Read the process status inside the container; the kernel reports what is really enforced."
+    },
+    {
+      "id": "behavior",
+      "type": "text",
+      "markdown": "## Watching behavior at run time\n\nRestrictions reduce what an attacker can do. **Detection** tells you when something is wrong. Containers are good to monitor because a healthy one is predictable: a web server should not start a shell, install packages or connect to unfamiliar addresses.\n\nGood signals to collect:\n\n- **Process execution inside containers.** A shell (`sh`, `bash`) spawned in a production container is rarely legitimate.\n- **File changes** in directories that should be static, such as `/etc`, `/usr/bin` and the application folder.\n- **Network connections** to addresses outside the expected set, or listening on unexpected ports.\n- **Sensitive file reads**, for example `/etc/shadow` or mounted secrets.\n- **Privilege events**, such as a process changing its UID or loading a kernel module.\n- **Container lifecycle:** new containers, privileged starts and image changes, from `docker events` and the daemon audit trail.\n\nTools such as Falco, Tetragon and your EDR agent use kernel hooks (eBPF) to produce these events. Send them to your central log system and alert on high-confidence patterns. For the detection side, see [Runtime Threat Detection](/learn/systems-infrastructure-security/runtime-threat-detection) and [Container Security Monitoring](/learn/systems-infrastructure-security/container-security-monitoring)."
+    },
+    {
+      "id": "falco",
+      "type": "code",
+      "language": "yaml",
+      "code": "- rule: Shell spawned in a production container\n  desc: Detect an interactive shell started inside a container labeled env=prod\n  condition: >\n    evt.type = execve and container.id != host\n    and proc.name in (sh, bash, ash)\n    and container.label.env = prod\n  output: >\n    Shell in container (user=%user.name container=%container.name\n    image=%container.image.repository cmd=%proc.cmdline)\n  priority: WARNING\n  tags: [container, shell]",
+      "filename": "shell-in-container.yaml",
+      "caption": "A Falco-style detection rule. Field names follow Falco's syntax; test any rule in a lab and tune it against your normal activity first."
+    },
+    {
+      "id": "rollout",
+      "type": "text",
+      "markdown": "## A practical rollout path\n\nTightening a fleet all at once breaks applications. Work in stages and keep each step reversible.\n\n1. **Inventory.** List running containers with their user, capabilities, mounts and network mode, using the audit commands from [Docker Security Fundamentals](/learn/systems-infrastructure-security/docker-security-fundamentals).\n2. **Set the easy wins.** Run as non-root, add `no-new-privileges`, and set memory and process limits. These rarely break anything.\n3. **Drop capabilities in staging.** Start with `--cap-drop ALL`, watch the application logs for `Operation not permitted`, and add back the single capability each error points to.\n4. **Make the filesystem read-only.** Add `tmpfs` mounts for the paths the application really writes, such as `/tmp` or a cache folder.\n5. **Profile system calls.** Run the workload through its tests with a tracing tool in a lab, generate a seccomp profile from what it used, then review it by hand before enforcing.\n6. **Enforce and monitor.** Move AppArmor profiles from complain mode to enforce mode only after a clean observation period.\n\nWrite the final settings into your Compose files, Helm charts or deployment templates so every new service starts hardened. A control that exists only in someone's memory will be missing from the next deployment."
+    },
+    {
+      "id": "rt-tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Start in complain mode",
+      "markdown": "When you write a new AppArmor profile, load it in complain mode first with `aa-complain`. The kernel logs every action the profile would have denied, but nothing breaks. Review those log lines for a week, remove false alarms, and only then switch to enforce mode. The same observe-then-enforce habit works for seccomp profiles and SELinux permissive domains."
+    },
+    {
+      "id": "rt-warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not use docker exec as a routine",
+      "markdown": "Every `docker exec` into production is an interactive shell that looks the same as an intruder's. Prefer logs, metrics and a separate debug container started on purpose and removed afterward. If exec is allowed, record who ran it and why, and make sure your alert rules distinguish approved sessions from the rest."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a Linux VM you own with Docker installed:\n\n1. Start `docker run -d --name rt1 docker.io/library/nginx:1.27` and read `/proc/1/status` inside it. Note `CapEff`, `NoNewPrivs` and `Seccomp`.\n2. Start `rt2` with `--cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges` and compare the same fields.\n3. Start `rt3` with `--security-opt seccomp=unconfined` and observe the `Seccomp` value, then explain why this is a downgrade.\n4. In another terminal run `docker events --filter type=container` and watch the events as you start and stop containers.\n5. Remove everything with `docker rm -f rt1 rt2 rt3`."
+    },
+    {
+      "id": "kt",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Runtime security",
+          "definition": "Controls and monitoring that apply while a container is running."
+        },
+        {
+          "term": "Capability",
+          "definition": "A fine-grained unit of root privilege that can be dropped or granted."
+        },
+        {
+          "term": "seccomp profile",
+          "definition": "An allow-list of system calls a process may use."
+        },
+        {
+          "term": "AppArmor",
+          "definition": "A Linux mandatory access control system based on path rules."
+        },
+        {
+          "term": "SELinux",
+          "definition": "A label-based mandatory access control system used on RHEL-family hosts."
+        },
+        {
+          "term": "no-new-privileges",
+          "definition": "A flag that stops a process gaining rights through setuid programs."
+        },
+        {
+          "term": "eBPF",
+          "definition": "A kernel technology that lets monitoring tools observe events safely."
+        },
+        {
+          "term": "Falco",
+          "definition": "An open source runtime detection engine for container and host events."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which control restricts the system calls a container process may make?",
+          "options": [
+            "seccomp",
+            "cgroups",
+            "Network namespace",
+            "Image digest"
+          ],
+          "answer": 0,
+          "explanation": "seccomp filters system calls. cgroups limit resources and namespaces limit visibility."
+        },
+        {
+          "question": "Which settings tighten a container at run time? (choose all that apply)",
+          "options": [
+            "`--cap-drop ALL`",
+            "`--read-only`",
+            "`--security-opt seccomp=unconfined`",
+            "`--security-opt no-new-privileges`"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Dropping capabilities, a read-only root and no-new-privileges all reduce what a process can do. Unconfined seccomp removes protection."
+        },
+        {
+          "question": "In `/proc/1/status` inside a container, `CapEff: 0000000000000000` means what?",
+          "options": [
+            "The process has all capabilities",
+            "The container is stopped",
+            "The process has no effective capabilities",
+            "AppArmor is disabled"
+          ],
+          "answer": 2,
+          "explanation": "A zero mask means no effective capabilities, which is the goal for most applications."
+        },
+        {
+          "question": "Which event in a production web container is most suspicious?",
+          "options": [
+            "Writing a log line",
+            "Answering an HTTP request",
+            "A health check running",
+            "A new interactive shell being started"
+          ],
+          "answer": 3,
+          "explanation": "Web servers do not normally start shells. This is a high-value detection rule."
+        },
+        {
+          "question": "Why is seccomp=unconfined a poor fix for an application that fails to start?",
+          "options": [
+            "It removes the system call filter for everything, instead of allowing only the one call the app needs",
+            "It deletes the image",
+            "It slows the network",
+            "It changes the hostname"
+          ],
+          "answer": 0,
+          "explanation": "Find the blocked call from logs or strace and add only that to a custom profile."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nRuntime security assumes that something will eventually go wrong inside a container and limits the damage. Four kernel controls stack: dropped capabilities, a seccomp filter, an AppArmor or SELinux profile and `no-new-privileges`. Add a read-only root filesystem, a non-root user and resource limits, and verify the result from `/proc/1/status` and `docker inspect`.\n\nThen watch behavior. Collect process, file, network and lifecycle events, alert on shells and unexpected connections in production containers, and keep exec access rare and logged. Together with image scanning, these controls make a compromised container a small, visible incident. Continue with [Docker Daemon Security](/learn/systems-infrastructure-security/docker-daemon-security) to protect the control plane behind your containers."
+    }
+  ],
+  "ar": {
+    "title": "أمن بيئة تشغيل الحاويات",
+    "summary": "قيّد الحاويات العاملة بإسقاط الصلاحيات وseccomp وAppArmor وأنظمة الملفات للقراءة فقط، وتحقق منها من المضيف، واكتشف السلوك المريب.",
+    "objectives": [
+      "اشرح كيف تتراكم الصلاحيات وseccomp وAppArmor/SELinux وno-new-privileges",
+      "شغّل حاوية بإعدادات وقت تشغيل بأقل الامتيازات",
+      "تحقق من القيود المنفَّذة عبر /proc وdocker inspect",
+      "اختر إشارات وقت التشغيل التي تستحق الجمع والتنبيه",
+      "تجنّب الاختصارات غير الآمنة مثل seccomp=unconfined وdocker exec الروتيني"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تُنشر صورة مفحوصة وموقّعة وفق كل الممارسات الجيدة. بعد ثلاثة أسابيع يستغل مهاجم ثغرة في إطار عمل الويب لم يعرفها أي ماسح. ماذا يستطيع أن يفعل بعد ذلك؟ يعتمد الأمر كليًا على طريقة تشغيل الحاوية. إن كانت تعمل بصلاحيات root وكل الصلاحيات ونظام ملفات قابل للكتابة، ثبّت أدواته وجسّ المضيف. وإن كانت تعمل بمستخدم محدود ونظام ملفات للقراءة فقط ومرشِّح استدعاءات نظام محكم، فالثغرة نفسها لا تمنحه إلا القليل.\n\n**أمن وقت التشغيل (Runtime security)** هو مجموعة الضوابط التي تنطبق أثناء عمل الحاوية: ما يجوز لها فعله، وما يجوز لها لمسه، وكيف تلاحظ سلوكها الغريب. يغطي هذا الدرس ميزات النواة التي تقيّد الحاوية العاملة، والإعدادات التي تفعّلها، والإشارات التي ينبغي أن تراقبها."
+      },
+      {
+        "id": "layers",
+        "type": "text",
+        "markdown": "## أربعة قيود وقت التشغيل تتراكم\n\nيقيّد Linux عملية الحاوية بأربع طرق مستقلة. ولكي يؤذي خلل ما المضيف عليه أن يتغلب عليها كلها.\n\n| الضابط | ما الذي يقيّده | الافتراضي في Docker | كيف تحكمه |\n|:--|:--|:--|:--|\n| الصلاحيات (Capabilities) | قطع من قوة root | مجموعة مخفّضة من نحو 14 | `--cap-drop ALL` ثم `--cap-add` لما يلزم فقط |\n| seccomp | استدعاءات النظام المسموح بها | الملف الافتراضي يحجب نحو 40 استدعاء | ملف مخصص للتطبيق |\n| AppArmor / SELinux | الملفات والشبكات والبرامج المسموحة | `docker-default` على مضيفات AppArmor | ملف مخصص لكل حمل عمل |\n| no-new-privileges | اكتساب الحقوق عبر ملفات setuid | معطّل | `--security-opt no-new-privileges` |\n\n### الصلاحيات\n\nيقسّم Linux قوة root إلى نحو 40 **صلاحية (Capability)**. يحتاج خادم الويب فقط إلى `NET_BIND_SERVICE` ليستخدم المنفذ 80، وغالبًا لا يحتاج إلى شيء إن استمع على المنفذ 8080. ومن الصلاحيات الخطرة `SYS_ADMIN` (الشاملة) و`SYS_PTRACE` (فحص عمليات أخرى) و`NET_ADMIN` (تغيير إعدادات الشبكة) و`DAC_OVERRIDE` (تجاهل أذونات الملفات). للخلفية راجع [Linux Capabilities and Privilege Escalation](/learn/systems-infrastructure-security/linux-capabilities-and-privilege-escalation).\n\n### seccomp\n\nملف **seccomp** قائمة باستدعاءات النظام المسموحة. وأي استدعاء غيرها يعيد خطأ أو يقتل العملية. الملف الافتراضي خط أساس جيد، وكثير من استغلالات النواة يحتاج إلى استدعاءات يحجبها. لا تستخدم `seccomp=unconfined` أبدًا «لكي يعمل التطبيق»؛ بل اعثر على الاستدعاء المحجوب تحديدًا.\n\n### AppArmor وSELinux\n\nيقيّد التحكم الإلزامي في الوصول العملية حتى لو عملت بصلاحيات root: فلا تستطيع قراءة `/etc/shadow` أو الكتابة في `/proc/sys` أو تحميل أنظمة ملفات ما لم يسمح الملف بذلك. راجع [Linux Security Modules: AppArmor and SELinux](/learn/systems-infrastructure-security/linux-security-modules-apparmor-and-selinux)."
+      },
+      {
+        "id": "stack-anim",
+        "type": "animation",
+        "kind": "layers",
+        "title": "طلب يمر عبر أربعة مرشِّحات وقت التشغيل",
+        "caption": "تستطيع كل طبقة رفض إجراء سمحت به الطبقة التي فوقها.",
+        "data": {
+          "layers": [
+            {
+              "label": "إجراء التطبيق",
+              "sub": "mount, ptrace, write"
+            },
+            {
+              "label": "no-new-privileges",
+              "sub": "حجب setuid"
+            },
+            {
+              "label": "Capabilities",
+              "sub": "CAP_SYS_ADMIN?"
+            },
+            {
+              "label": "seccomp",
+              "sub": "قائمة السماح بالاستدعاءات"
+            },
+            {
+              "label": "AppArmor / SELinux",
+              "sub": "قواعد المسارات والموارد"
+            }
+          ],
+          "steps": [
+            {
+              "layer": 0,
+              "packet": [
+                "Action"
+              ],
+              "caption": "عملية مخترَقة تحاول تحميل نظام ملفات للوصول إلى بيانات المضيف."
+            },
+            {
+              "layer": 1,
+              "packet": [
+                "Action"
+              ],
+              "caption": "لا تستطيع اكتساب حقوق إضافية عبر مساعد setuid فتبقى بلا امتيازات."
+            },
+            {
+              "layer": 2,
+              "packet": [
+                "Cap check",
+                "Action"
+              ],
+              "caption": "يحتاج التحميل إلى CAP_SYS_ADMIN. أُسقطت الصلاحية فيُرفض الطلب هنا."
+            },
+            {
+              "layer": 3,
+              "packet": [
+                "Syscall",
+                "Cap check",
+                "Action"
+              ],
+              "caption": "حتى مع الصلاحية كان seccomp سيحجب استدعاء mount."
+            },
+            {
+              "layer": 4,
+              "packet": [
+                "MAC",
+                "Syscall",
+                "Cap check",
+                "Action"
+              ],
+              "caption": "وحتى لو سُمح بالاستدعاء فإن ملف AppArmor يمنع التحميل والكتابة في المسارات الحساسة."
+            }
+          ]
+        }
+      },
+      {
+        "id": "compose",
+        "type": "code",
+        "language": "yaml",
+        "code": "services:\n  web:\n    image: registry.example.com/team/webapp:1.4.2\n    user: \"10001:10001\"\n    read_only: true\n    tmpfs:\n      - /tmp:size=16m,noexec,nosuid\n    cap_drop: [ALL]\n    security_opt:\n      - no-new-privileges:true\n      - seccomp=/etc/docker/seccomp/webapp.json\n      - apparmor=webapp-profile\n    pids_limit: 100\n    mem_limit: 256m\n    restart: unless-stopped\n    ports:\n      - \"192.0.2.10:8080:8080\"\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"-qO-\", \"http://127.0.0.1:8080/health\"]\n      interval: 30s",
+        "filename": "compose.yaml",
+        "caption": "خدمة Compose تطبق كل ضوابط وقت التشغيل في هذا الدرس. ملفا seccomp وAppArmor المخصصان ملفان تتولى صيانتهما."
+      },
+      {
+        "id": "verify-term",
+        "type": "terminal",
+        "title": "التحقق من القيود من المضيف",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "docker inspect --format '{{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.HostConfig.ReadonlyRootfs}}' web",
+            "output": "[ALL] [no-new-privileges:true seccomp=/etc/docker/seccomp/webapp.json apparmor=webapp-profile] true",
+            "comment": "الإعداد الذي طبقته الخدمة الخلفية."
+          },
+          {
+            "cmd": "docker exec web grep -E 'CapEff|NoNewPrivs|Seccomp' /proc/1/status",
+            "output": "CapEff:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2",
+            "comment": "القيمة `CapEff` كلها أصفار تعني عدم وجود صلاحيات فعّالة. و`NoNewPrivs: 1` مفعّل. و`Seccomp: 2` تعني أن مرشِّحًا محمّل."
+          },
+          {
+            "cmd": "docker exec web cat /proc/1/attr/current",
+            "output": "webapp-profile (enforce)",
+            "comment": "العملية مقيّدة بملف AppArmor المسمى في وضع الإنفاذ."
+          },
+          {
+            "cmd": "sudo aa-status | head -4",
+            "output": "apparmor module is loaded.\n38 profiles are loaded.\n36 profiles are in enforce mode.\n   webapp-profile",
+            "comment": "منظور على مستوى المضيف للملفات المحمّلة. وعلى مضيفات SELinux استخدم `getenforce` و`ps -eZ`."
+          }
+        ],
+        "caption": "اقرأ حالة العملية داخل الحاوية؛ فالنواة تعلن ما يُنفَّذ فعلًا."
+      },
+      {
+        "id": "behavior",
+        "type": "text",
+        "markdown": "## مراقبة السلوك وقت التشغيل\n\nتقلل القيود ما يستطيع المهاجم فعله، أما **الكشف** فيخبرك حين يكون هناك خطب. الحاويات سهلة المراقبة لأن السليمة منها قابلة للتوقع: فخادم الويب لا ينبغي أن يشغّل صدفة أو يثبّت حزمًا أو يتصل بعناوين غير مألوفة.\n\nإشارات جيدة لجمعها:\n\n- **تنفيذ العمليات داخل الحاويات.** صدفة (`sh` أو `bash`) تُطلق في حاوية إنتاج نادرًا ما تكون مشروعة.\n- **تغييرات الملفات** في مجلدات يفترض أن تكون ثابتة مثل `/etc` و`/usr/bin` ومجلد التطبيق.\n- **الاتصالات الشبكية** بعناوين خارج المجموعة المتوقعة، أو الاستماع على منافذ غير متوقعة.\n- **قراءات الملفات الحساسة** مثل `/etc/shadow` أو الأسرار المحمّلة.\n- **أحداث الامتيازات** مثل تغيير عملية لمعرّفها UID أو تحميلها وحدة نواة.\n- **دورة حياة الحاوية:** الحاويات الجديدة والتشغيل بامتيازات وتغيير الصور، من `docker events` ومسار تدقيق الخدمة الخلفية.\n\nتستخدم أدوات مثل Falco وTetragon ووكيل EDR لديك خطافات النواة (eBPF) لإنتاج هذه الأحداث. أرسلها إلى نظام السجلات المركزي ونبّه على الأنماط عالية الثقة. وللجانب المتعلق بالكشف راجع [Runtime Threat Detection](/learn/systems-infrastructure-security/runtime-threat-detection) و[Container Security Monitoring](/learn/systems-infrastructure-security/container-security-monitoring)."
+      },
+      {
+        "id": "falco",
+        "type": "code",
+        "language": "yaml",
+        "code": "- rule: Shell spawned in a production container\n  desc: Detect an interactive shell started inside a container labeled env=prod\n  condition: >\n    evt.type = execve and container.id != host\n    and proc.name in (sh, bash, ash)\n    and container.label.env = prod\n  output: >\n    Shell in container (user=%user.name container=%container.name\n    image=%container.image.repository cmd=%proc.cmdline)\n  priority: WARNING\n  tags: [container, shell]",
+        "filename": "shell-in-container.yaml",
+        "caption": "قاعدة كشف على طراز Falco. أسماء الحقول تتبع صياغة Falco؛ جرّب أي قاعدة في مختبر واضبطها على نشاطك المعتاد أولًا."
+      },
+      {
+        "id": "rollout",
+        "type": "text",
+        "markdown": "## مسار عملي للتطبيق\n\nإحكام أسطول كامل دفعة واحدة يكسر التطبيقات. اعمل على مراحل وأبقِ كل خطوة قابلة للتراجع.\n\n1. **الجرد.** اسرد الحاويات العاملة مع مستخدمها وصلاحياتها ونقاط تحميلها ووضع شبكتها، باستخدام أوامر التدقيق من [Docker Security Fundamentals](/learn/systems-infrastructure-security/docker-security-fundamentals).\n2. **ابدأ بالمكاسب السهلة.** شغّل بمستخدم غير root وأضف `no-new-privileges` وحدّد حدود الذاكرة والعمليات. نادرًا ما تكسر هذه شيئًا.\n3. **أسقط الصلاحيات في بيئة الاختبار.** ابدأ بـ`--cap-drop ALL` وراقب سجلات التطبيق بحثًا عن `Operation not permitted`، وأعد إضافة الصلاحية الوحيدة التي يشير إليها كل خطأ.\n4. **اجعل نظام الملفات للقراءة فقط.** أضف نقاط تحميل `tmpfs` للمسارات التي يكتب فيها التطبيق فعلًا مثل `/tmp` أو مجلد التخزين المؤقت.\n5. **ارسم ملف استدعاءات النظام.** شغّل حمل العمل عبر اختباراته بأداة تتبع في مختبر، وولّد ملف seccomp مما استخدمه، ثم راجعه يدويًا قبل الإنفاذ.\n6. **أنفذ وراقب.** انقل ملفات AppArmor من وضع الشكوى إلى وضع الإنفاذ بعد فترة مراقبة نظيفة فقط.\n\nاكتب الإعدادات النهائية في ملفات Compose أو مخططات Helm أو قوالب النشر لتبدأ كل خدمة جديدة محكَمة. فالضابط الموجود في ذاكرة شخص ما فقط سيغيب عن النشر التالي."
+      },
+      {
+        "id": "rt-tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "ابدأ بوضع الشكوى",
+        "markdown": "عند كتابة ملف AppArmor جديد، حمّله في وضع الشكوى أولًا بالأمر `aa-complain`. تسجل النواة كل إجراء كان الملف سيرفضه دون أن ينكسر شيء. راجع أسطر السجل هذه أسبوعًا، وأزل الإنذارات الكاذبة، ثم انتقل إلى وضع الإنفاذ. وتصلح عادة «راقب ثم أنفذ» نفسها لملفات seccomp ومجالات SELinux في الوضع المتساهل."
+      },
+      {
+        "id": "rt-warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تجعل docker exec أمرًا روتينيًا",
+        "markdown": "كل `docker exec` إلى الإنتاج صدفة تفاعلية تبدو مماثلة لصدفة المتسلل. فضّل السجلات والمقاييس وحاوية تصحيح منفصلة تُشغَّل عمدًا وتُحذف بعد ذلك. وإن سُمح بالتنفيذ فسجّل من نفّذه ولماذا، وتأكد أن قواعد التنبيه تميّز الجلسات المعتمدة من غيرها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة Linux افتراضية تملكها وفيها Docker:\n\n1. شغّل `docker run -d --name rt1 docker.io/library/nginx:1.27` واقرأ `/proc/1/status` داخلها. دوّن `CapEff` و`NoNewPrivs` و`Seccomp`.\n2. شغّل `rt2` مع `--cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges` وقارن الحقول نفسها.\n3. شغّل `rt3` مع `--security-opt seccomp=unconfined` ولاحظ قيمة `Seccomp`، ثم اشرح لماذا يُعد هذا تراجعًا.\n4. في طرفية أخرى نفّذ `docker events --filter type=container` وراقب الأحداث وأنت تشغّل الحاويات وتوقفها.\n5. احذف كل شيء بالأمر `docker rm -f rt1 rt2 rt3`."
+      },
+      {
+        "id": "kt",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "أمن وقت التشغيل",
+            "definition": "ضوابط ومراقبة تنطبق أثناء عمل الحاوية."
+          },
+          {
+            "term": "الصلاحية",
+            "definition": "وحدة دقيقة من امتياز root يمكن إسقاطها أو منحها."
+          },
+          {
+            "term": "ملف seccomp",
+            "definition": "قائمة سماح باستدعاءات النظام التي يجوز للعملية استخدامها."
+          },
+          {
+            "term": "AppArmor",
+            "definition": "نظام تحكم وصول إلزامي في Linux قائم على قواعد المسارات."
+          },
+          {
+            "term": "SELinux",
+            "definition": "نظام تحكم وصول إلزامي قائم على الوسوم يُستخدم في مضيفات عائلة RHEL."
+          },
+          {
+            "term": "no-new-privileges",
+            "definition": "خيار يمنع العملية من اكتساب حقوق عبر برامج setuid."
+          },
+          {
+            "term": "eBPF",
+            "definition": "تقنية في النواة تتيح لأدوات المراقبة رصد الأحداث بأمان."
+          },
+          {
+            "term": "Falco",
+            "definition": "محرك كشف وقت تشغيل مفتوح المصدر لأحداث الحاويات والمضيف."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي ضابط يقيّد استدعاءات النظام التي تستطيع عملية الحاوية تنفيذها؟",
+            "options": [
+              "seccomp",
+              "cgroups",
+              "مساحة أسماء الشبكة",
+              "بصمة الصورة"
+            ],
+            "answer": 0,
+            "explanation": "يرشّح seccomp استدعاءات النظام. وتحدّ cgroups الموارد وتحدّ مساحات الأسماء الرؤية."
+          },
+          {
+            "question": "أي الإعدادات تحكم الحاوية وقت التشغيل؟ (اختر كل ما ينطبق)",
+            "options": [
+              "`--cap-drop ALL`",
+              "`--read-only`",
+              "`--security-opt seccomp=unconfined`",
+              "`--security-opt no-new-privileges`"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "إسقاط الصلاحيات ونظام الجذر للقراءة فقط وno-new-privileges كلها تقلل ما تفعله العملية. أما seccomp غير المقيّد فيزيل الحماية."
+          },
+          {
+            "question": "ماذا تعني `CapEff: 0000000000000000` في `/proc/1/status` داخل حاوية؟",
+            "options": [
+              "للعملية كل الصلاحيات",
+              "الحاوية متوقفة",
+              "ليس للعملية أي صلاحيات فعّالة",
+              "AppArmor معطّل"
+            ],
+            "answer": 2,
+            "explanation": "القناع الصفري يعني عدم وجود صلاحيات فعّالة، وهو الهدف لمعظم التطبيقات."
+          },
+          {
+            "question": "أي حدث في حاوية ويب إنتاجية هو الأكثر إثارة للشك؟",
+            "options": [
+              "كتابة سطر في السجل",
+              "الرد على طلب HTTP",
+              "تشغيل فحص صحة",
+              "بدء صدفة تفاعلية جديدة"
+            ],
+            "answer": 3,
+            "explanation": "لا تبدأ خوادم الويب صدفًا عادة. وهذه قاعدة كشف عالية القيمة."
+          },
+          {
+            "question": "لماذا يُعد seccomp=unconfined حلًا سيئًا لتطبيق يفشل في البدء؟",
+            "options": [
+              "يزيل مرشِّح الاستدعاءات عن كل شيء بدل السماح بالاستدعاء الوحيد الذي يحتاجه التطبيق",
+              "يحذف الصورة",
+              "يبطئ الشبكة",
+              "يغيّر اسم المضيف"
+            ],
+            "answer": 0,
+            "explanation": "اعثر على الاستدعاء المحجوب من السجلات أو strace وأضفه وحده إلى ملف مخصص."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nيفترض أمن وقت التشغيل أن شيئًا ما سيسوء داخل الحاوية يومًا ما، فيحدّ من الضرر. تتراكم أربعة ضوابط في النواة: إسقاط الصلاحيات ومرشِّح seccomp وملف AppArmor أو SELinux والخيار `no-new-privileges`. أضف نظام جذر للقراءة فقط ومستخدمًا غير root وحدودًا للموارد، وتحقق من النتيجة عبر `/proc/1/status` و`docker inspect`.\n\nثم راقب السلوك. اجمع أحداث العمليات والملفات والشبكة ودورة الحياة، ونبّه على الصدفات والاتصالات غير المتوقعة في حاويات الإنتاج، وأبقِ الوصول بالتنفيذ نادرًا ومسجلًا. ومع فحص الصور تجعل هذه الضوابط الحاوية المخترَقة حادثة صغيرة ومرئية. تابع مع [Docker Daemon Security](/learn/systems-infrastructure-security/docker-daemon-security) لحماية مستوى التحكم الذي تقوم عليه حاوياتك."
+      }
+    ]
+  }
+}

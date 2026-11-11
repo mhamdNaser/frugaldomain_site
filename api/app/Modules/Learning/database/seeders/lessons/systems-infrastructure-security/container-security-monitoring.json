@@ -1,0 +1,578 @@
+{
+ "slug": "container-security-monitoring",
+ "title": "Container Security Monitoring",
+ "summary": "Collect and correlate signals from hosts, containers, Kubernetes and the network, write actionable alerts, and follow a fixed investigation routine.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Choose signals to monitor at each container layer",
+  "Read Docker and Kubernetes built-in signals",
+  "Write Prometheus alert rules with clear actions",
+  "Correlate signals across layers",
+  "Follow an incident investigation routine"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 03:10 a payments container starts using four times its normal CPU. By 03:25 it is restarting every few minutes, and at 03:40 it is making outbound connections to an address nobody recognizes. Each symptom alone looks like an ordinary performance problem. Together they look like a cryptominer. The team notices only because someone happened to open a dashboard the next morning.\n\n**Container security monitoring** turns that luck into a process. It collects signals from hosts, containers, the orchestrator and the network, and it alerts on the combinations that matter. In this lesson you will decide what to collect, read the built-in signals Docker and Kubernetes already give you, write alert rules, and build a simple investigation routine. Use only systems you own."
+  },
+  {
+   "id": "layers",
+   "type": "text",
+   "markdown": "## Step 1: Decide what to watch at each layer\n\nA container incident can start at any layer, so monitoring has to cover all of them. For each layer, choose a few signals that are cheap to collect and hard for an attacker to avoid.\n\n| Layer | What to collect | Example signal |\n|:--|:--|:--|\n| Host | Kernel logs, auth logs, file integrity | Unexpected `sudo`, new SSH key |\n| Container runtime | Start, stop, die events, image pulls | Image from an unapproved registry |\n| Orchestrator | API audit logs, Pod events, config changes | New privileged Pod, new ClusterRoleBinding |\n| Workload | Resource use, restarts, application logs | CPU spike, restart loop |\n| Network | Flow logs, DNS queries, denied connections | Egress to a new destination |\n| Runtime behavior | Syscall-level alerts | Shell in a production container |\n\nThe most valuable rule of thumb is to monitor **changes to the thing that defends you**. If the audit policy, the sensor or the log shipper stops reporting, treat that silence as an alert too."
+  },
+  {
+   "id": "builtin",
+   "type": "text",
+   "markdown": "## Step 2: Read the signals you already have\n\nBefore you deploy anything new, look at what Docker and Kubernetes already expose. The **Docker events** stream records every container lifecycle change. `docker stats` gives live resource use. `docker inspect` reveals risky settings, such as a privileged container or a mounted Docker socket, which deserve their own review.\n\nOn Kubernetes, **events** record scheduling, image pulls, probe failures and kills, and `kubectl top` shows resource use through the metrics server. Events expire after about an hour by default, so ship them to long-term storage if you want to investigate yesterday's incident."
+  },
+  {
+   "id": "docker",
+   "type": "terminal",
+   "title": "Built-in Docker signals",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "docker stats --no-stream --format \"table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\"",
+     "output": "NAME         CPU %     MEM USAGE / LIMIT\nshop-web     2.31%     120MiB / 512MiB\nshop-worker  396.80%   88MiB / 512MiB",
+     "comment": "A worker at almost 400 percent CPU is far above its baseline. Investigate before assuming it is load."
+    },
+    {
+     "cmd": "docker inspect --format '{{.Name}} privileged={{.HostConfig.Privileged}} user={{.Config.User}}' $(docker ps -q)",
+     "output": "/shop-web privileged=false user=app\n/shop-worker privileged=false user=app",
+     "comment": "A quick audit of risky settings. privileged=true or an empty user would deserve review."
+    },
+    {
+     "cmd": "docker events --since 30m --until 0s --filter type=container --filter event=die",
+     "output": "2026-03-10T03:12:44.100000000Z container die 5c1e... (exitCode=137, image=registry.example.com/shop/worker:2.0.1, name=shop-worker)",
+     "comment": "Exit code 137 means the process was killed, often by the out-of-memory killer or a stop signal."
+    }
+   ]
+  },
+  {
+   "id": "k8s",
+   "type": "terminal",
+   "title": "Built-in Kubernetes signals",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "kubectl -n payments get events --sort-by=.lastTimestamp | tail -n 4",
+     "output": "LAST SEEN   TYPE      REASON      OBJECT                  MESSAGE\n6m          Warning   BackOff     pod/pay-api-5f7c9-m2x   Back-off restarting failed container\n4m          Normal    Pulled      pod/pay-api-5f7c9-m2x   Container image \"registry.example.com/pay/api:3.1.0\" already present\n2m          Warning   OOMKilling  node/worker-2           Killed process 8841 (pay-api) total-vm:2210000kB\n1m          Warning   BackOff     pod/pay-api-5f7c9-m2x   Back-off restarting failed container"
+    },
+    {
+     "cmd": "kubectl top pod -n payments",
+     "output": "NAME                 CPU(cores)   MEMORY(bytes)\npay-api-5f7c9-m2x    1840m        498Mi",
+     "comment": "1840m is nearly two full cores for a service that normally uses 120m."
+    }
+   ]
+  },
+  {
+   "id": "flow",
+   "type": "animation",
+   "kind": "layers",
+   "title": "Correlating signals across layers",
+   "data": {
+    "layers": [
+     {
+      "label": "Alert + response",
+      "sub": "SOC"
+     },
+     {
+      "label": "Correlation",
+      "sub": "SIEM"
+     },
+     {
+      "label": "Collection",
+      "sub": "Prometheus, Fluent Bit"
+     },
+     {
+      "label": "Orchestrator",
+      "sub": "Kubernetes"
+     },
+     {
+      "label": "Runtime + host",
+      "sub": "Docker, kernel"
+     }
+    ],
+    "steps": [
+     {
+      "layer": 4,
+      "packet": [
+       "CPU 400%"
+      ],
+      "caption": "The host shows a worker container using almost four cores."
+     },
+     {
+      "layer": 3,
+      "packet": [
+       "CPU 400%",
+       "OOMKilled"
+      ],
+      "caption": "Kubernetes events add repeated OOMKilled and restarts."
+     },
+     {
+      "layer": 2,
+      "packet": [
+       "CPU 400%",
+       "OOMKilled",
+       "metrics + logs"
+      ],
+      "caption": "Collectors ship metrics and logs to central storage with pod labels."
+     },
+     {
+      "layer": 1,
+      "packet": [
+       "CPU 400%",
+       "OOMKilled",
+       "new egress IP"
+      ],
+      "caption": "Correlation joins resource spikes with a new outbound destination from the same pod."
+     },
+     {
+      "layer": 0,
+      "packet": [
+       "High severity alert"
+      ],
+      "caption": "One high-confidence alert is raised, with evidence from three layers."
+     }
+    ]
+   }
+  },
+  {
+   "id": "rules",
+   "type": "text",
+   "markdown": "## Step 3: Turn signals into alerts\n\nCollect metrics with **Prometheus**. The Kubernetes add-on **kube-state-metrics** exposes object state, such as restarts and termination reasons, and **cAdvisor** inside the kubelet exposes container resource use. Alert rules are written as expressions over those metrics.\n\nStart with alerts that have a clear action:\n\n- **OOMKilled** may be a leak, a mis-sized limit, or abusive behavior.\n- **A restart loop** is either a bug or a repeated attack attempt.\n- **An image from an unexpected registry** breaks your supply chain policy.\n\nEvery alert needs an owner, a severity and a link to a short runbook. If nobody knows what to do when it fires, it is not ready."
+  },
+  {
+   "id": "prom",
+   "type": "code",
+   "language": "yaml",
+   "filename": "container-security-rules.yaml",
+   "code": "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: container-security\n  namespace: monitoring\nspec:\n  groups:\n    - name: container-security\n      rules:\n        - alert: ContainerOOMKilled\n          expr: kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1\n          for: 0m\n          labels:\n            severity: warning\n          annotations:\n            summary: \"{{ $labels.namespace }}/{{ $labels.pod }} was OOM killed\"\n        - alert: ContainerRestartLoop\n          expr: increase(kube_pod_container_status_restarts_total[15m]) > 3\n          for: 5m\n          labels:\n            severity: critical\n          annotations:\n            summary: \"{{ $labels.namespace }}/{{ $labels.pod }} restarted more than 3 times in 15 minutes\"\n        - alert: UnexpectedImageRegistry\n          expr: count by (namespace, pod, image) (kube_pod_container_info{image!~\"registry.example.com/.*\"}) > 0\n          for: 1m\n          labels:\n            severity: warning\n          annotations:\n            summary: \"{{ $labels.pod }} runs an image from outside registry.example.com\"",
+   "highlight": [
+    11,
+    19,
+    27
+   ],
+   "caption": "Three alert rules for a Prometheus Operator cluster. The registry name is an example; replace it with your approved registry."
+  },
+  {
+   "id": "investigate",
+   "type": "text",
+   "markdown": "## Step 4: Investigate with a routine\n\nWhen an alert fires, a fixed routine beats improvisation. The goal is to decide quickly whether this is a fault or an attack and to preserve evidence either way.\n\n1. **Scope.** Which pod, namespace, node and image? Is it one replica or all of them?\n2. **Timeline.** What changed in the last hour: a deployment, a new image, a role change? Check Kubernetes events and the audit log.\n3. **Behavior.** Look at runtime alerts, network flows and process lists for that pod.\n4. **Contain.** Apply a deny-all network policy to the pod and cordon the node if needed. Do not delete the pod yet.\n5. **Preserve.** Save logs, `kubectl describe` output and, where policy allows, a filesystem snapshot.\n6. **Recover.** Redeploy from a known-good, scanned image, rotate any credentials the pod could reach, and record what you learned.\n\nPractice this on a lab cluster so the first time you run it is not during a real incident."
+  },
+  {
+   "id": "network",
+   "type": "text",
+   "markdown": "## Do not forget the network\n\nCompromised containers almost always talk to something: a command server, a mining pool or a storage bucket. Network signals are therefore some of the most reliable evidence you can collect.\n\nStart with **default-deny egress** through Kubernetes network policies, so that an unexpected destination is blocked and logged instead of silently allowed. Then collect three things: denied connection counts per namespace, DNS queries for domains that are new to your environment, and flow records that show which pod talked to which destination and how many bytes moved. A sudden rise in outbound bytes from a service that normally only answers requests is a strong exfiltration indicator.\n\nBuild a small allow-list of the external destinations each workload legitimately needs, such as a payment provider or a package mirror. Anything outside that list becomes a high-quality alert, because a healthy service has a short and stable list of friends."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- **Collecting everything, alerting on nothing.** Data without alerts is just storage cost.\n- **Short retention.** Kubernetes events vanish within about an hour. Ship them out.\n- **Monitoring only CPU and memory.** Resource graphs miss quiet attackers.\n- **Deleting the pod first.** You lose the evidence. Isolate before you replace.\n- **Not monitoring the monitors.** Alert when a collector, sensor or log pipeline stops sending data."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Related lessons",
+   "markdown": "Feed this pipeline with [Kubernetes Audit Logging](/learn/systems-infrastructure-security/kubernetes-audit-logging) and [Runtime Threat Detection](/learn/systems-infrastructure-security/runtime-threat-detection). For the build-time side of the same picture, see [Software Bill of Materials (SBOM)](/learn/systems-infrastructure-security/software-bill-of-materials-sbom)."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a Linux machine or VM you own with Docker installed.\n\n1. Start two containers: `docker run -d --name web nginx` and `docker run -d --name burn busybox sh -c 'while true; do :; done'`.\n2. Run `docker stats --no-stream` and identify the container above its baseline.\n3. Use `docker inspect` to print the `Privileged` and `User` settings for both.\n4. Stop the busy container with `docker kill burn` and find the `die` event with `docker events --since 5m --filter event=die`.\n5. Bonus: on a lab Kubernetes cluster, apply the Prometheus rules above and trigger the restart-loop alert with a pod that exits immediately."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Container security monitoring",
+     "definition": "Collecting and correlating signals across host, runtime, orchestrator and network to detect abuse."
+    },
+    {
+     "term": "Baseline",
+     "definition": "The normal range of a workload's behavior, used to spot anomalies."
+    },
+    {
+     "term": "OOMKilled",
+     "definition": "A termination reason when the kernel kills a container for exceeding its memory limit."
+    },
+    {
+     "term": "kube-state-metrics",
+     "definition": "An add-on that exposes Kubernetes object state as Prometheus metrics."
+    },
+    {
+     "term": "cAdvisor",
+     "definition": "A component in the kubelet that reports container resource usage."
+    },
+    {
+     "term": "Kubernetes event",
+     "definition": "A short-lived record of something that happened to an object, such as a failed probe."
+    },
+    {
+     "term": "Egress",
+     "definition": "Outbound network traffic leaving a workload or cluster."
+    },
+    {
+     "term": "Runbook",
+     "definition": "A short document saying what to check and do when a specific alert fires."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which statement about Kubernetes events is correct?",
+     "options": [
+      "They are kept for a year by default",
+      "They expire after about an hour, so ship them for later investigation",
+      "They contain full request bodies",
+      "They are only for nodes"
+     ],
+     "answer": 1,
+     "explanation": "Events are short-lived. Without forwarding them you cannot investigate yesterday's incident."
+    },
+    {
+     "question": "Exit code 137 in docker events usually means:",
+     "options": [
+      "A clean shutdown",
+      "The process was killed, for example by the OOM killer",
+      "A network timeout",
+      "A failed image pull"
+     ],
+     "answer": 1,
+     "explanation": "137 is 128 plus signal 9 (SIGKILL), commonly from memory exhaustion or a forced stop."
+    },
+    {
+     "question": "Which are good first alerts for container monitoring? (Choose all that apply.)",
+     "options": [
+      "Restart loop",
+      "Image from an unapproved registry",
+      "Every successful HTTP 200",
+      "A monitoring agent that stops reporting"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Each has a clear action. Successful requests are normal traffic and create noise."
+    },
+    {
+     "question": "During an incident, why isolate a suspicious pod before deleting it?",
+     "options": [
+      "Deleting is slower",
+      "Deletion destroys evidence needed for investigation",
+      "Kubernetes forbids deleting pods",
+      "Isolation fixes the vulnerability"
+     ],
+     "answer": 1,
+     "explanation": "Isolation stops the harm while keeping memory, files and logs for analysis."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Monitor every layer: host, runtime, orchestrator, workload and network.\n- Use built-in signals first: `docker stats`, `docker events`, `docker inspect`, Kubernetes events and `kubectl top`.\n- Write a few actionable alerts in Prometheus for OOMKilled, restart loops and unapproved registries.\n- Correlate signals across layers to separate faults from attacks.\n- Follow a fixed routine: scope, timeline, behavior, contain, preserve, recover. Monitor the monitors too."
+  }
+ ],
+ "ar": {
+  "title": "المراقبة الأمنية للحاويات",
+  "summary": "اجمع الإشارات من المضيفات والحاويات وKubernetes والشبكة واربط بينها، واكتب تنبيهات قابلة للتنفيذ، واتبع روتين تحقيق ثابتاً.",
+  "objectives": [
+   "اختيار الإشارات المراقَبة في كل طبقة من طبقات الحاويات",
+   "قراءة إشارات Docker وKubernetes المدمجة",
+   "كتابة قواعد تنبيه Prometheus بإجراءات واضحة",
+   "ربط الإشارات عبر الطبقات",
+   "اتباع روتين التحقيق في الحوادث"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "عند الساعة 03:10 تبدأ حاوية مدفوعات باستهلاك معالج يبلغ أربعة أضعاف المعتاد. وبحلول 03:25 تُعاد تشغيلها كل بضع دقائق، وعند 03:40 تجري اتصالات صادرة إلى عنوان لا يعرفه أحد. كل عَرَض وحده يبدو مشكلة أداء عادية، لكنها معاً تشبه معدِّن عملات رقمية خفياً. ولا ينتبه الفريق إلا لأن أحدهم فتح لوحة المراقبة في الصباح بمحض الصدفة.\n\nتحوّل **المراقبة الأمنية للحاويات (Container security monitoring)** هذه الصدفة إلى عملية منظّمة. فهي تجمع الإشارات من المضيفات والحاويات والمنسّق (Orchestrator) والشبكة، وتنبّه على التركيبات المهمة. في هذا الدرس ستقرر ما تجمعه، وتقرأ الإشارات المدمجة التي يمنحك إياها Docker وKubernetes أصلاً، وتكتب قواعد تنبيه، وتبني روتين تحقيق بسيطاً. استعمل أنظمة تملكها فقط."
+   },
+   {
+    "id": "layers",
+    "type": "text",
+    "markdown": "## الخطوة 1: قرّر ما تراقبه في كل طبقة\n\nقد يبدأ حادث الحاويات في أي طبقة، فيجب أن تغطيها المراقبة كلها. اختر لكل طبقة بضع إشارات رخيصة الجمع وصعبة التجنّب على المهاجم.\n\n| الطبقة | ما تجمعه | مثال على الإشارة |\n|:--|:--|:--|\n| المضيف | سجلّات النواة والمصادقة وسلامة الملفات | `sudo` غير متوقع أو مفتاح SSH جديد |\n| وقت تشغيل الحاويات | أحداث البدء والإيقاف والموت وسحب الصور | صورة من سجلّ غير معتمد |\n| المنسّق | سجلّات تدقيق الـ API وأحداث الـ Pod وتغييرات الإعداد | Pod مميّز جديد أو ClusterRoleBinding جديد |\n| حِمل العمل | استهلاك الموارد وإعادات التشغيل وسجلّات التطبيق | قفزة معالج أو حلقة إعادة تشغيل |\n| الشبكة | سجلّات التدفق واستعلامات DNS والاتصالات المرفوضة | حركة صادرة إلى وجهة جديدة |\n| السلوك أثناء التشغيل | تنبيهات على مستوى استدعاءات النظام | صدفة في حاوية إنتاج |\n\nوأنفع قاعدة عملية هي مراقبة **التغييرات في ما يدافع عنك**. فإذا توقفت سياسة التدقيق أو المستشعر أو ناقل السجلّات عن الإبلاغ، فاعتبر هذا الصمت تنبيهاً أيضاً."
+   },
+   {
+    "id": "builtin",
+    "type": "text",
+    "markdown": "## الخطوة 2: اقرأ الإشارات الموجودة لديك\n\nقبل نشر أي شيء جديد انظر إلى ما يكشفه Docker وKubernetes أصلاً. يسجّل تدفق **أحداث Docker** كل تغيير في دورة حياة الحاويات، ويعطيك `docker stats` استهلاك الموارد مباشرة، ويكشف `docker inspect` الإعدادات الخطرة مثل الحاوية المميّزة أو مقبس Docker المركّب، وهذه تستحق مراجعة مستقلة.\n\nوفي Kubernetes تسجّل **الأحداث (Events)** الجدولة وسحب الصور وإخفاق الفحوص وعمليات القتل، ويعرض `kubectl top` استهلاك الموارد عبر خادم المقاييس. وتنتهي صلاحية الأحداث بعد نحو ساعة افتراضياً، فأرسلها إلى تخزين طويل الأمد إن أردت التحقيق في حادث الأمس."
+   },
+   {
+    "id": "docker",
+    "type": "terminal",
+    "title": "إشارات Docker المدمجة",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "docker stats --no-stream --format \"table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\"",
+      "output": "NAME         CPU %     MEM USAGE / LIMIT\nshop-web     2.31%     120MiB / 512MiB\nshop-worker  396.80%   88MiB / 512MiB",
+      "comment": "Worker يقارب 400 بالمئة من المعالج أعلى كثيراً من خط أساسه. حقّق قبل أن تفترض أنه ضغط عمل."
+     },
+     {
+      "cmd": "docker inspect --format '{{.Name}} privileged={{.HostConfig.Privileged}} user={{.Config.User}}' $(docker ps -q)",
+      "output": "/shop-web privileged=false user=app\n/shop-worker privileged=false user=app",
+      "comment": "تدقيق سريع للإعدادات الخطرة. وجود privileged=true أو مستخدم فارغ يستحق المراجعة."
+     },
+     {
+      "cmd": "docker events --since 30m --until 0s --filter type=container --filter event=die",
+      "output": "2026-03-10T03:12:44.100000000Z container die 5c1e... (exitCode=137, image=registry.example.com/shop/worker:2.0.1, name=shop-worker)",
+      "comment": "رمز الخروج 137 يعني أن العملية قُتلت، وغالباً بسبب قاتل نفاد الذاكرة أو إشارة إيقاف."
+     }
+    ]
+   },
+   {
+    "id": "k8s",
+    "type": "terminal",
+    "title": "إشارات Kubernetes المدمجة",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "kubectl -n payments get events --sort-by=.lastTimestamp | tail -n 4",
+      "output": "LAST SEEN   TYPE      REASON      OBJECT                  MESSAGE\n6m          Warning   BackOff     pod/pay-api-5f7c9-m2x   Back-off restarting failed container\n4m          Normal    Pulled      pod/pay-api-5f7c9-m2x   Container image \"registry.example.com/pay/api:3.1.0\" already present\n2m          Warning   OOMKilling  node/worker-2           Killed process 8841 (pay-api) total-vm:2210000kB\n1m          Warning   BackOff     pod/pay-api-5f7c9-m2x   Back-off restarting failed container"
+     },
+     {
+      "cmd": "kubectl top pod -n payments",
+      "output": "NAME                 CPU(cores)   MEMORY(bytes)\npay-api-5f7c9-m2x    1840m        498Mi",
+      "comment": "1840m تقارب نواتين كاملتين لخدمة تستعمل عادةً 120m."
+     }
+    ]
+   },
+   {
+    "id": "flow",
+    "type": "animation",
+    "kind": "layers",
+    "title": "ربط الإشارات عبر الطبقات",
+    "data": {
+     "layers": [
+      {
+       "label": "التنبيه والاستجابة",
+       "sub": "SOC"
+      },
+      {
+       "label": "الربط",
+       "sub": "SIEM"
+      },
+      {
+       "label": "الجمع",
+       "sub": "Prometheus, Fluent Bit"
+      },
+      {
+       "label": "المنسّق",
+       "sub": "Kubernetes"
+      },
+      {
+       "label": "وقت التشغيل والمضيف",
+       "sub": "Docker, kernel"
+      }
+     ],
+     "steps": [
+      {
+       "layer": 4,
+       "packet": [
+        "CPU 400%"
+       ],
+       "caption": "يُظهر المضيف حاوية تستعمل نحو أربع أنوية."
+      },
+      {
+       "layer": 3,
+       "packet": [
+        "CPU 400%",
+        "OOMKilled"
+       ],
+       "caption": "تضيف أحداث Kubernetes تكرار OOMKilled وإعادات التشغيل."
+      },
+      {
+       "layer": 2,
+       "packet": [
+        "CPU 400%",
+        "OOMKilled",
+        "metrics + logs"
+       ],
+       "caption": "تنقل المجمِّعات المقاييس والسجلّات إلى تخزين مركزي مع وسوم الـ Pod."
+      },
+      {
+       "layer": 1,
+       "packet": [
+        "CPU 400%",
+        "OOMKilled",
+        "new egress IP"
+       ],
+       "caption": "يربط التحليل قفزة الموارد بوجهة صادرة جديدة من الـ Pod نفسه."
+      },
+      {
+       "layer": 0,
+       "packet": [
+        "High severity alert"
+       ],
+       "caption": "يُرفع تنبيه واحد عالي الثقة بأدلة من ثلاث طبقات."
+      }
+     ]
+    }
+   },
+   {
+    "id": "rules",
+    "type": "text",
+    "markdown": "## الخطوة 3: حوّل الإشارات إلى تنبيهات\n\nاجمع المقاييس بأداة **Prometheus**. تكشف الإضافة **kube-state-metrics** حالة الكائنات مثل إعادات التشغيل وأسباب الإنهاء، ويكشف **cAdvisor** داخل الـ kubelet استهلاك الموارد للحاويات. وتُكتب قواعد التنبيه كتعابير على هذه المقاييس.\n\nابدأ بتنبيهات لها إجراء واضح:\n\n- قد يدل **OOMKilled** على تسرّب ذاكرة أو حد خاطئ الحجم أو سلوك مسيء.\n- **حلقة إعادة التشغيل** إما علّة وإما محاولة هجوم متكررة.\n- **صورة من سجلّ غير متوقع** تخرق سياسة سلسلة التوريد لديك.\n\nيحتاج كل تنبيه إلى مالك ودرجة خطورة ورابط إلى دليل إجراءات قصير. فإن لم يعرف أحد ماذا يفعل عند إطلاقه، فهو غير جاهز."
+   },
+   {
+    "id": "prom",
+    "type": "code",
+    "language": "yaml",
+    "filename": "container-security-rules.yaml",
+    "code": "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: container-security\n  namespace: monitoring\nspec:\n  groups:\n    - name: container-security\n      rules:\n        - alert: ContainerOOMKilled\n          expr: kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1\n          for: 0m\n          labels:\n            severity: warning\n          annotations:\n            summary: \"{{ $labels.namespace }}/{{ $labels.pod }} was OOM killed\"\n        - alert: ContainerRestartLoop\n          expr: increase(kube_pod_container_status_restarts_total[15m]) > 3\n          for: 5m\n          labels:\n            severity: critical\n          annotations:\n            summary: \"{{ $labels.namespace }}/{{ $labels.pod }} restarted more than 3 times in 15 minutes\"\n        - alert: UnexpectedImageRegistry\n          expr: count by (namespace, pod, image) (kube_pod_container_info{image!~\"registry.example.com/.*\"}) > 0\n          for: 1m\n          labels:\n            severity: warning\n          annotations:\n            summary: \"{{ $labels.pod }} runs an image from outside registry.example.com\"",
+    "highlight": [
+     11,
+     19,
+     27
+    ],
+    "caption": "ثلاث قواعد تنبيه لعنقود يستعمل Prometheus Operator. اسم السجلّ مثال، فاستبدله بسجلّك المعتمد."
+   },
+   {
+    "id": "investigate",
+    "type": "text",
+    "markdown": "## الخطوة 4: حقّق بروتين ثابت\n\nعند إطلاق تنبيه يتفوق الروتين الثابت على الارتجال. والهدف أن تقرر بسرعة هل هو عطل أم هجوم، وأن تحفظ الأدلة في الحالتين.\n\n1. **حدّد النطاق.** أي Pod وأي Namespace وأي عقدة وأي صورة؟ هل هي نسخة واحدة أم كلها؟\n2. **ارسم الخط الزمني.** ما الذي تغيّر خلال الساعة الأخيرة: نشر أو صورة جديدة أو تغيير دور؟ افحص أحداث Kubernetes وسجلّ التدقيق.\n3. **افحص السلوك.** انظر إلى تنبيهات وقت التشغيل وتدفقات الشبكة وقوائم العمليات لذلك الـ Pod.\n4. **احتوِ.** طبّق سياسة شبكة ترفض كل شيء على الـ Pod وعزل العقدة (Cordon) عند الحاجة. لا تحذف الـ Pod بعد.\n5. **احفظ.** احفظ السجلّات ومخرجات `kubectl describe` ولقطة من نظام الملفات إن سمحت السياسة.\n6. **تعافَ.** أعد النشر من صورة سليمة مفحوصة، ودوّر أي بيانات دخول كان الـ Pod يصل إليها، ودوّن ما تعلمته.\n\nتمرّن على هذا في عنقود تجريبي حتى لا تكون أول مرة تنفّذه فيها أثناء حادث حقيقي."
+   },
+   {
+    "id": "network",
+    "type": "text",
+    "markdown": "## لا تنسَ الشبكة\n\nتتصل الحاويات المخترقة بشيء ما في الغالب: خادم تحكم أو مجمّع تعدين أو حاوية تخزين. ولذلك تُعد إشارات الشبكة من أوثق الأدلة التي تجمعها.\n\nابدأ بـ **رفض الحركة الصادرة افتراضياً** عبر سياسات شبكة Kubernetes، فتُحجب الوجهة غير المتوقعة وتُسجَّل بدلاً من السماح بها بصمت. ثم اجمع ثلاثة أشياء: أعداد الاتصالات المرفوضة لكل Namespace، واستعلامات DNS لنطاقات جديدة على بيئتك، وسجلّات التدفق التي تبيّن أي Pod اتصل بأي وجهة وكم بايتاً انتقل. والارتفاع المفاجئ في البايتات الصادرة من خدمة تكتفي عادةً بالرد على الطلبات مؤشر قوي على تسريب البيانات.\n\nوابنِ قائمة سماح صغيرة بالوجهات الخارجية التي يحتاجها كل حِمل عمل فعلاً، مثل مزوّد الدفع أو مرآة الحزم. وكل ما خرج عن القائمة يصبح تنبيهاً عالي الجودة، لأن الخدمة السليمة لها قائمة أصدقاء قصيرة وثابتة."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- **جمع كل شيء والتنبيه على لا شيء.** البيانات بلا تنبيهات مجرد كلفة تخزين.\n- **احتفاظ قصير.** تختفي أحداث Kubernetes خلال نحو ساعة، فأرسلها إلى الخارج.\n- **مراقبة المعالج والذاكرة فقط.** تفوّت رسوم الموارد المهاجم الهادئ.\n- **حذف الـ Pod أولاً.** تفقد الأدلة. اعزل قبل أن تستبدل.\n- **ترك المراقِبات بلا مراقبة.** نبّه عند توقف مجمِّع أو مستشعر أو خط سجلّات عن إرسال البيانات."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "دروس ذات صلة",
+    "markdown": "غذِّ هذا الخط بـ [سجلات التدقيق في Kubernetes](/learn/systems-infrastructure-security/kubernetes-audit-logging) و[كشف التهديدات أثناء التشغيل](/learn/systems-infrastructure-security/runtime-threat-detection). ولجانب البناء من الصورة نفسها راجع [قائمة مكونات البرمجيات (SBOM)](/learn/systems-infrastructure-security/software-bill-of-materials-sbom)."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استعمل جهاز Linux أو آلة افتراضية تملكها مثبّتاً عليها Docker.\n\n1. شغّل حاويتين: `docker run -d --name web nginx` و`docker run -d --name burn busybox sh -c 'while true; do :; done'`.\n2. نفّذ `docker stats --no-stream` وحدّد الحاوية التي تتجاوز خط أساسها.\n3. استعمل `docker inspect` لطباعة إعدادي `Privileged` و`User` للحاويتين.\n4. أوقف الحاوية المشغولة بـ `docker kill burn` وابحث عن حدث `die` بالأمر `docker events --since 5m --filter event=die`.\n5. تحدٍّ إضافي: في عنقود Kubernetes تجريبي طبّق قواعد Prometheus أعلاه وأطلق تنبيه حلقة إعادة التشغيل بـ Pod ينتهي فوراً."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "المراقبة الأمنية للحاويات",
+      "definition": "جمع الإشارات وربطها عبر المضيف ووقت التشغيل والمنسّق والشبكة لاكتشاف إساءة الاستعمال."
+     },
+     {
+      "term": "خط الأساس (Baseline)",
+      "definition": "النطاق الطبيعي لسلوك حِمل العمل، يُستعمل لاكتشاف الشذوذ."
+     },
+     {
+      "term": "OOMKilled",
+      "definition": "سبب إنهاء حين تقتل النواة حاوية لتجاوزها حد الذاكرة."
+     },
+     {
+      "term": "kube-state-metrics",
+      "definition": "إضافة تكشف حالة كائنات Kubernetes كمقاييس Prometheus."
+     },
+     {
+      "term": "cAdvisor",
+      "definition": "مكوّن داخل الـ kubelet يبلّغ عن استهلاك الحاويات للموارد."
+     },
+     {
+      "term": "حدث Kubernetes (Event)",
+      "definition": "سجلّ قصير العمر لما حدث لكائن، مثل فحص فاشل."
+     },
+     {
+      "term": "الحركة الصادرة (Egress)",
+      "definition": "حركة الشبكة الصادرة من حِمل العمل أو العنقود."
+     },
+     {
+      "term": "دليل الإجراءات (Runbook)",
+      "definition": "وثيقة قصيرة تبيّن ما يُفحص وما يُفعل عند إطلاق تنبيه محدد."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي العبارات عن أحداث Kubernetes صحيحة؟",
+      "options": [
+       "تُحفظ عاماً افتراضياً",
+       "تنتهي خلال نحو ساعة فأرسلها للتحقيق لاحقاً",
+       "تحوي أجسام الطلبات كاملة",
+       "هي للعقد فقط"
+      ],
+      "answer": 1,
+      "explanation": "الأحداث قصيرة العمر، وبلا إرسالها لا تستطيع التحقيق في حادث الأمس."
+     },
+     {
+      "question": "رمز الخروج 137 في أحداث docker يعني غالباً:",
+      "options": [
+       "إيقافاً سليماً",
+       "قُتلت العملية، مثلاً بقاتل نفاد الذاكرة",
+       "انتهاء مهلة الشبكة",
+       "فشل سحب الصورة"
+      ],
+      "answer": 1,
+      "explanation": "137 تساوي 128 زائد الإشارة 9 (SIGKILL)، وتأتي عادةً من نفاد الذاكرة أو إيقاف قسري."
+     },
+     {
+      "question": "أي ما يلي تنبيهات أولى جيدة لمراقبة الحاويات؟ (اختر كل ما ينطبق)",
+      "options": [
+       "حلقة إعادة التشغيل",
+       "صورة من سجلّ غير معتمد",
+       "كل استجابة HTTP 200 ناجحة",
+       "وكيل مراقبة يتوقف عن الإبلاغ"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "لكل منها إجراء واضح، أما الطلبات الناجحة فحركة عادية تصنع ضجيجاً."
+     },
+     {
+      "question": "أثناء الحادث، لماذا تعزل Pod مشبوهاً قبل حذفه؟",
+      "options": [
+       "الحذف أبطأ",
+       "الحذف يتلف الأدلة اللازمة للتحقيق",
+       "يمنع Kubernetes حذف الـ Pods",
+       "العزل يصلح الثغرة"
+      ],
+      "answer": 1,
+      "explanation": "يوقف العزل الضرر مع إبقاء الذاكرة والملفات والسجلّات للتحليل."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- راقب كل الطبقات: المضيف ووقت التشغيل والمنسّق وحِمل العمل والشبكة.\n- ابدأ بالإشارات المدمجة: `docker stats` و`docker events` و`docker inspect` وأحداث Kubernetes و`kubectl top`.\n- اكتب في Prometheus تنبيهات قليلة قابلة للتنفيذ لـ OOMKilled وحلقات إعادة التشغيل والسجلّات غير المعتمدة.\n- اربط الإشارات عبر الطبقات للتمييز بين الأعطال والهجمات.\n- اتبع روتيناً ثابتاً: النطاق، الخط الزمني، السلوك، الاحتواء، الحفظ، التعافي. وراقب المراقِبات أيضاً."
+   }
+  ]
+ }
+}

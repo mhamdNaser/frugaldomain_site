@@ -1,0 +1,558 @@
+{
+ "slug": "network-security-architecture",
+ "title": "Network Security Architecture",
+ "summary": "How to design zones, allowed flows and enforcement points so one compromise stays contained.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Apply defense in depth, least privilege, segmentation and default deny",
+  "Define zones and the flows allowed between them",
+  "Enforce policy with a host firewall and verify forbidden flows fail",
+  "Document a flow matrix and isolate the management plane"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Your company runs a web shop, a database, a hypervisor cluster and an office network. Everything sits on one flat network, so a single infected laptop can reach the database directly. That is not a bug in one server. It is a **design** problem.\n\nNetwork security architecture is the plan that decides where systems live, which traffic may cross between them, and where you watch. Good architecture limits the damage when something fails, because something always fails. In this lesson you will learn the building blocks, apply them to a small environment, and verify the result from a Linux host you own."
+  },
+  {
+   "type": "text",
+   "id": "principles",
+   "markdown": "## 1. Start from four principles\n\nEvery sound design rests on a few ideas. Learn these first, because products and syntax change but the principles do not.\n\n- **Defense in depth.** Place several independent controls in a row. If the perimeter firewall is bypassed, a host firewall and an access control list (ACL) still stand.\n- **Least privilege.** A system may talk only to the peers and ports it needs for its job, nothing more.\n- **Segmentation.** Split the network into zones with a different trust level. A breach in one zone does not become a breach everywhere.\n- **Default deny.** Block everything, then allow specific flows. An allow-list is easier to audit than a block-list.\n\nTwo more ideas help in daily work: *assume breach* (design as if an attacker is already inside) and *fail secure* (when a control breaks, traffic stops rather than flows freely)."
+  },
+  {
+   "type": "text",
+   "id": "zones",
+   "markdown": "## 2. Define zones and trust levels\n\nA **zone** is a group of systems that share the same trust level and the same rules. A small environment usually needs these:\n\n| Zone | Example systems | Trust | Typical rule |\n|:--|:--|:--|:--|\n| Internet | Customers, scanners | None | Reach only published services |\n| DMZ | Nginx reverse proxy, mail relay | Low | Initiate almost nothing inward |\n| Application | App servers, containers | Medium | Talk to the database on one port |\n| Data | PostgreSQL, MySQL, backup target | High | Accept only from the application zone |\n| Management | Proxmox, jump host, monitoring | High | Reachable only from admin workstations |\n| Users | Office laptops, Wi-Fi | Low | Reach the proxy and approved services |\n\nNotice the **management zone**. Hypervisor and switch administration interfaces should never share a segment with user devices. Attackers who take over a laptop then find no admin panel to hit.\n\n### Traffic directions\n\nThink in two directions. **North-south** traffic crosses the perimeter (internet to DMZ). **East-west** traffic moves between internal systems (application to database). Most attackers move east-west after the first foothold, so internal filtering matters as much as the edge."
+  },
+  {
+   "type": "animation",
+   "id": "flow-anim",
+   "kind": "flow",
+   "title": "A request crossing the zones",
+   "caption": "Each hop is an enforcement point. A flow not on the allow-list stops.",
+   "data": {
+    "token": "Request",
+    "nodes": [
+     {
+      "id": "net",
+      "label": "Internet",
+      "icon": "cloud"
+     },
+     {
+      "id": "edge",
+      "label": "Edge firewall",
+      "sub": "allow 443",
+      "icon": "firewall"
+     },
+     {
+      "id": "dmz",
+      "label": "DMZ proxy",
+      "sub": "198.51.100.10",
+      "icon": "server"
+     },
+     {
+      "id": "int",
+      "label": "Internal firewall",
+      "sub": "app to db",
+      "icon": "firewall"
+     },
+     {
+      "id": "db",
+      "label": "Database",
+      "sub": "10.20.0.5:5432",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "at": "net",
+      "caption": "A customer sends HTTPS to the shop."
+     },
+     {
+      "at": "edge",
+      "caption": "The edge firewall permits TCP/443 to the DMZ only.",
+      "tone": "success"
+     },
+     {
+      "at": "dmz",
+      "caption": "The proxy forwards to the application zone."
+     },
+     {
+      "at": "int",
+      "caption": "The internal firewall checks the flow against its allow-list.",
+      "tone": "secure"
+     },
+     {
+      "at": "db",
+      "caption": "Only the application server reaches TCP/5432.",
+      "tone": "success"
+     },
+     {
+      "at": "net",
+      "token": "TCP/5432",
+      "caption": "An internet host tries the database port directly."
+     },
+     {
+      "at": "edge",
+      "token": "TCP/5432",
+      "caption": "Default deny drops it at the edge.",
+      "tone": "blocked"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "enforce",
+   "markdown": "## 3. Choose enforcement points\n\nZones mean nothing until something enforces them. You have four layers, and a real design uses several.\n\n1. **Network firewalls** between zones. Stateful rules by zone and port.\n2. **Switch and VLAN controls.** Separate broadcast domains, covered in [VLAN Security and Inter-VLAN Filtering](/learn/systems-infrastructure-security/vlan-security-and-inter-vlan-filtering).\n3. **Host firewalls** such as `nftables` or Windows Defender Firewall. They protect east-west flows the network firewall never sees, for example two VMs on the same hypervisor bridge.\n4. **Identity controls** such as 802.1X, described in [Network Access and Identity Management](/learn/systems-infrastructure-security/network-access-and-identity-management).\n\nHypervisors deserve special attention. Two VMs on one Proxmox bridge talk without ever leaving the host, so an external firewall cannot see them. Use the Proxmox firewall or separate bridges per zone."
+  },
+  {
+   "type": "code",
+   "id": "nft",
+   "language": "bash",
+   "filename": "/etc/nftables.conf",
+   "code": "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n    ct state established,related accept\n    iif lo accept\n    # database accepts PostgreSQL only from the application zone\n    ip saddr 10.10.0.0/24 tcp dport 5432 accept\n    # SSH only from the management zone\n    ip saddr 10.99.0.0/24 tcp dport 22 accept\n    limit rate 5/minute log prefix \"nft-drop: \"\n  }\n}",
+   "caption": "Host firewall on the database server. The policy is drop, so only the two listed flows work."
+  },
+  {
+   "type": "terminal",
+   "id": "verify",
+   "title": "Verify from the application server",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "nc -zv -w 3 10.20.0.5 5432",
+     "output": "Connection to 10.20.0.5 5432 port [tcp/postgresql] succeeded!",
+     "comment": "Expected: app zone to database is allowed"
+    },
+    {
+     "cmd": "nc -zv -w 3 10.20.0.5 22",
+     "output": "nc: connect to 10.20.0.5 port 22 (tcp) timed out: Operation now in progress",
+     "comment": "Expected: SSH from the app zone is dropped"
+    },
+    {
+     "cmd": "sudo nft list ruleset | grep -c drop",
+     "output": "2",
+     "comment": "Policy plus the log prefix are present"
+    }
+   ],
+   "caption": "A timeout (not a refusal) shows the packet was silently dropped."
+  },
+  {
+   "type": "callout",
+   "id": "c-verify",
+   "variant": "warning",
+   "title": "Test the deny, not only the allow",
+   "markdown": "Teams confirm that the application works and stop there. A design is only proven when you also confirm that **forbidden** flows fail. Keep a short list of expected-to-fail tests and rerun it after every firewall change."
+  },
+  {
+   "type": "text",
+   "id": "pitfalls",
+   "markdown": "## 4. Avoid the common design mistakes\n\nMost real incidents trace back to a small set of architectural errors. Check your own network against this list.\n\n| Mistake | Why it hurts | Fix |\n|:--|:--|:--|\n| One flat network | Any compromised host can scan and reach everything | Split into zones with filtering between them |\n| \"Any to any\" rules added during an outage | Temporary rules become permanent holes | Time-limit emergency rules and review them weekly |\n| Shared administrator credentials | One stolen password opens every device | Per-person accounts and a central identity service |\n| Trusting the internal network | Malware and insiders are already inside | Assume breach and filter east-west traffic |\n| Backups on the production network | Ransomware encrypts the backups too | Place backups in a separate zone with one-way access |\n\nA useful exercise is to draw your network on one page, color each zone, and draw an arrow for every allowed flow. If you cannot explain an arrow, you have found either a missing document or an unnecessary rule. Either way, you have improved the design.\n\nFinally, remember that architecture is never finished. New servers, containers and cloud links appear every month. Each one needs a zone, an owner and an entry in the flow matrix before it goes live, not after."
+  },
+  {
+   "type": "text",
+   "id": "mgmt",
+   "markdown": "## 4. Protect the management plane and document it\n\nThree habits separate a mature design from a lucky one.\n\n- **Out-of-band management.** Keep hypervisor, switch and firewall administration on its own network. Reach it only through a hardened jump host with multi-factor authentication.\n- **Central logging.** Send firewall, host and DNS logs to one collector so you can reconstruct an incident. See [Network Security Monitoring](/learn/systems-infrastructure-security/network-security-monitoring).\n- **A flow matrix.** Write down every allowed flow: source zone, destination zone, port, owner and reason. Any rule without an owner is a candidate for removal.\n\nReview the matrix every quarter. Rules accumulate like clutter, and a rule nobody remembers is a hole nobody watches. Finally, layer in DNS controls and protection against floods, covered in [DNS Security and DNS Filtering](/learn/systems-infrastructure-security/dns-security-and-dns-filtering) and [Denial of Service (DoS/DDoS) Protection](/learn/systems-infrastructure-security/denial-of-service-dos-ddos-protection)."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On two Linux VMs you own (for example in Proxmox or VirtualBox), call them `app` and `db`:\n\n1. Install PostgreSQL or just run `nc -l 5432` on `db`.\n2. Apply the `nftables` policy above, adjusting the addresses to your lab.\n3. From `app`, test ports 5432 and 22 with `nc -zv`.\n4. Confirm the drop log with `journalctl -k | grep nft-drop`.\n\nWrite a three-line flow matrix for what you built."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Defense in depth",
+     "definition": "Layering independent controls so one failure is not fatal."
+    },
+    {
+     "term": "Segmentation",
+     "definition": "Splitting a network into zones with separate rules."
+    },
+    {
+     "term": "Default deny",
+     "definition": "Blocking all traffic except what is explicitly allowed."
+    },
+    {
+     "term": "DMZ",
+     "definition": "A low-trust zone that hosts internet-facing services."
+    },
+    {
+     "term": "East-west traffic",
+     "definition": "Flows between internal systems."
+    },
+    {
+     "term": "North-south traffic",
+     "definition": "Flows crossing the network perimeter."
+    },
+    {
+     "term": "Management plane",
+     "definition": "The network and tools used to administer infrastructure."
+    },
+    {
+     "term": "Flow matrix",
+     "definition": "A documented list of every allowed traffic flow."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which principle says a system may reach only the peers and ports its job requires?",
+     "options": [
+      "Defense in depth",
+      "Least privilege",
+      "Fail open",
+      "Port mirroring"
+     ],
+     "answer": 1,
+     "explanation": "Least privilege limits each system to the access it needs."
+    },
+    {
+     "question": "Select all that are good practices for a management zone.",
+     "options": [
+      "Share the segment with user Wi-Fi",
+      "Reach it through a hardened jump host",
+      "Use multi-factor authentication",
+      "Expose the hypervisor UI to the internet"
+     ],
+     "answer": [
+      1,
+      2
+     ],
+     "explanation": "Management is isolated and gated by a jump host with MFA; never exposed or shared."
+    },
+    {
+     "question": "Why can an external firewall miss traffic between two VMs?",
+     "options": [
+      "Firewalls cannot filter TCP",
+      "The VMs may share a virtual bridge on the same host",
+      "VMs always use encryption",
+      "East-west traffic does not exist"
+     ],
+     "answer": 1,
+     "explanation": "Traffic on one virtual bridge never leaves the host, so use a host or hypervisor firewall."
+    },
+    {
+     "question": "A test shows a forbidden port times out. What does that most likely mean?",
+     "options": [
+      "The packet was silently dropped",
+      "The service is healthy",
+      "DNS failed",
+      "The port is open"
+     ],
+     "answer": 0,
+     "explanation": "Drop rules produce timeouts; reject rules produce an immediate refusal."
+    },
+    {
+     "question": "Select all that describe default deny.",
+     "options": [
+      "Allow-list approach",
+      "Easier to audit than a block-list",
+      "Permits everything unless listed",
+      "Applied at several layers"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Default deny blocks everything except listed flows and can be applied on every layer."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\n- Architecture is a plan: zones, allowed flows and enforcement points, not a single product.\n- Four principles guide it: defense in depth, least privilege, segmentation and default deny.\n- Watch both north-south and east-west traffic; internal filtering stops lateral movement.\n- Enforce at the network, switch, host and identity layers, and do not forget hypervisor bridges.\n- Isolate the management plane, centralize logs and keep a flow matrix.\n- Always test that forbidden flows fail."
+  }
+ ],
+ "ar": {
+  "title": "بنية أمن الشبكات",
+  "summary": "كيف تصمّم المناطق والتدفقات المسموحة ونقاط الفرض بحيث يبقى أي اختراق محصورًا.",
+  "objectives": [
+   "تطبيق الدفاع المتعمّق وأقل الصلاحيات والتجزئة والرفض الافتراضي",
+   "تحديد المناطق والتدفقات المسموحة بينها",
+   "فرض السياسة بجدار حماية المضيف والتحقق من فشل التدفقات المحظورة",
+   "توثيق مصفوفة التدفقات وعزل مستوى الإدارة"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "تشغّل شركتك متجرًا إلكترونيًا وقاعدة بيانات وعنقود مضيفات افتراضية وشبكة مكاتب، وكلها على شبكة مسطّحة واحدة. لذلك يستطيع حاسوب محمول مصاب واحد أن يصل إلى قاعدة البيانات مباشرة. هذه ليست ثغرة في خادم بعينه، بل مشكلة في **التصميم**.\n\nبنية أمن الشبكات (Network Security Architecture) هي الخطة التي تحدّد أين تعيش الأنظمة، وأي حركة مرور يُسمح لها بالعبور بينها، وأين تراقب. التصميم الجيد يحدّ من الضرر عندما يفشل شيء ما، فشيء ما يفشل دائمًا. ستتعلم في هذا الدرس اللبنات الأساسية، وتطبّقها على بيئة صغيرة، ثم تتحقق من النتيجة من جهاز Linux تملكه."
+   },
+   {
+    "type": "text",
+    "id": "principles",
+    "markdown": "## 1. ابدأ من أربعة مبادئ\n\nيقوم كل تصميم سليم على أفكار قليلة. تعلّمها أولًا لأن المنتجات وصيغ الأوامر تتغيّر أما المبادئ فلا تتغيّر.\n\n- **الدفاع المتعمّق (Defense in depth).** ضع عدة ضوابط مستقلة على التوالي. فإذا تم تجاوز جدار الحماية الطرفي بقي جدار حماية المضيف وقوائم التحكم بالوصول (ACL).\n- **أقل الصلاحيات (Least privilege).** يتحدث النظام فقط مع النظراء والمنافذ التي تلزم عمله، لا أكثر.\n- **التجزئة (Segmentation).** قسّم الشبكة إلى مناطق ذات مستويات ثقة مختلفة، فلا يتحوّل اختراق منطقة واحدة إلى اختراق شامل.\n- **الرفض الافتراضي (Default deny).** امنع كل شيء ثم اسمح بتدفقات محدّدة. فقائمة السماح أسهل في التدقيق من قائمة المنع.\n\nوتفيدك فكرتان إضافيتان في العمل اليومي: *افترض الاختراق* أي صمّم وكأن المهاجم داخل الشبكة فعلًا، و*الفشل الآمن* أي أن تتوقف الحركة عند تعطّل الضابط بدل أن تنساب بحرية."
+   },
+   {
+    "type": "text",
+    "id": "zones",
+    "markdown": "## 2. حدّد المناطق ومستويات الثقة\n\n**المنطقة (Zone)** مجموعة أنظمة تتشارك مستوى الثقة والقواعد نفسها. تحتاج البيئة الصغيرة عادةً إلى ما يلي:\n\n| المنطقة | أمثلة الأنظمة | الثقة | القاعدة المعتادة |\n|:--|:--|:--|:--|\n| الإنترنت | العملاء والماسحات | لا ثقة | الوصول إلى الخدمات المنشورة فقط |\n| المنطقة المنزوعة السلاح (DMZ) | وكيل Nginx العكسي، مرحّل البريد | منخفضة | لا تبدأ أي اتصال نحو الداخل تقريبًا |\n| التطبيقات | خوادم التطبيقات والحاويات | متوسطة | تتصل بقاعدة البيانات عبر منفذ واحد |\n| البيانات | PostgreSQL وMySQL ووجهة النسخ الاحتياطي | عالية | تقبل من منطقة التطبيقات فقط |\n| الإدارة | Proxmox وخادم القفز والمراقبة | عالية | لا يُوصل إليها إلا من محطات المسؤولين |\n| المستخدمون | حواسيب المكاتب وWi-Fi | منخفضة | تصل إلى الوكيل والخدمات المعتمدة |\n\nلاحظ **منطقة الإدارة**. يجب ألا تشارك واجهات إدارة المضيفات الافتراضية والمحوّلات قطاعًا مع أجهزة المستخدمين، فإذا سيطر مهاجم على حاسوب محمول لم يجد لوحة إدارة يضربها.\n\n### اتجاهات الحركة\n\nفكّر في اتجاهين. حركة **شمال-جنوب (North-south)** تعبر المحيط، من الإنترنت إلى DMZ. وحركة **شرق-غرب (East-west)** تنتقل بين الأنظمة الداخلية، من التطبيق إلى قاعدة البيانات. ينتقل معظم المهاجمين شرقًا وغربًا بعد موطئ القدم الأول، لذلك لا تقل أهمية التصفية الداخلية عن تصفية الحافة."
+   },
+   {
+    "type": "animation",
+    "id": "flow-anim",
+    "kind": "flow",
+    "title": "طلب يعبر المناطق",
+    "caption": "كل قفزة نقطة فرض. أي تدفق غير موجود في قائمة السماح يتوقف.",
+    "data": {
+     "token": "طلب",
+     "nodes": [
+      {
+       "id": "net",
+       "label": "الإنترنت",
+       "icon": "cloud"
+      },
+      {
+       "id": "edge",
+       "label": "جدار حماية الحافة",
+       "sub": "السماح بـ 443",
+       "icon": "firewall"
+      },
+      {
+       "id": "dmz",
+       "label": "وكيل DMZ",
+       "sub": "198.51.100.10",
+       "icon": "server"
+      },
+      {
+       "id": "int",
+       "label": "جدار الحماية الداخلي",
+       "sub": "التطبيق إلى القاعدة",
+       "icon": "firewall"
+      },
+      {
+       "id": "db",
+       "label": "قاعدة البيانات",
+       "sub": "10.20.0.5:5432",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "at": "net",
+       "caption": "يرسل عميل HTTPS إلى المتجر."
+      },
+      {
+       "at": "edge",
+       "caption": "يسمح جدار حماية الحافة بـ TCP/443 إلى DMZ فقط.",
+       "tone": "success"
+      },
+      {
+       "at": "dmz",
+       "caption": "يمرّر الوكيل الطلب إلى منطقة التطبيقات."
+      },
+      {
+       "at": "int",
+       "caption": "يفحص جدار الحماية الداخلي التدفق مقابل قائمة السماح.",
+       "tone": "secure"
+      },
+      {
+       "at": "db",
+       "caption": "خادم التطبيق وحده يصل إلى TCP/5432.",
+       "tone": "success"
+      },
+      {
+       "at": "net",
+       "token": "TCP/5432",
+       "caption": "يحاول مضيف من الإنترنت الوصول إلى منفذ قاعدة البيانات مباشرة."
+      },
+      {
+       "at": "edge",
+       "token": "TCP/5432",
+       "caption": "يُسقطه الرفض الافتراضي عند الحافة.",
+       "tone": "blocked"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "enforce",
+    "markdown": "## 3. اختر نقاط الفرض\n\nلا معنى للمناطق ما لم يفرضها شيء ما. لديك أربع طبقات، والتصميم الحقيقي يستخدم عدة منها.\n\n1. **جدران حماية الشبكة** بين المناطق، وقواعدها حالة-واعية (Stateful) بحسب المنطقة والمنفذ.\n2. **ضوابط المحوّل وVLAN.** تفصل نطاقات البث، وقد شرحناها في [أمن VLAN والتصفية بين شبكات VLAN](/learn/systems-infrastructure-security/vlan-security-and-inter-vlan-filtering).\n3. **جدران حماية المضيف** مثل `nftables` أو جدار حماية Windows Defender. تحمي التدفقات الشرقية-الغربية التي لا يراها جدار حماية الشبكة، مثل جهازين افتراضيين على جسر المضيف الافتراضي نفسه.\n4. **ضوابط الهوية** مثل 802.1X، وقد شُرحت في [الوصول إلى الشبكة وإدارة الهوية](/learn/systems-infrastructure-security/network-access-and-identity-management).\n\nوتستحق المضيفات الافتراضية عناية خاصة. فجهازان افتراضيان على جسر Proxmox واحد يتحادثان دون مغادرة المضيف، فلا يراهما جدار حماية خارجي. استخدم جدار حماية Proxmox أو جسورًا منفصلة لكل منطقة."
+   },
+   {
+    "type": "code",
+    "id": "nft",
+    "language": "bash",
+    "filename": "/etc/nftables.conf",
+    "code": "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n    ct state established,related accept\n    iif lo accept\n    # database accepts PostgreSQL only from the application zone\n    ip saddr 10.10.0.0/24 tcp dport 5432 accept\n    # SSH only from the management zone\n    ip saddr 10.99.0.0/24 tcp dport 22 accept\n    limit rate 5/minute log prefix \"nft-drop: \"\n  }\n}",
+    "caption": "جدار حماية المضيف على خادم قاعدة البيانات. السياسة drop، لذلك تعمل التدفقات المذكورة فقط."
+   },
+   {
+    "type": "terminal",
+    "id": "verify",
+    "title": "التحقق من خادم التطبيق",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "nc -zv -w 3 10.20.0.5 5432",
+      "output": "Connection to 10.20.0.5 5432 port [tcp/postgresql] succeeded!",
+      "comment": "المتوقع: يُسمح من منطقة التطبيقات إلى قاعدة البيانات"
+     },
+     {
+      "cmd": "nc -zv -w 3 10.20.0.5 22",
+      "output": "nc: connect to 10.20.0.5 port 22 (tcp) timed out: Operation now in progress",
+      "comment": "المتوقع: يُسقَط SSH القادم من منطقة التطبيقات"
+     },
+     {
+      "cmd": "sudo nft list ruleset | grep -c drop",
+      "output": "2",
+      "comment": "السياسة وبادئة التسجيل موجودتان"
+     }
+    ],
+    "caption": "المهلة (وليس الرفض) تعني أن الحزمة أُسقطت بصمت."
+   },
+   {
+    "type": "callout",
+    "id": "c-verify",
+    "variant": "warning",
+    "title": "اختبر المنع وليس السماح فقط",
+    "markdown": "يكتفي كثير من الفرق بالتأكد من عمل التطبيق. لا يثبت التصميم إلا عندما تتأكد أيضًا من فشل التدفقات **المحظورة**. احتفظ بقائمة قصيرة باختبارات يُتوقع فشلها وأعد تشغيلها بعد كل تغيير في جدار الحماية."
+   },
+   {
+    "type": "text",
+    "id": "pitfalls",
+    "markdown": "## 4. تجنّب أخطاء التصميم الشائعة\n\nتعود معظم الحوادث الحقيقية إلى مجموعة صغيرة من الأخطاء المعمارية. قارن شبكتك بهذه القائمة.\n\n| الخطأ | سبب الضرر | الحل |\n|:--|:--|:--|\n| شبكة مسطّحة واحدة | أي مضيف مخترق يستطيع المسح والوصول إلى كل شيء | التقسيم إلى مناطق مع تصفية بينها |\n| قواعد «أي إلى أي» تُضاف أثناء عطل | تتحول القواعد المؤقتة إلى ثغرات دائمة | حدّد مدة لقواعد الطوارئ وراجعها أسبوعيًا |\n| بيانات اعتماد مشتركة للمسؤولين | كلمة مرور مسروقة واحدة تفتح كل الأجهزة | حسابات فردية وخدمة هوية مركزية |\n| الثقة بالشبكة الداخلية | البرمجيات الخبيثة والمطلعون الداخليون موجودون أصلًا | افترض الاختراق وصفِّ الحركة الشرقية-الغربية |\n| النسخ الاحتياطية على شبكة الإنتاج | تشفّر برمجيات الفدية النسخ الاحتياطية أيضًا | ضع النسخ في منطقة منفصلة بوصول أحادي الاتجاه |\n\nتمرين مفيد أن ترسم شبكتك على صفحة واحدة، وتلوّن كل منطقة، وترسم سهمًا لكل تدفق مسموح. فإذا عجزت عن تفسير سهم فقد وجدت إما وثيقة ناقصة أو قاعدة غير ضرورية. وفي الحالتين تكون قد حسّنت التصميم.\n\nوتذكّر أخيرًا أن البنية لا تنتهي أبدًا. تظهر خوادم وحاويات وروابط سحابية جديدة كل شهر. وكل واحد منها يحتاج إلى منطقة ومالك وسطر في مصفوفة التدفقات قبل التشغيل لا بعده."
+   },
+   {
+    "type": "text",
+    "id": "mgmt",
+    "markdown": "## 4. احمِ مستوى الإدارة ووثّقه\n\nثلاث عادات تفرّق بين التصميم الناضج والتصميم المحظوظ.\n\n- **الإدارة خارج النطاق (Out-of-band).** أبقِ إدارة المضيفات الافتراضية والمحوّلات وجدران الحماية على شبكة مستقلة، ولا تصل إليها إلا عبر خادم قفز مُحصَّن مع مصادقة متعددة العوامل.\n- **التسجيل المركزي.** أرسل سجلات جدار الحماية والمضيفات وDNS إلى مجمّع واحد لتتمكن من إعادة بناء الحادثة. راجع [مراقبة أمن الشبكات](/learn/systems-infrastructure-security/network-security-monitoring).\n- **مصفوفة التدفقات.** دوّن كل تدفق مسموح: منطقة المصدر ومنطقة الوجهة والمنفذ والمالك والسبب. أي قاعدة بلا مالك مرشّحة للحذف.\n\nراجع المصفوفة كل ربع سنة. فالقواعد تتراكم كما تتراكم الفوضى، والقاعدة التي لا يتذكرها أحد ثغرة لا يراقبها أحد. وأضف أخيرًا ضوابط DNS والحماية من الإغراق، وقد غُطّيت في [أمن DNS وتصفية DNS](/learn/systems-infrastructure-security/dns-security-and-dns-filtering) و[الحماية من هجمات حجب الخدمة (DoS/DDoS)](/learn/systems-infrastructure-security/denial-of-service-dos-ddos-protection)."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على جهازين افتراضيين Linux تملكهما (مثلًا في Proxmox أو VirtualBox) سمِّهما `app` و`db`:\n\n1. ثبّت PostgreSQL أو شغّل فقط `nc -l 5432` على `db`.\n2. طبّق سياسة `nftables` أعلاه مع تعديل العناوين لتناسب مختبرك.\n3. من `app` اختبر المنفذين 5432 و22 بالأمر `nc -zv`.\n4. تأكد من سجل الإسقاط بالأمر `journalctl -k | grep nft-drop`.\n\nاكتب مصفوفة تدفقات من ثلاثة أسطر لما بنيته."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "الدفاع المتعمّق",
+      "definition": "وضع ضوابط مستقلة في طبقات بحيث لا يكون فشل واحد قاتلًا."
+     },
+     {
+      "term": "التجزئة",
+      "definition": "تقسيم الشبكة إلى مناطق ذات قواعد منفصلة."
+     },
+     {
+      "term": "الرفض الافتراضي",
+      "definition": "منع كل الحركة إلا ما يُسمح به صراحةً."
+     },
+     {
+      "term": "المنطقة المنزوعة السلاح (DMZ)",
+      "definition": "منطقة منخفضة الثقة تستضيف الخدمات المواجهة للإنترنت."
+     },
+     {
+      "term": "الحركة الشرقية-الغربية",
+      "definition": "تدفقات بين الأنظمة الداخلية."
+     },
+     {
+      "term": "الحركة الشمالية-الجنوبية",
+      "definition": "تدفقات تعبر محيط الشبكة."
+     },
+     {
+      "term": "مستوى الإدارة",
+      "definition": "الشبكة والأدوات المستخدمة لإدارة البنية التحتية."
+     },
+     {
+      "term": "مصفوفة التدفقات",
+      "definition": "قائمة موثّقة بكل تدفق مسموح."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي مبدأ يقول إن النظام لا يصل إلا إلى النظراء والمنافذ التي يتطلبها عمله؟",
+      "options": [
+       "الدفاع المتعمّق",
+       "أقل الصلاحيات",
+       "الفشل المفتوح",
+       "عكس المنافذ"
+      ],
+      "answer": 1,
+      "explanation": "يقصر مبدأ أقل الصلاحيات كل نظام على الوصول الذي يحتاجه."
+     },
+     {
+      "question": "اختر كل الممارسات الجيدة لمنطقة الإدارة.",
+      "options": [
+       "مشاركة القطاع مع Wi-Fi المستخدمين",
+       "الوصول عبر خادم قفز مُحصَّن",
+       "استخدام المصادقة متعددة العوامل",
+       "كشف واجهة المضيف الافتراضي للإنترنت"
+      ],
+      "answer": [
+       1,
+       2
+      ],
+      "explanation": "تُعزل الإدارة ويُتحكم بها عبر خادم قفز مع MFA، ولا تُكشف ولا تُشارَك."
+     },
+     {
+      "question": "لماذا قد يفوّت جدار حماية خارجي الحركة بين جهازين افتراضيين؟",
+      "options": [
+       "لأن جدران الحماية لا تصفّي TCP",
+       "لأن الجهازين قد يشتركان في جسر افتراضي على المضيف نفسه",
+       "لأن الأجهزة الافتراضية تشفّر دائمًا",
+       "لأن الحركة الشرقية-الغربية غير موجودة"
+      ],
+      "answer": 1,
+      "explanation": "الحركة على جسر افتراضي واحد لا تغادر المضيف، فاستخدم جدار حماية المضيف أو المضيف الافتراضي."
+     },
+     {
+      "question": "أظهر اختبار أن منفذًا محظورًا ينتهي بمهلة. ما التفسير الأرجح؟",
+      "options": [
+       "أُسقطت الحزمة بصمت",
+       "الخدمة سليمة",
+       "فشل DNS",
+       "المنفذ مفتوح"
+      ],
+      "answer": 0,
+      "explanation": "قواعد drop تنتج مهلة، أما قواعد reject فتنتج رفضًا فوريًا."
+     },
+     {
+      "question": "اختر كل ما يصف الرفض الافتراضي.",
+      "options": [
+       "نهج قائمة السماح",
+       "أسهل في التدقيق من قائمة المنع",
+       "يسمح بكل شيء ما لم يُذكر",
+       "يُطبَّق على عدة طبقات"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يمنع الرفض الافتراضي كل شيء عدا التدفقات المذكورة ويمكن تطبيقه على كل طبقة."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\n- البنية خطة تتألف من مناطق وتدفقات مسموحة ونقاط فرض، وليست منتجًا واحدًا.\n- تقودها أربعة مبادئ: الدفاع المتعمّق وأقل الصلاحيات والتجزئة والرفض الافتراضي.\n- راقب الحركة الشمالية-الجنوبية والشرقية-الغربية معًا، فالتصفية الداخلية توقف الحركة الجانبية.\n- افرض على مستوى الشبكة والمحوّل والمضيف والهوية، ولا تنسَ الجسور الافتراضية.\n- اعزل مستوى الإدارة ومركِز السجلات وأبقِ مصفوفة تدفقات.\n- تحقق دائمًا من فشل التدفقات المحظورة."
+   }
+  ]
+ }
+}

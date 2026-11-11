@@ -1,0 +1,538 @@
+{
+ "slug": "virtualization-security-monitoring",
+ "title": "Virtualization Security Monitoring",
+ "summary": "Monitor Proxmox authentication, API calls, tasks and guests, ship logs off the host and build a small set of actionable alerts.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Identify the log and metric sources on a Proxmox node",
+  "Forward logs to a central server over TLS",
+  "Define high-signal alerts and baselines",
+  "Extend monitoring to guests"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "## You cannot defend what you cannot see\n\nA virtualization host concentrates risk. One Proxmox node runs dozens of workloads, holds their disks and controls their networks. If someone guesses a password on the web interface at 03:00, or a script creates a new API token, you want to know within minutes, not at the next audit.\n\nThis lesson shows what to watch on a Proxmox VE environment you own, where those signals live, and how to ship them to a place an attacker on the host cannot quietly erase. It builds on [Proxmox web interface security](/learn/systems-infrastructure-security/proxmox-web-interface-security) and [Proxmox API token security](/learn/systems-infrastructure-security/proxmox-api-token-security)."
+  },
+  {
+   "type": "text",
+   "id": "signals",
+   "markdown": "## Step 1: Know the signals\n\nGroup the signals by layer. Each answers a different question.\n\n| Layer | Source | Question it answers |\n|:--|:--|:--|\n| Authentication | `journalctl -u pvedaemon`, `/var/log/auth.log` | Who logged in, and who failed? |\n| Web and API | `/var/log/pveproxy/access.log` | Which client called which endpoint? |\n| Tasks | `/var/log/pve/tasks/`, cluster task list | Who started, stopped, deleted or restored a VM? |\n| Network | Proxmox firewall log, bridge counters | What traffic was dropped, and from where? |\n| Host | `journalctl -k`, SMART, ZFS or Ceph status | Is hardware or storage failing? |\n| Guests | Metrics: CPU, disk, network | Is a VM behaving differently from its baseline? |\n\nA good start is a short list of events that should *always* raise an alert: repeated failed logins, a login from a new network, creation of an API token or user, a role change, deletion of a backup job, and any change to firewall options. These are rare in a stable environment, so every occurrence deserves a look."
+  },
+  {
+   "type": "terminal",
+   "id": "logs-term",
+   "title": "Reading Proxmox logs on a node you own",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "journalctl -u pvedaemon --since '1 hour ago' | grep -i 'authentication failure'",
+     "output": "Nov 11 03:02:14 pve1 pvedaemon[1423]: authentication failure; rhost=198.51.100.23 user=root@pam msg=Authentication failure\nNov 11 03:02:19 pve1 pvedaemon[1423]: authentication failure; rhost=198.51.100.23 user=root@pam msg=Authentication failure",
+     "comment": "Repeated failures from one source address."
+    },
+    {
+     "cmd": "grep -c ' 401 ' /var/log/pveproxy/access.log",
+     "output": "37",
+     "comment": "Count HTTP 401 responses. A sudden jump is a signal."
+    },
+    {
+     "cmd": "pvesh get /cluster/tasks --output-format json-pretty | head -n 12",
+     "output": "[\n  {\n    \"type\": \"qmdestroy\",\n    \"user\": \"ops@pve\",\n    \"node\": \"pve1\",\n    \"status\": \"OK\",\n    \"upid\": \"UPID:pve1:...\"\n  }\n]",
+     "comment": "Tasks record who destroyed a VM."
+    },
+    {
+     "cmd": "pveum user token list ops@pve",
+     "output": "tokenid  privsep  expire\nbackup   1        0",
+     "comment": "Review tokens regularly. An expire of 0 means no expiry."
+    }
+   ],
+   "caption": "The 198.51.100.23 address is a documentation example. In your lab it would be a real client."
+  },
+  {
+   "type": "animation",
+   "id": "log-flow",
+   "kind": "flow",
+   "title": "From event to alert",
+   "caption": "A log only helps if it leaves the host and someone is told.",
+   "data": {
+    "token": "Log line",
+    "nodes": [
+     {
+      "id": "pve",
+      "label": "Proxmox node",
+      "sub": "pvedaemon, pveproxy",
+      "icon": "server"
+     },
+     {
+      "id": "fwd",
+      "label": "Forwarder",
+      "sub": "rsyslog over TLS",
+      "icon": "log"
+     },
+     {
+      "id": "siem",
+      "label": "Log server",
+      "sub": "Separate host",
+      "icon": "database"
+     },
+     {
+      "id": "rule",
+      "label": "Alert rule",
+      "sub": "5 failures / 5 min",
+      "icon": "eye"
+     },
+     {
+      "id": "ops",
+      "label": "On-call admin",
+      "icon": "user"
+     }
+    ],
+    "steps": [
+     {
+      "at": "pve",
+      "caption": "A failed login is written to the journal."
+     },
+     {
+      "at": "fwd",
+      "caption": "rsyslog forwards the line within seconds."
+     },
+     {
+      "at": "siem",
+      "caption": "The central server stores it where the node cannot edit it.",
+      "tone": "secure"
+     },
+     {
+      "at": "rule",
+      "caption": "A rule counts five failures in five minutes.",
+      "tone": "warning"
+     },
+     {
+      "at": "ops",
+      "caption": "The admin gets a message and investigates.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "ship",
+   "markdown": "## Step 2: Ship logs off the host\n\nLocal logs are the first thing an intruder with root will edit. Forward them to a separate log server so that a copy survives. On Debian-based Proxmox, rsyslog is already installed. A forwarding rule is a single line plus TLS settings."
+  },
+  {
+   "type": "code",
+   "id": "rsyslog-conf",
+   "language": "bash",
+   "code": "# /etc/rsyslog.d/90-forward.conf\n# Forward everything from the node to the central log server over TLS.\n$DefaultNetstreamDriver gtls\n$DefaultNetstreamDriverCAFile /etc/ssl/certs/example-ca.pem\n$ActionSendStreamDriver gtls\n$ActionSendStreamDriverMode 1\n$ActionSendStreamDriverAuthMode x509/name\n$ActionSendStreamDriverPermittedPeer logs.example.com\n*.* @@logs.example.com:6514\n# Apply the change and test it:\n#   systemctl restart rsyslog\n#   logger -p auth.notice \"test message from pve1\"\n",
+   "filename": "/etc/rsyslog.d/90-forward.conf",
+   "caption": "The double @@ means TCP. Authenticating the peer by name prevents sending logs to an impostor."
+  },
+  {
+   "type": "callout",
+   "id": "tip-time",
+   "variant": "tip",
+   "title": "Synchronize clocks first",
+   "markdown": "Correlating events across nodes requires accurate time. Point every node at the same internal NTP source, and confirm with `chronyc tracking`. Logs with a five-minute skew make an investigation far harder."
+  },
+  {
+   "type": "text",
+   "id": "detect",
+   "markdown": "## Step 3: Turn signals into alerts\n\nAlerts must be few and actionable. Start with these:\n\n1. **Brute force:** five or more authentication failures from one address within five minutes.\n2. **Privilege change:** any new user, token or role assignment outside a change window.\n3. **Destructive task:** deletion of a VM, storage or backup job.\n4. **Firewall change:** the datacenter or node firewall is disabled or a rule is removed.\n5. **Resource anomaly:** a guest that suddenly sustains maximum CPU or sends far more traffic than its baseline. This can indicate cryptomining or data exfiltration.\n\nYou can also rate-limit repeated failures at the host with Fail2ban, using the `pve` filter that matches the authentication failure lines. This slows guessing, but it does not replace central alerting.\n\n### Establish a baseline\n\nAlerts on resource use only work if you know what normal looks like. Record a week of CPU, disk and network figures per VM, using the Proxmox metric server (InfluxDB or Graphite) or Prometheus. Then alert on deviations such as three times the usual outbound traffic, not on a fixed number."
+  },
+  {
+   "type": "callout",
+   "id": "warn-noise",
+   "variant": "warning",
+   "title": "Alert fatigue is a security risk",
+   "markdown": "If the on-call admin receives fifty low-value alerts a day, the one real alert is ignored. Review every alert monthly. Tune or delete the ones nobody acts on, and write a one-line response for each one you keep."
+  },
+  {
+   "type": "text",
+   "id": "retention",
+   "markdown": "## Step 4: Plan retention, access and response\n\nMonitoring creates sensitive data, because logs contain usernames, addresses and sometimes secrets typed by mistake. Decide three things up front.\n\n### Retention\n\nKeep authentication and task logs long enough to investigate slow attacks. Ninety days online and one year archived is a common starting point. Check whether a regulation or contract sets a longer period. Size the log server so that it never fills up silently, and alert when disk usage passes 80 percent.\n\n### Access\n\nGive the log server its own accounts. Administrators of the Proxmox nodes should be able to read logs but not delete them. If the same people control both the hypervisor and its evidence, a single compromised account can erase the trail.\n\n### Response\n\nFor every alert, write who looks first, what they check, and when they escalate. A useful first check for a suspicious login is short: confirm the source address, look at the tasks that followed, list the tokens and users created recently, and compare against the change calendar. If the activity is not explained, rotate the credentials involved and follow your incident process.\n\n| Alert | First check | Escalate when |\n|:--|:--|:--|\n| Brute force | Was any attempt successful? | A success follows the failures |\n| New token | Is there a change ticket? | No ticket, or created by an unexpected user |\n| VM deleted | Was it planned and backed up? | Not planned, or the backup is missing |\n| Firewall disabled | Who ran the change? | Not in a change window |"
+  },
+  {
+   "type": "text",
+   "id": "guests",
+   "markdown": "## Step 5: Do not forget the guests\n\nThe hypervisor sees resources, not what happens inside a VM. For important guests, add an agent or log shipper inside the operating system, and send those logs to the same central server. Tag each event with the VM name and ID so that you can pivot from a host alert to the guest and back. The QEMU guest agent also lets you query the guest state during an investigation. Keep management traffic on its own network, as described in [management network isolation](/learn/systems-infrastructure-security/management-network-isolation), so the log path itself is protected."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab node you own, set up rsyslog forwarding to a second lab machine. Then fail a web interface login three times with a wrong password on purpose, and find the three lines on the receiving machine. Finally, write one alert rule in plain words: threshold, time window and who is told."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Baseline",
+     "definition": "A record of normal behavior used to detect deviations."
+    },
+    {
+     "term": "Log forwarding",
+     "definition": "Sending log lines to a separate server as they are written."
+    },
+    {
+     "term": "pveproxy",
+     "definition": "The Proxmox web and API service; its access log records every request."
+    },
+    {
+     "term": "Fail2ban",
+     "definition": "A tool that bans addresses after repeated authentication failures."
+    },
+    {
+     "term": "Alert fatigue",
+     "definition": "Ignoring alerts because there are too many low-value ones."
+    },
+    {
+     "term": "Metric server",
+     "definition": "An external store such as InfluxDB that receives Proxmox performance data."
+    },
+    {
+     "term": "Exfiltration",
+     "definition": "Unauthorized transfer of data out of an environment."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why forward logs to a separate server?",
+     "options": [
+      "To reduce disk usage on the node",
+      "So a copy survives if the node is compromised",
+      "Because Proxmox cannot log locally"
+     ],
+     "answer": 1,
+     "explanation": "An intruder with root can edit local logs. A remote copy preserves the evidence."
+    },
+    {
+     "question": "Which events should always raise an alert? Choose all that apply.",
+     "options": [
+      "A new API token is created",
+      "Five failed logins in five minutes from one address",
+      "A routine nightly backup finishes",
+      "The firewall is disabled"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Token creation, brute force and firewall changes are rare or suspicious. A routine backup completion is normal."
+    },
+    {
+     "question": "A VM suddenly sends three times its normal outbound traffic. What makes this detectable?",
+     "options": [
+      "A fixed global threshold",
+      "A per-VM baseline",
+      "Disabling logging"
+     ],
+     "answer": 1,
+     "explanation": "Only a per-VM baseline tells you what is abnormal for that workload."
+    },
+    {
+     "question": "What does Fail2ban replace?",
+     "options": [
+      "Central alerting",
+      "Nothing; it slows guessing but does not replace alerting",
+      "Strong passwords and MFA"
+     ],
+     "answer": 1,
+     "explanation": "Fail2ban is a rate-limiter. You still need central alerts, strong passwords and MFA."
+    },
+    {
+     "question": "Why synchronize clocks across nodes?",
+     "options": [
+      "To correlate events in the right order",
+      "To speed up backups",
+      "To enable HTTPS"
+     ],
+     "answer": 0,
+     "explanation": "Accurate, consistent timestamps are needed to reconstruct a timeline."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nMonitor authentication, API calls, tasks, network drops, host health and guest behavior. Forward logs to a separate server over TLS, keep clocks in sync, and write a few high-signal alerts with a clear response. Build baselines so anomalies stand out, and review alerts monthly to avoid fatigue. Next, secure the cluster those nodes form in [Proxmox cluster security](/learn/systems-infrastructure-security/proxmox-cluster-security)."
+  }
+ ],
+ "ar": {
+  "title": "المراقبة الأمنية لبيئات المحاكاة الافتراضية",
+  "summary": "راقب مصادقة Proxmox واستدعاءات API والمهام والضيوف، وأرسل السجلات خارج المضيف وابنِ مجموعة صغيرة من التنبيهات القابلة للتنفيذ.",
+  "objectives": [
+   "تحديد مصادر السجلات والمقاييس على عقدة Proxmox",
+   "إرسال السجلات إلى خادم مركزي عبر TLS",
+   "تعريف تنبيهات عالية الإشارة وخطوط أساس",
+   "توسيع المراقبة لتشمل الضيوف"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "## لا تستطيع الدفاع عمّا لا تراه\n\nيركّز مضيف المحاكاة الافتراضية المخاطر في مكان واحد. فعقدة Proxmox واحدة تشغّل عشرات الأحمال وتحتفظ بأقراصها وتتحكم بشبكاتها. وإذا خمّن أحدهم كلمة مرور واجهة الويب عند الثالثة فجرًا، أو أنشأ سكربت رمز API جديدًا، فأنت تريد أن تعرف خلال دقائق لا عند التدقيق القادم.\n\nيبيّن هذا الدرس ما الذي تراقبه في بيئة Proxmox VE تملكها، وأين تعيش هذه الإشارات، وكيف تُرسلها إلى مكان لا يستطيع مهاجم على المضيف محوها بصمت. وهو يبني على [أمن واجهة الويب في Proxmox](/learn/systems-infrastructure-security/proxmox-web-interface-security) و[أمن رموز API في Proxmox](/learn/systems-infrastructure-security/proxmox-api-token-security)."
+   },
+   {
+    "type": "text",
+    "id": "signals",
+    "markdown": "## الخطوة 1: تعرّف على الإشارات\n\nصنّف الإشارات بحسب الطبقة، فكل طبقة تجيب عن سؤال مختلف.\n\n| الطبقة | المصدر | السؤال الذي تجيب عنه |\n|:--|:--|:--|\n| المصادقة | `journalctl -u pvedaemon` و`/var/log/auth.log` | من دخل ومن فشل؟ |\n| الويب وAPI | `/var/log/pveproxy/access.log` | أي عميل استدعى أي نقطة نهاية؟ |\n| المهام | `/var/log/pve/tasks/` وقائمة مهام العنقود | من شغّل آلة أو أوقفها أو حذفها أو استعادها؟ |\n| الشبكة | سجل جدار Proxmox وعدّادات الجسر | ما الحركة المحجوبة ومن أين؟ |\n| المضيف | `journalctl -k` وSMART وحالة ZFS أو Ceph | هل العتاد أو التخزين يتعطّل؟ |\n| الضيوف | مقاييس المعالج والقرص والشبكة | هل تتصرف آلة بشكل مختلف عن خط الأساس؟ |\n\nبداية جيدة هي قائمة قصيرة بأحداث يجب أن تُطلق تنبيهًا دائمًا: فشل تسجيل الدخول المتكرر، ودخول من شبكة جديدة، وإنشاء رمز API أو مستخدم، وتغيير دور، وحذف مهمة نسخ احتياطي، وأي تغيير في خيارات الجدار. هذه الأحداث نادرة في بيئة مستقرة، لذا يستحق كل حدوث منها نظرة."
+   },
+   {
+    "type": "terminal",
+    "id": "logs-term",
+    "title": "قراءة سجلات Proxmox على عقدة تملكها",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "journalctl -u pvedaemon --since '1 hour ago' | grep -i 'authentication failure'",
+      "output": "Nov 11 03:02:14 pve1 pvedaemon[1423]: authentication failure; rhost=198.51.100.23 user=root@pam msg=Authentication failure\nNov 11 03:02:19 pve1 pvedaemon[1423]: authentication failure; rhost=198.51.100.23 user=root@pam msg=Authentication failure",
+      "comment": "فشل متكرر من عنوان مصدر واحد."
+     },
+     {
+      "cmd": "grep -c ' 401 ' /var/log/pveproxy/access.log",
+      "output": "37",
+      "comment": "احسب استجابات HTTP 401. القفزة المفاجئة إشارة."
+     },
+     {
+      "cmd": "pvesh get /cluster/tasks --output-format json-pretty | head -n 12",
+      "output": "[\n  {\n    \"type\": \"qmdestroy\",\n    \"user\": \"ops@pve\",\n    \"node\": \"pve1\",\n    \"status\": \"OK\",\n    \"upid\": \"UPID:pve1:...\"\n  }\n]",
+      "comment": "تسجّل المهام من حذف آلة."
+     },
+     {
+      "cmd": "pveum user token list ops@pve",
+      "output": "tokenid  privsep  expire\nbackup   1        0",
+      "comment": "راجع الرموز دوريًا. القيمة 0 تعني بلا انتهاء."
+     }
+    ],
+    "caption": "العنوان 198.51.100.23 مثال توثيقي، وفي مختبرك سيكون عميلاً حقيقيًا."
+   },
+   {
+    "type": "animation",
+    "id": "log-flow",
+    "kind": "flow",
+    "title": "من الحدث إلى التنبيه",
+    "caption": "السجل لا ينفع إلا إذا غادر المضيف وأُبلغ أحدهم.",
+    "data": {
+     "token": "سطر سجل",
+     "nodes": [
+      {
+       "id": "pve",
+       "label": "عقدة Proxmox",
+       "sub": "pvedaemon وpveproxy",
+       "icon": "server"
+      },
+      {
+       "id": "fwd",
+       "label": "المُرسِل",
+       "sub": "rsyslog عبر TLS",
+       "icon": "log"
+      },
+      {
+       "id": "siem",
+       "label": "خادم السجلات",
+       "sub": "مضيف منفصل",
+       "icon": "database"
+      },
+      {
+       "id": "rule",
+       "label": "قاعدة التنبيه",
+       "sub": "5 إخفاقات / 5 دقائق",
+       "icon": "eye"
+      },
+      {
+       "id": "ops",
+       "label": "مسؤول المناوبة",
+       "icon": "user"
+      }
+     ],
+     "steps": [
+      {
+       "at": "pve",
+       "caption": "يُكتب فشل تسجيل الدخول في السجل."
+      },
+      {
+       "at": "fwd",
+       "caption": "يُرسل rsyslog السطر خلال ثوانٍ."
+      },
+      {
+       "at": "siem",
+       "caption": "يخزّنه الخادم المركزي حيث لا تستطيع العقدة تعديله.",
+       "tone": "secure"
+      },
+      {
+       "at": "rule",
+       "caption": "تحسب قاعدة خمسة إخفاقات في خمس دقائق.",
+       "tone": "warning"
+      },
+      {
+       "at": "ops",
+       "caption": "يتلقى المسؤول رسالة ويحقّق.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "ship",
+    "markdown": "## الخطوة 2: أرسل السجلات خارج المضيف\n\nالسجلات المحلية أول ما سيعدّله متسلل يملك صلاحيات root. أرسلها إلى خادم سجلات منفصل لتبقى نسخة منها. في Proxmox المبني على Debian يكون rsyslog مثبتًا أصلاً، وقاعدة الإرسال سطر واحد مع إعدادات TLS."
+   },
+   {
+    "type": "code",
+    "id": "rsyslog-conf",
+    "language": "bash",
+    "code": "# /etc/rsyslog.d/90-forward.conf\n# Forward everything from the node to the central log server over TLS.\n$DefaultNetstreamDriver gtls\n$DefaultNetstreamDriverCAFile /etc/ssl/certs/example-ca.pem\n$ActionSendStreamDriver gtls\n$ActionSendStreamDriverMode 1\n$ActionSendStreamDriverAuthMode x509/name\n$ActionSendStreamDriverPermittedPeer logs.example.com\n*.* @@logs.example.com:6514\n# Apply the change and test it:\n#   systemctl restart rsyslog\n#   logger -p auth.notice \"test message from pve1\"\n",
+    "filename": "/etc/rsyslog.d/90-forward.conf",
+    "caption": "علامة @@ تعني TCP. مصادقة الطرف بالاسم تمنع إرسال السجلات إلى منتحل."
+   },
+   {
+    "type": "callout",
+    "id": "tip-time",
+    "variant": "tip",
+    "title": "زامن الساعات أولاً",
+    "markdown": "يتطلب ربط الأحداث عبر العقد وقتًا دقيقًا. وجّه كل العقد إلى مصدر NTP داخلي واحد وتأكد بالأمر `chronyc tracking`. فالسجلات ذات انحراف الخمس دقائق تجعل التحقيق أصعب كثيرًا."
+   },
+   {
+    "type": "text",
+    "id": "detect",
+    "markdown": "## الخطوة 3: حوّل الإشارات إلى تنبيهات\n\nيجب أن تكون التنبيهات قليلة وقابلة للتنفيذ. ابدأ بهذه:\n\n1. **التخمين بالقوة الغاشمة:** خمسة إخفاقات مصادقة أو أكثر من عنوان واحد خلال خمس دقائق.\n2. **تغيير الصلاحيات:** أي مستخدم أو رمز أو إسناد دور جديد خارج نافذة التغيير.\n3. **مهمة مدمّرة:** حذف آلة أو تخزين أو مهمة نسخ احتياطي.\n4. **تغيير الجدار:** تعطيل جدار مركز البيانات أو العقدة أو إزالة قاعدة.\n5. **شذوذ الموارد:** ضيف يستهلك المعالج بالحد الأقصى فجأة ولمدة طويلة أو يرسل حركة تفوق خط أساسه بكثير. قد يدل ذلك على تعدين عملات أو تسريب بيانات.\n\nيمكنك أيضًا الحد من الإخفاقات المتكررة على المضيف باستخدام Fail2ban مع مرشّح `pve` الذي يطابق أسطر فشل المصادقة. هذا يبطئ التخمين لكنه لا يغني عن التنبيه المركزي.\n\n### أنشئ خط أساس\n\nلا تنجح تنبيهات استهلاك الموارد إلا إذا عرفت الوضع الطبيعي. سجّل أسبوعًا من أرقام المعالج والقرص والشبكة لكل آلة عبر خادم مقاييس Proxmox (InfluxDB أو Graphite) أو Prometheus. ثم نبّه على الانحراف، كأن تتجاوز الحركة الصادرة ثلاثة أضعاف المعتاد، لا على رقم ثابت."
+   },
+   {
+    "type": "callout",
+    "id": "warn-noise",
+    "variant": "warning",
+    "title": "إرهاق التنبيهات خطر أمني",
+    "markdown": "إذا تلقى مسؤول المناوبة خمسين تنبيهًا قليل القيمة يوميًا فسيُتجاهل التنبيه الحقيقي الوحيد. راجع كل تنبيه شهريًا، واضبط أو احذف ما لا يتصرف أحد حياله، واكتب استجابة من سطر واحد لكل تنبيه تُبقي عليه."
+   },
+   {
+    "type": "text",
+    "id": "retention",
+    "markdown": "## الخطوة 4: خطّط للاحتفاظ والوصول والاستجابة\n\nتُنتج المراقبة بيانات حساسة، فالسجلات تحوي أسماء مستخدمين وعناوين وأحيانًا أسرارًا كُتبت بالخطأ. قرّر ثلاثة أمور مسبقًا.\n\n### الاحتفاظ\n\nاحتفظ بسجلات المصادقة والمهام مدة كافية للتحقيق في الهجمات البطيئة. تسعون يومًا متاحة وسنة مؤرشفة نقطة بداية شائعة. تحقق مما إذا كانت لائحة أو عقد يفرض مدة أطول. حدّد حجم خادم السجلات كي لا يمتلئ بصمت، ونبّه عندما يتجاوز استخدام القرص 80 بالمئة.\n\n### الوصول\n\nامنح خادم السجلات حساباته الخاصة. ينبغي أن يستطيع مسؤولو عقد Proxmox قراءة السجلات لا حذفها. فإذا كان الأشخاص أنفسهم يتحكمون بالمضيف وبأدلته، فقد يمحو حساب مخترَق واحد الأثر كله.\n\n### الاستجابة\n\nلكل تنبيه اكتب من ينظر أولاً وماذا يفحص ومتى يصعّد. والفحص الأول المفيد لدخول مشبوه قصير: تأكد من عنوان المصدر، وانظر في المهام التي تلته، واعرض الرموز والمستخدمين المُنشَأين حديثًا، وقارن ذلك بتقويم التغييرات. وإذا لم يكن النشاط مفسَّرًا فبدّل بيانات الاعتماد المعنية واتبع عملية الاستجابة للحوادث.\n\n| التنبيه | الفحص الأول | التصعيد عندما |\n|:--|:--|:--|\n| التخمين | هل نجحت أي محاولة؟ | يتبع الإخفاقات نجاح |\n| رمز جديد | هل توجد تذكرة تغيير؟ | لا تذكرة، أو أنشأه مستخدم غير متوقع |\n| حذف آلة | هل كان مخططًا ومنسوخًا؟ | غير مخطط أو النسخة مفقودة |\n| تعطيل الجدار | من نفّذ التغيير؟ | خارج نافذة التغيير |"
+   },
+   {
+    "type": "text",
+    "id": "guests",
+    "markdown": "## الخطوة 5: لا تنسَ الضيوف\n\nيرى المضيف الموارد لا ما يحدث داخل الآلة الافتراضية. للضيوف المهمة، أضف وكيلاً أو مُرسِل سجلات داخل نظام التشغيل وأرسل سجلاتها إلى الخادم المركزي نفسه. ضع على كل حدث اسم الآلة ومعرّفها لتنتقل من تنبيه المضيف إلى الضيف والعكس. كما يتيح وكيل الضيف QEMU الاستعلام عن حالة الضيف أثناء التحقيق. وأبقِ حركة الإدارة على شبكتها المنفصلة كما في [عزل شبكة الإدارة](/learn/systems-infrastructure-security/management-network-isolation) كي يكون مسار السجلات نفسه محميًا."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على عقدة مخبرية تملكها، اضبط إرسال rsyslog إلى جهاز مخبري ثانٍ. ثم أخفق عمدًا في تسجيل الدخول إلى واجهة الويب ثلاث مرات بكلمة مرور خاطئة، وابحث عن الأسطر الثلاثة على الجهاز المستقبِل. وأخيرًا اكتب قاعدة تنبيه واحدة بكلمات بسيطة: العتبة والنافذة الزمنية ومن يُبلَّغ."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "خط الأساس",
+      "definition": "سجل للسلوك الطبيعي يُستخدم لاكتشاف الانحرافات."
+     },
+     {
+      "term": "إرسال السجلات",
+      "definition": "إرسال أسطر السجل إلى خادم منفصل فور كتابتها."
+     },
+     {
+      "term": "pveproxy",
+      "definition": "خدمة الويب وAPI في Proxmox، ويسجّل سجل الوصول فيها كل طلب."
+     },
+     {
+      "term": "Fail2ban",
+      "definition": "أداة تحظر العناوين بعد إخفاقات مصادقة متكررة."
+     },
+     {
+      "term": "إرهاق التنبيهات",
+      "definition": "تجاهل التنبيهات بسبب كثرة التنبيهات قليلة القيمة."
+     },
+     {
+      "term": "خادم المقاييس",
+      "definition": "مخزن خارجي مثل InfluxDB يستقبل بيانات أداء Proxmox."
+     },
+     {
+      "term": "تسريب البيانات",
+      "definition": "نقل غير مصرح به للبيانات خارج البيئة."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا تُرسل السجلات إلى خادم منفصل؟",
+      "options": [
+       "لتقليل استخدام القرص على العقدة",
+       "لتبقى نسخة منها إذا اختُرقت العقدة",
+       "لأن Proxmox لا يسجّل محليًا"
+      ],
+      "answer": 1,
+      "explanation": "المتسلل الذي يملك root يستطيع تعديل السجلات المحلية، والنسخة البعيدة تحفظ الأدلة."
+     },
+     {
+      "question": "أي الأحداث يجب أن تُطلق تنبيهًا دائمًا؟ اختر كل ما ينطبق.",
+      "options": [
+       "إنشاء رمز API جديد",
+       "خمس محاولات دخول فاشلة في خمس دقائق من عنوان واحد",
+       "انتهاء نسخة ليلية معتادة",
+       "تعطيل الجدار"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "إنشاء الرموز والتخمين وتغيير الجدار نادرة أو مشبوهة، أما اكتمال نسخة معتادة فطبيعي."
+     },
+     {
+      "question": "آلة افتراضية ترسل فجأة ثلاثة أضعاف حركتها الصادرة المعتادة. ما الذي يجعل ذلك قابلاً للاكتشاف؟",
+      "options": [
+       "عتبة عامة ثابتة",
+       "خط أساس لكل آلة",
+       "تعطيل التسجيل"
+      ],
+      "answer": 1,
+      "explanation": "خط الأساس لكل آلة وحده يخبرك بما هو غير طبيعي لذلك الحمل."
+     },
+     {
+      "question": "ما الذي يحلّ Fail2ban محلّه؟",
+      "options": [
+       "التنبيه المركزي",
+       "لا شيء؛ يبطئ التخمين لكنه لا يغني عن التنبيه",
+       "كلمات المرور القوية والمصادقة المتعددة"
+      ],
+      "answer": 1,
+      "explanation": "Fail2ban أداة تحديد معدل، وما زلت تحتاج التنبيهات المركزية وكلمات المرور القوية وMFA."
+     },
+     {
+      "question": "لماذا تُزامن الساعات عبر العقد؟",
+      "options": [
+       "لربط الأحداث بالترتيب الصحيح",
+       "لتسريع النسخ الاحتياطية",
+       "لتمكين HTTPS"
+      ],
+      "answer": 0,
+      "explanation": "تلزم طوابع زمنية دقيقة ومتسقة لإعادة بناء التسلسل الزمني."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nراقب المصادقة واستدعاءات API والمهام وإسقاطات الشبكة وصحة المضيف وسلوك الضيوف. أرسل السجلات إلى خادم منفصل عبر TLS، وأبقِ الساعات متزامنة، واكتب عددًا قليلاً من التنبيهات عالية الإشارة مع استجابة واضحة. ابنِ خطوط أساس لتبرز الشذوذات، وراجع التنبيهات شهريًا لتجنب الإرهاق. وفي الدرس التالي تؤمّن العنقود الذي تشكّله هذه العقد: [أمن عنقود Proxmox](/learn/systems-infrastructure-security/proxmox-cluster-security)."
+   }
+  ]
+ }
+}

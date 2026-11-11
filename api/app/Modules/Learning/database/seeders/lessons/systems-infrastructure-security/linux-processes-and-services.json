@@ -1,0 +1,636 @@
+{
+  "slug": "linux-processes-and-services",
+  "title": "Linux Processes and Services",
+  "summary": "Inspect running processes, manage services with systemd and sandbox them with unit directives to limit what a compromised service can do.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Inspect processes with ps, ss and /proc and spot suspicious ones",
+    "Manage services with systemctl and reduce attack surface",
+    "Sandbox a service with systemd directives and measure the result",
+    "Operate and monitor services and scheduled jobs safely"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 02:10 an on-call engineer is paged: a server's CPU is pinned at 100 percent. The top process is named `kworker`, which looks like a kernel thread. But kernel threads have no command-line path in `ps` and no entry under `/proc/<pid>/exe`. This one does, and it points to a file in `/dev/shm`.\n\nKnowing what a normal process tree looks like, and how services are started, restricted and supervised, is the difference between a ten-minute diagnosis and a long night. This lesson covers how to inspect processes, manage services with `systemd`, and shrink the damage any one service can do."
+    },
+    {
+      "id": "procs",
+      "type": "text",
+      "markdown": "## Inspecting processes\n\nA **process** is a running program with a PID, an owner, a parent and a set of open files and sockets. The kernel exposes all of it under `/proc`. Start with four views:\n\n| Question | Command |\n|:--|:--|\n| What is running, as a tree? | `ps -eo pid,ppid,user,etime,cmd --forest` |\n| Who is using resources? | `top` or `ps aux --sort=-%cpu \\| head` |\n| What does it have open? | `sudo ls -l /proc/<pid>/fd` or `sudo lsof -p <pid>` |\n| What is it listening on? | `sudo ss -tulpn` |\n\nThings that deserve a second look: a process whose binary was **deleted** from disk (`/proc/<pid>/exe` shows `(deleted)`), a web-server child spawning a shell, a process running from `/tmp` or `/dev/shm`, and a service account running something interactive.\n\nProcesses talk through **signals**. `SIGTERM` (15) asks a process to exit cleanly, `SIGHUP` (1) usually asks it to reload configuration, and `SIGKILL` (9) ends it immediately with no cleanup. Try `SIGTERM` first. A process that survives only `SIGKILL` may be hung, or may be deliberately resisting, and either case belongs in your notes."
+    },
+    {
+      "id": "ps-term",
+      "type": "terminal",
+      "title": "app01.example.com",
+      "prompt": "admin@app01:~$",
+      "lines": [
+        {
+          "cmd": "ps -eo pid,ppid,user,cmd --forest | grep -A2 nginx",
+          "output": " 1203     1 root     nginx: master process /usr/sbin/nginx\n 1204  1203 www-data nginx: worker process\n 1205  1203 www-data nginx: worker process",
+          "comment": "A normal layout: a root master and unprivileged workers."
+        },
+        {
+          "cmd": "sudo ls -l /proc/4417/exe",
+          "output": "lrwxrwxrwx 1 root root 0 Nov 11 02:12 /proc/4417/exe -> /dev/shm/.kworker (deleted)",
+          "comment": "A fake kernel-thread name running from shared memory with its file deleted: contain and investigate."
+        },
+        {
+          "cmd": "sudo ss -tnp | grep 4417",
+          "output": "ESTAB 0 0 192.0.2.10:48122 203.0.113.80:443 users:((\".kworker\",pid=4417))",
+          "comment": "It also holds an outbound connection to an external host. Preserve evidence before killing it."
+        },
+        {
+          "cmd": "sudo kill -STOP 4417",
+          "output": "",
+          "comment": "Pausing keeps memory intact for forensics, unlike an immediate SIGKILL."
+        }
+      ]
+    },
+    {
+      "id": "systemd",
+      "type": "text",
+      "markdown": "## Managing services with systemd\n\nOn modern Linux, `systemd` starts everything after the kernel. A **unit** file describes one thing to manage. The most common is a `.service`. Know these commands:\n\n- `systemctl status nginx`: state, recent log lines and the process tree.\n- `systemctl enable --now nginx`: start now and at boot. `disable` removes the boot link.\n- `systemctl list-units --type=service --state=running`: everything running.\n- `systemctl list-unit-files --state=enabled`: everything that will start at boot.\n- `systemctl mask <unit>`: make a unit impossible to start, even as a dependency.\n- `journalctl -u nginx -b`: the service's logs for this boot.\n\nThe security rule is simple: **if you do not need a service, remove it.** Every enabled service is attack surface. After a fresh install, review the enabled list and the listening ports, then disable or uninstall what you do not use, such as `cups`, `avahi-daemon`, `rpcbind` or a database installed \"just in case\".\n\nNever edit unit files shipped by a package, since upgrades overwrite them. Create an override with `systemctl edit nginx`, which writes a drop-in under `/etc/systemd/system/nginx.service.d/`."
+    },
+    {
+      "id": "harden",
+      "type": "text",
+      "markdown": "## Sandboxing a service\n\n`systemd` can confine a service using kernel features, with a few lines in the unit. This is among the cheapest hardening available, because it needs no extra software.\n\n| Directive | Effect |\n|:--|:--|\n| `User=` / `Group=` | Run as a dedicated unprivileged account |\n| `NoNewPrivileges=yes` | Block privilege gain through setuid programs |\n| `ProtectSystem=strict` | Mount the filesystem read-only except listed paths |\n| `ProtectHome=yes` | Hide `/home`, `/root` and `/run/user` |\n| `PrivateTmp=yes` | Give the service its own `/tmp` |\n| `ReadWritePaths=` | List the only writable paths |\n| `CapabilityBoundingSet=` | Drop Linux capabilities the service never needs |\n| `RestrictAddressFamilies=` | Limit socket types, for example `AF_INET AF_INET6` |\n\nCapabilities and why they matter for privilege are covered in [Linux Capabilities and Privilege Escalation](/learn/systems-infrastructure-security/linux-capabilities-and-privilege-escalation). Start restrictive, run the service, and loosen only what the logs show it needs."
+    },
+    {
+      "id": "unit",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/systemd/system/reportd.service",
+      "caption": "A sandboxed unit for a custom reporting daemon we own.",
+      "code": "[Unit]\nDescription=Report generator\nAfter=network-online.target\n\n[Service]\nUser=reportd\nGroup=reportd\nExecStart=/opt/reportd/bin/reportd --config /etc/reportd/reportd.conf\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nReadWritePaths=/var/lib/reportd /var/log/reportd\nCapabilityBoundingSet=\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nUMask=0027\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target",
+      "highlight": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ]
+    },
+    {
+      "id": "sd-term",
+      "type": "terminal",
+      "title": "app01.example.com",
+      "prompt": "admin@app01:~$",
+      "lines": [
+        {
+          "cmd": "systemd-analyze security reportd.service --no-pager | tail -n 3",
+          "output": "→ Overall exposure level for reportd.service: 1.9 SAFE",
+          "comment": "Scores below about 4 are good. Unhardened services often score 9."
+        },
+        {
+          "cmd": "systemd-analyze security nginx.service --no-pager | tail -n 1",
+          "output": "→ Overall exposure level for nginx.service: 8.3 EXPOSED",
+          "comment": "A distribution default. Add a drop-in with restrictions and re-test."
+        }
+      ]
+    },
+    {
+      "id": "start-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "From systemctl start to a confined process",
+      "caption": "systemd applies the sandbox before the service's first instruction runs.",
+      "data": {
+        "actors": [
+          {
+            "id": "adm",
+            "label": "Administrator",
+            "sub": "sudo",
+            "icon": "user"
+          },
+          {
+            "id": "sd",
+            "label": "systemd",
+            "sub": "PID 1",
+            "icon": "cpu"
+          },
+          {
+            "id": "svc",
+            "label": "Service",
+            "sub": "reportd",
+            "icon": "server"
+          },
+          {
+            "id": "jr",
+            "label": "journald",
+            "sub": "Logs",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "from": "adm",
+            "to": "sd",
+            "label": "systemctl start reportd",
+            "note": "The request arrives over the systemd socket and is checked by polkit."
+          },
+          {
+            "from": "sd",
+            "to": "sd",
+            "label": "Read unit",
+            "detail": "User=reportd ProtectSystem=strict",
+            "tone": "secure",
+            "note": "systemd merges the unit file with its drop-ins."
+          },
+          {
+            "from": "sd",
+            "to": "svc",
+            "label": "fork + sandbox",
+            "detail": "namespaces, caps dropped",
+            "tone": "secure",
+            "note": "Namespaces, read-only mounts and dropped capabilities are set up before exec."
+          },
+          {
+            "from": "svc",
+            "to": "jr",
+            "label": "stdout and stderr",
+            "note": "Output is captured with the unit name and timestamp."
+          },
+          {
+            "from": "svc",
+            "to": "svc",
+            "label": "Write to /etc denied",
+            "tone": "blocked",
+            "note": "If the service is compromised, ProtectSystem blocks changes outside ReadWritePaths."
+          },
+          {
+            "from": "sd",
+            "to": "adm",
+            "label": "active (running)",
+            "tone": "success",
+            "note": "systemctl reports the state; Restart=on-failure supervises it afterward."
+          }
+        ]
+      }
+    },
+    {
+      "id": "socket",
+      "type": "text",
+      "markdown": "## Socket activation and least exposure\n\nSome services do not need to run all the time. With **socket activation**, systemd listens on the port and starts the service only when a connection arrives. This reduces memory use and, more importantly, lets systemd hold the privileged operation of binding to a low port while the service itself runs unprivileged.\n\nYou can also control who can reach a service at the unit level. `IPAddressAllow=` and `IPAddressDeny=` restrict which source addresses a service may talk to, and `SocketBindAllow=` limits the ports it may bind. For example, `IPAddressDeny=any` followed by `IPAddressAllow=192.0.2.0/24` confines a management daemon to one admin subnet even if the firewall is misconfigured. These controls complement, and never replace, the host firewall described in [Linux Firewall Management: nftables, UFW and firewalld](/learn/systems-infrastructure-security/linux-firewall-management-nftables-ufw-and-firewalld)."
+    },
+    {
+      "id": "ops",
+      "type": "text",
+      "markdown": "## Operating services safely\n\nGood habits keep services reliable and observable:\n\n1. **Reload instead of restart** when the service supports it (`systemctl reload nginx`) so connections are not dropped.\n2. **Validate configuration first** with `nginx -t`, `sshd -t` or a service's own check command.\n3. **Set resource limits** with `MemoryMax=`, `TasksMax=` and `LimitNOFILE=` so one runaway process cannot starve the host.\n4. **Watch for failures.** `systemctl --failed` lists broken units, and repeated restarts in `journalctl` often signal an exploit attempt or a bad deployment.\n5. **Run scheduled jobs deliberately.** Review `crontab -l` for each account, `/etc/cron.*` and `systemctl list-timers`. Attackers favor scheduled tasks for persistence, so alert on new ones.\n\nLogging and alerting for all of this is the subject of [Linux Auditing and System Logging](/learn/systems-infrastructure-security/linux-auditing-and-system-logging)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not kill what you have not examined",
+      "markdown": "Killing a suspicious process destroys its memory and open sockets, which are your best evidence. Capture `ps`, `/proc/<pid>/exe`, `lsof` and network connections first, then contain by isolating the host from the network if your procedure allows."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Roll back hardening safely",
+      "markdown": "Add one directive at a time and restart the service after each. If it fails, `journalctl -u <unit> -b` usually names the denied path, which you can then allow in `ReadWritePaths=`."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a VM you own:\n\n1. Run `systemctl list-unit-files --state=enabled` and `sudo ss -tulpn`. Write down one service you do not need and disable it with `sudo systemctl disable --now <name>`.\n2. Run `systemd-analyze security` and note the three services with the highest exposure.\n3. Pick one, run `sudo systemctl edit <name>`, add `NoNewPrivileges=yes`, `PrivateTmp=yes` and `ProtectHome=yes`, then restart it.\n4. Re-run `systemd-analyze security <name>` and compare the score. Check `systemctl status <name>` for failures.\n5. Run `systemctl --failed` and `systemctl list-timers` and record the result."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Process",
+          "definition": "A running instance of a program with its own PID, memory and open files."
+        },
+        {
+          "term": "Signal",
+          "definition": "A message sent to a process, such as SIGTERM for a graceful stop or SIGKILL for an immediate one."
+        },
+        {
+          "term": "/proc",
+          "definition": "A virtual filesystem through which the kernel exposes process and system information."
+        },
+        {
+          "term": "Unit file",
+          "definition": "A systemd configuration file describing a service, timer, socket or mount."
+        },
+        {
+          "term": "Drop-in",
+          "definition": "An override file in a .d directory that modifies a unit without editing the original."
+        },
+        {
+          "term": "mask",
+          "definition": "A systemctl action that makes a unit impossible to start by any means."
+        },
+        {
+          "term": "NoNewPrivileges",
+          "definition": "A unit option that stops a service and its children from gaining privilege."
+        },
+        {
+          "term": "Attack surface",
+          "definition": "The total set of services and interfaces an attacker could try to use."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "A process shows `/proc/<pid>/exe -> /dev/shm/.kworker (deleted)`. What does this suggest?",
+          "options": [
+            "A normal kernel thread",
+            "A binary run from shared memory whose file was deleted, which is suspicious",
+            "A systemd service",
+            "A log rotation job"
+          ],
+          "answer": 1,
+          "explanation": "Kernel threads have no executable path. A deleted binary in /dev/shm is a classic sign of malware hiding on disk."
+        },
+        {
+          "question": "Which directives limit what a compromised service can do? (Choose all that apply.)",
+          "options": [
+            "NoNewPrivileges=yes",
+            "ProtectSystem=strict",
+            "Restart=always",
+            "PrivateTmp=yes"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "The first, second and fourth confine privilege and file access. Restart=always only affects availability."
+        },
+        {
+          "question": "Why use `systemctl edit nginx` instead of editing the packaged unit file?",
+          "options": [
+            "It is faster",
+            "Package upgrades overwrite packaged files but keep drop-ins",
+            "It disables the service",
+            "It requires no root"
+          ],
+          "answer": 1,
+          "explanation": "Drop-ins live under /etc/systemd/system and persist across package updates."
+        },
+        {
+          "question": "What does `systemctl mask` do?",
+          "options": [
+            "Hides logs",
+            "Makes a unit impossible to start, even as a dependency",
+            "Encrypts the unit",
+            "Restarts the unit"
+          ],
+          "answer": 1,
+          "explanation": "A masked unit is linked to /dev/null, so nothing can start it until it is unmasked."
+        },
+        {
+          "question": "Before terminating a suspicious process, what should you do first?",
+          "options": [
+            "Reboot immediately",
+            "Capture its details and network state as evidence",
+            "Delete its binary",
+            "Ignore it"
+          ],
+          "answer": 1,
+          "explanation": "Memory, open files and sockets are lost when it exits, so preserve evidence first."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Learn the normal process tree so abnormal processes stand out: deleted binaries, execution from `/tmp` or `/dev/shm`, and shells under web servers.\n- Use `systemctl` to inspect, enable, disable and mask services, and remove what you do not need.\n- Change packaged units through drop-ins, never by editing the shipped file.\n- Sandbox services with `User=`, `NoNewPrivileges`, `ProtectSystem`, `PrivateTmp` and a minimal capability set, and measure with `systemd-analyze security`.\n- Preserve evidence before killing suspicious processes, and monitor failed units and timers.\n\nNext: [Linux Package and Patch Management](/learn/systems-infrastructure-security/linux-package-and-patch-management)."
+    }
+  ],
+  "ar": {
+    "title": "العمليات والخدمات في Linux",
+    "summary": "افحص العمليات الجارية وأدِر الخدمات بـ systemd وعزلها بتوجيهات الوحدات للحد مما تستطيع خدمة مخترقة فعله.",
+    "objectives": [
+      "افحص العمليات بـ ps وss و/proc وميّز المشبوهة منها",
+      "أدِر الخدمات بـ systemctl وقلّص سطح الهجوم",
+      "اعزل خدمة بتوجيهات systemd وقِس النتيجة",
+      "شغّل الخدمات والمهام المجدولة وراقبها بأمان"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الساعة 02:10 يصل نداء إلى المهندس المناوب: معالج الخادم عند 100 بالمئة. والعملية الأعلى استهلاكًا اسمها `kworker` وتبدو خيطًا من النواة. لكن خيوط النواة لا مسار لها في سطر أوامر `ps` ولا مدخل لها تحت `/proc/<pid>/exe`. أما هذه فلها مدخل يشير إلى ملف في `/dev/shm`.\n\nمعرفة شكل شجرة العمليات الطبيعية وكيف تُبدأ الخدمات وتُقيَّد وتُراقَب هي الفرق بين تشخيص في عشر دقائق وليلة طويلة. يغطي هذا الدرس فحص العمليات وإدارة الخدمات بـ `systemd` وتقليص الضرر الذي تستطيع أي خدمة إحداثه."
+      },
+      {
+        "id": "procs",
+        "type": "text",
+        "markdown": "## فحص العمليات\n\n**العملية (Process)** برنامج قيد التشغيل له معرّف PID ومالك وأب ومجموعة ملفات ومقابس مفتوحة. وتعرض النواة ذلك كله تحت `/proc`. ابدأ بأربع طرق عرض:\n\n| السؤال | الأمر |\n|:--|:--|\n| ما الذي يعمل على هيئة شجرة؟ | `ps -eo pid,ppid,user,etime,cmd --forest` |\n| من يستهلك الموارد؟ | `top` أو `ps aux --sort=-%cpu \\| head` |\n| ماذا فتحت العملية؟ | `sudo ls -l /proc/<pid>/fd` أو `sudo lsof -p <pid>` |\n| على ماذا تستمع؟ | `sudo ss -tulpn` |\n\nأمور تستحق نظرة ثانية: عملية **حُذف** ملفها التنفيذي من القرص (يعرض `/proc/<pid>/exe` عبارة `(deleted)`)، وعملية ابنة لخادم ويب تنشئ صدفة، وعملية تعمل من `/tmp` أو `/dev/shm`، وحساب خدمة يشغّل شيئًا تفاعليًا.\n\nتتخاطب العمليات عبر **الإشارات (Signals)**. تطلب `SIGTERM` (15) من العملية الإنهاء بهدوء، وتطلب `SIGHUP` (1) عادةً إعادة تحميل الإعدادات، وتنهيها `SIGKILL` (9) فورًا دون تنظيف. جرّب `SIGTERM` أولًا. فالعملية التي لا تموت إلا بـ `SIGKILL` قد تكون معلّقة أو تقاوم عمدًا، وفي الحالتين تستحق التدوين."
+      },
+      {
+        "id": "ps-term",
+        "type": "terminal",
+        "title": "app01.example.com",
+        "prompt": "admin@app01:~$",
+        "lines": [
+          {
+            "cmd": "ps -eo pid,ppid,user,cmd --forest | grep -A2 nginx",
+            "output": " 1203     1 root     nginx: master process /usr/sbin/nginx\n 1204  1203 www-data nginx: worker process\n 1205  1203 www-data nginx: worker process",
+            "comment": "هيئة طبيعية: عملية رئيسية بـ root وعمليات عاملة بلا امتياز."
+          },
+          {
+            "cmd": "sudo ls -l /proc/4417/exe",
+            "output": "lrwxrwxrwx 1 root root 0 Nov 11 02:12 /proc/4417/exe -> /dev/shm/.kworker (deleted)",
+            "comment": "اسم خيط نواة مزيّف يعمل من الذاكرة المشتركة وقد حُذف ملفه: اعزل وحقّق."
+          },
+          {
+            "cmd": "sudo ss -tnp | grep 4417",
+            "output": "ESTAB 0 0 192.0.2.10:48122 203.0.113.80:443 users:((\".kworker\",pid=4417))",
+            "comment": "ولديها اتصال صادر بمضيف خارجي. احفظ الأدلة قبل إنهائها."
+          },
+          {
+            "cmd": "sudo kill -STOP 4417",
+            "output": "",
+            "comment": "الإيقاف المؤقت يُبقي الذاكرة سليمة للتحليل الجنائي بخلاف SIGKILL الفوري."
+          }
+        ]
+      },
+      {
+        "id": "systemd",
+        "type": "text",
+        "markdown": "## إدارة الخدمات باستخدام systemd\n\nفي Linux الحديث يبدأ `systemd` كل شيء بعد النواة. يصف ملف **الوحدة (Unit)** شيئًا واحدًا يُدار، وأشيعها `.service`. تعرّف على هذه الأوامر:\n\n- `systemctl status nginx`: الحالة وآخر أسطر السجل وشجرة العمليات.\n- `systemctl enable --now nginx`: التشغيل الآن وعند الإقلاع. و`disable` يزيل رابط الإقلاع.\n- `systemctl list-units --type=service --state=running`: كل ما يعمل.\n- `systemctl list-unit-files --state=enabled`: كل ما سيبدأ عند الإقلاع.\n- `systemctl mask <unit>`: يجعل بدء الوحدة مستحيلًا حتى كاعتماد لوحدة أخرى.\n- `journalctl -u nginx -b`: سجلات الخدمة لهذا الإقلاع.\n\nالقاعدة الأمنية بسيطة: **إن لم تحتج خدمة فأزلها.** كل خدمة مفعّلة سطح هجوم. بعد تثبيت جديد راجع قائمة المفعّل والمنافذ المستمعة ثم عطّل أو أزل ما لا تستخدمه مثل `cups` أو `avahi-daemon` أو `rpcbind` أو قاعدة بيانات ثُبّتت \"للاحتياط\".\n\nلا تعدّل ملفات الوحدات التي تأتي مع الحزم لأن الترقيات تستبدلها. أنشئ تجاوزًا بالأمر `systemctl edit nginx` الذي يكتب ملفًا إضافيًا تحت `/etc/systemd/system/nginx.service.d/`."
+      },
+      {
+        "id": "harden",
+        "type": "text",
+        "markdown": "## عزل الخدمة\n\nيستطيع `systemd` حصر الخدمة بميزات النواة عبر بضعة أسطر في الوحدة. وهذا من أرخص أشكال التحصين لأنه لا يحتاج برمجيات إضافية.\n\n| التوجيه | الأثر |\n|:--|:--|\n| `User=` / `Group=` | التشغيل بحساب مخصّص بلا امتياز |\n| `NoNewPrivileges=yes` | منع اكتساب امتياز عبر برامج setuid |\n| `ProtectSystem=strict` | تركيب نظام الملفات للقراءة فقط عدا المسارات المذكورة |\n| `ProtectHome=yes` | إخفاء `/home` و`/root` و`/run/user` |\n| `PrivateTmp=yes` | منح الخدمة `/tmp` خاصًا بها |\n| `ReadWritePaths=` | تحديد المسارات الوحيدة القابلة للكتابة |\n| `CapabilityBoundingSet=` | إسقاط قدرات Linux التي لا تحتاجها الخدمة |\n| `RestrictAddressFamilies=` | تقييد أنواع المقابس مثل `AF_INET AF_INET6` |\n\nيغطي [القدرات وتصعيد الامتيازات في Linux](/learn/systems-infrastructure-security/linux-capabilities-and-privilege-escalation) القدرات (Capabilities) وأهميتها للامتياز. ابدأ بالتقييد، وشغّل الخدمة، ولا تخفف إلا ما تُظهر السجلات أنها تحتاجه."
+      },
+      {
+        "id": "unit",
+        "type": "code",
+        "language": "ini",
+        "filename": "/etc/systemd/system/reportd.service",
+        "caption": "وحدة معزولة لخدمة تقارير مخصّصة نملكها.",
+        "code": "[Unit]\nDescription=Report generator\nAfter=network-online.target\n\n[Service]\nUser=reportd\nGroup=reportd\nExecStart=/opt/reportd/bin/reportd --config /etc/reportd/reportd.conf\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nReadWritePaths=/var/lib/reportd /var/log/reportd\nCapabilityBoundingSet=\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nUMask=0027\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target",
+        "highlight": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ]
+      },
+      {
+        "id": "sd-term",
+        "type": "terminal",
+        "title": "app01.example.com",
+        "prompt": "admin@app01:~$",
+        "lines": [
+          {
+            "cmd": "systemd-analyze security reportd.service --no-pager | tail -n 3",
+            "output": "→ Overall exposure level for reportd.service: 1.9 SAFE",
+            "comment": "الدرجات دون 4 تقريبًا جيدة، والخدمات غير المحصّنة كثيرًا ما تحصل على 9."
+          },
+          {
+            "cmd": "systemd-analyze security nginx.service --no-pager | tail -n 1",
+            "output": "→ Overall exposure level for nginx.service: 8.3 EXPOSED",
+            "comment": "إعداد افتراضي من التوزيعة. أضف ملفًا إضافيًا بقيود ثم أعد القياس."
+          }
+        ]
+      },
+      {
+        "id": "start-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "من systemctl start إلى عملية محصورة",
+        "caption": "يطبّق systemd العزل قبل تنفيذ أول تعليمة في الخدمة.",
+        "data": {
+          "actors": [
+            {
+              "id": "adm",
+              "label": "المسؤول",
+              "sub": "sudo",
+              "icon": "user"
+            },
+            {
+              "id": "sd",
+              "label": "systemd",
+              "sub": "PID 1",
+              "icon": "cpu"
+            },
+            {
+              "id": "svc",
+              "label": "الخدمة",
+              "sub": "reportd",
+              "icon": "server"
+            },
+            {
+              "id": "jr",
+              "label": "journald",
+              "sub": "السجلات",
+              "icon": "log"
+            }
+          ],
+          "steps": [
+            {
+              "from": "adm",
+              "to": "sd",
+              "label": "systemctl start reportd",
+              "note": "يصل الطلب عبر مقبس systemd ويفحصه polkit."
+            },
+            {
+              "from": "sd",
+              "to": "sd",
+              "label": "قراءة الوحدة",
+              "detail": "User=reportd ProtectSystem=strict",
+              "tone": "secure",
+              "note": "يدمج systemd ملف الوحدة مع ملفاته الإضافية."
+            },
+            {
+              "from": "sd",
+              "to": "svc",
+              "label": "تفرّع وعزل",
+              "detail": "namespaces, caps dropped",
+              "tone": "secure",
+              "note": "تُجهَّز فضاءات الأسماء والتركيبات للقراءة فقط وإسقاط القدرات قبل exec."
+            },
+            {
+              "from": "svc",
+              "to": "jr",
+              "label": "المخرجات والأخطاء",
+              "note": "تُلتقط المخرجات مع اسم الوحدة والطابع الزمني."
+            },
+            {
+              "from": "svc",
+              "to": "svc",
+              "label": "رفض الكتابة إلى /etc",
+              "tone": "blocked",
+              "note": "إن اختُرقت الخدمة منع ProtectSystem التغييرات خارج ReadWritePaths."
+            },
+            {
+              "from": "sd",
+              "to": "adm",
+              "label": "نشط (يعمل)",
+              "tone": "success",
+              "note": "يُبلغ systemctl بالحالة ويشرف Restart=on-failure عليها بعد ذلك."
+            }
+          ]
+        }
+      },
+      {
+        "id": "socket",
+        "type": "text",
+        "markdown": "## التفعيل عبر المقبس وأدنى تعرّض\n\nبعض الخدمات لا يلزم أن تعمل طوال الوقت. في **التفعيل عبر المقبس (Socket activation)** يستمع systemd على المنفذ ويبدأ الخدمة فقط عند وصول اتصال. يقلّل ذلك استهلاك الذاكرة، والأهم أنه يتيح لـ systemd أداء العملية المميّزة وهي الارتباط بمنفذ منخفض بينما تعمل الخدمة نفسها بلا امتياز.\n\nويمكنك أيضًا التحكم في من يصل إلى الخدمة على مستوى الوحدة. فـ `IPAddressAllow=` و`IPAddressDeny=` تقيّدان عناوين المصدر التي تتخاطب معها الخدمة، و`SocketBindAllow=` تحدّ المنافذ التي تربط بها. فمثلًا `IPAddressDeny=any` متبوعًا بـ `IPAddressAllow=192.0.2.0/24` يحصر خدمة إدارة في شبكة إدارية واحدة حتى لو أُسيء ضبط جدار الحماية. وهذه الضوابط تكمّل جدار حماية المضيف ولا تحل محله، وهو موضوع [إدارة جدار الحماية في Linux: nftables وUFW وfirewalld](/learn/systems-infrastructure-security/linux-firewall-management-nftables-ufw-and-firewalld)."
+      },
+      {
+        "id": "ops",
+        "type": "text",
+        "markdown": "## تشغيل الخدمات بأمان\n\nعادات جيدة تُبقي الخدمات موثوقة وقابلة للمراقبة:\n\n1. **أعد التحميل بدل إعادة التشغيل** حين تدعم الخدمة ذلك (`systemctl reload nginx`) كي لا تنقطع الاتصالات.\n2. **تحقق من الإعداد أولًا** بـ `nginx -t` أو `sshd -t` أو أمر الفحص الخاص بالخدمة.\n3. **اضبط حدود الموارد** بـ `MemoryMax=` و`TasksMax=` و`LimitNOFILE=` كي لا تجوّع عملية منفلتة المضيف.\n4. **راقب الإخفاقات.** يسرد `systemctl --failed` الوحدات المعطلة، وإعادة التشغيل المتكررة في `journalctl` كثيرًا ما تدل على محاولة استغلال أو نشر خاطئ.\n5. **شغّل المهام المجدولة عن قصد.** راجع `crontab -l` لكل حساب و`/etc/cron.*` و`systemctl list-timers`. يفضّل المهاجمون المهام المجدولة للبقاء، فنبّه على الجديد منها.\n\nوالتسجيل والتنبيه لكل ذلك موضوع [التدقيق وتسجيل النظام في Linux](/learn/systems-infrastructure-security/linux-auditing-and-system-logging)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تقتل ما لم تفحصه",
+        "markdown": "إنهاء عملية مشبوهة يدمّر ذاكرتها ومقابسها المفتوحة وهي أفضل أدلتك. التقط أولًا `ps` و`/proc/<pid>/exe` و`lsof` والاتصالات الشبكية، ثم احتوِ بعزل المضيف عن الشبكة إن سمحت إجراءاتك."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "تراجع عن التحصين بأمان",
+        "markdown": "أضف توجيهًا واحدًا في كل مرة وأعد تشغيل الخدمة بعد كل إضافة. فإن فشلت فغالبًا يذكر `journalctl -u <unit> -b` المسار المرفوض، فتسمح به في `ReadWritePaths=`."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة افتراضية تملكها:\n\n1. نفّذ `systemctl list-unit-files --state=enabled` و`sudo ss -tulpn`. دوّن خدمة واحدة لا تحتاجها وعطّلها بـ `sudo systemctl disable --now <name>`.\n2. نفّذ `systemd-analyze security` ودوّن الخدمات الثلاث الأعلى تعرضًا.\n3. اختر واحدة ونفّذ `sudo systemctl edit <name>` وأضف `NoNewPrivileges=yes` و`PrivateTmp=yes` و`ProtectHome=yes` ثم أعد تشغيلها.\n4. أعد تنفيذ `systemd-analyze security <name>` وقارن الدرجة. وافحص `systemctl status <name>` بحثًا عن إخفاقات.\n5. نفّذ `systemctl --failed` و`systemctl list-timers` وسجّل النتيجة."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "العملية",
+            "definition": "نسخة قيد التشغيل من برنامج لها PID وذاكرة وملفات مفتوحة خاصة بها."
+          },
+          {
+            "term": "الإشارة",
+            "definition": "رسالة تُرسل إلى عملية مثل SIGTERM لإيقاف هادئ أو SIGKILL لإيقاف فوري."
+          },
+          {
+            "term": "/proc",
+            "definition": "نظام ملفات افتراضي تعرض النواة عبره معلومات العمليات والنظام."
+          },
+          {
+            "term": "ملف الوحدة",
+            "definition": "ملف إعداد في systemd يصف خدمة أو مؤقتًا أو مقبسًا أو تركيبًا."
+          },
+          {
+            "term": "ملف إضافي (Drop-in)",
+            "definition": "ملف تجاوز في دليل .d يعدّل وحدة دون تحرير الأصل."
+          },
+          {
+            "term": "الحجب (mask)",
+            "definition": "إجراء في systemctl يجعل بدء الوحدة مستحيلًا بأي وسيلة."
+          },
+          {
+            "term": "NoNewPrivileges",
+            "definition": "خيار وحدة يمنع الخدمة وأبناءها من اكتساب امتياز."
+          },
+          {
+            "term": "سطح الهجوم",
+            "definition": "المجموعة الكلية من الخدمات والواجهات التي قد يحاول المهاجم استخدامها."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "تُظهر عملية `/proc/<pid>/exe -> /dev/shm/.kworker (deleted)`. ماذا يوحي ذلك؟",
+            "options": [
+              "خيط نواة عادي",
+              "ملف تنفيذي يعمل من الذاكرة المشتركة وحُذف ملفه، وهذا مريب",
+              "خدمة systemd",
+              "مهمة تدوير سجلات"
+            ],
+            "answer": 1,
+            "explanation": "خيوط النواة لا مسار تنفيذيًا لها. والملف المحذوف في /dev/shm علامة كلاسيكية على برمجية خبيثة تخفي نفسها على القرص."
+          },
+          {
+            "question": "أي التوجيهات تحدّ مما تفعله خدمة مخترقة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "NoNewPrivileges=yes",
+              "ProtectSystem=strict",
+              "Restart=always",
+              "PrivateTmp=yes"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الأول والثاني والرابع تقيّد الامتياز والوصول للملفات. أما Restart=always فيؤثر على التوافر فقط."
+          },
+          {
+            "question": "لماذا نستخدم `systemctl edit nginx` بدل تحرير ملف الوحدة المثبّت بالحزمة؟",
+            "options": [
+              "لأنه أسرع",
+              "ترقيات الحزم تستبدل ملفاتها لكنها تُبقي الملفات الإضافية",
+              "لأنه يعطّل الخدمة",
+              "لأنه لا يتطلب root"
+            ],
+            "answer": 1,
+            "explanation": "الملفات الإضافية تقع تحت /etc/systemd/system وتبقى عبر تحديثات الحزم."
+          },
+          {
+            "question": "ماذا يفعل `systemctl mask`؟",
+            "options": [
+              "يخفي السجلات",
+              "يجعل بدء الوحدة مستحيلًا حتى كاعتماد",
+              "يشفّر الوحدة",
+              "يعيد تشغيل الوحدة"
+            ],
+            "answer": 1,
+            "explanation": "الوحدة المحجوبة مربوطة بـ /dev/null فلا يستطيع شيء بدأها حتى يُرفع الحجب."
+          },
+          {
+            "question": "ماذا ينبغي فعله أولًا قبل إنهاء عملية مشبوهة؟",
+            "options": [
+              "إعادة التشغيل فورًا",
+              "التقاط تفاصيلها وحالتها الشبكية كدليل",
+              "حذف ملفها التنفيذي",
+              "تجاهلها"
+            ],
+            "answer": 1,
+            "explanation": "تُفقد الذاكرة والملفات والمقابس المفتوحة عند الإنهاء، فاحفظ الأدلة أولًا."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- تعلّم شجرة العمليات الطبيعية لتبرز الشاذة: ملفات تنفيذية محذوفة، وتنفيذ من `/tmp` أو `/dev/shm`، وصدفات تحت خوادم الويب.\n- استخدم `systemctl` لفحص الخدمات وتفعيلها وتعطيلها وحجبها، وأزل ما لا تحتاجه.\n- غيّر الوحدات المثبّتة بالحزم عبر الملفات الإضافية لا بتحرير الملف الأصلي.\n- اعزل الخدمات بـ `User=` و`NoNewPrivileges` و`ProtectSystem` و`PrivateTmp` ومجموعة قدرات دنيا، وقِس بـ `systemd-analyze security`.\n- احفظ الأدلة قبل إنهاء العمليات المشبوهة، وراقب الوحدات الفاشلة والمؤقتات.\n\nالتالي: [إدارة الحزم والتصحيحات في Linux](/learn/systems-infrastructure-security/linux-package-and-patch-management)."
+      }
+    ]
+  }
+}

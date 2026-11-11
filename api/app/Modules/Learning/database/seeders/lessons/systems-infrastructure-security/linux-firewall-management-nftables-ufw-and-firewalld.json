@@ -1,0 +1,634 @@
+{
+  "slug": "linux-firewall-management-nftables-ufw-and-firewalld",
+  "title": "Linux Firewall Management: nftables, UFW and firewalld",
+  "summary": "Build and safely change a default-deny host firewall on Linux with nftables, UFW and firewalld.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain how netfilter hooks, chains and policies filter packets",
+    "Write a default-deny nftables input policy covering IPv4 and IPv6",
+    "Compare UFW and firewalld and choose one manager per host",
+    "Apply firewall changes without losing remote access",
+    "Verify rules against listening services from another machine"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "You install a database on a new Linux server for an internal application. The default configuration listens on all interfaces. A month later, a port scan from the wrong network finds it, and the only thing that would have stopped the connection, a host firewall, was never switched on because \"the network firewall handles that\".\n\nA **host firewall** protects the server even when the network around it is wrong, misconfigured or already compromised. On Linux the packet filtering happens in the kernel through **netfilter**. Today the tool that programs it is **nftables**, and friendlier front ends such as **UFW** (Debian and Ubuntu) and **firewalld** (RHEL family) sit on top. This lesson explains how they relate, how to build a default-deny policy and how to change rules without losing your SSH session."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## How Linux filters packets\n\nPackets pass through **hooks** in the kernel. nftables organizes rules as **tables** that contain **chains**, and chains contain **rules**. A base chain attaches to a hook and has a **policy** (the default verdict) of `accept` or `drop`.\n\n| Hook | When the rule set is consulted |\n|:--|:--|\n| `input` | Packets addressed to this host |\n| `output` | Packets this host sends |\n| `forward` | Packets routed through the host (routers, containers) |\n| `prerouting` / `postrouting` | Before and after routing, used for NAT |\n\nThree ideas carry over from other firewalls. Rules run **top-down and the first matching verdict wins**. The policy catches what no rule matched. **Connection tracking** (`ct state`) lets you accept replies to connections the host started without opening ports for them.\n\nThe tools differ in how they present this model.\n\n| Tool | Default on | Style | Best for |\n|:--|:--|:--|:--|\n| `nftables` | Debian 10+, RHEL 8+ (backend) | Full rule language | Servers, scripted policy |\n| UFW | Ubuntu, Debian | Simple commands | Single hosts, quick policy |\n| firewalld | RHEL, Fedora, Rocky | Zones and services | Hosts with changing networks |\n| `iptables` (legacy) | Older systems | Per-table commands | Existing scripts, often a shim over nftables |\n\nUse only **one** manager on a host. Two tools editing the same rule set overwrite each other."
+    },
+    {
+      "id": "fw-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "A packet meeting an nftables input chain",
+      "caption": "Established traffic and approved ports pass; everything else meets the drop policy.",
+      "data": {
+        "token": "TCP/443",
+        "nodes": [
+          {
+            "id": "net",
+            "label": "Network",
+            "sub": "203.0.113.50",
+            "icon": "cloud"
+          },
+          {
+            "id": "ct",
+            "label": "ct state",
+            "sub": "established, related",
+            "icon": "eye"
+          },
+          {
+            "id": "rules",
+            "label": "Allow rules",
+            "sub": "22 from mgmt, 443",
+            "icon": "firewall"
+          },
+          {
+            "id": "drop",
+            "label": "Policy drop",
+            "sub": "input chain",
+            "icon": "shield"
+          },
+          {
+            "id": "svc",
+            "label": "Service",
+            "sub": "192.0.2.10:443",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "net",
+            "caption": "A client sends a new HTTPS connection to 192.0.2.10."
+          },
+          {
+            "at": "ct",
+            "caption": "Connection tracking sees no existing entry, so the packet is new and goes on to the rules."
+          },
+          {
+            "at": "rules",
+            "caption": "The rule tcp dport 443 accept matches.",
+            "tone": "success"
+          },
+          {
+            "at": "svc",
+            "caption": "The service receives the packet. The reply will match established state on the way out.",
+            "tone": "success"
+          },
+          {
+            "at": "net",
+            "token": "TCP/5432",
+            "caption": "A scanner probes the database port, which no rule opens.",
+            "tone": "attack"
+          },
+          {
+            "at": "rules",
+            "token": "TCP/5432",
+            "caption": "No allow rule matches."
+          },
+          {
+            "at": "drop",
+            "token": "TCP/5432",
+            "caption": "The chain policy is drop, so the packet is silently discarded and the port looks closed.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "nft",
+      "type": "text",
+      "markdown": "## nftables: a default-deny policy\n\nThe file below is a complete minimal server policy. It accepts loopback traffic and replies to existing connections, drops invalid packets, allows ICMP so path discovery and ping work, permits SSH only from a management network, permits HTTPS, and drops everything else. Note that **IPv6 is covered too** through the `inet` family. A policy for IPv4 alone leaves IPv6 wide open.\n\nLoad the file with `nft -f`, and use `nft list ruleset` to confirm it. Keep it in `/etc/nftables.conf` and enable the `nftables` service so it applies at boot."
+    },
+    {
+      "id": "nft-conf",
+      "type": "code",
+      "language": "plain",
+      "filename": "/etc/nftables.conf",
+      "caption": "Default-deny input policy for a web server. The management network 198.51.100.0/24 is a documentation range.",
+      "highlight": [
+        3,
+        8,
+        10,
+        11
+      ],
+      "code": "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n    iif lo accept\n    ct state established,related accept\n    ct state invalid drop\n    ip protocol icmp accept\n    ip6 nexthdr icmpv6 accept\n    ip saddr 198.51.100.0/24 tcp dport 22 accept\n    tcp dport 443 accept\n    limit rate 5/minute log prefix \"nft-drop: \" counter drop\n  }\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n  }\n  chain output {\n    type filter hook output priority 0; policy accept;\n  }\n}"
+    },
+    {
+      "id": "nft-term",
+      "type": "terminal",
+      "title": "Loading, checking and testing nftables",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "sudo nft -c -f /etc/nftables.conf && echo SYNTAX-OK",
+          "output": "SYNTAX-OK"
+        },
+        {
+          "comment": "-c only checks the file and changes nothing, like sshd -t does for SSH."
+        },
+        {
+          "cmd": "sudo nft -f /etc/nftables.conf && sudo nft list chain inet filter input | head -8",
+          "output": "table inet filter {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tiif \"lo\" accept\n\t\tct state established,related accept\n\t\tct state invalid drop\n\t\tmeta l4proto icmp accept"
+        },
+        {
+          "cmd": "sudo ss -tlnp | awk 'NR==1 || /LISTEN/'",
+          "output": "State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process\nLISTEN 0      128          0.0.0.0:22        0.0.0.0:*     users:((\"sshd\",pid=812))\nLISTEN 0      511          0.0.0.0:443       0.0.0.0:*     users:((\"nginx\",pid=901))\nLISTEN 0      244        127.0.0.1:5432      0.0.0.0:*     users:((\"postgres\",pid=640))"
+        },
+        {
+          "comment": "Compare listeners with the rules. PostgreSQL listens only on localhost, so the firewall and the service agree."
+        }
+      ]
+    },
+    {
+      "id": "ufw",
+      "type": "text",
+      "markdown": "## UFW and firewalld\n\n### UFW\nUFW keeps a short policy file and generates the underlying rules. The order that avoids a lockout is: set defaults, **allow SSH first**, then enable. Use `ufw limit 22/tcp` to rate-limit connection attempts, and `ufw status verbose` to review. UFW is a good fit when one administrator manages a handful of Ubuntu or Debian servers.\n\n### firewalld\nfirewalld groups interfaces into **zones** with different trust levels (`public`, `internal`, `trusted`, `drop`), and rules refer to named **services** such as `https`. It has two configurations: **runtime**, which is lost at reload, and **permanent**. Changes made without `--permanent` disappear on reload or reboot, which surprises many administrators. Use `--runtime-to-permanent` only after you have tested.\n\n| Task | UFW | firewalld |\n|:--|:--|:--|\n| Default deny | `ufw default deny incoming` | Zone `drop` or `public` with no extra services |\n| Allow HTTPS | `ufw allow 443/tcp` | `firewall-cmd --permanent --add-service=https` |\n| Restrict SSH | `ufw allow from 198.51.100.0/24 to any port 22 proto tcp` | `--add-rich-rule='rule family=ipv4 source address=198.51.100.0/24 service name=ssh accept'` |\n| Apply | Immediate | `firewall-cmd --reload` |\n| Review | `ufw status numbered` | `firewall-cmd --list-all` |"
+    },
+    {
+      "id": "fwd-term",
+      "type": "terminal",
+      "title": "firewalld: permanent change with a safe default zone",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "sudo firewall-cmd --get-active-zones",
+          "output": "public\n  interfaces: eth0"
+        },
+        {
+          "cmd": "sudo firewall-cmd --permanent --zone=public --remove-service=cockpit",
+          "output": "success"
+        },
+        {
+          "cmd": "sudo firewall-cmd --permanent --zone=public --add-service=https",
+          "output": "success"
+        },
+        {
+          "cmd": "sudo firewall-cmd --reload",
+          "output": "success"
+        },
+        {
+          "cmd": "sudo firewall-cmd --zone=public --list-all",
+          "output": "public (active)\n  target: default\n  interfaces: eth0\n  services: https ssh\n  ports: \n  rich rules: "
+        },
+        {
+          "comment": "Only https and ssh remain. Cockpit's web console was removed because nobody needed it, which shrinks the exposed surface."
+        }
+      ]
+    },
+    {
+      "id": "safe",
+      "type": "text",
+      "markdown": "## Changing rules without losing access\n\nFirewall mistakes are the classic way to lock yourself out of a remote server. Build these habits:\n\n1. **Allow your own access first.** The SSH rule comes before the default-deny takes effect.\n2. **Validate before applying.** `nft -c -f` checks syntax; `ufw` and `firewalld` reject invalid rules.\n3. **Use a dead man's switch.** Schedule a rollback before you apply, for example `sudo systemd-run --on-active=2m systemctl stop nftables`, then cancel it once you confirm access. Many hosting consoles also give you out-of-band access as a last resort.\n4. **Test from outside.** Check the result from another machine with a scanner like `nmap` against your own host, not just from the server itself.\n5. **Log drops, with a rate limit.** Unlimited logging lets a flood fill the disk.\n6. **Document each rule.** Record the owner and reason, and review quarterly.\n\nContainers add a trap. Docker writes its own rules and publishes ports directly, which can bypass UFW rules. Bind containers to `127.0.0.1` or place filters in the `DOCKER-USER` chain when needed.\n\nFor rules that complement them, see [Linux SSH Hardening](/learn/systems-infrastructure-security/linux-ssh-hardening) and the earlier lesson on [Linux Processes and Services](/learn/systems-infrastructure-security/linux-processes-and-services), where you decide which services should listen at all."
+    },
+    {
+      "id": "pitfall",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common firewall mistakes on Linux",
+      "markdown": "- **IPv6 left open.** Rules written only for IPv4 do nothing to IPv6 traffic. Use the `inet` family, or `IPV6=yes` in UFW.\n- **Two managers at once.** Running UFW, firewalld and hand-written nft rules together produces unpredictable results.\n- **Unsaved runtime rules.** A rule added with a bare `nft add rule` or without `--permanent` disappears at reboot.\n- **Policy accept with a block list.** A policy of `accept` plus a list of denied ports misses the one port you forgot. Use default deny.\n- **Trusting the firewall instead of fixing the service.** If a database should be local only, bind it to localhost as well."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a Linux virtual machine you own, with console access in case you lock yourself out.\n\n1. List what is listening with `sudo ss -tlnp` and write down which ports should be reachable.\n2. Save the example policy above as `/root/test.nft`, change the management network to your own, and run `sudo nft -c -f /root/test.nft`.\n3. Schedule a safety rollback with `sudo systemd-run --on-active=3m nft flush ruleset`, then apply with `sudo nft -f /root/test.nft`.\n4. From another machine you own, run `nmap -Pn -p 22,443,5432 <vm-ip>` and compare the result with your policy.\n5. Add a rate-limited log rule, trigger it with a blocked port, and find the `nft-drop:` line in `journalctl -k`."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "netfilter",
+          "definition": "The Linux kernel framework that inspects and filters network packets at hooks."
+        },
+        {
+          "term": "nftables",
+          "definition": "The modern rule language and tool that programs netfilter, replacing iptables."
+        },
+        {
+          "term": "Chain policy",
+          "definition": "The default verdict, accept or drop, for packets no rule matched."
+        },
+        {
+          "term": "Connection tracking",
+          "definition": "State kept per connection so replies are accepted without separate rules."
+        },
+        {
+          "term": "UFW",
+          "definition": "Uncomplicated Firewall, a simple front end for host firewall rules on Debian and Ubuntu."
+        },
+        {
+          "term": "firewalld",
+          "definition": "A zone-based firewall manager used on RHEL-family systems."
+        },
+        {
+          "term": "Zone",
+          "definition": "A firewalld trust level that groups interfaces and the rules that apply to them."
+        },
+        {
+          "term": "Default deny",
+          "definition": "A policy that blocks everything not explicitly allowed."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "An nftables input chain has `policy drop` and no rule matches an incoming packet. What happens?",
+          "options": [
+            "The packet is accepted",
+            "The packet is dropped",
+            "The packet is sent to forward",
+            "nftables asks the administrator"
+          ],
+          "answer": 1,
+          "explanation": "The policy is the verdict for traffic that matches no rule, which is why default deny is safe."
+        },
+        {
+          "question": "Why should a ruleset use the `inet` family or equivalent IPv6 rules?",
+          "options": [
+            "IPv6 is faster",
+            "IPv4-only rules leave IPv6 traffic unfiltered",
+            "inet encrypts packets",
+            "It is required by UFW"
+          ],
+          "answer": 1,
+          "explanation": "IPv4 and IPv6 are filtered separately. Servers with an IPv6 address need rules for both."
+        },
+        {
+          "question": "Which steps help avoid locking yourself out of a remote server? (Choose all that apply.)",
+          "options": [
+            "Allow SSH before enabling default deny",
+            "Validate with nft -c -f",
+            "Schedule an automatic rollback",
+            "Apply the rules and disconnect immediately"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Each of the first three gives you a safety net. Disconnecting immediately removes your ability to react."
+        },
+        {
+          "question": "A firewalld rule was added without `--permanent`. What happens after `firewall-cmd --reload`?",
+          "options": [
+            "It is kept",
+            "It disappears because only the permanent configuration is reloaded",
+            "It is moved to another zone",
+            "The firewall stops"
+          ],
+          "answer": 1,
+          "explanation": "Runtime changes are temporary. Reload restores the permanent configuration."
+        },
+        {
+          "question": "Which statements about containers and host firewalls are correct? (Choose all that apply.)",
+          "options": [
+            "Docker can publish ports in a way that bypasses UFW rules",
+            "Binding a container to 127.0.0.1 limits exposure",
+            "The DOCKER-USER chain can hold your own filters",
+            "Containers are never affected by host rules"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Docker manages its own netfilter rules, so you must filter in the places it respects."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Linux filters packets in the kernel with netfilter. nftables programs it; UFW and firewalld are front ends. Use one manager per host.\n- Build a default-deny input policy: allow loopback, established traffic, needed ports and SSH from a management network.\n- Cover IPv4 and IPv6, and remember forward rules for routers and containers.\n- Change rules safely: allow your access first, validate, schedule a rollback and test from another machine.\n- Persist rules, log drops with a rate limit, and compare open listeners with what the firewall permits.\n\nThis closes the Linux Hardening unit. Continue with [Linux Auditing and System Logging](/learn/systems-infrastructure-security/linux-auditing-and-system-logging) to see what your controls record."
+    }
+  ],
+  "ar": {
+    "title": "إدارة جدار الحماية في Linux: nftables وUFW وfirewalld",
+    "summary": "ابنِ جدار حماية للمضيف برفض افتراضي في Linux وغيّره بأمان باستخدام nftables وUFW وfirewalld.",
+    "objectives": [
+      "شرح كيف ترشّح نقاط ربط netfilter والسلاسل والسياسات الحزم",
+      "كتابة سياسة input برفض افتراضي في nftables تغطي IPv4 وIPv6",
+      "المقارنة بين UFW وfirewalld واختيار مدير واحد لكل مضيف",
+      "تطبيق تغييرات جدار الحماية دون فقدان الوصول عن بُعد",
+      "التحقق من القواعد مقابل الخدمات المستمعة من جهاز آخر"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تثبّت قاعدة بيانات على خادم Linux جديد لتطبيق داخلي. الإعداد الافتراضي يستمع على كل الواجهات. وبعد شهر يعثر عليها مسح منافذ من شبكة خاطئة، ولم يكن هناك ما يوقف الاتصال سوى جدار حماية على المضيف لم يُفعَّل أبدًا لأن «جدار الشبكة يتولى ذلك».\n\nيحمي **جدار الحماية على المضيف (Host Firewall)** الخادم حتى عندما تكون الشبكة المحيطة به خاطئة أو سيئة الضبط أو مخترَقة أصلًا. وفي Linux يجري ترشيح الحزم داخل النواة عبر **netfilter**. والأداة التي تبرمجه اليوم هي **nftables**، وتعلوها واجهات أيسر مثل **UFW** (في Debian وUbuntu) و**firewalld** (في عائلة RHEL). يشرح هذا الدرس العلاقة بينها، وكيف تبني سياسة رفض افتراضي، وكيف تغيّر القواعد دون أن تفقد جلسة SSH."
+      },
+      {
+        "id": "model",
+        "type": "text",
+        "markdown": "## كيف يرشّح Linux الحزم؟\n\nتمرّ الحزم عبر **نقاط ربط (Hooks)** في النواة. تنظّم nftables القواعد في **جداول (Tables)** تحوي **سلاسل (Chains)** تحوي **قواعد**. وترتبط السلسلة الأساسية بنقطة ربط ولها **سياسة** (الحكم الافتراضي) هي `accept` أو `drop`.\n\n| نقطة الربط | متى تُستشار القواعد |\n|:--|:--|\n| `input` | الحزم الموجهة إلى هذا المضيف |\n| `output` | الحزم التي يرسلها هذا المضيف |\n| `forward` | الحزم الموجَّهة عبر المضيف (الموجّهات والحاويات) |\n| `prerouting` / `postrouting` | قبل التوجيه وبعده، وتُستخدم لـNAT |\n\nثلاث أفكار تنتقل من جدران الحماية الأخرى. تُنفَّذ القواعد **من الأعلى إلى الأسفل ويفوز أول حكم مطابق**. وتلتقط السياسة ما لم تطابقه أي قاعدة. ويتيح **تتبّع الاتصالات** (`ct state`) قبول الردود على الاتصالات التي بدأها المضيف دون فتح منافذ لها.\n\nوتختلف الأدوات في طريقة عرض هذا النموذج.\n\n| الأداة | الافتراضية في | الأسلوب | الأنسب لـ |\n|:--|:--|:--|:--|\n| `nftables` | Debian 10+ وRHEL 8+ (الخلفية) | لغة قواعد كاملة | الخوادم والسياسات المكتوبة بنصوص |\n| UFW | Ubuntu وDebian | أوامر بسيطة | مضيفات منفردة وسياسة سريعة |\n| firewalld | RHEL وFedora وRocky | مناطق وخدمات | مضيفات تتغير شبكاتها |\n| `iptables` (القديمة) | أنظمة أقدم | أوامر لكل جدول | نصوص قائمة، وغالبًا طبقة فوق nftables |\n\nاستخدم مديرًا **واحدًا** فقط على المضيف. فأداتان تعدّلان مجموعة القواعد نفسها تمحو إحداهما عمل الأخرى."
+      },
+      {
+        "id": "fw-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "حزمة تلتقي سلسلة input في nftables",
+        "caption": "تمرّ الحركة القائمة والمنافذ المعتمدة، وتواجه البقية سياسة الإسقاط.",
+        "data": {
+          "token": "TCP/443",
+          "nodes": [
+            {
+              "id": "net",
+              "label": "الشبكة",
+              "sub": "203.0.113.50",
+              "icon": "cloud"
+            },
+            {
+              "id": "ct",
+              "label": "ct state",
+              "sub": "established, related",
+              "icon": "eye"
+            },
+            {
+              "id": "rules",
+              "label": "قواعد السماح",
+              "sub": "22 from mgmt, 443",
+              "icon": "firewall"
+            },
+            {
+              "id": "drop",
+              "label": "سياسة الإسقاط",
+              "sub": "input chain",
+              "icon": "shield"
+            },
+            {
+              "id": "svc",
+              "label": "الخدمة",
+              "sub": "192.0.2.10:443",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "at": "net",
+              "caption": "يرسل عميل اتصال HTTPS جديدًا إلى 192.0.2.10."
+            },
+            {
+              "at": "ct",
+              "caption": "لا يجد التتبع مُدخلًا قائمًا، فالحزمة جديدة وتنتقل إلى القواعد."
+            },
+            {
+              "at": "rules",
+              "caption": "تطابق القاعدة `tcp dport 443 accept`.",
+              "tone": "success"
+            },
+            {
+              "at": "svc",
+              "caption": "تتلقى الخدمة الحزمة، وسيطابق الردّ حالة الاتصال القائم عند خروجه.",
+              "tone": "success"
+            },
+            {
+              "at": "net",
+              "token": "TCP/5432",
+              "caption": "ماسح يطرق منفذ قاعدة البيانات الذي لا تفتحه أي قاعدة.",
+              "tone": "attack"
+            },
+            {
+              "at": "rules",
+              "token": "TCP/5432",
+              "caption": "لا تطابق أي قاعدة سماح."
+            },
+            {
+              "at": "drop",
+              "token": "TCP/5432",
+              "caption": "سياسة السلسلة هي drop، فتُسقط الحزمة بصمت ويبدو المنفذ مغلقًا.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "nft",
+        "type": "text",
+        "markdown": "## nftables: سياسة رفض افتراضي\n\nالملف التالي سياسة خادم دنيا كاملة. يقبل حركة الحلقة الراجعة (loopback) وردود الاتصالات القائمة، ويسقط الحزم غير الصالحة، ويسمح بـICMP لتعمل اكتشاف المسار و`ping`، ويسمح بـSSH من شبكة الإدارة فقط، ويسمح بـHTTPS، ويسقط كل ما عداه. لاحظ أن **IPv6 مغطّى أيضًا** عبر العائلة `inet`. فسياسة لـIPv4 وحده تترك IPv6 مفتوحًا على مصراعيه.\n\nحمّل الملف بـ`nft -f` وتأكّد بـ`nft list ruleset`. واحفظه في `/etc/nftables.conf` وفعّل خدمة `nftables` ليُطبَّق عند الإقلاع."
+      },
+      {
+        "id": "nft-conf",
+        "type": "code",
+        "language": "plain",
+        "filename": "/etc/nftables.conf",
+        "caption": "سياسة input برفض افتراضي لخادم ويب. شبكة الإدارة 198.51.100.0/24 نطاق توثيقي.",
+        "highlight": [
+          3,
+          8,
+          10,
+          11
+        ],
+        "code": "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n    iif lo accept\n    ct state established,related accept\n    ct state invalid drop\n    ip protocol icmp accept\n    ip6 nexthdr icmpv6 accept\n    ip saddr 198.51.100.0/24 tcp dport 22 accept\n    tcp dport 443 accept\n    limit rate 5/minute log prefix \"nft-drop: \" counter drop\n  }\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n  }\n  chain output {\n    type filter hook output priority 0; policy accept;\n  }\n}"
+      },
+      {
+        "id": "nft-term",
+        "type": "terminal",
+        "title": "تحميل nftables وفحصها واختبارها",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "sudo nft -c -f /etc/nftables.conf && echo SYNTAX-OK",
+            "output": "SYNTAX-OK"
+          },
+          {
+            "comment": "الخيار `-c` يفحص الملف فقط دون تغيير شيء، كما يفعل `sshd -t` مع SSH."
+          },
+          {
+            "cmd": "sudo nft -f /etc/nftables.conf && sudo nft list chain inet filter input | head -8",
+            "output": "table inet filter {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tiif \"lo\" accept\n\t\tct state established,related accept\n\t\tct state invalid drop\n\t\tmeta l4proto icmp accept"
+          },
+          {
+            "cmd": "sudo ss -tlnp | awk 'NR==1 || /LISTEN/'",
+            "output": "State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process\nLISTEN 0      128          0.0.0.0:22        0.0.0.0:*     users:((\"sshd\",pid=812))\nLISTEN 0      511          0.0.0.0:443       0.0.0.0:*     users:((\"nginx\",pid=901))\nLISTEN 0      244        127.0.0.1:5432      0.0.0.0:*     users:((\"postgres\",pid=640))"
+          },
+          {
+            "comment": "قارن المستمعين بالقواعد. يستمع PostgreSQL على localhost فقط، فجدار الحماية والخدمة متفقان."
+          }
+        ]
+      },
+      {
+        "id": "ufw",
+        "type": "text",
+        "markdown": "## UFW وfirewalld\n\n### UFW\nيحتفظ UFW بملف سياسة قصير ويولّد القواعد الأساسية. والترتيب الذي يتفادى الإقفال هو: اضبط الافتراضات، ثم **اسمح بـSSH أولًا**، ثم فعّل. استخدم `ufw limit 22/tcp` لتحديد معدل محاولات الاتصال، و`ufw status verbose` للمراجعة. وهو مناسب حين يدير مسؤول واحد عددًا قليلًا من خوادم Ubuntu أو Debian.\n\n### firewalld\nيجمّع firewalld الواجهات في **مناطق (Zones)** بمستويات ثقة مختلفة (`public` و`internal` و`trusted` و`drop`)، وتشير القواعد إلى **خدمات** مسمّاة مثل `https`. وله إعدادان: **وقت التشغيل (runtime)** الذي يضيع عند إعادة التحميل، و**الدائم (permanent)**. التغييرات دون `--permanent` تختفي عند إعادة التحميل أو الإقلاع، وهذا يفاجئ كثيرًا من المسؤولين. استخدم `--runtime-to-permanent` فقط بعد الاختبار.\n\n| المهمة | UFW | firewalld |\n|:--|:--|:--|\n| الرفض الافتراضي | `ufw default deny incoming` | المنطقة `drop` أو `public` دون خدمات إضافية |\n| السماح بـHTTPS | `ufw allow 443/tcp` | `firewall-cmd --permanent --add-service=https` |\n| تقييد SSH | `ufw allow from 198.51.100.0/24 to any port 22 proto tcp` | `--add-rich-rule='rule family=ipv4 source address=198.51.100.0/24 service name=ssh accept'` |\n| التطبيق | فوري | `firewall-cmd --reload` |\n| المراجعة | `ufw status numbered` | `firewall-cmd --list-all` |"
+      },
+      {
+        "id": "fwd-term",
+        "type": "terminal",
+        "title": "firewalld: تغيير دائم مع منطقة افتراضية آمنة",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "sudo firewall-cmd --get-active-zones",
+            "output": "public\n  interfaces: eth0"
+          },
+          {
+            "cmd": "sudo firewall-cmd --permanent --zone=public --remove-service=cockpit",
+            "output": "success"
+          },
+          {
+            "cmd": "sudo firewall-cmd --permanent --zone=public --add-service=https",
+            "output": "success"
+          },
+          {
+            "cmd": "sudo firewall-cmd --reload",
+            "output": "success"
+          },
+          {
+            "cmd": "sudo firewall-cmd --zone=public --list-all",
+            "output": "public (active)\n  target: default\n  interfaces: eth0\n  services: https ssh\n  ports: \n  rich rules: "
+          },
+          {
+            "comment": "لم يبقَ سوى https وssh. أُزيلت واجهة Cockpit لأن أحدًا لم يحتجها، مما يقلص السطح المكشوف."
+          }
+        ]
+      },
+      {
+        "id": "safe",
+        "type": "text",
+        "markdown": "## تغيير القواعد دون فقدان الوصول\n\nأخطاء جدار الحماية هي الطريقة الكلاسيكية لإقفال نفسك عن خادم بعيد. كوّن هذه العادات:\n\n1. **اسمح بوصولك أولًا.** تأتي قاعدة SSH قبل أن يسري الرفض الافتراضي.\n2. **تحقق قبل التطبيق.** يفحص `nft -c -f` الصياغة، ويرفض `ufw` و`firewalld` القواعد غير الصالحة.\n3. **استخدم مفتاح الأمان.** جدول تراجعًا قبل التطبيق، مثل `sudo systemd-run --on-active=2m systemctl stop nftables`، ثم ألغه بعد تأكّدك من الوصول. وتمنحك لوحات الاستضافة غالبًا وصولًا خارج النطاق كحل أخير.\n4. **اختبر من الخارج.** افحص النتيجة من جهاز آخر بماسح مثل `nmap` موجَّه إلى مضيفك أنت، لا من الخادم نفسه فقط.\n5. **سجّل الإسقاط مع حد معدل.** التسجيل غير المحدود يتيح لفيضان أن يملأ القرص.\n6. **وثّق كل قاعدة.** سجّل المالك والسبب وراجع كل ربع سنة.\n\nوتضيف الحاويات فخًا. يكتب Docker قواعده الخاصة وينشر المنافذ مباشرة، وقد يتجاوز قواعد UFW. اربط الحاويات بـ`127.0.0.1` أو ضع المرشحات في سلسلة `DOCKER-USER` عند الحاجة.\n\nوللقواعد المكمِّلة انظر [تحصين SSH في Linux](/learn/systems-infrastructure-security/linux-ssh-hardening) ودرس [العمليات والخدمات في Linux](/learn/systems-infrastructure-security/linux-processes-and-services) حيث تقرر أي الخدمات ينبغي أن تستمع أصلًا."
+      },
+      {
+        "id": "pitfall",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة في جدار الحماية على Linux",
+        "markdown": "- **ترك IPv6 مفتوحًا.** القواعد المكتوبة لـIPv4 فقط لا تؤثر في حركة IPv6. استخدم العائلة `inet` أو `IPV6=yes` في UFW.\n- **مديران في وقت واحد.** تشغيل UFW وfirewalld وقواعد nft مكتوبة يدويًا معًا ينتج نتائج لا يمكن توقعها.\n- **قواعد وقت التشغيل غير المحفوظة.** قاعدة أُضيفت بـ`nft add rule` وحده أو دون `--permanent` تختفي عند الإقلاع.\n- **سياسة قبول مع قائمة حظر.** سياسة `accept` مع قائمة منافذ مرفوضة تفوّت المنفذ الوحيد الذي نسيته. استخدم الرفض الافتراضي.\n- **الوثوق بالجدار بدل إصلاح الخدمة.** إذا كان ينبغي أن تكون قاعدة البيانات محلية فقط فاربطها بـlocalhost أيضًا."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم آلة Linux افتراضية تملكها مع وصول إلى الطرفية المحلية تحسبًا لإقفال نفسك.\n\n1. اعرض المستمعين بـ`sudo ss -tlnp` ودوّن المنافذ التي ينبغي أن تكون متاحة.\n2. احفظ سياسة المثال أعلاه في `/root/test.nft`، وغيّر شبكة الإدارة إلى شبكتك، ونفّذ `sudo nft -c -f /root/test.nft`.\n3. جدول تراجعًا آمنًا بـ`sudo systemd-run --on-active=3m nft flush ruleset` ثم طبّق بـ`sudo nft -f /root/test.nft`.\n4. من جهاز آخر تملكه نفّذ `nmap -Pn -p 22,443,5432 <vm-ip>` وقارن النتيجة بسياستك.\n5. أضف قاعدة تسجيل بحد معدل، وأطلقها بمنفذ محجوب، وابحث عن سطر `nft-drop:` في `journalctl -k`."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "netfilter",
+            "definition": "إطار نواة Linux الذي يفحص حزم الشبكة ويرشّحها عند نقاط الربط."
+          },
+          {
+            "term": "nftables",
+            "definition": "لغة القواعد والأداة الحديثة التي تبرمج netfilter وتحل محل iptables."
+          },
+          {
+            "term": "سياسة السلسلة",
+            "definition": "الحكم الافتراضي، قبول أو إسقاط، للحزم التي لم تطابقها قاعدة."
+          },
+          {
+            "term": "تتبّع الاتصالات",
+            "definition": "حالة تُحفظ لكل اتصال ليُقبل الردّ دون قواعد منفصلة."
+          },
+          {
+            "term": "UFW",
+            "definition": "واجهة مبسطة لقواعد جدار حماية المضيف في Debian وUbuntu."
+          },
+          {
+            "term": "firewalld",
+            "definition": "مدير جدار حماية قائم على المناطق يُستخدم في عائلة RHEL."
+          },
+          {
+            "term": "المنطقة (Zone)",
+            "definition": "مستوى ثقة في firewalld يجمع الواجهات والقواعد المطبّقة عليها."
+          },
+          {
+            "term": "الرفض الافتراضي",
+            "definition": "سياسة تحجب كل ما لم يُسمح به صراحةً."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "سلسلة input في nftables لها `policy drop` ولا تطابق أي قاعدة حزمة واردة. ماذا يحدث؟",
+            "options": [
+              "تُقبل الحزمة",
+              "تُسقط الحزمة",
+              "تُحال الحزمة إلى forward",
+              "تسأل nftables المسؤول"
+            ],
+            "answer": 1,
+            "explanation": "السياسة هي الحكم على الحركة التي لا تطابق أي قاعدة، ولهذا يعد الرفض الافتراضي آمنًا."
+          },
+          {
+            "question": "لماذا ينبغي أن تستخدم مجموعة القواعد العائلة `inet` أو قواعد IPv6 مكافئة؟",
+            "options": [
+              "IPv6 أسرع",
+              "قواعد IPv4 وحدها تترك حركة IPv6 دون ترشيح",
+              "تشفّر inet الحزم",
+              "يتطلبها UFW"
+            ],
+            "answer": 1,
+            "explanation": "يُرشَّح IPv4 وIPv6 كلٌّ على حدة. والخوادم ذات عنوان IPv6 تحتاج قواعد للاثنين."
+          },
+          {
+            "question": "أي الخطوات تساعد على تجنّب إقفال نفسك عن خادم بعيد؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "السماح بـSSH قبل تفعيل الرفض الافتراضي",
+              "التحقق بـ`nft -c -f`",
+              "جدولة تراجع تلقائي",
+              "تطبيق القواعد ثم قطع الاتصال فورًا"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "كل من الثلاثة الأولى شبكة أمان. أما قطع الاتصال فورًا فيزيل قدرتك على التصرف."
+          },
+          {
+            "question": "أُضيفت قاعدة firewalld دون `--permanent`. ماذا يحدث بعد `firewall-cmd --reload`؟",
+            "options": [
+              "تبقى",
+              "تختفي لأن الإعداد الدائم وحده يُعاد تحميله",
+              "تنتقل إلى منطقة أخرى",
+              "يتوقف الجدار"
+            ],
+            "answer": 1,
+            "explanation": "تغييرات وقت التشغيل مؤقتة، وإعادة التحميل تستعيد الإعداد الدائم."
+          },
+          {
+            "question": "أي العبارات عن الحاويات وجدران حماية المضيف صحيحة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "يستطيع Docker نشر المنافذ بطريقة تتجاوز قواعد UFW",
+              "ربط الحاوية بـ127.0.0.1 يحد من الانكشاف",
+              "تستطيع سلسلة DOCKER-USER حمل مرشحاتك",
+              "الحاويات لا تتأثر أبدًا بقواعد المضيف"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "يدير Docker قواعد netfilter الخاصة به، لذا يجب أن ترشّح في الأماكن التي يحترمها."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يرشّح Linux الحزم في النواة عبر netfilter. تبرمجه nftables، وUFW وfirewalld واجهتان له. استخدم مديرًا واحدًا لكل مضيف.\n- ابنِ سياسة input برفض افتراضي: اسمح بالحلقة الراجعة والحركة القائمة والمنافذ اللازمة وSSH من شبكة الإدارة.\n- غطِّ IPv4 وIPv6، وتذكّر قواعد forward للموجّهات والحاويات.\n- غيّر القواعد بأمان: اسمح بوصولك أولًا، وتحقق، وجدول تراجعًا، واختبر من جهاز آخر.\n- احفظ القواعد، وسجّل الإسقاط بحد معدل، وقارن المستمعين المفتوحين بما يسمح به الجدار.\n\nبهذا تنتهي وحدة تحصين Linux. تابع مع [التدقيق وتسجيل النظام في Linux](/learn/systems-infrastructure-security/linux-auditing-and-system-logging) لترى ما تسجّله ضوابطك."
+      }
+    ]
+  }
+}

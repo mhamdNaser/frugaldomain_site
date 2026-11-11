@@ -1,0 +1,580 @@
+{
+ "slug": "database-auditing-and-activity-logging",
+ "title": "Database Auditing and Activity Logging",
+ "summary": "Decide what to audit, configure PostgreSQL logging and pgaudit, cover MySQL, and protect and use the audit trail.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Choose the events a database audit trail must capture",
+  "Configure PostgreSQL native logging and pgaudit object auditing",
+  "Apply auditing options in MySQL and MariaDB",
+  "Protect, retain and alert on audit logs"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "On Monday the finance team notices that 40,000 customer email addresses appear in a marketing list that should not contain them. Someone exported them from the database. The questions come quickly: Who ran the export? From which host? At what time? Did they touch other tables? Without audit logs, the honest answer to all four is \"we do not know\", and the investigation becomes guesswork.\n\nDatabase auditing records who did what, when and from where. It serves three purposes: detecting misuse while it is happening, reconstructing events after an incident, and proving to auditors that controls work. In this lesson you will configure native logging for PostgreSQL, add the `pgaudit` extension, enable auditing for MySQL, decide what to log without drowning in noise, and protect the logs themselves."
+  },
+  {
+   "id": "what",
+   "type": "text",
+   "markdown": "## What to record\n\nThe temptation is to log everything. That fills disks, slows the database and buries the events that matter. Decide by risk. A practical baseline covers five categories:\n\n| Category | Examples | Why it matters |\n|:--|:--|:--|\n| Connections | Logins, failures, disconnects, source address | Brute force, unusual locations |\n| Privilege changes | `GRANT`, `REVOKE`, `CREATE ROLE`, `ALTER ROLE` | Persistence and escalation |\n| Schema changes | `CREATE`, `ALTER`, `DROP` | Sabotage and unapproved changes |\n| Access to sensitive data | `SELECT` on tables with personal or financial data | Exfiltration and snooping |\n| Errors and denials | Permission denied, policy violations | Probing and injection attempts |\n\nLogging every `SELECT` on every table is rarely sustainable. Log reads only on the tables classified as sensitive, and log all writes to those tables. Be careful with what the log contains: query text can include literal values such as emails or tokens, so restrict who reads the logs and avoid logging bind parameter values where you can."
+  },
+  {
+   "id": "native",
+   "type": "text",
+   "markdown": "## Step 1: Start with PostgreSQL native logging\n\nPostgreSQL logs a surprising amount before you install anything. The settings below give you connection events, slow statements, and a `log_line_prefix` that stamps each line with time, process, user, database and client address, which is what makes a line attributable.\n\nSet `log_connections` and `log_disconnections` to `on`. Use `log_statement = 'ddl'` as a baseline, since it records schema changes without recording every query. Add `log_min_duration_statement` to catch slow or bulk queries, and `log_checkpoints` is useful for operations, but it is not part of the security trail. Enable `log_error_verbosity = default`, not `verbose`, to keep noise down. Avoid `log_statement = 'all'` on busy systems unless you have a measured reason and a plan for volume. The default location is under the data directory or `/var/log/postgresql`. Make sure the log files are readable by the logging service and not by the application or by every user."
+  },
+  {
+   "id": "pglog",
+   "type": "code",
+   "language": "ini",
+   "filename": "postgresql.conf (logging section)",
+   "caption": "Baseline security logging for PostgreSQL 16. Tune volume to your workload.",
+   "code": "logging_collector = on\nlog_directory = 'log'\nlog_filename = 'postgresql-%Y-%m-%d.log'\nlog_file_mode = 0600\nlog_rotation_age = 1d\n\nlog_connections = on\nlog_disconnections = on\nlog_hostname = off\nlog_line_prefix = '%m [%p] %q%u@%d from %h app=%a '\n\nlog_statement = 'ddl'\nlog_min_duration_statement = 2000      # ms; flags slow or bulk reads\nlog_error_verbosity = default\nlog_lock_waits = on",
+   "highlight": [
+    4,
+    7,
+    8,
+    10,
+    11
+   ]
+  },
+  {
+   "id": "pgaudit",
+   "type": "text",
+   "markdown": "## Step 2: Add pgaudit for detail you can query\n\nNative logging cannot tell you which tables a statement touched, or whether a `SELECT` hit a sensitive table. The `pgaudit` extension adds structured audit records with two modes.\n\n**Session auditing** logs whole classes of statements for everyone: `READ`, `WRITE`, `ROLE`, `DDL`, `FUNCTION`, `MISC`. It is simple but can be noisy.\n\n**Object auditing** logs only access to tables that a dedicated audit role has been granted. You grant `SELECT` on the sensitive table to an `auditor` role, set `pgaudit.role = 'auditor'`, and from then on every read or write of that table is logged. This is the precise tool: low volume, high value. The extension must be loaded through `shared_preload_libraries`, which needs a restart, so plan for it. It writes records into the normal PostgreSQL log with an `AUDIT:` prefix, which your log shipper can parse. Pair it with the role design in [Database Least-Privilege Access](/learn/systems-infrastructure-security/database-least-privilege-access), because a named account in an audit line is only useful if accounts are not shared."
+  },
+  {
+   "id": "pgauditsql",
+   "type": "code",
+   "language": "sql",
+   "filename": "pgaudit-setup.sql",
+   "caption": "Object auditing for one sensitive table. Requires pgaudit in shared_preload_libraries (restart).",
+   "code": "-- postgresql.conf: shared_preload_libraries = 'pgaudit'\nCREATE EXTENSION pgaudit;\n\nCREATE ROLE auditor NOLOGIN;\nALTER SYSTEM SET pgaudit.role = 'auditor';\nALTER SYSTEM SET pgaudit.log = 'ddl, role';   -- session classes\nALTER SYSTEM SET pgaudit.log_parameter = off; -- keep values out of the log\nSELECT pg_reload_conf();\n\n-- Anything done to this table is now audited, for every user\nGRANT SELECT, INSERT, UPDATE, DELETE ON app.customers TO auditor;",
+   "highlight": [
+    5,
+    6,
+    7,
+    11
+   ]
+  },
+  {
+   "id": "audit-flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Life of an audit record",
+   "caption": "Recording locally is not enough; the record must leave the host before an attacker can edit it.",
+   "data": {
+    "token": "Event",
+    "nodes": [
+     {
+      "id": "usr",
+      "label": "DBA session",
+      "sub": "jsmith@10.20.9.8",
+      "icon": "user"
+     },
+     {
+      "id": "db",
+      "label": "Database",
+      "sub": "pgaudit",
+      "icon": "database"
+     },
+     {
+      "id": "col",
+      "label": "Log collector",
+      "sub": "logs.example.com",
+      "icon": "log"
+     },
+     {
+      "id": "siem",
+      "label": "Alerting",
+      "sub": "SIEM rules",
+      "icon": "eye"
+     }
+    ],
+    "steps": [
+     {
+      "at": "usr",
+      "caption": "A DBA runs SELECT * FROM app.customers on a sensitive table."
+     },
+     {
+      "at": "db",
+      "caption": "pgaudit matches the audit role grant and writes an AUDIT: line with user, host and object.",
+      "tone": "secure"
+     },
+     {
+      "at": "db",
+      "caption": "rsyslog ships the line over TLS within seconds."
+     },
+     {
+      "at": "col",
+      "caption": "The collector stores it append-only, outside the database host.",
+      "tone": "success"
+     },
+     {
+      "at": "siem",
+      "caption": "A rule flags a bulk read outside business hours from a non-standard source.",
+      "tone": "warning"
+     },
+     {
+      "at": "siem",
+      "caption": "An analyst opens the case within minutes, with the full trail intact.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "mysql",
+   "type": "text",
+   "markdown": "## Step 3: Auditing in MySQL and MariaDB\n\nMySQL Community Edition does not include the enterprise audit plugin, but you have good options. Percona Server and MariaDB include audit plugins (`audit_log` and `server_audit`). On plain MySQL, enable the **general query log** only for short investigations, since it records every statement and is heavy. The **binary log** records data-changing statements and is also useful for forensics, though it is meant for replication and recovery, not auditing.\n\nA practical baseline is to enable connection logging, log errors with `log_error_verbosity = 3`, and use an audit plugin where available to record connect events, DDL and statements on named schemas. Query `performance_schema` for live visibility, and rotate files with `logrotate`.\n\nWhichever platform you use, the design is the same: define events, record them with attribution, ship them off the host, and alert on patterns. The storage layer for these logs should itself be treated as sensitive, using the controls from [Database TLS and Encryption](/learn/systems-infrastructure-security/database-tls-and-encryption)."
+  },
+  {
+   "id": "audit-term",
+   "type": "terminal",
+   "title": "Reading audit records (lab)",
+   "lines": [
+    {
+     "cmd": "sudo grep 'AUDIT:' /var/lib/postgresql/16/main/log/postgresql-2026-03-02.log | tail -2",
+     "output": "2026-03-02 10:14:07.221 UTC [4182] jsmith@appdb from 10.20.9.8 app=psql AUDIT: OBJECT,1,1,READ,SELECT,TABLE,app.customers,\"SELECT * FROM app.customers\",<not logged>\n2026-03-02 10:14:31.904 UTC [4182] jsmith@appdb from 10.20.9.8 app=psql AUDIT: SESSION,2,1,ROLE,GRANT,,,\"GRANT app_rw TO jsmith\",<not logged>",
+     "comment": "Each line says who, from where, which object and which statement class."
+    },
+    {
+     "cmd": "sudo grep -c 'FATAL:  password authentication failed' /var/lib/postgresql/16/main/log/postgresql-2026-03-02.log",
+     "output": "37",
+     "comment": "A spike of failures is the signal a brute-force alert should key on."
+    },
+    {
+     "cmd": "psql -d appdb -c \"SELECT current_setting('pgaudit.role'), current_setting('log_connections');\"",
+     "output": " current_setting | current_setting\n-----------------+-----------------\n auditor         | on\n(1 row)",
+     "comment": "Confirms the live settings match your design."
+    },
+    {
+     "cmd": "ls -l /var/lib/postgresql/16/main/log/ | head -3",
+     "output": "-rw------- 1 postgres postgres 482113 Mar  2 10:20 postgresql-2026-03-02.log",
+     "comment": "Mode 0600 and owner postgres; the forwarder reads via a dedicated group or journal."
+    }
+   ],
+   "caption": "Example output; line formats follow pgaudit's CSV style."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "A DBA who can edit the log can erase the evidence",
+   "markdown": "If the people being audited also control the log files, the audit trail proves little. Ship records to a separate collector with append-only storage, give database administrators no write access there, and keep clocks synchronized with NTP so events from different systems line up."
+  },
+  {
+   "id": "operate",
+   "type": "text",
+   "markdown": "## Step 4: Protect, retain and use the logs\n\nAudit data has its own lifecycle. Treat it like this:\n\n- **Protect.** Restrict read access to security staff, set file mode `0600`, and ship over TLS. Logs contain sensitive text.\n- **Separate duties.** The audit configuration should not be changeable by the people it monitors. Alert on changes to `pgaudit` or logging settings themselves.\n- **Retain.** Keep logs long enough for your investigations and regulations, commonly 90 days hot and a year or more archived. Compress and rotate to control cost.\n- **Alert.** Start with a handful of high-signal rules: repeated login failures, a new superuser or `GRANT` to an admin role, a `DROP` in production, reads of sensitive tables outside business hours, and a sudden large result volume.\n- **Review.** Schedule a weekly look at the top users by sensitive-table reads. Anomalies appear quickly once you know the baseline.\n- **Test.** Perform a controlled action and confirm it appears in the collector with the right user and time. An untested audit pipeline silently fails.\n\nDedicated monitoring products add behavioral baselines and blocking; see [Database Activity Monitoring (DAM)](/learn/systems-infrastructure-security/database-activity-monitoring-dam). When something does go wrong, the trail feeds directly into [Database Incident Response](/learn/systems-infrastructure-security/database-incident-response)."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a lab PostgreSQL server **you own**, apply the logging baseline from the lesson and reload. Connect once with a wrong password and once correctly, then find both events in the log.\n2. Install `pgaudit` (package `postgresql-16-pgaudit`), add it to `shared_preload_libraries`, restart, create the `auditor` role and grant it `SELECT` on one test table.\n3. Run a `SELECT` on that table and an unrelated table. Confirm only the first produces an `AUDIT:` line, and note the user, host and statement fields.\n4. Write three alert rules you would create from these logs and the threshold for each."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Audit log",
+     "definition": "A record of who did what, when and from where."
+    },
+    {
+     "term": "pgaudit",
+     "definition": "PostgreSQL extension that writes detailed, structured audit records."
+    },
+    {
+     "term": "Session auditing",
+     "definition": "Logging whole classes of statements such as READ or DDL for all users."
+    },
+    {
+     "term": "Object auditing",
+     "definition": "Logging access only to specific tables via an audit role's grants."
+    },
+    {
+     "term": "log_line_prefix",
+     "definition": "Setting that stamps each log line with time, user, database and client."
+    },
+    {
+     "term": "Log forwarding",
+     "definition": "Sending records to a separate collector so they cannot be altered locally."
+    },
+    {
+     "term": "Retention",
+     "definition": "How long logs are kept for investigations and compliance."
+    },
+    {
+     "term": "Separation of duties",
+     "definition": "Ensuring the audited cannot change the audit configuration or records."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why is object auditing with pgaudit often preferred over logging all SELECT statements?",
+     "options": [
+      "It logs only sensitive tables, giving high value at low volume",
+      "It encrypts the logs",
+      "It removes the need for a restart",
+      "It disables DDL logging"
+     ],
+     "answer": 0,
+     "explanation": "Logging every read is noisy and expensive; targeted auditing keeps the signal."
+    },
+    {
+     "question": "Which setting stamps each log line with the user, database and client address?",
+     "options": [
+      "log_statement",
+      "log_line_prefix",
+      "log_rotation_age",
+      "log_checkpoints"
+     ],
+     "answer": 1,
+     "explanation": "log_line_prefix controls the metadata at the start of each line, making events attributable."
+    },
+    {
+     "question": "Which are good practices for protecting audit logs? Choose all that apply.",
+     "options": [
+      "Ship them to a separate append-only collector",
+      "Give DBAs write access to the collector",
+      "Synchronize clocks with NTP",
+      "Restrict file mode to 0600"
+     ],
+     "answer": [
+      0,
+      2,
+      3
+     ],
+     "explanation": "DBAs with write access to the collector could erase evidence; the other three help integrity and attribution."
+    },
+    {
+     "question": "Why is log_statement = 'all' risky on a busy server?",
+     "options": [
+      "It fills disks, slows the system and buries important events",
+      "It disables TLS",
+      "It deletes data",
+      "It changes passwords"
+     ],
+     "answer": 0,
+     "explanation": "Volume overwhelms both the host and the people reading the logs."
+    },
+    {
+     "question": "What does the lesson say about an untested audit pipeline?",
+     "options": [
+      "It works by default",
+      "It silently fails",
+      "It is faster",
+      "It is illegal"
+     ],
+     "answer": 1,
+     "explanation": "Perform a controlled action and confirm it reaches the collector with the right user and time."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Auditing answers who, what, when and from where; without it, incidents become guesswork.\n- Log by risk: connections, privilege and schema changes, sensitive-table access, and denials.\n- Start with PostgreSQL native settings (`log_connections`, `log_line_prefix`, `log_statement = 'ddl'`), then add `pgaudit` object auditing for sensitive tables.\n- In MySQL, use an audit plugin where available and the general log only briefly.\n- Protect the trail: ship logs off-host over TLS, separate duties, synchronize clocks, retain sensibly and alert on a few high-signal rules.\n\nThis completes the first part of the stage. Continue with [Database Activity Monitoring (DAM)](/learn/systems-infrastructure-security/database-activity-monitoring-dam) to turn logs into live detection."
+  }
+ ],
+ "ar": {
+  "title": "تدقيق قواعد البيانات وتسجيل النشاط",
+  "summary": "قرّر ما يُدقَّق، واضبط تسجيل PostgreSQL وpgaudit، وغطِّ MySQL، واحمِ أثر التدقيق واستخدمه.",
+  "objectives": [
+   "اختيار الأحداث التي يجب أن يلتقطها أثر تدقيق قاعدة البيانات",
+   "ضبط تسجيل PostgreSQL الأصلي وتدقيق كائنات pgaudit",
+   "تطبيق خيارات التدقيق في MySQL وMariaDB",
+   "حماية سجلات التدقيق والاحتفاظ بها والتنبيه عليها"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في صباح الاثنين يلاحظ فريق المالية أن 40,000 عنوان بريد إلكتروني لعملاء ظهرت في قائمة تسويقية لا ينبغي أن تحتويها. صدّرها أحد ما من قاعدة البيانات. وتأتي الأسئلة سريعًا: من نفّذ التصدير؟ من أي مضيف؟ في أي وقت؟ هل لمس جداول أخرى؟ وبلا سجلات تدقيق يكون الجواب الصادق عن الأربعة «لا نعرف»، فيصير التحقيق تخمينًا.\n\nيسجّل تدقيق قواعد البيانات (Database auditing) من فعل ماذا ومتى ومن أين. وله ثلاثة أغراض: اكتشاف سوء الاستخدام أثناء حدوثه، وإعادة بناء الأحداث بعد حادثة، وإثبات فعالية الضوابط للمدققين. في هذا الدرس ستضبط التسجيل الأصلي في PostgreSQL، وتضيف امتداد `pgaudit`، وتفعّل التدقيق في MySQL، وتقرر ما تسجله دون أن تغرق في الضجيج، وتحمي السجلات نفسها."
+   },
+   {
+    "id": "what",
+    "type": "text",
+    "markdown": "## ما الذي يُسجَّل\n\nالإغراء أن تسجّل كل شيء. وهذا يملأ الأقراص ويبطّئ قاعدة البيانات ويدفن الأحداث المهمة. قرّر بحسب الخطر. يغطي خط أساس عملي خمس فئات:\n\n| الفئة | أمثلة | لماذا تهم |\n|:--|:--|:--|\n| الاتصالات | الدخول والإخفاق والانقطاع وعنوان المصدر | القوة الغاشمة والمواقع غير المعتادة |\n| تغييرات الامتيازات | `GRANT` و`REVOKE` و`CREATE ROLE` و`ALTER ROLE` | الإبقاء على الموطئ والتصعيد |\n| تغييرات المخطط | `CREATE` و`ALTER` و`DROP` | التخريب والتغييرات غير المعتمدة |\n| الوصول إلى البيانات الحساسة | `SELECT` على جداول فيها بيانات شخصية أو مالية | تسريب البيانات والتطفل |\n| الأخطاء والرفض | رفض الإذن وانتهاكات السياسات | الاستكشاف ومحاولات الحقن |\n\nنادرًا ما يكون تسجيل كل `SELECT` على كل جدول قابلًا للاستمرار. سجّل القراءات على الجداول المصنفة حساسة فقط، وسجّل كل الكتابات على تلك الجداول. وانتبه لمحتوى السجل: قد يتضمن نص الاستعلام قيمًا حرفية كالبريد والرموز، فقيّد من يقرأ السجلات وتجنب تسجيل قيم معاملات الربط حيثما أمكن."
+   },
+   {
+    "id": "native",
+    "type": "text",
+    "markdown": "## الخطوة 1: ابدأ بتسجيل PostgreSQL الأصلي\n\nيسجل PostgreSQL قدرًا مدهشًا قبل أن تثبّت شيئًا. تمنحك الإعدادات أدناه أحداث الاتصال والعبارات البطيئة، وبادئة `log_line_prefix` التي تختم كل سطر بالوقت والعملية والمستخدم وقاعدة البيانات وعنوان العميل، وهذا ما يجعل السطر منسوبًا.\n\nاضبط `log_connections` و`log_disconnections` على `on`. واستخدم `log_statement = 'ddl'` خطَّ أساس لأنه يسجل تغييرات المخطط دون تسجيل كل استعلام. وأضف `log_min_duration_statement` لالتقاط الاستعلامات البطيئة أو الجماعية، أما `log_checkpoints` فمفيد للعمليات لكنه ليس جزءًا من أثر الأمن. وفعّل `log_error_verbosity = default` لا `verbose` لتقليل الضجيج. وتجنب `log_statement = 'all'` على الأنظمة المزدحمة ما لم يكن لديك سبب مقيس وخطة للحجم. الموضع الافتراضي تحت دليل البيانات أو `/var/log/postgresql`. تأكد أن ملفات السجل مقروءة لخدمة التسجيل لا للتطبيق ولا لكل مستخدم."
+   },
+   {
+    "id": "pglog",
+    "type": "code",
+    "language": "ini",
+    "filename": "postgresql.conf (logging section)",
+    "caption": "تسجيل أمني أساسي لـ PostgreSQL 16. اضبط الحجم بحسب حمل عملك.",
+    "code": "logging_collector = on\nlog_directory = 'log'\nlog_filename = 'postgresql-%Y-%m-%d.log'\nlog_file_mode = 0600\nlog_rotation_age = 1d\n\nlog_connections = on\nlog_disconnections = on\nlog_hostname = off\nlog_line_prefix = '%m [%p] %q%u@%d from %h app=%a '\n\nlog_statement = 'ddl'\nlog_min_duration_statement = 2000      # ms; flags slow or bulk reads\nlog_error_verbosity = default\nlog_lock_waits = on",
+    "highlight": [
+     4,
+     7,
+     8,
+     10,
+     11
+    ]
+   },
+   {
+    "id": "pgaudit",
+    "type": "text",
+    "markdown": "## الخطوة 2: أضف pgaudit لتفاصيل يمكن الاستعلام عنها\n\nلا يخبرك التسجيل الأصلي أي الجداول مسّتها عبارة، ولا هل أصاب `SELECT` جدولًا حساسًا. يضيف الامتداد `pgaudit` سجلات تدقيق منظمة بوضعين.\n\n**تدقيق الجلسة** يسجل فئات كاملة من العبارات للجميع: `READ` و`WRITE` و`ROLE` و`DDL` و`FUNCTION` و`MISC`. وهو بسيط لكنه قد يكون مزعجًا.\n\n**تدقيق الكائنات** يسجل الوصول إلى الجداول التي مُنح دور تدقيق مخصص عليها فقط. تمنح `SELECT` على الجدول الحساس للدور `auditor` وتضبط `pgaudit.role = 'auditor'`، ومن ثم تُسجَّل كل قراءة أو كتابة لذلك الجدول. هذه الأداة الدقيقة: حجم قليل وقيمة عالية. ويجب تحميل الامتداد عبر `shared_preload_libraries` وهذا يتطلب إعادة تشغيل، فخطط له. ويكتب السجلات في سجل PostgreSQL العادي ببادئة `AUDIT:` فيستطيع ناقل السجلات تحليلها. واقرنه بتصميم الأدوار في [الوصول بأقل الامتيازات إلى قواعد البيانات](/learn/systems-infrastructure-security/database-least-privilege-access)، فاسم الحساب في سطر التدقيق لا ينفع إلا إن لم تكن الحسابات مشتركة."
+   },
+   {
+    "id": "pgauditsql",
+    "type": "code",
+    "language": "sql",
+    "filename": "pgaudit-setup.sql",
+    "caption": "تدقيق الكائنات لجدول حساس واحد. يتطلب pgaudit في shared_preload_libraries (مع إعادة تشغيل).",
+    "code": "-- postgresql.conf: shared_preload_libraries = 'pgaudit'\nCREATE EXTENSION pgaudit;\n\nCREATE ROLE auditor NOLOGIN;\nALTER SYSTEM SET pgaudit.role = 'auditor';\nALTER SYSTEM SET pgaudit.log = 'ddl, role';   -- session classes\nALTER SYSTEM SET pgaudit.log_parameter = off; -- keep values out of the log\nSELECT pg_reload_conf();\n\n-- Anything done to this table is now audited, for every user\nGRANT SELECT, INSERT, UPDATE, DELETE ON app.customers TO auditor;",
+    "highlight": [
+     5,
+     6,
+     7,
+     11
+    ]
+   },
+   {
+    "id": "audit-flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "حياة سجل التدقيق",
+    "caption": "التسجيل محليًّا لا يكفي؛ يجب أن يغادر السجل المضيف قبل أن يعدّله مهاجم.",
+    "data": {
+     "token": "حدث",
+     "nodes": [
+      {
+       "id": "usr",
+       "label": "جلسة مدير",
+       "sub": "jsmith@10.20.9.8",
+       "icon": "user"
+      },
+      {
+       "id": "db",
+       "label": "قاعدة البيانات",
+       "sub": "pgaudit",
+       "icon": "database"
+      },
+      {
+       "id": "col",
+       "label": "جامع السجلات",
+       "sub": "logs.example.com",
+       "icon": "log"
+      },
+      {
+       "id": "siem",
+       "label": "التنبيه",
+       "sub": "SIEM rules",
+       "icon": "eye"
+      }
+     ],
+     "steps": [
+      {
+       "at": "usr",
+       "caption": "ينفّذ مدير SELECT * FROM app.customers على جدول حساس."
+      },
+      {
+       "at": "db",
+       "caption": "يطابق pgaudit منحة دور التدقيق ويكتب سطر AUDIT: بالمستخدم والمضيف والكائن.",
+       "tone": "secure"
+      },
+      {
+       "at": "db",
+       "caption": "يشحن rsyslog السطر عبر TLS خلال ثوانٍ."
+      },
+      {
+       "at": "col",
+       "caption": "يخزنه الجامع للإلحاق فقط خارج مضيف قاعدة البيانات.",
+       "tone": "success"
+      },
+      {
+       "at": "siem",
+       "caption": "تُعلِم قاعدة بقراءة جماعية خارج ساعات العمل من مصدر غير معتاد.",
+       "tone": "warning"
+      },
+      {
+       "at": "siem",
+       "caption": "يفتح محلل الحالة خلال دقائق والأثر كامل.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "mysql",
+    "type": "text",
+    "markdown": "## الخطوة 3: التدقيق في MySQL وMariaDB\n\nلا يتضمن إصدار MySQL المجتمعي ملحق التدقيق المؤسسي، لكن لديك خيارات جيدة. يتضمن Percona Server وMariaDB ملحقي تدقيق (`audit_log` و`server_audit`). وعلى MySQL العادي فعّل **سجل الاستعلامات العام** لتحقيقات قصيرة فقط، فهو يسجل كل عبارة وثقيل. أما **السجل الثنائي** فيسجل العبارات المغيِّرة للبيانات ومفيد في التحقيق الجنائي، لكنه مخصص للنسخ المتماثل والاستعادة لا للتدقيق.\n\nوخط الأساس العملي: فعّل تسجيل الاتصالات، وسجّل الأخطاء بـ `log_error_verbosity = 3`، واستخدم ملحق تدقيق حيث يتوفر لتسجيل أحداث الاتصال وDDL وعبارات المخططات المسماة. واستعلم عن `performance_schema` لرؤية حية، ودوّر الملفات بـ `logrotate`.\n\nومهما كانت المنصة فالتصميم واحد: عرّف الأحداث، وسجلها منسوبة، واشحنها خارج المضيف، ونبّه على الأنماط. وينبغي أن تعامل طبقة تخزين هذه السجلات نفسها بوصفها حساسة، بضوابط [TLS والتشفير في قواعد البيانات](/learn/systems-infrastructure-security/database-tls-and-encryption)."
+   },
+   {
+    "id": "audit-term",
+    "type": "terminal",
+    "title": "قراءة سجلات التدقيق (مخبري)",
+    "lines": [
+     {
+      "cmd": "sudo grep 'AUDIT:' /var/lib/postgresql/16/main/log/postgresql-2026-03-02.log | tail -2",
+      "output": "2026-03-02 10:14:07.221 UTC [4182] jsmith@appdb from 10.20.9.8 app=psql AUDIT: OBJECT,1,1,READ,SELECT,TABLE,app.customers,\"SELECT * FROM app.customers\",<not logged>\n2026-03-02 10:14:31.904 UTC [4182] jsmith@appdb from 10.20.9.8 app=psql AUDIT: SESSION,2,1,ROLE,GRANT,,,\"GRANT app_rw TO jsmith\",<not logged>",
+      "comment": "كل سطر يقول من، ومن أين، وأي كائن، وأي صنف عبارة."
+     },
+     {
+      "cmd": "sudo grep -c 'FATAL:  password authentication failed' /var/lib/postgresql/16/main/log/postgresql-2026-03-02.log",
+      "output": "37",
+      "comment": "ارتفاع الإخفاقات هو الإشارة التي ينبغي أن يعتمد عليها تنبيه القوة الغاشمة."
+     },
+     {
+      "cmd": "psql -d appdb -c \"SELECT current_setting('pgaudit.role'), current_setting('log_connections');\"",
+      "output": " current_setting | current_setting\n-----------------+-----------------\n auditor         | on\n(1 row)",
+      "comment": "يؤكد أن الإعدادات الحية توافق تصميمك."
+     },
+     {
+      "cmd": "ls -l /var/lib/postgresql/16/main/log/ | head -3",
+      "output": "-rw------- 1 postgres postgres 482113 Mar  2 10:20 postgresql-2026-03-02.log",
+      "comment": "الوضع 0600 والمالك postgres؛ يقرأ الناقل عبر مجموعة مخصصة أو journal."
+     }
+    ],
+    "caption": "مخرجات مثال؛ تتبع صيغ الأسطر نمط CSV في pgaudit."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "مدير يستطيع تعديل السجل يستطيع محو الدليل",
+    "markdown": "إن كان من يُدقَّق عليهم هم من يتحكم بملفات السجل، فلا يثبت أثر التدقيق شيئًا. اشحن السجلات إلى جامع منفصل بتخزين للإلحاق فقط، ولا تمنح مديري قواعد البيانات صلاحية كتابة هناك، وأبقِ الساعات متزامنة بـ NTP لتتراصف أحداث الأنظمة المختلفة."
+   },
+   {
+    "id": "operate",
+    "type": "text",
+    "markdown": "## الخطوة 4: احمِ السجلات واحتفظ بها واستخدمها\n\nلبيانات التدقيق دورة حياة خاصة بها. تعامل معها هكذا:\n\n- **احمِ.** قيّد القراءة بموظفي الأمن، واضبط وضع الملف `0600`، وانقل عبر TLS. فالسجلات تحوي نصوصًا حساسة.\n- **افصل المهام.** ينبغي ألا يستطيع من يُراقَبون تغيير إعداد التدقيق. ونبّه على التغيير في إعدادات `pgaudit` أو التسجيل نفسها.\n- **احتفظ.** أبقِ السجلات مدة تكفي تحقيقاتك والأنظمة، وغالبًا 90 يومًا ساخنة وسنة أو أكثر مؤرشفة. اضغط ودوّر لضبط الكلفة.\n- **نبّه.** ابدأ بحفنة قواعد عالية الإشارة: إخفاقات دخول متكررة، ومستخدم متفوق جديد أو `GRANT` لدور إداري، و`DROP` في الإنتاج، وقراءات لجداول حساسة خارج ساعات العمل، وحجم نتائج كبير مفاجئ.\n- **راجع.** حدّد موعدًا أسبوعيًّا لمراجعة أكثر المستخدمين قراءةً للجداول الحساسة. تظهر الشواذ سريعًا متى عرفت خط الأساس.\n- **اختبر.** نفّذ فعلًا مضبوطًا وتأكد أنه يظهر في الجامع بالمستخدم والوقت الصحيحين. فمسار تدقيق لم يُختبر يفشل بصمت.\n\nوتضيف منتجات المراقبة المخصصة خطوط أساس سلوكية وإمكانية الحجب؛ انظر [مراقبة نشاط قواعد البيانات (DAM)](/learn/systems-infrastructure-security/database-activity-monitoring-dam). وحين يحدث ما هو سيئ فعلًا يغذّي الأثر مباشرة [الاستجابة لحوادث قواعد البيانات](/learn/systems-infrastructure-security/database-incident-response)."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على خادم PostgreSQL مخبري **تملكه**، طبّق خط أساس التسجيل من الدرس وأعد التحميل. اتصل مرة بكلمة مرور خاطئة ومرة بصحيحة، ثم جد الحدثين في السجل.\n2. ثبّت `pgaudit` (الحزمة `postgresql-16-pgaudit`) وأضفه إلى `shared_preload_libraries` وأعد التشغيل، وأنشئ دور `auditor` وامنحه `SELECT` على جدول اختبار واحد.\n3. نفّذ `SELECT` على ذلك الجدول وعلى جدول آخر. تأكد أن الأول فقط ينتج سطر `AUDIT:` ولاحظ حقول المستخدم والمضيف والعبارة.\n4. اكتب ثلاث قواعد تنبيه تنشئها من هذه السجلات وعتبة كل منها."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "سجل التدقيق",
+      "definition": "سجل لمن فعل ماذا ومتى ومن أين."
+     },
+     {
+      "term": "pgaudit",
+      "definition": "امتداد PostgreSQL يكتب سجلات تدقيق مفصلة ومنظمة."
+     },
+     {
+      "term": "تدقيق الجلسة",
+      "definition": "تسجيل فئات كاملة من العبارات مثل READ أو DDL لكل المستخدمين."
+     },
+     {
+      "term": "تدقيق الكائنات",
+      "definition": "تسجيل الوصول إلى جداول بعينها فقط عبر منح دور التدقيق."
+     },
+     {
+      "term": "log_line_prefix",
+      "definition": "إعداد يختم كل سطر سجل بالوقت والمستخدم وقاعدة البيانات والعميل."
+     },
+     {
+      "term": "شحن السجلات",
+      "definition": "إرسال السجلات إلى جامع منفصل حتى لا تُعدَّل محليًّا."
+     },
+     {
+      "term": "مدة الاحتفاظ",
+      "definition": "المدة التي تُحفظ فيها السجلات للتحقيق والامتثال."
+     },
+     {
+      "term": "فصل المهام",
+      "definition": "ضمان ألا يستطيع الخاضعون للتدقيق تغيير إعداده أو سجلاته."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يُفضَّل غالبًا تدقيق الكائنات في pgaudit على تسجيل كل عبارات SELECT؟",
+      "options": [
+       "يسجل الجداول الحساسة فقط فيعطي قيمة عالية بحجم قليل",
+       "يشفّر السجلات",
+       "يلغي الحاجة إلى إعادة التشغيل",
+       "يعطّل تسجيل DDL"
+      ],
+      "answer": 0,
+      "explanation": "تسجيل كل قراءة مزعج ومكلف؛ والتدقيق المستهدف يحفظ الإشارة."
+     },
+     {
+      "question": "أي إعداد يختم كل سطر سجل بالمستخدم وقاعدة البيانات وعنوان العميل؟",
+      "options": [
+       "log_statement",
+       "log_line_prefix",
+       "log_rotation_age",
+       "log_checkpoints"
+      ],
+      "answer": 1,
+      "explanation": "يتحكم log_line_prefix بالبيانات الوصفية في بداية كل سطر فتصير الأحداث منسوبة."
+     },
+     {
+      "question": "أي مما يلي ممارسات جيدة لحماية سجلات التدقيق؟ اختر كل ما ينطبق.",
+      "options": [
+       "شحنها إلى جامع منفصل للإلحاق فقط",
+       "منح المديرين صلاحية كتابة على الجامع",
+       "مزامنة الساعات بـ NTP",
+       "تقييد وضع الملف بـ 0600"
+      ],
+      "answer": [
+       0,
+       2,
+       3
+      ],
+      "explanation": "قد يمحو المديرون ذوو صلاحية الكتابة الدليل؛ والثلاثة الأخرى تعزز السلامة والنسبة."
+     },
+     {
+      "question": "لماذا يُعد log_statement = 'all' خطرًا على خادم مزدحم؟",
+      "options": [
+       "يملأ الأقراص ويبطئ النظام ويدفن الأحداث المهمة",
+       "يعطّل TLS",
+       "يحذف البيانات",
+       "يغيّر كلمات المرور"
+      ],
+      "answer": 0,
+      "explanation": "يُغرق الحجم المضيف ومن يقرأ السجلات معًا."
+     },
+     {
+      "question": "ماذا يقول الدرس عن مسار تدقيق لم يُختبر؟",
+      "options": [
+       "يعمل افتراضيًّا",
+       "يفشل بصمت",
+       "أسرع",
+       "غير قانوني"
+      ],
+      "answer": 1,
+      "explanation": "نفّذ فعلًا مضبوطًا وتأكد وصوله إلى الجامع بالمستخدم والوقت الصحيحين."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يجيب التدقيق عن من وماذا ومتى ومن أين؛ وبدونه تصير الحوادث تخمينًا.\n- سجّل بحسب الخطر: الاتصالات، وتغييرات الامتيازات والمخطط، والوصول إلى الجداول الحساسة، وحالات الرفض.\n- ابدأ بإعدادات PostgreSQL الأصلية (`log_connections` و`log_line_prefix` و`log_statement = 'ddl'`) ثم أضف تدقيق كائنات `pgaudit` للجداول الحساسة.\n- في MySQL استخدم ملحق تدقيق حيث يتوفر، والسجل العام لفترات قصيرة فقط.\n- احمِ الأثر: اشحن السجلات خارج المضيف عبر TLS، وافصل المهام، وزامن الساعات، واحتفظ بما يلزم، ونبّه على قواعد قليلة عالية الإشارة.\n\nبهذا يكتمل الجزء الأول من المرحلة. تابع مع [مراقبة نشاط قواعد البيانات (DAM)](/learn/systems-infrastructure-security/database-activity-monitoring-dam) لتحويل السجلات إلى كشف حي."
+   }
+  ]
+ }
+}

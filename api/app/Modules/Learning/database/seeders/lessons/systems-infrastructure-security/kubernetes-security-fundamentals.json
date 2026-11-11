@@ -1,0 +1,592 @@
+{
+ "slug": "kubernetes-security-fundamentals",
+ "title": "Kubernetes Security Fundamentals",
+ "summary": "The layers of Kubernetes security: the control plane, Pod Security Standards, secrets, nodes and how to measure your posture.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Describe the 4C model of cloud-native security",
+  "Harden the API server, etcd and kubelet",
+  "Enforce Pod Security Standards with namespace labels",
+  "Assess a node with kube-bench and fix common findings"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A team moves its applications from a few Docker hosts to a Kubernetes cluster. Within a month there are forty services, six namespaces and a dozen people with `kubectl` access. Then someone asks a simple question: if one pod is compromised, what can it reach? Nobody can answer. The cluster accepts any pod specification, every pod can talk to every other pod, and the default service account token is mounted in all of them.\n\nKubernetes is not insecure by design, but its defaults favor convenience. Security comes from decisions you make: who can call the API, what pods are allowed to look like, how the control plane is protected and what you can see afterward. This lesson gives you the map. The next lessons go deep on [RBAC](/learn/systems-infrastructure-security/kubernetes-rbac) and [network policies](/learn/systems-infrastructure-security/kubernetes-network-policies)."
+  },
+  {
+   "id": "layers",
+   "type": "text",
+   "markdown": "## The four layers: the 4C model\n\nKubernetes documentation describes security as nested layers called the **4Cs**. An inner layer cannot be safer than the layer around it.\n\n| Layer | Examples of controls |\n|:--|:--|\n| **Cloud** (or data center) | Network and firewall rules for nodes, IAM, restricted access to the control plane endpoint, encrypted disks |\n| **Cluster** | API server authentication and authorization, admission control, etcd protection, kubelet settings, audit logs |\n| **Container** | Trusted and scanned images, minimal base images, runtime restrictions |\n| **Code** | Application authentication, input handling, dependency updates, secrets outside the source |\n\nThis lesson focuses on the Cluster and Container layers, because they are where administrators have the most control. A hardened pod running on a node with a wide-open kubelet port is still at risk, so check every layer in turn."
+  },
+  {
+   "id": "control",
+   "type": "text",
+   "markdown": "## Protecting the control plane\n\nThe **API server** is the front door of the cluster. Every `kubectl` command, every controller and every kubelet talks to it. Treat it like the Docker daemon: whoever controls it controls the cluster.\n\nThe control plane has four parts worth hardening:\n\n- **kube-apiserver.** Disable anonymous access (`--anonymous-auth=false` where your setup allows it), use TLS everywhere, require strong authentication such as OIDC or client certificates, enable the `RBAC` and `Node` authorizers, and write an audit log.\n- **etcd.** It stores every object, including Secrets. Allow only the API server to connect, require client certificates and encrypt Secrets at rest with an `EncryptionConfiguration`.\n- **kubelet.** The agent on each node. Set `authentication.anonymous.enabled: false`, `authorization.mode: Webhook` and `readOnlyPort: 0` so it does not answer unauthenticated requests.\n- **Scheduler and controller manager.** Keep their ports bound to localhost and their credentials protected.\n\nManaged services such as EKS, AKS and GKE run the control plane for you, but the shared-responsibility model still leaves node, workload and RBAC configuration to you."
+  },
+  {
+   "id": "api-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Life of an API request",
+   "caption": "Every request passes four gates before anything is stored.",
+   "data": {
+    "token": "kubectl apply",
+    "nodes": [
+     {
+      "id": "u",
+      "label": "Developer",
+      "sub": "kubectl",
+      "icon": "laptop"
+     },
+     {
+      "id": "authn",
+      "label": "Authentication",
+      "sub": "Who are you?",
+      "icon": "key"
+     },
+     {
+      "id": "authz",
+      "label": "Authorization",
+      "sub": "RBAC",
+      "icon": "lock"
+     },
+     {
+      "id": "adm",
+      "label": "Admission",
+      "sub": "Pod Security",
+      "icon": "shield"
+     },
+     {
+      "id": "etcd",
+      "label": "etcd",
+      "sub": "stored",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "at": "u",
+      "caption": "A developer submits a Pod manifest to the API server over TLS."
+     },
+     {
+      "at": "authn",
+      "caption": "The server checks the client certificate or token. The identity is dev-anna.",
+      "tone": "secure"
+     },
+     {
+      "at": "authz",
+      "caption": "RBAC confirms dev-anna may create pods in the namespace shop.",
+      "tone": "secure"
+     },
+     {
+      "at": "adm",
+      "caption": "Admission checks the spec. It asks for privileged: true, which the restricted standard forbids.",
+      "tone": "danger"
+     },
+     {
+      "at": "u",
+      "token": "rejected",
+      "caption": "The request is rejected with a clear error. Nothing reaches etcd.",
+      "tone": "blocked"
+     },
+     {
+      "at": "adm",
+      "token": "fixed spec",
+      "caption": "After the developer removes the privileged flag, the spec passes admission.",
+      "tone": "success"
+     },
+     {
+      "at": "etcd",
+      "token": "fixed spec",
+      "caption": "The object is persisted and the scheduler can place the pod.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "pods",
+   "type": "text",
+   "markdown": "## Controlling what pods may do\n\nThe workload layer is where most day-to-day risk lives. Two features carry most of the weight.\n\n### securityContext\n\nEach pod and container can declare its own limits: `runAsNonRoot`, `runAsUser`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [\"ALL\"]` and `seccompProfile.type: RuntimeDefault`. These are the Kubernetes forms of the container flags you saw in [Container Escape Risks](/learn/systems-infrastructure-security/container-escape-risks).\n\n### Pod Security Standards\n\nDeclaring a context is voluntary, so the cluster needs a rule that enforces it. The built-in **Pod Security Admission** controller applies one of three standards to a namespace through labels:\n\n| Standard | Meaning | Typical use |\n|:--|:--|:--|\n| `privileged` | No restrictions | System components only |\n| `baseline` | Blocks known dangerous settings such as host namespaces and privileged containers | Default for most workloads |\n| `restricted` | Follows current hardening practice: non-root, no privilege escalation, dropped capabilities | Sensitive and internet-facing apps |\n\nEach standard can run in three modes: `enforce` rejects violations, `audit` records them, and `warn` prints a message to the user. Roll out with `warn` and `audit` first, fix the findings, then switch to `enforce`."
+  },
+  {
+   "id": "pss-term",
+   "type": "terminal",
+   "title": "kubectl - enforce Pod Security",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "kubectl label namespace shop pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted",
+     "output": "namespace/shop labeled",
+     "comment": "One label pair turns on the restricted standard for every new pod in the namespace."
+    },
+    {
+     "cmd": "kubectl -n shop run test --image=registry.example.com/tools/busybox:1.36 --privileged",
+     "output": "Error from server (Forbidden): pods \"test\" is forbidden: violates PodSecurity \"restricted:latest\": privileged (container \"test\" must not set securityContext.privileged=true), allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile",
+     "comment": "The admission controller lists every violated rule, so the developer knows what to fix. The wording differs slightly between versions."
+    },
+    {
+     "cmd": "kubectl auth can-i create pods --as=system:serviceaccount:shop:default -n shop",
+     "output": "no",
+     "comment": "Check what a default service account can do before assuming it is harmless."
+    }
+   ],
+   "caption": "Enforce, test and verify on a cluster you own."
+  },
+  {
+   "id": "pod-yaml",
+   "type": "code",
+   "language": "yaml",
+   "filename": "web-pod.yaml",
+   "code": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\n  namespace: shop\nspec:\n  automountServiceAccountToken: false\n  securityContext:\n    runAsNonRoot: true\n    runAsUser: 10001\n    seccompProfile:\n      type: RuntimeDefault\n  containers:\n    - name: web\n      image: registry.example.com/shop/web:1.4.2\n      ports:\n        - containerPort: 8080\n      securityContext:\n        allowPrivilegeEscalation: false\n        readOnlyRootFilesystem: true\n        capabilities:\n          drop: [\"ALL\"]\n      resources:\n        limits:\n          cpu: \"500m\"\n          memory: \"256Mi\"",
+   "caption": "A pod that satisfies the restricted standard."
+  },
+  {
+   "id": "secrets",
+   "type": "text",
+   "markdown": "## Secrets, nodes and visibility\n\nThree more areas complete the picture.\n\n- **Secrets.** A Kubernetes Secret is only base64-encoded by default, not encrypted. Enable encryption at rest, restrict `get` and `list` on Secrets through RBAC, and consider an external secret store. See [Kubernetes Secrets Management](/learn/systems-infrastructure-security/kubernetes-secrets-management).\n- **Nodes.** Use a minimal, regularly patched node operating system, restrict SSH, and avoid running workloads on control plane nodes. A compromised node exposes every pod scheduled on it.\n- **Visibility.** Turn on API server audit logging and ship the logs off the cluster. See [Kubernetes Audit Logging](/learn/systems-infrastructure-security/kubernetes-audit-logging). Add vulnerability scanning for images and a runtime detection tool.\n\nTo measure where you stand, run the CIS Kubernetes Benchmark with **kube-bench** on your own nodes. It reads configuration files and flags, and reports each check as PASS, FAIL, WARN or INFO with a suggested fix."
+  },
+  {
+   "id": "bench-term",
+   "type": "terminal",
+   "title": "node01 - kube-bench",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "sudo kube-bench run --targets node",
+     "output": "[INFO] 4 Worker Node Security Configuration\n[INFO] 4.2 Kubelet\n[PASS] 4.2.1 Ensure that the --anonymous-auth argument is set to false\n[PASS] 4.2.2 Ensure that the --authorization-mode argument is not set to AlwaysAllow\n[FAIL] 4.2.4 Verify that the --read-only-port argument is set to 0\n== Remediations node ==\n4.2.4 Edit the kubelet config file and set readOnlyPort to 0, then restart the kubelet.",
+     "comment": "One failure with a ready remediation. Check item numbers against your benchmark version."
+    }
+   ],
+   "caption": "Illustrative output from a node you own."
+  },
+  {
+   "id": "roll-tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Roll out controls in stages",
+   "markdown": "A strict policy applied overnight breaks deployments and teaches teams to ask for exceptions. Instead, label a test namespace first, read the warnings for a week, fix the manifests that fail, and only then enforce. Keep system namespaces such as `kube-system` on the `privileged` standard, because those components genuinely need it. Record each exception with an owner and a review date so that the list shrinks over time rather than growing quietly in the background.\n\nRemember that enforcement applies to new pods only. Pods that were running before you enabled it stay as they are until they are rescheduled, so redeploy workloads after enabling it and review the `audit` warnings until none remain."
+  },
+  {
+   "id": "sa-warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Default service account tokens",
+   "markdown": "Every pod gets a service account token mounted unless you say otherwise. If the application never calls the Kubernetes API, set `automountServiceAccountToken: false` on the pod or on the service account. A stolen token is only as dangerous as the permissions behind it, which is why RBAC matters so much, but the best token is the one that was never there."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab cluster you own (kind, minikube or k3s):\n\n1. Create a namespace with `kubectl create namespace shop`.\n2. Label it with `pod-security.kubernetes.io/enforce=baseline` and `pod-security.kubernetes.io/warn=restricted`.\n3. Apply a plain `nginx` pod and read the warning. Then apply `web-pod.yaml` after changing the image to one that runs as non-root and listens on port 8080.\n4. Switch the `enforce` label to `restricted` and confirm which of your pods are still admitted.\n5. Run `kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.name}{\"\\t\"}{.spec.serviceAccountName}{\"\\n\"}{end}'` and list pods that use the default service account."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "4C model",
+     "definition": "Cloud, Cluster, Container and Code: nested layers of Kubernetes security."
+    },
+    {
+     "term": "API server",
+     "definition": "The front door of the cluster that authenticates, authorizes and validates every request."
+    },
+    {
+     "term": "etcd",
+     "definition": "The key-value store that holds all cluster state, including Secrets."
+    },
+    {
+     "term": "kubelet",
+     "definition": "The node agent that starts pods and reports status to the API server."
+    },
+    {
+     "term": "Admission controller",
+     "definition": "A gate that can reject or change a request after authorization."
+    },
+    {
+     "term": "Pod Security Standards",
+     "definition": "Three profiles (privileged, baseline, restricted) for pod settings."
+    },
+    {
+     "term": "securityContext",
+     "definition": "Pod and container fields that set user, capabilities and filesystem limits."
+    },
+    {
+     "term": "kube-bench",
+     "definition": "A tool that checks nodes against the CIS Kubernetes Benchmark."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "In the 4C model, which layer contains the API server and etcd?",
+     "options": [
+      "Cloud",
+      "Cluster",
+      "Container",
+      "Code"
+     ],
+     "answer": 1,
+     "explanation": "Control plane components are part of the Cluster layer."
+    },
+    {
+     "question": "What is the correct order of gates an API request passes?",
+     "options": [
+      "Admission, authorization, authentication",
+      "Authentication, authorization, admission",
+      "Authorization, authentication, admission",
+      "Admission, authentication, authorization"
+     ],
+     "answer": 1,
+     "explanation": "The server first identifies the caller, then checks permission, then admission controllers validate or change the object before it is stored."
+    },
+    {
+     "question": "Which of these are valid Pod Security Admission modes? (choose all that apply)",
+     "options": [
+      "`enforce`",
+      "`audit`",
+      "`warn`",
+      "`ignore`"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "There are three modes. `ignore` does not exist; a namespace without labels is simply unrestricted."
+    },
+    {
+     "question": "Why enable encryption at rest for etcd?",
+     "options": [
+      "Secrets are only base64-encoded by default",
+      "It makes pods start faster",
+      "It replaces RBAC",
+      "It is required by the scheduler"
+     ],
+     "answer": 0,
+     "explanation": "Base64 is an encoding, not protection. Anyone with a copy of the etcd data or a backup can read Secrets unless they are encrypted."
+    },
+    {
+     "question": "Which kubelet setting stops it from answering unauthenticated requests?",
+     "options": [
+      "`authentication.anonymous.enabled: false`",
+      "`readOnlyPort: 10255`",
+      "`authorization.mode: AlwaysAllow`",
+      "`failSwapOn: false`"
+     ],
+     "answer": 0,
+     "explanation": "Disabling anonymous authentication, with Webhook authorization, closes unauthenticated access. The other settings are unrelated or make things worse."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Kubernetes security is layered: Cloud, Cluster, Container and Code. Each layer depends on the one around it.\n- Protect the API server, etcd and kubelet first. Every request passes authentication, authorization and admission before it is stored.\n- Declare a `securityContext` and enforce Pod Security Standards with namespace labels, starting in `warn` and `audit` modes.\n- Encrypt Secrets at rest, harden nodes, ship audit logs off the cluster and measure with kube-bench.\n- Next, learn to control who can do what in [Kubernetes RBAC](/learn/systems-infrastructure-security/kubernetes-rbac)."
+  }
+ ],
+ "ar": {
+  "title": "أساسيات أمن Kubernetes",
+  "summary": "طبقات أمن Kubernetes: مستوى التحكم ومعايير أمان Pod والأسرار والعقد وكيف تقيس وضعك.",
+  "objectives": [
+   "وصف نموذج 4C لأمان البيئات السحابية الأصلية",
+   "تقوية خادم الواجهة وetcd وkubelet",
+   "فرض معايير أمان Pod بوسوم مساحات الأسماء",
+   "تقييم عقدة بـkube-bench وإصلاح الملاحظات الشائعة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "ينقل فريق تطبيقاته من بضعة مضيفات Docker إلى عنقود Kubernetes. وخلال شهر يصبح لديه أربعون خدمة وست مساحات أسماء واثنا عشر شخصاً يملكون وصول `kubectl`. ثم يسأل أحدهم سؤالاً بسيطاً: إذا اختُرق Pod واحد فما الذي يستطيع الوصول إليه؟ لا يملك أحد الجواب. العنقود يقبل أي مواصفات Pod، وكل Pod يستطيع مخاطبة كل Pod آخر، ورمز حساب الخدمة الافتراضي مركّب في كلها.\n\nلم يُصمَّم Kubernetes ليكون غير آمن، لكن إعداداته الافتراضية تنحاز إلى الراحة. ويأتي الأمان من قرارات تتخذها أنت: من يستطيع استدعاء الواجهة البرمجية، وكيف يُسمح لشكل الـPod أن يكون، وكيف يُحمى مستوى التحكم، وماذا تستطيع أن ترى بعد وقوع الحدث. يعطيك هذا الدرس الخريطة، وتتعمق الدروس التالية في [RBAC](/learn/systems-infrastructure-security/kubernetes-rbac) و[سياسات الشبكة](/learn/systems-infrastructure-security/kubernetes-network-policies)."
+   },
+   {
+    "id": "layers",
+    "type": "text",
+    "markdown": "## الطبقات الأربع: نموذج 4C\n\nتصف وثائق Kubernetes الأمان بوصفه طبقات متداخلة تسمى **الـ4C**. ولا تكون الطبقة الداخلية أكثر أماناً من الطبقة المحيطة بها.\n\n| الطبقة | أمثلة على الضوابط |\n|:--|:--|\n| **السحابة** (أو مركز البيانات) | قواعد الشبكة وجدار الحماية للعقد، وإدارة الهوية والوصول، وتقييد الوصول إلى نقطة مستوى التحكم، وتشفير الأقراص |\n| **العنقود (Cluster)** | مصادقة وتفويض خادم الواجهة، والتحكم بالقبول، وحماية etcd، وإعدادات kubelet، وسجلات التدقيق |\n| **الحاوية** | صور موثوقة ومفحوصة، وصور أساس صغيرة، وقيود وقت التشغيل |\n| **الشيفرة** | مصادقة التطبيق، ومعالجة المدخلات، وتحديث الاعتماديات، وإبقاء الأسرار خارج الشيفرة المصدرية |\n\nيركز هذا الدرس على طبقتي العنقود والحاوية لأن المسؤولين يملكون فيهما أكبر قدر من التحكم. وPod مقوّى يعمل على عقدة منفذ kubelet فيها مفتوح على مصراعيه يظل معرّضاً للخطر، فافحص كل طبقة بدورها."
+   },
+   {
+    "id": "control",
+    "type": "text",
+    "markdown": "## حماية مستوى التحكم\n\nيُعدّ **خادم الواجهة (API server)** الباب الأمامي للعنقود. فكل أمر `kubectl` وكل متحكّم وكل kubelet يتحدث إليه. عامِله كما تعامل خدمة Docker: من يتحكم به يتحكم بالعنقود.\n\nلمستوى التحكم أربعة أجزاء تستحق التقوية:\n\n- **kube-apiserver.** عطّل الوصول المجهول (`--anonymous-auth=false` حيث تسمح بيئتك)، واستخدم TLS في كل مكان، واشترط مصادقة قوية مثل OIDC أو شهادات العملاء، وفعّل مفوِّضَي `RBAC` و`Node`، واكتب سجل تدقيق.\n- **etcd.** يخزن كل الكائنات ومنها الأسرار (Secrets). اسمح لخادم الواجهة وحده بالاتصال، واشترط شهادات العملاء، وشفّر الأسرار أثناء التخزين بملف `EncryptionConfiguration`.\n- **kubelet.** الوكيل على كل عقدة. اضبط `authentication.anonymous.enabled: false` و`authorization.mode: Webhook` و`readOnlyPort: 0` كي لا يجيب عن الطلبات غير الموثّقة.\n- **المجدوِل ومدير المتحكمات.** أبقِ منافذهما مربوطة بالمضيف المحلي وصلاحياتهما محمية.\n\nتدير الخدمات المُدارة مثل EKS وAKS وGKE مستوى التحكم نيابةً عنك، لكن نموذج المسؤولية المشتركة يترك إعدادات العقد وأحمال العمل وRBAC لك."
+   },
+   {
+    "id": "api-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "رحلة طلب إلى الواجهة البرمجية",
+    "caption": "يمر كل طلب بأربع بوابات قبل أن يُخزَّن أي شيء.",
+    "data": {
+     "token": "kubectl apply",
+     "nodes": [
+      {
+       "id": "u",
+       "label": "المطوّر",
+       "sub": "kubectl",
+       "icon": "laptop"
+      },
+      {
+       "id": "authn",
+       "label": "المصادقة",
+       "sub": "Who are you?",
+       "icon": "key"
+      },
+      {
+       "id": "authz",
+       "label": "التفويض",
+       "sub": "RBAC",
+       "icon": "lock"
+      },
+      {
+       "id": "adm",
+       "label": "القبول",
+       "sub": "Pod Security",
+       "icon": "shield"
+      },
+      {
+       "id": "etcd",
+       "label": "etcd",
+       "sub": "stored",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "at": "u",
+       "caption": "يرسل مطوّر ملف Pod إلى خادم الواجهة عبر TLS."
+      },
+      {
+       "at": "authn",
+       "caption": "يفحص الخادم شهادة العميل أو رمزه، والهوية هي dev-anna.",
+       "tone": "secure"
+      },
+      {
+       "at": "authz",
+       "caption": "يؤكد RBAC أن dev-anna تستطيع إنشاء pods في مساحة shop.",
+       "tone": "secure"
+      },
+      {
+       "at": "adm",
+       "caption": "يفحص القبول المواصفات. يطلب Pod القيمة privileged: true وهو ما يحظره المعيار المقيّد.",
+       "tone": "danger"
+      },
+      {
+       "at": "u",
+       "token": "rejected",
+       "caption": "يُرفض الطلب برسالة خطأ واضحة ولا يصل شيء إلى etcd.",
+       "tone": "blocked"
+      },
+      {
+       "at": "adm",
+       "token": "fixed spec",
+       "caption": "بعد أن يزيل المطوّر علم privileged يجتاز الطلب القبول.",
+       "tone": "success"
+      },
+      {
+       "at": "etcd",
+       "token": "fixed spec",
+       "caption": "يُحفظ الكائن ويستطيع المجدوِل وضع الـPod على عقدة.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "pods",
+    "type": "text",
+    "markdown": "## التحكم فيما تفعله الـPods\n\nطبقة أحمال العمل هي موضع معظم المخاطر اليومية، وتحمل ميزتان معظم العبء.\n\n### سياق الأمان (securityContext)\n\nيستطيع كل Pod وكل حاوية إعلان حدودها بنفسها: `runAsNonRoot` و`runAsUser` و`allowPrivilegeEscalation: false` و`readOnlyRootFilesystem: true` و`capabilities.drop: [\"ALL\"]` و`seccompProfile.type: RuntimeDefault`. وهذه هي صيغ Kubernetes لخيارات الحاويات التي رأيتها في [مخاطر الهروب من الحاويات](/learn/systems-infrastructure-security/container-escape-risks).\n\n### معايير أمان Pod (Pod Security Standards)\n\nإعلان السياق اختياري، ولذلك يحتاج العنقود إلى قاعدة تفرضه. يطبّق متحكم **Pod Security Admission** المدمج أحد ثلاثة معايير على مساحة أسماء عبر الوسوم:\n\n| المعيار | المعنى | الاستخدام المعتاد |\n|:--|:--|:--|\n| `privileged` | بلا قيود | مكوّنات النظام فقط |\n| `baseline` | يمنع الإعدادات الخطرة المعروفة كمساحات أسماء المضيف والحاويات الممتازة | الافتراضي لمعظم الأحمال |\n| `restricted` | يتبع ممارسات التقوية الحالية: غير جذر، ومنع رفع الصلاحيات، وحذف القدرات | التطبيقات الحساسة والمكشوفة للإنترنت |\n\nويعمل كل معيار بثلاثة أوضاع: `enforce` يرفض المخالفات، و`audit` يسجلها، و`warn` يعرض رسالة للمستخدم. ابدأ بـ`warn` و`audit` ثم أصلح الملاحظات، وبعدها انتقل إلى `enforce`."
+   },
+   {
+    "id": "pss-term",
+    "type": "terminal",
+    "title": "kubectl - enforce Pod Security",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "kubectl label namespace shop pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted",
+      "output": "namespace/shop labeled",
+      "comment": "زوج وسوم واحد يفعّل المعيار المقيّد لكل Pod جديد في المساحة."
+     },
+     {
+      "cmd": "kubectl -n shop run test --image=registry.example.com/tools/busybox:1.36 --privileged",
+      "output": "Error from server (Forbidden): pods \"test\" is forbidden: violates PodSecurity \"restricted:latest\": privileged (container \"test\" must not set securityContext.privileged=true), allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile",
+      "comment": "يسرد متحكم القبول كل قاعدة خُرقت فيعرف المطوّر ما يصلحه. تختلف الصياغة قليلاً بين الإصدارات."
+     },
+     {
+      "cmd": "kubectl auth can-i create pods --as=system:serviceaccount:shop:default -n shop",
+      "output": "no",
+      "comment": "افحص ما يستطيعه حساب الخدمة الافتراضي قبل افتراض أنه غير ضار."
+     }
+    ],
+    "caption": "فرض ثم اختبار ثم تحقق على عنقود تملكه."
+   },
+   {
+    "id": "pod-yaml",
+    "type": "code",
+    "language": "yaml",
+    "filename": "web-pod.yaml",
+    "code": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\n  namespace: shop\nspec:\n  automountServiceAccountToken: false\n  securityContext:\n    runAsNonRoot: true\n    runAsUser: 10001\n    seccompProfile:\n      type: RuntimeDefault\n  containers:\n    - name: web\n      image: registry.example.com/shop/web:1.4.2\n      ports:\n        - containerPort: 8080\n      securityContext:\n        allowPrivilegeEscalation: false\n        readOnlyRootFilesystem: true\n        capabilities:\n          drop: [\"ALL\"]\n      resources:\n        limits:\n          cpu: \"500m\"\n          memory: \"256Mi\"",
+    "caption": "Pod يستوفي المعيار المقيّد."
+   },
+   {
+    "id": "secrets",
+    "type": "text",
+    "markdown": "## الأسرار والعقد والرؤية\n\nتكمل ثلاثة مجالات أخرى الصورة.\n\n- **الأسرار.** السر (Secret) في Kubernetes مرمّز بـbase64 فقط افتراضياً وليس مشفّراً. فعّل التشفير أثناء التخزين، وقيّد الصلاحيتين `get` و`list` على الأسرار عبر RBAC، وفكّر في مخزن أسرار خارجي. راجع [إدارة الأسرار في Kubernetes](/learn/systems-infrastructure-security/kubernetes-secrets-management).\n- **العقد.** استخدم نظام تشغيل صغيراً ومحدَّثاً دورياً للعقد، وقيّد SSH، وتجنّب تشغيل الأحمال على عقد مستوى التحكم. فاختراق عقدة يكشف كل Pod جُدول عليها.\n- **الرؤية.** فعّل تدقيق خادم الواجهة وأرسل السجلات إلى خارج العنقود. راجع [تدقيق السجلات في Kubernetes](/learn/systems-infrastructure-security/kubernetes-audit-logging). وأضف فحص ثغرات الصور وأداة اكتشاف أثناء التشغيل.\n\nولقياس موقعك شغّل معيار CIS لـKubernetes عبر الأداة **kube-bench** على عقدك الخاصة. تقرأ الأداة ملفات الإعداد والخيارات، وتبلّغ عن كل فحص بالنتيجة PASS أو FAIL أو WARN أو INFO مع إصلاح مقترح."
+   },
+   {
+    "id": "bench-term",
+    "type": "terminal",
+    "title": "node01 - kube-bench",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "sudo kube-bench run --targets node",
+      "output": "[INFO] 4 Worker Node Security Configuration\n[INFO] 4.2 Kubelet\n[PASS] 4.2.1 Ensure that the --anonymous-auth argument is set to false\n[PASS] 4.2.2 Ensure that the --authorization-mode argument is not set to AlwaysAllow\n[FAIL] 4.2.4 Verify that the --read-only-port argument is set to 0\n== Remediations node ==\n4.2.4 Edit the kubelet config file and set readOnlyPort to 0, then restart the kubelet.",
+      "comment": "فشل واحد مع إصلاح جاهز. قارن أرقام البنود بإصدار المعيار لديك."
+     }
+    ],
+    "caption": "مخرجات توضيحية من عقدة تملكها."
+   },
+   {
+    "id": "roll-tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "طبّق الضوابط على مراحل",
+    "markdown": "تطبيق سياسة صارمة بين ليلة وضحاها يكسر عمليات النشر ويعلّم الفرق طلب الاستثناءات. بدلاً من ذلك ضع الوسوم على مساحة تجريبية أولاً، واقرأ التحذيرات أسبوعاً، وأصلح الملفات التي تفشل، ثم فعّل الفرض. أبقِ مساحات النظام مثل `kube-system` على معيار `privileged` لأن مكوّناتها تحتاجه فعلاً. وسجّل كل استثناء مع مالكه وتاريخ مراجعته حتى تتقلص القائمة مع الوقت بدل أن تكبر بصمت في الخلفية.\n\nوتذكّر أن فرض المعايير يسري على الـPods الجديدة فقط، فالـPods العاملة قبل التفعيل تبقى كما هي حتى تُعاد جدولتها. لذلك أعد نشر الأحمال بعد التفعيل، وراجع تحذيرات `audit` للتأكد من خلوها من المخالفات."
+   },
+   {
+    "id": "sa-warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "رموز حساب الخدمة الافتراضي",
+    "markdown": "يحصل كل Pod على رمز حساب خدمة مركّب فيه ما لم تقل غير ذلك. إذا كان التطبيق لا يستدعي واجهة Kubernetes فاضبط `automountServiceAccountToken: false` على الـPod أو على حساب الخدمة. فالرمز المسروق لا يكون خطراً إلا بقدر الصلاحيات خلفه، ولهذا يهم RBAC كثيراً، لكن أفضل رمز هو الذي لم يوجد أصلاً."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على عنقود تجريبي تملكه (kind أو minikube أو k3s):\n\n1. أنشئ مساحة أسماء بالأمر `kubectl create namespace shop`.\n2. ضع عليها الوسمين `pod-security.kubernetes.io/enforce=baseline` و`pod-security.kubernetes.io/warn=restricted`.\n3. طبّق Pod عادياً من `nginx` واقرأ التحذير، ثم طبّق `web-pod.yaml` بعد تغيير الصورة إلى صورة تعمل بمستخدم غير جذر وتستمع على المنفذ 8080.\n4. بدّل وسم `enforce` إلى `restricted` وتأكد أي Pods ما زالت مقبولة.\n5. نفّذ `kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.name}{\"\\t\"}{.spec.serviceAccountName}{\"\\n\"}{end}'` واسرد الـPods التي تستخدم حساب الخدمة الافتراضي."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "4C model",
+      "definition": "السحابة والعنقود والحاوية والشيفرة: طبقات متداخلة لأمان Kubernetes."
+     },
+     {
+      "term": "API server",
+      "definition": "الباب الأمامي للعنقود الذي يصادق ويفوّض ويتحقق من كل طلب."
+     },
+     {
+      "term": "etcd",
+      "definition": "مخزن المفاتيح والقيم الذي يحفظ حالة العنقود كلها ومنها الأسرار."
+     },
+     {
+      "term": "kubelet",
+      "definition": "وكيل العقدة الذي يشغّل الـPods ويبلّغ خادم الواجهة بالحالة."
+     },
+     {
+      "term": "Admission controller",
+      "definition": "بوابة تستطيع رفض الطلب أو تعديله بعد التفويض."
+     },
+     {
+      "term": "Pod Security Standards",
+      "definition": "ثلاثة ملفات (privileged وbaseline وrestricted) لإعدادات الـPod."
+     },
+     {
+      "term": "securityContext",
+      "definition": "حقول في الـPod والحاوية تحدد المستخدم والقدرات وحدود نظام الملفات."
+     },
+     {
+      "term": "kube-bench",
+      "definition": "أداة تفحص العقد مقابل معيار CIS لـKubernetes."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "في نموذج 4C، أي طبقة تضم خادم الواجهة وetcd؟",
+      "options": [
+       "السحابة",
+       "العنقود",
+       "الحاوية",
+       "الشيفرة"
+      ],
+      "answer": 1,
+      "explanation": "مكوّنات مستوى التحكم جزء من طبقة العنقود."
+     },
+     {
+      "question": "ما الترتيب الصحيح للبوابات التي يمر بها طلب إلى الواجهة؟",
+      "options": [
+       "القبول ثم التفويض ثم المصادقة",
+       "المصادقة ثم التفويض ثم القبول",
+       "التفويض ثم المصادقة ثم القبول",
+       "القبول ثم المصادقة ثم التفويض"
+      ],
+      "answer": 1,
+      "explanation": "يتعرف الخادم أولاً على المستدعي ثم يتحقق من الإذن ثم تتحقق متحكمات القبول من الكائن أو تعدله قبل تخزينه."
+     },
+     {
+      "question": "أي مما يلي أوضاع صالحة في Pod Security Admission؟ (اختر كل ما ينطبق)",
+      "options": [
+       "`enforce`",
+       "`audit`",
+       "`warn`",
+       "`ignore`"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "هناك ثلاثة أوضاع. الوضع `ignore` غير موجود، ومساحة الأسماء بلا وسوم تكون بلا قيود."
+     },
+     {
+      "question": "لماذا نفعّل التشفير أثناء التخزين في etcd؟",
+      "options": [
+       "الأسرار مرمّزة بـbase64 فقط افتراضياً",
+       "يجعل الـPods تبدأ أسرع",
+       "يحل محل RBAC",
+       "يطلبه المجدوِل"
+      ],
+      "answer": 0,
+      "explanation": "base64 ترميز لا حماية. وكل من يملك نسخة من بيانات etcd أو نسخة احتياطية يقرأ الأسرار ما لم تكن مشفّرة."
+     },
+     {
+      "question": "أي إعداد في kubelet يمنعه من الرد على الطلبات غير الموثّقة؟",
+      "options": [
+       "`authentication.anonymous.enabled: false`",
+       "`readOnlyPort: 10255`",
+       "`authorization.mode: AlwaysAllow`",
+       "`failSwapOn: false`"
+      ],
+      "answer": 0,
+      "explanation": "تعطيل المصادقة المجهولة مع تفويض Webhook يغلق الوصول غير الموثّق. والإعدادات الأخرى لا علاقة لها أو تزيد الوضع سوءاً."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- أمان Kubernetes طبقي: السحابة والعنقود والحاوية والشيفرة، وتعتمد كل طبقة على التي تحيط بها.\n- احمِ خادم الواجهة وetcd وkubelet أولاً. يمر كل طلب بالمصادقة والتفويض والقبول قبل أن يُخزَّن.\n- أعلن `securityContext` وافرض معايير أمان Pod بوسوم مساحات الأسماء، مبتدئاً بوضعي `warn` و`audit`.\n- شفّر الأسرار أثناء التخزين، وقوِّ العقد، وأرسل سجلات التدقيق إلى خارج العنقود، وقِس وضعك بـkube-bench.\n- بعد ذلك تعلّم التحكم فيمن يفعل ماذا في [RBAC في Kubernetes](/learn/systems-infrastructure-security/kubernetes-rbac)."
+   }
+  ]
+ }
+}

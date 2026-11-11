@@ -1,0 +1,554 @@
+{
+ "slug": "nginx-security-hardening",
+ "title": "Nginx Security Hardening",
+ "summary": "Harden Nginx with a minimal TLS configuration, safe defaults, request limits, blocked paths and a repeatable test and reload procedure.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Write a hardened server block with modern TLS",
+  "Hide version information and restrict methods",
+  "Limit request size, timeouts and connection rates",
+  "Block access to hidden and sensitive paths",
+  "Test, reload and verify changes safely"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "Nginx is fast and small, and its defaults are tuned for compatibility rather than for security. A fresh install may print its version in every response, accept very large request bodies, wait forever for slow clients and serve whatever lies under the document root, including a stray `.git` folder.\n\nIn this lesson you will build a hardened configuration step by step. It builds on the baseline from [Web Server Security Fundamentals](/learn/systems-infrastructure-security/web-server-security-fundamentals) and prepares the ground for placing Nginx as a [reverse proxy](/learn/systems-infrastructure-security/reverse-proxy-security). All examples use `example.com` and documentation addresses, and you should only apply them to servers you administer."
+  },
+  {
+   "id": "structure",
+   "type": "text",
+   "markdown": "## How the configuration is organized\n\nNginx reads `nginx.conf`, which includes files from `conf.d/` or `sites-enabled/`. Directives live in contexts, and an inner context inherits from the outer one:\n\n| Context | Scope | Typical hardening here |\n|:--|:--|:--|\n| `main` | Process level | `user nginx;`, worker settings |\n| `http` | All sites | `server_tokens off;`, TLS defaults, limits |\n| `server` | One virtual host | `server_name`, certificates, redirects |\n| `location` | One URL pattern | Blocks, upload limits, proxy settings |\n\nTwo inheritance rules cause real incidents. First, `add_header` in a lower context **replaces** all headers set above it, it does not add to them. Second, a request that matches no `server_name` goes to the **default server**. Define that one explicitly and make it return nothing useful, so scanners that hit the bare IP address learn nothing about your sites.\n\nAlways keep one site per file, named after the domain, so a review shows exactly which file controls which host."
+  },
+  {
+   "id": "nginx-http",
+   "type": "code",
+   "language": "nginx",
+   "code": "# /etc/nginx/nginx.conf (http context)\nhttp {\n    server_tokens off;                  # no version in headers or error pages\n    client_max_body_size 2m;            # raise per location only where needed\n    client_body_timeout 10s;            # slow-client protection\n    client_header_timeout 10s;\n    keepalive_timeout 15s;\n    send_timeout 10s;\n\n    ssl_protocols TLSv1.2 TLSv1.3;      # no SSLv3, TLS 1.0 or 1.1\n    ssl_prefer_server_ciphers off;      # let modern clients choose\n    ssl_session_tickets off;\n    ssl_session_cache shared:SSL:10m;\n\n    limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;\n\n    # Catch-all server: answers requests for unknown host names\n    server {\n        listen 80 default_server;\n        listen 443 ssl default_server;\n        ssl_certificate     /etc/nginx/ssl/default.crt;\n        ssl_certificate_key /etc/nginx/ssl/default.key;\n        return 444;                     # close the connection without a response\n    }\n\n    include /etc/nginx/conf.d/*.conf;\n}",
+   "filename": "nginx.conf",
+   "caption": "Global defaults. The catch-all server hides your real sites from requests that use the bare IP address."
+  },
+  {
+   "id": "site",
+   "type": "text",
+   "markdown": "## A hardened site\n\nThe site file below redirects HTTP to HTTPS, serves one domain, sets security headers and denies the paths that should never leave the server. Read each part and ask what it prevents.\n\n- `return 301` for port 80 stops accidental cleartext use.\n- `add_header ... always` sends headers on error responses too. Repeat the full set in any `location` that adds its own.\n- The `location ~ /\\.` rule refuses every dotfile and dot-directory, which covers `.git`, `.env` and `.htaccess`. The `.well-known` exception keeps certificate renewal working.\n- The backup rule refuses editor and dump files such as `index.php.bak` or `db.sql`.\n- `limit_except` accepts only the methods the site uses.\n- `limit_req` slows down password guessing on the login URL. See [rate limiting and request filtering](/learn/systems-infrastructure-security/rate-limiting-and-request-filtering) for tuning."
+  },
+  {
+   "id": "nginx-site",
+   "type": "code",
+   "language": "nginx",
+   "code": "# /etc/nginx/conf.d/example.com.conf\nserver {\n    listen 80;\n    server_name example.com www.example.com;\n    return 301 https://example.com$request_uri;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name example.com;\n    root /var/www/example.com/public;\n    index index.html;\n\n    ssl_certificate     /etc/nginx/ssl/example.com.fullchain.pem;\n    ssl_certificate_key /etc/nginx/ssl/example.com.key;\n\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header X-Frame-Options \"SAMEORIGIN\" always;\n\n    autoindex off;\n\n    location ~ /\\.(?!well-known) { deny all; }\n    location ~* \\.(bak|sql|old|orig|swp|log)$ { deny all; }\n\n    location / {\n        limit_except GET HEAD POST { deny all; }\n        try_files $uri $uri/ =404;\n    }\n\n    location = /login {\n        limit_req zone=login burst=5 nodelay;\n        try_files $uri =404;\n    }\n}",
+   "filename": "example.com.conf",
+   "caption": "One site per file. Lines under location blocks show where each protection applies."
+  },
+  {
+   "id": "reload-anim",
+   "type": "animation",
+   "kind": "cycle",
+   "title": "Safe change cycle for Nginx",
+   "caption": "Never reload a configuration you have not tested.",
+   "data": {
+    "center": "Nginx change",
+    "items": [
+     {
+      "label": "Backup",
+      "sub": "Copy /etc/nginx"
+     },
+     {
+      "label": "Edit",
+      "sub": "One change at a time"
+     },
+     {
+      "label": "Test",
+      "sub": "nginx -t"
+     },
+     {
+      "label": "Reload",
+      "sub": "systemctl reload nginx"
+     },
+     {
+      "label": "Verify",
+      "sub": "curl from outside"
+     }
+    ],
+    "steps": [
+     {
+      "item": 0,
+      "caption": "Copy the configuration directory so you can roll back in seconds."
+     },
+     {
+      "item": 1,
+      "caption": "Change one thing in the site file, not several at once."
+     },
+     {
+      "item": 2,
+      "caption": "nginx -t checks syntax and the certificate paths. It prints nothing risky to the live service."
+     },
+     {
+      "item": 3,
+      "caption": "A reload starts new workers with the new settings and lets old connections finish."
+     },
+     {
+      "item": 4,
+      "caption": "Request the site from another host and check headers and blocked paths. Then repeat the cycle."
+     }
+    ]
+   }
+  },
+  {
+   "id": "nginx-term",
+   "type": "terminal",
+   "title": "Testing, reloading and verifying",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "sudo nginx -t",
+     "output": "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful"
+    },
+    {
+     "cmd": "sudo systemctl reload nginx",
+     "output": ""
+    },
+    {
+     "cmd": "curl -sI https://example.com/ | grep -i -E '^(server|strict|x-content)'",
+     "output": "server: nginx\nstrict-transport-security: max-age=31536000\nx-content-type-options: nosniff"
+    },
+    {
+     "comment": "The Server header has no version because of server_tokens off."
+    },
+    {
+     "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://example.com/.git/config",
+     "output": "403"
+    },
+    {
+     "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' -X DELETE https://example.com/",
+     "output": "403"
+    },
+    {
+     "comment": "Dotfiles and unlisted methods are denied. Compare this with the default server, which would return 404 or even file content."
+    },
+    {
+     "cmd": "sudo nginx -T 2>/dev/null | grep -c 'add_header'",
+     "output": "3"
+    },
+    {
+     "comment": "nginx -T dumps the merged configuration, which is the quickest way to see what is really loaded."
+    }
+   ]
+  },
+  {
+   "id": "limits",
+   "type": "text",
+   "markdown": "## Limits that keep one client from hurting everyone\n\nNginx handles many connections per worker, so a single abusive client can still tie up resources unless you set boundaries. Think of three kinds of limit:\n\n| Limit | Directive | What it protects against |\n|:--|:--|:--|\n| Request rate | `limit_req_zone`, `limit_req` | Password guessing, scraping |\n| Connections | `limit_conn_zone`, `limit_conn` | One address opening thousands of sockets |\n| Size and time | `client_max_body_size`, `client_body_timeout` | Huge uploads, slow-body attacks |\n\nApply the strict limits to the expensive or sensitive URLs, such as login, search and password reset, and leave static files generous. When the site sits behind a CDN or load balancer, the client address is the proxy's address, so key the zone on the real client address that the proxy forwards, and trust that header only from the proxy's own network.\n\nLimits are a speed bump, not a shield against large attacks. Volumetric floods must be absorbed upstream, and application-level abuse needs a [web application firewall](/learn/systems-infrastructure-security/web-application-firewall-waf). Log rejected requests with a distinct status such as `429`, so you can see who hits the limits and tune them without guessing."
+  },
+  {
+   "id": "run",
+   "type": "text",
+   "markdown": "## Running Nginx safely\n\nConfiguration is only half the work. Also check the following.\n\n**Process and files.** Workers should run as `nginx` or `www-data`, set with `user` in the main context. The configuration and private keys should be owned by root, with keys at mode `600`. The web user must not be able to edit `/etc/nginx`.\n\n**Logging.** Keep access and error logs, and ship them to a central place. A `403` burst on dotfiles or a spike of `404` responses on `/wp-login.php` on a site that is not WordPress is an early sign of scanning. Rotate the logs so a flood does not fill the disk.\n\n**Updates.** Use the packages from your distribution or from the official Nginx repository, and apply security updates promptly. Remove modules you do not use, because each one is code that could contain a bug.\n\n**Containment.** If Nginx proxies to an application, give the application its own network path and do not let Nginx reach the database. For the proxy specifics, continue with [Reverse Proxy Security](/learn/systems-infrastructure-security/reverse-proxy-security)."
+  },
+  {
+   "id": "pitfall",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Mistakes that bite",
+   "markdown": "- `add_header` inside a `location` silently drops the headers from the `server` block. Repeat them or use a shared include.\n- A regex `location` can override a prefix `location`. Test the blocked paths with `curl` instead of trusting your reading.\n- `alias` without a trailing slash match can expose parent directories (\"off-by-slash\"). Keep the slashes of `location` and `alias` consistent.\n- `return 444` is non-standard. It is useful for the catch-all server but is not a replacement for a firewall.\n- Raising `client_max_body_size` globally because one upload form needed it."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a Linux virtual machine you own with Nginx installed.\n\n1. Copy `/etc/nginx` to `/root/nginx-backup` and create a test page under a new web root.\n2. Add `server_tokens off;` and the catch-all server shown above, then run `sudo nginx -t` and `sudo systemctl reload nginx`.\n3. Request the site by IP address with `curl -k -i https://<vm-ip>/` and confirm the connection is closed with no content.\n4. Add the dotfile and backup rules. Create `.secret` and `old.sql` in the web root and confirm both return `403`.\n5. Break the configuration on purpose by removing a semicolon. Observe that `nginx -t` reports the line and the running site keeps working.\n\nRestore the backup if anything goes wrong."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "server_tokens",
+     "definition": "Directive that controls whether Nginx prints its version."
+    },
+    {
+     "term": "Default server",
+     "definition": "The virtual host that answers requests matching no server_name."
+    },
+    {
+     "term": "location",
+     "definition": "A block that applies settings to a URL pattern."
+    },
+    {
+     "term": "limit_req",
+     "definition": "Module that limits the request rate per key such as client address."
+    },
+    {
+     "term": "ssl_protocols",
+     "definition": "Directive listing the TLS versions the server accepts."
+    },
+    {
+     "term": "nginx -t",
+     "definition": "Syntax and file check of the configuration without applying it."
+    },
+    {
+     "term": "Reload",
+     "definition": "Graceful application of a new configuration without dropping connections."
+    },
+    {
+     "term": "Dotfile",
+     "definition": "A file or directory whose name starts with a dot, often holding secrets or metadata."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What does `add_header` in a `location` block do to headers set in the parent `server` block?",
+     "options": [
+      "Adds to them",
+      "Replaces them for that location",
+      "Has no effect",
+      "Deletes the location"
+     ],
+     "answer": 1,
+     "explanation": "If a context defines any add_header, it does not inherit the parent's headers. Repeat the full set."
+    },
+    {
+     "question": "Which command checks the configuration without applying it?",
+     "options": [
+      "nginx -s reload",
+      "nginx -t",
+      "nginx -V",
+      "systemctl status nginx"
+     ],
+     "answer": 1,
+     "explanation": "nginx -t validates syntax and referenced files and leaves the running service untouched."
+    },
+    {
+     "question": "Which settings help against slow-client and oversized-request abuse? (Choose all that apply.)",
+     "options": [
+      "client_body_timeout",
+      "client_max_body_size",
+      "limit_req_zone",
+      "autoindex on"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Timeouts, size limits and rate limits reduce resource exhaustion. autoindex on exposes file listings."
+    },
+    {
+     "question": "Why define an explicit default server?",
+     "options": [
+      "It speeds up TLS",
+      "It prevents requests for unknown host names or the bare IP from reaching a real site",
+      "It is required for HTTP/2",
+      "It enables logging"
+     ],
+     "answer": 1,
+     "explanation": "Without it, the first server block becomes the default and may reveal a real site."
+    },
+    {
+     "question": "Which TLS versions should `ssl_protocols` allow today? (Choose all that apply.)",
+     "options": [
+      "TLSv1",
+      "TLSv1.1",
+      "TLSv1.2",
+      "TLSv1.3"
+     ],
+     "answer": [
+      2,
+      3
+     ],
+     "explanation": "Only TLS 1.2 and 1.3 are considered safe for a general public site."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\nA hardened Nginx hides its version, speaks only modern TLS, limits request size and speed, denies dotfiles, backups and unused methods, and answers unknown host names with nothing. Keep one site per file, remember how `add_header` inherits, and follow the same loop every time: backup, edit, `nginx -t`, reload, verify from outside. Next, see how the same ideas look in [Apache HTTP Server Security](/learn/systems-infrastructure-security/apache-http-server-security)."
+  }
+ ],
+ "ar": {
+  "title": "التحصين الأمني لـ Nginx",
+  "summary": "حصّن Nginx بإعداد TLS مختصر وقيم افتراضية آمنة وحدود للطلبات وحجب للمسارات الحساسة وإجراء متكرر للاختبار وإعادة التحميل.",
+  "objectives": [
+   "كتابة كتلة خادم محصّنة مع TLS حديث",
+   "إخفاء معلومات الإصدار وتقييد الطرائق",
+   "تحديد حجم الطلب ومهلاته ومعدل الاتصالات",
+   "حجب الوصول إلى المسارات المخفية والحساسة",
+   "اختبار التغييرات وإعادة تحميلها والتحقق منها بأمان"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "Nginx سريع وصغير، لكن قيمه الافتراضية مضبوطة للتوافق لا للأمن. فقد يطبع التثبيت الجديد إصداره في كل رد، ويقبل أجساماً كبيرة جداً للطلبات، وينتظر العملاء البطيئين إلى ما لا نهاية، ويخدم كل ما تحت جذر المستندات، بما في ذلك مجلد `.git` منسي.\n\nفي هذا الدرس ستبني إعداداً محصّناً خطوة بخطوة. وهو يبني على أساس درس [أساسيات أمن خوادم الويب](/learn/systems-infrastructure-security/web-server-security-fundamentals) ويمهّد لوضع Nginx [وكيلاً عكسياً](/learn/systems-infrastructure-security/reverse-proxy-security). تستخدم كل الأمثلة `example.com` وعناوين التوثيق، ولا تطبّقها إلا على خوادم تديرها."
+   },
+   {
+    "id": "structure",
+    "type": "text",
+    "markdown": "## كيف يُنظَّم الإعداد\n\nيقرأ Nginx الملف `nginx.conf` الذي يضمّ ملفات من `conf.d/` أو `sites-enabled/`. تعيش التوجيهات داخل سياقات، ويرث السياق الداخلي من الخارجي:\n\n| السياق | النطاق | تحصين نموذجي فيه |\n|:--|:--|:--|\n| `main` | مستوى العملية | `user nginx;` وإعدادات العمال |\n| `http` | كل المواقع | `server_tokens off;` وقيم TLS الافتراضية والحدود |\n| `server` | مضيف افتراضي واحد | `server_name` والشهادات وإعادة التوجيه |\n| `location` | نمط عنوان واحد | الحجب وحدود الرفع وإعدادات الوكيل |\n\nقاعدتان في الوراثة تسبّبان حوادث حقيقية. الأولى أن `add_header` في سياق أدنى **يستبدل** كل الترويسات المحددة في السياق الأعلى ولا يضيف إليها. والثانية أن الطلب الذي لا يطابق أي `server_name` يذهب إلى **الخادم الافتراضي**. عرّفه صراحةً واجعله لا يعيد شيئاً مفيداً، كي لا تتعلم أدوات الفحص التي تصل إلى العنوان المجرد شيئاً عن مواقعك.\n\nوأبقِ موقعاً واحداً في كل ملف وسمِّه باسم النطاق، ليُظهر أي استعراض أي ملف يتحكم بأي مضيف."
+   },
+   {
+    "id": "nginx-http",
+    "type": "code",
+    "language": "nginx",
+    "code": "# /etc/nginx/nginx.conf (http context)\nhttp {\n    server_tokens off;                  # no version in headers or error pages\n    client_max_body_size 2m;            # raise per location only where needed\n    client_body_timeout 10s;            # slow-client protection\n    client_header_timeout 10s;\n    keepalive_timeout 15s;\n    send_timeout 10s;\n\n    ssl_protocols TLSv1.2 TLSv1.3;      # no SSLv3, TLS 1.0 or 1.1\n    ssl_prefer_server_ciphers off;      # let modern clients choose\n    ssl_session_tickets off;\n    ssl_session_cache shared:SSL:10m;\n\n    limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;\n\n    # Catch-all server: answers requests for unknown host names\n    server {\n        listen 80 default_server;\n        listen 443 ssl default_server;\n        ssl_certificate     /etc/nginx/ssl/default.crt;\n        ssl_certificate_key /etc/nginx/ssl/default.key;\n        return 444;                     # close the connection without a response\n    }\n\n    include /etc/nginx/conf.d/*.conf;\n}",
+    "filename": "nginx.conf",
+    "caption": "القيم العامة الافتراضية. يخفي الخادم الشامل مواقعك الحقيقية عن الطلبات التي تستخدم عنوان IP المجرد."
+   },
+   {
+    "id": "site",
+    "type": "text",
+    "markdown": "## موقع محصّن\n\nيعيد ملف الموقع أدناه توجيه HTTP إلى HTTPS، ويخدم نطاقاً واحداً، ويضبط ترويسات الأمان، ويمنع المسارات التي يجب ألا تغادر الخادم أبداً. اقرأ كل جزء واسأل عمّا يمنعه.\n\n- يوقف `return 301` على المنفذ 80 الاستخدام العرضي دون تشفير.\n- تُرسل `add_header ... always` الترويسات مع ردود الخطأ أيضاً. كرّر المجموعة كاملة في أي `location` يضيف ترويساته الخاصة.\n- تمنع القاعدة `location ~ /\\.` كل ملف أو مجلد يبدأ بنقطة، فتغطي `.git` و`.env` و`.htaccess`. ويُبقي الاستثناء `.well-known` تجديد الشهادات يعمل.\n- تمنع قاعدة النسخ الاحتياطية ملفات المحررات والتفريغ مثل `index.php.bak` أو `db.sql`.\n- يقبل `limit_except` الطرائق التي يستخدمها الموقع فقط.\n- يبطئ `limit_req` تخمين كلمات المرور على عنوان الدخول. راجع [تحديد المعدل وتصفية الطلبات](/learn/systems-infrastructure-security/rate-limiting-and-request-filtering) للضبط."
+   },
+   {
+    "id": "nginx-site",
+    "type": "code",
+    "language": "nginx",
+    "code": "# /etc/nginx/conf.d/example.com.conf\nserver {\n    listen 80;\n    server_name example.com www.example.com;\n    return 301 https://example.com$request_uri;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name example.com;\n    root /var/www/example.com/public;\n    index index.html;\n\n    ssl_certificate     /etc/nginx/ssl/example.com.fullchain.pem;\n    ssl_certificate_key /etc/nginx/ssl/example.com.key;\n\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header X-Frame-Options \"SAMEORIGIN\" always;\n\n    autoindex off;\n\n    location ~ /\\.(?!well-known) { deny all; }\n    location ~* \\.(bak|sql|old|orig|swp|log)$ { deny all; }\n\n    location / {\n        limit_except GET HEAD POST { deny all; }\n        try_files $uri $uri/ =404;\n    }\n\n    location = /login {\n        limit_req zone=login burst=5 nodelay;\n        try_files $uri =404;\n    }\n}",
+    "filename": "example.com.conf",
+    "caption": "موقع واحد في كل ملف. تُظهر الأسطر داخل كتل location موضع تطبيق كل حماية."
+   },
+   {
+    "id": "reload-anim",
+    "type": "animation",
+    "kind": "cycle",
+    "title": "دورة التغيير الآمن في Nginx",
+    "caption": "لا تعِد تحميل إعداد لم تختبره.",
+    "data": {
+     "center": "تغيير Nginx",
+     "items": [
+      {
+       "label": "نسخ احتياطي",
+       "sub": "انسخ /etc/nginx"
+      },
+      {
+       "label": "تعديل",
+       "sub": "تغيير واحد في كل مرة"
+      },
+      {
+       "label": "اختبار",
+       "sub": "nginx -t"
+      },
+      {
+       "label": "إعادة تحميل",
+       "sub": "systemctl reload nginx"
+      },
+      {
+       "label": "تحقق",
+       "sub": "curl من الخارج"
+      }
+     ],
+     "steps": [
+      {
+       "item": 0,
+       "caption": "انسخ مجلد الإعدادات لتستطيع التراجع خلال ثوانٍ."
+      },
+      {
+       "item": 1,
+       "caption": "غيّر أمراً واحداً في ملف الموقع لا عدة أمور معاً."
+      },
+      {
+       "item": 2,
+       "caption": "يفحص الأمر nginx -t الصياغة ومسارات الشهادات دون المساس بالخدمة العاملة."
+      },
+      {
+       "item": 3,
+       "caption": "تبدأ إعادة التحميل عمالاً جدداً بالإعدادات الجديدة وتترك الاتصالات القديمة تنتهي."
+      },
+      {
+       "item": 4,
+       "caption": "اطلب الموقع من مضيف آخر وافحص الترويسات والمسارات المحجوبة. ثم كرّر الدورة."
+      }
+     ]
+    }
+   },
+   {
+    "id": "nginx-term",
+    "type": "terminal",
+    "title": "الاختبار وإعادة التحميل والتحقق",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "sudo nginx -t",
+      "output": "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful"
+     },
+     {
+      "cmd": "sudo systemctl reload nginx",
+      "output": ""
+     },
+     {
+      "cmd": "curl -sI https://example.com/ | grep -i -E '^(server|strict|x-content)'",
+      "output": "server: nginx\nstrict-transport-security: max-age=31536000\nx-content-type-options: nosniff"
+     },
+     {
+      "comment": "لا تحتوي ترويسة Server على رقم إصدار بسبب server_tokens off."
+     },
+     {
+      "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://example.com/.git/config",
+      "output": "403"
+     },
+     {
+      "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' -X DELETE https://example.com/",
+      "output": "403"
+     },
+     {
+      "comment": "الملفات التي تبدأ بنقطة والطرائق غير المسموحة مرفوضة. قارن بالخادم الافتراضي الذي كان سيعيد 404 أو حتى محتوى الملف."
+     },
+     {
+      "cmd": "sudo nginx -T 2>/dev/null | grep -c 'add_header'",
+      "output": "3"
+     },
+     {
+      "comment": "يطبع nginx -T الإعداد المدمج، وهو أسرع طريقة لمعرفة ما حُمّل فعلاً."
+     }
+    ]
+   },
+   {
+    "id": "limits",
+    "type": "text",
+    "markdown": "## حدود تمنع عميلاً واحداً من إيذاء الجميع\n\nيعالج Nginx اتصالات كثيرة في كل عامل، لذلك يستطيع عميل مسيء واحد أن يشغل الموارد ما لم تضع حدوداً. فكّر في ثلاثة أنواع من الحدود:\n\n| الحد | التوجيه | ما يحمي منه |\n|:--|:--|:--|\n| معدل الطلبات | `limit_req_zone` و`limit_req` | تخمين كلمات المرور والكشط |\n| الاتصالات | `limit_conn_zone` و`limit_conn` | عنوان واحد يفتح آلاف المقابس |\n| الحجم والزمن | `client_max_body_size` و`client_body_timeout` | الرفع الضخم وهجمات الجسم البطيء |\n\nطبّق الحدود الصارمة على العناوين المكلفة أو الحساسة مثل الدخول والبحث وإعادة تعيين كلمة المرور، وكن سخياً مع الملفات الثابتة. وعندما يقع الموقع خلف شبكة توصيل محتوى أو موزّع أحمال، يكون عنوان العميل هو عنوان الوكيل، فاجعل مفتاح المنطقة هو عنوان العميل الحقيقي الذي يمرره الوكيل، ولا تثق بتلك الترويسة إلا من شبكة الوكيل نفسه.\n\nالحدود مطبّ سرعة وليست درعاً ضد الهجمات الكبيرة. فيجب امتصاص الفيضانات الحجمية في المنبع، وتحتاج إساءة مستوى التطبيق إلى [جدار حماية تطبيقات الويب](/learn/systems-infrastructure-security/web-application-firewall-waf). وسجّل الطلبات المرفوضة بحالة مميزة مثل `429`، لترى من يصطدم بالحدود وتضبطها دون تخمين."
+   },
+   {
+    "id": "run",
+    "type": "text",
+    "markdown": "## تشغيل Nginx بأمان\n\nالإعداد نصف العمل فقط. تحقّق أيضاً مما يلي.\n\n**العملية والملفات.** يجب أن يعمل العمال بالحساب `nginx` أو `www-data` المحدد بالتوجيه `user` في السياق الرئيسي. ويجب أن يملك الجذر ملفات الإعداد والمفاتيح الخاصة، مع إذن `600` للمفاتيح. ولا يجوز أن يستطيع مستخدم الويب تعديل `/etc/nginx`.\n\n**التسجيل.** احتفظ بسجلات الوصول والأخطاء وأرسلها إلى مكان مركزي. إن اندفاع ردود `403` على الملفات المخفية، أو ارتفاع ردود `404` على `/wp-login.php` في موقع ليس ووردبريس، علامة مبكرة على الفحص. دوّر السجلات كي لا يملأ الفيضان القرص.\n\n**التحديثات.** استخدم حزم توزيعتك أو مستودع Nginx الرسمي وطبّق التحديثات الأمنية سريعاً. واحذف الوحدات التي لا تستخدمها، لأن كل وحدة شيفرة قد يكون فيها خلل.\n\n**الاحتواء.** إذا كان Nginx يمرّر إلى تطبيق، فامنح التطبيق مساره الشبكي الخاص ولا تدع Nginx يصل إلى قاعدة البيانات. وللتفاصيل الخاصة بالوكيل تابع مع [أمن الوكيل العكسي](/learn/systems-infrastructure-security/reverse-proxy-security)."
+   },
+   {
+    "id": "pitfall",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء تؤلم",
+    "markdown": "- يُسقط `add_header` داخل `location` الترويسات المحددة في كتلة `server` دون إنذار. كرّرها أو استخدم ملف تضمين مشتركاً.\n- قد يتغلب `location` من نوع التعبير النمطي على `location` من نوع البادئة. اختبر المسارات المحجوبة بـ `curl` ولا تعتمد على قراءتك.\n- قد يكشف `alias` المطابَق بلا شرطة مائلة أخيرة المجلدات الأعلى (خطأ \"off-by-slash\"). اجعل الشرطات المائلة في `location` و`alias` متسقة.\n- الرمز `return 444` غير قياسي. يفيد للخادم الشامل لكنه لا يغني عن جدار الحماية.\n- رفع `client_max_body_size` عالمياً لأن نموذج رفع واحداً احتاج إلى ذلك."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم آلة افتراضية لينكس تملكها وفيها Nginx مثبّت.\n\n1. انسخ `/etc/nginx` إلى `/root/nginx-backup` وأنشئ صفحة اختبار تحت مجلد ويب جديد.\n2. أضف `server_tokens off;` والخادم الشامل المعروض أعلاه، ثم نفّذ `sudo nginx -t` و`sudo systemctl reload nginx`.\n3. اطلب الموقع بعنوان IP بالأمر `curl -k -i https://<vm-ip>/` وتأكد من إغلاق الاتصال بلا محتوى.\n4. أضف قاعدتي الملفات المخفية والنسخ الاحتياطية. أنشئ `.secret` و`old.sql` في مجلد الويب وتأكد أن كليهما يعيد `403`.\n5. اكسر الإعداد عمداً بحذف فاصلة منقوطة. لاحظ أن `nginx -t` يذكر السطر وأن الموقع العامل يستمر.\n\nاستعد النسخة الاحتياطية إن حدث خطأ."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "server_tokens",
+      "definition": "توجيه يتحكم في طباعة Nginx لإصداره."
+     },
+     {
+      "term": "الخادم الافتراضي (Default server)",
+      "definition": "المضيف الافتراضي الذي يجيب الطلبات التي لا تطابق أي server_name."
+     },
+     {
+      "term": "location",
+      "definition": "كتلة تطبّق إعدادات على نمط عنوان."
+     },
+     {
+      "term": "limit_req",
+      "definition": "وحدة تحدّ معدل الطلبات لكل مفتاح مثل عنوان العميل."
+     },
+     {
+      "term": "ssl_protocols",
+      "definition": "توجيه يسرد إصدارات TLS التي يقبلها الخادم."
+     },
+     {
+      "term": "nginx -t",
+      "definition": "فحص صياغة الإعداد وملفاته دون تطبيقه."
+     },
+     {
+      "term": "إعادة التحميل (Reload)",
+      "definition": "تطبيق لطيف لإعداد جديد دون قطع الاتصالات."
+     },
+     {
+      "term": "ملف النقطة (Dotfile)",
+      "definition": "ملف أو مجلد يبدأ اسمه بنقطة، وغالباً يحوي أسراراً أو بيانات وصفية."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ماذا يفعل `add_header` في كتلة `location` بالترويسات المحددة في كتلة `server` الأعلى؟",
+      "options": [
+       "يضيف إليها",
+       "يستبدلها في ذلك الـ location",
+       "لا أثر له",
+       "يحذف الـ location"
+      ],
+      "answer": 1,
+      "explanation": "إذا عرّف السياق أي add_header فلا يرث ترويسات الأعلى. كرّر المجموعة كاملة."
+     },
+     {
+      "question": "أي أمر يفحص الإعداد دون تطبيقه؟",
+      "options": [
+       "nginx -s reload",
+       "nginx -t",
+       "nginx -V",
+       "systemctl status nginx"
+      ],
+      "answer": 1,
+      "explanation": "يتحقق nginx -t من الصياغة والملفات المشار إليها ويترك الخدمة العاملة دون مساس."
+     },
+     {
+      "question": "أي الإعدادات تفيد ضد إساءة العملاء البطيئين والطلبات الضخمة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "client_body_timeout",
+       "client_max_body_size",
+       "limit_req_zone",
+       "autoindex on"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "المهلات وحدود الحجم وحدود المعدل تقلل استنزاف الموارد. أما autoindex on فيكشف قوائم الملفات."
+     },
+     {
+      "question": "لماذا نعرّف خادماً افتراضياً صريحاً؟",
+      "options": [
+       "يسرّع TLS",
+       "يمنع وصول الطلبات لأسماء مضيفات غير معروفة أو للعنوان المجرد إلى موقع حقيقي",
+       "هو مطلوب لـ HTTP/2",
+       "يفعّل التسجيل"
+      ],
+      "answer": 1,
+      "explanation": "من دونه تصبح أول كتلة خادم هي الافتراضية وقد تكشف موقعاً حقيقياً."
+     },
+     {
+      "question": "أي إصدارات TLS يجب أن يسمح بها `ssl_protocols` اليوم؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "TLSv1",
+       "TLSv1.1",
+       "TLSv1.2",
+       "TLSv1.3"
+      ],
+      "answer": [
+       2,
+       3
+      ],
+      "explanation": "إصدارا TLS 1.2 و1.3 وحدهما يُعدّان آمنين لموقع عام."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\nيخفي Nginx المحصّن إصداره، ولا يتكلم إلا TLS حديثاً، ويحدّ حجم الطلبات وسرعتها، ويمنع الملفات التي تبدأ بنقطة والنسخ الاحتياطية والطرائق غير المستخدمة، ويجيب أسماء المضيفات المجهولة بلا شيء. أبقِ موقعاً واحداً في كل ملف، وتذكّر كيف يرث `add_header`، واتبع الحلقة نفسها دائماً: نسخ احتياطي، تعديل، `nginx -t`، إعادة تحميل، تحقق من الخارج. بعد ذلك انظر كيف تبدو الأفكار نفسها في [أمن Apache HTTP Server](/learn/systems-infrastructure-security/apache-http-server-security)."
+   }
+  ]
+ }
+}

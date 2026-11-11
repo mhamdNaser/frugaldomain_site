@@ -1,0 +1,594 @@
+{
+  "slug": "rate-limiting-and-request-filtering",
+  "title": "Rate Limiting and Request Filtering",
+  "summary": "Learn how to cap request rates, filter unexpected requests and ban repeat offenders on Nginx so brute force and abusive traffic never reach your application.",
+  "duration_minutes": 25,
+  "objectives": [
+    "Set different rate limits for login, search and API endpoints",
+    "Compare fixed window, sliding window, token bucket and leaky bucket",
+    "Configure limit_req, limit_conn and request size and timeout filters in Nginx",
+    "Ban repeat offenders with fail2ban without locking yourself out",
+    "Test and tune limits safely on a server you own"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "The login page of `shop.example.com` normally sees a handful of requests per minute. At 02:00 the access log shows 4,000 login attempts in ten minutes, all from a few addresses, each trying a different password. At the same time a scraper is hitting the product search, which runs an expensive database query, and the application servers start to slow down for real customers.\n\nNothing here is a software bug. The server did exactly what it was asked. The problem is that nobody told it how much is too much. **Rate limiting** puts a ceiling on how fast one client may call your service, and **request filtering** rejects requests that have no business reaching the application at all, such as unexpected methods, oversized bodies or clients that send data one byte at a time.\n\nIn this lesson you will design limits that match how real users behave, configure them in Nginx, ban repeat offenders automatically, and measure the result on a server you own."
+    },
+    {
+      "id": "why",
+      "type": "text",
+      "markdown": "## Step 1: Decide what you are protecting\n\nA single global limit is rarely right. Different endpoints deserve different budgets because the harm and the cost differ.\n\n| Endpoint | Risk if unlimited | Reasonable starting limit |\n|:--|:--|:--|\n| `/login`, `/password-reset` | Password guessing, account lockouts, email flooding | 5 requests per minute per IP |\n| `/api/search` | Expensive queries exhaust the database | 10 requests per second per IP |\n| `/api/*` for authenticated clients | One noisy client starves others | Limit per API key, not per IP |\n| Static files | Mostly harmless, but bandwidth adds up | Generous, or none |\n\nStart from data. Read the access log, find the busiest legitimate clients, and set the limit comfortably above their normal peak. A limit that blocks real users is an outage you caused yourself.\n\nLimits are also **not an authentication control**. They slow an attacker down and make guessing impractical, but you still need strong passwords, multi-factor authentication and account lockout logic in the application. Think of rate limits as the layer that keeps cheap attacks expensive."
+    },
+    {
+      "id": "algo",
+      "type": "text",
+      "markdown": "## Step 2: Understand how limiting algorithms work\n\nNginx implements the **leaky bucket** idea in `limit_req`. Requests arrive, and the server lets them out at a fixed rate. A short burst can wait in a small queue, but when the queue is full, new requests are rejected.\n\n| Algorithm | How it counts | Trade-off |\n|:--|:--|:--|\n| Fixed window | Counts requests per clock minute | Simple, but allows double the rate across a window boundary |\n| Sliding window | Counts requests in the last N seconds | Fairer, needs more memory |\n| Token bucket | Tokens refill at a steady rate, each request spends one | Allows controlled bursts |\n| Leaky bucket | Requests drain at a constant rate | Smooths traffic, adds delay unless `nodelay` is used |\n\nThree Nginx parameters matter most:\n\n- **`rate`** is the steady allowance, for example `5r/m`.\n- **`burst`** is how many extra requests may exceed the rate before rejection.\n- **`nodelay`** serves the burst immediately instead of spacing it out, which feels better to real users.\n\nThe **key** decides who is counted. `$binary_remote_addr` counts per client address and uses little memory. Behind a CDN or load balancer every request seems to come from one address, so you must first restore the real client address, as covered in [Reverse Proxy Security]({C}reverse-proxy-security), or you will limit everybody at once."
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "A request passing a rate limit with burst",
+      "caption": "Zone login: rate 5r/m, burst 3, nodelay. Requests 1 to 4 pass, later ones receive 429.",
+      "data": {
+        "token": "GET /login",
+        "nodes": [
+          {
+            "id": "c",
+            "label": "Client",
+            "sub": "198.51.100.20",
+            "icon": "laptop"
+          },
+          {
+            "id": "z",
+            "label": "limit_req zone",
+            "sub": "login 5r/m",
+            "icon": "shield"
+          },
+          {
+            "id": "q",
+            "label": "Burst allowance",
+            "sub": "3 extra",
+            "icon": "log"
+          },
+          {
+            "id": "a",
+            "label": "Application",
+            "sub": "10.0.0.20:8080",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "c",
+            "caption": "A client submits the first login request of the minute."
+          },
+          {
+            "at": "z",
+            "caption": "The zone finds the client's key and sees the rate budget is unused.",
+            "tone": "secure"
+          },
+          {
+            "at": "a",
+            "caption": "Request 1 is forwarded at the normal rate.",
+            "tone": "success"
+          },
+          {
+            "at": "c",
+            "token": "GET /login x3",
+            "caption": "The client retries three times within a second, for example a user with a typo."
+          },
+          {
+            "at": "q",
+            "token": "GET /login x3",
+            "caption": "The three extra requests use the burst allowance and, with nodelay, are served at once.",
+            "tone": "warning"
+          },
+          {
+            "at": "c",
+            "token": "GET /login #5",
+            "caption": "A script keeps sending requests without pause.",
+            "tone": "attack"
+          },
+          {
+            "at": "z",
+            "token": "GET /login #5",
+            "caption": "Rate and burst are both exhausted. The zone rejects the request and logs the excess.",
+            "tone": "blocked"
+          },
+          {
+            "at": "c",
+            "token": "429",
+            "caption": "The client receives 429 Too Many Requests. The application never saw the flood.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "conf-intro",
+      "type": "text",
+      "markdown": "## Step 3: Configure limits in Nginx\n\nZones are defined once in the `http` context and applied where needed. Each zone reserves shared memory: roughly 16,000 client states per megabyte with `$binary_remote_addr`.\n\nThree habits keep the configuration safe:\n\n1. Return **429** with `limit_req_status`. The default 503 looks like a server failure and confuses monitoring.\n2. Use `limit_req_dry_run on;` while tuning. Nginx then logs what it would have rejected without rejecting anything.\n3. Add a `limit_conn` cap so that one address cannot hold hundreds of simultaneous connections."
+    },
+    {
+      "id": "conf",
+      "type": "code",
+      "language": "nginx",
+      "filename": "/etc/nginx/conf.d/limits.conf",
+      "caption": "Zones in the http context, then per-location limits. Method and size filtering sits in the same server block.",
+      "highlight": [
+        1,
+        2,
+        13,
+        14
+      ],
+      "code": "limit_req_zone  $binary_remote_addr zone=login:10m rate=5r/m;\nlimit_req_zone  $binary_remote_addr zone=search:10m rate=10r/s;\nlimit_conn_zone $binary_remote_addr zone=perip:10m;\nlimit_req_status  429;\nlimit_conn_status 429;\n\nmap $request_method $method_ok { default 0; GET 1; HEAD 1; POST 1; }\n\nserver {\n    listen 443 ssl;\n    server_name shop.example.com;\n\n    client_max_body_size   1m;      # reject big bodies early\n    client_header_timeout  10s;     # slow header senders are cut off\n    client_body_timeout    10s;\n    limit_conn perip 20;\n\n    if ($method_ok = 0) { return 405; }\n\n    location = /login {\n        limit_req zone=login burst=3 nodelay;\n        proxy_pass http://10.0.0.20:8080;\n    }\n    location /api/search {\n        limit_req zone=search burst=20 nodelay;\n        proxy_pass http://10.0.0.20:8080;\n    }\n}\n"
+    },
+    {
+      "id": "filter",
+      "type": "text",
+      "markdown": "## Step 4: Filter requests that should never arrive\n\nFiltering removes traffic by shape rather than by volume. Apply it as an **allow-list** wherever you can, because a list of what is acceptable is shorter than a list of everything bad.\n\n- **Methods.** Most sites need only `GET`, `HEAD` and `POST`. Rejecting `TRACE`, `CONNECT` and unexpected `PUT` or `DELETE` removes a whole class of surprises.\n- **Size.** `client_max_body_size` stops giant uploads from filling disk or memory. Raise it only on the one location that needs it.\n- **Time.** Short header and body timeouts defeat **slow-request** attacks, where a client holds a connection open by sending data extremely slowly.\n- **Length and character set.** Reject URLs and header blocks far beyond normal size with `large_client_header_buffers`.\n- **Known-bad clients.** Blocking by `User-Agent` is easy to bypass, so use it only to quiet obvious noise, never as protection.\n\nKeep filtering rules in the proxy and also validate inside the application. A filter that sees only headers cannot judge the meaning of a body. For content-aware inspection, move on to the [Web Application Firewall]({C}web-application-firewall-waf) lesson."
+    },
+    {
+      "id": "test",
+      "type": "terminal",
+      "title": "Test the limit on your own server",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "for i in $(seq 1 8); do curl -s -o /dev/null -w '%{http_code} ' https://shop.example.com/login; done; echo",
+          "output": "200 200 200 200 429 429 429 429",
+          "comment": "The first request plus a burst of 3 pass. The rest are rejected."
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' -X TRACE https://shop.example.com/",
+          "output": "405"
+        },
+        {
+          "cmd": "sudo tail -n 2 /var/log/nginx/error.log",
+          "output": "2026/11/11 02:14:07 [error] 1201#1201: *48 limiting requests, excess: 3.980 by zone \"login\", client: 198.51.100.20, server: shop.example.com, request: \"GET /login HTTP/2.0\", host: \"shop.example.com\"\n2026/11/11 02:14:07 [error] 1201#1201: *49 limiting requests, excess: 4.020 by zone \"login\", client: 198.51.100.20, server: shop.example.com, request: \"GET /login HTTP/2.0\", host: \"shop.example.com\"",
+          "comment": "excess shows how far above the rate the client is. These lines are what fail2ban reads."
+        }
+      ],
+      "caption": "Run tests only against servers you own."
+    },
+    {
+      "id": "ban",
+      "type": "text",
+      "markdown": "## Step 5: Ban repeat offenders and watch the results\n\nRate limiting rejects requests but does not remember who was rude. **fail2ban** reads logs and adds a temporary firewall rule for clients that keep tripping the limit. This moves the cost of an attack from your application to the packet filter.\n\nKeep three safeguards in place. First, add your own management network to `ignoreip` so you never ban yourself. Second, use a ban time of minutes to hours rather than forever, since addresses are shared and reassigned. Third, alert on spikes in 429 responses, because a sudden rise is either an attack or a limit that is too tight for a new feature.\n\nFinally, review the numbers weekly: how many 429 responses, from how many addresses, on which endpoints. Tune limits from evidence, not guesses."
+    },
+    {
+      "id": "jail",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/fail2ban/jail.d/nginx-limit-req.local",
+      "caption": "Ban an address for one hour after 10 limit violations within a minute.",
+      "code": "[nginx-limit-req]\nenabled  = true\nport     = http,https\nfilter   = nginx-limit-req\nlogpath  = /var/log/nginx/error.log\nfindtime = 60\nmaxretry = 10\nbantime  = 3600\nignoreip = 127.0.0.1/8 10.1.50.0/24\n"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common mistakes",
+      "markdown": "- **Limiting by proxy address.** Behind a CDN, every user shares one IP unless you restore the real client address first.\n- **Blocking whole mobile or office networks.** Many users can share one public address through NAT. Prefer limits per account or API key where possible.\n- **Forgetting `nodelay`.** Without it, a legitimate burst is slowed instead of served, and pages feel broken.\n- **No monitoring.** A limit nobody watches either hides an attack or silently blocks customers."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a virtual machine you own with Nginx installed.\n\n1. Create the `login` zone from the example and apply it to a `/login` location that returns a simple page.\n2. Add `limit_req_dry_run on;` and run the `curl` loop. Confirm all requests return 200 but the error log shows excess lines.\n3. Remove the dry-run line, reload, and repeat. Confirm the 429 responses.\n4. Change `burst` to 0 and observe the difference.\n5. Install fail2ban, enable the jail, and verify with `sudo fail2ban-client status nginx-limit-req` that your test address is banned. Unban it with `sudo fail2ban-client set nginx-limit-req unbanip <address>`."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Rate limiting",
+          "definition": "Capping how many requests a client may send in a period."
+        },
+        {
+          "term": "Burst",
+          "definition": "Extra requests tolerated above the steady rate before rejection starts."
+        },
+        {
+          "term": "Leaky bucket",
+          "definition": "An algorithm that releases requests at a constant rate and drops overflow."
+        },
+        {
+          "term": "Token bucket",
+          "definition": "An algorithm where tokens refill steadily and each request spends one."
+        },
+        {
+          "term": "HTTP 429",
+          "definition": "The status code meaning Too Many Requests."
+        },
+        {
+          "term": "Slow request attack",
+          "definition": "Holding connections open by sending data very slowly to exhaust server capacity."
+        },
+        {
+          "term": "Allow-list",
+          "definition": "A filter that accepts only explicitly approved values and rejects the rest."
+        },
+        {
+          "term": "fail2ban",
+          "definition": "A tool that reads logs and temporarily bans addresses that repeat abusive behavior."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which status code should a rate limiter return so monitoring can tell it from a server fault?",
+          "options": [
+            "200",
+            "429",
+            "503",
+            "301"
+          ],
+          "answer": 1,
+          "explanation": "429 Too Many Requests states the cause clearly. Nginx defaults to 503, which looks like an outage."
+        },
+        {
+          "question": "A site sits behind a CDN and limits by $binary_remote_addr without further setup. What happens?",
+          "options": [
+            "Each user is limited correctly",
+            "All users share the CDN's address and are limited together",
+            "Nothing is limited",
+            "The CDN ignores the limit"
+          ],
+          "answer": 1,
+          "explanation": "Every request appears to come from the CDN. Restore the real client address first."
+        },
+        {
+          "question": "Which measures help against slow-request attacks? (Choose all that apply.)",
+          "options": [
+            "Short client_header_timeout and client_body_timeout",
+            "limit_conn per client address",
+            "Increasing client_max_body_size",
+            "Disabling all timeouts"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "Short timeouts cut off slow senders and a connection cap stops one address hoarding sockets. Larger bodies and no timeouts make it worse."
+        },
+        {
+          "question": "What does the nodelay parameter do with a burst?",
+          "options": [
+            "Serves the burst immediately instead of spacing it out",
+            "Rejects the burst",
+            "Doubles the rate",
+            "Logs but never limits"
+          ],
+          "answer": 0,
+          "explanation": "Requests within the burst are processed at once, but the burst slots still count against the client until they refill."
+        },
+        {
+          "question": "Which are sound practices for a fail2ban jail? (Choose all that apply.)",
+          "options": [
+            "Add the admin network to ignoreip",
+            "Use a finite bantime",
+            "Ban permanently on the first violation",
+            "Alert on ban spikes"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Protect yourself, keep bans finite because addresses are shared, and watch spikes. Permanent first-strike bans hurt innocent users."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Set limits per endpoint, based on real traffic, with stricter budgets for login and expensive queries.\n- Nginx `limit_req` uses a leaky bucket with `rate`, `burst` and `nodelay`; return 429 and tune with `limit_req_dry_run`.\n- Restore the real client address behind a CDN or proxy before using it as the key.\n- Filter by shape: allowed methods, body size, header and body timeouts, and connection caps.\n- Use fail2ban for repeat offenders, protect your own network with `ignoreip`, and review 429 trends regularly.\n\nContinue with [Web Application Firewall (WAF)](/learn/systems-infrastructure-security/web-application-firewall-waf) for content-aware filtering, and see [Authentication and Session Security](/learn/systems-infrastructure-security/authentication-and-session-security) for the application side of login protection."
+    }
+  ],
+  "ar": {
+    "title": "تحديد معدل الطلبات وتصفيتها",
+    "summary": "تعلّم كيف تضع سقفًا لمعدل الطلبات وترشّح الطلبات غير المتوقعة وتحظر المتكرّرين في Nginx حتى لا تصل حركة التخمين والإساءة إلى تطبيقك.",
+    "objectives": [
+      "ضبط حدود معدل مختلفة لنقاط الدخول والبحث والواجهات البرمجية",
+      "المقارنة بين النافذة الثابتة والمنزلقة ودلو الرموز والدلو المتسرب",
+      "ضبط limit_req وlimit_conn ومرشحات الحجم والمهلة في Nginx",
+      "حظر المتكرّرين بـfail2ban دون إقفال نفسك",
+      "اختبار الحدود وضبطها بأمان على خادم تملكه"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "لا تتلقى صفحة تسجيل الدخول في `shop.example.com` عادةً سوى بضعة طلبات في الدقيقة. وفي الثانية صباحًا يُظهر سجل الوصول 4,000 محاولة دخول خلال عشر دقائق، من بضعة عناوين فقط، وكل محاولة بكلمة مرور مختلفة. وفي الوقت نفسه يضرب برنامج كشط (Scraper) البحث في المنتجات، وهو يشغّل استعلام قاعدة بيانات مكلفًا، فتبطؤ خوادم التطبيق على حساب العملاء الحقيقيين.\n\nليس في الأمر خلل برمجي. فقد فعل الخادم ما طُلب منه بالضبط. المشكلة أن أحدًا لم يخبره بما يُعدّ كثيرًا. يضع **تحديد المعدل (Rate Limiting)** سقفًا لسرعة استدعاء العميل الواحد لخدمتك، ويرفض **ترشيح الطلبات (Request Filtering)** الطلبات التي لا شأن لها بالتطبيق أصلًا، كالطرائق غير المتوقعة والأجسام الضخمة والعملاء الذين يرسلون البيانات بايتًا بايتًا.\n\nستتعلم في هذا الدرس كيف تصمّم حدودًا تناسب سلوك المستخدمين الحقيقيين، وكيف تضبطها في Nginx، وكيف تحظر المتكرّرين تلقائيًا، وكيف تقيس النتيجة على خادم تملكه."
+      },
+      {
+        "id": "why",
+        "type": "text",
+        "markdown": "## الخطوة 1: حدّد ما الذي تحميه\n\nنادرًا ما يكون حدّ عام واحد صحيحًا. فلكل نقطة نهاية ميزانية مختلفة لأن الضرر والتكلفة يختلفان.\n\n| نقطة النهاية | الخطر إذا لم تُقيَّد | حدّ بدئي معقول |\n|:--|:--|:--|\n| `/login` و`/password-reset` | تخمين كلمات المرور وإقفال الحسابات وإغراق البريد | 5 طلبات في الدقيقة لكل IP |\n| `/api/search` | استعلامات مكلفة تستنزف قاعدة البيانات | 10 طلبات في الثانية لكل IP |\n| `/api/*` للعملاء المصادَق عليهم | عميل مزعج يجوّع الآخرين | حدّ لكل مفتاح API لا لكل IP |\n| الملفات الثابتة | غالبًا غير ضارة لكن النطاق الترددي يتراكم | سخيّ أو بلا حدّ |\n\nابدأ من البيانات. اقرأ سجل الوصول، وابحث عن أنشط العملاء المشروعين، واضبط الحدّ فوق ذروتهم المعتادة بهامش مريح. فالحدّ الذي يحجب مستخدمين حقيقيين هو عطل تصنعه بيدك.\n\nوالحدود كذلك **ليست ضابط مصادقة**. فهي تبطئ المهاجم وتجعل التخمين غير عملي، لكنك ما زلت تحتاج إلى كلمات مرور قوية ومصادقة متعددة العوامل ومنطق إقفال للحسابات في التطبيق. اعتبر تحديد المعدل الطبقةَ التي تُبقي الهجمات الرخيصة مكلفة."
+      },
+      {
+        "id": "algo",
+        "type": "text",
+        "markdown": "## الخطوة 2: افهم كيف تعمل خوارزميات التحديد\n\nينفّذ Nginx فكرة **الدلو المتسرب (Leaky Bucket)** في `limit_req`. تصل الطلبات ويُخرجها الخادم بمعدل ثابت. يمكن لدفعة قصيرة أن تنتظر في طابور صغير، فإذا امتلأ الطابور رُفضت الطلبات الجديدة.\n\n| الخوارزمية | طريقة العدّ | المفاضلة |\n|:--|:--|:--|\n| النافذة الثابتة | تعدّ الطلبات في كل دقيقة زمنية | بسيطة لكنها تسمح بضعف المعدل عند حدود النوافذ |\n| النافذة المنزلقة | تعدّ الطلبات في آخر N ثانية | أعدل وتحتاج ذاكرة أكبر |\n| دلو الرموز (Token Bucket) | تُملأ الرموز بمعدل ثابت وكل طلب يستهلك رمزًا | تسمح بدفعات مضبوطة |\n| الدلو المتسرب | تُصرَّف الطلبات بمعدل ثابت | تنعّم الحركة وتضيف تأخيرًا ما لم يُستخدم `nodelay` |\n\nوثلاثة معاملات في Nginx هي الأهم:\n\n- **`rate`** هو السماح الثابت، مثل `5r/m`.\n- **`burst`** هو عدد الطلبات الإضافية التي يجوز أن تتجاوز المعدل قبل الرفض.\n- **`nodelay`** يخدم الدفعة فورًا بدل تباعدها، وهذا أريح للمستخدمين الحقيقيين.\n\nأما **المفتاح (Key)** فيحدّد من الذي يُعدّ. فـ`$binary_remote_addr` يعدّ لكل عنوان عميل ويستهلك ذاكرة قليلة. وخلف شبكة توصيل المحتوى (CDN) أو موازن الحمل يبدو كل طلب قادمًا من عنوان واحد، فيجب أولًا استعادة عنوان العميل الحقيقي كما في درس [أمان الوكيل العكسي]({C}reverse-proxy-security) وإلا حددتَ الجميع دفعة واحدة."
+      },
+      {
+        "id": "anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "طلب يمر عبر حدّ معدل مع burst",
+        "caption": "المنطقة login: المعدل 5r/m وburst يساوي 3 مع nodelay. تمر الطلبات من 1 إلى 4 وتتلقى اللاحقة 429.",
+        "data": {
+          "token": "GET /login",
+          "nodes": [
+            {
+              "id": "c",
+              "label": "العميل",
+              "sub": "198.51.100.20",
+              "icon": "laptop"
+            },
+            {
+              "id": "z",
+              "label": "منطقة limit_req",
+              "sub": "login 5r/m",
+              "icon": "shield"
+            },
+            {
+              "id": "q",
+              "label": "سعة burst",
+              "sub": "3 extra",
+              "icon": "log"
+            },
+            {
+              "id": "a",
+              "label": "التطبيق",
+              "sub": "10.0.0.20:8080",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "at": "c",
+              "caption": "يرسل عميل أول طلب دخول في الدقيقة."
+            },
+            {
+              "at": "z",
+              "caption": "تجد المنطقة مفتاح العميل وترى أن ميزانية المعدل لم تُستهلك.",
+              "tone": "secure"
+            },
+            {
+              "at": "a",
+              "caption": "يُمرَّر الطلب 1 بالمعدل العادي.",
+              "tone": "success"
+            },
+            {
+              "at": "c",
+              "token": "GET /login x3",
+              "caption": "يعيد العميل المحاولة ثلاث مرات خلال ثانية، كمستخدم أخطأ في الكتابة."
+            },
+            {
+              "at": "q",
+              "token": "GET /login x3",
+              "caption": "تستهلك الطلبات الثلاثة الإضافية سعة burst وتُخدم فورًا بفضل nodelay.",
+              "tone": "warning"
+            },
+            {
+              "at": "c",
+              "token": "GET /login #5",
+              "caption": "يواصل سكربت إرسال الطلبات دون توقف.",
+              "tone": "attack"
+            },
+            {
+              "at": "z",
+              "token": "GET /login #5",
+              "caption": "نفدت سعة المعدل وburst معًا. ترفض المنطقة الطلب وتسجّل الزيادة.",
+              "tone": "blocked"
+            },
+            {
+              "at": "c",
+              "token": "429",
+              "caption": "يتلقى العميل 429 Too Many Requests. ولم يرَ التطبيق الفيضان أبدًا.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "conf-intro",
+        "type": "text",
+        "markdown": "## الخطوة 3: اضبط الحدود في Nginx\n\nتُعرَّف المناطق (Zones) مرة واحدة في سياق `http` ثم تُطبَّق حيث يلزم. تحجز كل منطقة ذاكرة مشتركة: نحو 16,000 حالة عميل لكل ميغابايت عند استخدام `$binary_remote_addr`.\n\nوثلاث عادات تُبقي الإعداد آمنًا:\n\n1. أرجع **429** بالتوجيه `limit_req_status`. فالقيمة الافتراضية 503 تبدو عطلًا في الخادم وتُربك المراقبة.\n2. استخدم `limit_req_dry_run on;` أثناء الضبط. عندها يسجّل Nginx ما كان سيرفضه دون أن يرفض شيئًا.\n3. أضف سقف `limit_conn` حتى لا يحتفظ عنوان واحد بمئات الاتصالات المتزامنة."
+      },
+      {
+        "id": "conf",
+        "type": "code",
+        "language": "nginx",
+        "filename": "/etc/nginx/conf.d/limits.conf",
+        "caption": "المناطق في سياق http ثم الحدود لكل location. ويقع ترشيح الطرائق والحجم في كتلة server نفسها.",
+        "highlight": [
+          1,
+          2,
+          13,
+          14
+        ],
+        "code": "limit_req_zone  $binary_remote_addr zone=login:10m rate=5r/m;\nlimit_req_zone  $binary_remote_addr zone=search:10m rate=10r/s;\nlimit_conn_zone $binary_remote_addr zone=perip:10m;\nlimit_req_status  429;\nlimit_conn_status 429;\n\nmap $request_method $method_ok { default 0; GET 1; HEAD 1; POST 1; }\n\nserver {\n    listen 443 ssl;\n    server_name shop.example.com;\n\n    client_max_body_size   1m;      # reject big bodies early\n    client_header_timeout  10s;     # slow header senders are cut off\n    client_body_timeout    10s;\n    limit_conn perip 20;\n\n    if ($method_ok = 0) { return 405; }\n\n    location = /login {\n        limit_req zone=login burst=3 nodelay;\n        proxy_pass http://10.0.0.20:8080;\n    }\n    location /api/search {\n        limit_req zone=search burst=20 nodelay;\n        proxy_pass http://10.0.0.20:8080;\n    }\n}\n"
+      },
+      {
+        "id": "filter",
+        "type": "text",
+        "markdown": "## الخطوة 4: رشّح الطلبات التي لا ينبغي أن تصل\n\nيزيل الترشيح الحركة بحسب شكلها لا بحسب حجمها. طبّقه **قائمةَ سماح (Allow-list)** حيثما أمكن، لأن قائمة المقبول أقصر من قائمة كل ما هو سيئ.\n\n- **الطرائق.** تحتاج معظم المواقع إلى `GET` و`HEAD` و`POST` فقط. ورفض `TRACE` و`CONNECT` و`PUT` أو `DELETE` غير المتوقعة يزيل فئة كاملة من المفاجآت.\n- **الحجم.** يمنع `client_max_body_size` الأجسام الضخمة من ملء القرص أو الذاكرة. ارفعه فقط في الموضع الوحيد الذي يحتاجه.\n- **الزمن.** مهلات الترويسات والأجسام القصيرة تُبطل هجمات **الطلبات البطيئة (Slow Requests)** التي يُبقي فيها العميل الاتصال مفتوحًا بإرسال البيانات ببطء شديد.\n- **الطول ومجموعة المحارف.** ارفض العناوين وكتل الترويسات التي تتجاوز الحجم الطبيعي بكثير بالتوجيه `large_client_header_buffers`.\n- **العملاء السيئون المعروفون.** الحجب بحسب `User-Agent` سهل التجاوز، فاستخدمه لتهدئة الضجيج الواضح فقط لا للحماية.\n\nأبقِ قواعد الترشيح في الوكيل وتحقق أيضًا داخل التطبيق. فالمرشّح الذي يرى الترويسات فقط لا يستطيع الحكم على معنى الجسم. وللفحص المدرك للمحتوى انتقل إلى درس [جدار حماية تطبيقات الويب]({C}web-application-firewall-waf)."
+      },
+      {
+        "id": "test",
+        "type": "terminal",
+        "title": "اختبر الحدّ على خادمك",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "for i in $(seq 1 8); do curl -s -o /dev/null -w '%{http_code} ' https://shop.example.com/login; done; echo",
+            "output": "200 200 200 200 429 429 429 429",
+            "comment": "يمر الطلب الأول مع دفعة من 3 طلبات. ويُرفض الباقي."
+          },
+          {
+            "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' -X TRACE https://shop.example.com/",
+            "output": "405"
+          },
+          {
+            "cmd": "sudo tail -n 2 /var/log/nginx/error.log",
+            "output": "2026/11/11 02:14:07 [error] 1201#1201: *48 limiting requests, excess: 3.980 by zone \"login\", client: 198.51.100.20, server: shop.example.com, request: \"GET /login HTTP/2.0\", host: \"shop.example.com\"\n2026/11/11 02:14:07 [error] 1201#1201: *49 limiting requests, excess: 4.020 by zone \"login\", client: 198.51.100.20, server: shop.example.com, request: \"GET /login HTTP/2.0\", host: \"shop.example.com\"",
+            "comment": "يُظهر excess مقدار تجاوز العميل للمعدل. وهذه الأسطر هي ما يقرؤه fail2ban."
+          }
+        ],
+        "caption": "نفّذ الاختبارات على خوادم تملكها فقط."
+      },
+      {
+        "id": "ban",
+        "type": "text",
+        "markdown": "## الخطوة 5: احظر المتكرّرين وراقب النتائج\n\nيرفض تحديد المعدل الطلبات لكنه لا يتذكر من أساء. أما **fail2ban** فيقرأ السجلات ويضيف قاعدة جدار حماية مؤقتة للعملاء الذين يواصلون تجاوز الحدّ. وهذا ينقل كلفة الهجوم من تطبيقك إلى مرشّح الحزم.\n\nحافظ على ثلاث ضمانات. أولًا، أضف شبكة الإدارة لديك إلى `ignoreip` حتى لا تحظر نفسك. ثانيًا، اجعل مدة الحظر دقائق أو ساعات لا إلى الأبد، فالعناوين تُشارَك وتُعاد تخصيصها. ثالثًا، نبّه عند ارتفاع استجابات 429، فالارتفاع المفاجئ إما هجوم وإما حدّ ضيق جدًا لميزة جديدة.\n\nوأخيرًا راجع الأرقام أسبوعيًا: كم استجابة 429، ومن كم عنوانًا، وعلى أي نقاط نهاية. اضبط الحدود بالأدلة لا بالتخمين."
+      },
+      {
+        "id": "jail",
+        "type": "code",
+        "language": "ini",
+        "filename": "/etc/fail2ban/jail.d/nginx-limit-req.local",
+        "caption": "حظر العنوان ساعة بعد 10 تجاوزات للحد خلال دقيقة.",
+        "code": "[nginx-limit-req]\nenabled  = true\nport     = http,https\nfilter   = nginx-limit-req\nlogpath  = /var/log/nginx/error.log\nfindtime = 60\nmaxretry = 10\nbantime  = 3600\nignoreip = 127.0.0.1/8 10.1.50.0/24\n"
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة",
+        "markdown": "- **التحديد بحسب عنوان الوكيل.** خلف CDN يتشارك كل المستخدمين عنوانًا واحدًا ما لم تستعد عنوان العميل الحقيقي أولًا.\n- **حجب شبكات جوال أو مكاتب بأكملها.** قد يتشارك مستخدمون كثيرون عنوانًا عامًا واحدًا عبر NAT. فضّل الحدود لكل حساب أو مفتاح API حيثما أمكن.\n- **نسيان `nodelay`.** بدونه تُبطَّأ الدفعة المشروعة بدل أن تُخدم، فتبدو الصفحات معطلة.\n- **غياب المراقبة.** حدّ لا يراقبه أحد إما يُخفي هجومًا وإما يحجب العملاء بصمت."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم آلة افتراضية تملكها وفيها Nginx.\n\n1. أنشئ المنطقة `login` من المثال وطبّقها على location باسم `/login` يعيد صفحة بسيطة.\n2. أضف `limit_req_dry_run on;` ونفّذ حلقة `curl`. تأكد أن كل الطلبات تعيد 200 بينما يُظهر سجل الأخطاء أسطر excess.\n3. احذف سطر dry-run وأعد التحميل وكرّر. تأكد من ظهور استجابات 429.\n4. غيّر `burst` إلى 0 ولاحظ الفرق.\n5. ثبّت fail2ban وفعّل الـjail وتحقق بالأمر `sudo fail2ban-client status nginx-limit-req` أن عنوان الاختبار قد حُظر. وارفع الحظر بالأمر `sudo fail2ban-client set nginx-limit-req unbanip <address>`."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "تحديد المعدل",
+            "definition": "وضع سقف لعدد الطلبات التي يجوز للعميل إرسالها خلال مدة."
+          },
+          {
+            "term": "الدفعة (Burst)",
+            "definition": "طلبات إضافية يُتسامح بها فوق المعدل الثابت قبل بدء الرفض."
+          },
+          {
+            "term": "الدلو المتسرب",
+            "definition": "خوارزمية تُخرج الطلبات بمعدل ثابت وتُسقط الفائض."
+          },
+          {
+            "term": "دلو الرموز",
+            "definition": "خوارزمية تُملأ فيها الرموز بثبات ويستهلك كل طلب رمزًا."
+          },
+          {
+            "term": "الاستجابة 429",
+            "definition": "رمز الحالة الذي يعني كثرة الطلبات (Too Many Requests)."
+          },
+          {
+            "term": "هجوم الطلبات البطيئة",
+            "definition": "إبقاء الاتصالات مفتوحة بإرسال البيانات ببطء شديد لاستنزاف قدرة الخادم."
+          },
+          {
+            "term": "قائمة السماح",
+            "definition": "مرشّح يقبل القيم المعتمدة صراحةً فقط ويرفض الباقي."
+          },
+          {
+            "term": "fail2ban",
+            "definition": "أداة تقرأ السجلات وتحظر مؤقتًا العناوين التي تكرر سلوكًا مسيئًا."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي رمز حالة ينبغي أن يعيده محدّد المعدل ليميّزه المراقبون عن عطل الخادم؟",
+            "options": [
+              "200",
+              "429",
+              "503",
+              "301"
+            ],
+            "answer": 1,
+            "explanation": "يعبّر 429 عن السبب بوضوح، بينما الافتراضي في Nginx هو 503 الذي يبدو كعطل."
+          },
+          {
+            "question": "موقع خلف CDN يحدّد المعدل بـ$binary_remote_addr دون إعداد إضافي. ماذا يحدث؟",
+            "options": [
+              "يُحدَّد كل مستخدم بشكل صحيح",
+              "يتشارك الجميع عنوان CDN ويُحدَّدون معًا",
+              "لا يُحدَّد أحد",
+              "يتجاهل CDN الحد"
+            ],
+            "answer": 1,
+            "explanation": "يبدو كل طلب قادمًا من CDN. استعد عنوان العميل الحقيقي أولًا."
+          },
+          {
+            "question": "أي التدابير تفيد ضد هجمات الطلبات البطيئة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "مهلات client_header_timeout وclient_body_timeout قصيرة",
+              "limit_conn لكل عنوان عميل",
+              "رفع client_max_body_size",
+              "تعطيل كل المهلات"
+            ],
+            "answer": [
+              0,
+              1
+            ],
+            "explanation": "تقطع المهلات القصيرة المرسلين البطيئين ويمنع سقف الاتصالات عنوانًا واحدًا من احتكار المقابس. أما الأجسام الأكبر وغياب المهلات فيزيدان الأمر سوءًا."
+          },
+          {
+            "question": "ما أثر المعامل nodelay على الدفعة (burst)؟",
+            "options": [
+              "يخدم الدفعة فورًا بدل تباعدها",
+              "يرفض الدفعة",
+              "يضاعف المعدل",
+              "يسجّل ولا يحدّد أبدًا"
+            ],
+            "answer": 0,
+            "explanation": "تُعالج الطلبات داخل الدفعة فورًا، لكن خانات الدفعة تبقى محسوبة على العميل حتى تُملأ من جديد."
+          },
+          {
+            "question": "أي ممارسات سليمة لـjail في fail2ban؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "إضافة شبكة الإدارة إلى ignoreip",
+              "استخدام bantime محدود",
+              "الحظر الدائم من أول مخالفة",
+              "التنبيه عند ارتفاع الحظر"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "احمِ نفسك، واجعل الحظر محدودًا لأن العناوين تُشارَك، وراقب الارتفاعات. أما الحظر الدائم من المخالفة الأولى فيضرّ الأبرياء."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- اضبط الحدود لكل نقطة نهاية اعتمادًا على الحركة الحقيقية، مع ميزانيات أشد لتسجيل الدخول والاستعلامات المكلفة.\n- يستخدم `limit_req` في Nginx الدلو المتسرب مع `rate` و`burst` و`nodelay`؛ أرجع 429 واضبط بمساعدة `limit_req_dry_run`.\n- استعد عنوان العميل الحقيقي خلف CDN أو وكيل قبل استخدامه مفتاحًا.\n- رشّح بحسب الشكل: الطرائق المسموحة وحجم الجسم ومهلات الترويسات والأجسام وسقوف الاتصالات.\n- استخدم fail2ban للمتكرّرين، واحمِ شبكتك بـ`ignoreip`، وراجع اتجاهات 429 بانتظام.\n\nتابع مع [جدار حماية تطبيقات الويب (WAF)](/learn/systems-infrastructure-security/web-application-firewall-waf) للترشيح المدرك للمحتوى، وراجع [أمن المصادقة والجلسات](/learn/systems-infrastructure-security/authentication-and-session-security) لجانب التطبيق من حماية تسجيل الدخول."
+      }
+    ]
+  }
+}

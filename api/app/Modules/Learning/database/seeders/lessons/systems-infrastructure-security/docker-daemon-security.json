@@ -1,0 +1,586 @@
+{
+ "slug": "docker-daemon-security",
+ "title": "Docker Daemon Security",
+ "summary": "Why the Docker daemon is root-equivalent, and how to lock down its socket, API, configuration and logs.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Explain why access to the Docker socket is root access",
+  "Secure remote API access with SSH or mutual TLS",
+  "Harden daemon.json and consider rootless mode",
+  "Audit and monitor a Docker host with Docker Bench and auditd"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A small team runs a build server with Docker. To save time, a developer adds the CI user to the `docker` group and, in a hurry, exposes the Docker API on a TCP port so a dashboard can read container status. Nobody notices that this API has no authentication. A port scan from another host finds it, and anyone who can reach that port can start a container that mounts the host's root filesystem.\n\nThis is why the Docker daemon deserves more attention than the containers it runs. The daemon, `dockerd`, runs as root and controls every image, container, network and volume on the host. Whoever can talk to it controls the machine. In this lesson you will learn how the daemon is reached, how to lock down that access, which `daemon.json` settings matter, and how to audit and monitor a Docker host."
+  },
+  {
+   "id": "socket",
+   "type": "text",
+   "markdown": "## The daemon is root, and the socket is the door\n\nThe Docker command line is only a client. It sends requests to the daemon over a **Unix socket**, `/var/run/docker.sock`, which is owned by `root:docker`. Any request that reaches the socket is executed with root privileges on the host.\n\nThat has three consequences:\n\n- **The `docker` group is equal to root.** A member can run `docker run -v /:/host` with an image of their choice and read or change any file on the machine. Treat membership like `sudo` access: grant it to named administrators only.\n- **Mounting the socket into a container is equal to giving that container root.** Many monitoring and CI images ask for `/var/run/docker.sock`. Think twice before agreeing.\n- **Remote access multiplies the risk.** The daemon can also listen on TCP. Port 2375 is plain text with no authentication. Port 2376 is the TLS port, and it is safe only when the daemon verifies client certificates.\n\n| Access path | Authentication | Risk | Recommendation |\n|:--|:--|:--|:--|\n| Unix socket, group `docker` | File permissions | Root-equivalent for members | Keep the group small |\n| TCP 2375 | None | Anyone on the network is root | Never enable |\n| TCP 2376 with `tlsverify` | Mutual TLS certificates | Safe if keys are protected | Use only when needed, restrict by firewall |\n| SSH (`docker -H ssh://...`) | SSH keys | Same as an SSH login | Preferred for remote use |"
+  },
+  {
+   "id": "config",
+   "type": "text",
+   "markdown": "## Hardening with daemon.json\n\nDaemon-wide behavior lives in `/etc/docker/daemon.json`. A restart of the service applies it. The settings below give the largest security return for the least effort.\n\n- **`userns-remap`** maps root inside containers to an unprivileged range on the host (see `/etc/subuid`). A process that escapes is no longer root.\n- **`no-new-privileges`** blocks setuid binaries from gaining extra rights inside containers by default.\n- **`icc: false`** stops containers on the default bridge from talking to each other unless you link them or use user-defined networks.\n- **`live-restore`** keeps containers running while the daemon restarts for patching.\n- **`log-driver` and `log-opts`** cap log size so a noisy container cannot fill the disk.\n- **`userland-proxy: false`** uses iptables rules instead of a proxy process for published ports.\n\nAlso consider **rootless mode**, where the daemon itself runs as a normal user. A compromise of the daemon then yields only that user's rights. It has limits, such as no privileged ports below 1024 by default and some storage and network restrictions, so test your workloads first."
+  },
+  {
+   "id": "daemon-json",
+   "type": "code",
+   "language": "json",
+   "filename": "/etc/docker/daemon.json",
+   "code": "{\n  \"userns-remap\": \"default\",\n  \"no-new-privileges\": true,\n  \"icc\": false,\n  \"live-restore\": true,\n  \"userland-proxy\": false,\n  \"log-driver\": \"json-file\",\n  \"log-opts\": { \"max-size\": \"10m\", \"max-file\": \"3\" }\n}",
+   "caption": "A hardened baseline. With no `hosts` key, the daemon uses only the local socket and has no TCP listener."
+  },
+  {
+   "id": "tls-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Remote API access with mutual TLS",
+   "caption": "Both sides prove who they are before any command runs.",
+   "data": {
+    "actors": [
+     {
+      "id": "c",
+      "label": "Admin client",
+      "sub": "198.51.100.20",
+      "icon": "laptop"
+     },
+     {
+      "id": "d",
+      "label": "dockerd",
+      "sub": "192.0.2.10:2376",
+      "icon": "server"
+     },
+     {
+      "id": "x",
+      "label": "Unknown host",
+      "sub": "203.0.113.77",
+      "icon": "attacker"
+     }
+    ],
+    "steps": [
+     {
+      "from": "c",
+      "to": "d",
+      "label": "ClientHello",
+      "note": "The client connects to the TLS port and starts the handshake."
+     },
+     {
+      "from": "d",
+      "to": "c",
+      "label": "Server certificate",
+      "tone": "secure",
+      "note": "The daemon presents a certificate signed by the private CA."
+     },
+     {
+      "from": "c",
+      "to": "d",
+      "label": "Client certificate",
+      "tone": "secure",
+      "note": "The client answers with its own certificate. This is the step that plain TLS lacks."
+     },
+     {
+      "from": "d",
+      "to": "d",
+      "label": "Verify against CA",
+      "tone": "success",
+      "note": "`tlsverify` checks the client chain. Valid, so the session opens."
+     },
+     {
+      "from": "c",
+      "to": "d",
+      "label": "docker ps",
+      "tone": "success",
+      "note": "Commands now flow over the encrypted channel."
+     },
+     {
+      "from": "x",
+      "to": "d",
+      "label": "ClientHello",
+      "tone": "attack",
+      "note": "An unknown host tries the same port."
+     },
+     {
+      "from": "d",
+      "to": "x",
+      "label": "Handshake failure",
+      "tone": "blocked",
+      "note": "No valid client certificate, so the connection is dropped and logged."
+     }
+    ]
+   }
+  },
+  {
+   "id": "audit",
+   "type": "text",
+   "markdown": "## Auditing the host\n\nStart with what is listening and who is allowed in, then check the running configuration. Three questions cover most findings: Is the API exposed on the network? Who is in the `docker` group? Which security features are active?\n\nThe CIS Docker Benchmark turns these questions into numbered checks, and the open-source **Docker Bench for Security** script runs many of them for you. It only reads settings, so it is safe on production hosts, but run it as an administrator on a host you own and review each warning before changing anything."
+  },
+  {
+   "id": "audit-term",
+   "type": "terminal",
+   "title": "docker01 - quick audit",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "ss -tlnp | grep -E 'dockerd|:237[56]'",
+     "output": "",
+     "comment": "No output means the daemon has no TCP listener. A line with 0.0.0.0:2375 would be a critical finding."
+    },
+    {
+     "cmd": "getent group docker",
+     "output": "docker:x:998:alice,ci-runner",
+     "comment": "Two members. Confirm both really need root-equivalent access."
+    },
+    {
+     "cmd": "docker info --format '{{.SecurityOptions}}'",
+     "output": "[name=seccomp,profile=builtin name=userns name=cgroupns]",
+     "comment": "`userns` appears because userns-remap is active. `rootless` would appear in rootless mode."
+    },
+    {
+     "cmd": "sudo ./docker-bench-security.sh -c host_configuration",
+     "output": "[INFO] 1 - Host Configuration\n[PASS] 1.1.1 - Ensure a separate partition for containers has been created\n[WARN] 1.1.3 - Ensure auditing is configured for the Docker daemon\n[WARN] 1.1.4 - Ensure auditing is configured for Docker files and directories - /run/containerd",
+     "comment": "Each WARN names the benchmark item to fix. The exact numbering varies by benchmark version."
+    }
+   ],
+   "caption": "Four read-only checks on a host you own."
+  },
+  {
+   "id": "monitor",
+   "type": "text",
+   "markdown": "## Monitoring the daemon\n\nBecause the daemon is so powerful, watch who touches it and its files. The Linux audit framework (`auditd`) can log every access to the binary, the configuration and the socket. Send these events to your central log server, and alert on changes to `/etc/docker`, new members of the `docker` group, and any container started with unusual mounts.\n\nPair auditing with a few routine habits:\n\n- **Patch the engine and `containerd`** together with the kernel. Many runtime flaws are fixed in point releases.\n- **Protect certificates.** Store the CA key offline and give each client its own certificate so you can revoke one.\n- **Limit the network.** Even with TLS, allow port 2376 only from known management addresses.\n- **Review the socket mounts.** List containers that mount `docker.sock` and justify each one."
+  },
+  {
+   "id": "audit-rules",
+   "type": "code",
+   "language": "bash",
+   "filename": "/etc/audit/rules.d/docker.rules",
+   "code": "-w /usr/bin/dockerd -p wa -k docker\n-w /etc/docker -p wa -k docker\n-w /var/lib/docker -p wa -k docker\n-w /run/containerd -p wa -k docker\n-w /lib/systemd/system/docker.service -p wa -k docker\n-w /run/docker.sock -p wa -k docker",
+   "caption": "Audit rules for the daemon. Load them with `augenrules --load`, then search with `ausearch -k docker`."
+  },
+  {
+   "id": "tcp-warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Never publish 2375",
+   "markdown": "Exposing the unauthenticated API port is one of the most common ways Docker hosts are taken over. Scanners look for it constantly. If you find `tcp://0.0.0.0:2375` in `daemon.json` or in a systemd override file, remove it and restart the service. Then check whether any container was started that you did not create."
+  },
+  {
+   "id": "ctx-tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Use SSH contexts for remote work",
+   "markdown": "The simplest safe way to manage a remote host is a Docker context that tunnels over SSH. Create it once with `docker context create prod --docker \"host=ssh://admin@192.0.2.10\"` and switch with `docker context use prod`. The daemon needs no network listener at all, authentication uses the SSH keys you already manage, and every session appears in the SSH logs. If you later remove a person's SSH key, their Docker access disappears with it. This also keeps your certificate authority out of the picture, which means one less secret to protect, rotate and eventually revoke."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab VM you own:\n\n1. Run `ss -tlnp | grep dockerd` and `getent group docker`, and write down who has access.\n2. Create `/etc/docker/daemon.json` from the example, run `sudo systemctl restart docker`, and confirm `docker info --format '{{.SecurityOptions}}'` now lists `userns`.\n3. Add the audit rules, run `sudo augenrules --load`, edit `daemon.json` again, and find your change with `sudo ausearch -k docker`.\n4. Run Docker Bench for Security and fix one WARN item. Run it again to confirm."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "dockerd",
+     "definition": "The Docker daemon, a root process that manages images, containers, networks and volumes."
+    },
+    {
+     "term": "docker.sock",
+     "definition": "The Unix socket through which clients send commands to the daemon."
+    },
+    {
+     "term": "docker group",
+     "definition": "A Linux group whose members can use the socket, which is root-equivalent access."
+    },
+    {
+     "term": "Mutual TLS",
+     "definition": "TLS where both server and client present certificates."
+    },
+    {
+     "term": "userns-remap",
+     "definition": "A setting that maps container root to an unprivileged host user range."
+    },
+    {
+     "term": "Rootless mode",
+     "definition": "Running the daemon and containers as a normal user."
+    },
+    {
+     "term": "live-restore",
+     "definition": "Keeps containers running while the daemon restarts."
+    },
+    {
+     "term": "CIS Docker Benchmark",
+     "definition": "A published checklist of secure Docker settings."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why is membership in the `docker` group treated as root-equivalent?",
+     "options": [
+      "Members can edit `/etc/passwd` directly",
+      "Members can ask the root daemon to mount any host path into a container",
+      "Members can disable the kernel",
+      "The group owns all containers' images"
+     ],
+     "answer": 1,
+     "explanation": "The daemon runs as root and obeys requests on its socket, so a member can mount `/` into a container and change anything."
+    },
+    {
+     "question": "Which TCP port is the unauthenticated Docker API port?",
+     "options": [
+      "2375",
+      "2376",
+      "443",
+      "22"
+     ],
+     "answer": 0,
+     "explanation": "2375 is plain text with no authentication. 2376 is the TLS port."
+    },
+    {
+     "question": "Which settings in `daemon.json` reduce risk? (choose all that apply)",
+     "options": [
+      "`userns-remap`",
+      "`no-new-privileges: true`",
+      "`hosts: [\"tcp://0.0.0.0:2375\"]`",
+      "`icc: false`"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "The first, second and fourth restrict privileges and container-to-container traffic. The third exposes the unauthenticated API."
+    },
+    {
+     "question": "What does `tlsverify` add to remote API access?",
+     "options": [
+      "Compression of image layers",
+      "Verification of client certificates against a CA",
+      "Automatic image scanning",
+      "Faster pulls"
+     ],
+     "answer": 1,
+     "explanation": "Without it, TLS only encrypts. With it, clients must also prove their identity."
+    },
+    {
+     "question": "A CI tool asks you to mount `/var/run/docker.sock` into its container. What is the best response?",
+     "options": [
+      "Allow it, since containers are isolated",
+      "Treat the container as root on the host and use an alternative or a rootless builder",
+      "Make the socket world-writable",
+      "Disable audit logging"
+     ],
+     "answer": 1,
+     "explanation": "Socket access is root on the host. Prefer rootless or daemonless builders, or isolate the CI host."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- The Docker daemon runs as root, so access to its socket or API is root access to the host.\n- Keep the `docker` group small, never publish port 2375, and use SSH or mutual TLS for remote access.\n- Harden `daemon.json` with `userns-remap`, `no-new-privileges`, `icc: false`, log limits and `live-restore`; consider rootless mode.\n- Audit with `ss`, `docker info` and Docker Bench for Security, and record changes with `auditd`.\n- Next, see how a misconfigured container can reach the host in [Container Escape Risks](/learn/systems-infrastructure-security/container-escape-risks), and review the basics in [Docker Security Fundamentals](/learn/systems-infrastructure-security/docker-security-fundamentals)."
+  }
+ ],
+ "ar": {
+  "title": "أمن خدمة Docker الخلفية (Daemon)",
+  "summary": "لماذا تعادل خدمة Docker الجذر، وكيف تقفل مقبسها وواجهتها وإعداداتها وسجلاتها.",
+  "objectives": [
+   "شرح لماذا يعني الوصول إلى مقبس Docker وصول الجذر",
+   "تأمين الوصول البعيد للواجهة عبر SSH أو TLS المتبادل",
+   "تقوية daemon.json والنظر في الوضع بلا صلاحيات",
+   "تدقيق مضيف Docker ومراقبته بـDocker Bench وauditd"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يشغّل فريق صغير خادم بناء (Build Server) باستخدام Docker. ولتوفير الوقت يضيف أحد المطوّرين مستخدم نظام التكامل المستمر إلى مجموعة `docker`، ثم يكشف واجهة Docker البرمجية على منفذ TCP كي تقرأ لوحة متابعة حالة الحاويات. لا ينتبه أحد إلى أن هذه الواجهة بلا مصادقة. يعثر فحص المنافذ من جهاز آخر على هذا المنفذ، وبعدها يستطيع أي شخص يصل إليه تشغيل حاوية تربط نظام الملفات الجذري للمضيف بداخلها.\n\nلهذا تستحق خدمة Docker الخلفية (Daemon) اهتماماً أكبر من الحاويات التي تشغّلها. تعمل الخدمة `dockerd` بصلاحيات الجذر (root)، وتتحكم بكل الصور والحاويات والشبكات والأقراص على المضيف، ومن يستطيع مخاطبتها يتحكم بالجهاز. ستتعلم في هذا الدرس كيف يُوصَل إلى الخدمة، وكيف تُقفل طرق الوصول، وما إعدادات `daemon.json` المهمة، وكيف تدقّق مضيف Docker وتراقبه."
+   },
+   {
+    "id": "socket",
+    "type": "text",
+    "markdown": "## الخدمة تعمل بصلاحيات الجذر والمقبس هو الباب\n\nأداة سطر أوامر Docker مجرد عميل (Client)، فهي ترسل الطلبات إلى الخدمة عبر **مقبس يونكس (Unix socket)** هو `/var/run/docker.sock` ويملكه `root:docker`. وأي طلب يصل إلى هذا المقبس يُنفَّذ بصلاحيات الجذر على المضيف.\n\nويترتب على ذلك ثلاث نتائج:\n\n- **مجموعة `docker` تعادل الجذر.** يستطيع العضو فيها تنفيذ `docker run -v /:/host` بصورة يختارها، وقراءة أي ملف على الجهاز أو تعديله. عامِل العضوية كما تعامل صلاحية `sudo`، ولا تمنحها إلا لمسؤولين معروفين بأسمائهم.\n- **ربط المقبس داخل حاوية يعادل منحها صلاحيات الجذر.** تطلب صور كثيرة للمراقبة والتكامل المستمر الوصول إلى `/var/run/docker.sock`، ففكّر جيداً قبل الموافقة.\n- **الوصول عن بُعد يضاعف الخطر.** يمكن للخدمة أن تستمع على TCP أيضاً. المنفذ 2375 نصٌّ صريح بلا مصادقة، والمنفذ 2376 هو منفذ TLS ولا يكون آمناً إلا إذا تحقّقت الخدمة من شهادات العملاء.\n\n| طريق الوصول | المصادقة | الخطر | التوصية |\n|:--|:--|:--|:--|\n| مقبس يونكس، مجموعة `docker` | أذونات الملفات | يعادل الجذر لأعضاء المجموعة | أبقِ المجموعة صغيرة |\n| TCP 2375 | لا شيء | أي جهاز على الشبكة يصبح جذراً | لا تفعّله أبداً |\n| TCP 2376 مع `tlsverify` | شهادات TLS متبادلة | آمن إذا حُمِيت المفاتيح | استخدمه عند الحاجة فقط وقيّده بجدار الحماية |\n| SSH (`docker -H ssh://...`) | مفاتيح SSH | كتسجيل دخول SSH | مفضّل للاستخدام عن بُعد |"
+   },
+   {
+    "id": "config",
+    "type": "text",
+    "markdown": "## التقوية عبر الملف daemon.json\n\nيُحفَظ سلوك الخدمة العام في `/etc/docker/daemon.json`، ويُطبَّق بإعادة تشغيل الخدمة. تعطي الإعدادات التالية أكبر عائد أمني بأقل جهد.\n\n- **`userns-remap`** يحوّل جذر الحاوية إلى نطاق غير مميّز على المضيف (راجع `/etc/subuid`)، فلا تبقى العملية الهاربة جذراً.\n- **`no-new-privileges`** يمنع الملفات التنفيذية ذات بت setuid من اكتساب صلاحيات إضافية داخل الحاويات افتراضياً.\n- **`icc: false`** يمنع حاويات الجسر الافتراضي من الاتصال ببعضها ما لم تربطها أنت أو تستخدم شبكات يعرّفها المستخدم.\n- **`live-restore`** يُبقي الحاويات تعمل أثناء إعادة تشغيل الخدمة لتطبيق التحديثات.\n- **`log-driver` و`log-opts`** يحدّان حجم السجلات حتى لا تملأ حاوية كثيرة الضجيج القرص.\n- **`userland-proxy: false`** يستخدم قواعد iptables بدل عملية وسيطة للمنافذ المنشورة.\n\nفكّر أيضاً في **الوضع بلا صلاحيات (Rootless mode)** حيث تعمل الخدمة نفسها كمستخدم عادي، فإذا اختُرقت لا يحصل المهاجم إلا على صلاحيات ذلك المستخدم. وله قيود، مثل عدم إمكان استخدام المنافذ الأقل من 1024 افتراضياً وبعض قيود التخزين والشبكة، فاختبر أحمالك أولاً."
+   },
+   {
+    "id": "daemon-json",
+    "type": "code",
+    "language": "json",
+    "filename": "/etc/docker/daemon.json",
+    "code": "{\n  \"userns-remap\": \"default\",\n  \"no-new-privileges\": true,\n  \"icc\": false,\n  \"live-restore\": true,\n  \"userland-proxy\": false,\n  \"log-driver\": \"json-file\",\n  \"log-opts\": { \"max-size\": \"10m\", \"max-file\": \"3\" }\n}",
+    "caption": "خط أساس مقوّى. بغياب المفتاح `hosts` تستخدم الخدمة المقبس المحلي فقط ولا يوجد مستمع TCP."
+   },
+   {
+    "id": "tls-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "الوصول البعيد إلى الواجهة عبر TLS المتبادل",
+    "caption": "يثبت الطرفان هويتهما قبل تنفيذ أي أمر.",
+    "data": {
+     "actors": [
+      {
+       "id": "c",
+       "label": "جهاز المسؤول",
+       "sub": "198.51.100.20",
+       "icon": "laptop"
+      },
+      {
+       "id": "d",
+       "label": "dockerd",
+       "sub": "192.0.2.10:2376",
+       "icon": "server"
+      },
+      {
+       "id": "x",
+       "label": "جهاز مجهول",
+       "sub": "203.0.113.77",
+       "icon": "attacker"
+      }
+     ],
+     "steps": [
+      {
+       "from": "c",
+       "to": "d",
+       "label": "ClientHello",
+       "note": "يتصل العميل بمنفذ TLS ويبدأ المصافحة."
+      },
+      {
+       "from": "d",
+       "to": "c",
+       "label": "Server certificate",
+       "tone": "secure",
+       "note": "تقدّم الخدمة شهادة موقّعة من جهة إصدار خاصة."
+      },
+      {
+       "from": "c",
+       "to": "d",
+       "label": "Client certificate",
+       "tone": "secure",
+       "note": "يردّ العميل بشهادته الخاصة، وهذه الخطوة غائبة عن TLS العادي."
+      },
+      {
+       "from": "d",
+       "to": "d",
+       "label": "التحقق من جهة الإصدار",
+       "tone": "success",
+       "note": "يفحص `tlsverify` سلسلة شهادة العميل. هي سليمة فتُفتح الجلسة."
+      },
+      {
+       "from": "c",
+       "to": "d",
+       "label": "docker ps",
+       "tone": "success",
+       "note": "تنتقل الأوامر الآن عبر القناة المشفّرة."
+      },
+      {
+       "from": "x",
+       "to": "d",
+       "label": "ClientHello",
+       "tone": "attack",
+       "note": "جهاز مجهول يجرّب المنفذ نفسه."
+      },
+      {
+       "from": "d",
+       "to": "x",
+       "label": "فشل المصافحة",
+       "tone": "blocked",
+       "note": "لا توجد شهادة عميل صالحة، فيُقطع الاتصال ويُسجَّل."
+      }
+     ]
+    }
+   },
+   {
+    "id": "audit",
+    "type": "text",
+    "markdown": "## تدقيق المضيف\n\nابدأ بما يستمع على الشبكة ومن يُسمح له بالدخول، ثم افحص الإعدادات الجارية. تغطي ثلاثة أسئلة معظم الملاحظات: هل الواجهة مكشوفة على الشبكة؟ ومن هم أعضاء مجموعة `docker`؟ وما ميزات الأمان المفعّلة؟\n\nيحوّل معيار CIS لـ Docker هذه الأسئلة إلى فحوصات مرقّمة، ويشغّل سكربت **Docker Bench for Security** مفتوح المصدر كثيراً منها نيابةً عنك. هو يقرأ الإعدادات فقط فيصلح للأجهزة الإنتاجية، لكن شغّله بصفة مسؤول على مضيف تملكه، وراجع كل تحذير قبل تغيير أي شيء."
+   },
+   {
+    "id": "audit-term",
+    "type": "terminal",
+    "title": "docker01 - quick audit",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "ss -tlnp | grep -E 'dockerd|:237[56]'",
+      "output": "",
+      "comment": "لا مخرجات تعني أن الخدمة بلا مستمع TCP. ظهور السطر 0.0.0.0:2375 ملاحظة حرجة."
+     },
+     {
+      "cmd": "getent group docker",
+      "output": "docker:x:998:alice,ci-runner",
+      "comment": "عضوان. تأكد أنهما يحتاجان فعلاً صلاحية تعادل الجذر."
+     },
+     {
+      "cmd": "docker info --format '{{.SecurityOptions}}'",
+      "output": "[name=seccomp,profile=builtin name=userns name=cgroupns]",
+      "comment": "يظهر `userns` لأن userns-remap مفعّل. وسيظهر `rootless` في الوضع بلا صلاحيات."
+     },
+     {
+      "cmd": "sudo ./docker-bench-security.sh -c host_configuration",
+      "output": "[INFO] 1 - Host Configuration\n[PASS] 1.1.1 - Ensure a separate partition for containers has been created\n[WARN] 1.1.3 - Ensure auditing is configured for the Docker daemon\n[WARN] 1.1.4 - Ensure auditing is configured for Docker files and directories - /run/containerd",
+      "comment": "كل تحذير يسمّي بند المعيار المطلوب إصلاحه. يختلف الترقيم حسب إصدار المعيار."
+     }
+    ],
+    "caption": "أربعة فحوصات للقراءة فقط على مضيف تملكه."
+   },
+   {
+    "id": "monitor",
+    "type": "text",
+    "markdown": "## مراقبة الخدمة\n\nلأن الخدمة قوية جداً، راقب من يلمسها ويلمس ملفاتها. يستطيع إطار التدقيق في لينكس (`auditd`) تسجيل كل وصول إلى الملف التنفيذي والإعدادات والمقبس. أرسل هذه الأحداث إلى خادم السجلات المركزي، وأطلق تنبيهاً عند تغيّر محتوى `/etc/docker`، أو انضمام عضو جديد إلى مجموعة `docker`، أو تشغيل حاوية بربط غير معتاد.\n\nواقرن التدقيق ببعض العادات الدورية:\n\n- **حدّث المحرّك و`containerd`** مع النواة، فكثير من ثغرات بيئة التشغيل تُصلَح في إصدارات التحديث الفرعية.\n- **احمِ الشهادات.** احتفظ بمفتاح جهة الإصدار خارج الشبكة، وأعطِ كل عميل شهادته الخاصة لتتمكن من إبطال واحدة منها.\n- **قيّد الشبكة.** حتى مع TLS اسمح بالمنفذ 2376 من عناوين إدارة معروفة فقط.\n- **راجع ربط المقبس.** اسرد الحاويات التي تربط `docker.sock` وبرّر كل واحدة."
+   },
+   {
+    "id": "audit-rules",
+    "type": "code",
+    "language": "bash",
+    "filename": "/etc/audit/rules.d/docker.rules",
+    "code": "-w /usr/bin/dockerd -p wa -k docker\n-w /etc/docker -p wa -k docker\n-w /var/lib/docker -p wa -k docker\n-w /run/containerd -p wa -k docker\n-w /lib/systemd/system/docker.service -p wa -k docker\n-w /run/docker.sock -p wa -k docker",
+    "caption": "قواعد تدقيق للخدمة. حمّلها بالأمر `augenrules --load` ثم ابحث بالأمر `ausearch -k docker`."
+   },
+   {
+    "id": "tcp-warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تنشر المنفذ 2375",
+    "markdown": "كشف منفذ الواجهة بلا مصادقة من أكثر الطرق شيوعاً لاختراق مضيفات Docker، والماسحات تبحث عنه باستمرار. إذا وجدت `tcp://0.0.0.0:2375` في `daemon.json` أو في ملف تجاوز systemd فأزِله وأعد تشغيل الخدمة، ثم تحقق هل شُغّلت حاويات لم تنشئها أنت."
+   },
+   {
+    "id": "ctx-tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "استخدم سياقات SSH للعمل عن بُعد",
+    "markdown": "أبسط طريقة آمنة لإدارة مضيف بعيد هي سياق Docker (Context) يمر عبر نفق SSH. أنشئه مرة واحدة بالأمر `docker context create prod --docker \"host=ssh://admin@192.0.2.10\"` وبدّل إليه بالأمر `docker context use prod`. لا تحتاج الخدمة إلى أي مستمع شبكي، وتعتمد المصادقة على مفاتيح SSH التي تديرها أصلاً، وتظهر كل جلسة في سجلات SSH. وإذا أزلت مفتاح SSH لشخص ما زال وصوله إلى Docker معه. وهذا يُبعد جهة الإصدار الخاصة عن الصورة أيضاً، فيقلّ سر واحد تحتاج إلى حمايته وتدويره ثم إبطاله لاحقاً."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على جهاز افتراضي تجريبي تملكه:\n\n1. شغّل `ss -tlnp | grep dockerd` و`getent group docker` ودوّن من يملك حق الوصول.\n2. أنشئ الملف `/etc/docker/daemon.json` من المثال، ونفّذ `sudo systemctl restart docker`، وتأكد أن `docker info --format '{{.SecurityOptions}}'` يُظهر الآن `userns`.\n3. أضف قواعد التدقيق ونفّذ `sudo augenrules --load`، ثم عدّل `daemon.json` مرة أخرى وابحث عن تعديلك بالأمر `sudo ausearch -k docker`.\n4. شغّل Docker Bench for Security وأصلح تحذيراً واحداً، ثم شغّله ثانية للتأكد."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "dockerd",
+      "definition": "خدمة Docker الخلفية، عملية جذر تدير الصور والحاويات والشبكات والأقراص."
+     },
+     {
+      "term": "docker.sock",
+      "definition": "مقبس يونكس الذي ترسل عبره العملاء الأوامر إلى الخدمة."
+     },
+     {
+      "term": "docker group",
+      "definition": "مجموعة لينكس يستطيع أعضاؤها استخدام المقبس، وهذا وصول يعادل الجذر."
+     },
+     {
+      "term": "Mutual TLS",
+      "definition": "بروتوكول TLS يقدّم فيه الخادم والعميل كلاهما شهادة."
+     },
+     {
+      "term": "userns-remap",
+      "definition": "إعداد يحوّل جذر الحاوية إلى نطاق مستخدمين غير مميّز على المضيف."
+     },
+     {
+      "term": "Rootless mode",
+      "definition": "تشغيل الخدمة والحاويات بمستخدم عادي."
+     },
+     {
+      "term": "live-restore",
+      "definition": "يُبقي الحاويات تعمل أثناء إعادة تشغيل الخدمة."
+     },
+     {
+      "term": "CIS Docker Benchmark",
+      "definition": "قائمة فحص منشورة بإعدادات Docker الآمنة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا تُعدّ العضوية في مجموعة `docker` معادلة للجذر؟",
+      "options": [
+       "يستطيع الأعضاء تعديل `/etc/passwd` مباشرة",
+       "يستطيع الأعضاء أن يطلبوا من خدمة الجذر ربط أي مسار من المضيف داخل حاوية",
+       "يستطيع الأعضاء تعطيل النواة",
+       "تملك المجموعة صور كل الحاويات"
+      ],
+      "answer": 1,
+      "explanation": "تعمل الخدمة بصلاحيات الجذر وتلبّي طلبات مقبسها، فيستطيع العضو ربط `/` داخل حاوية وتعديل أي شيء."
+     },
+     {
+      "question": "أي منفذ TCP هو منفذ واجهة Docker بلا مصادقة؟",
+      "options": [
+       "2375",
+       "2376",
+       "443",
+       "22"
+      ],
+      "answer": 0,
+      "explanation": "المنفذ 2375 نصّ صريح بلا مصادقة، أما 2376 فهو منفذ TLS."
+     },
+     {
+      "question": "أي إعدادات في `daemon.json` تقلّل الخطر؟ (اختر كل ما ينطبق)",
+      "options": [
+       "`userns-remap`",
+       "`no-new-privileges: true`",
+       "`hosts: [\"tcp://0.0.0.0:2375\"]`",
+       "`icc: false`"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "الأول والثاني والرابع تقيّد الصلاحيات وحركة الحاويات فيما بينها، أما الثالث فيكشف الواجهة بلا مصادقة."
+     },
+     {
+      "question": "ماذا يضيف `tlsverify` إلى الوصول البعيد للواجهة؟",
+      "options": [
+       "ضغط طبقات الصور",
+       "التحقق من شهادات العملاء مقابل جهة إصدار",
+       "فحص الصور تلقائياً",
+       "سحب أسرع"
+      ],
+      "answer": 1,
+      "explanation": "بدونه يقتصر TLS على التشفير، ومعه يجب على العملاء إثبات هويتهم أيضاً."
+     },
+     {
+      "question": "أداة تكامل مستمر تطلب ربط `/var/run/docker.sock` داخل حاويتها. ما أفضل تصرف؟",
+      "options": [
+       "السماح، فالحاويات معزولة",
+       "اعتبار الحاوية جذراً على المضيف واستخدام بديل أو أداة بناء بلا صلاحيات",
+       "جعل المقبس قابلاً للكتابة للجميع",
+       "تعطيل سجلات التدقيق"
+      ],
+      "answer": 1,
+      "explanation": "الوصول إلى المقبس يعني جذراً على المضيف. فضّل أدوات البناء بلا صلاحيات أو بلا خدمة، أو اعزل مضيف التكامل المستمر."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تعمل خدمة Docker بصلاحيات الجذر، فالوصول إلى مقبسها أو واجهتها يعني وصولاً جذرياً إلى المضيف.\n- أبقِ مجموعة `docker` صغيرة، ولا تنشر المنفذ 2375، واستخدم SSH أو TLS المتبادل للوصول عن بُعد.\n- قوِّ `daemon.json` بالإعدادات `userns-remap` و`no-new-privileges` و`icc: false` وحدود السجلات و`live-restore`، وفكّر في الوضع بلا صلاحيات.\n- دقّق باستخدام `ss` و`docker info` وDocker Bench for Security، وسجّل التغييرات بـ`auditd`.\n- في الدرس التالي ترى كيف تصل حاوية سيئة الإعداد إلى المضيف: [مخاطر الهروب من الحاويات](/learn/systems-infrastructure-security/container-escape-risks)، وراجع الأساسيات في [أساسيات أمن Docker](/learn/systems-infrastructure-security/docker-security-fundamentals)."
+   }
+  ]
+ }
+}

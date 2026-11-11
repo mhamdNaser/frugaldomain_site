@@ -1,0 +1,554 @@
+{
+  "slug": "proxmox-web-interface-security",
+  "title": "Proxmox Web Interface Security",
+  "summary": "Narrow who can reach the Proxmox console and API, protect the connection with a trusted certificate and modern TLS, and monitor access to it.",
+  "duration_minutes": 25,
+  "objectives": [
+    "Explain what the web interface and API expose",
+    "Bind and filter pveproxy by source address",
+    "Replace the self-signed certificate with a trusted one",
+    "Choose a safe remote-access design without publishing port 8006",
+    "Monitor logins and tasks on the interface"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Search any internet scanning service for port 8006 and you will find thousands of Proxmox consoles open to the world. Some run old versions. Some have the default realm and no second factor. Each one is a single stolen password away from losing every VM behind it.\n\nThe web interface is the most convenient way to manage Proxmox and also the most attractive target, because it exposes the full API. In this lesson you will shrink who can reach it, protect the traffic with a proper certificate and modern TLS, and watch for abuse. Authentication itself is covered in the next lesson. Here the goal is that fewer people can even try."
+    },
+    {
+      "id": "exposure",
+      "type": "text",
+      "markdown": "## What the interface exposes\n\nThe service `pveproxy` listens on TCP 8006 and serves two things over HTTPS: the browser console and the REST API at `/api2/json`. Scripts, Terraform and Ansible all use the same API. A user who is logged in to the console can do whatever their role allows, including opening a root shell on the node if they hold the right privileges.\n\nBy default `pveproxy` listens on **all** interfaces, so any network the host is attached to can reach it. That is the first default to change.\n\n| Exposure level | Description | Verdict |\n|:--|:--|:--|\n| Public internet | Port 8006 open to anyone | Avoid |\n| User or guest network | Reachable from ordinary client VLANs | Avoid |\n| Management network, allow-listed | Only administrator addresses | Recommended |\n| VPN or bastion only | Reached after a separate authenticated hop | Best for remote access |\n\nThe next sections give you three layers: bind to the right interface, filter by source address, and secure the transport."
+    },
+    {
+      "id": "restrict",
+      "type": "text",
+      "markdown": "## Restrict who can connect\n\nProxmox reads `/etc/default/pveproxy`. Three settings matter most.\n\n- `LISTEN_IP` binds the service to one address, such as the management IP.\n- `ALLOW_FROM` lists the addresses or networks that may connect.\n- `DENY_FROM` lists addresses to refuse. `POLICY` sets the default when nothing matches.\n\nSetting `POLICY=\"deny\"` with an explicit `ALLOW_FROM` is an allow-list, which is safer than a block-list because it fails closed. Restart the service after editing with `systemctl restart pveproxy`. Existing sessions are not harmed, but check from a second connection that you still have access before closing your terminal.\n\nThis application-level filter complements the host firewall. Use both: the firewall stops packets early, and `pveproxy` refuses anything that slips past a firewall mistake. See [Proxmox firewall configuration](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+    },
+    {
+      "id": "pveproxy-default",
+      "type": "code",
+      "language": "bash",
+      "code": "# Bind only to the management address\nLISTEN_IP=\"10.20.0.11\"\n\n# Allow-list: administrators and the jump host only\nALLOW_FROM=\"10.20.0.0/28,198.51.100.10\"\nDENY_FROM=\"all\"\nPOLICY=\"deny\"\n\n# Modern TLS only: disable TLS 1.2 only if every client supports 1.3\n#DISABLE_TLS_1_2=1",
+      "caption": "pveproxy settings. Restart with systemctl restart pveproxy.",
+      "filename": "/etc/default/pveproxy"
+    },
+    {
+      "id": "allow-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Source filtering on the console",
+      "caption": "The same port gives a different answer depending on who asks.",
+      "data": {
+        "token": "HTTPS",
+        "nodes": [
+          {
+            "id": "adm",
+            "label": "Admin workstation",
+            "sub": "10.20.0.5",
+            "icon": "laptop"
+          },
+          {
+            "id": "usr",
+            "label": "User VLAN host",
+            "sub": "10.30.0.77",
+            "icon": "desktop"
+          },
+          {
+            "id": "fw",
+            "label": "Host firewall",
+            "sub": "8006 allow-list",
+            "icon": "firewall"
+          },
+          {
+            "id": "px",
+            "label": "pveproxy",
+            "sub": "ALLOW_FROM",
+            "icon": "lock"
+          },
+          {
+            "id": "ui",
+            "label": "Console / API",
+            "sub": "10.20.0.11:8006",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "adm",
+            "caption": "An administrator opens https://pve1.example.com:8006 from the management range."
+          },
+          {
+            "at": "fw",
+            "caption": "The firewall rule allows 10.20.0.0/28 to port 8006.",
+            "tone": "success"
+          },
+          {
+            "at": "px",
+            "caption": "pveproxy checks ALLOW_FROM and accepts the TLS session.",
+            "tone": "success"
+          },
+          {
+            "at": "ui",
+            "caption": "The login page is served over TLS. Authentication happens next.",
+            "tone": "secure"
+          },
+          {
+            "at": "usr",
+            "caption": "A host on the user VLAN tries the same address.",
+            "tone": "warning"
+          },
+          {
+            "at": "fw",
+            "caption": "No rule matches that source. The packet is dropped before the service sees it.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tls",
+      "type": "text",
+      "markdown": "## Protect the transport with a real certificate\n\nProxmox installs a self-signed certificate. Browsers warn about it, and administrators learn to click past the warning, which is exactly the habit an attacker who intercepts the connection depends on. Replace it with a certificate that browsers trust.\n\nTwo routes are common:\n\n1. **ACME (Let's Encrypt or an internal ACME CA).** Proxmox has built-in support through `pvenode acme`. It works best when the node has a DNS name such as `pve1.example.com` and can complete a challenge. DNS-based challenges work without exposing port 80.\n2. **Your own CA.** Issue a certificate for the node name and install it with `pvenode cert set`.\n\nAfter installing, test with `openssl s_client` and confirm the chain, the name and the protocol version. Prefer TLS 1.3, and disable weak ciphers if you set `CIPHERS` manually. Keep the private key readable by root only, which the cluster filesystem does for you when you use the supported commands."
+    },
+    {
+      "id": "tls-term",
+      "type": "terminal",
+      "title": "Certificate and exposure checks",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "pvenode acme account register default admin@example.com",
+          "output": "Directory endpoint: 1) Let's Encrypt V2\nTOS accepted. Registering account...\nTask OK",
+          "comment": "One-time ACME account. Use a monitored mailbox for expiry notices."
+        },
+        {
+          "cmd": "pvenode config set --acme domains=pve1.example.com && pvenode acme cert order",
+          "output": "Loading ACME account details\nPlacing ACME order\nValidating challenge\nInstalling new certificate\nRestarting pveproxy\nTask OK",
+          "comment": "Orders and installs a trusted certificate, then restarts pveproxy."
+        },
+        {
+          "cmd": "echo | openssl s_client -connect 10.20.0.11:8006 -servername pve1.example.com 2>/dev/null | grep -E 'Protocol|Verify return'",
+          "output": "    Protocol  : TLSv1.3\nVerify return code: 0 (ok)",
+          "comment": "TLS 1.3 and a verified chain. A self-signed cert would show code 18 or 19."
+        },
+        {
+          "cmd": "ss -tln 'sport = :8006'",
+          "output": "State  Recv-Q Send-Q Local Address:Port\nLISTEN 0      4096   10.20.0.11:8006",
+          "comment": "Bound to the management address only, not to 0.0.0.0."
+        }
+      ]
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not publish 8006 to the internet",
+      "markdown": "Port-forwarding the console to the internet is the most common Proxmox exposure. Even with MFA, you inherit every future vulnerability in the web stack the day it is disclosed. If you need remote access, put the management network behind a VPN or a bastion host and publish nothing. A reverse proxy in front adds another component to patch, so do not treat it as a security control on its own."
+    },
+    {
+      "id": "habits",
+      "type": "text",
+      "markdown": "## Good habits on the client side\n\nThe best server settings still fail if the people using them are careless. Agree on a few rules.\n\n- **Use a dedicated browser profile or a hardened admin workstation** for the console. Avoid browsing the web in the same session where you hold a root-level ticket.\n- **Never share accounts.** One person, one account, so that the task log names a real individual.\n- **Check the address bar.** Always reach the console by its DNS name, such as `pve1.example.com`, so that a certificate mismatch is obvious.\n- **Automation uses tokens, not passwords.** Scripts should authenticate with scoped [API tokens](/learn/systems-infrastructure-security/proxmox-api-token-security) so that a leaked script cannot log in to the console.\n- **Track certificate expiry.** An expired certificate teaches people to accept warnings again. Alert at least 14 days before renewal is due.\n\nThese habits cost nothing and close the gaps that technical controls cannot reach."
+    },
+    {
+      "id": "monitor",
+      "type": "text",
+      "markdown": "## Watch the interface\n\nRestricting access is prevention. You also need detection. Proxmox logs web authentication results and API tasks, so you can answer who logged in, from where, and what they changed.\n\n- Failed logins appear in the journal for `pvedaemon` with the remote host. Use them to feed [fail2ban](/learn/systems-infrastructure-security/proxmox-host-hardening) and your alerts.\n- Completed and failed tasks appear in the **Tasks** panel and under `/var/log/pve/tasks/`.\n- Ticket lifetime is two hours, so a stolen cookie has a limit. Log out of shared workstations anyway.\n\nForward these logs to a central collector so they survive a compromise of the node. See [virtualization security monitoring](/learn/systems-infrastructure-security/virtualization-security-monitoring). Alert on a burst of failures, a login from an unexpected address, and any privileged change outside a maintenance window."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a lab node you own, with a second terminal open as a safety net:\n\n1. Note the current listener with `ss -tln 'sport = :8006'`. It will probably show `*:8006`.\n2. Edit `/etc/default/pveproxy` to set `LISTEN_IP` to your management address and `ALLOW_FROM` to your workstation only, with `POLICY=\"deny\"`.\n3. Run `systemctl restart pveproxy` and confirm you can still log in.\n4. From a different address or network namespace, confirm the page no longer loads.\n5. If you have a DNS name for the lab, order a certificate with `pvenode acme` and check it with `openssl s_client`.\n\nRevert by removing the lines and restarting the service."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "pveproxy",
+          "definition": "The service that serves the Proxmox console and API on TCP 8006."
+        },
+        {
+          "term": "LISTEN_IP",
+          "definition": "A setting that binds pveproxy to a single local address."
+        },
+        {
+          "term": "ALLOW_FROM",
+          "definition": "The list of source addresses allowed to connect to the web interface."
+        },
+        {
+          "term": "Allow-list",
+          "definition": "A policy that permits only listed sources and denies the rest."
+        },
+        {
+          "term": "ACME",
+          "definition": "A protocol that automates certificate issuance and renewal."
+        },
+        {
+          "term": "Self-signed certificate",
+          "definition": "A certificate not issued by a trusted CA, which browsers warn about."
+        },
+        {
+          "term": "Bastion host",
+          "definition": "A hardened gateway through which administrators reach a private network."
+        },
+        {
+          "term": "Session ticket",
+          "definition": "The signed cookie issued after login, valid for two hours."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which setting binds the Proxmox web service to a single address?",
+          "options": [
+            "ALLOW_FROM",
+            "LISTEN_IP",
+            "POLICY",
+            "CIPHERS"
+          ],
+          "answer": 1,
+          "explanation": "LISTEN_IP chooses the interface address. ALLOW_FROM filters who may connect."
+        },
+        {
+          "question": "Why is an allow-list safer than a block-list for the console?",
+          "options": [
+            "It uses less memory",
+            "Unknown sources are denied by default (fails closed)",
+            "It encrypts traffic",
+            "It removes the need for passwords"
+          ],
+          "answer": 1,
+          "explanation": "A block-list only stops what you thought of. An allow-list stops everything else."
+        },
+        {
+          "question": "Which are good ways to give administrators remote access to the console? Choose all that apply.",
+          "options": [
+            "A VPN into the management network",
+            "A hardened bastion host",
+            "Port-forwarding 8006 to the internet",
+            "An allow-list limited to known addresses"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Publishing the port exposes the whole web stack to every future vulnerability."
+        },
+        {
+          "question": "Why replace the default self-signed certificate?",
+          "options": [
+            "It makes the VMs faster",
+            "It stops administrators learning to ignore certificate warnings",
+            "Self-signed certificates cannot use TLS",
+            "It disables the API"
+          ],
+          "answer": 1,
+          "explanation": "A trusted certificate lets users treat a warning as a real signal of interception."
+        },
+        {
+          "question": "After changing /etc/default/pveproxy, what is the next step?",
+          "options": [
+            "Reboot the whole cluster",
+            "Restart pveproxy and test from a second connection",
+            "Delete the file",
+            "Nothing; it applies instantly"
+          ],
+          "answer": 1,
+          "explanation": "The service reads the file at start. Testing from another connection avoids a lockout."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nThe Proxmox web interface exposes the full API, so reduce who can reach it. Bind `pveproxy` to the management address with `LISTEN_IP`, enforce an allow-list with `ALLOW_FROM` and `POLICY`, and back it with the host firewall. Replace the self-signed certificate with a trusted one, check the TLS version, and never publish port 8006 to the internet. Log logins and tasks and send them off the node. With the door narrowed, the next step is deciding who may walk through it: [Proxmox authentication and MFA](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa)."
+    }
+  ],
+  "ar": {
+    "title": "أمن واجهة الويب في Proxmox",
+    "summary": "ضيّق من يستطيع بلوغ وحدة Proxmox وAPI، واحمِ الاتصال بشهادة موثوقة وTLS حديث، وراقب الوصول إليها.",
+    "objectives": [
+      "اشرح ما تكشفه واجهة الويب وAPI",
+      "اربط pveproxy وصفِّه بعنوان المصدر",
+      "استبدل الشهادة الذاتية بشهادة موثوقة",
+      "اختر تصميم وصول بعيد آمنًا دون نشر المنفذ 8006",
+      "راقب عمليات الدخول والمهام على الواجهة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "ابحث في أي خدمة مسح للإنترنت عن المنفذ 8006 وستجد آلاف وحدات Proxmox مفتوحة للعالم. بعضها بإصدارات قديمة، وبعضها بالنطاق الافتراضي ودون عامل ثانٍ. وكل واحدة منها تبعد كلمة مرور مسروقة واحدة عن خسارة كل الأجهزة الافتراضية خلفها.\n\nواجهة الويب أسهل طريقة لإدارة Proxmox وأكثر الأهداف جاذبية أيضًا، لأنها تكشف API كاملة. في هذا الدرس ستقلّص من يستطيع بلوغها، وتحمي المرور بشهادة سليمة وTLS حديث، وتراقب إساءة الاستخدام. تُغطّى المصادقة نفسها في الدرس التالي، وهدفنا هنا أن يقلّ عدد من يستطيع حتى المحاولة."
+      },
+      {
+        "id": "exposure",
+        "type": "text",
+        "markdown": "## ما الذي تكشفه الواجهة\n\nتستمع خدمة `pveproxy` على TCP 8006 وتقدّم عبر HTTPS أمرين: وحدة المتصفح وواجهة REST API عند `/api2/json`. وتستخدم النصوص البرمجية وTerraform وAnsible واجهة API نفسها. والمستخدم المسجّل في الوحدة يفعل ما يسمح به دوره، ومنه فتح صدفة root على العقدة إن امتلك الصلاحيات المناسبة.\n\nيستمع `pveproxy` افتراضيًا على **كل** الواجهات، فتستطيع أي شبكة متصلة بالمضيف بلوغه. وهذا أول افتراضي يجب تغييره.\n\n| مستوى الانكشاف | الوصف | الحكم |\n|:--|:--|:--|\n| الإنترنت العام | المنفذ 8006 مفتوح للجميع | تجنّبه |\n| شبكة المستخدمين أو الضيوف | يمكن بلوغه من شبكات العملاء | تجنّبه |\n| شبكة الإدارة بقائمة سماح | عناوين المدراء فقط | موصى به |\n| VPN أو مضيف حماية فقط | يُبلغ بعد قفزة موثّقة منفصلة | الأفضل للوصول البعيد |\n\nتعطيك الأقسام التالية ثلاث طبقات: الربط بالواجهة الصحيحة، والتصفية بعنوان المصدر، وتأمين النقل."
+      },
+      {
+        "id": "restrict",
+        "type": "text",
+        "markdown": "## قيّد من يستطيع الاتصال\n\nيقرأ Proxmox الملف `/etc/default/pveproxy`. ثلاثة إعدادات هي الأهم.\n\n- `LISTEN_IP` يربط الخدمة بعنوان واحد مثل عنوان الإدارة.\n- `ALLOW_FROM` يسرد العناوين أو الشبكات المسموح لها بالاتصال.\n- `DENY_FROM` يسرد العناوين المرفوضة، و`POLICY` يحدد الافتراضي عند عدم المطابقة.\n\nضبط `POLICY=\"deny\"` مع `ALLOW_FROM` صريحة يعطي قائمة سماح، وهي أأمن من قائمة الحظر لأنها تفشل مغلقة. أعد تشغيل الخدمة بعد التعديل بالأمر `systemctl restart pveproxy`. لا تتضرر الجلسات القائمة، لكن تأكد من اتصال ثانٍ أنك ما زلت تملك الوصول قبل إغلاق الطرفية.\n\nيكمّل هذا المرشّح على مستوى التطبيق جدار حماية المضيف. استخدمهما معًا: يوقف الجدار الحزم مبكرًا، ويرفض `pveproxy` ما يفلت من خطأ في الجدار. راجع [إعداد جدار Proxmox](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+      },
+      {
+        "id": "pveproxy-default",
+        "type": "code",
+        "language": "bash",
+        "code": "# Bind only to the management address\nLISTEN_IP=\"10.20.0.11\"\n\n# Allow-list: administrators and the jump host only\nALLOW_FROM=\"10.20.0.0/28,198.51.100.10\"\nDENY_FROM=\"all\"\nPOLICY=\"deny\"\n\n# Modern TLS only: disable TLS 1.2 only if every client supports 1.3\n#DISABLE_TLS_1_2=1",
+        "caption": "إعدادات pveproxy. أعد التشغيل بـ systemctl restart pveproxy.",
+        "filename": "/etc/default/pveproxy"
+      },
+      {
+        "id": "allow-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "التصفية بالمصدر على الوحدة",
+        "caption": "المنفذ نفسه يعطي جوابًا مختلفًا بحسب السائل.",
+        "data": {
+          "token": "HTTPS",
+          "nodes": [
+            {
+              "id": "adm",
+              "label": "محطة المدير",
+              "sub": "10.20.0.5",
+              "icon": "laptop"
+            },
+            {
+              "id": "usr",
+              "label": "مضيف شبكة المستخدمين",
+              "sub": "10.30.0.77",
+              "icon": "desktop"
+            },
+            {
+              "id": "fw",
+              "label": "جدار المضيف",
+              "sub": "8006 allow-list",
+              "icon": "firewall"
+            },
+            {
+              "id": "px",
+              "label": "pveproxy",
+              "sub": "ALLOW_FROM",
+              "icon": "lock"
+            },
+            {
+              "id": "ui",
+              "label": "الوحدة / API",
+              "sub": "10.20.0.11:8006",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "at": "adm",
+              "caption": "يفتح المدير https://pve1.example.com:8006 من نطاق الإدارة."
+            },
+            {
+              "at": "fw",
+              "caption": "تسمح قاعدة الجدار بـ 10.20.0.0/28 إلى المنفذ 8006.",
+              "tone": "success"
+            },
+            {
+              "at": "px",
+              "caption": "يفحص pveproxy قائمة ALLOW_FROM ويقبل جلسة TLS.",
+              "tone": "success"
+            },
+            {
+              "at": "ui",
+              "caption": "تُقدَّم صفحة الدخول عبر TLS ثم تبدأ المصادقة.",
+              "tone": "secure"
+            },
+            {
+              "at": "usr",
+              "caption": "يجرّب مضيف في شبكة المستخدمين العنوان نفسه.",
+              "tone": "warning"
+            },
+            {
+              "at": "fw",
+              "caption": "لا تطابق أي قاعدة هذا المصدر فتُسقط الحزمة قبل أن تراها الخدمة.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "tls",
+        "type": "text",
+        "markdown": "## احمِ النقل بشهادة حقيقية\n\nيثبّت Proxmox شهادة موقّعة ذاتيًا. تحذّر المتصفحات منها، فيعتاد المدراء تجاوز التحذير، وهي العادة نفسها التي يعتمد عليها مهاجم يعترض الاتصال. استبدلها بشهادة تثق بها المتصفحات.\n\nطريقان شائعان:\n\n1. **ACME (مثل Let's Encrypt أو جهة ACME داخلية).** يدعمه Proxmox مدمجًا عبر `pvenode acme`. يعمل أفضل إذا كان للعقدة اسم DNS مثل `pve1.example.com` وأمكنها إتمام التحدي. وتعمل تحديات DNS دون كشف المنفذ 80.\n2. **جهة إصدار شهادات خاصة بك (CA).** أصدر شهادة لاسم العقدة وثبّتها بـ `pvenode cert set`.\n\nبعد التثبيت اختبر بـ `openssl s_client` وأكّد السلسلة والاسم وإصدار البروتوكول. فضّل TLS 1.3 وعطّل الشيفرات الضعيفة إن ضبطت `CIPHERS` يدويًا. وأبقِ المفتاح الخاص مقروءًا لـ root فقط، وهو ما يفعله نظام ملفات العنقود عند استخدام الأوامر المدعومة."
+      },
+      {
+        "id": "tls-term",
+        "type": "terminal",
+        "title": "فحوص الشهادة والانكشاف",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "pvenode acme account register default admin@example.com",
+            "output": "Directory endpoint: 1) Let's Encrypt V2\nTOS accepted. Registering account...\nTask OK",
+            "comment": "حساب ACME لمرة واحدة. استخدم صندوق بريد مراقبًا لإشعارات الانتهاء."
+          },
+          {
+            "cmd": "pvenode config set --acme domains=pve1.example.com && pvenode acme cert order",
+            "output": "Loading ACME account details\nPlacing ACME order\nValidating challenge\nInstalling new certificate\nRestarting pveproxy\nTask OK",
+            "comment": "يطلب شهادة موثوقة ويثبّتها ثم يعيد تشغيل pveproxy."
+          },
+          {
+            "cmd": "echo | openssl s_client -connect 10.20.0.11:8006 -servername pve1.example.com 2>/dev/null | grep -E 'Protocol|Verify return'",
+            "output": "    Protocol  : TLSv1.3\nVerify return code: 0 (ok)",
+            "comment": "TLS 1.3 وسلسلة موثّقة. الشهادة الذاتية تعرض الرمز 18 أو 19."
+          },
+          {
+            "cmd": "ss -tln 'sport = :8006'",
+            "output": "State  Recv-Q Send-Q Local Address:Port\nLISTEN 0      4096   10.20.0.11:8006",
+            "comment": "مربوط بعنوان الإدارة فقط وليس بـ 0.0.0.0."
+          }
+        ]
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تنشر المنفذ 8006 على الإنترنت",
+        "markdown": "فتح الوحدة على الإنترنت بتحويل المنافذ هو أشيع أشكال انكشاف Proxmox. حتى مع MFA ترث كل ثغرة مستقبلية في حزمة الويب يوم الإعلان عنها. وإذا احتجت وصولًا بعيدًا فضع شبكة الإدارة خلف VPN أو مضيف حماية (Bastion) ولا تنشر شيئًا. ويضيف وكيل عكسي أمامها مكوّنًا آخر يحتاج تحديثًا، فلا تعدّه ضابطًا أمنيًا بذاته."
+      },
+      {
+        "id": "habits",
+        "type": "text",
+        "markdown": "## عادات جيدة من جهة العميل\n\nتفشل أفضل إعدادات الخادم إذا أهمل مستخدموها. اتفقوا على بضع قواعد.\n\n- **استخدم ملف متصفح مخصصًا أو محطة إدارة محصّنة** للوحدة. تجنّب تصفح الويب في الجلسة نفسها التي تحمل فيها تذكرة بصلاحية root.\n- **لا تشارك الحسابات أبدًا.** شخص واحد وحساب واحد ليذكر سجل المهام فردًا حقيقيًا.\n- **افحص شريط العنوان.** ادخل الوحدة دائمًا باسم DNS مثل `pve1.example.com` ليظهر عدم تطابق الشهادة بوضوح.\n- **تستخدم الأتمتة رموزًا لا كلمات مرور.** يجب أن تصادق النصوص البرمجية برموز [API](/learn/systems-infrastructure-security/proxmox-api-token-security) محدودة النطاق لكي لا يستطيع نص مسرّب تسجيل الدخول إلى الوحدة.\n- **تتبّع انتهاء الشهادة.** الشهادة المنتهية تعوّد الناس قبول التحذيرات من جديد. نبّه قبل موعد التجديد بأربعة عشر يومًا على الأقل.\n\nلا تكلّف هذه العادات شيئًا وتسدّ ثغرات لا تصل إليها الضوابط التقنية."
+      },
+      {
+        "id": "monitor",
+        "type": "text",
+        "markdown": "## راقب الواجهة\n\nتقييد الوصول وقاية، وتحتاج أيضًا إلى الكشف. يسجّل Proxmox نتائج مصادقة الويب ومهام API، فتستطيع الإجابة عن من دخل ومن أين وماذا غيّر.\n\n- تظهر محاولات الدخول الفاشلة في سجل `pvedaemon` مع المضيف البعيد. استخدمها لتغذية [fail2ban](/learn/systems-infrastructure-security/proxmox-host-hardening) وتنبيهاتك.\n- تظهر المهام المكتملة والفاشلة في لوحة **Tasks** وتحت `/var/log/pve/tasks/`.\n- مدة التذكرة ساعتان، فللكوكي المسروق حدّ. ومع ذلك سجّل الخروج من المحطات المشتركة.\n\nأعد توجيه هذه السجلات إلى مجمّع مركزي لتبقى بعد اختراق العقدة. راجع [مراقبة أمن المحاكاة الافتراضية](/learn/systems-infrastructure-security/virtualization-security-monitoring). نبّه عند اندفاع إخفاقات، أو دخول من عنوان غير متوقع، أو أي تغيير مميّز خارج نافذة الصيانة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على عقدة مختبر تملكها، مع طرفية ثانية مفتوحة شبكةَ أمان:\n\n1. دوّن المستمع الحالي بـ `ss -tln 'sport = :8006'`. سيظهر على الأرجح `*:8006`.\n2. عدّل `/etc/default/pveproxy` لضبط `LISTEN_IP` على عنوان الإدارة و`ALLOW_FROM` على محطتك وحدها مع `POLICY=\"deny\"`.\n3. شغّل `systemctl restart pveproxy` وتأكد أنك ما زلت تستطيع الدخول.\n4. من عنوان أو شبكة مختلفة تأكد أن الصفحة لم تعد تُحمَّل.\n5. إن كان لمختبرك اسم DNS فاطلب شهادة بـ `pvenode acme` وافحصها بـ `openssl s_client`.\n\nتراجع بحذف الأسطر وإعادة تشغيل الخدمة."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "pveproxy",
+            "definition": "الخدمة التي تقدّم وحدة Proxmox وAPI على TCP 8006."
+          },
+          {
+            "term": "LISTEN_IP",
+            "definition": "إعداد يربط pveproxy بعنوان محلي واحد."
+          },
+          {
+            "term": "ALLOW_FROM",
+            "definition": "قائمة عناوين المصدر المسموح لها بالاتصال بواجهة الويب."
+          },
+          {
+            "term": "قائمة السماح (Allow-list)",
+            "definition": "سياسة تسمح بالمصادر المدرجة فقط وترفض الباقي."
+          },
+          {
+            "term": "ACME",
+            "definition": "بروتوكول يؤتمت إصدار الشهادات وتجديدها."
+          },
+          {
+            "term": "شهادة موقّعة ذاتيًا",
+            "definition": "شهادة لم تصدرها جهة موثوقة وتحذّر منها المتصفحات."
+          },
+          {
+            "term": "مضيف الحماية (Bastion)",
+            "definition": "بوابة محصّنة يصل المدراء عبرها إلى شبكة خاصة."
+          },
+          {
+            "term": "تذكرة الجلسة",
+            "definition": "الكوكي الموقّع الصادر بعد الدخول وصلاحيته ساعتان."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي إعداد يربط خدمة ويب Proxmox بعنوان واحد؟",
+            "options": [
+              "ALLOW_FROM",
+              "LISTEN_IP",
+              "POLICY",
+              "CIPHERS"
+            ],
+            "answer": 1,
+            "explanation": "يحدد LISTEN_IP عنوان الواجهة، أما ALLOW_FROM فيصفّي من يحق له الاتصال."
+          },
+          {
+            "question": "لماذا تُعد قائمة السماح أأمن من قائمة الحظر للوحدة؟",
+            "options": [
+              "تستهلك ذاكرة أقل",
+              "المصادر المجهولة مرفوضة افتراضيًا (تفشل مغلقة)",
+              "تشفّر المرور",
+              "تلغي الحاجة إلى كلمات المرور"
+            ],
+            "answer": 1,
+            "explanation": "قائمة الحظر توقف ما فكرت فيه فقط، وقائمة السماح توقف كل ما سواه."
+          },
+          {
+            "question": "أي مما يلي طرق جيدة لمنح المدراء وصولًا بعيدًا إلى الوحدة؟ اختر كل ما ينطبق.",
+            "options": [
+              "VPN إلى شبكة الإدارة",
+              "مضيف حماية محصّن",
+              "تحويل المنفذ 8006 إلى الإنترنت",
+              "قائمة سماح محدودة بعناوين معروفة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "نشر المنفذ يعرّض حزمة الويب كلها لكل ثغرة مستقبلية."
+          },
+          {
+            "question": "لماذا تُستبدل الشهادة الذاتية الافتراضية؟",
+            "options": [
+              "تجعل الأجهزة أسرع",
+              "تمنع المدراء من اعتياد تجاهل تحذيرات الشهادة",
+              "الشهادات الذاتية لا تستخدم TLS",
+              "تعطّل API"
+            ],
+            "answer": 1,
+            "explanation": "تتيح الشهادة الموثوقة اعتبار التحذير إشارة حقيقية إلى اعتراض."
+          },
+          {
+            "question": "بعد تعديل /etc/default/pveproxy ما الخطوة التالية؟",
+            "options": [
+              "أعد تشغيل العنقود كله",
+              "أعد تشغيل pveproxy واختبر من اتصال ثانٍ",
+              "احذف الملف",
+              "لا شيء، فهو يسري فورًا"
+            ],
+            "answer": 1,
+            "explanation": "تقرأ الخدمة الملف عند البدء، والاختبار من اتصال آخر يتجنب الإقفال."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتكشف واجهة ويب Proxmox واجهة API كاملة، فقلّل من يستطيع بلوغها. اربط `pveproxy` بعنوان الإدارة بـ `LISTEN_IP`، وفرض قائمة سماح بـ `ALLOW_FROM` و`POLICY`، وادعمها بجدار حماية المضيف. استبدل الشهادة الذاتية بأخرى موثوقة، وافحص إصدار TLS، ولا تنشر المنفذ 8006 على الإنترنت. سجّل الدخول والمهام وأرسلها خارج العقدة. وبعد تضييق الباب تأتي خطوة تحديد من يحق له العبور: [المصادقة وMFA في Proxmox](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa)."
+      }
+    ]
+  }
+}

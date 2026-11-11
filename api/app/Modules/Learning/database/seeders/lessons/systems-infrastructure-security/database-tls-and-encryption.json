@@ -1,0 +1,606 @@
+{
+ "slug": "database-tls-and-encryption",
+ "title": "Database TLS and Encryption",
+ "summary": "Enable TLS on PostgreSQL and MySQL, enforce it, make clients verify the server, and monitor for plaintext sessions.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Explain what TLS protects and what it does not",
+  "Create a certificate with a correct SAN and enable TLS in PostgreSQL and MySQL",
+  "Enforce encrypted connections and choose a safe client sslmode",
+  "Verify sessions and plan certificate renewal"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A developer connects to the production database from a coffee shop using `psql -h db.example.com`. The connection works, so nothing seems wrong. But PostgreSQL and MySQL clients do not require encryption by default. Every query, every result row and, depending on the authentication method, material derived from the password may cross the network readable by anyone who can capture packets on the path.\n\nTransport Layer Security (TLS) fixes this in two ways. It encrypts the session so that captured traffic is useless, and it lets the client verify that it is talking to the real database server rather than an impostor. Most teams get the first half and skip the second. In this lesson you will enable TLS on PostgreSQL and MySQL, force clients to use it, and verify that the settings work on servers you own."
+  },
+  {
+   "id": "why",
+   "type": "text",
+   "markdown": "## What TLS protects, and what it does not\n\nTLS protects data **in transit** between a client and the database. It does not protect data on disk, in backups or in memory. That is the subject of [Encryption at Rest and in Transit](/learn/systems-infrastructure-security/encryption-at-rest-and-in-transit). It also does not decide who may log in; authentication and authorization remain separate controls, as covered in [PostgreSQL Authentication and Authorization](/learn/systems-infrastructure-security/postgresql-authentication-and-authorization).\n\nA TLS connection gives you three properties:\n\n- **Confidentiality.** A passive observer sees only ciphertext.\n- **Integrity.** An active attacker cannot alter queries or results without detection.\n- **Server authentication.** The server proves its identity with a certificate signed by an authority the client trusts.\n\nThe third property is the one people skip. If a client accepts any certificate, an attacker who sits between client and server can present their own, decrypt the traffic and forward it onward. Encryption without verification only stops passive eavesdropping."
+  },
+  {
+   "id": "cert",
+   "type": "text",
+   "markdown": "## Step 1: Create a certificate authority and a server certificate\n\nFor production, use your organization's internal certificate authority (CA) or a managed service. For a lab, `openssl` is enough. The principle is the same either way: clients trust one CA, and the CA signs the database server's certificate.\n\nThe server certificate must name the host that clients connect to. Put the DNS name in the **Subject Alternative Name** (SAN) field. Modern clients ignore the old Common Name field when a SAN is present, and a mismatch is the most common reason `verify-full` fails.\n\nKeep the private key readable only by the database account. PostgreSQL refuses to start if the key file is group- or world-readable, and that check is a feature, not an annoyance."
+  },
+  {
+   "id": "openssl",
+   "type": "code",
+   "language": "bash",
+   "filename": "lab-ca.sh",
+   "caption": "Lab CA and server certificate. Names and paths are examples; run on a host you own.",
+   "code": "# 1. Create the CA key and a self-signed CA certificate (3 years)\nopenssl genrsa -out lab-ca.key 4096\nopenssl req -x509 -new -key lab-ca.key -sha256 -days 1095 \\\n  -subj \"/O=Example Lab/CN=Example Lab Root CA\" -out lab-ca.crt\n\n# 2. Create the server key and a signing request with a SAN\nopenssl genrsa -out db.key 2048\nopenssl req -new -key db.key -subj \"/CN=db.example.com\" \\\n  -addext \"subjectAltName=DNS:db.example.com\" -out db.csr\n\n# 3. Sign it with the CA (1 year)\nopenssl x509 -req -in db.csr -CA lab-ca.crt -CAkey lab-ca.key \\\n  -CAcreateserial -days 365 -sha256 \\\n  -copy_extensions copy -out db.crt\n\n# 4. Lock down the key for the postgres account\nsudo install -o postgres -g postgres -m 0600 db.key /etc/postgresql/16/main/db.key\nsudo install -o postgres -g postgres -m 0644 db.crt lab-ca.crt /etc/postgresql/16/main/",
+   "highlight": [
+    8,
+    9,
+    15,
+    18
+   ]
+  },
+  {
+   "id": "pg",
+   "type": "text",
+   "markdown": "## Step 2: Enable and enforce TLS in PostgreSQL\n\nEnabling TLS is a configuration change in `postgresql.conf`. Enforcing it is a separate change in `pg_hba.conf`. Do both; the first alone only makes encryption optional.\n\nIn `postgresql.conf`, set `ssl = on`, point to the certificate and key, and raise the minimum protocol version to TLS 1.2 or higher. Reload the service. Then in `pg_hba.conf`, replace broad `host` lines with `hostssl` lines. A `hostssl` rule matches only encrypted connections, so a client that tries plaintext matches no rule and is rejected. Also add `hostnossl ... reject` as an explicit guard, so the intent is visible to the next administrator. Rule order matters: PostgreSQL uses the first matching line. The full rule syntax is in [PostgreSQL pg_hba.conf Security](/learn/systems-infrastructure-security/postgresql-pg-hba-conf-security)."
+  },
+  {
+   "id": "pgconf",
+   "type": "code",
+   "language": "ini",
+   "filename": "postgresql.conf and pg_hba.conf",
+   "caption": "Server settings and access rules that require TLS 1.2 or later (PostgreSQL 16 paths).",
+   "code": "# --- postgresql.conf ---\nlisten_addresses = '10.20.2.5'\nssl = on\nssl_cert_file = '/etc/postgresql/16/main/db.crt'\nssl_key_file  = '/etc/postgresql/16/main/db.key'\nssl_ca_file   = '/etc/postgresql/16/main/lab-ca.crt'\nssl_min_protocol_version = 'TLSv1.2'\nssl_prefer_server_ciphers = on\n\n# --- pg_hba.conf (first match wins) ---\n# TYPE     DATABASE  USER      ADDRESS         METHOD\nhostssl    appdb     app_rw    10.20.1.0/24    scram-sha-256\nhostnossl  all       all       0.0.0.0/0       reject",
+   "highlight": [
+    3,
+    7,
+    12,
+    13
+   ]
+  },
+  {
+   "id": "mysql",
+   "type": "text",
+   "markdown": "## Step 3: The same controls in MySQL\n\nMySQL 8 enables TLS automatically with a self-generated certificate, which gives encryption but no server authentication. Replace it with a certificate from your CA, then make encryption mandatory.\n\nThe key setting is `require_secure_transport = ON`. With it, the server rejects any TCP connection that is not encrypted. You can also require TLS per account with `REQUIRE SSL`, or require a client certificate with `REQUIRE X509` for service accounts that justify the extra effort. Restrict protocols with `tls_version = TLSv1.2,TLSv1.3`.\n\n| Control | PostgreSQL | MySQL 8 |\n|:--|:--|:--|\n| Turn TLS on | `ssl = on` | `ssl_cert`, `ssl_key`, `ssl_ca` in `my.cnf` |\n| Reject plaintext | `hostssl` plus `hostnossl ... reject` | `require_secure_transport = ON` |\n| Minimum version | `ssl_min_protocol_version` | `tls_version` |\n| Per-user requirement | `hostssl` rule per user | `ALTER USER ... REQUIRE SSL` |\n| Client certificate | `clientcert=verify-full` in `pg_hba.conf` | `REQUIRE X509` or `REQUIRE SUBJECT` |"
+  },
+  {
+   "id": "mycnf",
+   "type": "code",
+   "language": "ini",
+   "filename": "/etc/mysql/mysql.conf.d/tls.cnf",
+   "caption": "MySQL server TLS settings. Paths are examples.",
+   "code": "[mysqld]\nbind-address            = 10.20.2.6\nssl_ca                  = /etc/mysql/certs/lab-ca.crt\nssl_cert                = /etc/mysql/certs/db.crt\nssl_key                 = /etc/mysql/certs/db.key\ntls_version             = TLSv1.2,TLSv1.3\nrequire_secure_transport = ON",
+   "highlight": [
+    3,
+    4,
+    5,
+    6,
+    7
+   ]
+  },
+  {
+   "id": "tlsflow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "How a verified TLS session to the database is built",
+   "caption": "Verification happens before any credentials or queries are sent.",
+   "data": {
+    "token": "Handshake",
+    "nodes": [
+     {
+      "id": "cl",
+      "label": "App client",
+      "sub": "10.20.1.10",
+      "icon": "server"
+     },
+     {
+      "id": "net",
+      "label": "Network path",
+      "sub": "untrusted",
+      "icon": "cloud"
+     },
+     {
+      "id": "db",
+      "label": "Database",
+      "sub": "db.example.com",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "at": "cl",
+      "caption": "The client opens a connection and sends ClientHello with its supported TLS versions."
+     },
+     {
+      "at": "net",
+      "caption": "A passive observer on the path sees only handshake metadata.",
+      "tone": "warning"
+     },
+     {
+      "at": "db",
+      "caption": "The server picks TLS 1.3 and sends its certificate for db.example.com."
+     },
+     {
+      "at": "cl",
+      "caption": "The client checks the signature against the lab CA and the name against the SAN (verify-full).",
+      "tone": "secure"
+     },
+     {
+      "at": "db",
+      "caption": "Keys are agreed. The session is encrypted and the password exchange starts inside it.",
+      "tone": "success"
+     },
+     {
+      "at": "net",
+      "caption": "An attacker with a different certificate fails the name check: the client aborts.",
+      "tone": "blocked"
+     }
+    ]
+   }
+  },
+  {
+   "id": "client",
+   "type": "text",
+   "markdown": "## Step 4: Make clients verify the server\n\nThe server side is only half the work. Clients choose how strictly they check. PostgreSQL's `sslmode` setting has several values, and the weak ones are common in sample code.\n\n| sslmode | Encrypts | Verifies CA | Verifies host name | Verdict |\n|:--|:--|:--|:--|:--|\n| `disable` | No | No | No | Never use |\n| `prefer` | If offered | No | No | Silent downgrade possible |\n| `require` | Yes | No | No | Stops eavesdropping only |\n| `verify-ca` | Yes | Yes | No | Better, still open to a valid cert for another host |\n| `verify-full` | Yes | Yes | Yes | Use this |\n\nThe same idea applies elsewhere. In MySQL clients use `--ssl-mode=VERIFY_IDENTITY`. In application drivers, look for the equivalent flag and distribute the CA certificate with the application, not the server certificate, so renewals do not break clients."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Plaintext fallback hides failures",
+   "markdown": "With `sslmode=prefer`, a misconfigured server silently falls back to plaintext and the application keeps working. Nobody notices until an audit or an incident. Set `verify-full` in every connection string and keep a `hostnossl ... reject` rule so mistakes fail loudly."
+  },
+  {
+   "id": "verify",
+   "type": "text",
+   "markdown": "## Step 5: Verify, monitor and rotate\n\nCheck the result from the client and from the server. On the client, `psql` reports the protocol and cipher. On the server, `pg_stat_ssl` shows every connection and whether it is encrypted, which makes it easy to alert on any session where `ssl` is false. From a third host, `openssl s_client` shows what a scanner would see, including the certificate chain and its expiry date.\n\nCertificates expire, and an expired certificate under `verify-full` is an outage. Track expiry dates, renew at least 30 days early, and prefer short lifetimes with automation. Reloading PostgreSQL (`pg_ctl reload`) picks up new certificate files without dropping sessions. For auditing connection events, see [Database Auditing and Activity Logging](/learn/systems-infrastructure-security/database-auditing-and-activity-logging)."
+  },
+  {
+   "id": "vterm",
+   "type": "terminal",
+   "title": "Verifying TLS (lab network)",
+   "lines": [
+    {
+     "cmd": "psql \"host=db.example.com dbname=appdb user=app_rw sslmode=verify-full sslrootcert=lab-ca.crt\" -c \"\\conninfo\"",
+     "output": "You are connected to database \"appdb\" as user \"app_rw\" on host \"db.example.com\" (address \"10.20.2.5\") at port \"5432\".\nSSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)",
+     "comment": "verify-full succeeded: TLS 1.3 and the name matched the SAN."
+    },
+    {
+     "cmd": "psql \"host=db.example.com dbname=appdb user=app_rw sslmode=disable\"",
+     "output": "psql: error: connection to server at \"db.example.com\" (10.20.2.5), port 5432 failed: FATAL:  no pg_hba.conf entry for host \"10.20.1.10\", user \"app_rw\", database \"appdb\", no encryption",
+     "comment": "Plaintext is refused by the hostnossl reject rule."
+    },
+    {
+     "cmd": "sudo -u postgres psql -c \"SELECT pid, ssl, version, cipher FROM pg_stat_ssl WHERE NOT ssl;\"",
+     "output": " pid | ssl | version | cipher\n-----+-----+---------+--------\n(0 rows)",
+     "comment": "Zero unencrypted sessions. Alert if this ever returns rows."
+    },
+    {
+     "cmd": "openssl s_client -connect db.example.com:5432 -starttls postgres -CAfile lab-ca.crt </dev/null 2>/dev/null | grep -E \"Verify return|Protocol\"",
+     "output": "    Protocol  : TLSv1.3\nVerify return code: 0 (ok)",
+     "comment": "Run from a third host; code 0 means the chain validates. Check expiry with openssl x509 -noout -enddate."
+    }
+   ],
+   "caption": "Example output; versions and ciphers depend on your build."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a lab VM **you own** running PostgreSQL, create a lab CA and a server certificate with a SAN for a name such as `db.example.com`, using the sample script.\n2. Set `ssl = on`, the three file paths and `ssl_min_protocol_version = 'TLSv1.2'`, then reload. Add `hostssl` and `hostnossl ... reject` lines to `pg_hba.conf`.\n3. From a second lab VM, add `db.example.com` to `/etc/hosts` and connect with `sslmode=disable`, `require` and `verify-full`. Record which succeed.\n4. Change the SAN to a wrong name and confirm that `verify-full` fails while `require` still connects. Then run the `pg_stat_ssl` query."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "TLS",
+     "definition": "Protocol that encrypts and authenticates network connections."
+    },
+    {
+     "term": "Certificate authority (CA)",
+     "definition": "A trusted party that signs certificates."
+    },
+    {
+     "term": "SAN",
+     "definition": "Subject Alternative Name: the host names a certificate is valid for."
+    },
+    {
+     "term": "sslmode",
+     "definition": "PostgreSQL client setting that controls encryption and verification."
+    },
+    {
+     "term": "verify-full",
+     "definition": "Mode that checks the CA signature and the host name."
+    },
+    {
+     "term": "hostssl",
+     "definition": "A pg_hba.conf type that matches encrypted connections only."
+    },
+    {
+     "term": "require_secure_transport",
+     "definition": "MySQL option that rejects unencrypted connections."
+    },
+    {
+     "term": "Downgrade",
+     "definition": "Falling back from encrypted to plaintext, silently."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What does sslmode=require not protect against?",
+     "options": [
+      "Passive eavesdropping",
+      "An impostor server with a different certificate",
+      "Capturing packets on Wi-Fi",
+      "Replay of ciphertext"
+     ],
+     "answer": 1,
+     "explanation": "require encrypts but does not validate the certificate, so a man in the middle can present any certificate."
+    },
+    {
+     "question": "Which pg_hba.conf line type rejects plaintext connections when combined with a reject rule?",
+     "options": [
+      "host",
+      "local",
+      "hostnossl",
+      "hostssl"
+     ],
+     "answer": 2,
+     "explanation": "hostnossl matches only unencrypted connections, so pairing it with reject blocks them explicitly."
+    },
+    {
+     "question": "Which settings improve TLS safety for a database server? Choose all that apply.",
+     "options": [
+      "Minimum protocol version TLS 1.2",
+      "A certificate with a SAN for the real host name",
+      "Key file readable by all users",
+      "require_secure_transport = ON (MySQL)"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "A world-readable private key defeats the purpose, and PostgreSQL refuses to start with it."
+    },
+    {
+     "question": "Why distribute the CA certificate to clients instead of the server certificate?",
+     "options": [
+      "It is smaller",
+      "Renewing the server certificate does not break clients",
+      "It disables encryption",
+      "It speeds up queries"
+     ],
+     "answer": 1,
+     "explanation": "Clients trust the CA, so any new certificate it signs validates without a client change."
+    },
+    {
+     "question": "How can you list unencrypted sessions on PostgreSQL?",
+     "options": [
+      "SELECT * FROM pg_stat_ssl WHERE NOT ssl",
+      "SELECT * FROM pg_roles",
+      "SHOW ssl_ca_file only",
+      "pg_dump"
+     ],
+     "answer": 0,
+     "explanation": "pg_stat_ssl has one row per connection with its encryption state."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- TLS gives confidentiality, integrity and server authentication for connections to the database. It does not protect data at rest.\n- Enabling TLS is not enforcing it. Use `hostssl` plus `hostnossl ... reject` in PostgreSQL and `require_secure_transport = ON` in MySQL.\n- Certificates need a correct SAN, a private key with strict permissions, and a minimum of TLS 1.2.\n- Clients must use `verify-full` or `VERIFY_IDENTITY`; `prefer` and `require` leave you open to downgrade and impostors.\n- Verify with `psql \\conninfo`, `pg_stat_ssl` and `openssl s_client`, and track certificate expiry.\n\nNext, widen the view to storage and backups in [Encryption at Rest and in Transit](/learn/systems-infrastructure-security/encryption-at-rest-and-in-transit)."
+  }
+ ],
+ "ar": {
+  "title": "TLS والتشفير في قواعد البيانات",
+  "summary": "فعّل TLS في PostgreSQL وMySQL، وافرضه، واجعل العملاء يتحققون من الخادم، وراقب الجلسات غير المشفّرة.",
+  "objectives": [
+   "شرح ما يحميه TLS وما لا يحميه",
+   "إنشاء شهادة بـ SAN صحيح وتفعيل TLS في PostgreSQL وMySQL",
+   "فرض الاتصالات المشفّرة واختيار sslmode آمن للعميل",
+   "التحقق من الجلسات وتخطيط تجديد الشهادات"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يتصل مطوّر بقاعدة بيانات الإنتاج من مقهى باستخدام `psql -h db.example.com`. ينجح الاتصال فيبدو كل شيء سليمًا. لكن عملاء PostgreSQL وMySQL لا يشترطون التشفير افتراضيًّا. فكل استعلام وكل صف نتيجة، وبحسب طريقة المصادقة قد تكون هناك مواد مشتقة من كلمة المرور، قد يعبر الشبكة مقروءًا لكل من يلتقط الحزم على المسار.\n\nيعالج بروتوكول أمن طبقة النقل (TLS) ذلك بطريقتين: يشفّر الجلسة فتصبح الحركة الملتقطة بلا قيمة، ويتيح للعميل التحقق من أنه يخاطب خادم قاعدة البيانات الحقيقي لا منتحلًا. ومعظم الفرق تأخذ النصف الأول وتهمل الثاني. في هذا الدرس ستفعّل TLS في PostgreSQL وMySQL، وتُلزم العملاء باستخدامه، وتتحقق من الإعدادات على خوادم تملكها."
+   },
+   {
+    "id": "why",
+    "type": "text",
+    "markdown": "## ما الذي يحميه TLS وما الذي لا يحميه\n\nيحمي TLS البيانات **أثناء النقل** بين العميل وقاعدة البيانات. ولا يحمي البيانات على القرص ولا في النسخ الاحتياطية ولا في الذاكرة، وهذا موضوع [تشفير البيانات المخزنة والمنقولة](/learn/systems-infrastructure-security/encryption-at-rest-and-in-transit). كما أنه لا يقرر من يحق له الدخول؛ فالمصادقة والتفويض ضابطان مستقلان، كما في [المصادقة والتفويض في PostgreSQL](/learn/systems-infrastructure-security/postgresql-authentication-and-authorization).\n\nيمنحك اتصال TLS ثلاث خصائص:\n\n- **السرّية.** لا يرى المراقب السلبي إلا نصًّا مشفّرًا.\n- **السلامة.** لا يستطيع مهاجم نشط تعديل الاستعلامات أو النتائج دون أن يُكتشف.\n- **مصادقة الخادم.** يثبت الخادم هويته بشهادة موقّعة من جهة يثق بها العميل.\n\nالخاصية الثالثة هي التي يهملها الناس. فإن قبل العميل أي شهادة، استطاع مهاجم يقف بين العميل والخادم أن يعرض شهادته الخاصة ويفك تشفير الحركة ويمررها. فالتشفير دون تحقق لا يوقف إلا التنصت السلبي."
+   },
+   {
+    "id": "cert",
+    "type": "text",
+    "markdown": "## الخطوة 1: أنشئ جهة إصدار شهادات وشهادة للخادم\n\nفي الإنتاج استخدم جهة إصدار الشهادات (CA) الداخلية في مؤسستك أو خدمة مُدارة. وفي المختبر يكفي `openssl`. والمبدأ واحد: يثق العملاء بجهة إصدار واحدة، وهي توقّع شهادة خادم قاعدة البيانات.\n\nيجب أن تحمل شهادة الخادم اسم المضيف الذي يتصل به العملاء. ضع اسم DNS في حقل **الاسم البديل للموضوع** (SAN). تتجاهل العملاء الحديثة حقل الاسم الشائع (Common Name) متى وُجد SAN، وعدم التطابق هو أشيع سبب لفشل `verify-full`.\n\nأبقِ المفتاح الخاص مقروءًا لحساب قاعدة البيانات وحده. يرفض PostgreSQL الإقلاع إن كان ملف المفتاح مقروءًا للمجموعة أو للجميع، وهذا الفحص ميزة لا إزعاج."
+   },
+   {
+    "id": "openssl",
+    "type": "code",
+    "language": "bash",
+    "filename": "lab-ca.sh",
+    "caption": "شهادة CA مخبرية وشهادة خادم. الأسماء والمسارات أمثلة؛ شغّلها على مضيف تملكه.",
+    "code": "# 1. Create the CA key and a self-signed CA certificate (3 years)\nopenssl genrsa -out lab-ca.key 4096\nopenssl req -x509 -new -key lab-ca.key -sha256 -days 1095 \\\n  -subj \"/O=Example Lab/CN=Example Lab Root CA\" -out lab-ca.crt\n\n# 2. Create the server key and a signing request with a SAN\nopenssl genrsa -out db.key 2048\nopenssl req -new -key db.key -subj \"/CN=db.example.com\" \\\n  -addext \"subjectAltName=DNS:db.example.com\" -out db.csr\n\n# 3. Sign it with the CA (1 year)\nopenssl x509 -req -in db.csr -CA lab-ca.crt -CAkey lab-ca.key \\\n  -CAcreateserial -days 365 -sha256 \\\n  -copy_extensions copy -out db.crt\n\n# 4. Lock down the key for the postgres account\nsudo install -o postgres -g postgres -m 0600 db.key /etc/postgresql/16/main/db.key\nsudo install -o postgres -g postgres -m 0644 db.crt lab-ca.crt /etc/postgresql/16/main/",
+    "highlight": [
+     8,
+     9,
+     15,
+     18
+    ]
+   },
+   {
+    "id": "pg",
+    "type": "text",
+    "markdown": "## الخطوة 2: فعّل TLS وافرضه في PostgreSQL\n\nتفعيل TLS تغيير في `postgresql.conf`، وفرضه تغيير منفصل في `pg_hba.conf`. افعل الاثنين، فالأول وحده يجعل التشفير اختياريًّا فقط.\n\nفي `postgresql.conf` اضبط `ssl = on` وحدّد الشهادة والمفتاح، وارفع الحد الأدنى لإصدار البروتوكول إلى TLS 1.2 أو أعلى، ثم أعد تحميل الخدمة. بعد ذلك في `pg_hba.conf` استبدل أسطر `host` الواسعة بأسطر `hostssl`. لا يطابق سطر `hostssl` إلا الاتصالات المشفّرة، فالعميل الذي يحاول اتصالًا غير مشفّر لا يطابق أي قاعدة ويُرفض. وأضف أيضًا `hostnossl ... reject` حارسًا صريحًا ليرى المدير التالي القصد. والترتيب مهم: يستخدم PostgreSQL أول سطر مطابق. وتجد صياغة القواعد كاملة في [أمن ملف pg_hba.conf في PostgreSQL](/learn/systems-infrastructure-security/postgresql-pg-hba-conf-security)."
+   },
+   {
+    "id": "pgconf",
+    "type": "code",
+    "language": "ini",
+    "filename": "postgresql.conf and pg_hba.conf",
+    "caption": "إعدادات الخادم وقواعد الوصول التي تشترط TLS 1.2 أو أحدث (مسارات PostgreSQL 16).",
+    "code": "# --- postgresql.conf ---\nlisten_addresses = '10.20.2.5'\nssl = on\nssl_cert_file = '/etc/postgresql/16/main/db.crt'\nssl_key_file  = '/etc/postgresql/16/main/db.key'\nssl_ca_file   = '/etc/postgresql/16/main/lab-ca.crt'\nssl_min_protocol_version = 'TLSv1.2'\nssl_prefer_server_ciphers = on\n\n# --- pg_hba.conf (first match wins) ---\n# TYPE     DATABASE  USER      ADDRESS         METHOD\nhostssl    appdb     app_rw    10.20.1.0/24    scram-sha-256\nhostnossl  all       all       0.0.0.0/0       reject",
+    "highlight": [
+     3,
+     7,
+     12,
+     13
+    ]
+   },
+   {
+    "id": "mysql",
+    "type": "text",
+    "markdown": "## الخطوة 3: الضوابط نفسها في MySQL\n\nيفعّل MySQL 8 التشفير تلقائيًّا بشهادة يولّدها بنفسه، وهذا يعطي تشفيرًا بلا مصادقة للخادم. استبدلها بشهادة من جهة الإصدار لديك، ثم اجعل التشفير إلزاميًّا.\n\nالإعداد الأساسي هو `require_secure_transport = ON`، فيرفض الخادم أي اتصال TCP غير مشفّر. ويمكنك أيضًا إلزام حساب بعينه بـ `REQUIRE SSL`، أو اشتراط شهادة عميل بـ `REQUIRE X509` لحسابات الخدمات التي تستحق الجهد الإضافي. وقيّد البروتوكولات بـ `tls_version = TLSv1.2,TLSv1.3`.\n\n| الضابط | PostgreSQL | MySQL 8 |\n|:--|:--|:--|\n| تشغيل TLS | `ssl = on` | `ssl_cert` و`ssl_key` و`ssl_ca` في `my.cnf` |\n| رفض النص الصريح | `hostssl` مع `hostnossl ... reject` | `require_secure_transport = ON` |\n| الحد الأدنى للإصدار | `ssl_min_protocol_version` | `tls_version` |\n| اشتراط لكل مستخدم | قاعدة `hostssl` لكل مستخدم | `ALTER USER ... REQUIRE SSL` |\n| شهادة العميل | `clientcert=verify-full` في `pg_hba.conf` | `REQUIRE X509` أو `REQUIRE SUBJECT` |"
+   },
+   {
+    "id": "mycnf",
+    "type": "code",
+    "language": "ini",
+    "filename": "/etc/mysql/mysql.conf.d/tls.cnf",
+    "caption": "إعدادات TLS لخادم MySQL. المسارات أمثلة.",
+    "code": "[mysqld]\nbind-address            = 10.20.2.6\nssl_ca                  = /etc/mysql/certs/lab-ca.crt\nssl_cert                = /etc/mysql/certs/db.crt\nssl_key                 = /etc/mysql/certs/db.key\ntls_version             = TLSv1.2,TLSv1.3\nrequire_secure_transport = ON",
+    "highlight": [
+     3,
+     4,
+     5,
+     6,
+     7
+    ]
+   },
+   {
+    "id": "tlsflow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "كيف تُبنى جلسة TLS موثّقة مع قاعدة البيانات",
+    "caption": "يحدث التحقق قبل إرسال أي بيانات اعتماد أو استعلامات.",
+    "data": {
+     "token": "مصافحة",
+     "nodes": [
+      {
+       "id": "cl",
+       "label": "عميل التطبيق",
+       "sub": "10.20.1.10",
+       "icon": "server"
+      },
+      {
+       "id": "net",
+       "label": "مسار الشبكة",
+       "sub": "untrusted",
+       "icon": "cloud"
+      },
+      {
+       "id": "db",
+       "label": "قاعدة البيانات",
+       "sub": "db.example.com",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "at": "cl",
+       "caption": "يفتح العميل اتصالًا ويرسل ClientHello بإصدارات TLS التي يدعمها."
+      },
+      {
+       "at": "net",
+       "caption": "يرى مراقب سلبي على المسار بيانات المصافحة الوصفية فقط.",
+       "tone": "warning"
+      },
+      {
+       "at": "db",
+       "caption": "يختار الخادم TLS 1.3 ويرسل شهادته الخاصة بـ db.example.com."
+      },
+      {
+       "at": "cl",
+       "caption": "يتحقق العميل من التوقيع مقابل جهة CA المخبرية ومن الاسم مقابل SAN (verify-full).",
+       "tone": "secure"
+      },
+      {
+       "at": "db",
+       "caption": "يُتفق على المفاتيح فتُشفّر الجلسة وتبدأ مصادقة كلمة المرور داخلها.",
+       "tone": "success"
+      },
+      {
+       "at": "net",
+       "caption": "مهاجم بشهادة مختلفة يفشل في فحص الاسم، فيقطع العميل الاتصال.",
+       "tone": "blocked"
+      }
+     ]
+    }
+   },
+   {
+    "id": "client",
+    "type": "text",
+    "markdown": "## الخطوة 4: اجعل العملاء يتحققون من الخادم\n\nجانب الخادم نصف العمل فقط. فالعملاء يختارون مدى صرامة الفحص. وللإعداد `sslmode` في PostgreSQL قيم عدة، والضعيفة منها شائعة في الأمثلة البرمجية.\n\n| sslmode | يشفّر | يتحقق من CA | يتحقق من اسم المضيف | الحكم |\n|:--|:--|:--|:--|:--|\n| `disable` | لا | لا | لا | لا تستخدمه أبدًا |\n| `prefer` | إن عُرض | لا | لا | خفض صامت للأمان ممكن |\n| `require` | نعم | لا | لا | يمنع التنصت فقط |\n| `verify-ca` | نعم | نعم | لا | أفضل، لكنه يقبل شهادة صالحة لمضيف آخر |\n| `verify-full` | نعم | نعم | نعم | استخدمه |\n\nوالفكرة نفسها تنطبق في مواضع أخرى. في عملاء MySQL استخدم `--ssl-mode=VERIFY_IDENTITY`. وفي مشغّلات التطبيقات ابحث عن الراية المكافئة ووزّع شهادة CA مع التطبيق لا شهادة الخادم، حتى لا تنكسر العملاء عند التجديد."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "التراجع إلى النص الصريح يخفي الأعطال",
+    "markdown": "مع `sslmode=prefer` يتراجع خادم مضبوط خطأً إلى النص الصريح بصمت ويستمر التطبيق في العمل، ولا يلاحظ أحد حتى يقع تدقيق أو حادث. اضبط `verify-full` في كل سلسلة اتصال، وأبقِ قاعدة `hostnossl ... reject` ليكون الفشل مسموعًا."
+   },
+   {
+    "id": "verify",
+    "type": "text",
+    "markdown": "## الخطوة 5: تحقّق وراقب وبدّل\n\nافحص النتيجة من العميل ومن الخادم. على العميل يعرض `psql` البروتوكول والشيفرة. وعلى الخادم يعرض `pg_stat_ssl` كل اتصال وهل هو مشفّر، فيسهل التنبيه على أي جلسة قيمة `ssl` فيها false. ومن مضيف ثالث يُظهر `openssl s_client` ما يراه الماسح، بما فيه سلسلة الشهادات وتاريخ انتهائها.\n\nتنتهي الشهادات، والشهادة المنتهية تحت `verify-full` تعني انقطاع الخدمة. تتبّع تواريخ الانتهاء وجدّد قبل 30 يومًا على الأقل، وفضّل الأعمار القصيرة مع الأتمتة. وتؤدي إعادة تحميل PostgreSQL (`pg_ctl reload`) إلى التقاط ملفات الشهادات الجديدة دون قطع الجلسات. ولتدقيق أحداث الاتصال انظر [تدقيق قواعد البيانات وتسجيل النشاط](/learn/systems-infrastructure-security/database-auditing-and-activity-logging)."
+   },
+   {
+    "id": "vterm",
+    "type": "terminal",
+    "title": "التحقق من TLS (شبكة مخبرية)",
+    "lines": [
+     {
+      "cmd": "psql \"host=db.example.com dbname=appdb user=app_rw sslmode=verify-full sslrootcert=lab-ca.crt\" -c \"\\conninfo\"",
+      "output": "You are connected to database \"appdb\" as user \"app_rw\" on host \"db.example.com\" (address \"10.20.2.5\") at port \"5432\".\nSSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)",
+      "comment": "نجح verify-full: TLS 1.3 وتطابق الاسم مع SAN."
+     },
+     {
+      "cmd": "psql \"host=db.example.com dbname=appdb user=app_rw sslmode=disable\"",
+      "output": "psql: error: connection to server at \"db.example.com\" (10.20.2.5), port 5432 failed: FATAL:  no pg_hba.conf entry for host \"10.20.1.10\", user \"app_rw\", database \"appdb\", no encryption",
+      "comment": "رُفض النص الصريح بقاعدة hostnossl reject."
+     },
+     {
+      "cmd": "sudo -u postgres psql -c \"SELECT pid, ssl, version, cipher FROM pg_stat_ssl WHERE NOT ssl;\"",
+      "output": " pid | ssl | version | cipher\n-----+-----+---------+--------\n(0 rows)",
+      "comment": "لا جلسات غير مشفّرة. نبّه إن أعاد صفوفًا يومًا."
+     },
+     {
+      "cmd": "openssl s_client -connect db.example.com:5432 -starttls postgres -CAfile lab-ca.crt </dev/null 2>/dev/null | grep -E \"Verify return|Protocol\"",
+      "output": "    Protocol  : TLSv1.3\nVerify return code: 0 (ok)",
+      "comment": "شغّله من مضيف ثالث؛ الرمز 0 يعني صحة السلسلة. افحص الانتهاء بـ openssl x509 -noout -enddate."
+     }
+    ],
+    "caption": "مخرجات مثال؛ تعتمد الإصدارات والشيفرات على بنائك."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على آلة مخبرية **تملكها** تشغّل PostgreSQL، أنشئ جهة CA مخبرية وشهادة خادم بـ SAN لاسم مثل `db.example.com` باستخدام السكربت النموذجي.\n2. اضبط `ssl = on` ومسارات الملفات الثلاثة و`ssl_min_protocol_version = 'TLSv1.2'` ثم أعد التحميل. وأضف سطري `hostssl` و`hostnossl ... reject` إلى `pg_hba.conf`.\n3. من آلة مخبرية ثانية أضف `db.example.com` إلى `/etc/hosts` واتصل بـ `sslmode=disable` و`require` و`verify-full`. سجّل أيها ينجح.\n4. غيّر SAN إلى اسم خاطئ وتأكد أن `verify-full` يفشل بينما يظل `require` يتصل. ثم شغّل استعلام `pg_stat_ssl`."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "TLS",
+      "definition": "بروتوكول يشفّر الاتصالات الشبكية ويوثّقها."
+     },
+     {
+      "term": "جهة إصدار الشهادات (CA)",
+      "definition": "جهة موثوقة توقّع الشهادات."
+     },
+     {
+      "term": "SAN",
+      "definition": "الاسم البديل للموضوع: أسماء المضيفات التي تصلح الشهادة لها."
+     },
+     {
+      "term": "sslmode",
+      "definition": "إعداد عميل PostgreSQL يتحكم بالتشفير والتحقق."
+     },
+     {
+      "term": "verify-full",
+      "definition": "وضع يفحص توقيع CA واسم المضيف."
+     },
+     {
+      "term": "hostssl",
+      "definition": "نوع في pg_hba.conf يطابق الاتصالات المشفّرة فقط."
+     },
+     {
+      "term": "require_secure_transport",
+      "definition": "خيار في MySQL يرفض الاتصالات غير المشفّرة."
+     },
+     {
+      "term": "الخفض",
+      "definition": "التراجع من المشفّر إلى النص الصريح بصمت."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما الذي لا يحمي منه sslmode=require؟",
+      "options": [
+       "التنصت السلبي",
+       "خادم منتحل بشهادة مختلفة",
+       "التقاط الحزم على Wi-Fi",
+       "إعادة تشغيل النص المشفّر"
+      ],
+      "answer": 1,
+      "explanation": "يشفّر require لكنه لا يتحقق من الشهادة، فيستطيع المهاجم المعترض عرض أي شهادة."
+     },
+     {
+      "question": "أي نوع سطر في pg_hba.conf يرفض الاتصالات غير المشفّرة حين يقترن بقاعدة reject؟",
+      "options": [
+       "host",
+       "local",
+       "hostnossl",
+       "hostssl"
+      ],
+      "answer": 2,
+      "explanation": "يطابق hostnossl الاتصالات غير المشفّرة فقط، فاقترانه بـ reject يحجبها صراحةً."
+     },
+     {
+      "question": "أي الإعدادات تحسّن أمان TLS لخادم قاعدة بيانات؟ اختر كل ما ينطبق.",
+      "options": [
+       "حد أدنى TLS 1.2",
+       "شهادة بـ SAN لاسم المضيف الحقيقي",
+       "ملف مفتاح مقروء لكل المستخدمين",
+       "require_secure_transport = ON (في MySQL)"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "المفتاح الخاص المقروء للجميع يُبطل الغرض، ويرفض PostgreSQL الإقلاع به."
+     },
+     {
+      "question": "لماذا توزّع شهادة CA على العملاء لا شهادة الخادم؟",
+      "options": [
+       "حجمها أصغر",
+       "تجديد شهادة الخادم لا يكسر العملاء",
+       "تعطّل التشفير",
+       "تسرّع الاستعلامات"
+      ],
+      "answer": 1,
+      "explanation": "يثق العملاء بجهة CA، فتُقبل أي شهادة جديدة توقّعها دون تغيير في العميل."
+     },
+     {
+      "question": "كيف تسرد الجلسات غير المشفّرة في PostgreSQL؟",
+      "options": [
+       "SELECT * FROM pg_stat_ssl WHERE NOT ssl",
+       "SELECT * FROM pg_roles",
+       "SHOW ssl_ca_file فقط",
+       "pg_dump"
+      ],
+      "answer": 0,
+      "explanation": "يحوي pg_stat_ssl صفًّا لكل اتصال مع حالة تشفيره."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يمنح TLS السرّية والسلامة ومصادقة الخادم لاتصالات قاعدة البيانات، ولا يحمي البيانات المخزنة.\n- تفعيل TLS ليس فرضه. استخدم `hostssl` مع `hostnossl ... reject` في PostgreSQL و`require_secure_transport = ON` في MySQL.\n- تحتاج الشهادات إلى SAN صحيح ومفتاح خاص بأذونات صارمة وحد أدنى TLS 1.2.\n- يجب أن يستخدم العملاء `verify-full` أو `VERIFY_IDENTITY`؛ فـ `prefer` و`require` يتركانك عرضة للخفض والمنتحلين.\n- تحقق بـ `psql \\conninfo` و`pg_stat_ssl` و`openssl s_client`، وتتبّع انتهاء الشهادات.\n\nوالآن وسّع النظر إلى التخزين والنسخ الاحتياطية في [تشفير البيانات المخزنة والمنقولة](/learn/systems-infrastructure-security/encryption-at-rest-and-in-transit)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,584 @@
+{
+ "slug": "vm-to-vm-network-isolation",
+ "title": "VM-to-VM Network Isolation",
+ "summary": "Stop lateral movement between Proxmox VMs with tiered bridges, default-deny firewall rules, anti-spoofing options and tests.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Plan network tiers and the flows each one needs",
+  "Create internal bridges per tier",
+  "Write default-deny VM rules with macfilter and ipfilter",
+  "Prove isolation with allowed and blocked flow tests"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "An attacker rarely stops at the first machine. They break into a public web server, then look around: which other systems can this machine reach? On a default Proxmox setup the answer is often \"all of them.\" Every VM plugged into the same bridge shares one Layer 2 network, so the compromised web server can scan the database VM, the backup VM and the domain controller as easily as a laptop on the same switch.\n\nThis movement from one system to the next is lateral movement, and network isolation is the control that stops it. In this lesson you will plan tiers, enforce them with separate bridges and VM firewall rules, block address spoofing, and prove the result with tests you run against your own systems. It builds on [Proxmox firewall configuration](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+  },
+  {
+   "type": "text",
+   "id": "plan",
+   "markdown": "## Step 1: Plan tiers and allowed flows\n\nStart on paper. Group VMs by role and trust, then list the flows each tier genuinely needs. Everything not on the list is denied.\n\n| Tier | Subnet | May initiate to | Port |\n|:--|:--|:--|:--|\n| Web | 10.10.10.0/24 | App | TCP 8080 |\n| App | 10.10.20.0/24 | Database | TCP 5432 |\n| Database | 10.10.30.0/24 | Backup host | TCP 22 |\n| Management | 192.0.2.0/24 | All tiers | TCP 22 |\n\nNotice what is absent. Web never talks to the database. Nobody starts a connection to the management network. Each row is a rule you can test, and each missing row is a lateral path you have closed.\n\nTwo design choices follow:\n\n- **Segment at Layer 2 or Layer 3?** Separate bridges or VLANs per tier force traffic through a router or firewall VM, which can log and filter. Rules on each VM are a second layer on top.\n- **Where is the choke point?** Traffic between tiers should pass a place you control. That might be the Proxmox firewall on each VM, a virtual router, or both."
+  },
+  {
+   "type": "text",
+   "id": "bridges",
+   "markdown": "## Step 2: Build separate bridges\n\nCreate one Linux bridge per tier with no physical port, so it exists only on the host. VMs on `vmbr10` cannot reach `vmbr20` at Layer 2 at all. Only a router or firewall VM with a leg on each bridge can connect them.\n\nAdd the bridges in `/etc/network/interfaces` on the node, then apply with `ifreload -a`."
+  },
+  {
+   "type": "code",
+   "id": "bridge-code",
+   "language": "ini",
+   "code": "auto vmbr10\niface vmbr10 inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n    # web tier, no uplink\n\nauto vmbr20\niface vmbr20 inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n    # app tier\n\nauto vmbr30\niface vmbr30 inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n    # database tier",
+   "filename": "/etc/network/interfaces (excerpt)",
+   "caption": "Three internal bridges with no physical uplink."
+  },
+  {
+   "type": "text",
+   "id": "rules",
+   "markdown": "## Step 3: Enforce flows with VM firewall rules\n\nBridges separate tiers. Firewall rules restrict what is allowed within and between them. Give each VM a default deny and allow only its documented callers.\n\nAdd the anti-spoofing options too. Without `macfilter` and `ipfilter`, a compromised VM can forge another machine's addresses and poison neighbors' ARP tables to redirect traffic."
+  },
+  {
+   "type": "code",
+   "id": "rules-code",
+   "language": "ini",
+   "code": "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nmacfilter: 1\nipfilter: 1\n\n[IPSET ipfilter-net0]\n10.10.30.10\n\n[RULES]\nIN ACCEPT -source 10.10.20.0/24 -p tcp -dport 5432 -log info # app tier only\nIN SSH(ACCEPT) -source 192.0.2.0/24 # management\nIN DROP -log warning\nOUT ACCEPT -dest 10.10.30.5 -p tcp -dport 22 # backup host\nOUT DNS(ACCEPT) -dest 10.10.30.2 # internal resolver\nOUT DROP -log warning",
+   "filename": "/etc/pve/firewall/130.fw",
+   "caption": "A database VM that accepts connections only from the app tier and calls out only to backup and DNS."
+  },
+  {
+   "type": "animation",
+   "id": "lateral-flow",
+   "kind": "flow",
+   "title": "Blocking lateral movement",
+   "caption": "A compromised web server tries to reach the database.",
+   "data": {
+    "token": "TCP/8080",
+    "nodes": [
+     {
+      "id": "web",
+      "label": "Web VM",
+      "sub": "10.10.10.10",
+      "icon": "server"
+     },
+     {
+      "id": "fw1",
+      "label": "Tier firewall",
+      "sub": "rules per VM",
+      "icon": "firewall"
+     },
+     {
+      "id": "app",
+      "label": "App VM",
+      "sub": "10.10.20.10",
+      "icon": "server"
+     },
+     {
+      "id": "db",
+      "label": "Database VM",
+      "sub": "10.10.30.10",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "at": "web",
+      "caption": "The web VM calls the application on TCP 8080."
+     },
+     {
+      "at": "fw1",
+      "caption": "The flow web to app on 8080 is on the allow list.",
+      "tone": "success"
+     },
+     {
+      "at": "app",
+      "caption": "The request is delivered."
+     },
+     {
+      "at": "web",
+      "token": "TCP/5432",
+      "caption": "An attacker on the web VM tries the database port directly.",
+      "tone": "attack"
+     },
+     {
+      "at": "fw1",
+      "token": "TCP/5432",
+      "caption": "No rule allows web to database: dropped and logged.",
+      "tone": "blocked"
+     },
+     {
+      "at": "app",
+      "token": "TCP/5432",
+      "caption": "The app VM, which is allowed, reaches the database.",
+      "tone": "success"
+     },
+     {
+      "at": "db",
+      "token": "TCP/5432",
+      "caption": "Only the app tier ever connects to the database.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "sdn",
+   "markdown": "## Choosing where to enforce\n\nYou now have two enforcement points, and they complement each other.\n\n| Approach | Strength | Weakness |\n|:--|:--|:--|\n| Per-VM firewall rules | Follows the VM when it migrates; blocks traffic even inside one bridge | Many files to keep consistent |\n| Router or firewall VM between bridges | One place to log and inspect inter-tier traffic | Does not stop VMs on the same bridge from reaching each other |\n| Proxmox SDN zones and VNets | Central definition of networks across a cluster | Needs planning; check which isolation options your release offers |\n\nA sound design uses both. Bridges and a router carve out the tiers. Per-VM rules then protect machines inside a tier from each other, because two web servers rarely need to talk to one another. Recent releases of Proxmox SDN also let you isolate ports within a virtual network, which stops guests on the same VNet from communicating while still letting each reach the gateway. Check the documentation for your version before relying on it.\n\nKeep the allowed-flow table in version control. When a developer asks for a new connection, the change request becomes a one-line edit to the table and a matching rule, with an owner and a reason attached."
+  },
+  {
+   "type": "text",
+   "id": "verify",
+   "markdown": "## Step 4: Prove it with tests\n\nA diagram is a claim; a test is evidence. From inside each VM you own, test both the flows that should work and the ones that should not. Use short timeouts so a blocked flow fails fast.\n\nRun these tests after every change and keep the results with the change record. A blocked flow should appear in `/var/log/pve-firewall.log`. If it does not, the traffic took another path or the rule never loaded."
+  },
+  {
+   "type": "terminal",
+   "id": "verify-term",
+   "title": "web01 (10.10.10.10) - isolation tests",
+   "lines": [
+    {
+     "cmd": "nc -zv -w3 10.10.20.10 8080",
+     "output": "Connection to 10.10.20.10 8080 port [tcp/http-alt] succeeded!",
+     "comment": "Allowed flow works."
+    },
+    {
+     "cmd": "nc -zv -w3 10.10.30.10 5432",
+     "output": "nc: connect to 10.10.30.10 port 5432 (tcp) timed out: Operation now in progress",
+     "comment": "Web to database is silently dropped, as designed."
+    },
+    {
+     "cmd": "nmap -Pn -p 22,5432 10.10.30.10",
+     "output": "PORT     STATE    SERVICE\n22/tcp   filtered ssh\n5432/tcp filtered postgresql",
+     "comment": "Run only against your own lab. `filtered` means a firewall is dropping probes."
+    },
+    {
+     "cmd": "ip neigh show",
+     "output": "10.10.10.1 dev eth0 lladdr bc:24:11:aa:bb:01 REACHABLE",
+     "comment": "Only the gateway appears. Other tiers are not on this L2 segment."
+    }
+   ],
+   "caption": "Testing allowed and blocked flows from the web tier."
+  },
+  {
+   "type": "callout",
+   "id": "pitfall",
+   "variant": "warning",
+   "title": "Common gaps",
+   "markdown": "- **Forgetting the NIC flag.** Rules do nothing unless the VM's network device has `firewall=1`.\n- **A multi-homed VM.** A VM with legs on two tiers bypasses the design. Treat it as a router and filter it.\n- **Allow-all management.** Management access to every VM from one broad range can itself become the lateral path. Prefer a jump host.\n- **Only inbound rules.** Without outbound filtering, a compromised VM can still reach any destination the policy allows.\n- **No test after changes.** Rules drift. Re-test regularly."
+  },
+  {
+   "type": "callout",
+   "id": "log-tip",
+   "variant": "tip",
+   "title": "Make blocked traffic useful",
+   "markdown": "A dropped packet is also a detection. Legitimate software rarely tries ports it has no business using, so repeated drops from one VM to many internal addresses look like scanning from a compromised host. Send `/var/log/pve-firewall.log` to your central log system and alert on one source hitting many destinations. Rate-limit logging with `log_ratelimit` so a noisy scan cannot fill the disk, and review the top blocked sources every week."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab node you own, build a two-tier design:\n\n1. Create `vmbr10` and `vmbr20` with no uplink, and place two VMs on each of them with `firewall=1`.\n2. Give the second-tier VM a default deny rule file that allows TCP 8080 from the first tier only.\n3. From the first-tier VM, run `nc -zv -w3` to port 8080 (should succeed) and to port 22 (should time out).\n4. Find the blocked attempt in `/var/log/pve-firewall.log`, then disable the rule file and confirm that the test now succeeds."
+  },
+  {
+   "type": "keyterms",
+   "id": "kt",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Lateral movement",
+     "definition": "An attacker moving from one compromised system to others on the network."
+    },
+    {
+     "term": "Network segmentation",
+     "definition": "Dividing a network into zones with controlled traffic between them."
+    },
+    {
+     "term": "Bridge",
+     "definition": "A virtual Layer 2 switch that connects VM network interfaces."
+    },
+    {
+     "term": "Default deny",
+     "definition": "A policy that drops traffic unless a rule allows it."
+    },
+    {
+     "term": "ARP spoofing",
+     "definition": "Forging ARP replies to redirect traffic through an attacker."
+    },
+    {
+     "term": "MAC filter",
+     "definition": "A Proxmox option that drops frames with a forged source MAC."
+    },
+    {
+     "term": "Choke point",
+     "definition": "A place where all traffic between zones passes and can be filtered."
+    },
+    {
+     "term": "Jump host",
+     "definition": "A hardened system used as the single path for administration."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why is the default single bridge a problem?",
+     "options": [
+      "It is slow",
+      "All VMs on it share one Layer 2 network and can reach each other",
+      "It blocks the internet",
+      "It needs a license"
+     ],
+     "answer": 1,
+     "explanation": "A compromised VM can scan and attack neighbors without crossing any filter."
+    },
+    {
+     "question": "Which Proxmox options help against address spoofing from a VM? (choose all that apply)",
+     "options": [
+      "`macfilter: 1`",
+      "`ipfilter: 1`",
+      "`policy_in: ACCEPT`",
+      "Giving all VMs the same MAC"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "These drop frames and packets whose source MAC or IP does not belong to the NIC."
+    },
+    {
+     "question": "A test from the web VM to the database port times out. What does it show?",
+     "options": [
+      "The firewall is broken",
+      "The flow is blocked as designed",
+      "The database is down for everyone",
+      "DNS failed"
+     ],
+     "answer": 1,
+     "explanation": "A timeout on a port that should be denied is the expected evidence. Confirm the drop in the firewall log."
+    },
+    {
+     "question": "What is the risk of a VM with network legs on two tiers?",
+     "options": [
+      "None",
+      "It can act as a bridge between tiers and bypass segmentation",
+      "It uses more RAM",
+      "It cannot be backed up"
+     ],
+     "answer": 1,
+     "explanation": "It becomes an unfiltered path between zones unless you treat and filter it as a router."
+    },
+    {
+     "question": "Why filter outbound traffic from a database VM?",
+     "options": [
+      "To save bandwidth",
+      "To stop a compromised VM from calling out or spreading",
+      "To speed up queries",
+      "It is required by PostgreSQL"
+     ],
+     "answer": 1,
+     "explanation": "Outbound rules restrict command-and-control, data exfiltration and spread to other tiers."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nLateral movement thrives on flat networks. Plan tiers and their allowed flows, give each tier its own bridge, and enforce default-deny rules on every VM in both directions. Add `macfilter` and `ipfilter` against spoofing, and avoid multi-homed VMs and broad management access.\n\nFinally, test. Probe the flows that should work and those that should fail, and confirm the drops in the log. Next, see how VLANs extend this design across physical switches in [virtual bridges and VLAN-aware networking](/learn/systems-infrastructure-security/virtual-bridges-and-vlan-aware-networking)."
+  }
+ ],
+ "ar": {
+  "title": "العزل الشبكي بين الأجهزة الافتراضية",
+  "summary": "أوقف الحركة الجانبية بين أجهزة Proxmox بجسور مقسّمة وقواعد رفض افتراضي وخيارات مضادة للانتحال واختبارات.",
+  "objectives": [
+   "تخطيط طبقات الشبكة والتدفقات التي تحتاجها كل طبقة",
+   "إنشاء جسور داخلية لكل طبقة",
+   "كتابة قواعد رفض افتراضي للأجهزة مع macfilter وipfilter",
+   "إثبات العزل باختبارات التدفقات المسموحة والمحجوبة"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "نادرًا ما يتوقف المهاجم عند أول جهاز. يخترق خادم ويب عامًا ثم يتجول: ما الأنظمة الأخرى التي يصل إليها هذا الجهاز؟ في إعداد Proxmox الافتراضي كثيرًا ما يكون الجواب «كلها». كل جهاز افتراضي موصول بالجسر نفسه يتشارك شبكة الطبقة الثانية نفسها، فيستطيع خادم الويب المخترَق فحص جهاز قاعدة البيانات وجهاز النسخ الاحتياطي ووحدة تحكم النطاق بسهولة حاسوب محمول على المبدّل نفسه.\n\nهذا الانتقال من نظام إلى آخر هو الحركة الجانبية (lateral movement)، والعزل الشبكي هو الضابط الذي يوقفها. في هذا الدرس تخطط للطبقات، وتفرضها بجسور منفصلة وقواعد جدار حماية الأجهزة، وتمنع انتحال العناوين، وتثبت النتيجة باختبارات تجريها على أنظمتك. يبني الدرس على [تهيئة جدار الحماية في Proxmox](/learn/systems-infrastructure-security/proxmox-firewall-configuration)."
+   },
+   {
+    "type": "text",
+    "id": "plan",
+    "markdown": "## الخطوة 1: خطّط للطبقات والتدفقات المسموحة\n\nابدأ على الورق. صنّف الأجهزة بحسب الدور والثقة، ثم اسرد التدفقات التي تحتاجها كل طبقة فعلًا. كل ما ليس في القائمة مرفوض.\n\n| الطبقة | الشبكة الفرعية | يجوز أن تبادر إلى | المنفذ |\n|:--|:--|:--|:--|\n| الويب | 10.10.10.0/24 | التطبيق | TCP 8080 |\n| التطبيق | 10.10.20.0/24 | قاعدة البيانات | TCP 5432 |\n| قاعدة البيانات | 10.10.30.0/24 | مضيف النسخ الاحتياطي | TCP 22 |\n| الإدارة | 192.0.2.0/24 | كل الطبقات | TCP 22 |\n\nلاحظ ما هو غائب. الويب لا يتحدث مع قاعدة البيانات أبدًا. لا أحد يبدأ اتصالًا إلى شبكة الإدارة. كل صف قاعدة يمكنك اختبارها، وكل صف غائب مسار جانبي أغلقته.\n\nقراران تصميميان يتبعان:\n\n- **التقسيم في الطبقة الثانية أم الثالثة؟** جسور أو VLAN منفصلة لكل طبقة تجبر الحركة على المرور عبر موجّه أو جهاز جدار حماية يستطيع التسجيل والترشيح. وقواعد كل جهاز طبقة ثانية فوق ذلك.\n- **أين نقطة الاختناق؟** يجب أن تمر الحركة بين الطبقات بمكان تتحكم به. قد يكون جدار حماية Proxmox على كل جهاز، أو موجّهًا افتراضيًا، أو كليهما."
+   },
+   {
+    "type": "text",
+    "id": "bridges",
+    "markdown": "## الخطوة 2: ابنِ جسورًا منفصلة\n\nأنشئ جسر Linux واحدًا لكل طبقة بلا منفذ فيزيائي، فيوجد داخل المضيف فقط. لا تستطيع الأجهزة على `vmbr10` الوصول إلى `vmbr20` في الطبقة الثانية إطلاقًا. وحده موجّه أو جهاز جدار حماية له ساق على كل جسر يستطيع ربطهما.\n\nأضف الجسور في `/etc/network/interfaces` على العقدة ثم طبّق بالأمر `ifreload -a`."
+   },
+   {
+    "type": "code",
+    "id": "bridge-code",
+    "language": "ini",
+    "code": "auto vmbr10\niface vmbr10 inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n    # web tier, no uplink\n\nauto vmbr20\niface vmbr20 inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n    # app tier\n\nauto vmbr30\niface vmbr30 inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n    # database tier",
+    "filename": "/etc/network/interfaces (excerpt)",
+    "caption": "ثلاثة جسور داخلية بلا منفذ فيزيائي."
+   },
+   {
+    "type": "text",
+    "id": "rules",
+    "markdown": "## الخطوة 3: افرض التدفقات بقواعد جدار حماية الأجهزة\n\nتفصل الجسور بين الطبقات، وتقيّد قواعد جدار الحماية ما يُسمح به داخلها وبينها. أعطِ كل جهاز رفضًا افتراضيًا واسمح لمستدعيه الموثّقين فقط.\n\nأضف خيارات منع الانتحال أيضًا. فبدون `macfilter` و`ipfilter` يستطيع جهاز مخترَق تزوير عناوين جهاز آخر وتسميم جداول ARP للجيران لإعادة توجيه الحركة."
+   },
+   {
+    "type": "code",
+    "id": "rules-code",
+    "language": "ini",
+    "code": "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nmacfilter: 1\nipfilter: 1\n\n[IPSET ipfilter-net0]\n10.10.30.10\n\n[RULES]\nIN ACCEPT -source 10.10.20.0/24 -p tcp -dport 5432 -log info # app tier only\nIN SSH(ACCEPT) -source 192.0.2.0/24 # management\nIN DROP -log warning\nOUT ACCEPT -dest 10.10.30.5 -p tcp -dport 22 # backup host\nOUT DNS(ACCEPT) -dest 10.10.30.2 # internal resolver\nOUT DROP -log warning",
+    "filename": "/etc/pve/firewall/130.fw",
+    "caption": "جهاز قاعدة بيانات يقبل الاتصالات من طبقة التطبيق فقط ولا يتصل للخارج إلا بالنسخ الاحتياطي وDNS."
+   },
+   {
+    "type": "animation",
+    "id": "lateral-flow",
+    "kind": "flow",
+    "title": "حجب الحركة الجانبية",
+    "caption": "خادم ويب مخترَق يحاول الوصول إلى قاعدة البيانات.",
+    "data": {
+     "token": "TCP/8080",
+     "nodes": [
+      {
+       "id": "web",
+       "label": "جهاز الويب",
+       "sub": "10.10.10.10",
+       "icon": "server"
+      },
+      {
+       "id": "fw1",
+       "label": "جدار حماية الطبقة",
+       "sub": "قواعد لكل جهاز",
+       "icon": "firewall"
+      },
+      {
+       "id": "app",
+       "label": "جهاز التطبيق",
+       "sub": "10.10.20.10",
+       "icon": "server"
+      },
+      {
+       "id": "db",
+       "label": "جهاز قاعدة البيانات",
+       "sub": "10.10.30.10",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "at": "web",
+       "caption": "يستدعي جهاز الويب التطبيق على TCP 8080."
+      },
+      {
+       "at": "fw1",
+       "caption": "تدفق الويب إلى التطبيق على 8080 ضمن قائمة السماح.",
+       "tone": "success"
+      },
+      {
+       "at": "app",
+       "caption": "يُسلَّم الطلب."
+      },
+      {
+       "at": "web",
+       "token": "TCP/5432",
+       "caption": "مهاجم على جهاز الويب يجرّب منفذ قاعدة البيانات مباشرة.",
+       "tone": "attack"
+      },
+      {
+       "at": "fw1",
+       "token": "TCP/5432",
+       "caption": "لا قاعدة تسمح من الويب إلى قاعدة البيانات: تُسقط وتُسجَّل.",
+       "tone": "blocked"
+      },
+      {
+       "at": "app",
+       "token": "TCP/5432",
+       "caption": "جهاز التطبيق المسموح له يصل إلى قاعدة البيانات.",
+       "tone": "success"
+      },
+      {
+       "at": "db",
+       "token": "TCP/5432",
+       "caption": "طبقة التطبيق وحدها تتصل بقاعدة البيانات.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "sdn",
+    "markdown": "## اختيار مكان الفرض\n\nلديك الآن نقطتا فرض متكاملتان.\n\n| المنهج | نقطة القوة | نقطة الضعف |\n|:--|:--|:--|\n| قواعد جدار حماية لكل جهاز | تتبع الجهاز عند ترحيله، وتحجب الحركة حتى داخل جسر واحد | ملفات كثيرة يجب إبقاؤها متسقة |\n| موجّه أو جهاز جدار حماية بين الجسور | مكان واحد لتسجيل وفحص الحركة بين الطبقات | لا يمنع أجهزة الجسر الواحد من الوصول بعضها إلى بعض |\n| مناطق وVNet في Proxmox SDN | تعريف مركزي للشبكات عبر العنقود | يحتاج تخطيطًا؛ تحقق من خيارات العزل التي يقدمها إصدارك |\n\nالتصميم السليم يستخدم الاثنين. تقتطع الجسور والموجّه الطبقات، ثم تحمي قواعد كل جهاز الأجهزة داخل الطبقة من بعضها، فخادما ويب نادرًا ما يحتاجان إلى التحدث معًا. كما تتيح الإصدارات الحديثة من Proxmox SDN عزل المنافذ داخل الشبكة الافتراضية، فيُمنع الضيوف على VNet واحدة من التواصل مع بقاء كل منهم قادرًا على بلوغ البوابة. راجع وثائق إصدارك قبل الاعتماد على ذلك.\n\nاحتفظ بجدول التدفقات المسموحة في نظام التحكم بالإصدارات. حين يطلب مطوّر اتصالًا جديدًا يصبح طلب التغيير تعديل سطر واحد في الجدول وقاعدة مطابقة، مع مالك وسبب مرفقين."
+   },
+   {
+    "type": "text",
+    "id": "verify",
+    "markdown": "## الخطوة 4: أثبت ذلك بالاختبارات\n\nالمخطط ادعاء، والاختبار دليل. من داخل كل جهاز تملكه اختبر التدفقات التي يجب أن تعمل وتلك التي يجب ألا تعمل. استخدم مهلًا قصيرة كي يفشل التدفق المحجوب بسرعة.\n\nشغّل هذه الاختبارات بعد كل تغيير واحتفظ بنتائجها مع سجل التغيير. يجب أن يظهر التدفق المحجوب في `/var/log/pve-firewall.log`. وإن لم يظهر فقد سلكت الحركة مسارًا آخر أو لم تُحمَّل القاعدة."
+   },
+   {
+    "type": "terminal",
+    "id": "verify-term",
+    "title": "web01 (10.10.10.10) - isolation tests",
+    "lines": [
+     {
+      "cmd": "nc -zv -w3 10.10.20.10 8080",
+      "output": "Connection to 10.10.20.10 8080 port [tcp/http-alt] succeeded!",
+      "comment": "التدفق المسموح يعمل."
+     },
+     {
+      "cmd": "nc -zv -w3 10.10.30.10 5432",
+      "output": "nc: connect to 10.10.30.10 port 5432 (tcp) timed out: Operation now in progress",
+      "comment": "من الويب إلى قاعدة البيانات يُسقط بصمت كما صُمّم."
+     },
+     {
+      "cmd": "nmap -Pn -p 22,5432 10.10.30.10",
+      "output": "PORT     STATE    SERVICE\n22/tcp   filtered ssh\n5432/tcp filtered postgresql",
+      "comment": "شغّله على مختبرك فقط. `filtered` تعني أن جدار حماية يُسقط الاستكشاف."
+     },
+     {
+      "cmd": "ip neigh show",
+      "output": "10.10.10.1 dev eth0 lladdr bc:24:11:aa:bb:01 REACHABLE",
+      "comment": "يظهر البوابة فقط. الطبقات الأخرى ليست في هذا المقطع من الطبقة الثانية."
+     }
+    ],
+    "caption": "اختبار التدفقات المسموحة والمحجوبة من طبقة الويب."
+   },
+   {
+    "type": "callout",
+    "id": "pitfall",
+    "variant": "warning",
+    "title": "ثغرات شائعة",
+    "markdown": "- **نسيان علامة البطاقة.** لا تفعل القواعد شيئًا ما لم تكن لبطاقة الجهاز `firewall=1`.\n- **جهاز متعدد الوصلات.** جهاز بساقين على طبقتين يتجاوز التصميم. عامله كموجّه ورشّحه.\n- **إدارة مفتوحة للجميع.** وصول الإدارة إلى كل جهاز من نطاق واسع قد يصبح بنفسه المسار الجانبي. فضّل مضيف قفز.\n- **قواعد داخلة فقط.** بدون ترشيح للحركة الخارجة يظل الجهاز المخترَق قادرًا على بلوغ أي وجهة تسمح بها السياسة.\n- **لا اختبار بعد التغيير.** القواعد تنحرف. أعد الاختبار بانتظام."
+   },
+   {
+    "type": "callout",
+    "id": "log-tip",
+    "variant": "tip",
+    "title": "اجعل الحركة المحجوبة مفيدة",
+    "markdown": "الحزمة المُسقطة هي أيضًا اكتشاف. نادرًا ما يجرّب برنامج مشروع منافذ لا شأن له بها، لذا فتكرار الإسقاط من جهاز واحد إلى عناوين داخلية كثيرة يشبه فحصًا من مضيف مخترَق. أرسل `/var/log/pve-firewall.log` إلى نظام السجلات المركزي ونبّه عندما يطرق مصدر واحد وجهات كثيرة. حدّ معدل التسجيل بـ `log_ratelimit` كي لا يملأ فحص صاخب القرص، وراجع أكثر المصادر حجبًا كل أسبوع."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على عقدة مخبرية تملكها ابنِ تصميمًا من طبقتين:\n\n1. أنشئ `vmbr10` و`vmbr20` بلا منفذ فيزيائي، وضع جهازين على كل منهما مع `firewall=1`.\n2. أعطِ جهاز الطبقة الثانية ملف قواعد برفض افتراضي يسمح بـ TCP 8080 من الطبقة الأولى فقط.\n3. من جهاز الطبقة الأولى نفّذ `nc -zv -w3` إلى المنفذ 8080 (يجب أن ينجح) وإلى المنفذ 22 (يجب أن تنتهي المهلة).\n4. اعثر على المحاولة المحجوبة في `/var/log/pve-firewall.log`، ثم عطّل ملف القواعد وتأكد أن الاختبار ينجح الآن."
+   },
+   {
+    "type": "keyterms",
+    "id": "kt",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "الحركة الجانبية (Lateral movement)",
+      "definition": "انتقال مهاجم من نظام مخترَق إلى أنظمة أخرى في الشبكة."
+     },
+     {
+      "term": "تقسيم الشبكة (Network segmentation)",
+      "definition": "تقسيم الشبكة إلى مناطق مع حركة مضبوطة بينها."
+     },
+     {
+      "term": "الجسر (Bridge)",
+      "definition": "مبدّل افتراضي من الطبقة الثانية يربط واجهات شبكة الأجهزة."
+     },
+     {
+      "term": "الرفض الافتراضي (Default deny)",
+      "definition": "سياسة تُسقط الحركة ما لم تسمح بها قاعدة."
+     },
+     {
+      "term": "انتحال ARP (ARP spoofing)",
+      "definition": "تزوير ردود ARP لتحويل الحركة عبر المهاجم."
+     },
+     {
+      "term": "مرشّح MAC (MAC filter)",
+      "definition": "خيار في Proxmox يُسقط الإطارات ذات MAC مصدر مزوّر."
+     },
+     {
+      "term": "نقطة الاختناق (Choke point)",
+      "definition": "مكان تمر عبره كل الحركة بين المناطق ويمكن ترشيحها فيه."
+     },
+     {
+      "term": "مضيف القفز (Jump host)",
+      "definition": "نظام مقوّى يُستخدم مسارًا وحيدًا للإدارة."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يمثل الجسر الواحد الافتراضي مشكلة؟",
+      "options": [
+       "لأنه بطيء",
+       "لأن كل الأجهزة عليه تتشارك شبكة طبقة ثانية واحدة ويصل بعضها إلى بعض",
+       "لأنه يحجب الإنترنت",
+       "لأنه يحتاج رخصة"
+      ],
+      "answer": 1,
+      "explanation": "يستطيع جهاز مخترَق فحص الجيران ومهاجمتهم دون عبور أي مرشّح."
+     },
+     {
+      "question": "أي خيارات Proxmox تفيد ضد انتحال العناوين من جهاز؟ (اختر كل ما ينطبق)",
+      "options": [
+       "`macfilter: 1`",
+       "`ipfilter: 1`",
+       "`policy_in: ACCEPT`",
+       "إعطاء كل الأجهزة MAC نفسه"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "تُسقط هذه الخيارات الإطارات والحزم التي لا ينتمي MAC أو IP مصدرها إلى البطاقة."
+     },
+     {
+      "question": "اختبار من جهاز الويب إلى منفذ قاعدة البيانات تنتهي مهلته. ماذا يدل؟",
+      "options": [
+       "جدار الحماية معطّل",
+       "التدفق محجوب كما صُمّم",
+       "قاعدة البيانات متوقفة للجميع",
+       "فشل DNS"
+      ],
+      "answer": 1,
+      "explanation": "انتهاء المهلة على منفذ يجب رفضه هو الدليل المتوقع. أكّد الإسقاط في سجل الجدار."
+     },
+     {
+      "question": "ما خطر جهاز له ساقان شبكيتان على طبقتين؟",
+      "options": [
+       "لا خطر",
+       "قد يعمل جسرًا بين الطبقات ويتجاوز التقسيم",
+       "يستهلك ذاكرة أكثر",
+       "لا يمكن نسخه احتياطيًا"
+      ],
+      "answer": 1,
+      "explanation": "يصبح مسارًا غير مرشّح بين المناطق ما لم تعامله وترشّحه كموجّه."
+     },
+     {
+      "question": "لماذا نرشّح الحركة الخارجة من جهاز قاعدة البيانات؟",
+      "options": [
+       "لتوفير النطاق",
+       "لمنع جهاز مخترَق من الاتصال بالخارج أو الانتشار",
+       "لتسريع الاستعلامات",
+       "لأن PostgreSQL يتطلب ذلك"
+      ],
+      "answer": 1,
+      "explanation": "تقيّد القواعد الخارجة قنوات التحكم وتسريب البيانات والانتشار إلى طبقات أخرى."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nتزدهر الحركة الجانبية في الشبكات المسطحة. خطّط للطبقات وتدفقاتها المسموحة، وأعطِ كل طبقة جسرها، وافرض قواعد رفض افتراضي على كل جهاز في الاتجاهين. أضف `macfilter` و`ipfilter` ضد الانتحال، وتجنّب الأجهزة متعددة الوصلات والإدارة الواسعة المفتوحة.\n\nوأخيرًا اختبر. جرّب التدفقات التي يجب أن تعمل وتلك التي يجب أن تفشل، وأكّد الإسقاط في السجل. بعد ذلك انظر كيف تمدّ VLAN هذا التصميم عبر المبدّلات الفيزيائية في [الجسور الافتراضية والشبكات المدركة لـ VLAN](/learn/systems-infrastructure-security/virtual-bridges-and-vlan-aware-networking)."
+   }
+  ]
+ }
+}

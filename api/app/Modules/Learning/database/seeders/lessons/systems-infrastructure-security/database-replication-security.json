@@ -1,0 +1,676 @@
+{
+ "slug": "database-replication-security",
+ "title": "Database Replication Security",
+ "summary": "Secure the replication account, the network stream, slots and replicas for PostgreSQL and MySQL, and verify who is connected.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Identify what replication exposes",
+  "Create a least-privilege replication role restricted in pg_hba.conf",
+  "Encrypt and verify the replication stream",
+  "Monitor standbys and slots as security signals"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A team builds a read replica in a second data center so the business can survive a failure. The replica works, so everyone moves on. Months later an audit finds that the replication account is a superuser, the connection is unencrypted, and the replica's backups sit in a bucket nobody reviews. The copy of the data is as sensitive as the original, yet it was protected like a test server.\n\nReplication is a continuous, privileged copy of everything your database writes. Whoever can read the replication stream can read every row, including rows that were deleted from the primary a minute later. In this lesson you will secure the replication account, the network path, the replica itself and the monitoring around it, using PostgreSQL streaming replication and MySQL as examples."
+  },
+  {
+   "id": "exposure",
+   "type": "text",
+   "markdown": "## What replication exposes\n\nA replica is a second database that happens to receive its data over the network. Every weakness of the primary therefore appears twice, and a few weaknesses are new. The table lists the five places where replication creates exposure.\n\n| Exposure | Why it matters | Main control |\n|:--|:--|:--|\n| Replication account | It can read every change on the primary | Dedicated role with only the replication privilege |\n| Network stream | WAL or binary log data crosses the network | TLS plus an address allow-list |\n| Replica server | It holds a full copy of the data | Same hardening and encryption as the primary |\n| Slots and archives | They retain history on disk | Retention limits and monitoring |\n| Promotion path | A replica can become the new primary | Controlled failover credentials |\n\nTwo ideas guide the rest of the lesson. First, **the replica is a production system**. It deserves the same patching, logging and access control as the primary, even if only reports run on it. Second, **replication is one-directional trust**. The replica must prove its identity to the primary, and the primary must prove its identity to the replica, because a fake primary could feed the replica false data."
+  },
+  {
+   "id": "stream-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Securing a streaming connection",
+   "caption": "The replica verifies the primary, the primary checks the role and address, and strangers are refused.",
+   "data": {
+    "actors": [
+     {
+      "id": "r",
+      "label": "Replica",
+      "sub": "10.30.2.12",
+      "icon": "database"
+     },
+     {
+      "id": "p",
+      "label": "Primary",
+      "sub": "10.30.2.11:5432",
+      "icon": "server"
+     },
+     {
+      "id": "x",
+      "label": "Unknown host",
+      "sub": "10.30.7.99",
+      "icon": "laptop"
+     }
+    ],
+    "steps": [
+     {
+      "from": "r",
+      "to": "p",
+      "label": "TLS ClientHello",
+      "detail": "sslmode=verify-full",
+      "note": "The replica opens an encrypted connection to the primary."
+     },
+     {
+      "from": "p",
+      "to": "r",
+      "label": "Server certificate",
+      "detail": "CN=db-primary.example.com",
+      "tone": "secure",
+      "note": "The replica checks the certificate chain and host name before sending anything."
+     },
+     {
+      "from": "r",
+      "to": "p",
+      "label": "SCRAM-SHA-256",
+      "detail": "role=replicator",
+      "note": "The replica authenticates as the dedicated replication role."
+     },
+     {
+      "from": "p",
+      "to": "r",
+      "label": "Auth OK",
+      "detail": "pg_hba: hostssl replication",
+      "tone": "success",
+      "note": "A matching hostssl replication rule in pg_hba.conf admits the connection."
+     },
+     {
+      "from": "r",
+      "to": "p",
+      "label": "START_REPLICATION",
+      "detail": "slot=replica_dc2",
+      "note": "The replica asks to continue from its replication slot."
+     },
+     {
+      "from": "p",
+      "to": "r",
+      "label": "WAL stream",
+      "detail": "encrypted",
+      "tone": "secure",
+      "note": "Changes flow continuously over the encrypted channel."
+     },
+     {
+      "from": "x",
+      "to": "p",
+      "label": "Replication request",
+      "detail": "no matching rule",
+      "tone": "attack",
+      "note": "A host that is not in the allow-list tries to start replication."
+     },
+     {
+      "from": "p",
+      "to": "x",
+      "label": "FATAL: no pg_hba.conf entry",
+      "tone": "blocked",
+      "note": "The primary refuses it and writes the attempt to its log."
+     }
+    ]
+   }
+  },
+  {
+   "id": "role",
+   "type": "text",
+   "markdown": "## Create a dedicated replication role\n\nThe replication account should do one thing: stream changes. In PostgreSQL the `REPLICATION` attribute grants exactly that. Never reuse an application account or `postgres` for replication. A role that can read the stream but cannot own objects or run application queries limits what a stolen password can do.\n\nThe first block creates the role on the primary and caps its connections. The second restricts who may use it in `pg_hba.conf`. Note that the keyword `all` in the database column does **not** match replication connections. You must write `replication` explicitly, which is a useful safety property."
+  },
+  {
+   "id": "role-sql",
+   "type": "code",
+   "language": "sql",
+   "filename": "primary: psql",
+   "caption": "Dedicated replication role. The password is a placeholder; load the real one from your secrets store.",
+   "code": "CREATE ROLE replicator WITH REPLICATION LOGIN CONNECTION LIMIT 3 PASSWORD '<from-secrets-store>';\n\n-- a physical slot so the primary keeps WAL for this replica only\nSELECT pg_create_physical_replication_slot('replica_dc2');",
+   "highlight": [
+    1,
+    4
+   ]
+  },
+  {
+   "id": "role-hba",
+   "type": "code",
+   "language": "bash",
+   "filename": "pg_hba.conf (primary)",
+   "caption": "Replication allowed only over TLS, only from the replica address.",
+   "code": "# TYPE    DATABASE     USER        ADDRESS          METHOD\nhostssl   replication  replicator  10.30.2.12/32    scram-sha-256\nhost      replication  all         0.0.0.0/0        reject",
+   "highlight": [
+    2
+   ]
+  },
+  {
+   "id": "tls",
+   "type": "text",
+   "markdown": "## Encrypt and authenticate the stream\n\nA replication stream carries every committed change in readable form. Without TLS, anyone on the path can copy it. With TLS but without certificate checks, an attacker who redirects traffic can pose as the primary. The setting that closes both gaps is `sslmode=verify-full` in the replica's `primary_conninfo`, together with a CA certificate that the replica trusts.\n\nFor stronger authentication, give the replica a client certificate and use the `cert` method on the primary, so no password exists to steal. Keep the password file readable only by the `postgres` user, mode `0600`. The details of building certificates are covered in [Database TLS and Encryption](/learn/systems-infrastructure-security/database-tls-and-encryption)."
+  },
+  {
+   "id": "tls-conf",
+   "type": "code",
+   "language": "bash",
+   "filename": "postgresql.auto.conf (replica)",
+   "caption": "Replica connection string with full certificate verification.",
+   "code": "primary_conninfo = 'host=db-primary.example.com port=5432 user=replicator passfile=/var/lib/postgresql/.pgpass sslmode=verify-full sslrootcert=/etc/postgresql/tls/ca.crt application_name=replica_dc2'\nprimary_slot_name = 'replica_dc2'\nhot_standby = on",
+   "highlight": [
+    1
+   ]
+  },
+  {
+   "id": "slot-warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "An unused slot can stop your primary",
+   "markdown": "A replication slot makes the primary keep WAL until the replica has consumed it. If a replica is decommissioned but its slot remains, WAL accumulates until the disk is full and the primary stops accepting writes. Set `max_slot_wal_keep_size`, alert on inactive slots, and drop slots when you retire a replica."
+  },
+  {
+   "id": "verify",
+   "type": "text",
+   "markdown": "## Verify what is connected\n\nTrust but verify. The primary knows exactly who is replicating from it. Query `pg_stat_replication` to list connected standbys, and check that each one uses TLS and an address you expect. Then query `pg_replication_slots` to find slots that nobody is using."
+  },
+  {
+   "id": "verify-term",
+   "type": "terminal",
+   "title": "Verifying replication (lab primary)",
+   "lines": [
+    {
+     "cmd": "psql -c \"SELECT client_addr, usename, application_name, state, sync_state FROM pg_stat_replication;\"",
+     "output": " client_addr |  usename   | application_name |   state   | sync_state\n-------------+------------+------------------+-----------+------------\n 10.30.2.12  | replicator | replica_dc2      | streaming | async",
+     "comment": "One expected standby, using the dedicated role."
+    },
+    {
+     "cmd": "psql -c \"SELECT pid, ssl, version, cipher FROM pg_stat_ssl s JOIN pg_stat_replication r USING (pid);\"",
+     "output": "  pid | ssl | version |         cipher\n------+-----+---------+------------------------\n 2210 | t   | TLSv1.3 | TLS_AES_256_GCM_SHA384",
+     "comment": "ssl = t confirms the stream is encrypted."
+    },
+    {
+     "cmd": "psql -c \"SELECT slot_name, active, restart_lsn FROM pg_replication_slots;\"",
+     "output": "  slot_name  | active | restart_lsn\n-------------+--------+-------------\n replica_dc2 | t      | 0/5A000148\n old_replica | f      | 0/1B000060",
+     "comment": "old_replica is inactive and still holding WAL: drop it."
+    }
+   ],
+   "caption": "Three questions: who is connected, is it encrypted, and which slots are idle?"
+  },
+  {
+   "id": "mysql",
+   "type": "text",
+   "markdown": "## The same controls in MySQL\n\nMySQL replication follows the same pattern with different names. Create a user with only the `REPLICATION SLAVE` privilege (or `REPLICATION REPLICA` on newer releases), require TLS for that account, and make the replica verify the source's certificate. Enable `binlog_encryption` so binary logs on disk are encrypted, and keep the replica in `super_read_only` mode so nothing writes to it by accident."
+  },
+  {
+   "id": "mysql-code",
+   "type": "code",
+   "language": "sql",
+   "filename": "mysql",
+   "caption": "Source and replica setup (placeholders for secrets and names).",
+   "code": "-- on the source\nCREATE USER 'repl'@'10.30.2.12' IDENTIFIED BY '<from-secrets-store>' REQUIRE SSL;\nGRANT REPLICATION SLAVE ON *.* TO 'repl'@'10.30.2.12';\n\n-- on the replica\nSET GLOBAL super_read_only = ON;\nCHANGE REPLICATION SOURCE TO\n  SOURCE_HOST='db-source.example.com',\n  SOURCE_USER='repl',\n  SOURCE_PASSWORD='<from-secrets-store>',\n  SOURCE_SSL=1,\n  SOURCE_SSL_CA='/etc/mysql/tls/ca.pem',\n  SOURCE_SSL_VERIFY_SERVER_CERT=1;\nSTART REPLICA;",
+   "highlight": [
+    2,
+    11,
+    12
+   ]
+  },
+  {
+   "id": "replica",
+   "type": "text",
+   "markdown": "## Secure the replica itself\n\nThe replica holds a complete copy, so harden it as a first-class database. Apply the controls from [Database Hardening Benchmarks](/learn/systems-infrastructure-security/database-hardening-benchmarks) and [Database Network Isolation](/learn/systems-infrastructure-security/database-network-isolation): a private data-zone address, a host firewall that admits only application and monitoring hosts, and full-disk or tablespace encryption.\n\nThree habits are easy to forget:\n\n- **Replicas inherit data, not always policy.** Roles and grants replicate in PostgreSQL, but host files such as `pg_hba.conf` do not. Check them separately.\n- **Reporting users get least privilege.** Analysts who query the replica should have read-only roles on the tables they need, as described in [Database Least Privilege Access](/learn/systems-infrastructure-security/database-least-privilege-access).\n- **Logical replication is narrower.** When you replicate with publications and subscriptions, publish only the tables and columns the subscriber needs. A smaller copy is a smaller breach."
+  },
+  {
+   "id": "monitor",
+   "type": "text",
+   "markdown": "## Monitor replication as a security signal\n\nReplication metrics are usually watched for lag, but they also reveal attacks and mistakes. Alert on these events:\n\n- A new row in `pg_stat_replication` from an address you do not recognize.\n- A change to the `REPLICATION` attribute, visible through the audit trail described in [Database Auditing and Activity Logging](/learn/systems-infrastructure-security/database-auditing-and-activity-logging).\n- Failed authentications against the `replication` pseudo-database in the server log.\n- An inactive slot, or WAL directory growth beyond the expected rate.\n- Replication lag that suddenly changes. A stalled replica may mean a network fault or someone tampering with the path.\n\nSet `log_connections = on` so each replication login is recorded with its address and TLS state. Feed these logs to the same collector as the rest of your database telemetry, as covered in [Database Activity Monitoring](/learn/systems-infrastructure-security/database-activity-monitoring-dam)."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On two lab VMs **you own**, set up PostgreSQL streaming replication with a role named `replicator` created with `REPLICATION LOGIN`.\n2. Restrict access with a `hostssl replication replicator <replica-ip>/32 scram-sha-256` rule, and add a `reject` rule after it. Reload the configuration and confirm a third VM cannot start replication.\n3. Switch the replica to `sslmode=verify-full` with a lab CA. Then temporarily change the host name to something not in the certificate and observe the connection fail.\n4. Run the three queries from the terminal example. Create a second slot, leave it unused, and find it in `pg_replication_slots`. Drop it afterward."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Streaming replication",
+     "definition": "Continuously sending WAL records from a primary to a standby."
+    },
+    {
+     "term": "REPLICATION",
+     "definition": "The PostgreSQL role attribute that allows streaming the change log."
+    },
+    {
+     "term": "Replication slot",
+     "definition": "A primary-side marker that retains WAL until a standby consumes it."
+    },
+    {
+     "term": "verify-full",
+     "definition": "A TLS mode that checks both the certificate chain and the host name."
+    },
+    {
+     "term": "WAL",
+     "definition": "Write-ahead log: the ordered record of every change."
+    },
+    {
+     "term": "Binary log",
+     "definition": "MySQL's ordered record of data changes, used for replication."
+    },
+    {
+     "term": "Logical replication",
+     "definition": "Replicating selected tables through publications and subscriptions."
+    },
+    {
+     "term": "Replication lag",
+     "definition": "The delay between a change on the primary and its arrival on the replica."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What privilege should a PostgreSQL replication account have?",
+     "options": [
+      "SUPERUSER, for simplicity",
+      "REPLICATION and LOGIN only",
+      "Ownership of every table",
+      "CREATEDB"
+     ],
+     "answer": 1,
+     "explanation": "A dedicated role limited to streaming limits the damage if its credential leaks."
+    },
+    {
+     "question": "Which setting makes a replica verify the primary's certificate and host name?",
+     "options": [
+      "sslmode=prefer",
+      "sslmode=require",
+      "sslmode=verify-full",
+      "sslmode=disable"
+     ],
+     "answer": 2,
+     "explanation": "Only verify-full checks the chain and the name, so a fake primary is rejected."
+    },
+    {
+     "question": "Which are real risks of an abandoned replication slot? Choose all that apply.",
+     "options": [
+      "WAL accumulates and fills the disk",
+      "The primary may stop accepting writes",
+      "Passwords are sent in cleartext",
+      "Old data is retained longer than intended"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "An idle slot retains WAL indefinitely, which is both an availability and a data-retention problem. It does not change how passwords are sent."
+    },
+    {
+     "question": "Why does the pg_hba.conf database keyword all not cover replication connections?",
+     "options": [
+      "It is a bug",
+      "Replication uses a special pseudo-database named replication that must be written explicitly",
+      "Replication ignores pg_hba.conf",
+      "all only matches the postgres database"
+     ],
+     "answer": 1,
+     "explanation": "PostgreSQL deliberately separates replication rules so a broad rule does not open the stream."
+    },
+    {
+     "question": "A new row appears in pg_stat_replication from an unfamiliar address. What is the best first response?",
+     "options": [
+      "Ignore it, since lag is low",
+      "Identify the host, check the role's recent use, and terminate and investigate if unauthorized",
+      "Restart the replica",
+      "Disable TLS to debug"
+     ],
+     "answer": 1,
+     "explanation": "An unknown standby can read every change, so treat it as an incident until proven otherwise."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- A replica is a full, continuously updated copy of your data, so it needs primary-grade protection.\n- Use a dedicated role with only `REPLICATION` and `LOGIN`, and restrict it in `pg_hba.conf` to `hostssl` rules from the replica address.\n- Encrypt the stream and verify the server with `sslmode=verify-full`; in MySQL use `REQUIRE SSL` and certificate verification.\n- Manage slots and WAL retention, because idle slots can stop the primary.\n- Monitor connected standbys, role changes, authentication failures and slot state as security signals.\n\nNext you will learn how to respond when something goes wrong in [Database Incident Response](/learn/systems-infrastructure-security/database-incident-response)."
+  }
+ ],
+ "ar": {
+  "title": "أمن النسخ المتماثل لقواعد البيانات",
+  "summary": "أمّن حساب النسخ والتدفق الشبكي والفتحات والنسخ المتماثلة في PostgreSQL وMySQL، وتحقق ممن هو متصل.",
+  "objectives": [
+   "تحديد ما يكشفه النسخ المتماثل",
+   "إنشاء دور نسخ بأقل صلاحية ومقيّد في pg_hba.conf",
+   "تشفير تدفق النسخ والتحقق منه",
+   "مراقبة النسخ والفتحات بوصفها إشارات أمنية"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يبني فريق نسخة قراءة في مركز بيانات ثانٍ ليصمد العمل أمام أي عطل. تعمل النسخة فيمضي الجميع إلى مهامهم. وبعد أشهر يكتشف التدقيق أن حساب النسخ المتماثل مستخدم فائق الصلاحيات، وأن الاتصال غير مشفّر، وأن النسخ الاحتياطية للنسخة المتماثلة محفوظة في حاوية تخزين لا يراجعها أحد. فنسخة البيانات بحساسية الأصل نفسها، لكنها حُميت كأنها خادم اختبار.\n\nالنسخ المتماثل (Replication) نسخ مستمر وعالي الصلاحية لكل ما تكتبه قاعدة البيانات. ومن يقرأ تدفق النسخ يقرأ كل صف، حتى الصفوف التي حُذفت من الخادم الرئيسي بعد دقيقة. في هذا الدرس ستؤمّن حساب النسخ والمسار الشبكي والنسخة المتماثلة نفسها والمراقبة المحيطة بها، مستخدمًا النسخ المتدفق في PostgreSQL وMySQL مثالين."
+   },
+   {
+    "id": "exposure",
+    "type": "text",
+    "markdown": "## ما الذي ينكشف بالنسخ المتماثل\n\nالنسخة المتماثلة قاعدة بيانات ثانية تستقبل بياناتها عبر الشبكة. لذلك يظهر كل ضعف في الخادم الرئيسي مرتين، وتظهر بضعة نقاط ضعف جديدة. يعرض الجدول المواضع الخمسة التي يخلق فيها النسخ المتماثل انكشافًا.\n\n| الانكشاف | سبب الأهمية | الضابط الرئيسي |\n|:--|:--|:--|\n| حساب النسخ | يقرأ كل تغيير في الخادم الرئيسي | دور مخصّص بصلاحية النسخ وحدها |\n| تدفق الشبكة | تعبر بيانات WAL أو السجل الثنائي الشبكة | TLS مع قائمة عناوين مسموحة |\n| خادم النسخة المتماثلة | يحمل نسخة كاملة من البيانات | التحصين والتشفير نفسهما كالخادم الرئيسي |\n| الفتحات والأرشيفات | تحتفظ بالتاريخ على القرص | حدود للاحتفاظ ومراقبة |\n| مسار الترقية | قد تصير النسخة الخادم الرئيسي الجديد | بيانات اعتماد مضبوطة للتحويل الاحتياطي |\n\nتوجّه فكرتان بقية الدرس. الأولى أن **النسخة المتماثلة نظام إنتاجي**، فتستحق التحديث والتسجيل وضبط الوصول بقدر الخادم الرئيسي، حتى لو لم تُشغَّل عليها إلا التقارير. والثانية أن **الثقة في النسخ المتماثل ذات اتجاه واحد**. يجب أن تثبت النسخة هويتها للخادم الرئيسي، وأن يثبت الخادم الرئيسي هويته للنسخة، لأن خادمًا رئيسيًّا مزيّفًا قد يغذّي النسخة ببيانات كاذبة."
+   },
+   {
+    "id": "stream-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "تأمين اتصال النسخ المتدفق",
+    "caption": "تتحقق النسخة من الخادم الرئيسي، ويفحص الخادم الدور والعنوان، ويُرفض الغرباء.",
+    "data": {
+     "actors": [
+      {
+       "id": "r",
+       "label": "النسخة المتماثلة",
+       "sub": "10.30.2.12",
+       "icon": "database"
+      },
+      {
+       "id": "p",
+       "label": "الخادم الرئيسي",
+       "sub": "10.30.2.11:5432",
+       "icon": "server"
+      },
+      {
+       "id": "x",
+       "label": "مضيف مجهول",
+       "sub": "10.30.7.99",
+       "icon": "laptop"
+      }
+     ],
+     "steps": [
+      {
+       "from": "r",
+       "to": "p",
+       "label": "TLS ClientHello",
+       "detail": "sslmode=verify-full",
+       "note": "تفتح النسخة اتصالًا مشفّرًا بالخادم الرئيسي."
+      },
+      {
+       "from": "p",
+       "to": "r",
+       "label": "Server certificate",
+       "detail": "CN=db-primary.example.com",
+       "tone": "secure",
+       "note": "تفحص النسخة سلسلة الشهادة واسم المضيف قبل إرسال أي شيء."
+      },
+      {
+       "from": "r",
+       "to": "p",
+       "label": "SCRAM-SHA-256",
+       "detail": "role=replicator",
+       "note": "تصادق النسخة بدور النسخ المخصّص."
+      },
+      {
+       "from": "p",
+       "to": "r",
+       "label": "Auth OK",
+       "detail": "pg_hba: hostssl replication",
+       "tone": "success",
+       "note": "تسمح قاعدة hostssl replication المطابقة في pg_hba.conf بالاتصال."
+      },
+      {
+       "from": "r",
+       "to": "p",
+       "label": "START_REPLICATION",
+       "detail": "slot=replica_dc2",
+       "note": "تطلب النسخة المتابعة من فتحة النسخ الخاصة بها."
+      },
+      {
+       "from": "p",
+       "to": "r",
+       "label": "WAL stream",
+       "detail": "encrypted",
+       "tone": "secure",
+       "note": "تتدفق التغييرات باستمرار عبر القناة المشفّرة."
+      },
+      {
+       "from": "x",
+       "to": "p",
+       "label": "Replication request",
+       "detail": "no matching rule",
+       "tone": "attack",
+       "note": "مضيف خارج القائمة المسموحة يحاول بدء النسخ."
+      },
+      {
+       "from": "p",
+       "to": "x",
+       "label": "FATAL: no pg_hba.conf entry",
+       "tone": "blocked",
+       "note": "يرفضه الخادم الرئيسي ويسجّل المحاولة في سجلّه."
+      }
+     ]
+    }
+   },
+   {
+    "id": "role",
+    "type": "text",
+    "markdown": "## أنشئ دور نسخ مخصّصًا\n\nيجب أن يؤدي حساب النسخ مهمة واحدة: بثّ التغييرات. في PostgreSQL تمنح السمة `REPLICATION` ذلك بالضبط. لا تستخدم حساب تطبيق ولا `postgres` للنسخ أبدًا. فدور يقرأ التدفق لكنه لا يملك كائنات ولا ينفّذ استعلامات التطبيق يحدّ مما تفعله كلمة مرور مسروقة.\n\nتنشئ الكتلة الأولى الدور على الخادم الرئيسي وتحدّ اتصالاته. وتقيّد الثانية من يستخدمه في `pg_hba.conf`. لاحظ أن الكلمة `all` في عمود قاعدة البيانات **لا** تطابق اتصالات النسخ، فعليك كتابة `replication` صراحةً، وهي خاصية أمان مفيدة."
+   },
+   {
+    "id": "role-sql",
+    "type": "code",
+    "language": "sql",
+    "filename": "primary: psql",
+    "caption": "دور نسخ مخصّص. كلمة المرور نائبة؛ حمّل الحقيقية من مخزن الأسرار.",
+    "code": "CREATE ROLE replicator WITH REPLICATION LOGIN CONNECTION LIMIT 3 PASSWORD '<from-secrets-store>';\n\n-- a physical slot so the primary keeps WAL for this replica only\nSELECT pg_create_physical_replication_slot('replica_dc2');",
+    "highlight": [
+     1,
+     4
+    ]
+   },
+   {
+    "id": "role-hba",
+    "type": "code",
+    "language": "bash",
+    "filename": "pg_hba.conf (primary)",
+    "caption": "النسخ مسموح عبر TLS فقط ومن عنوان النسخة المتماثلة فقط.",
+    "code": "# TYPE    DATABASE     USER        ADDRESS          METHOD\nhostssl   replication  replicator  10.30.2.12/32    scram-sha-256\nhost      replication  all         0.0.0.0/0        reject",
+    "highlight": [
+     2
+    ]
+   },
+   {
+    "id": "tls",
+    "type": "text",
+    "markdown": "## شفّر التدفق وصادق عليه\n\nيحمل تدفق النسخ كل تغيير مثبَّت بصيغة مقروءة. فبلا TLS يستطيع أي طرف على المسار نسخه. ومع TLS بلا فحص للشهادة يستطيع مهاجم يحوّل الحركة أن ينتحل شخصية الخادم الرئيسي. والإعداد الذي يسدّ الثغرتين هو `sslmode=verify-full` في `primary_conninfo` على النسخة، مع شهادة المرجع الموثوق (CA) التي تثق بها.\n\nولمصادقة أقوى امنح النسخة شهادة عميل واستخدم الطريقة `cert` على الخادم الرئيسي فلا توجد كلمة مرور تُسرق. اجعل ملف كلمة المرور مقروءًا لمستخدم `postgres` فقط بالصلاحية `0600`. وتفاصيل بناء الشهادات في درس [TLS والتشفير في قواعد البيانات](/learn/systems-infrastructure-security/database-tls-and-encryption)."
+   },
+   {
+    "id": "tls-conf",
+    "type": "code",
+    "language": "bash",
+    "filename": "postgresql.auto.conf (replica)",
+    "caption": "سلسلة اتصال النسخة مع التحقق الكامل من الشهادة.",
+    "code": "primary_conninfo = 'host=db-primary.example.com port=5432 user=replicator passfile=/var/lib/postgresql/.pgpass sslmode=verify-full sslrootcert=/etc/postgresql/tls/ca.crt application_name=replica_dc2'\nprimary_slot_name = 'replica_dc2'\nhot_standby = on",
+    "highlight": [
+     1
+    ]
+   },
+   {
+    "id": "slot-warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "فتحة غير مستخدمة قد توقف الخادم الرئيسي",
+    "markdown": "تجعل فتحة النسخ الخادم الرئيسي يحتفظ بـ WAL حتى تستهلكه النسخة. فإذا أُوقفت النسخة وبقيت فتحتها تراكم WAL حتى يمتلئ القرص ويتوقف الخادم الرئيسي عن قبول الكتابة. اضبط `max_slot_wal_keep_size`، وأنذر عند وجود فتحات غير نشطة، واحذف الفتحة عند إخراج النسخة من الخدمة."
+   },
+   {
+    "id": "verify",
+    "type": "text",
+    "markdown": "## تحقق مما هو متصل\n\nثق لكن تحقق. يعرف الخادم الرئيسي بالضبط من ينسخ منه. استعلم عن `pg_stat_replication` لسرد النسخ المتصلة، وتأكد أن كلًّا منها يستخدم TLS وعنوانًا تتوقعه. ثم استعلم عن `pg_replication_slots` لإيجاد الفتحات التي لا يستخدمها أحد."
+   },
+   {
+    "id": "verify-term",
+    "type": "terminal",
+    "title": "Verifying replication (lab primary)",
+    "lines": [
+     {
+      "cmd": "psql -c \"SELECT client_addr, usename, application_name, state, sync_state FROM pg_stat_replication;\"",
+      "output": " client_addr |  usename   | application_name |   state   | sync_state\n-------------+------------+------------------+-----------+------------\n 10.30.2.12  | replicator | replica_dc2      | streaming | async",
+      "comment": "نسخة واحدة متوقعة تستخدم الدور المخصّص."
+     },
+     {
+      "cmd": "psql -c \"SELECT pid, ssl, version, cipher FROM pg_stat_ssl s JOIN pg_stat_replication r USING (pid);\"",
+      "output": "  pid | ssl | version |         cipher\n------+-----+---------+------------------------\n 2210 | t   | TLSv1.3 | TLS_AES_256_GCM_SHA384",
+      "comment": "القيمة ssl = t تؤكد أن التدفق مشفّر."
+     },
+     {
+      "cmd": "psql -c \"SELECT slot_name, active, restart_lsn FROM pg_replication_slots;\"",
+      "output": "  slot_name  | active | restart_lsn\n-------------+--------+-------------\n replica_dc2 | t      | 0/5A000148\n old_replica | f      | 0/1B000060",
+      "comment": "الفتحة old_replica غير نشطة وما زالت تحتجز WAL: احذفها."
+     }
+    ],
+    "caption": "ثلاثة أسئلة: من المتصل، وهل هو مشفّر، وأي الفتحات خاملة؟"
+   },
+   {
+    "id": "mysql",
+    "type": "text",
+    "markdown": "## الضوابط نفسها في MySQL\n\nيتبع النسخ المتماثل في MySQL النمط نفسه بأسماء مختلفة. أنشئ مستخدمًا بصلاحية `REPLICATION SLAVE` وحدها (أو `REPLICATION REPLICA` في الإصدارات الأحدث)، واشترط TLS لهذا الحساب، واجعل النسخة تتحقق من شهادة المصدر. فعّل `binlog_encryption` لتُشفَّر السجلات الثنائية على القرص، وأبقِ النسخة في وضع `super_read_only` حتى لا يكتب فيها أحد بالخطأ."
+   },
+   {
+    "id": "mysql-code",
+    "type": "code",
+    "language": "sql",
+    "filename": "mysql",
+    "caption": "إعداد المصدر والنسخة (نصوص نائبة للأسرار والأسماء).",
+    "code": "-- on the source\nCREATE USER 'repl'@'10.30.2.12' IDENTIFIED BY '<from-secrets-store>' REQUIRE SSL;\nGRANT REPLICATION SLAVE ON *.* TO 'repl'@'10.30.2.12';\n\n-- on the replica\nSET GLOBAL super_read_only = ON;\nCHANGE REPLICATION SOURCE TO\n  SOURCE_HOST='db-source.example.com',\n  SOURCE_USER='repl',\n  SOURCE_PASSWORD='<from-secrets-store>',\n  SOURCE_SSL=1,\n  SOURCE_SSL_CA='/etc/mysql/tls/ca.pem',\n  SOURCE_SSL_VERIFY_SERVER_CERT=1;\nSTART REPLICA;",
+    "highlight": [
+     2,
+     11,
+     12
+    ]
+   },
+   {
+    "id": "replica",
+    "type": "text",
+    "markdown": "## أمّن النسخة المتماثلة نفسها\n\nتحمل النسخة المتماثلة نسخة كاملة، فحصّنها كقاعدة بيانات من الدرجة الأولى. طبّق الضوابط في درسَي [معايير تحصين قواعد البيانات](/learn/systems-infrastructure-security/database-hardening-benchmarks) و[العزل الشبكي لقواعد البيانات](/learn/systems-infrastructure-security/database-network-isolation): عنوان خاص في نطاق البيانات، وجدار حماية على الخادم لا يسمح إلا لمضيفات التطبيقات والمراقبة، وتشفير للقرص أو لمساحات الجداول.\n\nثلاث عادات يسهل نسيانها:\n\n- **ترث النسخ البيانات ولا ترث السياسة دائمًا.** تُنسخ الأدوار والمنح في PostgreSQL لكن ملفات المضيف مثل `pg_hba.conf` لا تُنسخ. افحصها على حدة.\n- **مستخدمو التقارير بأقل صلاحية.** يجب أن يملك المحللون الذين يستعلمون من النسخة أدوار قراءة فقط على الجداول التي يحتاجونها، كما في درس [أقل صلاحية في الوصول إلى قواعد البيانات](/learn/systems-infrastructure-security/database-least-privilege-access).\n- **النسخ المنطقي أضيق.** عند النسخ بالنشر والاشتراك (publications وsubscriptions) انشر الجداول والأعمدة التي يحتاجها المشترك فقط. نسخة أصغر تعني اختراقًا أصغر."
+   },
+   {
+    "id": "monitor",
+    "type": "text",
+    "markdown": "## راقب النسخ المتماثل كإشارة أمنية\n\nتُراقَب مقاييس النسخ عادةً لمعرفة التأخر، لكنها تكشف أيضًا الهجمات والأخطاء. أنذر عند هذه الأحداث:\n\n- ظهور صف جديد في `pg_stat_replication` من عنوان لا تعرفه.\n- تغيير في السمة `REPLICATION`، ويظهر عبر مسار التدقيق في درس [التدقيق وتسجيل النشاط في قواعد البيانات](/learn/systems-infrastructure-security/database-auditing-and-activity-logging).\n- فشل المصادقة على قاعدة البيانات الوهمية `replication` في سجل الخادم.\n- فتحة غير نشطة، أو نمو مجلد WAL فوق المعدل المتوقع.\n- تغيّر مفاجئ في تأخر النسخ. فتوقف النسخة قد يعني عطلًا شبكيًّا أو عبثًا بالمسار.\n\nفعّل `log_connections = on` لتُسجَّل كل عملية دخول للنسخ مع عنوانها وحالة TLS. وأرسل هذه السجلات إلى المجمّع نفسه الذي تستخدمه لبقية قياسات قاعدة البيانات، كما في درس [مراقبة نشاط قواعد البيانات](/learn/systems-infrastructure-security/database-activity-monitoring-dam)."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على آلتين افتراضيتين مخبريتين **تملكهما** أعدّ النسخ المتدفق في PostgreSQL بدور اسمه `replicator` أُنشئ بالخيارين `REPLICATION LOGIN`.\n2. قيّد الوصول بقاعدة `hostssl replication replicator <replica-ip>/32 scram-sha-256` وأضف بعدها قاعدة `reject`. أعد تحميل الإعداد وتأكد أن آلة ثالثة لا تستطيع بدء النسخ.\n3. حوّل النسخة إلى `sslmode=verify-full` مع مرجع شهادات مخبري. ثم غيّر اسم المضيف مؤقتًا إلى اسم غير موجود في الشهادة ولاحظ فشل الاتصال.\n4. شغّل الاستعلامات الثلاثة من مثال الطرفية. أنشئ فتحة ثانية واتركها دون استخدام وابحث عنها في `pg_replication_slots`. ثم احذفها."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "النسخ المتدفق",
+      "definition": "إرسال سجلات WAL باستمرار من الخادم الرئيسي إلى النسخة الاحتياطية."
+     },
+     {
+      "term": "REPLICATION",
+      "definition": "سمة دور في PostgreSQL تسمح ببثّ سجل التغييرات."
+     },
+     {
+      "term": "فتحة النسخ",
+      "definition": "علامة في الخادم الرئيسي تُبقي WAL حتى تستهلكه النسخة."
+     },
+     {
+      "term": "verify-full",
+      "definition": "وضع TLS يفحص سلسلة الشهادة واسم المضيف معًا."
+     },
+     {
+      "term": "WAL",
+      "definition": "سجل الكتابة المسبقة: السجل المرتّب لكل تغيير."
+     },
+     {
+      "term": "السجل الثنائي",
+      "definition": "سجل MySQL المرتّب لتغييرات البيانات ويُستخدم في النسخ."
+     },
+     {
+      "term": "النسخ المنطقي",
+      "definition": "نسخ جداول مختارة عبر النشر والاشتراك."
+     },
+     {
+      "term": "تأخر النسخ",
+      "definition": "الفاصل بين تغيير في الخادم الرئيسي ووصوله إلى النسخة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما الصلاحية التي يجب أن يملكها حساب النسخ في PostgreSQL؟",
+      "options": [
+       "SUPERUSER للتبسيط",
+       "REPLICATION وLOGIN فقط",
+       "ملكية كل الجداول",
+       "CREATEDB"
+      ],
+      "answer": 1,
+      "explanation": "الدور المخصّص للبثّ وحده يحدّ الضرر إذا تسرّبت بيانات اعتماده."
+     },
+     {
+      "question": "أي إعداد يجعل النسخة تتحقق من شهادة الخادم الرئيسي واسم مضيفه؟",
+      "options": [
+       "sslmode=prefer",
+       "sslmode=require",
+       "sslmode=verify-full",
+       "sslmode=disable"
+      ],
+      "answer": 2,
+      "explanation": "وحده verify-full يفحص السلسلة والاسم فيُرفض الخادم الرئيسي المزيّف."
+     },
+     {
+      "question": "أي مما يلي مخاطر حقيقية لفتحة نسخ متروكة؟ اختر كل ما ينطبق.",
+      "options": [
+       "يتراكم WAL ويملأ القرص",
+       "قد يتوقف الخادم الرئيسي عن قبول الكتابة",
+       "تُرسل كلمات المرور بنص صريح",
+       "يُحتفظ بالبيانات القديمة أطول من المقصود"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تحتجز الفتحة الخاملة WAL إلى أجل غير مسمى، وهذه مشكلة توافرية ومشكلة احتفاظ بالبيانات. ولا تغيّر طريقة إرسال كلمات المرور."
+     },
+     {
+      "question": "لماذا لا تشمل الكلمة all في pg_hba.conf اتصالات النسخ؟",
+      "options": [
+       "إنه عطل",
+       "يستخدم النسخ قاعدة بيانات وهمية خاصة اسمها replication يجب كتابتها صراحةً",
+       "يتجاهل النسخ pg_hba.conf",
+       "all تطابق قاعدة postgres فقط"
+      ],
+      "answer": 1,
+      "explanation": "يفصل PostgreSQL قواعد النسخ عمدًا حتى لا تفتح قاعدة واسعة التدفق."
+     },
+     {
+      "question": "ظهر صف جديد في pg_stat_replication من عنوان غير مألوف. ما أفضل استجابة أولى؟",
+      "options": [
+       "تجاهله لأن التأخر منخفض",
+       "حدّد المضيف وافحص استخدام الدور مؤخرًا وأنهِ الاتصال وحقّق إن لم يكن مصرّحًا",
+       "أعد تشغيل النسخة",
+       "عطّل TLS للتشخيص"
+      ],
+      "answer": 1,
+      "explanation": "تستطيع نسخة مجهولة قراءة كل تغيير، فعامِلها كحادثة حتى يثبت العكس."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- النسخة المتماثلة نسخة كاملة محدّثة باستمرار من بياناتك، فتحتاج إلى حماية بمستوى الخادم الرئيسي.\n- استخدم دورًا مخصّصًا بالسمتين `REPLICATION` و`LOGIN` فقط، وقيّده في `pg_hba.conf` بقواعد `hostssl` من عنوان النسخة.\n- شفّر التدفق وتحقق من الخادم بـ `sslmode=verify-full`؛ وفي MySQL استخدم `REQUIRE SSL` والتحقق من الشهادة.\n- أدر الفتحات والاحتفاظ بـ WAL، لأن الفتحات الخاملة قد توقف الخادم الرئيسي.\n- راقب النسخ المتصلة وتغييرات الأدوار وإخفاقات المصادقة وحالة الفتحات بوصفها إشارات أمنية.\n\nفي الدرس التالي ستتعلم كيف تستجيب عند حدوث خلل في [الاستجابة لحوادث قواعد البيانات](/learn/systems-infrastructure-security/database-incident-response)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,552 @@
+{
+ "slug": "proxmox-cluster-security",
+ "title": "Proxmox Cluster Security",
+ "summary": "Secure a Proxmox cluster: isolate and encrypt Corosync, firewall management access, control joining and removal, and operate safely.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain what cluster nodes share and trust",
+  "Design separate Corosync, management and storage networks",
+  "Control node joining and removal",
+  "Operate the cluster with least privilege and audits"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "## One cluster, one trust domain\n\nYou have joined three Proxmox nodes into a cluster. Now you can migrate VMs, manage everything from one screen and share users and storage definitions. But you also created something new: a set of machines that trust each other deeply. Cluster nodes share a configuration database, exchange heartbeat messages and can reach each other over SSH as root.\n\nThe consequence is simple. **A cluster is only as secure as its weakest node.** If an attacker takes over one node, the cluster design gives that node paths to all the others. This lesson shows how to design the cluster network, protect the cluster traffic, control who can join, and remove a node safely. It builds on [Proxmox host hardening](/learn/systems-infrastructure-security/proxmox-host-hardening) and [management network isolation](/learn/systems-infrastructure-security/management-network-isolation)."
+  },
+  {
+   "type": "text",
+   "id": "how",
+   "markdown": "## Step 1: Understand what the cluster shares\n\nThree components matter for security.\n\n| Component | Role | Security consequence |\n|:--|:--|:--|\n| `pmxcfs` | Replicated file system at `/etc/pve` | Holds users, ACLs, storage and firewall config. Every node can write to it. |\n| Corosync | Membership, heartbeat and quorum | Traffic must be authenticated and kept off untrusted networks. |\n| SSH between nodes | Migration, replication, tooling | Root keys are shared across nodes. |\n\nBecause `/etc/pve` is replicated, a malicious change made on one node, such as adding a user or opening a firewall rule, spreads to all. That is why monitoring (see [virtualization security monitoring](/learn/systems-infrastructure-security/virtualization-security-monitoring)) must cover every node."
+  },
+  {
+   "type": "animation",
+   "id": "net-layers",
+   "kind": "layers",
+   "title": "Layers of cluster protection",
+   "caption": "Defense in depth for a cluster: each layer limits what a compromised node can reach.",
+   "data": {
+    "layers": [
+     {
+      "label": "Physical and BMC",
+      "sub": "Locked rack, isolated iDRAC/IPMI"
+     },
+     {
+      "label": "Corosync network",
+      "sub": "Dedicated VLAN, no routing"
+     },
+     {
+      "label": "Management network",
+      "sub": "Web UI and SSH from admin hosts only"
+     },
+     {
+      "label": "Cluster firewall",
+      "sub": "Default drop, allow lists"
+     },
+     {
+      "label": "Access control",
+      "sub": "RBAC, MFA, tokens"
+     }
+    ],
+    "steps": [
+     {
+      "layer": 0,
+      "packet": [
+       "Rack"
+      ],
+      "caption": "Start with physical control and an isolated out-of-band controller."
+     },
+     {
+      "layer": 1,
+      "packet": [
+       "Rack",
+       "Corosync"
+      ],
+      "caption": "Put heartbeat traffic on its own VLAN with no route to users."
+     },
+     {
+      "layer": 2,
+      "packet": [
+       "Rack",
+       "Corosync",
+       "Mgmt"
+      ],
+      "caption": "Limit management access to a small set of admin hosts."
+     },
+     {
+      "layer": 3,
+      "packet": [
+       "Rack",
+       "Corosync",
+       "Mgmt",
+       "Firewall"
+      ],
+      "caption": "Enforce the cluster firewall with a default drop policy.",
+      "tone": "secure"
+     },
+     {
+      "layer": 4,
+      "packet": [
+       "Rack",
+       "Corosync",
+       "Mgmt",
+       "Firewall",
+       "RBAC"
+      ],
+      "caption": "Finish with least-privilege roles and multi-factor authentication.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "type": "text",
+   "id": "network",
+   "markdown": "## Step 2: Design the cluster network\n\nRun Corosync on its own network, separate from guests and from the management interface where possible. Corosync is sensitive to latency, so a dedicated link also improves stability. Configure at least two links, so a single cable failure does not split the cluster.\n\nA typical plan for three nodes:\n\n| Network | Purpose | Example subnet | Reachable from |\n|:--|:--|:--|:--|\n| Corosync link 0 | Heartbeat, primary | 10.10.10.0/24 | Cluster nodes only |\n| Corosync link 1 | Heartbeat, backup | 10.10.20.0/24 | Cluster nodes only |\n| Management | Web UI, SSH, API | 192.0.2.0/24 | Admin hosts |\n| Storage / migration | Replication, Ceph | 10.10.30.0/24 | Cluster nodes only |\n| Guest traffic | VM networks | VLAN-aware bridge | Per VM firewall |\n\nNever expose Corosync (UDP 5405 and nearby ports) or the cluster ports to untrusted networks. Pair this with the VLAN guidance in [virtual bridges and VLAN-aware networking](/learn/systems-infrastructure-security/virtual-bridges-and-vlan-aware-networking)."
+  },
+  {
+   "type": "terminal",
+   "id": "cluster-term",
+   "title": "Checking cluster health and settings (lab)",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "pvecm status",
+     "output": "Cluster information\n-------------------\nName:             labcluster\nConfig Version:   3\nTransport:        knet\nSecure auth:      on\n\nQuorum information\n------------------\nNodes:            3\nQuorate:          Yes",
+     "comment": "Look for 'Secure auth: on' and Quorate: Yes."
+    },
+    {
+     "cmd": "corosync-cfgtool -s",
+     "output": "Local node ID 1, transport knet\nLINK ID 0 udp\n\taddr = 10.10.10.11\n\tstatus: n1: connected n2: connected n3: connected\nLINK ID 1 udp\n\taddr = 10.10.20.11\n\tstatus: n1: connected n2: connected n3: connected",
+     "comment": "Both links up means one cable failure will not split the cluster."
+    },
+    {
+     "cmd": "grep -E 'crypto|link' /etc/pve/corosync.conf",
+     "output": "  crypto_cipher: aes256\n  crypto_hash: sha256\n  ring0_addr: 10.10.10.11",
+     "comment": "Traffic encryption settings on the heartbeat links."
+    },
+    {
+     "cmd": "pvesh get /cluster/firewall/options",
+     "output": "enable: 1\npolicy_in: DROP\npolicy_out: ACCEPT",
+     "comment": "Cluster-wide firewall enabled with default drop inbound."
+    }
+   ],
+   "caption": "Output is representative; exact fields vary slightly between Proxmox VE versions."
+  },
+  {
+   "type": "text",
+   "id": "join",
+   "markdown": "## Step 3: Control joining and secrets\n\nJoining a node requires the cluster's join information and the root password of an existing node. Treat that password as the key to the whole cluster.\n\n1. **Verify the fingerprint.** When you join a node, compare the displayed certificate fingerprint with the one you read on the existing node. This stops you from joining to an impostor.\n2. **Use unique, long root passwords** and restrict root SSH to key-based login from the management network. Add node IPs to an allow list.\n3. **Join only fully hardened, patched nodes.** A node that joins carries its weaknesses with it.\n4. **Never copy the cluster files** such as `/etc/pve/priv/` into tickets, chats or backups without encryption. They contain private keys and secrets.\n\n### Removing a node\n\nA decommissioned node still holds cluster credentials. Remove it properly. Power it off, run `pvecm delnode` from a healthy node, and wipe or reinstall the old machine before it leaves your control. Do not power the old node back onto the network, because it still believes it is a member."
+  },
+  {
+   "type": "code",
+   "id": "fw-cluster",
+   "language": "ini",
+   "code": "# /etc/pve/firewall/cluster.fw  (replicated to all nodes)\n[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: ACCEPT\n\n[IPSET mgmt-admins]\n192.0.2.10   # admin workstation 1\n192.0.2.11   # admin workstation 2\n\n[RULES]\nIN SSH(ACCEPT) -source +mgmt-admins -log info\nIN ACCEPT -p tcp -dport 8006 -source +mgmt-admins -log info\nIN ACCEPT -p udp -dport 5405:5412 -source 10.10.10.0/24\nIN ACCEPT -p udp -dport 5405:5412 -source 10.10.20.0/24\n",
+   "filename": "/etc/pve/firewall/cluster.fw",
+   "caption": "Allow SSH and the web UI only from admin hosts, and Corosync only from the heartbeat subnets."
+  },
+  {
+   "type": "callout",
+   "id": "warn-lockout",
+   "variant": "warning",
+   "title": "Do not lock yourself out",
+   "markdown": "Before enabling a default-drop cluster firewall, add the rule that allows your own admin host on ports 22 and 8006, and keep a console session (for example through the out-of-band controller) open. A mistake replicated to every node can remove all remote access at once."
+  },
+  {
+   "type": "text",
+   "id": "mistakes",
+   "markdown": "## Common cluster mistakes\n\nReviews of small clusters find the same problems again and again.\n\n- **Corosync on the guest bridge.** A noisy or hostile VM can then disturb the heartbeat or sniff cluster traffic. Always use a dedicated interface or VLAN.\n- **One flat network for everything.** Management, storage, heartbeat and guests share one subnet, so any guest compromise can reach the host interfaces.\n- **Shared admin accounts.** When five people use `root@pam`, the audit log cannot say who did what. Give each person a named account.\n- **Forgotten out-of-band controllers.** The IPMI or iDRAC interface often runs old firmware with a default password. Patch it, change the password, and place it on the management network only.\n- **No test of node loss.** Many teams discover how their cluster behaves only during a real failure. Rehearse it in the lab first, which also prepares you for the next lesson.\n\nFixing these five items removes most of the practical risk in a small cluster."
+  },
+  {
+   "type": "text",
+   "id": "ops",
+   "markdown": "## Step 4: Operate the cluster safely\n\nDay-two habits keep the cluster safe.\n\n- **Patch in rolling order.** Update one node at a time, migrate workloads away first, and verify quorum after each node returns.\n- **Back up `/etc/pve`.** The cluster configuration is small and valuable. Include it in your backups, encrypted, as part of [disaster recovery](/learn/systems-infrastructure-security/disaster-recovery-and-recovery-testing).\n- **Limit admin roles.** Use [role-based access control](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac) so that daily tasks do not need `Administrator` on the whole cluster, and require [MFA](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa).\n- **Audit membership.** Run `pvecm nodes` on a schedule and alert when the list changes unexpectedly.\n- **Keep versions aligned.** Mixed versions across nodes create unpredictable behavior and delay security patches.\n\nA cluster also changes your incident response. If one node is believed compromised, isolate it from the Corosync network first, then rotate shared credentials and review recent changes to `/etc/pve`."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a three-node lab cluster you own, run `pvecm status` and `corosync-cfgtool -s` and note the quorum and link state. Then write a cluster firewall that allows SSH and port 8006 only from one admin address. Before enabling it, confirm that you have console access. Finally, draw your subnet plan like the table in Step 2 and mark which networks have no route to guests."
+  },
+  {
+   "type": "keyterms",
+   "id": "terms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Cluster",
+     "definition": "A group of nodes managed together that share configuration."
+    },
+    {
+     "term": "pmxcfs",
+     "definition": "The replicated Proxmox file system mounted at /etc/pve."
+    },
+    {
+     "term": "Corosync",
+     "definition": "The cluster engine that provides membership, heartbeat and quorum."
+    },
+    {
+     "term": "Quorum",
+     "definition": "A majority of votes required for the cluster to make changes."
+    },
+    {
+     "term": "Fingerprint",
+     "definition": "A hash of a certificate used to verify a node's identity."
+    },
+    {
+     "term": "Out-of-band controller",
+     "definition": "A separate management processor such as IPMI or iDRAC."
+    },
+    {
+     "term": "Rolling update",
+     "definition": "Patching nodes one at a time to keep services available."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why is one compromised node a risk to the whole cluster?",
+     "options": [
+      "Nodes share a replicated config and trust each other",
+      "Each node has a separate database",
+      "Corosync is disabled on infected nodes"
+     ],
+     "answer": 0,
+     "explanation": "The shared /etc/pve and inter-node SSH trust give a compromised node paths to the others."
+    },
+    {
+     "question": "Which are good practices for the Corosync network? Choose all that apply.",
+     "options": [
+      "Use a dedicated VLAN",
+      "Configure at least two links",
+      "Route it to the guest network",
+      "Keep it off untrusted networks"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Dedicated, redundant and unreachable by untrusted hosts is the goal. Routing it to guests widens exposure."
+    },
+    {
+     "question": "When joining a node, why compare the certificate fingerprint?",
+     "options": [
+      "To speed up the join",
+      "To avoid joining an impostor",
+      "To enable HA"
+     ],
+     "answer": 1,
+     "explanation": "Comparing the fingerprint confirms you are talking to the genuine node."
+    },
+    {
+     "question": "What should you do before powering a decommissioned node back on?",
+     "options": [
+      "Nothing, it will rejoin safely",
+      "Wipe or reinstall it first",
+      "Increase its quorum votes"
+     ],
+     "answer": 1,
+     "explanation": "An old node still holds cluster credentials and believes it is a member, so wipe it before reuse."
+    },
+    {
+     "question": "Before enabling a default-drop cluster firewall you should:",
+     "options": [
+      "Allow your admin host on ports 22 and 8006 and keep console access",
+      "Disable Corosync",
+      "Delete the admin user"
+     ],
+     "answer": 0,
+     "explanation": "A bad rule replicates to all nodes. Console access lets you recover."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nA cluster shares configuration, heartbeat and SSH trust, so one weak node endangers all. Separate and encrypt Corosync traffic, restrict management access with a cluster firewall, verify fingerprints when joining, remove nodes cleanly, and operate with rolling updates, least privilege and membership audits. Next, learn how clusters stay available, and how that affects security, in [high availability and quorum security](/learn/systems-infrastructure-security/high-availability-and-quorum-security)."
+  }
+ ],
+ "ar": {
+  "title": "أمن عنقود Proxmox",
+  "summary": "أمّن عنقود Proxmox: اعزل Corosync وشفّره، وقيّد وصول الإدارة بالجدار، وتحكم بالانضمام والإزالة، وشغّل العنقود بأمان.",
+  "objectives": [
+   "شرح ما تتشاركه عقد العنقود وتثق به",
+   "تصميم شبكات Corosync والإدارة والتخزين منفصلة",
+   "التحكم بانضمام العقد وإزالتها",
+   "تشغيل العنقود بأقل صلاحية وتدقيق"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "## عنقود واحد، نطاق ثقة واحد\n\nضممت ثلاث عقد Proxmox في عنقود. صار بإمكانك ترحيل الآلات وإدارة كل شيء من شاشة واحدة ومشاركة المستخدمين وتعريفات التخزين. لكنك أنشأت أيضًا شيئًا جديدًا: مجموعة أجهزة تثق ببعضها ثقة عميقة. فعقد العنقود تتشارك قاعدة إعدادات وتتبادل رسائل نبض وتستطيع الوصول إلى بعضها عبر SSH بصلاحيات root.\n\nوالنتيجة بسيطة: **أمن العنقود بقدر أضعف عقدة فيه.** فإذا سيطر مهاجم على عقدة واحدة، يمنحها تصميم العنقود مسارات إلى بقية العقد. يبيّن هذا الدرس كيف تصمّم شبكة العنقود، وتحمي حركته، وتتحكم بمن ينضم، وتزيل عقدة بأمان. وهو يبني على [تحصين مضيف Proxmox](/learn/systems-infrastructure-security/proxmox-host-hardening) و[عزل شبكة الإدارة](/learn/systems-infrastructure-security/management-network-isolation)."
+   },
+   {
+    "type": "text",
+    "id": "how",
+    "markdown": "## الخطوة 1: افهم ما يتشاركه العنقود\n\nثلاثة مكوّنات مهمة أمنيًا.\n\n| المكوّن | الدور | الأثر الأمني |\n|:--|:--|:--|\n| `pmxcfs` | نظام ملفات متماثل عند `/etc/pve` | يحوي المستخدمين وقوائم التحكم والتخزين وإعدادات الجدار، وتستطيع كل عقدة الكتابة فيه. |\n| Corosync | العضوية والنبض والنِّصاب | يجب مصادقة حركته وإبقاؤها بعيدًا عن الشبكات غير الموثوقة. |\n| SSH بين العقد | الترحيل والنسخ المتماثل والأدوات | مفاتيح root مشتركة بين العقد. |\n\nولأن `/etc/pve` متماثل، فأي تغيير خبيث على عقدة واحدة، كإضافة مستخدم أو فتح قاعدة جدار، ينتشر إلى الجميع. ولهذا يجب أن تغطي المراقبة (انظر [المراقبة الأمنية لبيئات المحاكاة الافتراضية](/learn/systems-infrastructure-security/virtualization-security-monitoring)) كل عقدة."
+   },
+   {
+    "type": "animation",
+    "id": "net-layers",
+    "kind": "layers",
+    "title": "طبقات حماية العنقود",
+    "caption": "دفاع متعدد الطبقات للعنقود: كل طبقة تحدّ مما تصل إليه عقدة مخترَقة.",
+    "data": {
+     "layers": [
+      {
+       "label": "المادي ووحدة BMC",
+       "sub": "حامل مقفل وiDRAC/IPMI معزولة"
+      },
+      {
+       "label": "شبكة Corosync",
+       "sub": "VLAN مخصصة دون توجيه"
+      },
+      {
+       "label": "شبكة الإدارة",
+       "sub": "الواجهة وSSH من أجهزة المسؤولين فقط"
+      },
+      {
+       "label": "جدار العنقود",
+       "sub": "إسقاط افتراضي وقوائم سماح"
+      },
+      {
+       "label": "التحكم بالوصول",
+       "sub": "RBAC وMFA ورموز"
+      }
+     ],
+     "steps": [
+      {
+       "layer": 0,
+       "packet": [
+        "حامل"
+       ],
+       "caption": "ابدأ بالتحكم المادي ووحدة تحكم خارج النطاق معزولة."
+      },
+      {
+       "layer": 1,
+       "packet": [
+        "حامل",
+        "Corosync"
+       ],
+       "caption": "ضع حركة النبض في VLAN خاصة دون مسار إلى المستخدمين."
+      },
+      {
+       "layer": 2,
+       "packet": [
+        "حامل",
+        "Corosync",
+        "إدارة"
+       ],
+       "caption": "قصر وصول الإدارة على مجموعة صغيرة من أجهزة المسؤولين."
+      },
+      {
+       "layer": 3,
+       "packet": [
+        "حامل",
+        "Corosync",
+        "إدارة",
+        "جدار"
+       ],
+       "caption": "فعّل جدار العنقود بسياسة إسقاط افتراضية.",
+       "tone": "secure"
+      },
+      {
+       "layer": 4,
+       "packet": [
+        "حامل",
+        "Corosync",
+        "إدارة",
+        "جدار",
+        "RBAC"
+       ],
+       "caption": "اختم بأدوار أقل صلاحية ومصادقة متعددة العوامل.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "type": "text",
+    "id": "network",
+    "markdown": "## الخطوة 2: صمّم شبكة العنقود\n\nشغّل Corosync على شبكته الخاصة، منفصلة عن الضيوف وعن واجهة الإدارة حيثما أمكن. فـ Corosync حساس للتأخير، ولذلك تحسّن الوصلة المخصصة الاستقرار أيضًا. اضبط وصلتين على الأقل كي لا يقسم عطل كابل واحد العنقود.\n\nخطة نموذجية لثلاث عقد:\n\n| الشبكة | الغرض | شبكة فرعية مثال | يمكن الوصول إليها من |\n|:--|:--|:--|:--|\n| Corosync وصلة 0 | النبض الأساسي | 10.10.10.0/24 | عقد العنقود فقط |\n| Corosync وصلة 1 | نبض احتياطي | 10.10.20.0/24 | عقد العنقود فقط |\n| الإدارة | الواجهة وSSH وAPI | 192.0.2.0/24 | أجهزة المسؤولين |\n| التخزين / الترحيل | النسخ المتماثل وCeph | 10.10.30.0/24 | عقد العنقود فقط |\n| حركة الضيوف | شبكات الآلات | جسر يدعم VLAN | جدار لكل آلة |\n\nلا تكشف Corosync (منفذ UDP 5405 وما حوله) ولا منافذ العنقود لشبكات غير موثوقة. واقرن ذلك بإرشادات VLAN في [الجسور الافتراضية والشبكات الداعمة لـ VLAN](/learn/systems-infrastructure-security/virtual-bridges-and-vlan-aware-networking)."
+   },
+   {
+    "type": "terminal",
+    "id": "cluster-term",
+    "title": "فحص صحة العنقود وإعداداته (مختبر)",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "pvecm status",
+      "output": "Cluster information\n-------------------\nName:             labcluster\nConfig Version:   3\nTransport:        knet\nSecure auth:      on\n\nQuorum information\n------------------\nNodes:            3\nQuorate:          Yes",
+      "comment": "ابحث عن 'Secure auth: on' وQuorate: Yes."
+     },
+     {
+      "cmd": "corosync-cfgtool -s",
+      "output": "Local node ID 1, transport knet\nLINK ID 0 udp\n\taddr = 10.10.10.11\n\tstatus: n1: connected n2: connected n3: connected\nLINK ID 1 udp\n\taddr = 10.10.20.11\n\tstatus: n1: connected n2: connected n3: connected",
+      "comment": "اتصال الوصلتين يعني أن عطل كابل واحد لن يقسم العنقود."
+     },
+     {
+      "cmd": "grep -E 'crypto|link' /etc/pve/corosync.conf",
+      "output": "  crypto_cipher: aes256\n  crypto_hash: sha256\n  ring0_addr: 10.10.10.11",
+      "comment": "إعدادات تشفير حركة وصلات النبض."
+     },
+     {
+      "cmd": "pvesh get /cluster/firewall/options",
+      "output": "enable: 1\npolicy_in: DROP\npolicy_out: ACCEPT",
+      "comment": "جدار العنقود مفعّل بإسقاط افتراضي للداخل."
+     }
+    ],
+    "caption": "المخرجات تمثيلية، وتختلف الحقول قليلاً بين إصدارات Proxmox VE."
+   },
+   {
+    "type": "text",
+    "id": "join",
+    "markdown": "## الخطوة 3: تحكّم بالانضمام والأسرار\n\nيتطلب ضم عقدة معلومات الانضمام الخاصة بالعنقود وكلمة مرور root لعقدة موجودة. عامل تلك الكلمة كمفتاح العنقود كله.\n\n1. **تحقق من البصمة.** عند ضم عقدة، قارن بصمة الشهادة المعروضة بتلك التي قرأتها على العقدة الموجودة. يمنعك ذلك من الانضمام إلى منتحل.\n2. **استخدم كلمات مرور root طويلة وفريدة** وقيّد SSH لـ root بالدخول بالمفاتيح من شبكة الإدارة. وأضف عناوين العقد إلى قائمة سماح.\n3. **اضمّ فقط عقدًا محصّنة ومحدّثة بالكامل.** فالعقدة المنضمة تحمل نقاط ضعفها معها.\n4. **لا تنسخ ملفات العنقود** مثل `/etc/pve/priv/` إلى تذاكر أو محادثات أو نسخ احتياطية دون تشفير، فهي تحوي مفاتيح خاصة وأسرارًا.\n\n### إزالة عقدة\n\nتحتفظ العقدة المُخرجة من الخدمة ببيانات اعتماد العنقود، لذا أزلها بشكل صحيح. أطفئها ونفّذ `pvecm delnode` من عقدة سليمة، ثم امسح الجهاز القديم أو أعد تثبيته قبل أن يخرج من سيطرتك. ولا تُعد تشغيل العقدة القديمة على الشبكة لأنها ما زالت تعتقد أنها عضو."
+   },
+   {
+    "type": "code",
+    "id": "fw-cluster",
+    "language": "ini",
+    "code": "# /etc/pve/firewall/cluster.fw  (replicated to all nodes)\n[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: ACCEPT\n\n[IPSET mgmt-admins]\n192.0.2.10   # admin workstation 1\n192.0.2.11   # admin workstation 2\n\n[RULES]\nIN SSH(ACCEPT) -source +mgmt-admins -log info\nIN ACCEPT -p tcp -dport 8006 -source +mgmt-admins -log info\nIN ACCEPT -p udp -dport 5405:5412 -source 10.10.10.0/24\nIN ACCEPT -p udp -dport 5405:5412 -source 10.10.20.0/24\n",
+    "filename": "/etc/pve/firewall/cluster.fw",
+    "caption": "اسمح بـ SSH والواجهة من أجهزة المسؤولين فقط، وبـ Corosync من شبكات النبض فقط."
+   },
+   {
+    "type": "callout",
+    "id": "warn-lockout",
+    "variant": "warning",
+    "title": "لا تحبس نفسك خارج النظام",
+    "markdown": "قبل تفعيل جدار عنقود بإسقاط افتراضي، أضف القاعدة التي تسمح لجهاز المسؤول الخاص بك على المنفذين 22 و8006، وأبقِ جلسة كونسول مفتوحة (مثلاً عبر وحدة التحكم خارج النطاق). فخطأ يتكرر على كل العقد قد يزيل كل الوصول عن بُعد دفعة واحدة."
+   },
+   {
+    "type": "text",
+    "id": "mistakes",
+    "markdown": "## أخطاء شائعة في العناقيد\n\nتكشف مراجعات العناقيد الصغيرة المشكلات نفسها مرارًا.\n\n- **Corosync على جسر الضيوف.** عندها قد تُربك آلة صاخبة أو معادية النبض أو تتنصت على حركة العنقود. استخدم دائمًا واجهة أو VLAN مخصصة.\n- **شبكة مسطحة واحدة لكل شيء.** تتشارك الإدارة والتخزين والنبض والضيوف شبكة فرعية واحدة، فيصل أي ضيف مخترَق إلى واجهات المضيف.\n- **حسابات مسؤول مشتركة.** عندما يستخدم خمسة أشخاص `root@pam` لا يستطيع سجل التدقيق تحديد من فعل ماذا. امنح كل شخص حسابًا باسمه.\n- **وحدات تحكم خارج النطاق منسية.** كثيرًا ما تعمل واجهة IPMI أو iDRAC ببرنامج ثابت قديم وكلمة مرور افتراضية. حدّثها وغيّر كلمة المرور وضعها على شبكة الإدارة فقط.\n- **عدم اختبار فقدان عقدة.** تكتشف فرق كثيرة سلوك عنقودها فقط أثناء عطل حقيقي. جرّب ذلك في المختبر أولاً، فهذا يجهّزك أيضًا للدرس التالي.\n\nمعالجة هذه البنود الخمسة تزيل معظم المخاطر العملية في عنقود صغير."
+   },
+   {
+    "type": "text",
+    "id": "ops",
+    "markdown": "## الخطوة 4: شغّل العنقود بأمان\n\nعادات اليوم الثاني تحافظ على أمان العنقود.\n\n- **حدّث بترتيب متدرّج.** حدّث عقدة واحدة في كل مرة، وارحّل الأحمال بعيدًا أولاً، وتحقق من النِّصاب بعد عودة كل عقدة.\n- **انسخ `/etc/pve` احتياطيًا.** إعداد العنقود صغير وقيّم. ضمّنه في نسخك مشفّرًا كجزء من [التعافي من الكوارث](/learn/systems-infrastructure-security/disaster-recovery-and-recovery-testing).\n- **قيّد أدوار المسؤولين.** استخدم [التحكم بالوصول على أساس الأدوار](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac) كي لا تحتاج المهام اليومية إلى `Administrator` على العنقود كله، واشترط [المصادقة المتعددة العوامل](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa).\n- **دقّق العضوية.** شغّل `pvecm nodes` بجدول زمني ونبّه عندما تتغير القائمة بشكل غير متوقع.\n- **حافظ على تطابق الإصدارات.** تسبب الإصدارات المختلطة سلوكًا غير متوقع وتؤخر التصحيحات الأمنية.\n\nويغيّر العنقود أيضًا استجابتك للحوادث. فإذا اشتُبه باختراق عقدة، اعزلها عن شبكة Corosync أولاً، ثم بدّل بيانات الاعتماد المشتركة وراجع التغييرات الأخيرة في `/etc/pve`."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في عنقود مخبري من ثلاث عقد تملكه، شغّل `pvecm status` و`corosync-cfgtool -s` ولاحظ حالة النِّصاب والوصلات. ثم اكتب جدار عنقود يسمح بـ SSH والمنفذ 8006 من عنوان مسؤول واحد فقط. قبل تفعيله تأكد من وجود وصول عبر الكونسول. وأخيرًا ارسم خطة شبكاتك كجدول الخطوة 2 وحدّد الشبكات التي لا مسار لها إلى الضيوف."
+   },
+   {
+    "type": "keyterms",
+    "id": "terms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "العنقود (Cluster)",
+      "definition": "مجموعة عقد تُدار معًا وتتشارك الإعدادات."
+     },
+     {
+      "term": "pmxcfs",
+      "definition": "نظام ملفات Proxmox المتماثل المركّب عند /etc/pve."
+     },
+     {
+      "term": "Corosync",
+      "definition": "محرك العنقود الذي يوفّر العضوية والنبض والنِّصاب."
+     },
+     {
+      "term": "النِّصاب (Quorum)",
+      "definition": "أغلبية الأصوات اللازمة ليجري العنقود تغييرات."
+     },
+     {
+      "term": "البصمة",
+      "definition": "تجزئة شهادة تُستخدم للتحقق من هوية عقدة."
+     },
+     {
+      "term": "وحدة التحكم خارج النطاق",
+      "definition": "معالج إدارة منفصل مثل IPMI أو iDRAC."
+     },
+     {
+      "term": "التحديث المتدرّج",
+      "definition": "تصحيح العقد واحدة تلو الأخرى للحفاظ على توافر الخدمات."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا تشكّل عقدة مخترَقة واحدة خطرًا على العنقود كله؟",
+      "options": [
+       "تتشارك العقد إعدادات متماثلة وتثق ببعضها",
+       "لكل عقدة قاعدة بيانات منفصلة",
+       "يُعطَّل Corosync على العقد المصابة"
+      ],
+      "answer": 0,
+      "explanation": "المشاركة في /etc/pve وثقة SSH بين العقد تمنح العقدة المخترَقة مسارات إلى الباقي."
+     },
+     {
+      "question": "أي ممارسات جيدة لشبكة Corosync؟ اختر كل ما ينطبق.",
+      "options": [
+       "استخدام VLAN مخصصة",
+       "ضبط وصلتين على الأقل",
+       "توجيهها إلى شبكة الضيوف",
+       "إبعادها عن الشبكات غير الموثوقة"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "الهدف شبكة مخصصة ومتكررة لا تصلها أجهزة غير موثوقة، أما توجيهها إلى الضيوف فيوسّع الانكشاف."
+     },
+     {
+      "question": "عند ضم عقدة، لماذا تقارن بصمة الشهادة؟",
+      "options": [
+       "لتسريع الانضمام",
+       "لتجنب الانضمام إلى منتحل",
+       "لتفعيل HA"
+      ],
+      "answer": 1,
+      "explanation": "مقارنة البصمة تؤكد أنك تتصل بالعقدة الحقيقية."
+     },
+     {
+      "question": "ماذا تفعل قبل إعادة تشغيل عقدة أُخرجت من الخدمة؟",
+      "options": [
+       "لا شيء، فستنضم بأمان",
+       "امسحها أو أعد تثبيتها أولاً",
+       "زِد أصوات النِّصاب لها"
+      ],
+      "answer": 1,
+      "explanation": "العقدة القديمة ما زالت تحمل بيانات اعتماد العنقود وتظن أنها عضو، فامسحها قبل إعادة الاستخدام."
+     },
+     {
+      "question": "قبل تفعيل جدار عنقود بإسقاط افتراضي عليك أن:",
+      "options": [
+       "تسمح لجهاز المسؤول على المنفذين 22 و8006 وتبقي الوصول عبر الكونسول",
+       "تعطّل Corosync",
+       "تحذف مستخدم المسؤول"
+      ],
+      "answer": 0,
+      "explanation": "القاعدة الخاطئة تتكرر على كل العقد، والكونسول يتيح لك الاسترداد."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nيتشارك العنقود الإعدادات والنبض وثقة SSH، فتعريض عقدة ضعيفة واحدة للخطر يهدّد الجميع. افصل حركة Corosync وشفّرها، وقيّد وصول الإدارة بجدار العنقود، وتحقق من البصمات عند الانضمام، وأزل العقد بشكل نظيف، وشغّل العنقود بتحديثات متدرّجة وأقل صلاحية وتدقيق للعضوية. وفي الدرس التالي تتعلم كيف تبقى العناقيد متاحة وأثر ذلك على الأمن: [التوافرية العالية وأمن النِّصاب](/learn/systems-infrastructure-security/high-availability-and-quorum-security)."
+   }
+  ]
+ }
+}

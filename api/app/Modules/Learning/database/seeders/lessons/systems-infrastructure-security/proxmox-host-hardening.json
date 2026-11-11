@@ -1,0 +1,560 @@
+{
+  "slug": "proxmox-host-hardening",
+  "title": "Proxmox Host Hardening",
+  "summary": "Harden a Proxmox VE node step by step: working updates, key-only SSH, fewer services, brute-force protection, accurate time and protected firmware.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Configure working repositories and verify the running kernel",
+    "Apply key-only SSH using a drop-in configuration",
+    "Identify and disable unused services",
+    "Add brute-force protection with fail2ban",
+    "Describe time, firmware and out-of-band hardening"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A new Proxmox node arrives, the installer finishes in ten minutes, and the web console is ready. It feels done. But the node is still a default Debian server: SSH accepts passwords, root can log in, nothing watches for guessing attempts, and the package lists may point at a repository that no longer receives updates. Within hours of being placed on a reachable network, such a host collects login attempts.\n\nHost hardening is the work of shrinking that default state to what you actually need. This lesson covers the changes that give the largest benefit for the least effort: patching, SSH, unneeded services, brute-force protection, time and physical access."
+    },
+    {
+      "id": "patching",
+      "type": "text",
+      "markdown": "## Step 1: Keep the host patched\n\nProxmox VE ships security fixes for Debian, the kernel, QEMU and its own services through APT. Without a valid repository you receive none of them.\n\n- The **enterprise repository** requires a subscription key. Without one, `apt update` fails with an authorization error.\n- The **no-subscription repository** is free and suitable for labs and many small sites. It receives packages slightly sooner than the tested enterprise channel.\n\nWhichever you use, enable exactly one Proxmox repository and make sure it works. A node that silently fails `apt update` is an unpatched node.\n\nAfter updates, a new kernel only takes effect after a reboot. Plan maintenance windows, migrate guests to another node first, and confirm the running kernel afterward. The `pveversion -v` output shows both the installed and the running kernel, which makes missed reboots easy to spot.\n\nFor critical fixes between maintenance windows, subscribe to the Proxmox security announcements and Debian security list so you hear about them promptly."
+    },
+    {
+      "id": "apt",
+      "type": "terminal",
+      "title": "Checking updates and the running kernel",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "grep -rH '^deb' /etc/apt/sources.list /etc/apt/sources.list.d/ | cut -c1-110",
+          "output": "/etc/apt/sources.list:deb http://deb.debian.org/debian bookworm main contrib\n/etc/apt/sources.list:deb http://security.debian.org/debian-security bookworm-security main contrib\n/etc/apt/sources.list.d/pve-no-subscription.list:deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription",
+          "comment": "Debian, Debian security and exactly one Proxmox repository."
+        },
+        {
+          "cmd": "apt update && apt list --upgradable 2>/dev/null | grep -c upgradable",
+          "output": "Fetched 1,204 kB in 2s (610 kB/s)\n7",
+          "comment": "Seven packages waiting. Review them, then apply with apt full-upgrade."
+        },
+        {
+          "cmd": "uname -r; pveversion -v | grep proxmox-kernel",
+          "output": "6.8.8-2-pve\nproxmox-kernel-6.8: 6.8.12-4\nproxmox-kernel-6.8.8-2-pve-signed: 6.8.8-2",
+          "comment": "A newer kernel package is installed than the one running. A reboot is pending."
+        }
+      ]
+    },
+    {
+      "id": "ssh",
+      "type": "text",
+      "markdown": "## Step 2: Lock down SSH\n\nSSH is the second door after the web console. It is also needed by the cluster: nodes use SSH keys for root to run migrations and cluster tasks. So you should not disable root login completely on a clustered node. The right setting is to forbid **password** logins for root and everyone else, and allow keys only.\n\nUse a drop-in file so that your changes survive package upgrades and are easy to review. Debian reads every file in `/etc/ssh/sshd_config.d/`.\n\nBefore you reload, keep your current session open, run `sshd -t` to catch syntax errors, then open a second session to prove you can still log in. Locking yourself out of a remote host is the classic hardening mistake. Create at least one named administrator account with your public key before you disable passwords."
+    },
+    {
+      "id": "sshd-conf",
+      "type": "code",
+      "language": "ini",
+      "code": "# Keys only. Root may log in with a key because the cluster needs it.\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n\n# Reduce guessing and unused features\nMaxAuthTries 3\nLoginGraceTime 30\nX11Forwarding no\n\n# Optional: only these groups may log in\nAllowGroups sshadmins root",
+      "caption": "Drop-in file. Test with sshd -t, then systemctl reload ssh.",
+      "filename": "/etc/ssh/sshd_config.d/10-hardening.conf"
+    },
+    {
+      "id": "services",
+      "type": "text",
+      "markdown": "## Step 3: Remove what you do not use\n\nEvery running service is a possible vulnerability and a possible log of noise. After installation, list what listens and decide.\n\n| Service | Keep? | Notes |\n|:--|:--|:--|\n| `sshd` | Yes | Restrict with keys and a firewall |\n| `pveproxy` | Yes | Restrict by source address (next lessons) |\n| `spiceproxy` | Only if you use SPICE | Disable otherwise |\n| `rpcbind` | Only for NFS v3 | Disable if you use NFS v4 or no NFS |\n| `postfix` | Yes, local only | Used to send alerts; do not accept remote mail |\n| Extra packages | No | Remove compilers and tools you do not need |\n\nDisable with `systemctl disable --now <service>` and confirm with `ss -tlnp`. Write down what you changed so that the next administrator understands why a feature is missing.\n\nThe host should also run the host firewall. See [Proxmox firewall configuration](/learn/systems-infrastructure-security/proxmox-firewall-configuration) for how to restrict ports 22 and 8006 to your management network."
+    },
+    {
+      "id": "guess-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Brute-force protection at work",
+      "caption": "fail2ban reads logs and asks the firewall to drop repeat offenders.",
+      "data": {
+        "token": "Login",
+        "nodes": [
+          {
+            "id": "src",
+            "label": "Guessing host",
+            "sub": "203.0.113.45",
+            "icon": "attacker"
+          },
+          {
+            "id": "px",
+            "label": "pveproxy",
+            "sub": "8006",
+            "icon": "globe"
+          },
+          {
+            "id": "log",
+            "label": "Journal",
+            "sub": "pvedaemon",
+            "icon": "log"
+          },
+          {
+            "id": "f2b",
+            "label": "fail2ban",
+            "sub": "maxretry 3",
+            "icon": "eye"
+          },
+          {
+            "id": "fw",
+            "label": "Firewall",
+            "sub": "nftables",
+            "icon": "firewall"
+          }
+        ],
+        "steps": [
+          {
+            "at": "src",
+            "caption": "A host tries passwords against the console.",
+            "tone": "attack"
+          },
+          {
+            "at": "px",
+            "caption": "Each attempt fails authentication.",
+            "tone": "warning"
+          },
+          {
+            "at": "log",
+            "caption": "pvedaemon logs: authentication failure; rhost=203.0.113.45.",
+            "tone": "default"
+          },
+          {
+            "at": "f2b",
+            "caption": "After three failures within the window, fail2ban raises a ban.",
+            "tone": "warning"
+          },
+          {
+            "at": "fw",
+            "caption": "The firewall now drops all packets from that address for an hour.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "bruteforce",
+      "type": "text",
+      "markdown": "## Step 4: Slow down password guessing\n\nEven with MFA, you want repeated failures to cost the attacker something and to leave a clear trail. `fail2ban` watches log files and bans addresses that fail too often. Proxmox logs failed web logins to the system journal, so you tell fail2ban to read the journal.\n\nTwo cautions apply. A ban list is a convenience, not a substitute for restricting the console to your management network. And a ban that triggers on your own address can lock you out, so add your administration network to `ignoreip`."
+    },
+    {
+      "id": "f2b-conf",
+      "type": "code",
+      "language": "ini",
+      "code": "# /etc/fail2ban/filter.d/proxmox.conf\n[Definition]\nfailregex = pvedaemon\\[.*authentication failure; rhost=<HOST> user=.* msg=.*\nignoreregex =\n\n# /etc/fail2ban/jail.d/proxmox.conf\n[proxmox]\nenabled  = true\nport     = https,8006\nfilter   = proxmox\nbackend  = systemd\nmaxretry = 3\nfindtime = 2d\nbantime  = 1h\nignoreip = 127.0.0.1/8 10.20.0.0/24",
+      "caption": "Filter plus jail. Verify with fail2ban-client status proxmox."
+    },
+    {
+      "id": "other",
+      "type": "text",
+      "markdown": "## Step 5: Time, firmware and physical access\n\nThree smaller items complete the baseline.\n\n- **Time.** Certificates, Kerberos, TOTP codes and log correlation all depend on correct clocks. Run `chrony` or `systemd-timesyncd` against internal NTP servers and check with `timedatectl`.\n- **Firmware and microcode.** Install the CPU microcode package for your vendor and keep BIOS and BMC firmware current. Microcode carries mitigations for CPU side-channel flaws.\n- **Physical and out-of-band access.** Set a BIOS password, disable unused boot devices, and put the BMC (iDRAC, iLO, IPMI) on the management network with a unique strong password. A BMC reachable from the user network is a back door to the whole host.\n\nFinally, consider full-disk encryption for hosts in places you do not fully control. It protects the data if a server is stolen, at the price of needing a way to unlock it at boot."
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Step 6: Verify and keep it that way\n\nHardening that is never verified is only a belief. After each change, test the result from the outside: try a password login, scan your own node with `nmap` from the management network, and read `sshd -T` for the effective settings. Then write the baseline into a short document or, better, into configuration management such as Ansible, so a rebuilt node ends up identical.\n\nRe-check on a schedule. Updates, new packages and quick fixes drift a system away from its baseline. A monthly review of listening ports, accounts and pending updates catches drift early. The lesson on [infrastructure hardening and configuration auditing](/learn/systems-infrastructure-security/infrastructure-hardening-and-configuration-auditing) shows how to automate it."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Never harden over your only connection",
+      "markdown": "Changes to SSH or the firewall can end your session permanently. Keep a second session or the BMC console open, test every change with a new connection, and know how to revert. On a remote host without out-of-band access, schedule a rollback with `at now + 10 minutes` before you apply risky changes and cancel it once you confirm access."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a lab Proxmox node you own, with console access available as a safety net:\n\n1. Run `apt update` and `apt list --upgradable`. Apply the updates and compare `uname -r` with the installed kernel.\n2. Add a named admin user with your public key and test logging in.\n3. Create the SSH drop-in file shown above, run `sshd -t`, reload, then confirm a password login is refused with `ssh -o PreferredAuthentications=password user@pve1.example.com`.\n4. Install `fail2ban`, add the two files, and check `fail2ban-client status proxmox`.\n5. Run `ss -tlnp` again and compare with your baseline."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Hardening",
+          "definition": "Reducing a system's attack surface by removing and restricting defaults."
+        },
+        {
+          "term": "Enterprise repository",
+          "definition": "The subscription-only Proxmox update channel that is tested more."
+        },
+        {
+          "term": "No-subscription repository",
+          "definition": "The free Proxmox update channel suited to labs and small sites."
+        },
+        {
+          "term": "Drop-in file",
+          "definition": "A small config file in a .d directory that overrides defaults without editing the main file."
+        },
+        {
+          "term": "fail2ban",
+          "definition": "A tool that bans addresses after repeated failures found in logs."
+        },
+        {
+          "term": "BMC",
+          "definition": "The out-of-band management controller on a server, such as iDRAC or iLO."
+        },
+        {
+          "term": "Microcode",
+          "definition": "CPU firmware updates that carry fixes and mitigations."
+        },
+        {
+          "term": "Out-of-band",
+          "definition": "Management that works independently of the host operating system."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why not disable root SSH login entirely on a Proxmox cluster node?",
+          "options": [
+            "Root is required for the web console",
+            "Cluster nodes use root SSH keys for migration and cluster tasks",
+            "SSH does not work without root",
+            "It breaks fail2ban"
+          ],
+          "answer": 1,
+          "explanation": "Use PermitRootLogin prohibit-password so root can use keys but never passwords."
+        },
+        {
+          "question": "Which actions are part of baseline host hardening? Choose all that apply.",
+          "options": [
+            "Working package repositories and regular updates",
+            "Key-only SSH",
+            "Disabling unused services",
+            "Leaving the BMC on the user network"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "The BMC belongs on the management network. Exposing it creates a back door."
+        },
+        {
+          "question": "What should you do before reloading a changed SSH configuration?",
+          "options": [
+            "Reboot the host",
+            "Run sshd -t and keep a second session open",
+            "Disable the firewall",
+            "Delete authorized_keys"
+          ],
+          "answer": 1,
+          "explanation": "sshd -t catches syntax errors and a second session proves you can still get in."
+        },
+        {
+          "question": "A new kernel was installed by apt but uname -r shows the old one. What does that mean?",
+          "options": [
+            "The update failed",
+            "A reboot is needed for the fix to take effect",
+            "The old kernel is more secure",
+            "fail2ban is blocking it"
+          ],
+          "answer": 1,
+          "explanation": "Kernel fixes protect you only once the new kernel is running."
+        },
+        {
+          "question": "What is the main risk of a fail2ban rule without an ignoreip entry for your admin network?",
+          "options": [
+            "It uses too much disk",
+            "You could ban yourself and lose access",
+            "It stops TLS",
+            "It disables MFA"
+          ],
+          "answer": 1,
+          "explanation": "Mistyped passwords from your own address can trigger the ban."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nHardening a Proxmox host means keeping it patched through a working repository, allowing only key-based SSH, removing unused services, slowing password guessing, keeping accurate time and protecting firmware and the BMC. Always test changes with a second connection. These steps make the host a small, predictable target. Next, apply the same care to the most exposed service of all: [the Proxmox web interface](/learn/systems-infrastructure-security/proxmox-web-interface-security)."
+    }
+  ],
+  "ar": {
+    "title": "تحصين مضيف Proxmox",
+    "summary": "حصّن عقدة Proxmox VE خطوة بخطوة: تحديثات عاملة وSSH بالمفاتيح وخدمات أقل وحماية من التخمين ووقت دقيق وبرامج ثابتة محمية.",
+    "objectives": [
+      "اضبط المستودعات العاملة وتحقق من النواة العاملة",
+      "طبّق SSH بالمفاتيح فقط عبر ملف إضافة",
+      "حدّد الخدمات غير المستخدمة وعطّلها",
+      "أضف حماية من التخمين باستخدام fail2ban",
+      "صِف تحصين الوقت والبرامج الثابتة والإدارة خارج النطاق"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يصل خادم Proxmox جديد، ويُنهي المثبّت عمله في عشر دقائق، وتصبح وحدة الويب جاهزة. يبدو كل شيء منتهيًا. لكن العقدة ما زالت خادم Debian افتراضيًا: يقبل SSH كلمات المرور، ويستطيع root تسجيل الدخول، ولا شيء يراقب محاولات التخمين، وقد تشير قوائم الحزم إلى مستودع لم يعد يتلقى تحديثات. وخلال ساعات من وضع مضيف كهذا على شبكة يمكن بلوغها يبدأ بجمع محاولات الدخول.\n\nتحصين المضيف (Host hardening) هو تقليص تلك الحالة الافتراضية إلى ما تحتاجه فعلًا. يغطي هذا الدرس التغييرات الأعلى فائدة بأقل جهد: التحديثات وSSH والخدمات غير الضرورية والحماية من التخمين والوقت والوصول الفيزيائي."
+      },
+      {
+        "id": "patching",
+        "type": "text",
+        "markdown": "## الخطوة 1: أبقِ المضيف محدّثًا\n\nيوزّع Proxmox VE إصلاحات الأمان لـ Debian والنواة وQEMU وخدماته عبر APT. ودون مستودع صالح لا تصلك أي منها.\n\n- **مستودع المؤسسات (Enterprise)** يتطلب مفتاح اشتراك. وبدونه يفشل `apt update` بخطأ تخويل.\n- **مستودع بلا اشتراك (No-subscription)** مجاني ومناسب للمختبرات ومواقع صغيرة كثيرة، وتصله الحزم أبكر قليلًا من القناة المؤسسية المختبرة.\n\nأيًّا اخترت، فعّل مستودع Proxmox واحدًا بالضبط وتأكد أنه يعمل. العقدة التي يفشل فيها `apt update` بصمت عقدة غير محدّثة.\n\nبعد التحديث لا تسري نواة جديدة إلا بعد إعادة التشغيل. خطّط لنوافذ صيانة، وانقل الضيوف إلى عقدة أخرى أولًا، وتأكد من النواة العاملة بعدها. يعرض الأمر `pveversion -v` النواة المثبّتة والعاملة معًا، فيسهل كشف إعادة تشغيل منسية.\n\nوللإصلاحات الحرجة بين نوافذ الصيانة اشترك في إعلانات Proxmox الأمنية وقائمة Debian الأمنية لتعلم بها فورًا."
+      },
+      {
+        "id": "apt",
+        "type": "terminal",
+        "title": "فحص التحديثات والنواة العاملة",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "grep -rH '^deb' /etc/apt/sources.list /etc/apt/sources.list.d/ | cut -c1-110",
+            "output": "/etc/apt/sources.list:deb http://deb.debian.org/debian bookworm main contrib\n/etc/apt/sources.list:deb http://security.debian.org/debian-security bookworm-security main contrib\n/etc/apt/sources.list.d/pve-no-subscription.list:deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription",
+            "comment": "Debian وأمان Debian ومستودع Proxmox واحد بالضبط."
+          },
+          {
+            "cmd": "apt update && apt list --upgradable 2>/dev/null | grep -c upgradable",
+            "output": "Fetched 1,204 kB in 2s (610 kB/s)\n7",
+            "comment": "سبع حزم بانتظار التحديث. راجعها ثم طبّقها بالأمر apt full-upgrade."
+          },
+          {
+            "cmd": "uname -r; pveversion -v | grep proxmox-kernel",
+            "output": "6.8.8-2-pve\nproxmox-kernel-6.8: 6.8.12-4\nproxmox-kernel-6.8.8-2-pve-signed: 6.8.8-2",
+            "comment": "حزمة نواة أحدث من العاملة مثبّتة. إعادة التشغيل معلّقة."
+          }
+        ]
+      },
+      {
+        "id": "ssh",
+        "type": "text",
+        "markdown": "## الخطوة 2: أحكم إغلاق SSH\n\nSSH هو الباب الثاني بعد وحدة الويب، ويحتاجه العنقود أيضًا: فالعقد تستخدم مفاتيح SSH لـ root لتنفيذ الترحيل ومهام العنقود. لذلك لا يجوز تعطيل دخول root تمامًا على عقدة ضمن عنقود. الإعداد الصحيح هو منع الدخول بـ**كلمة المرور** لـ root ولغيره، والسماح بالمفاتيح فقط.\n\nاستخدم ملف إضافة منفصلًا لتبقى تغييراتك بعد تحديث الحزم ويسهل تدقيقها. يقرأ Debian كل ملف في `/etc/ssh/sshd_config.d/`.\n\nقبل إعادة التحميل أبقِ جلستك الحالية مفتوحة، وشغّل `sshd -t` لكشف أخطاء الصياغة، ثم افتح جلسة ثانية لتثبت أنك ما زلت قادرًا على الدخول. إقفال نفسك خارج مضيف بعيد هو الخطأ الكلاسيكي في التحصين. أنشئ حساب مدير مسمّى واحدًا على الأقل بمفتاحك العام قبل تعطيل كلمات المرور."
+      },
+      {
+        "id": "sshd-conf",
+        "type": "code",
+        "language": "ini",
+        "code": "# Keys only. Root may log in with a key because the cluster needs it.\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n\n# Reduce guessing and unused features\nMaxAuthTries 3\nLoginGraceTime 30\nX11Forwarding no\n\n# Optional: only these groups may log in\nAllowGroups sshadmins root",
+        "caption": "ملف إضافة. اختبره بـ sshd -t ثم systemctl reload ssh.",
+        "filename": "/etc/ssh/sshd_config.d/10-hardening.conf"
+      },
+      {
+        "id": "services",
+        "type": "text",
+        "markdown": "## الخطوة 3: أزل ما لا تستخدمه\n\nكل خدمة تعمل ثغرة محتملة ومصدر ضجيج محتمل في السجلات. بعد التثبيت اعرض ما يستمع واتخذ قرارًا.\n\n| الخدمة | هل تبقى؟ | ملاحظات |\n|:--|:--|:--|\n| `sshd` | نعم | قيّده بالمفاتيح وجدار الحماية |\n| `pveproxy` | نعم | قيّده بعنوان المصدر (الدروس القادمة) |\n| `spiceproxy` | فقط إن استخدمت SPICE | عطّله وإلا |\n| `rpcbind` | فقط لـ NFS الإصدار 3 | عطّله إن استخدمت NFS v4 أو لم تستخدم NFS |\n| `postfix` | نعم، محليًا فقط | يُستخدم لإرسال التنبيهات، ولا تقبل به بريدًا بعيدًا |\n| حزم إضافية | لا | أزل المترجمات والأدوات التي لا تحتاجها |\n\nعطّل الخدمة بـ `systemctl disable --now <service>` وتأكد بـ `ss -tlnp`. دوّن ما غيّرته ليفهم المدير التالي سبب غياب ميزة.\n\nويجب أن يشغّل المضيف جدار الحماية الخاص به أيضًا. راجع [إعداد جدار Proxmox](/learn/systems-infrastructure-security/proxmox-firewall-configuration) لتقييد المنفذين 22 و8006 بشبكة الإدارة."
+      },
+      {
+        "id": "guess-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "الحماية من التخمين أثناء العمل",
+        "caption": "يقرأ fail2ban السجلات ويطلب من الجدار إسقاط المكرّرين.",
+        "data": {
+          "token": "دخول",
+          "nodes": [
+            {
+              "id": "src",
+              "label": "مضيف يخمّن",
+              "sub": "203.0.113.45",
+              "icon": "attacker"
+            },
+            {
+              "id": "px",
+              "label": "pveproxy",
+              "sub": "8006",
+              "icon": "globe"
+            },
+            {
+              "id": "log",
+              "label": "السجل",
+              "sub": "pvedaemon",
+              "icon": "log"
+            },
+            {
+              "id": "f2b",
+              "label": "fail2ban",
+              "sub": "maxretry 3",
+              "icon": "eye"
+            },
+            {
+              "id": "fw",
+              "label": "الجدار",
+              "sub": "nftables",
+              "icon": "firewall"
+            }
+          ],
+          "steps": [
+            {
+              "at": "src",
+              "caption": "يجرّب مضيف كلمات مرور على الوحدة.",
+              "tone": "attack"
+            },
+            {
+              "at": "px",
+              "caption": "تفشل كل محاولة في المصادقة.",
+              "tone": "warning"
+            },
+            {
+              "at": "log",
+              "caption": "يسجّل pvedaemon: authentication failure; rhost=203.0.113.45.",
+              "tone": "default"
+            },
+            {
+              "at": "f2b",
+              "caption": "بعد ثلاثة إخفاقات ضمن النافذة يُصدر fail2ban حظرًا.",
+              "tone": "warning"
+            },
+            {
+              "at": "fw",
+              "caption": "يُسقط الجدار الآن كل حزم ذلك العنوان لمدة ساعة.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "bruteforce",
+        "type": "text",
+        "markdown": "## الخطوة 4: أبطئ تخمين كلمات المرور\n\nحتى مع MFA تريد أن يكلّف تكرار الإخفاق المهاجم شيئًا وأن يترك أثرًا واضحًا. يراقب `fail2ban` ملفات السجل ويحظر العناوين التي تفشل كثيرًا. يسجّل Proxmox إخفاقات دخول الويب في سجل النظام (journal)، فتطلب من fail2ban قراءته.\n\nوهناك تنبيهان. قائمة الحظر وسيلة راحة وليست بديلًا عن تقييد الوحدة بشبكة الإدارة. وقد يؤدي حظر يُفعَّل على عنوانك أنت إلى إقفالك، فأضف شبكة الإدارة إلى `ignoreip`."
+      },
+      {
+        "id": "f2b-conf",
+        "type": "code",
+        "language": "ini",
+        "code": "# /etc/fail2ban/filter.d/proxmox.conf\n[Definition]\nfailregex = pvedaemon\\[.*authentication failure; rhost=<HOST> user=.* msg=.*\nignoreregex =\n\n# /etc/fail2ban/jail.d/proxmox.conf\n[proxmox]\nenabled  = true\nport     = https,8006\nfilter   = proxmox\nbackend  = systemd\nmaxretry = 3\nfindtime = 2d\nbantime  = 1h\nignoreip = 127.0.0.1/8 10.20.0.0/24",
+        "caption": "مرشّح مع سجن (jail). تحقّق بـ fail2ban-client status proxmox."
+      },
+      {
+        "id": "other",
+        "type": "text",
+        "markdown": "## الخطوة 5: الوقت والبرامج الثابتة والوصول الفيزيائي\n\nثلاثة بنود أصغر تكمل خط الأساس.\n\n- **الوقت.** تعتمد الشهادات وKerberos ورموز TOTP وربط السجلات على ساعات صحيحة. شغّل `chrony` أو `systemd-timesyncd` مع خوادم NTP داخلية وتحقّق بـ `timedatectl`.\n- **البرامج الثابتة والميكروكود.** ثبّت حزمة ميكروكود المعالج لمورّدك وأبقِ BIOS وBMC محدّثين. يحمل الميكروكود تخفيفات لعيوب القنوات الجانبية في المعالج.\n- **الوصول الفيزيائي وخارج النطاق.** اضبط كلمة مرور BIOS وعطّل أجهزة الإقلاع غير المستخدمة وضع BMC (مثل iDRAC وiLO وIPMI) على شبكة الإدارة بكلمة مرور قوية فريدة. BMC يمكن بلوغه من شبكة المستخدمين باب خلفي إلى المضيف كله.\n\nوأخيرًا فكّر في تشفير القرص الكامل للمضيفات في أماكن لا تتحكم بها تمامًا. فهو يحمي البيانات إذا سُرق الخادم، بثمن أنك تحتاج إلى وسيلة لفتحه عند الإقلاع."
+      },
+      {
+        "id": "verify",
+        "type": "text",
+        "markdown": "## الخطوة 6: تحقّق وحافظ على الحالة\n\nالتحصين الذي لا يُتحقَّق منه مجرد اعتقاد. بعد كل تغيير اختبر النتيجة من الخارج: جرّب الدخول بكلمة مرور، وافحص عقدتك بـ `nmap` من شبكة الإدارة، واقرأ `sshd -T` لمعرفة الإعدادات الفعلية. ثم دوّن خط الأساس في وثيقة قصيرة، أو الأفضل في أداة إدارة الإعدادات مثل Ansible، لتأتي أي عقدة يُعاد بناؤها مطابقة.\n\nأعد الفحص وفق جدول. فالتحديثات والحزم الجديدة والحلول السريعة تُبعد النظام تدريجيًا عن خط أساسه. وتكشف مراجعة شهرية للمنافذ المستمعة والحسابات والتحديثات المعلقة هذا الانحراف مبكرًا. ويبيّن درس [تحصين البنية وتدقيق الإعدادات](/learn/systems-infrastructure-security/infrastructure-hardening-and-configuration-auditing) كيف تؤتمت ذلك."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تحصّن عبر اتصالك الوحيد",
+        "markdown": "قد تنهي تغييرات SSH أو الجدار جلستك نهائيًا. أبقِ جلسة ثانية أو وحدة BMC مفتوحة، واختبر كل تغيير باتصال جديد، واعرف كيف تتراجع. وعلى مضيف بعيد دون وصول خارج النطاق جدول تراجعًا بـ `at now + 10 minutes` قبل تطبيق تغييرات خطرة وألغِه بعد تأكيد الوصول."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على عقدة Proxmox مختبرية تملكها، مع توفر وحدة الإدارة شبكةَ أمان:\n\n1. شغّل `apt update` و`apt list --upgradable`. طبّق التحديثات وقارن `uname -r` بالنواة المثبّتة.\n2. أضف مستخدم مدير مسمّى بمفتاحك العام وجرّب الدخول به.\n3. أنشئ ملف SSH المبين أعلاه، وشغّل `sshd -t`، وأعد التحميل، ثم تأكد من رفض الدخول بكلمة المرور بالأمر `ssh -o PreferredAuthentications=password user@pve1.example.com`.\n4. ثبّت `fail2ban` وأضف الملفين وافحص `fail2ban-client status proxmox`.\n5. شغّل `ss -tlnp` مجددًا وقارن بخط الأساس."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "التحصين (Hardening)",
+            "definition": "تقليص سطح هجوم النظام بإزالة الإعدادات الافتراضية وتقييدها."
+          },
+          {
+            "term": "مستودع المؤسسات",
+            "definition": "قناة تحديثات Proxmox بالاشتراك والأكثر اختبارًا."
+          },
+          {
+            "term": "مستودع بلا اشتراك",
+            "definition": "قناة تحديثات Proxmox المجانية المناسبة للمختبرات والمواقع الصغيرة."
+          },
+          {
+            "term": "ملف إضافة (Drop-in)",
+            "definition": "ملف إعداد صغير في مجلد .d يتجاوز الافتراضي دون تعديل الملف الرئيسي."
+          },
+          {
+            "term": "fail2ban",
+            "definition": "أداة تحظر العناوين بعد إخفاقات متكررة في السجلات."
+          },
+          {
+            "term": "وحدة BMC",
+            "definition": "وحدة الإدارة خارج النطاق في الخادم مثل iDRAC وiLO."
+          },
+          {
+            "term": "الميكروكود",
+            "definition": "تحديثات البرنامج الثابت للمعالج التي تحمل إصلاحات وتخفيفات."
+          },
+          {
+            "term": "خارج النطاق",
+            "definition": "إدارة تعمل بمعزل عن نظام تشغيل المضيف."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا لا يُعطَّل دخول root عبر SSH تمامًا على عقدة ضمن عنقود؟",
+            "options": [
+              "root مطلوب لوحدة الويب",
+              "تستخدم العقد مفاتيح SSH لـ root للترحيل ومهام العنقود",
+              "لا يعمل SSH بدون root",
+              "يُعطّل fail2ban"
+            ],
+            "answer": 1,
+            "explanation": "استخدم PermitRootLogin prohibit-password ليستخدم root المفاتيح لا كلمات المرور أبدًا."
+          },
+          {
+            "question": "أي الإجراءات من خط أساس تحصين المضيف؟ اختر كل ما ينطبق.",
+            "options": [
+              "مستودعات عاملة وتحديثات منتظمة",
+              "SSH بالمفاتيح فقط",
+              "تعطيل الخدمات غير المستخدمة",
+              "ترك BMC على شبكة المستخدمين"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "مكان BMC شبكة الإدارة، وكشفه يصنع بابًا خلفيًا."
+          },
+          {
+            "question": "ماذا تفعل قبل إعادة تحميل إعداد SSH معدّل؟",
+            "options": [
+              "أعد تشغيل المضيف",
+              "شغّل sshd -t وأبقِ جلسة ثانية مفتوحة",
+              "عطّل الجدار",
+              "احذف authorized_keys"
+            ],
+            "answer": 1,
+            "explanation": "يكشف sshd -t أخطاء الصياغة وتثبت الجلسة الثانية أنك ما زلت قادرًا على الدخول."
+          },
+          {
+            "question": "ثُبّتت نواة جديدة بـ apt لكن uname -r يعرض القديمة. ما معنى ذلك؟",
+            "options": [
+              "فشل التحديث",
+              "يلزم إعادة تشغيل لتسري الإصلاحات",
+              "النواة القديمة أكثر أمانًا",
+              "fail2ban يحجبها"
+            ],
+            "answer": 1,
+            "explanation": "لا تحميك إصلاحات النواة إلا بعد تشغيل النواة الجديدة."
+          },
+          {
+            "question": "ما الخطر الرئيسي لقاعدة fail2ban بلا إدخال ignoreip لشبكة الإدارة؟",
+            "options": [
+              "تستهلك قرصًا كثيرًا",
+              "قد تحظر نفسك وتفقد الوصول",
+              "توقف TLS",
+              "تعطّل MFA"
+            ],
+            "answer": 1,
+            "explanation": "قد تؤدي كلمات مرور خاطئة من عنوانك إلى تفعيل الحظر."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتحصين مضيف Proxmox يعني إبقاءه محدّثًا عبر مستودع عامل، والسماح بـ SSH بالمفاتيح فقط، وإزالة الخدمات غير المستخدمة، وإبطاء تخمين كلمات المرور، وضبط الوقت بدقة، وحماية البرامج الثابتة ووحدة BMC. اختبر التغييرات دائمًا باتصال ثانٍ. تجعل هذه الخطوات المضيف هدفًا صغيرًا يمكن التنبؤ به. بعد ذلك طبّق العناية نفسها على أكثر الخدمات انكشافًا: [واجهة ويب Proxmox](/learn/systems-infrastructure-security/proxmox-web-interface-security)."
+      }
+    ]
+  }
+}

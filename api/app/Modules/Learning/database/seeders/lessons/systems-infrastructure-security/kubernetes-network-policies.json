@@ -1,0 +1,566 @@
+{
+ "slug": "kubernetes-network-policies",
+ "title": "Kubernetes Network Policies",
+ "summary": "How to segment pod traffic with default deny and narrow allow rules, and how to test that policies are really enforced.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Explain how pods are isolated and how policies combine",
+  "Write a default-deny policy that still permits DNS",
+  "Allow a single application flow on both ends",
+  "Test and monitor policies and spot unenforced ones"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A shop runs a public web front end, an orders API and a payments database in the same Kubernetes cluster. One day a vulnerable image in a forgotten test namespace is compromised. The attacker opens a shell and discovers something alarming: from that pod, they can connect to the payments database in another namespace on its normal port. The cluster network is flat. Every pod can reach every other pod, because Kubernetes allows all traffic unless told otherwise.\n\nNetwork policies are how you tell it otherwise. They work like a host firewall for pods, expressed as Kubernetes objects and enforced by the network plugin. This lesson shows how they behave, how to start from default deny, how to open exactly the paths an application needs, and how to test the result."
+  },
+  {
+   "id": "model",
+   "type": "text",
+   "markdown": "## How network policies behave\n\nThree rules explain almost everything.\n\n1. **Pods are open until selected.** A pod with no policy that selects it accepts and sends all traffic. Once any policy selects a pod for a direction (ingress or egress), only traffic allowed by some policy is permitted in that direction.\n2. **Policies are additive.** There are no deny rules. The allowed traffic is the union of all policies that select the pod, and the order does not matter.\n3. **The network plugin enforces them.** The API server accepts a `NetworkPolicy` object even when nothing enforces it. Calico, Cilium, Antrea and Weave Net enforce policies. Plain Flannel does not. Check that your CNI supports them, and test it.\n\nA policy has four parts:\n\n| Field | Meaning |\n|:--|:--|\n| `podSelector` | Which pods in this namespace the policy protects. An empty selector means all pods |\n| `policyTypes` | `Ingress`, `Egress` or both |\n| `ingress` | Allowed sources, with optional ports |\n| `egress` | Allowed destinations, with optional ports |\n\nSources and destinations can be a `podSelector` (pods in the same namespace), a `namespaceSelector` (all pods in matching namespaces), both together, or an `ipBlock` (a CIDR range, useful for addresses outside the cluster)."
+  },
+  {
+   "id": "pol-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Default deny, then allow one path",
+   "caption": "The database only accepts traffic from the orders API on its own port.",
+   "data": {
+    "token": "TCP/5432",
+    "nodes": [
+     {
+      "id": "web",
+      "label": "Web front end",
+      "sub": "ns: shop",
+      "icon": "globe"
+     },
+     {
+      "id": "api",
+      "label": "Orders API",
+      "sub": "app=orders",
+      "icon": "server"
+     },
+     {
+      "id": "np",
+      "label": "NetworkPolicy",
+      "sub": "db-allow-orders",
+      "icon": "firewall"
+     },
+     {
+      "id": "db",
+      "label": "Payments DB",
+      "sub": "app=db",
+      "icon": "database"
+     },
+     {
+      "id": "old",
+      "label": "Test pod",
+      "sub": "ns: test",
+      "icon": "bug"
+     }
+    ],
+    "steps": [
+     {
+      "at": "web",
+      "caption": "Before any policy: the web pod can reach the database directly. The network is flat.",
+      "tone": "warning"
+     },
+     {
+      "at": "np",
+      "caption": "A default-deny policy selects every pod in shop. All ingress is now closed.",
+      "tone": "secure"
+     },
+     {
+      "at": "np",
+      "caption": "A second policy allows ingress to app=db only from app=orders on TCP 5432. Policies add up.",
+      "tone": "secure"
+     },
+     {
+      "at": "api",
+      "caption": "The orders API connects to the database and the packet matches the allow rule.",
+      "tone": "success"
+     },
+     {
+      "at": "db",
+      "caption": "The database receives the query.",
+      "tone": "success"
+     },
+     {
+      "at": "old",
+      "token": "TCP/5432",
+      "caption": "A pod in another namespace tries the same port and matches no allow rule.",
+      "tone": "attack"
+     },
+     {
+      "at": "np",
+      "token": "TCP/5432",
+      "caption": "The connection is dropped. The attacker's foothold no longer reaches the data.",
+      "tone": "blocked"
+     }
+    ]
+   }
+  },
+  {
+   "id": "deny",
+   "type": "text",
+   "markdown": "## Step 1: default deny\n\nThe safest pattern is to start every namespace with a policy that selects all pods and allows nothing. Then add narrow allow policies for each real flow. A pod that is later added without a matching allow rule simply cannot talk, which fails safe.\n\nYou usually need two default policies: one for ingress and one for egress. Be careful with egress. If you deny all egress, pods can no longer resolve names, because DNS queries to the cluster DNS service are blocked too. The first egress allow rule should therefore permit UDP and TCP port 53 to the DNS pods in `kube-system`."
+  },
+  {
+   "id": "deny-yaml",
+   "type": "code",
+   "language": "yaml",
+   "filename": "default-deny.yaml",
+   "code": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: default-deny-all\n  namespace: shop\nspec:\n  podSelector: {}\n  policyTypes:\n    - Ingress\n    - Egress\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: allow-dns-egress\n  namespace: shop\nspec:\n  podSelector: {}\n  policyTypes:\n    - Egress\n  egress:\n    - to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n      ports:\n        - protocol: UDP\n          port: 53\n        - protocol: TCP\n          port: 53",
+   "caption": "Deny everything in the namespace, then permit DNS lookups. Label names can differ in your cluster."
+  },
+  {
+   "id": "allow",
+   "type": "text",
+   "markdown": "## Step 2: allow each real flow\n\nNow describe what the application actually does. For the orders API and its database you need three rules: the web front end may call the API, the API may call the database, and the database accepts nothing else.\n\nEach flow needs rules on **both ends** once egress is restricted: an egress rule on the caller and an ingress rule on the receiver. People often write only one side and wonder why the connection hangs.\n\nA few tips keep policies readable:\n\n- **Label pods by role,** such as `app: orders` and `tier: db`, and select by those labels.\n- **Combine selectors carefully.** A `namespaceSelector` and `podSelector` in the same list item mean AND (pods with this label in matching namespaces). Written as two separate list items they mean OR, which is much broader. This is the most common mistake.\n- **Open ports explicitly.** Without a `ports` list, a rule allows all ports.\n- **Use `ipBlock` for external services** with documentation-style ranges in examples, for instance `203.0.113.0/24`, and use `except` to carve out holes.\n- **Name policies after the flow,** like `db-allow-orders`, so audits are easy."
+  },
+  {
+   "id": "allow-yaml",
+   "type": "code",
+   "language": "yaml",
+   "filename": "db-allow-orders.yaml",
+   "code": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: db-allow-orders\n  namespace: shop\nspec:\n  podSelector:\n    matchLabels:\n      app: db\n  policyTypes:\n    - Ingress\n  ingress:\n    - from:\n        - podSelector:\n            matchLabels:\n              app: orders\n      ports:\n        - protocol: TCP\n          port: 5432\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: orders-egress-db\n  namespace: shop\nspec:\n  podSelector:\n    matchLabels:\n      app: orders\n  policyTypes:\n    - Egress\n  egress:\n    - to:\n        - podSelector:\n            matchLabels:\n              app: db\n      ports:\n        - protocol: TCP\n          port: 5432",
+   "caption": "Both ends of one flow: the database ingress rule and the API egress rule."
+  },
+  {
+   "id": "test",
+   "type": "text",
+   "markdown": "## Step 3: test and monitor\n\nA policy you have not tested is a guess. Test from a temporary pod that has the labels of the client you want to allow, then from one that does not. Check that allowed flows work and denied flows time out (a timeout, not a refusal, is the normal sign of a dropped packet).\n\nFor day-to-day operations:\n\n- **Review policies with `kubectl get networkpolicy -A`** and `describe` to see the selectors in effect.\n- **Keep policies in version control** and apply them through your normal deployment pipeline, so changes are reviewed.\n- **Use flow logs** where your CNI supports them. Calico and Cilium can log or visualize allowed and denied flows, which makes it easy to find the rule you forgot. Cilium's Hubble is one example.\n- **Consider cluster-wide policies.** Some CNIs add global policy objects for rules that apply everywhere, such as blocking access to the cloud metadata address from workloads. Those are plugin-specific.\n- **Watch for gaps.** Network policies do not cover traffic that leaves through a node's host network, and they do not encrypt anything. Combine them with mutual TLS or a service mesh when you also need encryption and identity.\n\nNetwork policies are one layer. They pair well with the pod controls from [Kubernetes Security Fundamentals](/learn/systems-infrastructure-security/kubernetes-security-fundamentals) and the monitoring in [Container Security Monitoring](/learn/systems-infrastructure-security/container-security-monitoring)."
+  },
+  {
+   "id": "test-term",
+   "type": "terminal",
+   "title": "kubectl - test the policy",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "kubectl get networkpolicy -n shop",
+     "output": "NAME               POD-SELECTOR   AGE\nallow-dns-egress   <none>         5m\ndb-allow-orders    app=db         4m\ndefault-deny-all   <none>         5m\norders-egress-db   app=orders     4m",
+     "comment": "`<none>` means an empty selector, which matches every pod."
+    },
+    {
+     "cmd": "kubectl -n shop run probe-orders --rm -it --restart=Never --labels=app=orders --image=registry.example.com/tools/netshoot:1.0 -- nc -zv -w 3 db 5432",
+     "output": "db (10.244.1.15:5432) open",
+     "comment": "A pod labeled app=orders reaches the database. Hostnames and the pod IP are examples."
+    },
+    {
+     "cmd": "kubectl -n shop run probe-other --rm -it --restart=Never --labels=app=other --image=registry.example.com/tools/netshoot:1.0 -- nc -zv -w 3 db 5432",
+     "output": "nc: connect to db (10.244.1.15) port 5432 (tcp) timed out: Operation in progress",
+     "comment": "A different label times out, which is the sign of a dropped packet."
+    }
+   ],
+   "caption": "Test an allowed client and a denied client on a cluster you own."
+  },
+  {
+   "id": "cni-warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "A policy that nothing enforces",
+   "markdown": "If your network plugin does not implement network policies, `kubectl apply` still succeeds and `kubectl get networkpolicy` shows your objects, yet all traffic continues to flow. Always run one allowed and one denied test after installing a cluster or changing the CNI, and repeat it after upgrades. Treat a missing test as an unknown, not as a pass."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab cluster you own whose CNI supports network policies (for example kind with Calico, or minikube started with `--cni=calico`):\n\n1. Create namespace `shop`, then run two pods: `kubectl -n shop run db --image=postgres:16 --labels=app=db --env=POSTGRES_PASSWORD=<placeholder>` and a client pod with the label `app=orders`.\n2. Confirm the client can reach the database port with `nc -zv -w 3 <db-pod-ip> 5432`.\n3. Apply `default-deny.yaml` and repeat the test. It should now time out.\n4. Apply `db-allow-orders.yaml` and `orders-egress-db.yaml`. Test again from a pod labeled `app=orders` and from one labeled `app=other`.\n5. Edit the ingress rule to put `namespaceSelector` and `podSelector` in separate list items, reapply, and describe in one sentence why access became broader."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "NetworkPolicy",
+     "definition": "A Kubernetes object that restricts pod traffic, enforced by the CNI plugin."
+    },
+    {
+     "term": "CNI",
+     "definition": "The container network interface plugin that provides pod networking and, if supported, policy enforcement."
+    },
+    {
+     "term": "Default deny",
+     "definition": "A policy that selects all pods and allows nothing, so only added rules permit traffic."
+    },
+    {
+     "term": "podSelector",
+     "definition": "Chooses pods by label."
+    },
+    {
+     "term": "namespaceSelector",
+     "definition": "Chooses all pods in namespaces whose labels match."
+    },
+    {
+     "term": "ipBlock",
+     "definition": "A CIDR range for sources or destinations outside the cluster."
+    },
+    {
+     "term": "Ingress / Egress",
+     "definition": "Traffic entering a pod, and traffic leaving a pod."
+    },
+    {
+     "term": "Flat network",
+     "definition": "A network where every pod can reach every other pod."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "A pod is not selected by any NetworkPolicy. What traffic does it accept?",
+     "options": [
+      "None",
+      "All traffic",
+      "Only traffic from its namespace",
+      "Only traffic on port 443"
+     ],
+     "answer": 1,
+     "explanation": "Pods are non-isolated by default. Isolation starts when a policy selects the pod for that direction."
+    },
+    {
+     "question": "Two policies select the same pod and allow different sources. What is the effective result?",
+     "options": [
+      "Only the first policy applies",
+      "The intersection of both",
+      "The union of both",
+      "Both are rejected"
+     ],
+     "answer": 2,
+     "explanation": "Policies are additive. Traffic is allowed if any selecting policy allows it."
+    },
+    {
+     "question": "After applying a default-deny egress policy, pods cannot resolve names. What fixes this?",
+     "options": [
+      "Delete the CNI",
+      "Add an egress rule allowing port 53 to the cluster DNS pods",
+      "Add an ingress rule on port 53",
+      "Disable RBAC"
+     ],
+     "answer": 1,
+     "explanation": "DNS queries are outbound traffic to the DNS service, so egress to it must be allowed explicitly."
+    },
+    {
+     "question": "Which statements about a `from` list are correct? (choose all that apply)",
+     "options": [
+      "`namespaceSelector` and `podSelector` in one item mean AND",
+      "The same two selectors in separate items mean OR",
+      "Omitting `ports` allows all ports",
+      "An `ipBlock` can only select pod IPs inside the cluster"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The first three are correct. ipBlock is meant for addresses outside the cluster."
+    },
+    {
+     "question": "You apply a policy and traffic is still not blocked. What should you check first?",
+     "options": [
+      "Whether the CNI plugin enforces NetworkPolicy",
+      "The node's wallpaper",
+      "Whether the namespace has a quota",
+      "The image tag"
+     ],
+     "answer": 0,
+     "explanation": "Without enforcement, policy objects are accepted but have no effect."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Kubernetes pods can reach each other by default. A `NetworkPolicy` restricts this once the CNI plugin enforces it.\n- Policies are additive and select pods by labels. A pod becomes isolated in a direction when any policy selects it for that direction.\n- Start each namespace with default deny, allow DNS, then open each real flow on both ends with explicit ports.\n- Take care with `namespaceSelector` and `podSelector` combinations, and test both an allowed and a denied client.\n- Pair policies with RBAC, Pod Security and monitoring. See [Kubernetes RBAC](/learn/systems-infrastructure-security/kubernetes-rbac) if you want to revisit access control."
+  }
+ ],
+ "ar": {
+  "title": "سياسات الشبكة في Kubernetes",
+  "summary": "كيف تقسّم حركة الـPods بالمنع الافتراضي وقواعد سماح ضيقة، وكيف تختبر أن السياسات مفروضة فعلاً.",
+  "objectives": [
+   "شرح كيف تُعزل الـPods وكيف تتجمع السياسات",
+   "كتابة سياسة منع افتراضي تسمح بـDNS",
+   "السماح بتدفق تطبيق واحد من الطرفين",
+   "اختبار السياسات ومراقبتها واكتشاف غير المفروضة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يشغّل متجر واجهة ويب عامة وواجهة برمجية للطلبات وقاعدة بيانات للمدفوعات في عنقود Kubernetes واحد. وفي أحد الأيام تُخترق صورة مصابة بثغرة في مساحة اختبار منسية. يفتح المهاجم صدفة أوامر ويكتشف شيئاً مقلقاً: من ذلك الـPod يستطيع الاتصال بقاعدة بيانات المدفوعات في مساحة أخرى على منفذها المعتاد. فشبكة العنقود مسطّحة، وكل Pod يصل إلى كل Pod آخر لأن Kubernetes يسمح بكل الحركة ما لم تقل له غير ذلك.\n\nسياسات الشبكة (Network Policies) هي الطريقة التي تقول بها له غير ذلك. وتعمل مثل جدار حماية للمضيف لكن على مستوى الـPods، وتُكتب ككائنات Kubernetes ويفرضها مكوّن الشبكة (CNI). يوضح هذا الدرس كيف تتصرف، وكيف تبدأ من المنع الافتراضي، وكيف تفتح المسارات التي يحتاجها التطبيق بالضبط، وكيف تختبر النتيجة."
+   },
+   {
+    "id": "model",
+    "type": "text",
+    "markdown": "## كيف تتصرف سياسات الشبكة\n\nتفسّر ثلاث قواعد معظم السلوك.\n\n1. **الـPods مفتوحة حتى تُختار.** الـPod الذي لا تختاره أي سياسة يقبل ويرسل كل الحركة. وبمجرد أن تختاره أي سياسة في اتجاه معين (وارد أو صادر) لا يُسمح في ذلك الاتجاه إلا بما تسمح به سياسة ما.\n2. **السياسات تراكمية.** لا توجد قواعد منع. الحركة المسموحة هي اتحاد كل السياسات التي تختار الـPod، ولا يهم الترتيب.\n3. **مكوّن الشبكة هو الذي يفرضها.** يقبل خادم الواجهة كائن `NetworkPolicy` حتى لو لم يكن هناك من يفرضه. تفرض السياسات كل من Calico وCilium وAntrea وWeave Net، ولا يفرضها Flannel العادي. تأكد أن مكوّن الشبكة لديك يدعمها، واختبر ذلك.\n\nتتألف السياسة من أربعة أجزاء:\n\n| الحقل | المعنى |\n|:--|:--|\n| `podSelector` | الـPods في هذه المساحة التي تحميها السياسة. المحدِّد الفارغ يعني كل الـPods |\n| `policyTypes` | `Ingress` أو `Egress` أو كلاهما |\n| `ingress` | المصادر المسموحة مع منافذ اختيارية |\n| `egress` | الوجهات المسموحة مع منافذ اختيارية |\n\nقد يكون المصدر أو الوجهة `podSelector` (Pods في المساحة نفسها) أو `namespaceSelector` (كل الـPods في المساحات المطابقة) أو الاثنين معاً أو `ipBlock` (نطاق CIDR مفيد للعناوين خارج العنقود)."
+   },
+   {
+    "id": "pol-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "منع افتراضي ثم السماح بمسار واحد",
+    "caption": "تقبل قاعدة البيانات الحركة من واجهة الطلبات فقط وعلى منفذها.",
+    "data": {
+     "token": "TCP/5432",
+     "nodes": [
+      {
+       "id": "web",
+       "label": "الواجهة الأمامية",
+       "sub": "ns: shop",
+       "icon": "globe"
+      },
+      {
+       "id": "api",
+       "label": "واجهة الطلبات",
+       "sub": "app=orders",
+       "icon": "server"
+      },
+      {
+       "id": "np",
+       "label": "سياسة الشبكة",
+       "sub": "db-allow-orders",
+       "icon": "firewall"
+      },
+      {
+       "id": "db",
+       "label": "قاعدة المدفوعات",
+       "sub": "app=db",
+       "icon": "database"
+      },
+      {
+       "id": "old",
+       "label": "Pod اختبار",
+       "sub": "ns: test",
+       "icon": "bug"
+      }
+     ],
+     "steps": [
+      {
+       "at": "web",
+       "caption": "قبل أي سياسة: يستطيع Pod الويب الوصول إلى قاعدة البيانات مباشرة. الشبكة مسطّحة.",
+       "tone": "warning"
+      },
+      {
+       "at": "np",
+       "caption": "سياسة منع افتراضي تختار كل Pods مساحة shop، فيُغلق كل وارد.",
+       "tone": "secure"
+      },
+      {
+       "at": "np",
+       "caption": "سياسة ثانية تسمح بالوارد إلى app=db من app=orders فقط على TCP 5432. السياسات تتراكم.",
+       "tone": "secure"
+      },
+      {
+       "at": "api",
+       "caption": "تتصل واجهة الطلبات بقاعدة البيانات وتطابق الحزمة قاعدة السماح.",
+       "tone": "success"
+      },
+      {
+       "at": "db",
+       "caption": "تستلم قاعدة البيانات الاستعلام.",
+       "tone": "success"
+      },
+      {
+       "at": "old",
+       "token": "TCP/5432",
+       "caption": "Pod في مساحة أخرى يجرّب المنفذ نفسه فلا يطابق أي قاعدة سماح.",
+       "tone": "attack"
+      },
+      {
+       "at": "np",
+       "token": "TCP/5432",
+       "caption": "تُسقَط الحزمة. ولم يعد موطئ قدم المهاجم يصل إلى البيانات.",
+       "tone": "blocked"
+      }
+     ]
+    }
+   },
+   {
+    "id": "deny",
+    "type": "text",
+    "markdown": "## الخطوة 1: المنع الافتراضي\n\nالنمط الأكثر أماناً هو أن تبدأ كل مساحة أسماء بسياسة تختار كل الـPods ولا تسمح بشيء، ثم تضيف سياسات سماح ضيقة لكل تدفق حقيقي. أي Pod يُضاف لاحقاً دون قاعدة سماح مطابقة لا يستطيع التخاطب ببساطة، وهذا فشل آمن.\n\nتحتاج عادة إلى سياستين افتراضيتين: واحدة للوارد وأخرى للصادر. احذر في الصادر: إذا منعت كل الصادر لم تعد الـPods قادرة على حل الأسماء لأن استعلامات DNS إلى خدمة DNS في العنقود تُحجب أيضاً. لذلك ينبغي أن تسمح أول قاعدة سماح للصادر بالمنفذ 53 عبر UDP وTCP إلى Pods خدمة DNS في `kube-system`."
+   },
+   {
+    "id": "deny-yaml",
+    "type": "code",
+    "language": "yaml",
+    "filename": "default-deny.yaml",
+    "code": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: default-deny-all\n  namespace: shop\nspec:\n  podSelector: {}\n  policyTypes:\n    - Ingress\n    - Egress\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: allow-dns-egress\n  namespace: shop\nspec:\n  podSelector: {}\n  policyTypes:\n    - Egress\n  egress:\n    - to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n      ports:\n        - protocol: UDP\n          port: 53\n        - protocol: TCP\n          port: 53",
+    "caption": "امنع كل شيء في المساحة ثم اسمح باستعلامات DNS. قد تختلف أسماء الوسوم في عنقودك."
+   },
+   {
+    "id": "allow",
+    "type": "text",
+    "markdown": "## الخطوة 2: اسمح بكل تدفق حقيقي\n\nصِف الآن ما يفعله التطبيق فعلاً. تحتاج في حالة واجهة الطلبات وقاعدة بياناتها إلى ثلاث قواعد: يحق للواجهة الأمامية استدعاء الواجهة البرمجية، ويحق للواجهة البرمجية استدعاء قاعدة البيانات، ولا تقبل قاعدة البيانات شيئاً غير ذلك.\n\nيحتاج كل تدفق إلى قواعد عند **الطرفين** متى قُيّد الصادر: قاعدة صادر عند المتصل وقاعدة وارد عند المستقبل. وكثيراً ما يكتب الناس طرفاً واحداً ثم يتساءلون لماذا يتعلق الاتصال.\n\nوتحافظ بعض النصائح على وضوح السياسات:\n\n- **سمِّ الوسوم حسب الدور** مثل `app: orders` و`tier: db` واختر بها.\n- **ادمج المحدِّدات بحذر.** يعني `namespaceSelector` و`podSelector` في عنصر قائمة واحد \"و\" (Pods بهذا الوسم في المساحات المطابقة). وإذا كُتبا في عنصرين منفصلين فهما \"أو\"، وهو أوسع بكثير. وهذا أشيع خطأ.\n- **افتح المنافذ صراحة.** بغياب قائمة `ports` تسمح القاعدة بكل المنافذ.\n- **استخدم `ipBlock` للخدمات الخارجية** وفي الأمثلة نطاقات التوثيق مثل `203.0.113.0/24`، واستعمل `except` لاستثناء مجالات.\n- **سمِّ السياسات باسم التدفق** مثل `db-allow-orders` لتسهل المراجعة."
+   },
+   {
+    "id": "allow-yaml",
+    "type": "code",
+    "language": "yaml",
+    "filename": "db-allow-orders.yaml",
+    "code": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: db-allow-orders\n  namespace: shop\nspec:\n  podSelector:\n    matchLabels:\n      app: db\n  policyTypes:\n    - Ingress\n  ingress:\n    - from:\n        - podSelector:\n            matchLabels:\n              app: orders\n      ports:\n        - protocol: TCP\n          port: 5432\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: orders-egress-db\n  namespace: shop\nspec:\n  podSelector:\n    matchLabels:\n      app: orders\n  policyTypes:\n    - Egress\n  egress:\n    - to:\n        - podSelector:\n            matchLabels:\n              app: db\n      ports:\n        - protocol: TCP\n          port: 5432",
+    "caption": "طرفا تدفق واحد: قاعدة الوارد لقاعدة البيانات وقاعدة الصادر للواجهة البرمجية."
+   },
+   {
+    "id": "test",
+    "type": "text",
+    "markdown": "## الخطوة 3: اختبر وراقب\n\nالسياسة التي لم تُختبر مجرد تخمين. اختبر من Pod مؤقت يحمل وسوم العميل الذي تريد السماح له، ثم من Pod لا يحملها. تأكد أن التدفقات المسموحة تعمل وأن الممنوعة تنتهي مهلتها (انتهاء المهلة لا الرفض هو العلامة المعتادة لحزمة مسقطة).\n\nوللتشغيل اليومي:\n\n- **راجع السياسات بالأمر `kubectl get networkpolicy -A`** وبالأمر `describe` لترى المحدِّدات المطبقة.\n- **احفظ السياسات في نظام التحكم بالإصدارات** وطبّقها عبر خط النشر المعتاد لتخضع التغييرات للمراجعة.\n- **استخدم سجلات التدفق** حيث يدعمها مكوّن الشبكة. يستطيع Calico وCilium تسجيل التدفقات المسموحة والممنوعة أو عرضها، فيسهل إيجاد القاعدة المنسية. وأداة Hubble من Cilium مثال على ذلك.\n- **فكّر في السياسات على مستوى العنقود.** تضيف بعض المكوّنات كائنات سياسة عامة لقواعد تسري في كل مكان، مثل منع الأحمال من الوصول إلى عنوان بيانات التعريف السحابية. وهذه خاصة بكل مكوّن.\n- **انتبه إلى الثغرات.** لا تغطي سياسات الشبكة الحركة التي تخرج عبر شبكة المضيف للعقدة، ولا تشفّر شيئاً. اجمعها مع TLS المتبادل أو شبكة الخدمات (Service Mesh) عندما تحتاج إلى التشفير والهوية أيضاً.\n\nسياسات الشبكة طبقة واحدة، وتتكامل مع ضوابط الـPod في [أساسيات أمن Kubernetes](/learn/systems-infrastructure-security/kubernetes-security-fundamentals) ومع المراقبة في [مراقبة أمن الحاويات](/learn/systems-infrastructure-security/container-security-monitoring)."
+   },
+   {
+    "id": "test-term",
+    "type": "terminal",
+    "title": "kubectl - test the policy",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "kubectl get networkpolicy -n shop",
+      "output": "NAME               POD-SELECTOR   AGE\nallow-dns-egress   <none>         5m\ndb-allow-orders    app=db         4m\ndefault-deny-all   <none>         5m\norders-egress-db   app=orders     4m",
+      "comment": "`<none>` تعني محدِّداً فارغاً يطابق كل الـPods."
+     },
+     {
+      "cmd": "kubectl -n shop run probe-orders --rm -it --restart=Never --labels=app=orders --image=registry.example.com/tools/netshoot:1.0 -- nc -zv -w 3 db 5432",
+      "output": "db (10.244.1.15:5432) open",
+      "comment": "Pod يحمل الوسم app=orders يصل إلى قاعدة البيانات. أسماء الأجهزة وعنوان الـPod أمثلة."
+     },
+     {
+      "cmd": "kubectl -n shop run probe-other --rm -it --restart=Never --labels=app=other --image=registry.example.com/tools/netshoot:1.0 -- nc -zv -w 3 db 5432",
+      "output": "nc: connect to db (10.244.1.15) port 5432 (tcp) timed out: Operation in progress",
+      "comment": "وسم مختلف تنتهي مهلته، وهي علامة حزمة مسقطة."
+     }
+    ],
+    "caption": "اختبار عميل مسموح وعميل ممنوع على عنقود تملكه."
+   },
+   {
+    "id": "cni-warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "سياسة لا يفرضها أحد",
+    "markdown": "إذا كان مكوّن الشبكة لديك لا ينفّذ سياسات الشبكة فسينجح `kubectl apply` وسيعرض `kubectl get networkpolicy` كائناتك، ومع ذلك تستمر كل الحركة بالتدفق. شغّل دائماً اختباراً واحداً مسموحاً وآخر ممنوعاً بعد تركيب عنقود أو تغيير مكوّن الشبكة، وكرره بعد الترقيات. واعتبر غياب الاختبار مجهولاً لا نجاحاً."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على عنقود تجريبي تملكه ويدعم مكوّن الشبكة فيه سياسات الشبكة (مثل kind مع Calico أو minikube بالخيار `--cni=calico`):\n\n1. أنشئ مساحة `shop` ثم شغّل Podين: `kubectl -n shop run db --image=postgres:16 --labels=app=db --env=POSTGRES_PASSWORD=<placeholder>` وPod عميل يحمل الوسم `app=orders`.\n2. تأكد أن العميل يصل إلى منفذ قاعدة البيانات بالأمر `nc -zv -w 3 <db-pod-ip> 5432`.\n3. طبّق `default-deny.yaml` وكرر الاختبار، فيجب أن تنتهي مهلته الآن.\n4. طبّق `db-allow-orders.yaml` و`orders-egress-db.yaml`، ثم اختبر من Pod يحمل `app=orders` ومن آخر يحمل `app=other`.\n5. عدّل قاعدة الوارد بوضع `namespaceSelector` و`podSelector` في عنصرين منفصلين وأعد التطبيق، ثم اشرح في جملة واحدة لماذا اتسع الوصول."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "NetworkPolicy",
+      "definition": "كائن في Kubernetes يقيّد حركة الـPods ويفرضه مكوّن CNI."
+     },
+     {
+      "term": "CNI",
+      "definition": "مكوّن واجهة شبكة الحاويات الذي يوفر شبكة الـPods، ويفرض السياسات إن كان يدعمها."
+     },
+     {
+      "term": "Default deny",
+      "definition": "سياسة تختار كل الـPods ولا تسمح بشيء فلا يمر إلا ما تضيفه القواعد."
+     },
+     {
+      "term": "podSelector",
+      "definition": "يختار الـPods بحسب الوسوم."
+     },
+     {
+      "term": "namespaceSelector",
+      "definition": "يختار كل الـPods في المساحات التي تطابق وسومها."
+     },
+     {
+      "term": "ipBlock",
+      "definition": "نطاق CIDR لمصادر أو وجهات خارج العنقود."
+     },
+     {
+      "term": "Ingress / Egress",
+      "definition": "الحركة الداخلة إلى الـPod والحركة الخارجة منه."
+     },
+     {
+      "term": "Flat network",
+      "definition": "شبكة يصل فيها كل Pod إلى كل Pod آخر."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "Pod لا تختاره أي NetworkPolicy. ما الحركة التي يقبلها؟",
+      "options": [
+       "لا شيء",
+       "كل الحركة",
+       "الحركة من مساحته فقط",
+       "الحركة على المنفذ 443 فقط"
+      ],
+      "answer": 1,
+      "explanation": "الـPods غير معزولة افتراضياً، ويبدأ العزل عندما تختار سياسة الـPod في ذلك الاتجاه."
+     },
+     {
+      "question": "سياستان تختاران الـPod نفسه وتسمحان بمصادر مختلفة. ما النتيجة الفعلية؟",
+      "options": [
+       "تسري الأولى فقط",
+       "تقاطع السياستين",
+       "اتحاد السياستين",
+       "تُرفض كلتاهما"
+      ],
+      "answer": 2,
+      "explanation": "السياسات تراكمية، وتُسمح الحركة إن سمحت بها أي سياسة تختار الـPod."
+     },
+     {
+      "question": "بعد تطبيق سياسة منع صادر افتراضية لا تستطيع الـPods حل الأسماء. ما الحل؟",
+      "options": [
+       "حذف مكوّن CNI",
+       "إضافة قاعدة صادر تسمح بالمنفذ 53 إلى Pods خدمة DNS",
+       "إضافة قاعدة وارد على المنفذ 53",
+       "تعطيل RBAC"
+      ],
+      "answer": 1,
+      "explanation": "استعلامات DNS حركة صادرة إلى خدمة DNS، فيجب السماح بالصادر إليها صراحة."
+     },
+     {
+      "question": "أي العبارات عن قائمة `from` صحيحة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "`namespaceSelector` و`podSelector` في عنصر واحد يعنيان \"و\"",
+       "المحدِّدان نفسهما في عنصرين منفصلين يعنيان \"أو\"",
+       "غياب `ports` يسمح بكل المنافذ",
+       "`ipBlock` يختار عناوين Pods داخل العنقود فقط"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "الثلاثة الأولى صحيحة، و`ipBlock` مخصص للعناوين خارج العنقود."
+     },
+     {
+      "question": "طبّقت سياسة ولم تُحجب الحركة. ما أول ما تفحصه؟",
+      "options": [
+       "هل يفرض مكوّن CNI سياسات الشبكة",
+       "خلفية شاشة العقدة",
+       "هل لدى المساحة حصة",
+       "وسم الصورة"
+      ],
+      "answer": 0,
+      "explanation": "بغياب الفرض تُقبل كائنات السياسة دون أثر."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تصل Pods Kubernetes إلى بعضها افتراضياً. يقيّد `NetworkPolicy` ذلك متى فرضه مكوّن CNI.\n- السياسات تراكمية وتختار الـPods بالوسوم. يصبح الـPod معزولاً في اتجاه ما عندما تختاره أي سياسة في ذلك الاتجاه.\n- ابدأ كل مساحة بالمنع الافتراضي، واسمح بـDNS، ثم افتح كل تدفق حقيقي من الطرفين بمنافذ صريحة.\n- انتبه لتركيبات `namespaceSelector` و`podSelector`، واختبر عميلاً مسموحاً وآخر ممنوعاً.\n- اجمع السياسات مع RBAC ومعايير أمان Pod والمراقبة. راجع [RBAC في Kubernetes](/learn/systems-infrastructure-security/kubernetes-rbac) إن أردت العودة إلى التحكم بالوصول."
+   }
+  ]
+ }
+}

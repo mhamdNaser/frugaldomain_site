@@ -1,0 +1,578 @@
+{
+  "slug": "management-network-isolation",
+  "title": "Management Network Isolation",
+  "summary": "Learn how to keep hypervisor management interfaces on an isolated network, restrict them with the Proxmox firewall, and verify that a compromised guest cannot reach them.",
+  "duration_minutes": 25,
+  "objectives": [
+    "Explain why management traffic must be separated from guest traffic",
+    "Design a Proxmox network with a dedicated management bridge",
+    "Restrict management ports with IP sets and a default-drop policy",
+    "Verify isolation from the host and from a guest VM"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A virtual machine on your Proxmox VE host is compromised through a vulnerable web app. The attacker looks around and finds that the VM's network can reach port 8006 on the hypervisor, the same port you use to manage every guest on the node. One stolen password later, they own the host and every VM on it.\n\nThis lesson is about preventing that. **Management network isolation** means the interfaces that administer your infrastructure live on their own network, reachable only from a small set of trusted places. Guests, users and the internet never touch them."
+    },
+    {
+      "id": "planes",
+      "type": "text",
+      "markdown": "## Why management traffic needs its own network\n\nA hypervisor host carries several kinds of traffic. Mixing them on one network gives an attacker who reaches any one of them a path to all the others.\n\n| Plane | Examples on Proxmox VE | Who should reach it |\n|:--|:--|:--|\n| Management | Web UI and API (TCP 8006), SSH (TCP 22), console proxy (TCP 3128) | Administrators and automation only |\n| Cluster | Corosync (UDP 5405 and up), live migration | Cluster nodes only |\n| Storage | NFS, iSCSI, Ceph, backup traffic | Nodes and storage servers only |\n| Guest | VM and container traffic | Users, the internet, other guests |\n\nThe management plane is the most valuable. Anyone who logs in to port 8006 as an administrator can read every disk, open every console and delete every backup. The cluster plane is also sensitive because Corosync messages are trusted by design. See [Proxmox VE Security Architecture](/learn/systems-infrastructure-security/proxmox-ve-security-architecture) for how these planes fit together.\n\nThe goal is simple: **a compromised guest must have no network route to the management plane.**"
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## Step 1: Give management its own physical or VLAN path\n\nThe cleanest design uses a **dedicated network interface** for management, connected to a separate switch or an isolated VLAN. When you only have two NICs, put management on one and everything else on the other.\n\nIn this example, `eno1` carries management on the `10.10.0.0/24` network and `eno2` carries guest VLANs through a separate bridge. The host has no IP address on the guest bridge at all, so nothing on a guest VLAN can even address the host through it.\n\n### What not to do\n\n- Do not put the host's IP address on a bridge that guests also use.\n- Do not use the same VLAN for management and for any guest.\n- Do not expose port 8006 to the internet \"just for a quick test\". Scanners find it within hours.\n\nIf you must use one physical link, use a **tagged management VLAN** that guests are never allowed to join. This works, but it depends on correct switch configuration, so verify it. See [Virtual Bridges and VLAN-Aware Networking](/learn/systems-infrastructure-security/virtual-bridges-and-vlan-aware-networking)."
+    },
+    {
+      "id": "ifaces",
+      "type": "code",
+      "language": "ini",
+      "title": "/etc/network/interfaces on a Proxmox node",
+      "code": "auto lo\niface lo inet loopback\n\niface eno1 inet manual\niface eno2 inet manual\n\n# Management: only this bridge carries the host IP address\nauto vmbr0\niface vmbr0 inet static\n        address 10.10.0.11/24\n        gateway 10.10.0.1\n        bridge-ports eno1\n        bridge-stp off\n        bridge-fd 0\n\n# Guests: VLAN-aware bridge, no IP address on the host\nauto vmbr1\niface vmbr1 inet manual\n        bridge-ports eno2\n        bridge-stp off\n        bridge-fd 0\n        bridge-vlan-aware yes\n        bridge-vids 20-30\n",
+      "caption": "The host has an address only on vmbr0. VLAN 10 (management) is not in the guest bridge's allowed range."
+    },
+    {
+      "id": "fw",
+      "type": "text",
+      "markdown": "## Step 2: Restrict who can reach the management ports\n\nIsolation by network layout is the first layer. The second layer is the **Proxmox VE firewall**, which filters traffic to the host itself. Define an **IP set** of trusted sources, then allow management ports only from that set and drop everything else.\n\nThe rules live in `/etc/pve/firewall/cluster.fw`, so every node in the cluster gets them. Set the default inbound policy to `DROP` and add explicit allow rules. Allow Corosync and migration traffic only from the other nodes. Always add your own access rule **before** enabling the firewall, or you will lock yourself out. The full rule syntax is covered in [Proxmox Firewall Configuration](/learn/systems-infrastructure-security/proxmox-firewall-configuration).\n\nAn **administration jump host** adds one more control point. Administrators connect to the jump host with MFA, and only the jump host's address is in the allowed set. This gives you one place to log, record and revoke access. For the web interface itself, see [Proxmox Web Interface Security](/learn/systems-infrastructure-security/proxmox-web-interface-security)."
+    },
+    {
+      "id": "clusterfw",
+      "type": "code",
+      "language": "ini",
+      "title": "/etc/pve/firewall/cluster.fw",
+      "code": "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: ACCEPT\n\n[IPSET mgmt]\n10.10.0.0/24    # management VLAN\n192.0.2.25      # admin jump host\n\n[IPSET nodes]\n10.10.0.11\n10.10.0.12\n10.10.0.13\n\n[RULES]\nIN SSH(ACCEPT) -source +mgmt -log nolog\nIN ACCEPT -p tcp -dport 8006 -source +mgmt -log nolog\nIN ACCEPT -p udp -dport 5405:5412 -source +nodes -log nolog\nIN ACCEPT -p icmp -source +mgmt -log nolog\n",
+      "caption": "Everything not matched by a rule is dropped by policy_in. The +name syntax refers to an IP set."
+    },
+    {
+      "id": "path-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "A guest tries to reach the management plane",
+      "caption": "Network layout blocks the route, and the host firewall blocks what is left.",
+      "data": {
+        "actors": [
+          {
+            "id": "g",
+            "label": "Compromised VM",
+            "sub": "VLAN 20",
+            "icon": "server"
+          },
+          {
+            "id": "sw",
+            "label": "Switch",
+            "sub": "VLAN rules",
+            "icon": "switch"
+          },
+          {
+            "id": "fw",
+            "label": "PVE firewall",
+            "sub": "policy_in: DROP",
+            "icon": "firewall"
+          },
+          {
+            "id": "h",
+            "label": "Proxmox host",
+            "sub": "10.10.0.11:8006",
+            "icon": "lock"
+          }
+        ],
+        "steps": [
+          {
+            "from": "g",
+            "to": "sw",
+            "label": "Scan 10.10.0.0/24",
+            "tone": "attack",
+            "note": "The attacker scans for the management network from inside the guest VLAN."
+          },
+          {
+            "from": "sw",
+            "to": "sw",
+            "label": "No VLAN 10 route",
+            "tone": "blocked",
+            "note": "The guest VLAN has no gateway or trunk toward the management VLAN. The probe goes nowhere."
+          },
+          {
+            "from": "g",
+            "to": "fw",
+            "label": "Try 8006 via any other path",
+            "tone": "attack",
+            "note": "Suppose a misconfigured router leaks a route. The probe now reaches the host."
+          },
+          {
+            "from": "fw",
+            "to": "fw",
+            "label": "Source not in +mgmt",
+            "tone": "blocked",
+            "note": "The source address is not in the mgmt IP set, so policy_in DROP discards the packet silently."
+          },
+          {
+            "from": "fw",
+            "to": "h",
+            "label": "Admin from jump host",
+            "tone": "success",
+            "note": "A request from 192.0.2.25 matches the allow rule and reaches pveproxy."
+          },
+          {
+            "from": "h",
+            "to": "h",
+            "label": "Logged and MFA-checked",
+            "tone": "secure",
+            "note": "The login is logged and requires a second factor before a session starts."
+          }
+        ]
+      }
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Step 3: Verify from both sides\n\nA configuration you have not tested is only a hope. Verify isolation from the **host** (what is listening) and from the **guest side** (what is reachable).\n\nOn the host, `ss` shows which services listen and on which address. A service bound to `0.0.0.0` listens on every interface, including any that touch guest networks. Binding management services to the management address, or filtering them with the firewall, closes that gap.\n\nFrom a test VM on a guest VLAN, try to connect to the management address on ports 22 and 8006. Both should time out. A \"connection refused\" answer means the packet reached the host and was rejected. A **timeout** means it was dropped, which is what you want, because it tells a scanner nothing.\n\nRepeat the test after every network change, upgrade or cluster join. Isolation fails quietly when someone adds a bridge or a route."
+    },
+    {
+      "id": "check",
+      "type": "terminal",
+      "title": "Checking listeners and reachability",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "ss -tlnp | grep -E ':(22|8006|3128) '",
+          "output": "LISTEN 0 128  0.0.0.0:22    0.0.0.0:*  users:((\"sshd\",pid=812,fd=3))\nLISTEN 0 4096 *:8006       *:*      users:((\"pveproxy\",pid=1190,fd=6))\nLISTEN 0 4096 *:3128       *:*      users:((\"spiceproxy\",pid=1201,fd=6))"
+        },
+        {
+          "comment": "Everything listens on all interfaces. That is normal for Proxmox, which is why the firewall and network layout matter."
+        },
+        {
+          "cmd": "pve-firewall status",
+          "output": "Status: enabled/running"
+        },
+        {
+          "cmd": "nc -zv -w 3 10.10.0.11 8006",
+          "prompt": "ubuntu@guest-vm:~$",
+          "output": "nc: connect to 10.10.0.11 port 8006 (tcp) timed out: Operation now in progress"
+        },
+        {
+          "comment": "Run from a VM on VLAN 20. A timeout is the success case: the packet was dropped, not rejected."
+        }
+      ],
+      "caption": "The last command runs inside a guest VM that you own, against your own host."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where administrators go wrong",
+      "markdown": "- **Enabling the firewall before adding an allow rule.** You lose access to port 8006 and SSH at once. Add the rule first, or keep console access ready.\n- **Putting the host IP on the guest bridge** \"for convenience\". This makes the host reachable from every guest on that bridge.\n- **Forgetting out-of-band management.** The server's BMC (iDRAC, iLO, IPMI) is also a management interface. Put it on the management network too, never on a guest network.\n- **Trusting a VLAN without testing it.** A trunk port that allows all VLANs can bridge networks you meant to separate."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a lab Proxmox VE (a nested VM is fine), never on production:\n\n1. Create a Linux bridge `vmbr1` with no IP address and attach a test VM to it.\n2. In the web interface, open **Datacenter > Firewall > IPSet** and create `mgmt` with your admin workstation's address.\n3. Add an `IN ACCEPT` rule for TCP 8006 and one for SSH, both with source `+mgmt`. Check you can still log in.\n4. Only then set `policy_in` to `DROP` and enable the firewall at the datacenter level.\n5. From the test VM, run `nc -zv -w 3 <host-ip> 8006` and confirm it times out. Then confirm your workstation still connects.\n6. Write down the result and the commands you used."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Management plane",
+          "definition": "The interfaces and traffic used to administer a system, such as the web UI, API and SSH."
+        },
+        {
+          "term": "Out-of-band management",
+          "definition": "Management through a separate controller (BMC, IPMI) that works even when the OS is down."
+        },
+        {
+          "term": "Jump host",
+          "definition": "A hardened server that administrators connect to first, and from which they reach management interfaces."
+        },
+        {
+          "term": "IP set",
+          "definition": "A named list of addresses or networks that firewall rules can reference."
+        },
+        {
+          "term": "Default deny",
+          "definition": "A policy that drops all traffic not explicitly allowed."
+        },
+        {
+          "term": "VLAN-aware bridge",
+          "definition": "A Linux bridge that understands 802.1Q tags and limits which VLANs a port may use."
+        },
+        {
+          "term": "Corosync",
+          "definition": "The messaging layer a Proxmox cluster uses for membership and quorum."
+        },
+        {
+          "term": "Attack surface",
+          "definition": "All the points where an unauthorized party could try to interact with a system."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main goal of management network isolation?",
+          "options": [
+            "Make the web interface faster",
+            "Ensure a compromised guest has no route to the management plane",
+            "Reduce the number of VLANs",
+            "Encrypt all guest traffic"
+          ],
+          "answer": 1,
+          "explanation": "Isolation keeps the highest-value interfaces out of reach of the systems most likely to be compromised."
+        },
+        {
+          "question": "Which ports are part of the Proxmox VE management plane? (Choose all that apply.)",
+          "options": [
+            "TCP 8006",
+            "TCP 22",
+            "TCP 3128",
+            "TCP 443 on a guest web server"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "The web UI and API, SSH and the SPICE proxy administer the host. A guest's own web server is a guest service."
+        },
+        {
+          "question": "A scan from a guest VM to the management address ends in a timeout. What does that tell you?",
+          "options": [
+            "The packets were dropped, which is the desired result",
+            "The host is down",
+            "The port is open",
+            "The firewall is disabled"
+          ],
+          "answer": 0,
+          "explanation": "A drop gives a scanner no information. A refusal would show that a host is there."
+        },
+        {
+          "question": "What should you do before setting policy_in to DROP?",
+          "options": [
+            "Reboot every node",
+            "Add allow rules for your own admin access",
+            "Delete the IP sets",
+            "Disable SSH"
+          ],
+          "answer": 1,
+          "explanation": "Without an allow rule for your source, the default drop locks you out of ports 8006 and 22."
+        },
+        {
+          "question": "Which designs weaken isolation? (Choose all that apply.)",
+          "options": [
+            "The host IP address on a bridge shared with guests",
+            "BMC interface on a guest network",
+            "A dedicated NIC for management",
+            "A trunk port allowing all VLANs"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "A dedicated NIC strengthens isolation. The other three give guests a way toward management interfaces."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Separate the **management, cluster, storage and guest** planes. Management is the most valuable.\n- Prefer a **dedicated NIC or VLAN** for management, and keep the host IP off guest bridges.\n- Use the **Proxmox firewall** with `policy_in: DROP` and an IP set of trusted sources.\n- Add a **jump host** with MFA so access is logged in one place.\n- **Verify** with `ss`, `pve-firewall status` and a timeout test from a guest.\n\nNext, read [Virtualization Escape Risks](/learn/systems-infrastructure-security/virtualization-escape-risks) to see why isolation between guest and host matters even more."
+    }
+  ],
+  "ar": {
+    "title": "عزل شبكة الإدارة",
+    "summary": "تعلّم كيف تُبقي واجهات إدارة المشرف الافتراضي على شبكة معزولة، وتقيّدها بجدار حماية Proxmox، وتتحقق من أن الضيف المُخترق لا يستطيع الوصول إليها.",
+    "objectives": [
+      "شرح سبب وجوب فصل حركة الإدارة عن حركة الضيوف",
+      "تصميم شبكة Proxmox بجسر إدارة مخصص",
+      "تقييد منافذ الإدارة بمجموعات عناوين وسياسة إسقاط افتراضية",
+      "التحقق من العزل من المضيف ومن جهاز ضيف"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تخيّل أن جهازًا افتراضيًا على خادم Proxmox VE لديك اختُرق عبر تطبيق ويب ضعيف. ينظر المهاجم حوله فيجد أن شبكة الجهاز تصل إلى المنفذ 8006 على المشرف الافتراضي (Hypervisor)، وهو المنفذ نفسه الذي تدير به كل الأجهزة الضيفة على العقدة. وبعد كلمة مرور مسروقة واحدة يملك المضيف وكل جهاز افتراضي عليه.\n\nيعالج هذا الدرس هذا الخطر. يعني **عزل شبكة الإدارة (Management network isolation)** أن الواجهات التي تدير بنيتك التحتية تعيش على شبكة مستقلة لا يصل إليها إلا عدد صغير من الأماكن الموثوقة، ولا تلمسها الأجهزة الضيفة ولا المستخدمون ولا الإنترنت."
+      },
+      {
+        "id": "planes",
+        "type": "text",
+        "markdown": "## لماذا تحتاج حركة الإدارة إلى شبكة خاصة بها\n\nيحمل المشرف الافتراضي عدة أنواع من الحركة. وخلطها في شبكة واحدة يمنح المهاجم الذي يصل إلى أيٍّ منها طريقًا إلى بقيتها.\n\n| المستوى | أمثلة في Proxmox VE | من ينبغي أن يصل إليه |\n|:--|:--|:--|\n| الإدارة (Management) | واجهة الويب وواجهة API (TCP 8006)، وSSH (TCP 22)، ووسيط الطرفية (TCP 3128) | المسؤولون وأدوات الأتمتة فقط |\n| العنقود (Cluster) | Corosync (UDP 5405 فما فوق)، والترحيل الحي | عُقد العنقود فقط |\n| التخزين (Storage) | NFS وiSCSI وCeph وحركة النسخ الاحتياطي | العُقد وخوادم التخزين فقط |\n| الضيوف (Guest) | حركة الأجهزة الافتراضية والحاويات | المستخدمون والإنترنت والأجهزة الضيفة الأخرى |\n\nمستوى الإدارة هو الأثمن. فمن يسجّل الدخول إلى المنفذ 8006 مسؤولًا يستطيع قراءة كل قرص وفتح كل طرفية وحذف كل نسخة احتياطية. ومستوى العنقود حسّاس أيضًا لأن رسائل Corosync موثوقة بحكم تصميمها. راجع درس [البنية الأمنية لـ Proxmox VE](/learn/systems-infrastructure-security/proxmox-ve-security-architecture) لترى كيف تتكامل هذه المستويات.\n\nالهدف بسيط: **ألا يكون لأي جهاز ضيف مُخترق مسار شبكي إلى مستوى الإدارة.**"
+      },
+      {
+        "id": "design",
+        "type": "text",
+        "markdown": "## الخطوة 1: امنح الإدارة مسارًا فيزيائيًا أو شبكة VLAN خاصة\n\nأنظف تصميم يستخدم **واجهة شبكة مخصصة** للإدارة، موصولة بمحوّل منفصل أو بشبكة VLAN معزولة. وإن لم يتوفر لديك سوى واجهتين فاجعل إحداهما للإدارة والأخرى لكل ما عداها.\n\nفي هذا المثال تحمل `eno1` الإدارة على الشبكة `10.10.0.0/24`، وتحمل `eno2` شبكات VLAN الخاصة بالضيوف عبر جسر (Bridge) منفصل. ولا يملك المضيف أي عنوان IP على جسر الضيوف أصلًا، فلا يستطيع أي شيء على شبكة ضيوف أن يخاطب المضيف عبره.\n\n### ما لا ينبغي فعله\n\n- لا تضع عنوان IP الخاص بالمضيف على جسر يستخدمه الضيوف أيضًا.\n- لا تستخدم شبكة VLAN نفسها للإدارة ولأي ضيف.\n- لا تكشف المنفذ 8006 على الإنترنت «لاختبار سريع»، فالماسحات تجده خلال ساعات.\n\nوإذا اضطررت إلى وصلة فيزيائية واحدة فاستخدم **شبكة VLAN موسومة للإدارة** لا يُسمح للضيوف بالانضمام إليها. يعمل ذلك لكنه يعتمد على ضبط المحوّل بدقة، فتحقّق منه. راجع درس [الجسور الافتراضية والشبكات الواعية بـ VLAN](/learn/systems-infrastructure-security/virtual-bridges-and-vlan-aware-networking)."
+      },
+      {
+        "id": "ifaces",
+        "type": "code",
+        "language": "ini",
+        "title": "ملف /etc/network/interfaces على عقدة Proxmox",
+        "code": "auto lo\niface lo inet loopback\n\niface eno1 inet manual\niface eno2 inet manual\n\n# Management: only this bridge carries the host IP address\nauto vmbr0\niface vmbr0 inet static\n        address 10.10.0.11/24\n        gateway 10.10.0.1\n        bridge-ports eno1\n        bridge-stp off\n        bridge-fd 0\n\n# Guests: VLAN-aware bridge, no IP address on the host\nauto vmbr1\niface vmbr1 inet manual\n        bridge-ports eno2\n        bridge-stp off\n        bridge-fd 0\n        bridge-vlan-aware yes\n        bridge-vids 20-30\n",
+        "caption": "للمضيف عنوان على vmbr0 فقط. شبكة VLAN رقم 10 (الإدارة) ليست ضمن النطاق المسموح على جسر الضيوف."
+      },
+      {
+        "id": "fw",
+        "type": "text",
+        "markdown": "## الخطوة 2: قيّد من يصل إلى منافذ الإدارة\n\nالعزل بتخطيط الشبكة هو الطبقة الأولى. أما الطبقة الثانية فهي **جدار حماية Proxmox VE** الذي يرشّح الحركة الموجّهة إلى المضيف نفسه. عرّف **مجموعة عناوين IP (IP set)** من المصادر الموثوقة، ثم اسمح بمنافذ الإدارة من هذه المجموعة فقط وأسقط ما عداها.\n\nتوجد القواعد في الملف `/etc/pve/firewall/cluster.fw`، فتطبَّق على كل عقدة في العنقود. اضبط سياسة الدخول الافتراضية على `DROP` وأضف قواعد سماح صريحة. واسمح بحركة Corosync والترحيل من العُقد الأخرى فقط. وأضف قاعدة وصولك أنت **قبل** تفعيل جدار الحماية دائمًا، وإلا حجبتَ نفسك. يشرح درس [ضبط جدار حماية Proxmox](/learn/systems-infrastructure-security/proxmox-firewall-configuration) صياغة القواعد كاملة.\n\nويضيف **خادم القفز الإداري (Jump host)** نقطة تحكم أخرى. يتصل المسؤولون بخادم القفز مع التحقق متعدد العوامل (MFA)، ولا يكون في المجموعة المسموح بها إلا عنوان خادم القفز. وبذلك يصبح لديك مكان واحد للتسجيل والتتبع وسحب الصلاحية. وللواجهة الرسومية نفسها راجع درس [أمن واجهة الويب في Proxmox](/learn/systems-infrastructure-security/proxmox-web-interface-security)."
+      },
+      {
+        "id": "clusterfw",
+        "type": "code",
+        "language": "ini",
+        "title": "الملف /etc/pve/firewall/cluster.fw",
+        "code": "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: ACCEPT\n\n[IPSET mgmt]\n10.10.0.0/24    # management VLAN\n192.0.2.25      # admin jump host\n\n[IPSET nodes]\n10.10.0.11\n10.10.0.12\n10.10.0.13\n\n[RULES]\nIN SSH(ACCEPT) -source +mgmt -log nolog\nIN ACCEPT -p tcp -dport 8006 -source +mgmt -log nolog\nIN ACCEPT -p udp -dport 5405:5412 -source +nodes -log nolog\nIN ACCEPT -p icmp -source +mgmt -log nolog\n",
+        "caption": "كل ما لا تطابقه قاعدة تُسقطه policy_in. وتشير الصيغة +name إلى مجموعة عناوين."
+      },
+      {
+        "id": "path-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "جهاز ضيف يحاول الوصول إلى مستوى الإدارة",
+        "caption": "تخطيط الشبكة يقطع المسار، وجدار حماية المضيف يمنع ما تبقى.",
+        "data": {
+          "actors": [
+            {
+              "id": "g",
+              "label": "جهاز مُخترق",
+              "sub": "VLAN 20",
+              "icon": "server"
+            },
+            {
+              "id": "sw",
+              "label": "المحوّل",
+              "sub": "قواعد VLAN",
+              "icon": "switch"
+            },
+            {
+              "id": "fw",
+              "label": "جدار حماية PVE",
+              "sub": "policy_in: DROP",
+              "icon": "firewall"
+            },
+            {
+              "id": "h",
+              "label": "مضيف Proxmox",
+              "sub": "10.10.0.11:8006",
+              "icon": "lock"
+            }
+          ],
+          "steps": [
+            {
+              "from": "g",
+              "to": "sw",
+              "label": "مسح 10.10.0.0/24",
+              "tone": "attack",
+              "note": "يمسح المهاجم بحثًا عن شبكة الإدارة من داخل شبكة الضيوف."
+            },
+            {
+              "from": "sw",
+              "to": "sw",
+              "label": "لا مسار إلى VLAN 10",
+              "tone": "blocked",
+              "note": "لا تملك شبكة الضيوف بوابة ولا وصلة موسومة نحو شبكة الإدارة، فلا تصل المحاولة إلى أي مكان."
+            },
+            {
+              "from": "g",
+              "to": "fw",
+              "label": "محاولة 8006 عبر مسار آخر",
+              "tone": "attack",
+              "note": "افترض أن موجّهًا مضبوطًا خطأً سرّب مسارًا، فتصل المحاولة الآن إلى المضيف."
+            },
+            {
+              "from": "fw",
+              "to": "fw",
+              "label": "المصدر ليس في +mgmt",
+              "tone": "blocked",
+              "note": "عنوان المصدر ليس في مجموعة mgmt، فتُسقط policy_in الحزمة بصمت."
+            },
+            {
+              "from": "fw",
+              "to": "h",
+              "label": "المسؤول من خادم القفز",
+              "tone": "success",
+              "note": "الطلب القادم من 192.0.2.25 يطابق قاعدة السماح فيصل إلى pveproxy."
+            },
+            {
+              "from": "h",
+              "to": "h",
+              "label": "مسجَّل مع التحقق متعدد العوامل",
+              "tone": "secure",
+              "note": "يُسجَّل الدخول ويتطلب عاملًا ثانيًا قبل بدء الجلسة."
+            }
+          ]
+        }
+      },
+      {
+        "id": "verify",
+        "type": "text",
+        "markdown": "## الخطوة 3: تحقّق من الجهتين\n\nالإعداد الذي لم تختبره أملٌ لا أكثر. تحقّق من العزل من جهة **المضيف** (ما الذي يستمع) ومن جهة **الضيف** (ما الذي يمكن الوصول إليه).\n\nعلى المضيف يعرض الأمر `ss` الخدمات المستمعة وعناوينها. والخدمة المرتبطة بالعنوان `0.0.0.0` تستمع على كل الواجهات، ومنها ما يلامس شبكات الضيوف. وربط خدمات الإدارة بعنوان الإدارة، أو ترشيحها بجدار الحماية، يسدّ هذه الثغرة.\n\nومن جهاز اختبار على شبكة ضيوف جرّب الاتصال بعنوان الإدارة على المنفذين 22 و8006. ينبغي أن ينتهي الاتصالان بمهلة منتهية. أما الرد «connection refused» فيعني أن الحزمة وصلت إلى المضيف ورُفضت. وأما **انتهاء المهلة** فيعني أنها أُسقطت، وهذا المطلوب لأنه لا يخبر الماسح بشيء.\n\nكرّر الاختبار بعد كل تغيير في الشبكة أو ترقية أو انضمام إلى العنقود. فالعزل يفشل بهدوء حين يضيف أحدهم جسرًا أو مسارًا."
+      },
+      {
+        "id": "check",
+        "type": "terminal",
+        "title": "فحص المنافذ المستمعة وإمكانية الوصول",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "ss -tlnp | grep -E ':(22|8006|3128) '",
+            "output": "LISTEN 0 128  0.0.0.0:22    0.0.0.0:*  users:((\"sshd\",pid=812,fd=3))\nLISTEN 0 4096 *:8006       *:*      users:((\"pveproxy\",pid=1190,fd=6))\nLISTEN 0 4096 *:3128       *:*      users:((\"spiceproxy\",pid=1201,fd=6))"
+          },
+          {
+            "comment": "كل شيء يستمع على جميع الواجهات، وهذا طبيعي في Proxmox، ولهذا يهمّ جدار الحماية وتخطيط الشبكة."
+          },
+          {
+            "cmd": "pve-firewall status",
+            "output": "Status: enabled/running"
+          },
+          {
+            "cmd": "nc -zv -w 3 10.10.0.11 8006",
+            "prompt": "ubuntu@guest-vm:~$",
+            "output": "nc: connect to 10.10.0.11 port 8006 (tcp) timed out: Operation now in progress"
+          },
+          {
+            "comment": "نُفّذ من جهاز على VLAN 20. انتهاء المهلة هو حالة النجاح: الحزمة أُسقطت لا رُفضت."
+          }
+        ],
+        "caption": "يُنفَّذ الأمر الأخير داخل جهاز ضيف تملكه، ضد مضيفك أنت."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أين يخطئ المسؤولون",
+        "markdown": "- **تفعيل جدار الحماية قبل إضافة قاعدة السماح.** تفقد الوصول إلى المنفذ 8006 وSSH معًا. أضف القاعدة أولًا، أو أبقِ وصولًا عبر الطرفية جاهزًا.\n- **وضع عنوان المضيف على جسر الضيوف** «للتسهيل». يجعل ذلك المضيف قابلًا للوصول من كل ضيف على ذلك الجسر.\n- **نسيان الإدارة خارج النطاق.** وحدة الإدارة في الخادم (BMC مثل iDRAC وiLO وIPMI) واجهة إدارة أيضًا. ضعها على شبكة الإدارة كذلك، ولا تضعها أبدًا على شبكة ضيوف.\n- **الوثوق بشبكة VLAN دون اختبارها.** منفذ موسوم يسمح بكل الشبكات قد يصل بين شبكات أردت فصلها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في بيئة تجريبية لـ Proxmox VE (يكفي جهاز افتراضي متداخل)، وليس في الإنتاج أبدًا:\n\n1. أنشئ جسر Linux باسم `vmbr1` بلا عنوان IP، وصِل به جهازًا افتراضيًا للاختبار.\n2. في واجهة الويب افتح **Datacenter > Firewall > IPSet** وأنشئ مجموعة `mgmt` تضم عنوان محطة الإدارة لديك.\n3. أضف قاعدة `IN ACCEPT` للمنفذ TCP 8006 وأخرى لـ SSH، كلتاهما بالمصدر `+mgmt`. وتأكد أنك ما زلت تستطيع الدخول.\n4. بعد ذلك فقط اضبط `policy_in` على `DROP` وفعّل جدار الحماية على مستوى مركز البيانات.\n5. من جهاز الاختبار نفّذ `nc -zv -w 3 <host-ip> 8006` وتأكد من انتهاء المهلة، ثم تأكد أن محطتك ما زالت تتصل.\n6. دوّن النتيجة والأوامر التي استخدمتها."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "مستوى الإدارة",
+            "definition": "الواجهات والحركة المستخدمة لإدارة نظام ما، مثل واجهة الويب وAPI وSSH."
+          },
+          {
+            "term": "الإدارة خارج النطاق",
+            "definition": "إدارة عبر متحكم منفصل (BMC أو IPMI) تعمل حتى حين يتوقف نظام التشغيل."
+          },
+          {
+            "term": "خادم القفز",
+            "definition": "خادم مُحصَّن يتصل به المسؤولون أولًا، ومنه يصلون إلى واجهات الإدارة."
+          },
+          {
+            "term": "مجموعة عناوين IP",
+            "definition": "قائمة مسمّاة من العناوين أو الشبكات تشير إليها قواعد جدار الحماية."
+          },
+          {
+            "term": "الرفض الافتراضي",
+            "definition": "سياسة تُسقط كل حركة لم يُسمح بها صراحةً."
+          },
+          {
+            "term": "جسر واعٍ بـ VLAN",
+            "definition": "جسر Linux يفهم وسوم 802.1Q ويحدّ من الشبكات التي يجوز لمنفذ استخدامها."
+          },
+          {
+            "term": "Corosync",
+            "definition": "طبقة المراسلة التي يستخدمها عنقود Proxmox للعضوية والنصاب."
+          },
+          {
+            "term": "سطح الهجوم",
+            "definition": "كل النقاط التي قد يحاول فيها طرف غير مصرّح له التفاعل مع نظام."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما الهدف الرئيسي من عزل شبكة الإدارة؟",
+            "options": [
+              "جعل واجهة الويب أسرع",
+              "ضمان ألا يكون لجهاز ضيف مُخترق مسار إلى مستوى الإدارة",
+              "تقليل عدد شبكات VLAN",
+              "تشفير كل حركة الضيوف"
+            ],
+            "answer": 1,
+            "explanation": "يُبقي العزل أثمن الواجهات بعيدًا عن متناول الأنظمة الأكثر عرضة للاختراق."
+          },
+          {
+            "question": "أي المنافذ التالية جزء من مستوى الإدارة في Proxmox VE؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "TCP 8006",
+              "TCP 22",
+              "TCP 3128",
+              "TCP 443 على خادم ويب داخل ضيف"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "واجهة الويب وAPI وSSH ووسيط SPICE تدير المضيف، أما خادم الويب داخل الضيف فخدمة تخص الضيف."
+          },
+          {
+            "question": "انتهى مسح من جهاز ضيف إلى عنوان الإدارة بمهلة منتهية. ماذا يعني ذلك؟",
+            "options": [
+              "أُسقطت الحزم، وهذه النتيجة المطلوبة",
+              "المضيف متوقف",
+              "المنفذ مفتوح",
+              "جدار الحماية معطّل"
+            ],
+            "answer": 0,
+            "explanation": "الإسقاط لا يعطي الماسح أي معلومة، أما الرفض فيكشف وجود مضيف."
+          },
+          {
+            "question": "ما الذي ينبغي فعله قبل ضبط policy_in على DROP؟",
+            "options": [
+              "إعادة تشغيل كل العُقد",
+              "إضافة قواعد سماح لوصولك الإداري",
+              "حذف مجموعات العناوين",
+              "تعطيل SSH"
+            ],
+            "answer": 1,
+            "explanation": "من دون قاعدة سماح لمصدرك يحجبك الإسقاط الافتراضي عن المنفذين 8006 و22."
+          },
+          {
+            "question": "أي التصاميم التالية تُضعف العزل؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "عنوان المضيف على جسر مشترك مع الضيوف",
+              "واجهة BMC على شبكة ضيوف",
+              "واجهة شبكة مخصصة للإدارة",
+              "منفذ موسوم يسمح بكل شبكات VLAN"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الواجهة المخصصة تقوّي العزل، أما الثلاثة الأخرى فتمنح الضيوف طريقًا إلى واجهات الإدارة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- افصل مستويات **الإدارة والعنقود والتخزين والضيوف**. ومستوى الإدارة هو الأثمن.\n- فضّل **واجهة شبكة أو VLAN مخصصة** للإدارة، وأبقِ عنوان المضيف خارج جسور الضيوف.\n- استخدم **جدار حماية Proxmox** مع `policy_in: DROP` ومجموعة عناوين للمصادر الموثوقة.\n- أضف **خادم قفز** مع MFA ليُسجَّل الوصول في مكان واحد.\n- **تحقّق** بالأمرين `ss` و`pve-firewall status` وباختبار المهلة من جهاز ضيف.\n\nتابع بدرس [مخاطر الهروب من بيئة المحاكاة الافتراضية](/learn/systems-infrastructure-security/virtualization-escape-risks) لترى لماذا يزداد أثر العزل بين الضيف والمضيف."
+      }
+    ]
+  }
+}

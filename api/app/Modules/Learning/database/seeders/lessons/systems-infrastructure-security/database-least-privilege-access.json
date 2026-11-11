@@ -1,0 +1,594 @@
+{
+ "slug": "database-least-privilege-access",
+ "title": "Database Least-Privilege Access",
+ "summary": "Design job-based roles, grant minimum rights in PostgreSQL and MySQL, remove dangerous defaults, and audit real privileges.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Design roles around jobs and separate application from migration accounts",
+  "Write least-privilege grants for PostgreSQL and MySQL",
+  "Remove dangerous default and high-risk privileges",
+  "Audit and test effective privileges on a schedule"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A web application connects to its database as `postgres`, the superuser, because that was the easiest way to get the first deployment working. Months later a flaw in one search page allows an attacker to inject SQL. With an ordinary account the damage would be limited to a few tables. With a superuser, the same flaw can read every database, create new roles and, through features such as `COPY ... PROGRAM`, run commands on the server.\n\nThe principle of least privilege says every account gets the minimum rights needed for its job and nothing more. It does not stop the first mistake. It limits what the mistake costs. In this lesson you will design roles around jobs rather than people, write grants for PostgreSQL and MySQL, remove the dangerous defaults, and audit what each account can really do."
+  },
+  {
+   "id": "model",
+   "type": "text",
+   "markdown": "## Design roles around jobs\n\nStart on paper. List the **actors** that touch the database, then the **jobs** each needs. Typical actors are the application, a migration tool, a reporting service, a backup agent, a monitoring agent and human administrators.\n\n| Actor | Needs | Must not have |\n|:--|:--|:--|\n| Application | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on its own tables | `CREATE`, `DROP`, role management |\n| Migration tool | `CREATE`, `ALTER` on the app schema, run only during deploys | Access outside the app schema |\n| Reporting | `SELECT` on selected views | Any write permission |\n| Backup agent | Read access for dumps, or replication rights | Login from application hosts |\n| Monitoring | `pg_monitor` or `PROCESS` | Row data |\n| Human admin | Named personal account, elevated when needed | Shared passwords |\n\nThe split between the application and the migration tool is the single highest-value change. The running application rarely needs to create or drop tables. Giving that right only to a separate account used during deployments means a SQL injection in the app cannot alter the schema. The deeper mechanics of roles and grants are in [PostgreSQL Roles, Grants and Privileges](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+  },
+  {
+   "id": "pg",
+   "type": "text",
+   "markdown": "## Step 1: Build the roles in PostgreSQL\n\nPostgreSQL treats users and groups as **roles**. A good pattern is to create **group roles** that hold privileges and cannot log in, then **login roles** that are members of them. Grants go on the group, so adding or removing a person means changing membership, not re-granting dozens of objects.\n\nTwo defaults deserve attention. First, by default every role can connect to every database and, before PostgreSQL 15, could create objects in the `public` schema. Revoke these explicitly. Second, `ALTER DEFAULT PRIVILEGES` controls what future tables look like. Without it, a new table created by the migration account is invisible to the application until someone remembers to grant access, and the usual quick fix is a broad grant that overshoots."
+  },
+  {
+   "id": "pgroles",
+   "type": "code",
+   "language": "sql",
+   "filename": "least-privilege.sql",
+   "caption": "PostgreSQL roles for an application, a migrator and a reporting user. Passwords are placeholders.",
+   "code": "-- 1. Close the broad defaults\nREVOKE ALL ON DATABASE appdb FROM PUBLIC;\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\n-- 2. Group roles hold privileges and cannot log in\nCREATE ROLE app_rw NOLOGIN;\nCREATE ROLE app_ro NOLOGIN;\n\n-- 3. A dedicated schema, owned by the migration role\nCREATE ROLE app_migrator LOGIN PASSWORD '<placeholder-from-secrets-manager>';\nCREATE SCHEMA app AUTHORIZATION app_migrator;\n\nGRANT CONNECT ON DATABASE appdb TO app_rw, app_ro;\nGRANT USAGE ON SCHEMA app TO app_rw, app_ro;\n\n-- 4. Future tables created by the migrator get the right grants automatically\nALTER DEFAULT PRIVILEGES FOR ROLE app_migrator IN SCHEMA app\n  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;\nALTER DEFAULT PRIVILEGES FOR ROLE app_migrator IN SCHEMA app\n  GRANT SELECT ON TABLES TO app_ro;\nALTER DEFAULT PRIVILEGES FOR ROLE app_migrator IN SCHEMA app\n  GRANT USAGE, SELECT ON SEQUENCES TO app_rw;\n\n-- 5. Login roles are members of the groups\nCREATE ROLE web_app LOGIN PASSWORD '<placeholder>' CONNECTION LIMIT 50 IN ROLE app_rw;\nCREATE ROLE report_svc LOGIN PASSWORD '<placeholder>' CONNECTION LIMIT 5 IN ROLE app_ro;",
+   "highlight": [
+    2,
+    3,
+    5,
+    6,
+    11,
+    12,
+    15,
+    16,
+    22,
+    23
+   ]
+  },
+  {
+   "id": "mysql",
+   "type": "text",
+   "markdown": "## Step 2: The same design in MySQL\n\nMySQL 8 supports roles too. The ideas carry over: grant to roles, not users; scope to a schema; never use `*.*` for an application. Two MySQL-specific points matter.\n\nAccounts in MySQL are the pair **user and host**: `'app'@'10.20.1.%'` is a different account from `'app'@'%'`. Always restrict the host part to the application subnet. And the `GRANT OPTION`, `FILE`, `SUPER` and `PROCESS` privileges deserve special care. `FILE` lets an account read and write server files, `SUPER` and the newer dynamic privileges allow reconfiguration, and `GRANT OPTION` lets an account hand its rights to others, which defeats central control.\n\n| Dangerous privilege | Why | Who should hold it |\n|:--|:--|:--|\n| `SUPER` / `SYSTEM_VARIABLES_ADMIN` | Change server settings at runtime | Break-glass admin only |\n| `FILE` | Read and write files on the server | Nobody, in most cases |\n| `GRANT OPTION` | Delegate rights | Security administrators |\n| `ALL PRIVILEGES ON *.*` | Everything | Break-glass admin only |"
+  },
+  {
+   "id": "myroles",
+   "type": "code",
+   "language": "sql",
+   "filename": "mysql-roles.sql",
+   "caption": "MySQL 8 roles scoped to one schema and one subnet. Passwords are placeholders.",
+   "code": "CREATE ROLE 'app_rw', 'app_ro';\nGRANT SELECT, INSERT, UPDATE, DELETE ON appdb.* TO 'app_rw';\nGRANT SELECT ON appdb.* TO 'app_ro';\n\nCREATE USER 'web_app'@'10.20.1.%' IDENTIFIED BY '<placeholder>'\n  REQUIRE SSL WITH MAX_USER_CONNECTIONS 50;\nGRANT 'app_rw' TO 'web_app'@'10.20.1.%';\nSET DEFAULT ROLE 'app_rw' TO 'web_app'@'10.20.1.%';\n\n-- Remove anonymous and remote-root exposure\nDROP USER IF EXISTS ''@'localhost';\nSELECT user, host FROM mysql.user WHERE user = 'root';",
+   "highlight": [
+    5,
+    6,
+    7,
+    8
+   ]
+  },
+  {
+   "id": "priv-flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A least-privilege check on an injected query",
+   "caption": "The same attack lands in a very different place depending on the account.",
+   "data": {
+    "token": "Query",
+    "nodes": [
+     {
+      "id": "atk",
+      "label": "Injected input",
+      "sub": "198.51.100.20",
+      "icon": "attacker"
+     },
+     {
+      "id": "app",
+      "label": "Web app",
+      "sub": "web_app",
+      "icon": "server"
+     },
+     {
+      "id": "db",
+      "label": "Database",
+      "sub": "appdb",
+      "icon": "database"
+     },
+     {
+      "id": "sys",
+      "label": "Server OS",
+      "sub": "postgres user",
+      "icon": "cpu"
+     }
+    ],
+    "steps": [
+     {
+      "at": "atk",
+      "caption": "A crafted search string reaches the application.",
+      "tone": "attack"
+     },
+     {
+      "at": "app",
+      "caption": "The flawed query runs as web_app, a member of app_rw.",
+      "tone": "warning"
+     },
+     {
+      "at": "db",
+      "caption": "SELECT on app tables succeeds: the data in scope is exposed.",
+      "tone": "danger"
+     },
+     {
+      "at": "db",
+      "caption": "DROP TABLE and CREATE ROLE fail with permission denied.",
+      "tone": "blocked"
+     },
+     {
+      "at": "sys",
+      "caption": "COPY ... PROGRAM needs superuser or pg_execute_server_program: denied.",
+      "tone": "blocked"
+     },
+     {
+      "at": "db",
+      "caption": "The audit log records the denied attempts and alerts the team.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "id": "audit",
+   "type": "text",
+   "markdown": "## Step 3: Audit what accounts can really do\n\nDesign is only a promise. Query the catalog to find out what accounts hold today. Look for four patterns: superusers that are not human administrators, roles with `CREATEROLE` or `CREATEDB`, tables owned by login accounts used by the application, and members of powerful built-in roles such as `pg_execute_server_program` or `pg_write_server_files`.\n\nPrivileges drift. A contractor is added for a week and stays for a year, a quick `GRANT ALL` is run during an incident, and nobody removes it. Run the audit queries on a schedule, store the output, and review the differences. Pair this with authentication hardening from [PostgreSQL Authentication and Authorization](/learn/systems-infrastructure-security/postgresql-authentication-and-authorization), and with the logging described in [Database Auditing and Activity Logging](/learn/systems-infrastructure-security/database-auditing-and-activity-logging) so you know when a privileged action actually happens."
+  },
+  {
+   "id": "audit-term",
+   "type": "terminal",
+   "title": "Auditing privileges (lab database)",
+   "lines": [
+    {
+     "cmd": "psql -d appdb -c \"SELECT rolname, rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolsuper OR rolcreaterole OR rolcreatedb;\"",
+     "output": "  rolname   | rolsuper | rolcreaterole | rolcreatedb\n------------+----------+---------------+-------------\n postgres   | t        | t             | t\n legacy_dev | t        | f             | f\n(2 rows)",
+     "comment": "legacy_dev is a superuser that is not the admin account: investigate and demote."
+    },
+    {
+     "cmd": "psql -d appdb -c \"SELECT grantee, table_schema, table_name, privilege_type FROM information_schema.role_table_grants WHERE grantee='web_app' AND privilege_type IN ('TRUNCATE','REFERENCES','TRIGGER');\"",
+     "output": " grantee | table_schema | table_name | privilege_type\n---------+--------------+------------+----------------\n(0 rows)",
+     "comment": "No destructive extras for the application login."
+    },
+    {
+     "cmd": "psql -d appdb -U web_app -c \"DROP TABLE app.orders;\"",
+     "output": "ERROR:  must be owner of table orders",
+     "comment": "The permission-denied result is the proof that the design works."
+    },
+    {
+     "cmd": "psql -d appdb -c \"SELECT r.rolname AS member, g.rolname AS granted_role FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid WHERE g.rolname LIKE 'pg\\_%';\"",
+     "output": " member | granted_role\n--------+--------------\n(0 rows)",
+     "comment": "No account holds a powerful built-in role. Re-run after every change."
+    }
+   ],
+   "caption": "Example output from a lab database."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Test the negative case",
+   "markdown": "Every grant review should include a test that the account fails to do something it should not. Run `DROP`, `CREATE ROLE` and a read of an out-of-scope table as the application login in a staging database, and keep the results with your change record."
+  },
+  {
+   "id": "humans",
+   "type": "text",
+   "markdown": "## Step 4: Handle human and emergency access\n\nPeople are the hardest case. Give each administrator a **named account** with ordinary rights, and let them elevate through a documented path such as `SET ROLE` to an admin role or a just-in-time grant that expires. Shared logins make audit trails useless, because the log says `dbadmin` did it and nobody knows who that was.\n\nKeep one **break-glass** superuser account, with a long random secret stored in a vault, alerting on every use. Restrict its `pg_hba.conf` rule to the management subnet. For application accounts, set `CONNECTION LIMIT` or `MAX_USER_CONNECTIONS`, so a compromised account cannot exhaust the server, and set statement timeouts with `ALTER ROLE web_app SET statement_timeout = '30s'`.\n\nThe result is a database where a stolen application credential reaches only what the application needs, the damage of SQL injection is bounded, and every elevated action is attributable to a person."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. In a lab PostgreSQL instance **you own**, run the sample script to create `app_migrator`, `app_rw`, `app_ro` and `web_app`. Replace the placeholder passwords with random lab values.\n2. As `app_migrator`, create a table in schema `app`. As `web_app`, confirm `SELECT` and `INSERT` work and `DROP TABLE` fails.\n3. Run the audit queries and list every role with `rolsuper`, `rolcreaterole` or `rolcreatedb`.\n4. Set `ALTER ROLE web_app SET statement_timeout = '5s'`, run `SELECT pg_sleep(10)` as that role, and observe the cancellation."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Least privilege",
+     "definition": "Granting only the rights required for a task, and nothing more."
+    },
+    {
+     "term": "Role",
+     "definition": "A named set of privileges that can be granted to users or other roles."
+    },
+    {
+     "term": "Group role",
+     "definition": "A role that holds privileges and cannot log in."
+    },
+    {
+     "term": "Migration account",
+     "definition": "A separate account that alters schemas during deployments only."
+    },
+    {
+     "term": "Default privileges",
+     "definition": "Rules that grant rights on objects created in the future."
+    },
+    {
+     "term": "GRANT OPTION",
+     "definition": "A right that lets the holder pass privileges on to others."
+    },
+    {
+     "term": "Privilege drift",
+     "definition": "Gradual accumulation of rights that are no longer needed."
+    },
+    {
+     "term": "Break-glass account",
+     "definition": "A tightly guarded emergency admin account used only when normal access fails."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why separate the application account from the migration account?",
+     "options": [
+      "To speed up queries",
+      "So SQL injection in the app cannot alter the schema",
+      "To avoid backups",
+      "To disable TLS"
+     ],
+     "answer": 1,
+     "explanation": "The running app rarely needs DDL rights, so withholding them bounds the damage of an injection flaw."
+    },
+    {
+     "question": "In MySQL, why is 'app'@'%' riskier than 'app'@'10.20.1.%'?",
+     "options": [
+      "It allows connections from any host",
+      "It disables passwords",
+      "It has more tables",
+      "It is read-only"
+     ],
+     "answer": 0,
+     "explanation": "The host part is part of the account identity and should limit where logins can originate."
+    },
+    {
+     "question": "Which are good least-privilege practices? Choose all that apply.",
+     "options": [
+      "Grant privileges to group roles and add users as members",
+      "Use ALTER DEFAULT PRIVILEGES for future tables",
+      "Share one admin login among all DBAs",
+      "Revoke CREATE on the public schema from PUBLIC"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Shared logins destroy accountability; the other three reduce risk and admin effort."
+    },
+    {
+     "question": "What does 'must be owner of table orders' in response to DROP TABLE show?",
+     "options": [
+      "The design is working as intended",
+      "The table is corrupted",
+      "TLS failed",
+      "The server is down"
+     ],
+     "answer": 0,
+     "explanation": "A denial for a destructive command is the expected result for an application account."
+    },
+    {
+     "question": "What is privilege drift?",
+     "options": [
+      "Slow network speed",
+      "Accumulation of unneeded rights over time",
+      "A TLS version mismatch",
+      "Table bloat"
+     ],
+     "answer": 1,
+     "explanation": "Temporary grants are rarely removed, so scheduled audits are needed."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Least privilege limits the cost of every other failure, including SQL injection and stolen credentials.\n- Design roles around jobs: application, migrator, reporting, backup, monitoring and named human admins.\n- In PostgreSQL, use group roles, revoke the `PUBLIC` defaults and set default privileges. In MySQL, use roles and restrict the host part of each account.\n- Avoid `SUPER`, `FILE`, `GRANT OPTION` and superuser logins for applications.\n- Audit the catalog regularly, test that forbidden actions fail, and keep one guarded break-glass account.\n\nNext, learn how to keep the credentials for these accounts safe in [Database Secrets and Credential Management](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+  }
+ ],
+ "ar": {
+  "title": "الوصول بأقل الامتيازات إلى قواعد البيانات",
+  "summary": "صمّم أدوارًا قائمة على الوظائف، وامنح الحد الأدنى من الحقوق في PostgreSQL وMySQL، وأزل الإعدادات الافتراضية الخطرة، ودقّق الامتيازات الفعلية.",
+  "objectives": [
+   "تصميم الأدوار حول الوظائف وفصل حساب التطبيق عن الترحيل",
+   "كتابة منح بأقل الامتيازات في PostgreSQL وMySQL",
+   "إزالة الافتراضيات والامتيازات عالية الخطورة",
+   "تدقيق الامتيازات الفعلية واختبارها دوريًّا"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يتصل تطبيق ويب بقاعدة بياناته بالحساب `postgres`، أي المستخدم المتفوق، لأن هذا أسهل طريق لإنجاح أول نشر. وبعد أشهر تتيح ثغرة في صفحة بحث للمهاجم حقن SQL. مع حساب عادي يقتصر الضرر على بضعة جداول. أما مع المستخدم المتفوق فتستطيع الثغرة نفسها قراءة كل قواعد البيانات وإنشاء أدوار جديدة، وعبر ميزات مثل `COPY ... PROGRAM` تنفيذ أوامر على الخادم.\n\nينص مبدأ أقل الامتيازات (Least privilege) على أن يأخذ كل حساب الحد الأدنى من الحقوق اللازمة لعمله ولا شيء غيره. وهو لا يمنع الخطأ الأول، لكنه يحدّ كلفته. في هذا الدرس ستصمم أدوارًا حول الوظائف لا الأشخاص، وتكتب منحًا في PostgreSQL وMySQL، وتزيل الإعدادات الافتراضية الخطرة، وتدقّق ما يستطيع كل حساب فعله فعلًا."
+   },
+   {
+    "id": "model",
+    "type": "text",
+    "markdown": "## صمّم الأدوار حول الوظائف\n\nابدأ على الورق. اسرد **الفاعلين** الذين يلمسون قاعدة البيانات ثم **الوظائف** التي يحتاجها كل منهم. الفاعلون المعتادون: التطبيق، وأداة الترحيل، وخدمة التقارير، ووكيل النسخ الاحتياطي، ووكيل المراقبة، والمديرون البشر.\n\n| الفاعل | يحتاج | يجب ألا يملك |\n|:--|:--|:--|\n| التطبيق | `SELECT` و`INSERT` و`UPDATE` و`DELETE` على جداوله | `CREATE` و`DROP` وإدارة الأدوار |\n| أداة الترحيل | `CREATE` و`ALTER` على مخطط التطبيق، وتعمل أثناء النشر فقط | وصولًا خارج مخطط التطبيق |\n| التقارير | `SELECT` على عروض مختارة | أي إذن كتابة |\n| وكيل النسخ الاحتياطي | وصول قراءة للتفريغ أو حقوق النسخ المتماثل | الدخول من مضيفات التطبيق |\n| المراقبة | `pg_monitor` أو `PROCESS` | بيانات الصفوف |\n| المدير البشري | حساب شخصي مسمّى يُرفع عند الحاجة | كلمات مرور مشتركة |\n\nالفصل بين التطبيق وأداة الترحيل هو التغيير الأعلى قيمة. فالتطبيق العامل نادرًا ما يحتاج إلى إنشاء الجداول أو حذفها. ومنح هذا الحق لحساب منفصل يُستخدم أثناء النشر فقط يعني أن حقن SQL في التطبيق لا يستطيع تغيير المخطط. وتفاصيل الأدوار والمنح في [الأدوار والمنح والامتيازات في PostgreSQL](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+   },
+   {
+    "id": "pg",
+    "type": "text",
+    "markdown": "## الخطوة 1: ابنِ الأدوار في PostgreSQL\n\nيعامل PostgreSQL المستخدمين والمجموعات على أنهم **أدوار**. والنمط الجيد إنشاء **أدوار مجموعات** تحمل الامتيازات ولا تسجّل الدخول، ثم **أدوار دخول** أعضاء فيها. تُمنح الصلاحيات للمجموعة، فيعني إضافة شخص أو إزالته تغيير العضوية لا إعادة منح عشرات الكائنات.\n\nإعدادان افتراضيان يستحقان الانتباه. الأول أن كل دور يستطيع افتراضيًّا الاتصال بكل قاعدة بيانات، وقبل PostgreSQL 15 كان يستطيع إنشاء كائنات في المخطط `public`؛ فاسحب ذلك صراحةً. والثاني أن `ALTER DEFAULT PRIVILEGES` يتحكم بشكل الجداول المستقبلية. فبدونه يبقى الجدول الجديد الذي ينشئه حساب الترحيل غير مرئي للتطبيق حتى يتذكر أحدهم منح الوصول، والحل السريع المعتاد منح واسع يتجاوز المطلوب."
+   },
+   {
+    "id": "pgroles",
+    "type": "code",
+    "language": "sql",
+    "filename": "least-privilege.sql",
+    "caption": "أدوار PostgreSQL لتطبيق وأداة ترحيل ومستخدم تقارير. كلمات المرور عناصر نائبة.",
+    "code": "-- 1. Close the broad defaults\nREVOKE ALL ON DATABASE appdb FROM PUBLIC;\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\n-- 2. Group roles hold privileges and cannot log in\nCREATE ROLE app_rw NOLOGIN;\nCREATE ROLE app_ro NOLOGIN;\n\n-- 3. A dedicated schema, owned by the migration role\nCREATE ROLE app_migrator LOGIN PASSWORD '<placeholder-from-secrets-manager>';\nCREATE SCHEMA app AUTHORIZATION app_migrator;\n\nGRANT CONNECT ON DATABASE appdb TO app_rw, app_ro;\nGRANT USAGE ON SCHEMA app TO app_rw, app_ro;\n\n-- 4. Future tables created by the migrator get the right grants automatically\nALTER DEFAULT PRIVILEGES FOR ROLE app_migrator IN SCHEMA app\n  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;\nALTER DEFAULT PRIVILEGES FOR ROLE app_migrator IN SCHEMA app\n  GRANT SELECT ON TABLES TO app_ro;\nALTER DEFAULT PRIVILEGES FOR ROLE app_migrator IN SCHEMA app\n  GRANT USAGE, SELECT ON SEQUENCES TO app_rw;\n\n-- 5. Login roles are members of the groups\nCREATE ROLE web_app LOGIN PASSWORD '<placeholder>' CONNECTION LIMIT 50 IN ROLE app_rw;\nCREATE ROLE report_svc LOGIN PASSWORD '<placeholder>' CONNECTION LIMIT 5 IN ROLE app_ro;",
+    "highlight": [
+     2,
+     3,
+     5,
+     6,
+     11,
+     12,
+     15,
+     16,
+     22,
+     23
+    ]
+   },
+   {
+    "id": "mysql",
+    "type": "text",
+    "markdown": "## الخطوة 2: التصميم نفسه في MySQL\n\nيدعم MySQL 8 الأدوار أيضًا. وتنتقل الأفكار نفسها: امنح للأدوار لا للمستخدمين، وحدّد النطاق بمخطط واحد، ولا تستخدم `*.*` لتطبيق أبدًا. وثمة نقطتان خاصتان بـ MySQL.\n\nالحسابات في MySQL زوج **مستخدم ومضيف**: فـ `'app'@'10.20.1.%'` حساب مختلف عن `'app'@'%'`. قيّد جزء المضيف دائمًا بالشبكة الفرعية للتطبيق. وتستحق الامتيازات `GRANT OPTION` و`FILE` و`SUPER` و`PROCESS` عناية خاصة. يتيح `FILE` للحساب قراءة ملفات الخادم وكتابتها، ويتيح `SUPER` والامتيازات الديناميكية الأحدث إعادة الضبط، ويتيح `GRANT OPTION` للحساب تسليم حقوقه لغيره، مما يُبطل التحكم المركزي.\n\n| الامتياز الخطر | السبب | من ينبغي أن يملكه |\n|:--|:--|:--|\n| `SUPER` / `SYSTEM_VARIABLES_ADMIN` | تغيير إعدادات الخادم أثناء التشغيل | مدير الطوارئ فقط |\n| `FILE` | قراءة ملفات الخادم وكتابتها | لا أحد في الغالب |\n| `GRANT OPTION` | تفويض الحقوق | مديرو الأمن |\n| `ALL PRIVILEGES ON *.*` | كل شيء | مدير الطوارئ فقط |"
+   },
+   {
+    "id": "myroles",
+    "type": "code",
+    "language": "sql",
+    "filename": "mysql-roles.sql",
+    "caption": "أدوار MySQL 8 محصورة بمخطط واحد وشبكة فرعية واحدة. كلمات المرور عناصر نائبة.",
+    "code": "CREATE ROLE 'app_rw', 'app_ro';\nGRANT SELECT, INSERT, UPDATE, DELETE ON appdb.* TO 'app_rw';\nGRANT SELECT ON appdb.* TO 'app_ro';\n\nCREATE USER 'web_app'@'10.20.1.%' IDENTIFIED BY '<placeholder>'\n  REQUIRE SSL WITH MAX_USER_CONNECTIONS 50;\nGRANT 'app_rw' TO 'web_app'@'10.20.1.%';\nSET DEFAULT ROLE 'app_rw' TO 'web_app'@'10.20.1.%';\n\n-- Remove anonymous and remote-root exposure\nDROP USER IF EXISTS ''@'localhost';\nSELECT user, host FROM mysql.user WHERE user = 'root';",
+    "highlight": [
+     5,
+     6,
+     7,
+     8
+    ]
+   },
+   {
+    "id": "priv-flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "فحص أقل الامتيازات على استعلام محقون",
+    "caption": "الهجوم نفسه يصل إلى مكان مختلف جدًّا بحسب الحساب.",
+    "data": {
+     "token": "استعلام",
+     "nodes": [
+      {
+       "id": "atk",
+       "label": "مدخل محقون",
+       "sub": "198.51.100.20",
+       "icon": "attacker"
+      },
+      {
+       "id": "app",
+       "label": "تطبيق الويب",
+       "sub": "web_app",
+       "icon": "server"
+      },
+      {
+       "id": "db",
+       "label": "قاعدة البيانات",
+       "sub": "appdb",
+       "icon": "database"
+      },
+      {
+       "id": "sys",
+       "label": "نظام الخادم",
+       "sub": "postgres user",
+       "icon": "cpu"
+      }
+     ],
+     "steps": [
+      {
+       "at": "atk",
+       "caption": "تصل سلسلة بحث مصنوعة إلى التطبيق.",
+       "tone": "attack"
+      },
+      {
+       "at": "app",
+       "caption": "يُنفَّذ الاستعلام المعيب بالحساب web_app العضو في app_rw.",
+       "tone": "warning"
+      },
+      {
+       "at": "db",
+       "caption": "ينجح SELECT على جداول التطبيق: تنكشف البيانات الداخلة في نطاقه.",
+       "tone": "danger"
+      },
+      {
+       "at": "db",
+       "caption": "يفشل DROP TABLE وCREATE ROLE بخطأ رفض الإذن.",
+       "tone": "blocked"
+      },
+      {
+       "at": "sys",
+       "caption": "يحتاج COPY ... PROGRAM إلى مستخدم متفوق أو pg_execute_server_program: مرفوض.",
+       "tone": "blocked"
+      },
+      {
+       "at": "db",
+       "caption": "يسجّل سجل التدقيق المحاولات المرفوضة ويُنبّه الفريق.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "id": "audit",
+    "type": "text",
+    "markdown": "## الخطوة 3: دقّق ما تستطيع الحسابات فعله حقًّا\n\nالتصميم وعد فقط. استعلم عن الفهرس (catalog) لتعرف ما تملكه الحسابات اليوم. ابحث عن أربعة أنماط: مستخدمين متفوقين ليسوا مديرين بشريين، وأدوار تملك `CREATEROLE` أو `CREATEDB`، وجداول يملكها حساب دخول يستخدمه التطبيق، وأعضاء في أدوار مدمجة قوية مثل `pg_execute_server_program` أو `pg_write_server_files`.\n\nتنجرف الامتيازات مع الزمن. يُضاف متعاقد لأسبوع ويبقى سنة، وينفَّذ `GRANT ALL` سريع أثناء حادثة فلا يزيله أحد. شغّل استعلامات التدقيق وفق جدول واحفظ المخرجات وراجع الفروق. واقرن ذلك بتحصين المصادقة من [المصادقة والتفويض في PostgreSQL](/learn/systems-infrastructure-security/postgresql-authentication-and-authorization)، وبالتسجيل الموصوف في [تدقيق قواعد البيانات وتسجيل النشاط](/learn/systems-infrastructure-security/database-auditing-and-activity-logging) لتعرف متى يقع فعل متميز فعلًا."
+   },
+   {
+    "id": "audit-term",
+    "type": "terminal",
+    "title": "تدقيق الامتيازات (قاعدة مخبرية)",
+    "lines": [
+     {
+      "cmd": "psql -d appdb -c \"SELECT rolname, rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolsuper OR rolcreaterole OR rolcreatedb;\"",
+      "output": "  rolname   | rolsuper | rolcreaterole | rolcreatedb\n------------+----------+---------------+-------------\n postgres   | t        | t             | t\n legacy_dev | t        | f             | f\n(2 rows)",
+      "comment": "legacy_dev مستخدم متفوق ليس حساب المدير: حقّق وخفّض صلاحيته."
+     },
+     {
+      "cmd": "psql -d appdb -c \"SELECT grantee, table_schema, table_name, privilege_type FROM information_schema.role_table_grants WHERE grantee='web_app' AND privilege_type IN ('TRUNCATE','REFERENCES','TRIGGER');\"",
+      "output": " grantee | table_schema | table_name | privilege_type\n---------+--------------+------------+----------------\n(0 rows)",
+      "comment": "لا امتيازات تدميرية إضافية لدخول التطبيق."
+     },
+     {
+      "cmd": "psql -d appdb -U web_app -c \"DROP TABLE app.orders;\"",
+      "output": "ERROR:  must be owner of table orders",
+      "comment": "نتيجة رفض الإذن هي الدليل على نجاح التصميم."
+     },
+     {
+      "cmd": "psql -d appdb -c \"SELECT r.rolname AS member, g.rolname AS granted_role FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member JOIN pg_roles g ON g.oid=m.roleid WHERE g.rolname LIKE 'pg\\_%';\"",
+      "output": " member | granted_role\n--------+--------------\n(0 rows)",
+      "comment": "لا حساب يملك دورًا مدمجًا قويًّا. أعد التشغيل بعد كل تغيير."
+     }
+    ],
+    "caption": "مخرجات مثال من قاعدة مخبرية."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "اختبر الحالة السلبية",
+    "markdown": "ينبغي أن تتضمن كل مراجعة منح اختبارًا يثبت أن الحساب يفشل فيما لا يحق له. شغّل `DROP` و`CREATE ROLE` وقراءة جدول خارج النطاق بحساب التطبيق في قاعدة تجريبية، واحتفظ بالنتائج مع سجل التغيير."
+   },
+   {
+    "id": "humans",
+    "type": "text",
+    "markdown": "## الخطوة 4: عالج وصول البشر والطوارئ\n\nالبشر أصعب حالة. امنح كل مدير **حسابًا مسمّى** بحقوق عادية، ودعه يرتقي عبر مسار موثق مثل `SET ROLE` إلى دور إداري أو منح مؤقت ينتهي. تجعل الحسابات المشتركة سجلات التدقيق عديمة النفع، إذ يقول السجل إن `dbadmin` فعلها ولا يعرف أحد من هو.\n\nأبقِ حساب مستخدم متفوق واحدًا للطوارئ (break-glass) بسر عشوائي طويل محفوظ في خزنة، مع تنبيه عند كل استخدام. وقيّد قاعدته في `pg_hba.conf` بشبكة الإدارة. وللحسابات التطبيقية اضبط `CONNECTION LIMIT` أو `MAX_USER_CONNECTIONS` حتى لا يستنزف حساب مخترق الخادم، واضبط مهلات العبارات بـ `ALTER ROLE web_app SET statement_timeout = '30s'`.\n\nوالنتيجة قاعدة بيانات لا تصل فيها بيانات اعتماد تطبيق مسروقة إلا إلى ما يحتاجه التطبيق، ويكون ضرر حقن SQL محدودًا، وتُنسب كل عملية مرتفعة الامتياز إلى شخص."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. في نسخة PostgreSQL مخبرية **تملكها**، شغّل السكربت النموذجي لإنشاء `app_migrator` و`app_rw` و`app_ro` و`web_app`. استبدل كلمات المرور النائبة بقيم عشوائية مخبرية.\n2. بصفة `app_migrator` أنشئ جدولًا في المخطط `app`. وبصفة `web_app` تأكد أن `SELECT` و`INSERT` يعملان وأن `DROP TABLE` يفشل.\n3. شغّل استعلامات التدقيق واسرد كل دور يملك `rolsuper` أو `rolcreaterole` أو `rolcreatedb`.\n4. اضبط `ALTER ROLE web_app SET statement_timeout = '5s'` وشغّل `SELECT pg_sleep(10)` بذلك الدور ولاحظ الإلغاء."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "أقل الامتيازات",
+      "definition": "منح الحقوق اللازمة للمهمة فقط دون زيادة."
+     },
+     {
+      "term": "الدور",
+      "definition": "مجموعة امتيازات مسمّاة تُمنح لمستخدمين أو أدوار أخرى."
+     },
+     {
+      "term": "دور مجموعة",
+      "definition": "دور يحمل الامتيازات ولا يسجّل الدخول."
+     },
+     {
+      "term": "حساب الترحيل",
+      "definition": "حساب منفصل يغيّر المخططات أثناء النشر فقط."
+     },
+     {
+      "term": "الامتيازات الافتراضية",
+      "definition": "قواعد تمنح حقوقًا على كائنات تُنشأ لاحقًا."
+     },
+     {
+      "term": "GRANT OPTION",
+      "definition": "حق يتيح للحامل تمرير الامتيازات لغيره."
+     },
+     {
+      "term": "انجراف الامتيازات",
+      "definition": "تراكم تدريجي لحقوق لم تعد لازمة."
+     },
+     {
+      "term": "حساب الطوارئ",
+      "definition": "حساب إداري طارئ شديد الحراسة لا يُستخدم إلا عند فشل الوصول المعتاد."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا نفصل حساب التطبيق عن حساب الترحيل؟",
+      "options": [
+       "لتسريع الاستعلامات",
+       "حتى لا يغيّر حقن SQL في التطبيق المخطط",
+       "لتفادي النسخ الاحتياطي",
+       "لتعطيل TLS"
+      ],
+      "answer": 1,
+      "explanation": "نادرًا ما يحتاج التطبيق العامل إلى صلاحيات DDL، وحجبها يحدّ ضرر ثغرة الحقن."
+     },
+     {
+      "question": "في MySQL، لماذا 'app'@'%' أخطر من 'app'@'10.20.1.%'؟",
+      "options": [
+       "يسمح بالاتصال من أي مضيف",
+       "يعطّل كلمات المرور",
+       "لديه جداول أكثر",
+       "للقراءة فقط"
+      ],
+      "answer": 0,
+      "explanation": "جزء المضيف من هوية الحساب وينبغي أن يحدد مصدر الدخول."
+     },
+     {
+      "question": "أي مما يلي ممارسات جيدة لأقل الامتيازات؟ اختر كل ما ينطبق.",
+      "options": [
+       "منح الامتيازات لأدوار مجموعات وإضافة المستخدمين أعضاء",
+       "استخدام ALTER DEFAULT PRIVILEGES للجداول المستقبلية",
+       "مشاركة دخول إداري واحد بين كل المديرين",
+       "سحب CREATE على المخطط public من PUBLIC"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تهدم الحسابات المشتركة المساءلة؛ والثلاثة الأخرى تقلل المخاطر وجهد الإدارة."
+     },
+     {
+      "question": "ماذا يُظهر الخطأ 'must be owner of table orders' عند DROP TABLE؟",
+      "options": [
+       "أن التصميم يعمل كما قُصد",
+       "أن الجدول تالف",
+       "أن TLS فشل",
+       "أن الخادم متوقف"
+      ],
+      "answer": 0,
+      "explanation": "الرفض لأمر تدميري هو النتيجة المتوقعة لحساب تطبيق."
+     },
+     {
+      "question": "ما انجراف الامتيازات؟",
+      "options": [
+       "بطء الشبكة",
+       "تراكم حقوق غير لازمة بمرور الوقت",
+       "عدم تطابق إصدار TLS",
+       "تضخم الجداول"
+      ],
+      "answer": 1,
+      "explanation": "نادرًا ما تُزال المنح المؤقتة، فتلزم تدقيقات دورية."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يحدّ أقل الامتيازات كلفة كل إخفاق آخر، بما فيه حقن SQL وسرقة بيانات الاعتماد.\n- صمّم الأدوار حول الوظائف: التطبيق، والترحيل، والتقارير، والنسخ الاحتياطي، والمراقبة، والمديرون البشر المسمّون.\n- في PostgreSQL استخدم أدوار المجموعات واسحب افتراضيات `PUBLIC` واضبط الامتيازات الافتراضية. وفي MySQL استخدم الأدوار وقيّد جزء المضيف في كل حساب.\n- تجنب `SUPER` و`FILE` و`GRANT OPTION` وحسابات المستخدم المتفوق للتطبيقات.\n- دقّق الفهرس دوريًّا، واختبر فشل الأفعال المحظورة، وأبقِ حساب طوارئ واحدًا محروسًا.\n\nوالآن تعلّم كيف تحمي بيانات اعتماد هذه الحسابات في [إدارة أسرار قواعد البيانات وبيانات الاعتماد](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+   }
+  ]
+ }
+}

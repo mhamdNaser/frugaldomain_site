@@ -1,0 +1,562 @@
+{
+  "slug": "proxmox-role-based-access-control-rbac",
+  "title": "Proxmox Role-Based Access Control (RBAC)",
+  "summary": "Build a least-privilege Proxmox permission model with groups, roles, pools and paths, then test and review it.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Describe subjects, roles, privileges and paths in Proxmox",
+    "Choose suitable built-in roles and create custom roles",
+    "Scope access with pools and groups",
+    "Create and verify ACLs with pveum",
+    "Audit permissions and detect risky changes"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Two teams share one Proxmox cluster. The web team needs to start, stop and open the console of their own servers. The finance team needs the same for theirs and must never see the web team's machines. An auditor needs to read everything and change nothing. The simplest way to give everyone access is to make them all Administrators. It is also the way that turns one mistake or one stolen password into a cluster-wide outage.\n\nRole-based access control (RBAC) is how Proxmox VE lets you grant exactly the access each person needs, on exactly the objects they work with. In this lesson you will learn the building blocks and design a small, maintainable permission model."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## The permission model\n\nAn access rule in Proxmox has four parts, and it helps to read them as a sentence: **this subject has this role on this path.**\n\n| Part | What it is | Example |\n|:--|:--|:--|\n| Subject | A user, a group or an API token | `alice@pve`, `web-ops`, `ci@pve!deploy` |\n| Role | A named set of privileges | `PVEVMUser`, `PVEAuditor` |\n| Path | The object in the resource tree | `/vms/101`, `/pool/web`, `/storage/backup` |\n| Propagate | Whether the rule applies to children | Enabled by default |\n\nThe resource tree is hierarchical. A rule on `/` applies to everything. A rule on `/pool/web` applies to every VM and storage in that pool. A rule on `/vms/101` applies to one machine. Permissions flow down, and the most specific path wins when rules overlap.\n\nA **privilege** is a single permission such as `VM.PowerMgmt` or `Datastore.Allocate`. You never grant privileges directly. You collect them into roles and grant the role. This indirection is what keeps the model understandable."
+    },
+    {
+      "id": "roles",
+      "type": "text",
+      "markdown": "## Built-in roles worth knowing\n\nProxmox ships with ready-made roles. Learn these before you create your own.\n\n| Role | Allows | Use for |\n|:--|:--|:--|\n| `Administrator` | Everything, including changing permissions | One or two trusted people |\n| `PVEAdmin` | Almost everything except system and permission changes | Senior operators |\n| `PVEVMAdmin` | Full VM management | Team leads on their pool |\n| `PVEVMUser` | View, power, console and backup of VMs | Day-to-day operators |\n| `PVEAuditor` | Read-only view | Auditors and monitoring |\n| `PVEDatastoreUser` | Use a storage, allocate space | Backup operators |\n| `NoAccess` | Nothing, and it overrides inherited access | Explicit denial |\n\nTwo privileges deserve special care. `Permissions.Modify` lets a holder grant themselves more access, so it is effectively administrator. `Sys.Modify` and `Sys.Console` reach the node itself. Do not include them in a role unless the task truly requires it.\n\nIf a built-in role is close but too broad, create a custom role with exactly the privileges the job needs, rather than granting the broader one."
+    },
+    {
+      "id": "tree-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "A permission check walking the resource tree",
+      "caption": "The most specific matching rule decides the outcome.",
+      "data": {
+        "token": "alice stops VM 101",
+        "nodes": [
+          {
+            "id": "root",
+            "label": "/",
+            "sub": "no rule for alice",
+            "icon": "cloud"
+          },
+          {
+            "id": "pool",
+            "label": "/pool/web",
+            "sub": "PVEVMUser",
+            "icon": "database"
+          },
+          {
+            "id": "vm",
+            "label": "/vms/101",
+            "sub": "no override",
+            "icon": "server"
+          },
+          {
+            "id": "chk",
+            "label": "Privilege check",
+            "sub": "VM.PowerMgmt",
+            "icon": "shield"
+          },
+          {
+            "id": "vm2",
+            "label": "/vms/201",
+            "sub": "finance pool",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "root",
+            "caption": "The request starts at the root of the tree. Alice has no rule here."
+          },
+          {
+            "at": "pool",
+            "caption": "VM 101 is a member of the web pool. Alice's group holds PVEVMUser on this pool, and it propagates.",
+            "tone": "success"
+          },
+          {
+            "at": "vm",
+            "caption": "No more specific rule exists on the VM, so the inherited role applies."
+          },
+          {
+            "at": "chk",
+            "caption": "PVEVMUser includes VM.PowerMgmt. The stop request is allowed and logged under alice.",
+            "tone": "success"
+          },
+          {
+            "at": "vm2",
+            "token": "alice stops VM 201",
+            "caption": "Now Alice tries a finance VM in another pool. No rule covers that path.",
+            "tone": "warning"
+          },
+          {
+            "at": "chk",
+            "token": "alice stops VM 201",
+            "caption": "Permission check failed. Denied by default and recorded.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## Designing a model that stays clean\n\nThe goal is a model that a new colleague can understand in ten minutes. A few rules produce it.\n\n1. **Grant to groups, not individuals.** Add the person to `web-ops` and the group holds the rules. Onboarding and offboarding become one change.\n2. **Scope with pools.** A pool is a named collection of VMs and storage. Put each team's machines in a pool and grant roles on the pool path. New VMs added to the pool inherit access automatically.\n3. **Give the lowest role that works.** Most staff need `PVEVMUser`. Reserve `PVEVMAdmin` for leads, and `Administrator` for two named people plus the break-glass account.\n4. **Use `NoAccess` sparingly** to carve out an exception, such as a sensitive VM inside an otherwise open pool.\n5. **Separate duties.** The person who administers permissions should not be the only person who operates VMs, and automation gets [its own scoped tokens](/learn/systems-infrastructure-security/proxmox-api-token-security) rather than a human account.\n\nDocument the model in one table: group, role, path, owner. Review it with the same cadence as [authentication](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa)."
+    },
+    {
+      "id": "rbac",
+      "type": "terminal",
+      "title": "Building the model with pveum",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "pvesh create /pools --poolid web && pvesh set /pools/web --vms 101,102",
+          "output": "",
+          "comment": "A pool for the web team's VMs."
+        },
+        {
+          "cmd": "pveum group add web-ops --comment 'Web team operators'",
+          "output": "",
+          "comment": "Grant to a group, not to people."
+        },
+        {
+          "cmd": "pveum user modify alice@pve --groups web-ops",
+          "output": "",
+          "comment": "Membership is the only per-person change."
+        },
+        {
+          "cmd": "pveum acl modify /pool/web --groups web-ops --roles PVEVMUser",
+          "output": "",
+          "comment": "Role on the pool path; propagate defaults to on."
+        },
+        {
+          "cmd": "pveum acl list --output-format text",
+          "output": "path        type   ugid       roleid       propagate\n/           user   root@pam   Administrator 1\n/pool/web   group  web-ops    PVEVMUser    1\n/pool/fin   group  fin-ops    PVEVMUser    1\n/           group  auditors   PVEAuditor   1",
+          "comment": "The whole model fits on one screen. Auditors read everything, teams see only their pool."
+        },
+        {
+          "cmd": "pveum user permissions alice@pve --path /vms/201",
+          "output": "(no permissions)",
+          "comment": "Verify the negative case: Alice cannot touch a finance VM."
+        }
+      ],
+      "caption": "Run on a lab cluster you own. Adjust IDs to your environment."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Administrator is not a shortcut",
+      "markdown": "Granting `Administrator` at `/` to \"fix a permission error\" is the habit that quietly erases your model. Each time a task fails, find the missing privilege with `pveum user permissions`, then add it to a role at the narrowest path. If you must grant a broad role temporarily, put an expiry date in the comment and remove it."
+    },
+    {
+      "id": "scenarios",
+      "type": "text",
+      "markdown": "## Worked scenarios\n\nThe table maps common jobs to a role and a path. Use it as a starting point and adjust to your environment.\n\n| Person | Needs | Role | Path |\n|:--|:--|:--|:--|\n| Web operator | Start, stop, console | `PVEVMUser` | `/pool/web` |\n| Team lead | Create, edit, delete VMs in the pool | `PVEVMAdmin` | `/pool/web` |\n| Backup operator | Run and restore backups | `PVEDatastoreUser` plus VM backup privileges | `/storage/backup` |\n| Auditor | Read-only view of everything | `PVEAuditor` | `/` |\n| Monitoring tool | Read metrics only | `PVEAuditor` on a token | `/` |\n\nNotice that only the auditor and the monitoring tool hold a rule at the root, and both are read-only. Everyone who can change something is limited to a pool or a storage. When a new request arrives, ask three questions: which object, which actions, and for how long. The answers produce the path, the role and an expiry date."
+    },
+    {
+      "id": "audit",
+      "type": "text",
+      "markdown": "## Reviewing and testing permissions\n\nA permission model drifts. People change teams, VMs move between pools, and someone adds a temporary rule that nobody removes. Plan three checks.\n\n- **List all rules** with `pveum acl list` and look for rules at `/` for anything except auditors and administrators.\n- **Test as the user.** For each group, log in as a representative account, or use `pveum user permissions`, and confirm both what works and what is refused. Testing only the positive case misses over-granting.\n- **Review membership.** Compare group members with your HR or directory list. If you use a directory realm, groups can be synced so that a leaver loses access automatically.\n\nPermission changes are logged as tasks. Alert on changes to `/access/acl` and to the `Administrator` group, because that is how an attacker with a stolen session would try to make their access permanent."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a lab cluster you own, with two small test VMs:\n\n1. Create two pools, `web` and `fin`, and put one VM in each.\n2. Create groups `web-ops` and `fin-ops` and two test users, one in each.\n3. Grant `PVEVMUser` to each group on its own pool path only.\n4. Run `pveum user permissions` for each user on both VMs. You should see access to one and none to the other.\n5. Create a custom role `VMRestarter` with `pveum role add VMRestarter --privs \"VM.Audit VM.PowerMgmt\"` and assign it instead. Confirm the console is no longer available.\n6. Finish by running `pveum acl list` and checking that nothing is granted at `/` except what you expect."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "RBAC",
+          "definition": "Granting access through roles assigned to subjects on objects."
+        },
+        {
+          "term": "Role",
+          "definition": "A named set of privileges."
+        },
+        {
+          "term": "Privilege",
+          "definition": "A single permission such as VM.PowerMgmt."
+        },
+        {
+          "term": "Path",
+          "definition": "A location in the resource tree where a rule applies."
+        },
+        {
+          "term": "Propagate",
+          "definition": "A flag that makes a rule apply to child objects."
+        },
+        {
+          "term": "Pool",
+          "definition": "A named collection of VMs and storage used to scope permissions."
+        },
+        {
+          "term": "PVEAuditor",
+          "definition": "A built-in read-only role."
+        },
+        {
+          "term": "NoAccess",
+          "definition": "A role that denies access and overrides inherited rules."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which phrase best describes a Proxmox access rule?",
+          "options": [
+            "User, password and port",
+            "Subject has role on path",
+            "Node, cluster and quorum",
+            "Realm, factor and token"
+          ],
+          "answer": 1,
+          "explanation": "A rule combines a subject, a role and a path, with an optional propagate flag."
+        },
+        {
+          "question": "Which practices keep a permission model maintainable? Choose all that apply.",
+          "options": [
+            "Grant roles to groups",
+            "Scope access with pools",
+            "Give everyone Administrator at /",
+            "Review rules regularly"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Broad grants at the root defeat the purpose of the model."
+        },
+        {
+          "question": "Why is Permissions.Modify considered dangerous?",
+          "options": [
+            "It deletes VMs",
+            "A holder can grant themselves more access",
+            "It disables MFA",
+            "It formats storage"
+          ],
+          "answer": 1,
+          "explanation": "Whoever can edit permissions can give themselves anything, so it is equivalent to administrator."
+        },
+        {
+          "question": "A rule on /pool/web with propagate enabled covers which objects?",
+          "options": [
+            "Only the pool object",
+            "All VMs and storage in that pool",
+            "Every VM in the cluster",
+            "Only the nodes"
+          ],
+          "answer": 1,
+          "explanation": "Propagation applies the rule to children of the path."
+        },
+        {
+          "question": "When a task fails with a permission error, the best response is to...",
+          "options": [
+            "Grant Administrator at / temporarily",
+            "Find the missing privilege and add it to a role at the narrowest path",
+            "Share the root password",
+            "Disable the permission system"
+          ],
+          "answer": 1,
+          "explanation": "Fixing the exact gap preserves least privilege."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nProxmox RBAC combines a subject, a role and a path in the resource tree, with permissions flowing downward. Build it from groups, scope it with pools, give the lowest role that works, treat `Permissions.Modify` and `Administrator` as rare, and test both allowed and denied cases. Review rules and membership on a schedule and alert on permission changes. Automation needs the same discipline, which is the subject of [Proxmox API token security](/learn/systems-infrastructure-security/proxmox-api-token-security)."
+    }
+  ],
+  "ar": {
+    "title": "التحكم في الوصول القائم على الأدوار (RBAC) في Proxmox",
+    "summary": "ابنِ نموذج صلاحيات في Proxmox بأقل قدر من الامتيازات باستخدام المجموعات والأدوار والـ Pools والمسارات، ثم اختبره وراجعه.",
+    "objectives": [
+      "صِف الأطراف والأدوار والامتيازات والمسارات في Proxmox",
+      "اختر الأدوار المدمجة المناسبة وأنشئ أدوارًا مخصصة",
+      "حدّد نطاق الوصول بالـ Pools والمجموعات",
+      "أنشئ قوائم ACL وتحقق منها باستخدام pveum",
+      "دقّق الصلاحيات واكشف التغييرات الخطرة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يتشارك فريقان عنقود Proxmox واحدًا. يحتاج فريق الويب إلى تشغيل خوادمه وإيقافها وفتح وحدتها، ويحتاج فريق المالية إلى الأمر نفسه لخوادمه ويجب ألا يرى أجهزة فريق الويب أبدًا. ويحتاج المدقّق إلى قراءة كل شيء دون تغيير شيء. أبسط طريقة لمنح الجميع الوصول هي جعلهم كلهم مدراء (Administrators)، وهي أيضًا الطريقة التي تحوّل خطأ واحدًا أو كلمة مرور مسروقة إلى انقطاع يشمل العنقود.\n\nالتحكم في الوصول القائم على الأدوار (RBAC) هو ما يتيح لـ Proxmox VE منح كل شخص الوصول الذي يحتاجه بالضبط، على الكائنات التي يعمل عليها بالضبط. ستتعلم في هذا الدرس اللبنات الأساسية وتصمّم نموذج صلاحيات صغيرًا يسهل صيانته."
+      },
+      {
+        "id": "model",
+        "type": "text",
+        "markdown": "## نموذج الصلاحيات\n\nلقاعدة الوصول في Proxmox أربعة أجزاء، ويفيد قراءتها كجملة: **هذا الطرف له هذا الدور على هذا المسار.**\n\n| الجزء | ما هو | مثال |\n|:--|:--|:--|\n| الطرف (Subject) | مستخدم أو مجموعة أو رمز API | `alice@pve` و`web-ops` و`ci@pve!deploy` |\n| الدور (Role) | مجموعة مسمّاة من الامتيازات | `PVEVMUser` و`PVEAuditor` |\n| المسار (Path) | الكائن في شجرة الموارد | `/vms/101` و`/pool/web` و`/storage/backup` |\n| الانتشار (Propagate) | هل تنطبق القاعدة على الأبناء | مفعّل افتراضيًا |\n\nشجرة الموارد هرمية. قاعدة على `/` تنطبق على كل شيء، وقاعدة على `/pool/web` تنطبق على كل جهاز وتخزين في تلك المجموعة، وقاعدة على `/vms/101` تنطبق على جهاز واحد. تنساب الصلاحيات نزولًا، ويفوز المسار الأكثر تحديدًا عند التداخل.\n\n**الامتياز (Privilege)** إذن مفرد مثل `VM.PowerMgmt` أو `Datastore.Allocate`. لا تمنح الامتيازات مباشرة، بل تجمعها في أدوار وتمنح الدور. وهذه الطبقة الوسيطة هي ما يبقي النموذج مفهومًا."
+      },
+      {
+        "id": "roles",
+        "type": "text",
+        "markdown": "## الأدوار المدمجة التي تستحق المعرفة\n\nيأتي Proxmox بأدوار جاهزة. تعرّف عليها قبل إنشاء أدوارك.\n\n| الدور | يسمح بـ | الاستخدام |\n|:--|:--|:--|\n| `Administrator` | كل شيء بما فيه تغيير الصلاحيات | شخص أو اثنان موثوقان |\n| `PVEAdmin` | تقريبًا كل شيء عدا تغييرات النظام والصلاحيات | المشغّلون الكبار |\n| `PVEVMAdmin` | الإدارة الكاملة للأجهزة الافتراضية | قادة الفرق على مجموعتهم |\n| `PVEVMUser` | العرض والتشغيل والوحدة والنسخ الاحتياطي للأجهزة | المشغّلون اليوميون |\n| `PVEAuditor` | عرض للقراءة فقط | المدقّقون والمراقبة |\n| `PVEDatastoreUser` | استخدام تخزين وحجز مساحة | مشغّلو النسخ الاحتياطي |\n| `NoAccess` | لا شيء، ويتجاوز الوصول الموروث | منع صريح |\n\nيستحق امتيازان عناية خاصة. فالامتياز `Permissions.Modify` يتيح لحامله منح نفسه وصولًا أكبر، فهو فعليًا مدير. والامتيازان `Sys.Modify` و`Sys.Console` يبلغان العقدة نفسها. لا تضمّنهما في دور إلا إذا تطلبت المهمة ذلك فعلًا.\n\nوإذا كان الدور المدمج قريبًا لكنه أوسع من اللازم فأنشئ دورًا مخصصًا بالامتيازات التي تحتاجها المهمة بالضبط بدل منح الأوسع."
+      },
+      {
+        "id": "tree-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "فحص الصلاحية أثناء المرور على شجرة الموارد",
+        "caption": "القاعدة المطابقة الأكثر تحديدًا هي التي تحسم النتيجة.",
+        "data": {
+          "token": "أليس توقف الجهاز 101",
+          "nodes": [
+            {
+              "id": "root",
+              "label": "/",
+              "sub": "لا قاعدة لأليس",
+              "icon": "cloud"
+            },
+            {
+              "id": "pool",
+              "label": "/pool/web",
+              "sub": "PVEVMUser",
+              "icon": "database"
+            },
+            {
+              "id": "vm",
+              "label": "/vms/101",
+              "sub": "بلا تجاوز",
+              "icon": "server"
+            },
+            {
+              "id": "chk",
+              "label": "فحص الامتياز",
+              "sub": "VM.PowerMgmt",
+              "icon": "shield"
+            },
+            {
+              "id": "vm2",
+              "label": "/vms/201",
+              "sub": "مجموعة المالية",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "at": "root",
+              "caption": "يبدأ الطلب من جذر الشجرة ولا قاعدة لأليس هنا."
+            },
+            {
+              "at": "pool",
+              "caption": "الجهاز 101 عضو في مجموعة الويب. تملك مجموعة أليس الدور PVEVMUser عليها وهو ينتشر.",
+              "tone": "success"
+            },
+            {
+              "at": "vm",
+              "caption": "لا توجد قاعدة أكثر تحديدًا على الجهاز فيسري الدور الموروث."
+            },
+            {
+              "at": "chk",
+              "caption": "يتضمن PVEVMUser الامتياز VM.PowerMgmt. يُسمح بطلب الإيقاف ويُسجَّل باسم أليس.",
+              "tone": "success"
+            },
+            {
+              "at": "vm2",
+              "token": "أليس توقف الجهاز 201",
+              "caption": "تجرّب أليس الآن جهازًا للمالية في مجموعة أخرى ولا قاعدة تغطي ذلك المسار.",
+              "tone": "warning"
+            },
+            {
+              "at": "chk",
+              "token": "أليس توقف الجهاز 201",
+              "caption": "فشل فحص الصلاحية. مرفوض افتراضيًا ومسجّل.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "design",
+        "type": "text",
+        "markdown": "## تصميم نموذج يبقى نظيفًا\n\nالهدف نموذج يفهمه زميل جديد خلال عشر دقائق. وتنتجه بضع قواعد.\n\n1. **امنح للمجموعات لا للأفراد.** أضف الشخص إلى `web-ops` فتحمل المجموعة القواعد، ويصبح الانضمام والمغادرة تغييرًا واحدًا.\n2. **حدّد النطاق بالمجموعات (Pools).** المجموعة تجمّع مسمّى من الأجهزة والتخزين. ضع أجهزة كل فريق في مجموعة وامنح الأدوار على مسارها. وترث الأجهزة الجديدة المضافة إليها الوصول تلقائيًا.\n3. **أعطِ أدنى دور يكفي.** يحتاج معظم الموظفين `PVEVMUser`. احجز `PVEVMAdmin` للقادة، و`Administrator` لشخصين مسمّيين مع حساب الطوارئ.\n4. **استخدم `NoAccess` بحذر** لاستثناء حالة معينة مثل جهاز حساس داخل مجموعة مفتوحة.\n5. **افصل المهام.** يجب ألا يكون من يدير الصلاحيات الوحيد الذي يشغّل الأجهزة، وتحصل الأتمتة على [رموزها المحددة النطاق](/learn/systems-infrastructure-security/proxmox-api-token-security) بدل حساب بشري.\n\nوثّق النموذج في جدول واحد: المجموعة والدور والمسار والمالك. وراجعه بالإيقاع نفسه الذي تراجع به [المصادقة](/learn/systems-infrastructure-security/proxmox-authentication-and-mfa)."
+      },
+      {
+        "id": "rbac",
+        "type": "terminal",
+        "title": "بناء النموذج باستخدام pveum",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "pvesh create /pools --poolid web && pvesh set /pools/web --vms 101,102",
+            "output": "",
+            "comment": "مجموعة لأجهزة فريق الويب."
+          },
+          {
+            "cmd": "pveum group add web-ops --comment 'Web team operators'",
+            "output": "",
+            "comment": "امنح لمجموعة لا لأفراد."
+          },
+          {
+            "cmd": "pveum user modify alice@pve --groups web-ops",
+            "output": "",
+            "comment": "العضوية هي التغيير الوحيد لكل شخص."
+          },
+          {
+            "cmd": "pveum acl modify /pool/web --groups web-ops --roles PVEVMUser",
+            "output": "",
+            "comment": "دور على مسار المجموعة والانتشار مفعّل افتراضيًا."
+          },
+          {
+            "cmd": "pveum acl list --output-format text",
+            "output": "path        type   ugid       roleid       propagate\n/           user   root@pam   Administrator 1\n/pool/web   group  web-ops    PVEVMUser    1\n/pool/fin   group  fin-ops    PVEVMUser    1\n/           group  auditors   PVEAuditor   1",
+            "comment": "النموذج كله يتسع شاشة واحدة. يقرأ المدقّقون كل شيء ولا يرى كل فريق إلا مجموعته."
+          },
+          {
+            "cmd": "pveum user permissions alice@pve --path /vms/201",
+            "output": "(no permissions)",
+            "comment": "تحقق من الحالة السالبة: لا تستطيع أليس لمس جهاز تابع للمالية."
+          }
+        ],
+        "caption": "شغّل على عنقود مختبر تملكه، وعدّل المعرّفات لبيئتك."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "Administrator ليس اختصارًا",
+        "markdown": "منح `Administrator` على `/` لـ«إصلاح خطأ صلاحية» عادة تمحو نموذجك بهدوء. كلما فشلت مهمة فاعثر على الامتياز الناقص بـ `pveum user permissions` ثم أضفه إلى دور على أضيق مسار. وإذا اضطررت إلى منح دور واسع مؤقتًا فضع تاريخ انتهاء في التعليق وأزله."
+      },
+      {
+        "id": "scenarios",
+        "type": "text",
+        "markdown": "## سيناريوهات تطبيقية\n\nيربط الجدول المهام الشائعة بدور ومسار. استخدمه نقطة بداية وعدّله لبيئتك.\n\n| الشخص | يحتاج | الدور | المسار |\n|:--|:--|:--|:--|\n| مشغّل ويب | تشغيل وإيقاف ووحدة | `PVEVMUser` | `/pool/web` |\n| قائد الفريق | إنشاء الأجهزة وتعديلها وحذفها في المجموعة | `PVEVMAdmin` | `/pool/web` |\n| مشغّل النسخ الاحتياطي | تشغيل النسخ واستعادتها | `PVEDatastoreUser` مع امتيازات نسخ الأجهزة | `/storage/backup` |\n| المدقّق | عرض كل شيء للقراءة فقط | `PVEAuditor` | `/` |\n| أداة المراقبة | قراءة المقاييس فقط | `PVEAuditor` على رمز | `/` |\n\nلاحظ أن المدقّق وأداة المراقبة وحدهما يملكان قاعدة عند الجذر، وكلاهما للقراءة فقط. أما كل من يستطيع تغيير شيء فمقيّد بمجموعة أو تخزين. وعند وصول طلب جديد اسأل ثلاثة أسئلة: أي كائن، وأي إجراءات، ولكم من الوقت. تنتج الإجابات المسار والدور وتاريخ الانتهاء."
+      },
+      {
+        "id": "audit",
+        "type": "text",
+        "markdown": "## مراجعة الصلاحيات واختبارها\n\nيتغيّر نموذج الصلاحيات مع الوقت. ينتقل الناس بين الفرق، وتنتقل الأجهزة بين المجموعات، ويضيف أحدهم قاعدة مؤقتة لا يزيلها أحد. خطّط لثلاثة فحوص.\n\n- **اسرد كل القواعد** بـ `pveum acl list` وابحث عن قواعد عند `/` لأي جهة غير المدقّقين والمدراء.\n- **اختبر بصفة المستخدم.** لكل مجموعة سجّل الدخول بحساب ممثّل أو استخدم `pveum user permissions` وتأكد مما يعمل وما يُرفض. اختبار الحالة الإيجابية وحدها يفوّت الصلاحيات الزائدة.\n- **راجع العضوية.** قارن أعضاء المجموعات بقائمة الموارد البشرية أو الدليل. وفي نطاق الدليل يمكن مزامنة المجموعات ليفقد المغادر وصوله تلقائيًا.\n\nتُسجَّل تغييرات الصلاحيات كمهام. نبّه عند التغييرات على `/access/acl` وعلى مجموعة `Administrator` لأن هذه هي الطريقة التي يحاول بها مهاجم بجلسة مسروقة تثبيت وصوله."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على عنقود مختبر تملكه ومعه جهازان تجريبيان صغيران:\n\n1. أنشئ مجموعتين `web` و`fin` وضع جهازًا في كل منهما.\n2. أنشئ مجموعتي المستخدمين `web-ops` و`fin-ops` ومستخدمين تجريبيين، واحدًا في كل مجموعة.\n3. امنح `PVEVMUser` لكل مجموعة على مسار مجموعتها فقط.\n4. شغّل `pveum user permissions` لكل مستخدم على الجهازين. يجب أن ترى وصولًا إلى أحدهما وعدمه إلى الآخر.\n5. أنشئ دورًا مخصصًا `VMRestarter` بالأمر `pveum role add VMRestarter --privs \"VM.Audit VM.PowerMgmt\"` وعيّنه بدلًا من السابق. تأكد أن الوحدة لم تعد متاحة.\n6. اختم بتشغيل `pveum acl list` وتأكد ألا يُمنح شيء عند `/` سوى ما تتوقعه."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "التحكم القائم على الأدوار (RBAC)",
+            "definition": "منح الوصول عبر أدوار تُسند إلى أطراف على كائنات."
+          },
+          {
+            "term": "الدور",
+            "definition": "مجموعة مسمّاة من الامتيازات."
+          },
+          {
+            "term": "الامتياز",
+            "definition": "إذن مفرد مثل VM.PowerMgmt."
+          },
+          {
+            "term": "المسار",
+            "definition": "موضع في شجرة الموارد تنطبق عنده القاعدة."
+          },
+          {
+            "term": "الانتشار",
+            "definition": "علَم يجعل القاعدة تنطبق على الكائنات الأبناء."
+          },
+          {
+            "term": "المجموعة (Pool)",
+            "definition": "تجمّع مسمّى من الأجهزة والتخزين يُستخدم لتحديد نطاق الصلاحيات."
+          },
+          {
+            "term": "PVEAuditor",
+            "definition": "دور مدمج للقراءة فقط."
+          },
+          {
+            "term": "NoAccess",
+            "definition": "دور يمنع الوصول ويتجاوز القواعد الموروثة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي عبارة تصف قاعدة وصول Proxmox على أفضل وجه؟",
+            "options": [
+              "مستخدم وكلمة مرور ومنفذ",
+              "الطرف له دور على مسار",
+              "عقدة وعنقود ونصاب",
+              "نطاق وعامل ورمز"
+            ],
+            "answer": 1,
+            "explanation": "تجمع القاعدة طرفًا ودورًا ومسارًا مع علم انتشار اختياري."
+          },
+          {
+            "question": "أي الممارسات تُبقي نموذج الصلاحيات قابلًا للصيانة؟ اختر كل ما ينطبق.",
+            "options": [
+              "منح الأدوار للمجموعات",
+              "تحديد النطاق بالمجموعات",
+              "إعطاء الجميع Administrator عند /",
+              "مراجعة القواعد بانتظام"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "المنح الواسعة عند الجذر تُبطل غاية النموذج."
+          },
+          {
+            "question": "لماذا يُعد Permissions.Modify خطيرًا؟",
+            "options": [
+              "يحذف الأجهزة",
+              "يستطيع حامله منح نفسه وصولًا أكبر",
+              "يعطّل MFA",
+              "يهيّئ التخزين"
+            ],
+            "answer": 1,
+            "explanation": "من يستطيع تعديل الصلاحيات يستطيع منح نفسه أي شيء، فهو يعادل مديرًا."
+          },
+          {
+            "question": "على أي كائنات تنطبق قاعدة عند /pool/web مع تفعيل الانتشار؟",
+            "options": [
+              "كائن المجموعة فقط",
+              "كل الأجهزة والتخزين في تلك المجموعة",
+              "كل جهاز في العنقود",
+              "العقد فقط"
+            ],
+            "answer": 1,
+            "explanation": "يطبّق الانتشار القاعدة على أبناء المسار."
+          },
+          {
+            "question": "عند فشل مهمة بخطأ صلاحية فإن أفضل استجابة هي...",
+            "options": [
+              "منح Administrator عند / مؤقتًا",
+              "إيجاد الامتياز الناقص وإضافته إلى دور على أضيق مسار",
+              "مشاركة كلمة مرور root",
+              "تعطيل نظام الصلاحيات"
+            ],
+            "answer": 1,
+            "explanation": "إصلاح الثغرة المحددة يحافظ على أقل قدر من الصلاحيات."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nيجمع RBAC في Proxmox طرفًا ودورًا ومسارًا في شجرة الموارد، وتنساب الصلاحيات نزولًا. ابنِه من المجموعات، وحدّد نطاقه بالـ Pools، وأعطِ أدنى دور يكفي، واعتبر `Permissions.Modify` و`Administrator` استثنائيين، واختبر الحالتين المسموحة والمرفوضة. راجع القواعد والعضوية وفق جدول ونبّه عند تغييرات الصلاحيات. وتحتاج الأتمتة إلى الانضباط نفسه، وهو موضوع [أمن رموز API في Proxmox](/learn/systems-infrastructure-security/proxmox-api-token-security)."
+      }
+    ]
+  }
+}

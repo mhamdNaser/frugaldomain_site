@@ -1,0 +1,542 @@
+{
+ "slug": "container-escape-risks",
+ "title": "Container Escape Risks",
+ "summary": "The configurations and flaws that let code in a container reach the host, and how to find and remove them.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Describe the kernel features that form a container boundary",
+  "Recognize risky settings such as privileged mode and socket mounts",
+  "Audit running containers with docker inspect",
+  "Apply a hardened baseline and detect abnormal behavior"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A company runs a customer-facing web application in a container. The container was started with `--privileged` because a developer needed to debug a network issue and never switched it back. One day a vulnerability in the application lets a stranger run commands inside that container. In a normal container this would be a contained incident. In a privileged one, the stranger sits one step away from the host itself, and from every other container on it.\n\nA **container escape** is any way for code inside a container to reach the host or other containers. Containers are processes that share the host kernel, so the boundary is only as strong as the configuration around it. This lesson stays on the defender's side. You will learn the conditions that make an escape possible, how to find them on hosts you own, and how to remove them."
+  },
+  {
+   "id": "boundary",
+   "type": "text",
+   "markdown": "## What the boundary is made of\n\nA container is an ordinary Linux process wrapped in several kernel features. Each one closes a different door:\n\n| Layer | What it limits | Weakened by |\n|:--|:--|:--|\n| Namespaces | What the process can see: processes, network, mounts, users | `--pid=host`, `--net=host`, host path mounts |\n| Capabilities | Which root powers the process holds | `--cap-add=SYS_ADMIN`, `--privileged` |\n| Seccomp | Which system calls are allowed | `seccomp=unconfined` |\n| AppArmor or SELinux | Which files and actions are allowed | `apparmor=unconfined`, `label=disable` |\n| cgroups | How much CPU, memory and I/O is used | Missing limits |\n| User namespace | Whether container root is host root | Not enabled |\n\nNo single layer is perfect, which is why they are stacked. The defender's job is to keep every layer switched on, and to know quickly when a workload turns one off.\n\nThe kernel itself is the common component. A flaw in a system call, in a filesystem driver or in the container runtime (`runc`, `containerd`) can break the boundary even when the configuration is sound. These flaws are real and have been patched several times, for example in `runc` in 2019 and again in early 2024. You cannot configure your way out of an unpatched runtime."
+  },
+  {
+   "id": "path-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Where a risky setting leads, and where defenses stop it",
+   "caption": "The same foothold ends very differently depending on the layers that are on.",
+   "data": {
+    "token": "Intruder",
+    "nodes": [
+     {
+      "id": "app",
+      "label": "Vulnerable app",
+      "sub": "web-01",
+      "icon": "bug"
+     },
+     {
+      "id": "ctr",
+      "label": "Container",
+      "sub": "shell access",
+      "icon": "cpu"
+     },
+     {
+      "id": "def",
+      "label": "Hardened layers",
+      "sub": "seccomp, caps, userns",
+      "icon": "shield"
+     },
+     {
+      "id": "host",
+      "label": "Docker host",
+      "sub": "192.0.2.10",
+      "icon": "server"
+     },
+     {
+      "id": "log",
+      "label": "Audit log",
+      "sub": "SIEM alert",
+      "icon": "log"
+     }
+    ],
+    "steps": [
+     {
+      "at": "app",
+      "caption": "A flaw in the application gives a stranger a shell.",
+      "tone": "attack"
+     },
+     {
+      "at": "ctr",
+      "caption": "The shell runs inside the container as the app user.",
+      "tone": "warning"
+     },
+     {
+      "at": "def",
+      "caption": "Hardened case: dropped capabilities, the default seccomp profile and a user namespace deny the privileged calls.",
+      "tone": "blocked"
+     },
+     {
+      "at": "log",
+      "caption": "Denied calls are logged, and the alert reaches the team while the damage is still small.",
+      "tone": "success"
+     },
+     {
+      "at": "ctr",
+      "caption": "Risky case: the container is privileged or mounts the Docker socket.",
+      "tone": "danger"
+     },
+     {
+      "at": "host",
+      "caption": "Nothing separates the shell from the host. The incident is now a host compromise.",
+      "tone": "danger"
+     }
+    ]
+   }
+  },
+  {
+   "id": "risks",
+   "type": "text",
+   "markdown": "## The configurations that open the door\n\nMost real-world escapes start from a setting an administrator chose, not from a clever trick. These are the ones to look for.\n\n- **Privileged mode.** `--privileged` gives the container nearly all capabilities, access to host devices and relaxed seccomp and AppArmor rules. It removes most of the boundary.\n- **The Docker socket.** A container that mounts `/var/run/docker.sock` can ask the daemon to start a new container with any settings. That is root on the host.\n- **Sensitive host mounts.** Mounting `/`, `/etc`, `/proc`, `/sys` or `/var/lib/docker` read-write lets a container change the host or read its secrets.\n- **Dangerous capabilities.** `CAP_SYS_ADMIN` is nearly as strong as root. `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH` and `CAP_NET_ADMIN` also widen the reach.\n- **Shared namespaces.** `--pid=host` lets the container see and signal host processes. `--net=host` removes network isolation. `--ipc=host` shares memory.\n- **Running as root with no user namespace.** If container root is host root, any breakout lands with full rights.\n- **Outdated runtime or kernel.** Known runtime and kernel flaws turn a tidy configuration into a weak one.\n\nNote that the exploit techniques behind these conditions are public and well documented. Defenders do not need to reproduce them. It is enough to remove the conditions and to patch."
+  },
+  {
+   "id": "audit",
+   "type": "text",
+   "markdown": "## Finding risky containers on your host\n\nDocker can describe every running container in a machine-readable way. A short loop over `docker inspect` lists the properties that matter: privileged mode, added capabilities, host namespaces and bind mounts. Run it on hosts you own, on a schedule, and send the results to your inventory or SIEM.\n\nThe goal is not zero findings on day one. It is a short list of known, justified exceptions, each with an owner, and an alert when a new one appears."
+  },
+  {
+   "id": "audit-code",
+   "type": "code",
+   "language": "bash",
+   "filename": "audit-containers.sh",
+   "code": "#!/usr/bin/env bash\n# Read-only report of risky container settings on this host.\nfor id in $(docker ps -q); do\n  docker inspect \"$id\" --format '{{.Name}} priv={{.HostConfig.Privileged}} pid={{.HostConfig.PidMode}} net={{.HostConfig.NetworkMode}} caps={{.HostConfig.CapAdd}} sec={{.HostConfig.SecurityOpt}} user={{.Config.User}}'\n  docker inspect \"$id\" --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} ({{.Mode}}){{\"\\n\"}}{{end}}' | grep -E '^(/|/etc|/proc|/sys|/var/run/docker.sock|/var/lib/docker) ' \ndone",
+   "caption": "Lists privileged mode, shared namespaces, extra capabilities and sensitive mounts for each running container."
+  },
+  {
+   "id": "audit-term",
+   "type": "terminal",
+   "title": "docker01 - run the audit",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "bash audit-containers.sh",
+     "output": "/web-01 priv=false pid= net=bridge caps=[] sec=[no-new-privileges] user=10001\n/monitor priv=false pid= net=bridge caps=[] sec=[] user=\n/var/run/docker.sock -> /var/run/docker.sock (rw)\n/debug-tools priv=true pid=host net=host caps=[SYS_ADMIN] sec=[] user=",
+     "comment": "web-01 is well configured. monitor mounts the Docker socket. debug-tools is privileged, shares the host PID and network namespaces, and adds SYS_ADMIN. The last two need an owner and a reason, or removal."
+    },
+    {
+     "cmd": "docker rm -f debug-tools",
+     "output": "debug-tools",
+     "comment": "Remove the temporary debugging container once its purpose is over."
+    }
+   ],
+   "caption": "Sample output from a host you own. Names and layout vary with your setup."
+  },
+  {
+   "id": "harden",
+   "type": "text",
+   "markdown": "## Closing the doors\n\nHardening a container is mostly about starting from a narrow baseline and adding only what the workload proves it needs.\n\n1. **Drop all capabilities, then add back.** Use `--cap-drop=ALL` and add a single capability such as `NET_BIND_SERVICE` if required.\n2. **Never use `--privileged`.** If a device is needed, pass that one device with `--device`.\n3. **Keep the default seccomp and AppArmor profiles.** They are on by default. Do not set `unconfined`.\n4. **Run as a non-root user** and add `--security-opt=no-new-privileges`.\n5. **Use a read-only root filesystem** with `--read-only` and a small `--tmpfs /tmp`.\n6. **Mount only what you need,** read-only wherever possible, and never the socket.\n7. **Enable user namespaces** through `userns-remap` or use rootless mode.\n8. **Patch the kernel, `containerd` and `runc`,** and subscribe to their security announcements.\n9. **Add a stronger boundary for untrusted code.** Sandboxed runtimes such as gVisor, or lightweight VMs such as Kata Containers, put another layer between the workload and the host kernel. Dedicated VMs for sensitive tenants remain the strongest option.\n\nOn Kubernetes the same ideas appear as the pod `securityContext` and the Pod Security Standards, which you will meet in [Kubernetes Security Fundamentals](/learn/systems-infrastructure-security/kubernetes-security-fundamentals)."
+  },
+  {
+   "id": "run-code",
+   "type": "code",
+   "language": "bash",
+   "filename": "run-hardened.sh",
+   "code": "docker run -d --name web-01 \\\n  --user 10001:10001 \\\n  --cap-drop=ALL --cap-add=NET_BIND_SERVICE \\\n  --security-opt=no-new-privileges \\\n  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \\\n  --pids-limit 200 --memory 512m \\\n  -p 192.0.2.10:8080:8080 \\\n  registry.example.com/shop/web:1.4.2",
+   "caption": "A hardened start command. The image name is an example."
+  },
+  {
+   "id": "detect-tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Detect, do not only prevent",
+   "markdown": "Prevention fails sometimes, so add detection. Use the audit rules from the previous lesson on daemon files, alert when a container starts with `--privileged` or a socket mount, and watch for unexpected processes on the host that descend from a container runtime. Runtime tools such as Falco can match these patterns and raise alerts. You will meet them in [Runtime Threat Detection](/learn/systems-infrastructure-security/runtime-threat-detection). Review these alerts in the same queue as your other security events so they are not ignored."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab VM you own with Docker installed:\n\n1. Start two throwaway containers: `docker run -d --name risky --privileged alpine sleep 3600` and `docker run -d --name safe --cap-drop=ALL --read-only alpine sleep 3600`.\n2. Run `audit-containers.sh` and confirm it flags `risky` but not `safe`.\n3. Run `docker exec risky cat /proc/self/status | grep CapEff` and the same for `safe`, and compare the two capability masks.\n4. Remove both containers with `docker rm -f risky safe`, then write the `docker run` command you would use for a real web service."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Container escape",
+     "definition": "Code in a container reaching the host or other containers."
+    },
+    {
+     "term": "Privileged container",
+     "definition": "A container started with `--privileged`, with most isolation removed."
+    },
+    {
+     "term": "Capability",
+     "definition": "A fine-grained piece of root power, such as `CAP_NET_ADMIN`."
+    },
+    {
+     "term": "Seccomp",
+     "definition": "A kernel filter that limits the system calls a process may make."
+    },
+    {
+     "term": "Namespace",
+     "definition": "A kernel feature that gives a process its own view of processes, network or mounts."
+    },
+    {
+     "term": "User namespace",
+     "definition": "Maps container root to an unprivileged user on the host."
+    },
+    {
+     "term": "runc",
+     "definition": "The low-level runtime that creates containers for Docker and containerd."
+    },
+    {
+     "term": "gVisor / Kata",
+     "definition": "Sandboxed runtimes that add a stronger boundary than a plain container."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why can a container boundary be weaker than a virtual machine boundary?",
+     "options": [
+      "Containers cannot be monitored",
+      "Containers share the host kernel",
+      "Containers always run as root",
+      "Containers have no network"
+     ],
+     "answer": 1,
+     "explanation": "A kernel or runtime flaw reachable from one container can affect the host, which a VM's separate kernel mostly prevents."
+    },
+    {
+     "question": "Which settings greatly increase escape risk? (choose all that apply)",
+     "options": [
+      "`--privileged`",
+      "Mounting `/var/run/docker.sock`",
+      "`--cap-drop=ALL`",
+      "`--pid=host` with `CAP_SYS_PTRACE`"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Privileged mode, the Docker socket and shared host PIDs with ptrace all remove isolation. Dropping capabilities adds protection."
+    },
+    {
+     "question": "A monitoring container mounts the Docker socket. How should you treat it?",
+     "options": [
+      "As low risk because it only reads",
+      "As root on the host",
+      "As identical to any other container",
+      "As safe if it runs in the bridge network"
+     ],
+     "answer": 1,
+     "explanation": "The socket accepts any command, not just reads, so the container can start new containers with any settings."
+    },
+    {
+     "question": "Which command-line combination gives the narrowest starting point for a web service?",
+     "options": [
+      "`--privileged --user 0`",
+      "`--cap-drop=ALL --cap-add=NET_BIND_SERVICE --read-only --user 10001`",
+      "`--net=host --pid=host`",
+      "`--security-opt seccomp=unconfined`"
+     ],
+     "answer": 1,
+     "explanation": "It drops everything, adds back one capability, uses a read-only filesystem and a non-root user."
+    },
+    {
+     "question": "What does patching `runc` and the kernel address that configuration alone cannot?",
+     "options": [
+      "Slow image pulls",
+      "Known flaws in the shared components that break isolation",
+      "Missing log rotation",
+      "DNS failures"
+     ],
+     "answer": 1,
+     "explanation": "A correct configuration cannot protect against a bug in the code that enforces the configuration."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- A container is a process on the host kernel. Its boundary is built from namespaces, capabilities, seccomp, AppArmor or SELinux, cgroups and user namespaces.\n- Most escapes start from risky settings: privileged mode, the Docker socket, sensitive mounts, dangerous capabilities and shared host namespaces.\n- Audit running containers with `docker inspect`, keep a short list of justified exceptions, and alert on new ones.\n- Harden with dropped capabilities, non-root users, read-only filesystems, user namespaces and prompt patching. Use sandboxed runtimes or VMs for untrusted workloads.\n- Continue with [Docker Daemon Security](/learn/systems-infrastructure-security/docker-daemon-security) if you skipped it, and [Container Isolation and Namespaces](/learn/systems-infrastructure-security/container-isolation-and-namespaces) for the kernel details."
+  }
+ ],
+ "ar": {
+  "title": "مخاطر الهروب من الحاويات",
+  "summary": "الإعدادات والثغرات التي تتيح لشيفرة داخل حاوية الوصول إلى المضيف، وكيف تكتشفها وتزيلها.",
+  "objectives": [
+   "وصف ميزات النواة التي تشكّل حدود الحاوية",
+   "تمييز الإعدادات الخطرة مثل الوضع الممتاز وربط المقبس",
+   "تدقيق الحاويات العاملة بـdocker inspect",
+   "تطبيق أساس مقوّى واكتشاف السلوك الشاذ"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "تشغّل شركة تطبيق ويب موجّهاً للعملاء داخل حاوية. بدأت الحاوية بالخيار `--privileged` لأن مطوّراً احتاج إلى تتبّع مشكلة في الشبكة ولم يُعده إلى وضعه السابق. وفي أحد الأيام تتيح ثغرة في التطبيق لشخص غريب تنفيذ أوامر داخل تلك الحاوية. في حاوية عادية يبقى الحادث محصوراً، أما في حاوية ممتازة فيصبح الغريب على بُعد خطوة من المضيف نفسه ومن كل حاوية عليه.\n\n**الهروب من الحاوية (Container escape)** هو أي طريقة تصل بها شيفرة داخل الحاوية إلى المضيف أو إلى حاويات أخرى. الحاويات عمليات تتشارك نواة المضيف، فلا تكون الحدود أقوى من الإعدادات المحيطة بها. يبقى هذا الدرس في جانب المدافع: ستتعلم الظروف التي تجعل الهروب ممكناً، وكيف تكتشفها على مضيفات تملكها، وكيف تزيلها."
+   },
+   {
+    "id": "boundary",
+    "type": "text",
+    "markdown": "## مم تتكوّن الحدود\n\nالحاوية عملية لينكس عادية محاطة بعدة ميزات في النواة، وكل ميزة تغلق باباً مختلفاً:\n\n| الطبقة | ما الذي تقيّده | ما الذي يُضعفها |\n|:--|:--|:--|\n| مساحات الأسماء (Namespaces) | ما تراه العملية: العمليات والشبكة والتحميلات والمستخدمون | `--pid=host` و`--net=host` وربط مسارات المضيف |\n| القدرات (Capabilities) | أي صلاحيات جذر تملكها العملية | `--cap-add=SYS_ADMIN` و`--privileged` |\n| Seccomp | استدعاءات النظام المسموحة | `seccomp=unconfined` |\n| AppArmor أو SELinux | الملفات والإجراءات المسموحة | `apparmor=unconfined` و`label=disable` |\n| مجموعات التحكم (cgroups) | مقدار المعالج والذاكرة والإدخال والإخراج | غياب الحدود |\n| مساحة أسماء المستخدمين | هل جذر الحاوية هو جذر المضيف | عدم تفعيلها |\n\nلا توجد طبقة كاملة بذاتها، ولذلك تُكدَّس الطبقات. وعمل المدافع إبقاء كل طبقة مفعّلة، ومعرفة اللحظة التي يعطّل فيها حِمل عمل إحداها.\n\nوالنواة هي المكوّن المشترك. فثغرة في استدعاء نظام أو في مشغّل نظام ملفات أو في بيئة تشغيل الحاويات (`runc` و`containerd`) قد تكسر الحدود حتى لو كانت الإعدادات سليمة. وهذه الثغرات حقيقية وسُدّت مرات عدة، منها في `runc` عام 2019 ومرة أخرى في مطلع 2024. فلا يمكنك الاستعاضة بالإعدادات عن تحديث بيئة تشغيل قديمة."
+   },
+   {
+    "id": "path-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "إلى أين يقود إعداد خطر وأين توقفه الدفاعات",
+    "caption": "نفس موطئ القدم ينتهي بصورة مختلفة تماماً بحسب الطبقات المفعّلة.",
+    "data": {
+     "token": "المتسلل",
+     "nodes": [
+      {
+       "id": "app",
+       "label": "تطبيق مصاب بثغرة",
+       "sub": "web-01",
+       "icon": "bug"
+      },
+      {
+       "id": "ctr",
+       "label": "الحاوية",
+       "sub": "shell access",
+       "icon": "cpu"
+      },
+      {
+       "id": "def",
+       "label": "طبقات التقوية",
+       "sub": "seccomp, caps, userns",
+       "icon": "shield"
+      },
+      {
+       "id": "host",
+       "label": "مضيف Docker",
+       "sub": "192.0.2.10",
+       "icon": "server"
+      },
+      {
+       "id": "log",
+       "label": "سجل التدقيق",
+       "sub": "SIEM alert",
+       "icon": "log"
+      }
+     ],
+     "steps": [
+      {
+       "at": "app",
+       "caption": "ثغرة في التطبيق تمنح غريباً صدفة أوامر.",
+       "tone": "attack"
+      },
+      {
+       "at": "ctr",
+       "caption": "تعمل الصدفة داخل الحاوية بمستخدم التطبيق.",
+       "tone": "warning"
+      },
+      {
+       "at": "def",
+       "caption": "حالة التقوية: القدرات المحذوفة وملف seccomp الافتراضي ومساحة أسماء المستخدمين ترفض الاستدعاءات المميزة.",
+       "tone": "blocked"
+      },
+      {
+       "at": "log",
+       "caption": "تُسجَّل الاستدعاءات المرفوضة ويصل التنبيه إلى الفريق والضرر ما زال صغيراً.",
+       "tone": "success"
+      },
+      {
+       "at": "ctr",
+       "caption": "حالة الخطر: الحاوية ممتازة أو تربط مقبس Docker.",
+       "tone": "danger"
+      },
+      {
+       "at": "host",
+       "caption": "لا شيء يفصل الصدفة عن المضيف. صار الحادث اختراقاً للمضيف.",
+       "tone": "danger"
+      }
+     ]
+    }
+   },
+   {
+    "id": "risks",
+    "type": "text",
+    "markdown": "## الإعدادات التي تفتح الباب\n\nمعظم حالات الهروب الواقعية تبدأ من إعداد اختاره مسؤول، لا من حيلة ذكية. هذه هي الإعدادات التي ينبغي البحث عنها.\n\n- **الوضع الممتاز (Privileged).** يمنح `--privileged` الحاوية تقريباً كل القدرات والوصول إلى أجهزة المضيف ويخفف قواعد seccomp وAppArmor، فيزيل معظم الحدود.\n- **مقبس Docker.** الحاوية التي تربط `/var/run/docker.sock` تستطيع أن تطلب من الخدمة تشغيل حاوية جديدة بأي إعدادات، وهذا جذر على المضيف.\n- **ربط مسارات حساسة من المضيف.** ربط `/` أو `/etc` أو `/proc` أو `/sys` أو `/var/lib/docker` بصلاحية الكتابة يتيح للحاوية تعديل المضيف أو قراءة أسراره.\n- **قدرات خطرة.** القدرة `CAP_SYS_ADMIN` تكاد تعادل الجذر، وتوسّع القدرات `CAP_SYS_PTRACE` و`CAP_DAC_READ_SEARCH` و`CAP_NET_ADMIN` مدى الوصول أيضاً.\n- **مساحات أسماء مشتركة.** يتيح `--pid=host` للحاوية رؤية عمليات المضيف وإرسال إشارات إليها، ويزيل `--net=host` عزل الشبكة، ويشارك `--ipc=host` الذاكرة.\n- **العمل بالجذر دون مساحة أسماء للمستخدمين.** إذا كان جذر الحاوية هو جذر المضيف فأي اختراق للحدود يصل بصلاحيات كاملة.\n- **بيئة تشغيل أو نواة قديمة.** الثغرات المعروفة في بيئة التشغيل والنواة تحوّل إعداداً مرتباً إلى إعداد ضعيف.\n\nلاحظ أن تقنيات الاستغلال وراء هذه الظروف منشورة وموثقة جيداً، ولا يحتاج المدافعون إلى إعادة إنتاجها، فيكفي إزالة الظروف وتحديث الأنظمة."
+   },
+   {
+    "id": "audit",
+    "type": "text",
+    "markdown": "## البحث عن حاويات خطرة على مضيفك\n\nيستطيع Docker وصف كل حاوية قيد التشغيل بصيغة قابلة للقراءة الآلية. وتسرد حلقة قصيرة على `docker inspect` الخصائص المهمة: الوضع الممتاز والقدرات المضافة ومساحات أسماء المضيف والتحميلات المرتبطة. شغّلها على مضيفات تملكها وبجدول زمني، وأرسل النتائج إلى سجل الأصول أو نظام SIEM.\n\nليس الهدف صفر ملاحظات من اليوم الأول، بل قائمة قصيرة من الاستثناءات المعروفة والمبرَّرة ولكل منها مالك، وتنبيه حين يظهر استثناء جديد."
+   },
+   {
+    "id": "audit-code",
+    "type": "code",
+    "language": "bash",
+    "filename": "audit-containers.sh",
+    "code": "#!/usr/bin/env bash\n# Read-only report of risky container settings on this host.\nfor id in $(docker ps -q); do\n  docker inspect \"$id\" --format '{{.Name}} priv={{.HostConfig.Privileged}} pid={{.HostConfig.PidMode}} net={{.HostConfig.NetworkMode}} caps={{.HostConfig.CapAdd}} sec={{.HostConfig.SecurityOpt}} user={{.Config.User}}'\n  docker inspect \"$id\" --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} ({{.Mode}}){{\"\\n\"}}{{end}}' | grep -E '^(/|/etc|/proc|/sys|/var/run/docker.sock|/var/lib/docker) ' \ndone",
+    "caption": "يسرد الوضع الممتاز ومساحات الأسماء المشتركة والقدرات الإضافية والتحميلات الحساسة لكل حاوية قيد التشغيل."
+   },
+   {
+    "id": "audit-term",
+    "type": "terminal",
+    "title": "docker01 - run the audit",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "bash audit-containers.sh",
+      "output": "/web-01 priv=false pid= net=bridge caps=[] sec=[no-new-privileges] user=10001\n/monitor priv=false pid= net=bridge caps=[] sec=[] user=\n/var/run/docker.sock -> /var/run/docker.sock (rw)\n/debug-tools priv=true pid=host net=host caps=[SYS_ADMIN] sec=[] user=",
+      "comment": "الحاوية web-01 مضبوطة جيداً. الحاوية monitor تربط مقبس Docker. والحاوية debug-tools ممتازة وتشارك مساحتي العمليات والشبكة وتضيف SYS_ADMIN. الأخيرتان تحتاجان إلى مالك ومبرر أو إلى إزالة."
+     },
+     {
+      "cmd": "docker rm -f debug-tools",
+      "output": "debug-tools",
+      "comment": "أزل حاوية التتبع المؤقتة عندما ينتهي غرضها."
+     }
+    ],
+    "caption": "مخرجات نموذجية من مضيف تملكه. تختلف الأسماء والتنسيق بحسب بيئتك."
+   },
+   {
+    "id": "harden",
+    "type": "text",
+    "markdown": "## إغلاق الأبواب\n\nتقوية الحاوية تعني في معظمها البدء بأساس ضيّق وإضافة ما يثبت الحِمل حاجته إليه فقط.\n\n1. **احذف كل القدرات ثم أضف ما تحتاجه.** استخدم `--cap-drop=ALL` وأضف قدرة واحدة مثل `NET_BIND_SERVICE` عند الحاجة.\n2. **لا تستخدم `--privileged` أبداً.** وإذا لزم جهاز فمرّر ذلك الجهاز وحده بالخيار `--device`.\n3. **أبقِ ملفَّي seccomp وAppArmor الافتراضيين.** هما مفعّلان افتراضياً، فلا تضبطهما على `unconfined`.\n4. **شغّل الحاوية بمستخدم غير جذر** وأضف `--security-opt=no-new-privileges`.\n5. **استخدم نظام ملفات جذري للقراءة فقط** عبر `--read-only` مع `--tmpfs /tmp` صغير.\n6. **اربط ما تحتاجه فقط** وللقراءة فقط كلما أمكن، ولا تربط المقبس أبداً.\n7. **فعّل مساحات أسماء المستخدمين** عبر `userns-remap` أو استخدم الوضع بلا صلاحيات.\n8. **حدّث النواة و`containerd` و`runc`** وتابع إعلاناتها الأمنية.\n9. **أضف حداً أقوى للشيفرة غير الموثوقة.** تضع بيئات التشغيل المعزولة مثل gVisor، أو الأجهزة الافتراضية الخفيفة مثل Kata Containers، طبقة إضافية بين الحِمل ونواة المضيف. وتبقى الأجهزة الافتراضية المخصصة هي الخيار الأقوى للمستأجرين الحساسين.\n\nوفي Kubernetes تظهر الأفكار نفسها في `securityContext` للـPod ومعايير أمان Pod، وستتعرف عليها في [أساسيات أمن Kubernetes](/learn/systems-infrastructure-security/kubernetes-security-fundamentals)."
+   },
+   {
+    "id": "run-code",
+    "type": "code",
+    "language": "bash",
+    "filename": "run-hardened.sh",
+    "code": "docker run -d --name web-01 \\\n  --user 10001:10001 \\\n  --cap-drop=ALL --cap-add=NET_BIND_SERVICE \\\n  --security-opt=no-new-privileges \\\n  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \\\n  --pids-limit 200 --memory 512m \\\n  -p 192.0.2.10:8080:8080 \\\n  registry.example.com/shop/web:1.4.2",
+    "caption": "أمر تشغيل مقوّى. اسم الصورة مثال توضيحي."
+   },
+   {
+    "id": "detect-tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "اكتشف ولا تكتفِ بالمنع",
+    "markdown": "قد يفشل المنع أحياناً، فأضف الاكتشاف. استخدم قواعد التدقيق من الدرس السابق على ملفات الخدمة، وأطلق تنبيهاً عند بدء حاوية بالخيار `--privileged` أو بربط المقبس، وراقب العمليات غير المتوقعة على المضيف المتفرعة من بيئة تشغيل الحاويات. تستطيع أدوات وقت التشغيل مثل Falco مطابقة هذه الأنماط وإطلاق التنبيهات، وستتعرف عليها في [اكتشاف التهديدات أثناء التشغيل](/learn/systems-infrastructure-security/runtime-threat-detection). وراجع هذه التنبيهات في الطابور نفسه مع بقية الأحداث الأمنية حتى لا تُهمَل."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على جهاز افتراضي تجريبي تملكه ومثبّت عليه Docker:\n\n1. شغّل حاويتين مؤقتتين: `docker run -d --name risky --privileged alpine sleep 3600` و`docker run -d --name safe --cap-drop=ALL --read-only alpine sleep 3600`.\n2. شغّل `audit-containers.sh` وتأكد أنه يشير إلى `risky` ولا يشير إلى `safe`.\n3. نفّذ `docker exec risky cat /proc/self/status | grep CapEff` وكرره مع `safe` وقارن قناعَي القدرات.\n4. أزل الحاويتين بالأمر `docker rm -f risky safe` ثم اكتب أمر `docker run` الذي ستستخدمه لخدمة ويب حقيقية."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "الهروب من الحاوية",
+      "definition": "وصول شيفرة داخل حاوية إلى المضيف أو إلى حاويات أخرى."
+     },
+     {
+      "term": "Privileged container",
+      "definition": "حاوية بدأت بالخيار `--privileged` وأُزيل معظم عزلها."
+     },
+     {
+      "term": "Capability",
+      "definition": "جزء دقيق من صلاحيات الجذر مثل `CAP_NET_ADMIN`."
+     },
+     {
+      "term": "Seccomp",
+      "definition": "مرشّح في النواة يحدّ استدعاءات النظام المسموحة للعملية."
+     },
+     {
+      "term": "Namespace",
+      "definition": "ميزة في النواة تمنح العملية منظورها الخاص للعمليات أو الشبكة أو التحميلات."
+     },
+     {
+      "term": "User namespace",
+      "definition": "تحوّل جذر الحاوية إلى مستخدم غير مميّز على المضيف."
+     },
+     {
+      "term": "runc",
+      "definition": "بيئة التشغيل منخفضة المستوى التي تنشئ الحاويات لصالح Docker وcontainerd."
+     },
+     {
+      "term": "gVisor / Kata",
+      "definition": "بيئات تشغيل معزولة تضيف حداً أقوى من الحاوية العادية."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا قد تكون حدود الحاوية أضعف من حدود الجهاز الافتراضي؟",
+      "options": [
+       "لا يمكن مراقبة الحاويات",
+       "تتشارك الحاويات نواة المضيف",
+       "تعمل الحاويات دائماً بالجذر",
+       "لا شبكة للحاويات"
+      ],
+      "answer": 1,
+      "explanation": "ثغرة في النواة أو بيئة التشغيل يمكن بلوغها من حاوية قد تؤثر في المضيف، وهو ما يمنعه غالباً وجود نواة منفصلة في الجهاز الافتراضي."
+     },
+     {
+      "question": "أي إعدادات تزيد خطر الهروب كثيراً؟ (اختر كل ما ينطبق)",
+      "options": [
+       "`--privileged`",
+       "Mounting `/var/run/docker.sock`",
+       "`--cap-drop=ALL`",
+       "`--pid=host` with `CAP_SYS_PTRACE`"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "الوضع الممتاز ومقبس Docker ومشاركة عمليات المضيف مع ptrace كلها تزيل العزل، أما حذف القدرات فيضيف حماية."
+     },
+     {
+      "question": "حاوية مراقبة تربط مقبس Docker. كيف تتعامل معها؟",
+      "options": [
+       "كمنخفضة الخطر لأنها تقرأ فقط",
+       "كجذر على المضيف",
+       "كأي حاوية أخرى",
+       "كآمنة إن عملت في شبكة الجسر"
+      ],
+      "answer": 1,
+      "explanation": "يقبل المقبس أي أمر لا القراءة فقط، فتستطيع الحاوية تشغيل حاويات جديدة بأي إعدادات."
+     },
+     {
+      "question": "أي تركيبة أوامر تعطي أضيق نقطة بداية لخدمة ويب؟",
+      "options": [
+       "`--privileged --user 0`",
+       "`--cap-drop=ALL --cap-add=NET_BIND_SERVICE --read-only --user 10001`",
+       "`--net=host --pid=host`",
+       "`--security-opt seccomp=unconfined`"
+      ],
+      "answer": 1,
+      "explanation": "تحذف كل شيء وتعيد قدرة واحدة وتستخدم نظام ملفات للقراءة فقط ومستخدماً غير جذر."
+     },
+     {
+      "question": "ما الذي تعالجه تحديثات `runc` والنواة ولا تعالجه الإعدادات وحدها؟",
+      "options": [
+       "بطء سحب الصور",
+       "ثغرات معروفة في المكوّنات المشتركة تكسر العزل",
+       "غياب تدوير السجلات",
+       "أعطال DNS"
+      ],
+      "answer": 1,
+      "explanation": "الإعداد الصحيح لا يحمي من خطأ في الشيفرة التي تطبّق الإعداد."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- الحاوية عملية على نواة المضيف، وتتكوّن حدودها من مساحات الأسماء والقدرات وseccomp وAppArmor أو SELinux ومجموعات التحكم ومساحات أسماء المستخدمين.\n- تبدأ معظم حالات الهروب من إعدادات خطرة: الوضع الممتاز ومقبس Docker والتحميلات الحساسة والقدرات الخطرة ومساحات أسماء المضيف المشتركة.\n- دقّق الحاويات العاملة بـ`docker inspect`، وأبقِ قائمة قصيرة من الاستثناءات المبرَّرة، وأطلق تنبيهاً عند ظهور استثناء جديد.\n- قوِّ الحاويات بحذف القدرات والمستخدمين غير الجذر وأنظمة الملفات للقراءة فقط ومساحات أسماء المستخدمين والتحديث السريع، واستخدم بيئات تشغيل معزولة أو أجهزة افتراضية للأحمال غير الموثوقة.\n- تابع مع [أمن خدمة Docker الخلفية](/learn/systems-infrastructure-security/docker-daemon-security) إن فاتك، ومع [عزل الحاويات ومساحات الأسماء](/learn/systems-infrastructure-security/container-isolation-and-namespaces) لتفاصيل النواة."
+   }
+  ]
+ }
+}

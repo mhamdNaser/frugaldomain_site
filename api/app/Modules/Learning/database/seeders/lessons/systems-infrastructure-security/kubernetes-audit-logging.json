@@ -1,0 +1,562 @@
+{
+ "slug": "kubernetes-audit-logging",
+ "title": "Kubernetes Audit Logging",
+ "summary": "Write and enable a Kubernetes audit policy, read events with jq, and choose the few high-signal events worth alerting on.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain audit stages and levels",
+  "Write an audit policy that is small but useful",
+  "Enable audit logging with retention flags",
+  "Query audit events with jq",
+  "Select high-signal events for alerting"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "On Tuesday morning a monitoring alert says a production Deployment was scaled to zero overnight. The team asks the obvious questions: who did it, from which address, and with which credentials? Without audit logging the cluster cannot answer. Container logs show what applications did, but they say nothing about who changed the cluster itself.\n\nKubernetes **audit logging** records every request that reaches the API server, in order, with the identity that made it. It is the black box recorder of your cluster. In this lesson you will write an audit policy, enable it on the API server, read the events with `jq`, and decide what to alert on. All commands assume a cluster you own."
+  },
+  {
+   "id": "model",
+   "type": "text",
+   "markdown": "## How the audit system decides what to record\n\nEvery request passes through authentication, authorization and admission before it changes anything. The audit system watches the request at several **stages**:\n\n| Stage | When it fires |\n|:--|:--|\n| `RequestReceived` | As soon as the request arrives |\n| `ResponseStarted` | Headers sent, used for long-running calls such as `watch` |\n| `ResponseComplete` | The response body is finished |\n| `Panic` | The server failed while handling the request |\n\nA **policy** then picks a **level** for each request. Rules are checked top-down and the first match wins, exactly like a firewall ACL.\n\n| Level | What is stored |\n|:--|:--|\n| `None` | Nothing |\n| `Metadata` | Who, what, when and the result, but no bodies |\n| `Request` | Metadata plus the request body |\n| `RequestResponse` | Metadata plus request and response bodies |\n\nHigher levels cost more storage and can capture sensitive data. Never log `Request` or `RequestResponse` for `secrets`, because the log would then hold the secret values themselves."
+  },
+  {
+   "id": "flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "An API request meets the audit system",
+   "data": {
+    "token": "DELETE",
+    "nodes": [
+     {
+      "id": "cli",
+      "label": "kubectl",
+      "sub": "dev-anna",
+      "icon": "laptop"
+     },
+     {
+      "id": "authn",
+      "label": "Authentication",
+      "sub": "who are you",
+      "icon": "key"
+     },
+     {
+      "id": "authz",
+      "label": "Authorization",
+      "sub": "RBAC",
+      "icon": "shield"
+     },
+     {
+      "id": "aud",
+      "label": "Audit policy",
+      "sub": "pick a level",
+      "icon": "eye"
+     },
+     {
+      "id": "log",
+      "label": "Audit backend",
+      "sub": "file or webhook",
+      "icon": "log"
+     }
+    ],
+    "steps": [
+     {
+      "at": "cli",
+      "caption": "A user runs kubectl delete deployment shop-api -n prod."
+     },
+     {
+      "at": "authn",
+      "caption": "The API server identifies the caller as dev-anna from a client certificate."
+     },
+     {
+      "at": "authz",
+      "caption": "RBAC allows delete on deployments in prod. A broader role than intended.",
+      "tone": "warning"
+     },
+     {
+      "at": "aud",
+      "caption": "The first matching rule is level Request for destructive verbs."
+     },
+     {
+      "at": "log",
+      "caption": "A ResponseComplete event is written with user, verb, object, source IP and status 200.",
+      "tone": "success"
+     },
+     {
+      "at": "log",
+      "token": "forensics",
+      "caption": "On Tuesday the team searches the log and answers who, when and from where.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "id": "policy",
+   "type": "text",
+   "markdown": "## Step 1: Write a policy that is small but useful\n\nA policy that records everything at `RequestReceived` produces gigabytes of noise and hides the events that matter. Start from a short rule list that follows this order:\n\n1. **Silence the noise first.** Health probes and the constant `watch` calls from `kube-proxy` add volume and no value.\n2. **Record sensitive reads at Metadata.** You want to know who touched Secrets and ConfigMaps, not what they contained.\n3. **Capture `pods/exec`, `attach` and `portforward` at Request.** These are the interactive doors into a running workload.\n4. **Capture RBAC changes with bodies.** A new ClusterRoleBinding is the classic privilege escalation step.\n5. **Log everything else at Metadata** as a catch-all.\n\nBecause the first match wins, specific rules go above the final catch-all, just as in a firewall rule set."
+  },
+  {
+   "id": "policyfile",
+   "type": "code",
+   "language": "yaml",
+   "filename": "/etc/kubernetes/audit/policy.yaml",
+   "code": "apiVersion: audit.k8s.io/v1\nkind: Policy\nomitStages:\n  - RequestReceived\nrules:\n  - level: None\n    users: [\"system:kube-proxy\"]\n    verbs: [\"watch\"]\n    resources:\n      - group: \"\"\n        resources: [\"endpoints\", \"services\"]\n  - level: None\n    nonResourceURLs: [\"/healthz*\", \"/livez*\", \"/readyz*\"]\n  - level: Metadata\n    resources:\n      - group: \"\"\n        resources: [\"secrets\", \"configmaps\", \"serviceaccounts/token\"]\n  - level: Request\n    resources:\n      - group: \"\"\n        resources: [\"pods/exec\", \"pods/attach\", \"pods/portforward\"]\n  - level: RequestResponse\n    resources:\n      - group: \"rbac.authorization.k8s.io\"\n  - level: Request\n    verbs: [\"create\", \"update\", \"patch\", \"delete\"]\n  - level: Metadata",
+   "highlight": [
+    3,
+    4,
+    14,
+    15,
+    17
+   ],
+   "caption": "Noise rules first, sensitive resources at Metadata, interactive access at Request, catch-all last."
+  },
+  {
+   "id": "enable",
+   "type": "text",
+   "markdown": "## Step 2: Enable it on the API server\n\nOn a kubeadm cluster, the API server runs as a static Pod. Edit its manifest on each control plane node and add the flags below. You must also mount the policy file and the log directory into the Pod with `hostPath` volumes, or the server will fail to start.\n\nThe retention flags protect the node disk. With `maxsize=100` (megabytes), `maxbackup=10` and `maxage=30` (days), the node keeps at most about 1 GB of audit data locally. Local files are a short-term buffer only. Ship them to a central system, because an attacker with node access can delete a local file. On managed services such as EKS, GKE or AKS you cannot edit the API server, but you can enable the provider's audit log feature and send it to your logging service."
+  },
+  {
+   "id": "flags",
+   "type": "code",
+   "language": "yaml",
+   "filename": "/etc/kubernetes/manifests/kube-apiserver.yaml",
+   "code": "    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml\n    - --audit-log-path=/var/log/kubernetes/audit/audit.log\n    - --audit-log-maxage=30\n    - --audit-log-maxbackup=10\n    - --audit-log-maxsize=100",
+   "caption": "Flags added under spec.containers[0].command. Mount /etc/kubernetes/audit and /var/log/kubernetes/audit as hostPath volumes too."
+  },
+  {
+   "id": "backend",
+   "type": "text",
+   "markdown": "## Choose a backend and verify it works\n\nThe API server supports two backends. A **log backend** writes JSON lines to a file, which a collector such as Fluent Bit or Filebeat tails and forwards. A **webhook backend** posts batches of events to an HTTPS service. The file backend is simpler and survives a network outage, so it is the usual first choice.\n\nAfter restarting the API server, confirm three things. The static Pod is running again, the log file is growing, and the first events contain the identity you expect. If the API server does not return, read the container log on the node with `crictl logs`. The most common causes are a policy file that is not mounted, a YAML indentation error, or a log directory that the server cannot write to.\n\nKeep a copy of the working manifest before every change. A broken API server manifest on a single control plane node means you cannot use `kubectl` to repair it."
+  },
+  {
+   "id": "read",
+   "type": "terminal",
+   "title": "Reading audit events with jq",
+   "prompt": "cp-node#",
+   "lines": [
+    {
+     "cmd": "kubectl -n prod get pods",
+     "output": "NAME                        READY   STATUS    RESTARTS   AGE\nshop-api-7d9c5b6f4-x8k2p    1/1     Running   0          3d",
+     "comment": "Any API call generates an event. Now find who deleted the Deployment."
+    },
+    {
+     "cmd": "jq -c 'select(.verb==\"delete\" and .objectRef.resource==\"deployments\") | {t:.requestReceivedTimestamp, user:.user.username, ip:.sourceIPs[0], name:.objectRef.name, ns:.objectRef.namespace, code:.responseStatus.code}' /var/log/kubernetes/audit/audit.log",
+     "output": "{\"t\":\"2026-03-10T02:14:51.402913Z\",\"user\":\"dev-anna\",\"ip\":\"10.20.4.31\",\"name\":\"shop-api\",\"ns\":\"prod\",\"code\":200}",
+     "comment": "The answer to who, when and from where. Code 200 shows the delete succeeded."
+    },
+    {
+     "cmd": "jq -c 'select(.objectRef.subresource==\"exec\") | {user:.user.username, pod:.objectRef.name, ns:.objectRef.namespace}' /var/log/kubernetes/audit/audit.log",
+     "output": "{\"user\":\"dev-anna\",\"pod\":\"shop-api-7d9c5b6f4-x8k2p\",\"ns\":\"prod\"}",
+     "comment": "Interactive shells into production pods deserve their own review."
+    }
+   ]
+  },
+  {
+   "id": "alerts",
+   "type": "text",
+   "markdown": "## Step 3: Decide what to alert on\n\nStoring events is only half the job. Forward them to your central logging or SIEM platform and write a small set of high-signal alerts. A good starting list:\n\n| Event | Why it matters |\n|:--|:--|\n| `create` of a ClusterRoleBinding to `cluster-admin` | Privilege escalation or persistence |\n| `pods/exec` in a production namespace | Interactive access to a workload |\n| `get` or `list` on secrets by an unusual user | Possible credential harvesting |\n| Many `403` responses from one identity | Probing for permissions |\n| Requests from `system:anonymous` | Unauthenticated access is enabled somewhere |\n| Audit policy or API server manifest changed | Someone is blinding your detection |\n\nTune each alert against a week of normal data before you page anyone. An alert that fires every hour trains the team to ignore it."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- **Logging Secrets at Request level.** The log then stores the passwords. Use `Metadata` only.\n- **Keeping logs only on the control plane node.** Whoever compromises the node can erase the evidence.\n- **No policy review.** New resources and operators appear. Revisit the policy every quarter.\n- **Ignoring `user.groups`.** Group names explain why an action was allowed.\n- **Running the log disk out of space.** Always set `maxsize` and `maxbackup`."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Connect it to the rest of your defense",
+   "markdown": "Audit logs show API activity. Runtime activity inside containers needs another tool, covered in [Runtime Threat Detection](/learn/systems-infrastructure-security/runtime-threat-detection). Also review [Kubernetes RBAC](/learn/systems-infrastructure-security/kubernetes-rbac) and [Kubernetes Secrets Management](/learn/systems-infrastructure-security/kubernetes-secrets-management) so the events you collect point at real controls."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a disposable kind or minikube cluster that you own.\n\n1. Save the policy above as `policy.yaml` and enable the five audit flags on the lab API server, mounting both paths.\n2. Run `kubectl create secret generic demo --from-literal=k=v` and `kubectl get secret demo`.\n3. Use `jq` to list the events for the `demo` Secret and confirm no secret value appears.\n4. Run `kubectl exec` into a test pod and find the `exec` event.\n5. Bonus: write a `jq` filter that prints every `403` response with its user and path."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Audit log",
+     "definition": "A chronological record of API server requests with the identity, action and result."
+    },
+    {
+     "term": "Audit policy",
+     "definition": "An ordered rule list that assigns an audit level to each request, first match wins."
+    },
+    {
+     "term": "Audit level",
+     "definition": "How much of a request is stored: None, Metadata, Request or RequestResponse."
+    },
+    {
+     "term": "Stage",
+     "definition": "A point in request handling at which an event can be generated, such as ResponseComplete."
+    },
+    {
+     "term": "Webhook backend",
+     "definition": "An audit backend that sends events to a remote HTTP service in batches."
+    },
+    {
+     "term": "pods/exec",
+     "definition": "The API subresource that opens an interactive command in a running container."
+    },
+    {
+     "term": "SIEM",
+     "definition": "A platform that collects, correlates and alerts on security events from many sources."
+    },
+    {
+     "term": "Log retention",
+     "definition": "How long and how much log data is kept before it is rotated or deleted."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which audit level should you use for the secrets resource?",
+     "options": [
+      "RequestResponse",
+      "Request",
+      "Metadata",
+      "None, because secrets are encrypted"
+     ],
+     "answer": 2,
+     "explanation": "Metadata records who accessed which Secret without storing its value. Higher levels would copy the secret into the log."
+    },
+    {
+     "question": "How does the audit policy choose between two matching rules?",
+     "options": [
+      "The highest level wins",
+      "The first matching rule wins",
+      "The last matching rule wins",
+      "Both apply and logs are merged"
+     ],
+     "answer": 1,
+     "explanation": "Rules are evaluated top-down and evaluation stops at the first match, so order matters."
+    },
+    {
+     "question": "Which events are good high-signal alerts? (Choose all that apply.)",
+     "options": [
+      "A new ClusterRoleBinding to cluster-admin",
+      "pods/exec in production",
+      "Every kube-proxy watch call",
+      "Changes to the audit policy file"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Privilege changes, interactive access and tampering with detection are rare and meaningful. kube-proxy watches are constant noise."
+    },
+    {
+     "question": "Why ship audit logs off the control plane node?",
+     "options": [
+      "An attacker who owns the node can delete local files",
+      "Local files cannot be read by jq",
+      "The API server forbids local logs",
+      "Remote logs are always smaller"
+     ],
+     "answer": 0,
+     "explanation": "Central storage preserves evidence and lets you correlate events even after a node is compromised."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Audit logging records who did what, when and from where at the API server.\n- A policy assigns a level to each request, top-down with first match winning.\n- Silence noise, log Secrets at Metadata, capture exec and RBAC changes, and end with a catch-all.\n- Enable the flags, mount the files, and ship logs off the node with sensible retention.\n- Alert on a few high-signal events and tune them before paging anyone."
+  }
+ ],
+ "ar": {
+  "title": "سجلات التدقيق في Kubernetes",
+  "summary": "اكتب سياسة تدقيق Kubernetes وفعّلها، واقرأ الأحداث بأداة jq، واختر الأحداث القليلة عالية الدلالة التي تستحق التنبيه.",
+  "objectives": [
+   "شرح مراحل التدقيق ومستوياته",
+   "كتابة سياسة تدقيق صغيرة ومفيدة",
+   "تفعيل تسجيل التدقيق مع رايات الاحتفاظ",
+   "الاستعلام عن أحداث التدقيق بأداة jq",
+   "اختيار الأحداث عالية الدلالة للتنبيه"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "صباح الثلاثاء ينبّه نظام المراقبة إلى أن Deployment في الإنتاج جرى تقليصه إلى صفر نسخ خلال الليل. يطرح الفريق الأسئلة البديهية: من فعل ذلك؟ ومن أي عنوان؟ وبأي بيانات دخول؟ وبلا تسجيل تدقيق لا يستطيع العنقود الإجابة. فسجلّات الحاويات تعرض ما فعلته التطبيقات، لكنها لا تقول شيئاً عمّن غيّر العنقود نفسه.\n\nيسجّل **تسجيل التدقيق (Audit logging)** في Kubernetes كل طلب يصل إلى خادم الـ API بالترتيب مع هوية صاحبه، فهو الصندوق الأسود للعنقود. في هذا الدرس ستكتب سياسة تدقيق، وتفعّلها على خادم الـ API، وتقرأ الأحداث بأداة `jq`، وتقرّر ما الذي يستحق التنبيه. كل الأوامر مفترضة على عنقود تملكه."
+   },
+   {
+    "id": "model",
+    "type": "text",
+    "markdown": "## كيف يقرّر نظام التدقيق ما يسجّله\n\nيمرّ كل طلب بالمصادقة والتفويض والقبول (Admission) قبل أن يغيّر أي شيء. ويراقب نظام التدقيق الطلب عند عدة **مراحل (Stages)**:\n\n| المرحلة | متى تحدث |\n|:--|:--|\n| `RequestReceived` | فور وصول الطلب |\n| `ResponseStarted` | بعد إرسال الترويسات، وتُستعمل للطلبات الطويلة مثل `watch` |\n| `ResponseComplete` | عند اكتمال جسم الاستجابة |\n| `Panic` | عند فشل الخادم أثناء معالجة الطلب |\n\nثم تختار **السياسة (Policy)** **مستوى (Level)** لكل طلب. وتُفحص القواعد من الأعلى إلى الأسفل وتفوز أول قاعدة مطابقة، تماماً كقوائم التحكم بالوصول في جدار الحماية.\n\n| المستوى | ما يُخزَّن |\n|:--|:--|\n| `None` | لا شيء |\n| `Metadata` | من وماذا ومتى والنتيجة، من دون أجسام الطلبات |\n| `Request` | البيانات الوصفية مع جسم الطلب |\n| `RequestResponse` | البيانات الوصفية مع جسمي الطلب والاستجابة |\n\nالمستويات الأعلى تكلّف تخزيناً أكثر وقد تلتقط بيانات حسّاسة. فلا تسجّل `Request` أو `RequestResponse` لمورد `secrets`، لأن السجلّ سيحوي عندئذ قيم الأسرار نفسها."
+   },
+   {
+    "id": "flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "طلب API يلتقي بنظام التدقيق",
+    "data": {
+     "token": "DELETE",
+     "nodes": [
+      {
+       "id": "cli",
+       "label": "kubectl",
+       "sub": "dev-anna",
+       "icon": "laptop"
+      },
+      {
+       "id": "authn",
+       "label": "المصادقة",
+       "sub": "من أنت",
+       "icon": "key"
+      },
+      {
+       "id": "authz",
+       "label": "التفويض",
+       "sub": "RBAC",
+       "icon": "shield"
+      },
+      {
+       "id": "aud",
+       "label": "سياسة التدقيق",
+       "sub": "اختيار المستوى",
+       "icon": "eye"
+      },
+      {
+       "id": "log",
+       "label": "وجهة السجلّ",
+       "sub": "ملف أو Webhook",
+       "icon": "log"
+      }
+     ],
+     "steps": [
+      {
+       "at": "cli",
+       "caption": "ينفّذ المستخدم الأمر kubectl delete deployment shop-api -n prod."
+      },
+      {
+       "at": "authn",
+       "caption": "يتعرّف خادم الـ API على المتصل بوصفه dev-anna من شهادة العميل."
+      },
+      {
+       "at": "authz",
+       "caption": "تسمح RBAC بحذف الـ deployments في prod، وهذا دور أوسع من المقصود.",
+       "tone": "warning"
+      },
+      {
+       "at": "aud",
+       "caption": "أول قاعدة مطابقة هي المستوى Request للأفعال المدمّرة."
+      },
+      {
+       "at": "log",
+       "caption": "يُكتب حدث ResponseComplete فيه المستخدم والفعل والكائن وعنوان المصدر والحالة 200.",
+       "tone": "success"
+      },
+      {
+       "at": "log",
+       "token": "forensics",
+       "caption": "يوم الثلاثاء يبحث الفريق في السجلّ ويعرف من ومتى ومن أين.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "id": "policy",
+    "type": "text",
+    "markdown": "## الخطوة 1: اكتب سياسة صغيرة ومفيدة\n\nالسياسة التي تسجّل كل شيء عند `RequestReceived` تنتج غيغابايتات من الضجيج وتخفي الأحداث المهمة. ابدأ بقائمة قصيرة من القواعد بهذا الترتيب:\n\n1. **أسكِت الضجيج أولاً.** فحوص الصحة وطلبات `watch` المستمرة من `kube-proxy` تزيد الحجم ولا تضيف قيمة.\n2. **سجّل القراءات الحسّاسة بمستوى Metadata.** تريد معرفة من لمس الأسرار وخرائط الإعداد، لا ما تحويه.\n3. **التقط `pods/exec` و`attach` و`portforward` بمستوى Request.** فهذه الأبواب التفاعلية إلى حِمل عمل قيد التشغيل.\n4. **سجّل تغييرات RBAC مع الأجسام.** فإنشاء ClusterRoleBinding جديد هو الخطوة الكلاسيكية لرفع الصلاحيات.\n5. **سجّل كل ما عداه بمستوى Metadata** كقاعدة شاملة.\n\nولأن أول قاعدة مطابقة هي التي تفوز، تأتي القواعد المحدّدة فوق القاعدة الشاملة الأخيرة كما في مجموعات قواعد جدار الحماية."
+   },
+   {
+    "id": "policyfile",
+    "type": "code",
+    "language": "yaml",
+    "filename": "/etc/kubernetes/audit/policy.yaml",
+    "code": "apiVersion: audit.k8s.io/v1\nkind: Policy\nomitStages:\n  - RequestReceived\nrules:\n  - level: None\n    users: [\"system:kube-proxy\"]\n    verbs: [\"watch\"]\n    resources:\n      - group: \"\"\n        resources: [\"endpoints\", \"services\"]\n  - level: None\n    nonResourceURLs: [\"/healthz*\", \"/livez*\", \"/readyz*\"]\n  - level: Metadata\n    resources:\n      - group: \"\"\n        resources: [\"secrets\", \"configmaps\", \"serviceaccounts/token\"]\n  - level: Request\n    resources:\n      - group: \"\"\n        resources: [\"pods/exec\", \"pods/attach\", \"pods/portforward\"]\n  - level: RequestResponse\n    resources:\n      - group: \"rbac.authorization.k8s.io\"\n  - level: Request\n    verbs: [\"create\", \"update\", \"patch\", \"delete\"]\n  - level: Metadata",
+    "highlight": [
+     3,
+     4,
+     14,
+     15,
+     17
+    ],
+    "caption": "قواعد الضجيج أولاً، ثم الموارد الحسّاسة بمستوى Metadata، ثم الوصول التفاعلي بمستوى Request، والقاعدة الشاملة أخيراً."
+   },
+   {
+    "id": "enable",
+    "type": "text",
+    "markdown": "## الخطوة 2: فعّلها على خادم الـ API\n\nفي عنقود kubeadm يعمل خادم الـ API كـ Pod ثابت (Static Pod). عدّل ملف بيانه على كل عقدة من مستوى التحكم وأضف الرايات أدناه. ويجب أيضاً تركيب ملف السياسة ومجلد السجلّ داخل الـ Pod بوحدات `hostPath`، وإلا فشل الخادم في الإقلاع.\n\nتحمي رايات الاحتفاظ قرص العقدة. فمع `maxsize=100` (ميغابايت) و`maxbackup=10` و`maxage=30` (يوماً) تحتفظ العقدة محلياً بنحو 1 غيغابايت من بيانات التدقيق على الأكثر. والملفات المحلية مخزن مؤقت قصير الأمد فقط، فأرسلها إلى نظام مركزي لأن المهاجم الذي يصل إلى العقدة يستطيع حذف الملف المحلي. وفي الخدمات المُدارة مثل EKS وGKE وAKS لا تستطيع تعديل خادم الـ API، لكن يمكنك تفعيل ميزة سجلّ التدقيق لدى المزوّد وإرسالها إلى خدمة السجلّات لديك."
+   },
+   {
+    "id": "flags",
+    "type": "code",
+    "language": "yaml",
+    "filename": "/etc/kubernetes/manifests/kube-apiserver.yaml",
+    "code": "    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml\n    - --audit-log-path=/var/log/kubernetes/audit/audit.log\n    - --audit-log-maxage=30\n    - --audit-log-maxbackup=10\n    - --audit-log-maxsize=100",
+    "caption": "رايات تُضاف تحت spec.containers[0].command. ركّب أيضاً /etc/kubernetes/audit و/var/log/kubernetes/audit كوحدات hostPath."
+   },
+   {
+    "id": "backend",
+    "type": "text",
+    "markdown": "## اختر وجهة السجلّ وتحقق من عملها\n\nيدعم خادم الـ API وجهتين. **وجهة الملف (Log backend)** تكتب أسطر JSON في ملف تقرؤه أداة تجميع مثل Fluent Bit أو Filebeat وتعيد إرساله. أما **وجهة Webhook** فترسل دفعات من الأحداث إلى خدمة HTTPS. وجهة الملف أبسط وتصمد أمام انقطاع الشبكة، فهي الخيار الأول المعتاد.\n\nبعد إعادة تشغيل خادم الـ API تحقق من ثلاثة أمور: أن الـ Pod الثابت يعمل من جديد، وأن ملف السجلّ يكبر، وأن الأحداث الأولى تحمل الهوية المتوقعة. وإن لم يعد الخادم فاقرأ سجلّ الحاوية على العقدة بالأمر `crictl logs`. وأكثر الأسباب شيوعاً ملف سياسة غير مركّب، أو خطأ في إزاحة YAML، أو مجلد سجلّ لا يستطيع الخادم الكتابة فيه.\n\nاحتفظ بنسخة من ملف البيان العامل قبل كل تعديل. فملف بيان خادم API معطوب على عقدة تحكم وحيدة يعني أنك لا تستطيع استعمال `kubectl` لإصلاحه."
+   },
+   {
+    "id": "read",
+    "type": "terminal",
+    "title": "قراءة أحداث التدقيق بأداة jq",
+    "prompt": "cp-node#",
+    "lines": [
+     {
+      "cmd": "kubectl -n prod get pods",
+      "output": "NAME                        READY   STATUS    RESTARTS   AGE\nshop-api-7d9c5b6f4-x8k2p    1/1     Running   0          3d",
+      "comment": "أي استدعاء للـ API يولّد حدثاً. لنبحث الآن عمّن حذف الـ Deployment."
+     },
+     {
+      "cmd": "jq -c 'select(.verb==\"delete\" and .objectRef.resource==\"deployments\") | {t:.requestReceivedTimestamp, user:.user.username, ip:.sourceIPs[0], name:.objectRef.name, ns:.objectRef.namespace, code:.responseStatus.code}' /var/log/kubernetes/audit/audit.log",
+      "output": "{\"t\":\"2026-03-10T02:14:51.402913Z\",\"user\":\"dev-anna\",\"ip\":\"10.20.4.31\",\"name\":\"shop-api\",\"ns\":\"prod\",\"code\":200}",
+      "comment": "الجواب عن من ومتى ومن أين. والرمز 200 يعني نجاح الحذف."
+     },
+     {
+      "cmd": "jq -c 'select(.objectRef.subresource==\"exec\") | {user:.user.username, pod:.objectRef.name, ns:.objectRef.namespace}' /var/log/kubernetes/audit/audit.log",
+      "output": "{\"user\":\"dev-anna\",\"pod\":\"shop-api-7d9c5b6f4-x8k2p\",\"ns\":\"prod\"}",
+      "comment": "الأصداف التفاعلية داخل Pods الإنتاج تستحق مراجعة خاصة."
+     }
+    ]
+   },
+   {
+    "id": "alerts",
+    "type": "text",
+    "markdown": "## الخطوة 3: قرّر ما الذي يستحق التنبيه\n\nتخزين الأحداث نصف العمل فقط. أرسلها إلى منصة السجلّات المركزية أو نظام إدارة معلومات الأمن والأحداث (SIEM) واكتب مجموعة صغيرة من التنبيهات عالية الدلالة. قائمة بداية جيدة:\n\n| الحدث | أهميته |\n|:--|:--|\n| `create` لـ ClusterRoleBinding إلى `cluster-admin` | رفع صلاحيات أو إبقاء موطئ قدم |\n| `pods/exec` في Namespace إنتاج | وصول تفاعلي إلى حِمل عمل |\n| `get` أو `list` على الأسرار من مستخدم غير معتاد | احتمال جمع بيانات دخول |\n| كثرة استجابات `403` من هوية واحدة | استكشاف للصلاحيات |\n| طلبات من `system:anonymous` | الوصول المجهول مفعّل في مكان ما |\n| تغيير سياسة التدقيق أو ملف بيان خادم الـ API | شخص يحاول تعطيل الكشف |\n\nاضبط كل تنبيه على بيانات أسبوع طبيعي قبل أن توقظ به أحداً. فالتنبيه الذي ينطلق كل ساعة يدرّب الفريق على تجاهله."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- **تسجيل الأسرار بمستوى Request.** فيخزّن السجلّ كلمات المرور. استعمل `Metadata` فقط.\n- **إبقاء السجلّات على عقدة مستوى التحكم وحدها.** فمن يخترق العقدة يستطيع محو الأدلة.\n- **عدم مراجعة السياسة.** تظهر موارد ومشغّلات جديدة، فراجع السياسة كل ربع سنة.\n- **تجاهل `user.groups`.** فأسماء المجموعات تفسّر لماذا سُمح بالإجراء.\n- **ترك قرص السجلّ يمتلئ.** اضبط دائماً `maxsize` و`maxbackup`."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "اربطه ببقية دفاعاتك",
+    "markdown": "تعرض سجلّات التدقيق نشاط الواجهة البرمجية. أما النشاط داخل الحاويات أثناء التشغيل فيحتاج أداة أخرى يشرحها درس [كشف التهديدات أثناء التشغيل](/learn/systems-infrastructure-security/runtime-threat-detection). وراجع أيضاً [Kubernetes RBAC](/learn/systems-infrastructure-security/kubernetes-rbac) و[إدارة الأسرار في Kubernetes](/learn/systems-infrastructure-security/kubernetes-secrets-management) لتشير الأحداث التي تجمعها إلى ضوابط حقيقية."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استعمل عنقود kind أو minikube مؤقتاً تملكه.\n\n1. احفظ السياسة أعلاه باسم `policy.yaml` وفعّل رايات التدقيق الخمس على خادم الـ API التجريبي مع تركيب المسارين.\n2. نفّذ `kubectl create secret generic demo --from-literal=k=v` ثم `kubectl get secret demo`.\n3. استعمل `jq` لسرد أحداث الـ Secret المسمّى `demo` وتأكد من عدم ظهور أي قيمة سرّية.\n4. نفّذ `kubectl exec` داخل Pod تجريبي وابحث عن حدث `exec`.\n5. تحدٍّ إضافي: اكتب مرشّح `jq` يطبع كل استجابة `403` مع مستخدمها ومسارها."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "سجلّ التدقيق",
+      "definition": "سجلّ زمني لطلبات خادم الـ API يتضمن الهوية والإجراء والنتيجة."
+     },
+     {
+      "term": "سياسة التدقيق",
+      "definition": "قائمة قواعد مرتبة تحدد مستوى التدقيق لكل طلب، وتفوز أول قاعدة مطابقة."
+     },
+     {
+      "term": "مستوى التدقيق",
+      "definition": "مقدار ما يُخزَّن من الطلب: None أو Metadata أو Request أو RequestResponse."
+     },
+     {
+      "term": "المرحلة",
+      "definition": "نقطة في معالجة الطلب يمكن أن يُولَّد عندها حدث، مثل ResponseComplete."
+     },
+     {
+      "term": "وجهة Webhook",
+      "definition": "وجهة تدقيق ترسل الأحداث دفعات إلى خدمة HTTP بعيدة."
+     },
+     {
+      "term": "pods/exec",
+      "definition": "المورد الفرعي الذي يفتح أمراً تفاعلياً داخل حاوية قيد التشغيل."
+     },
+     {
+      "term": "نظام إدارة معلومات الأمن والأحداث (SIEM)",
+      "definition": "منصة تجمع أحداث الأمن من مصادر كثيرة وتربط بينها وتنبّه عليها."
+     },
+     {
+      "term": "الاحتفاظ بالسجلّات",
+      "definition": "المدة والحجم اللذان تُحفظ بهما بيانات السجلّ قبل تدويرها أو حذفها."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي مستوى تدقيق تستعمله لمورد secrets؟",
+      "options": [
+       "RequestResponse",
+       "Request",
+       "Metadata",
+       "None لأن الأسرار مشفّرة"
+      ],
+      "answer": 2,
+      "explanation": "يسجّل Metadata من وصل إلى أي Secret من دون تخزين قيمته، أما المستويات الأعلى فتنسخ السر إلى السجلّ."
+     },
+     {
+      "question": "كيف تختار سياسة التدقيق بين قاعدتين مطابقتين؟",
+      "options": [
+       "يفوز المستوى الأعلى",
+       "تفوز أول قاعدة مطابقة",
+       "تفوز آخر قاعدة مطابقة",
+       "تنطبق القاعدتان وتُدمج السجلّات"
+      ],
+      "answer": 1,
+      "explanation": "تُقيَّم القواعد من الأعلى إلى الأسفل وتتوقف عند أول مطابقة، فالترتيب مهم."
+     },
+     {
+      "question": "أي الأحداث تصلح تنبيهات عالية الدلالة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "ClusterRoleBinding جديد إلى cluster-admin",
+       "pods/exec في الإنتاج",
+       "كل طلب watch من kube-proxy",
+       "تغييرات في ملف سياسة التدقيق"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تغييرات الصلاحيات والوصول التفاعلي والعبث بالكشف أحداث نادرة وذات معنى، أما طلبات kube-proxy فضجيج دائم."
+     },
+     {
+      "question": "لماذا تُرسَل سجلّات التدقيق خارج عقدة مستوى التحكم؟",
+      "options": [
+       "المهاجم الذي يسيطر على العقدة يستطيع حذف الملفات المحلية",
+       "لا تستطيع jq قراءة الملفات المحلية",
+       "يمنع الخادم السجلّات المحلية",
+       "السجلّات البعيدة أصغر دائماً"
+      ],
+      "answer": 0,
+      "explanation": "يحفظ التخزين المركزي الأدلة ويتيح ربط الأحداث حتى بعد اختراق العقدة."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يسجّل التدقيق من فعل ماذا ومتى ومن أين على مستوى خادم الـ API.\n- تعيّن السياسة مستوى لكل طلب من الأعلى إلى الأسفل وتفوز أول قاعدة مطابقة.\n- أسكِت الضجيج، وسجّل الأسرار بمستوى Metadata، والتقط exec وتغييرات RBAC، وانتهِ بقاعدة شاملة.\n- فعّل الرايات وركّب الملفات وأرسل السجلّات خارج العقدة مع احتفاظ معقول.\n- نبّه على أحداث قليلة عالية الدلالة واضبطها قبل أن توقظ بها أحداً."
+   }
+  ]
+ }
+}

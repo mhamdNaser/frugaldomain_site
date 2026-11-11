@@ -1,0 +1,536 @@
+{
+ "slug": "secure-software-deployment",
+ "title": "Secure Software Deployment",
+ "summary": "How to move code to production through a reviewed, repeatable, auditable and reversible process with least-privilege deploy accounts.",
+ "duration_minutes": 25,
+ "objectives": [
+  "List the principles of a secure deployment pipeline",
+  "Implement atomic releases with health checks and rollback",
+  "Restrict the deploy account and its credentials",
+  "Detect configuration drift after deployment"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "On Friday at 17:30 a developer logs in to the production server over SSH, runs `git pull` in the web root, edits `.env` with `nano` to fix a typo, and restarts PHP-FPM. It works. Three weeks later nobody can say which commit is live, why the server differs from staging, or who changed the database password. Then an incident happens, and the team cannot tell whether the bad code came from the repository or from a hand edit.\n\nManual, ad hoc deployment is one of the most common sources of both outages and breaches. **Secure software deployment** means that code reaches production through a repeatable, reviewed, logged and reversible process, using the least privilege needed at every step. This lesson shows how a systems administrator designs that path."
+  },
+  {
+   "id": "principles",
+   "type": "text",
+   "markdown": "## Principles of a secure deployment path\n\nA good pipeline answers five questions for every release: *what* was deployed, *who* approved it, *when*, *from which source*, and *how do we undo it*.\n\n| Principle | In practice |\n|:--|:--|\n| **Everything from version control** | No hand edits on servers; the live state equals a commit |\n| **Build once, deploy many** | One immutable artifact moves from test to production unchanged |\n| **Separate duties** | The person who writes code does not alone approve and push it to production |\n| **Least privilege** | The deploy account can only do deployment, nothing else |\n| **Secrets outside the artifact** | Configuration and credentials are injected at deploy time |\n| **Verify before and after** | Tests and checksums before; health checks after |\n| **Reversible** | A previous release is always one command away |\n| **Auditable** | Every deployment is logged with who, what and when |\n\nThese principles apply equally to a PHP site on a single VM, a container on Kubernetes and a Proxmox template rollout. The mechanism changes; the questions do not. The configuration side is covered in [Configuration management and security baselines](/learn/systems-infrastructure-security/configuration-management-and-security-baselines)."
+  },
+  {
+   "id": "deploy-anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A gated deployment pipeline",
+   "data": {
+    "token": "Release",
+    "nodes": [
+     {
+      "id": "git",
+      "label": "Repository",
+      "sub": "protected main",
+      "icon": "file"
+     },
+     {
+      "id": "ci",
+      "label": "CI build",
+      "sub": "test + scan",
+      "icon": "cpu"
+     },
+     {
+      "id": "art",
+      "label": "Artifact store",
+      "sub": "signed, immutable",
+      "icon": "database"
+     },
+     {
+      "id": "appr",
+      "label": "Approval",
+      "sub": "second person",
+      "icon": "user"
+     },
+     {
+      "id": "prod",
+      "label": "Production",
+      "sub": "192.0.2.40",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "at": "git",
+      "caption": "A pull request is reviewed and merged into the protected main branch.",
+      "tone": "secure"
+     },
+     {
+      "at": "ci",
+      "caption": "CI runs tests, a dependency audit and a secret scan, then builds the release.",
+      "tone": "default"
+     },
+     {
+      "at": "art",
+      "caption": "The build output is signed and stored once. The same artifact will be used everywhere.",
+      "tone": "secure"
+     },
+     {
+      "at": "appr",
+      "caption": "A second person approves the production deployment.",
+      "tone": "warning"
+     },
+     {
+      "at": "prod",
+      "caption": "The deploy account verifies the signature, switches the release and runs a health check.",
+      "tone": "success"
+     },
+     {
+      "at": "prod",
+      "caption": "If the health check fails, the symlink returns to the previous release automatically.",
+      "tone": "blocked"
+     }
+    ]
+   }
+  },
+  {
+   "id": "atomic",
+   "type": "text",
+   "markdown": "## Atomic releases and rollback\n\nThe simplest robust pattern on a single server is the **release directory with a symlink**. Each release is unpacked into its own timestamped folder. The web server always serves `/var/www/portal/current`, a symbolic link. Deployment is just changing where the link points, which is atomic: visitors see the old version or the new one, never a half-copied mix.\n\n```\n/var/www/portal/\n  releases/20261110-1730/\n  releases/20261111-0915/\n  shared/.env          (secrets, owned by root, mode 640)\n  shared/storage/      (uploads and logs)\n  current -> releases/20261111-0915\n```\n\nRollback is repointing `current` at the previous folder and reloading PHP-FPM. Keep the last three to five releases and delete older ones. Make the release files **read-only for the web server user**, so a vulnerable application cannot rewrite its own code. Only `shared/storage` should be writable.\n\nContainers give the same property: the image is immutable and rollback means starting the previous tag. For Kubernetes that is `kubectl rollout undo`."
+  },
+  {
+   "id": "deploy-sh",
+   "type": "code",
+   "language": "bash",
+   "code": "#!/usr/bin/env bash\n# deploy.sh - runs as the 'deploy' user, invoked by CI over SSH with a restricted key\nset -euo pipefail\n\nAPP=/var/www/portal\nREL=\"$APP/releases/$(date +%Y%m%d-%H%M)\"\nARTIFACT=/srv/artifacts/portal-${1:?usage: deploy.sh <version>}.tar.gz\n\n# 1. Verify integrity before touching anything\nsha256sum -c \"${ARTIFACT}.sha256\"\n\n# 2. Unpack into a new release folder\nmkdir -p \"$REL\"\ntar -xzf \"$ARTIFACT\" -C \"$REL\"\nln -sfn \"$APP/shared/.env\" \"$REL/.env\"\nln -sfn \"$APP/shared/storage\" \"$REL/storage\"\n\n# 3. Switch atomically, then health-check; roll back on failure\nPREV=$(readlink \"$APP/current\")\nln -sfn \"$REL\" \"$APP/current.new\" && mv -T \"$APP/current.new\" \"$APP/current\"\nsudo systemctl reload php8.3-fpm\nif ! curl -fsS --max-time 5 http://127.0.0.1/health >/dev/null; then\n  ln -sfn \"$PREV\" \"$APP/current.new\" && mv -T \"$APP/current.new\" \"$APP/current\"\n  sudo systemctl reload php8.3-fpm\n  echo \"ROLLED BACK to $PREV\" >&2; exit 1\nfi\nlogger -t deploy \"release $REL deployed by ${SUDO_USER:-$USER}\"",
+   "filename": "/usr/local/bin/deploy.sh",
+   "caption": "Integrity check, atomic switch, health check, automatic rollback and a log line."
+  },
+  {
+   "id": "access",
+   "type": "text",
+   "markdown": "## Locking down the deploy account\n\nThe pipeline needs access to production, which makes it a high-value target. Treat its credentials with care.\n\n- **A dedicated `deploy` user**, not root and not a human's account, with no password login.\n- **A restricted SSH key**: use `command=` and `restrict` options in `authorized_keys` so the key can run only the deploy script, from the CI address.\n- **A narrow `sudoers` rule** permitting only `systemctl reload php8.3-fpm`, not a shell.\n- **Short-lived credentials** where possible, such as signed SSH certificates or OIDC tokens from CI instead of long-lived passwords stored as pipeline variables.\n- **Protected branches and required reviews** on the repository, because whoever can change the pipeline definition controls production.\n- **Secrets from a vault or the host**, never committed. A secret scanner in CI catches mistakes.\n\nCompare the two approaches: **push-based** deployment (CI connects to the server) needs inbound SSH from CI; **pull-based** deployment (an agent on the server fetches and applies approved releases) needs no inbound access, and the server decides what to trust. Pull-based is generally safer for sensitive environments. See [Linux SSH hardening](/learn/systems-infrastructure-security/linux-ssh-hardening) for the SSH side."
+  },
+  {
+   "id": "deploy-run",
+   "type": "terminal",
+   "title": "A deployment and a rollback",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "sudo -u deploy /usr/local/bin/deploy.sh 2026.11.3",
+     "output": "portal-2026.11.3.tar.gz: OK\n"
+    },
+    {
+     "cmd": "readlink /var/www/portal/current",
+     "output": "/var/www/portal/releases/20261111-0915"
+    },
+    {
+     "cmd": "journalctl -t deploy --since today --no-pager",
+     "output": "Nov 11 09:15:07 web01 deploy[2211]: release /var/www/portal/releases/20261111-0915 deployed by ci-runner"
+    },
+    {
+     "cmd": "sudo -u deploy /usr/local/bin/deploy.sh 2026.11.4",
+     "output": "portal-2026.11.4.tar.gz: OK\ncurl: (22) The requested URL returned error: 500\nROLLED BACK to /var/www/portal/releases/20261111-0915"
+    }
+   ],
+   "caption": "The first deployment is logged. The second one fails its health check and returns to the previous release by itself."
+  },
+  {
+   "id": "harden",
+   "type": "text",
+   "markdown": "## Runtime protection after the deploy\n\nDeployment security does not end when the files land. Add controls that make drift visible:\n\n1. **File integrity monitoring.** Hash the release folder at deploy time and compare periodically, so any manual edit raises an alert. See [Linux file integrity monitoring](/learn/systems-infrastructure-security/linux-file-integrity-monitoring).\n2. **Read-only code.** Mount or permission the release folder so PHP cannot write to it.\n3. **Disable direct shell edits.** Remove routine human SSH access to production and use break-glass accounts that page someone when used.\n4. **Environment parity.** Staging should run the same artifact, with the same hardening, so tests mean something.\n5. **Staged rollouts.** Deploy to one server or a small share of traffic first (canary), watch the error rate, then continue.\n\nFinally, record the deployment in your change log with the artifact version and hash. Auditors and incident responders will ask for exactly that."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Do not store production secrets in pipeline variables for years",
+   "markdown": "A long-lived deploy key stored in a CI system is a skeleton key to production. Rotate it on a schedule, scope it to one server and one command, and alert on any login by the deploy user that does not match a pipeline run."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a test VM you own:\n\n1. Create the folders `releases`, `shared` and `current` as shown. Put a simple `index.php` in two release folders that print different version strings.\n2. Point `current` at the first release, then switch with `ln -sfn` and `mv -T`. Reload and confirm the change with `curl`.\n3. Add a `/health` file in one release that returns a failure, and confirm your script rolls back.\n4. Make the release folder owned by root and the web user read-only. Try writing a file as the web user and observe the error.\n5. Create a `deploy` user with a key restricted by `command=` and test that it cannot open a shell.\n\nNote how long a rollback takes compared with a manual fix."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Immutable artifact",
+     "definition": "A build output that is never modified after creation; the same file runs in every environment."
+    },
+    {
+     "term": "Atomic release",
+     "definition": "A switch between versions that happens all at once, with no half-updated state."
+    },
+    {
+     "term": "Rollback",
+     "definition": "Returning to the previous known good release."
+    },
+    {
+     "term": "Canary deployment",
+     "definition": "Releasing to a small share of servers or traffic first to catch problems early."
+    },
+    {
+     "term": "Push vs pull deployment",
+     "definition": "Push: the pipeline connects to the server. Pull: an agent on the server fetches approved releases."
+    },
+    {
+     "term": "Separation of duties",
+     "definition": "Requiring more than one person to take a change from code to production."
+    },
+    {
+     "term": "Configuration drift",
+     "definition": "Production gradually diverging from what version control says it should be."
+    },
+    {
+     "term": "Break-glass account",
+     "definition": "A tightly controlled emergency account whose use triggers alerts."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why is switching a symlink a good way to release?",
+     "options": [
+      "It is atomic and easy to reverse",
+      "It encrypts the files",
+      "It removes the need for tests",
+      "It hides the code"
+     ],
+     "answer": 0,
+     "explanation": "Visitors see the old or the new version, never a mix, and rollback is repointing the link."
+    },
+    {
+     "question": "What does 'build once, deploy many' protect against?",
+     "options": [
+      "Slow networks",
+      "Differences between what was tested and what runs in production",
+      "Expired certificates",
+      "Disk failures"
+     ],
+     "answer": 1,
+     "explanation": "Rebuilding for each environment can produce different results. One artifact keeps test and production identical."
+    },
+    {
+     "question": "Which settings harden the deploy account? Choose all that apply.",
+     "options": [
+      "A key restricted with command= in authorized_keys",
+      "A sudoers rule limited to one reload command",
+      "Using the root account",
+      "Rotating the key on a schedule"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Restricting what the key can run and rotating it limits the damage if it leaks. Root does the opposite."
+    },
+    {
+     "question": "Why can pull-based deployment be safer than push-based?",
+     "options": [
+      "It needs no inbound access from CI to the server",
+      "It is always faster",
+      "It skips tests",
+      "It needs no credentials at all"
+     ],
+     "answer": 0,
+     "explanation": "The server fetches and verifies releases itself, so a compromised pipeline cannot log in to it."
+    },
+    {
+     "question": "What should the health-check step do after switching releases?",
+     "options": [
+      "Nothing",
+      "Trigger an automatic rollback on failure",
+      "Delete the logs",
+      "Open port 22"
+     ],
+     "answer": 1,
+     "explanation": "An automatic rollback limits the time a broken release is live."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\nSecure deployment turns \"someone logged in and changed something\" into a process you can review, repeat and undo. Keep everything in version control, build one immutable artifact, verify it, switch releases atomically and health-check with automatic rollback.\n\nProtect the path itself: a dedicated, restricted deploy account, short-lived credentials, protected branches, second-person approval and secrets kept outside the artifact. Afterward, watch for drift with file integrity monitoring and read-only code.\n\nOnce you can deploy reliably, you can test the result systematically: [Web application vulnerability assessment](/learn/systems-infrastructure-security/web-application-vulnerability-assessment)."
+  }
+ ],
+ "ar": {
+  "title": "النشر الآمن للبرمجيات",
+  "summary": "كيف تنقل الشيفرة إلى الإنتاج عبر عملية مراجَعة وقابلة للتكرار والتدقيق والتراجع بحسابات نشر بأقل الصلاحيات.",
+  "objectives": [
+   "سرد مبادئ خط أنابيب النشر الآمن",
+   "تنفيذ إصدارات ذرّية مع فحوص صحة وتراجع",
+   "تقييد حساب النشر وبيانات اعتماده",
+   "كشف انحراف الإعدادات بعد النشر"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يوم الجمعة الساعة 17:30 يدخل مطور إلى خادم الإنتاج عبر SSH، وينفّذ `git pull` في جذر الويب، ويعدّل `.env` بـ `nano` لتصحيح خطأ إملائي، ثم يعيد تشغيل PHP-FPM. يعمل كل شيء. بعد ثلاثة أسابيع لا يستطيع أحد القول أي إيداع (Commit) يعمل حاليًا، ولا لماذا يختلف الخادم عن بيئة الاختبار، ولا من غيّر كلمة مرور قاعدة البيانات. ثم تقع حادثة ولا يعرف الفريق هل جاءت الشيفرة السيئة من المستودع أم من تعديل يدوي.\n\nالنشر اليدوي العشوائي من أكثر مصادر الأعطال والاختراقات شيوعًا. و**النشر الآمن للبرمجيات** يعني أن تصل الشيفرة إلى الإنتاج عبر عملية قابلة للتكرار ومراجَعة ومسجَّلة وقابلة للتراجع، بأقل صلاحيات لازمة في كل خطوة. يبين هذا الدرس كيف يصمم مسؤول النظام ذلك المسار."
+   },
+   {
+    "id": "principles",
+    "type": "text",
+    "markdown": "## مبادئ مسار النشر الآمن\n\nيجيب خط الأنابيب الجيد عن خمسة أسئلة لكل إصدار: *ماذا* نُشر، و*من* وافق عليه، و*متى*، و*من أي مصدر*، و*كيف نتراجع عنه*.\n\n| المبدأ | في التطبيق |\n|:--|:--|\n| **كل شيء من التحكم بالإصدارات** | لا تعديلات يدوية على الخوادم؛ الحالة الحية تساوي إيداعًا |\n| **ابنِ مرة وانشر مرارًا** | ناتج واحد غير قابل للتغيير ينتقل من الاختبار إلى الإنتاج دون تعديل |\n| **فصل المهام** | من يكتب الشيفرة لا يوافق وحده على دفعها إلى الإنتاج |\n| **أقل الصلاحيات** | حساب النشر لا يفعل إلا النشر |\n| **الأسرار خارج الناتج** | تُحقن الإعدادات وبيانات الاعتماد وقت النشر |\n| **تحقّق قبل وبعد** | اختبارات وتجزئات قبله، وفحوص صحة بعده |\n| **قابل للتراجع** | الإصدار السابق على بعد أمر واحد |\n| **قابل للتدقيق** | يُسجَّل كل نشر بمن وماذا ومتى |\n\nتنطبق هذه المبادئ على موقع PHP على آلة افتراضية واحدة وعلى حاوية في Kubernetes وعلى طرح قالب Proxmox بالقدر نفسه. تتغير الآلية ولا تتغير الأسئلة. ويُغطّى جانب الإعدادات في [إدارة الإعدادات وخطوط الأساس الأمنية](/learn/systems-infrastructure-security/configuration-management-and-security-baselines)."
+   },
+   {
+    "id": "deploy-anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "خط أنابيب نشر ذو بوابات",
+    "data": {
+     "token": "إصدار",
+     "nodes": [
+      {
+       "id": "git",
+       "label": "المستودع",
+       "sub": "protected main",
+       "icon": "file"
+      },
+      {
+       "id": "ci",
+       "label": "بناء CI",
+       "sub": "test + scan",
+       "icon": "cpu"
+      },
+      {
+       "id": "art",
+       "label": "مخزن النواتج",
+       "sub": "signed, immutable",
+       "icon": "database"
+      },
+      {
+       "id": "appr",
+       "label": "الموافقة",
+       "sub": "second person",
+       "icon": "user"
+      },
+      {
+       "id": "prod",
+       "label": "الإنتاج",
+       "sub": "192.0.2.40",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "at": "git",
+       "caption": "تُراجَع طلبات الدمج وتُدمج في الفرع الرئيسي المحمي.",
+       "tone": "secure"
+      },
+      {
+       "at": "ci",
+       "caption": "ينفّذ CI الاختبارات وتدقيق الاعتماديات وفحص الأسرار ثم يبني الإصدار.",
+       "tone": "default"
+      },
+      {
+       "at": "art",
+       "caption": "يُوقَّع ناتج البناء ويُخزَّن مرة واحدة، ويُستخدم الناتج نفسه في كل مكان.",
+       "tone": "secure"
+      },
+      {
+       "at": "appr",
+       "caption": "يوافق شخص ثانٍ على النشر في الإنتاج.",
+       "tone": "warning"
+      },
+      {
+       "at": "prod",
+       "caption": "يتحقق حساب النشر من التوقيع ويبدّل الإصدار وينفّذ فحص صحة.",
+       "tone": "success"
+      },
+      {
+       "at": "prod",
+       "caption": "إن فشل فحص الصحة يعود الرابط الرمزي إلى الإصدار السابق تلقائيًا.",
+       "tone": "blocked"
+      }
+     ]
+    }
+   },
+   {
+    "id": "atomic",
+    "type": "text",
+    "markdown": "## الإصدارات الذرّية والتراجع\n\nأبسط نمط متين على خادم واحد هو **مجلد الإصدار مع رابط رمزي**. يُفكّ كل إصدار في مجلده المؤرَّخ. ويخدم خادم الويب دائمًا `/var/www/portal/current` وهو رابط رمزي. فالنشر مجرد تغيير وجهة الرابط، وهذا ذرّي: يرى الزوار الإصدار القديم أو الجديد، لا خليطًا منسوخًا جزئيًا.\n\n```\n/var/www/portal/\n  releases/20261110-1730/\n  releases/20261111-0915/\n  shared/.env          (secrets, owned by root, mode 640)\n  shared/storage/      (uploads and logs)\n  current -> releases/20261111-0915\n```\n\nالتراجع هو إعادة توجيه `current` إلى المجلد السابق وإعادة تحميل PHP-FPM. احتفظ بآخر ثلاثة إلى خمسة إصدارات واحذف الأقدم. واجعل ملفات الإصدار **للقراءة فقط لمستخدم خادم الويب** كي لا يعيد تطبيق معرّض كتابة شيفرته. ولا يُسمح بالكتابة إلا في `shared/storage`.\n\nوتمنح الحاويات الخاصية نفسها: الصورة غير قابلة للتغيير والتراجع يعني تشغيل الوسم السابق. وفي Kubernetes يكون ذلك `kubectl rollout undo`."
+   },
+   {
+    "id": "deploy-sh",
+    "type": "code",
+    "language": "bash",
+    "code": "#!/usr/bin/env bash\n# deploy.sh - runs as the 'deploy' user, invoked by CI over SSH with a restricted key\nset -euo pipefail\n\nAPP=/var/www/portal\nREL=\"$APP/releases/$(date +%Y%m%d-%H%M)\"\nARTIFACT=/srv/artifacts/portal-${1:?usage: deploy.sh <version>}.tar.gz\n\n# 1. Verify integrity before touching anything\nsha256sum -c \"${ARTIFACT}.sha256\"\n\n# 2. Unpack into a new release folder\nmkdir -p \"$REL\"\ntar -xzf \"$ARTIFACT\" -C \"$REL\"\nln -sfn \"$APP/shared/.env\" \"$REL/.env\"\nln -sfn \"$APP/shared/storage\" \"$REL/storage\"\n\n# 3. Switch atomically, then health-check; roll back on failure\nPREV=$(readlink \"$APP/current\")\nln -sfn \"$REL\" \"$APP/current.new\" && mv -T \"$APP/current.new\" \"$APP/current\"\nsudo systemctl reload php8.3-fpm\nif ! curl -fsS --max-time 5 http://127.0.0.1/health >/dev/null; then\n  ln -sfn \"$PREV\" \"$APP/current.new\" && mv -T \"$APP/current.new\" \"$APP/current\"\n  sudo systemctl reload php8.3-fpm\n  echo \"ROLLED BACK to $PREV\" >&2; exit 1\nfi\nlogger -t deploy \"release $REL deployed by ${SUDO_USER:-$USER}\"",
+    "filename": "/usr/local/bin/deploy.sh",
+    "caption": "فحص سلامة، وتبديل ذرّي، وفحص صحة، وتراجع تلقائي، وسطر في السجل."
+   },
+   {
+    "id": "access",
+    "type": "text",
+    "markdown": "## تأمين حساب النشر\n\nيحتاج خط الأنابيب إلى الوصول إلى الإنتاج، مما يجعله هدفًا عالي القيمة. فتعامل مع بيانات اعتماده بحرص.\n\n- **مستخدم `deploy` مخصص**، لا root ولا حساب إنسان، بلا دخول بكلمة مرور.\n- **مفتاح SSH مقيّد**: استخدم خياري `command=` و`restrict` في `authorized_keys` ليشغّل المفتاح سكربت النشر فقط وعبر عنوان CI.\n- **قاعدة `sudoers` ضيقة** تسمح بـ `systemctl reload php8.3-fpm` فقط لا بصدفة (Shell).\n- **بيانات اعتماد قصيرة العمر** حيثما أمكن، كشهادات SSH الموقّعة أو رموز OIDC من CI بدل كلمات مرور طويلة العمر محفوظة كمتغيرات في خط الأنابيب.\n- **فروع محمية ومراجعات إلزامية** في المستودع، لأن من يستطيع تغيير تعريف خط الأنابيب يتحكم بالإنتاج.\n- **أسرار من خزنة أو من المضيف** لا تُودَع أبدًا. ويلتقط فاحص الأسرار في CI الأخطاء.\n\nقارن النهجين: النشر **القائم على الدفع** (يتصل CI بالخادم) يحتاج إلى SSH وارد من CI، أما النشر **القائم على السحب** (وكيل على الخادم يجلب الإصدارات المعتمدة ويطبقها) فلا يحتاج إلى وصول وارد ويقرر الخادم بنفسه ما يثق به. والسحب أكثر أمانًا عمومًا للبيئات الحساسة. وراجع [تقوية SSH على لينكس](/learn/systems-infrastructure-security/linux-ssh-hardening) لجانب SSH."
+   },
+   {
+    "id": "deploy-run",
+    "type": "terminal",
+    "title": "A deployment and a rollback",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "sudo -u deploy /usr/local/bin/deploy.sh 2026.11.3",
+      "output": "portal-2026.11.3.tar.gz: OK\n"
+     },
+     {
+      "cmd": "readlink /var/www/portal/current",
+      "output": "/var/www/portal/releases/20261111-0915"
+     },
+     {
+      "cmd": "journalctl -t deploy --since today --no-pager",
+      "output": "Nov 11 09:15:07 web01 deploy[2211]: release /var/www/portal/releases/20261111-0915 deployed by ci-runner"
+     },
+     {
+      "cmd": "sudo -u deploy /usr/local/bin/deploy.sh 2026.11.4",
+      "output": "portal-2026.11.4.tar.gz: OK\ncurl: (22) The requested URL returned error: 500\nROLLED BACK to /var/www/portal/releases/20261111-0915"
+     }
+    ],
+    "caption": "يُسجَّل النشر الأول. ويفشل الثاني في فحص الصحة فيعود إلى الإصدار السابق من تلقاء نفسه."
+   },
+   {
+    "id": "harden",
+    "type": "text",
+    "markdown": "## الحماية وقت التشغيل بعد النشر\n\nلا ينتهي أمن النشر حين تصل الملفات. أضف ضوابط تجعل الانحراف مرئيًا:\n\n1. **مراقبة سلامة الملفات.** احسب تجزئة مجلد الإصدار عند النشر وقارنه دوريًا، فيطلق أي تعديل يدوي تنبيهًا. راجع [مراقبة سلامة الملفات على لينكس](/learn/systems-infrastructure-security/linux-file-integrity-monitoring).\n2. **شيفرة للقراءة فقط.** اضبط الصلاحيات كي لا يستطيع PHP الكتابة في مجلد الإصدار.\n3. **عطّل التعديل المباشر عبر الصدفة.** أزل وصول SSH البشري الروتيني إلى الإنتاج واستخدم حسابات الطوارئ التي تنبّه أحدًا عند استعمالها.\n4. **تكافؤ البيئات.** ينبغي أن تشغّل بيئة الاختبار الناتج نفسه وبالتقوية نفسها لتكون للاختبارات قيمة.\n5. **الطرح المرحلي.** انشر على خادم واحد أو نسبة صغيرة من الحركة أولًا (Canary)، وراقب معدل الأخطاء، ثم تابع.\n\nوأخيرًا دوّن النشر في سجل التغييرات مع إصدار الناتج وتجزئته؛ فهذا بالضبط ما سيسأل عنه المدققون ومستجيبو الحوادث."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تُبقِ أسرار الإنتاج في متغيرات خط الأنابيب سنوات",
+    "markdown": "مفتاح نشر طويل العمر محفوظ في نظام CI هو مفتاح عام للإنتاج. بدّله وفق جدول، وحصره بخادم واحد وأمر واحد، ونبّه على أي دخول لمستخدم النشر لا يطابق تشغيلًا لخط الأنابيب."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على آلة افتراضية للاختبار تملكها:\n\n1. أنشئ المجلدات `releases` و`shared` و`current` كما هو موضح. ضع `index.php` بسيطًا في مجلدي إصدارين يطبعان نصي إصدار مختلفين.\n2. وجّه `current` إلى الإصدار الأول، ثم بدّل بـ `ln -sfn` و`mv -T`. أعد التحميل وتأكد من التغيير بـ `curl`.\n3. أضف ملف `/health` في أحد الإصدارين يعيد فشلًا وتأكد من أن سكربتك يتراجع.\n4. اجعل مجلد الإصدار مملوكًا لـ root وللقراءة فقط لمستخدم الويب. جرّب كتابة ملف بمستخدم الويب ولاحظ الخطأ.\n5. أنشئ مستخدم `deploy` بمفتاح مقيّد بـ `command=` واختبر أنه لا يستطيع فتح صدفة.\n\nلاحظ كم يستغرق التراجع مقارنة بالإصلاح اليدوي."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "ناتج غير قابل للتغيير",
+      "definition": "ناتج بناء لا يُعدَّل بعد إنشائه، ويعمل الملف نفسه في كل البيئات."
+     },
+     {
+      "term": "إصدار ذرّي",
+      "definition": "تبديل بين الإصدارات يحدث دفعة واحدة دون حالة محدّثة جزئيًا."
+     },
+     {
+      "term": "التراجع",
+      "definition": "العودة إلى الإصدار السابق السليم المعروف."
+     },
+     {
+      "term": "نشر الكناري",
+      "definition": "الطرح لنسبة صغيرة من الخوادم أو الحركة أولًا لاكتشاف المشكلات مبكرًا."
+     },
+     {
+      "term": "نشر الدفع مقابل السحب",
+      "definition": "الدفع: يتصل خط الأنابيب بالخادم. السحب: وكيل على الخادم يجلب الإصدارات المعتمدة."
+     },
+     {
+      "term": "فصل المهام",
+      "definition": "اشتراط أكثر من شخص لنقل التغيير من الشيفرة إلى الإنتاج."
+     },
+     {
+      "term": "انحراف الإعدادات",
+      "definition": "ابتعاد الإنتاج تدريجيًا عما يقوله التحكم بالإصدارات."
+     },
+     {
+      "term": "حساب الطوارئ",
+      "definition": "حساب طوارئ مضبوط بإحكام يطلق استعماله تنبيهات."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يُعد تبديل رابط رمزي طريقة جيدة للإصدار؟",
+      "options": [
+       "ذرّي وسهل العكس",
+       "يشفّر الملفات",
+       "يلغي الحاجة إلى الاختبارات",
+       "يخفي الشيفرة"
+      ],
+      "answer": 0,
+      "explanation": "يرى الزوار الإصدار القديم أو الجديد لا خليطًا، والتراجع هو إعادة توجيه الرابط."
+     },
+     {
+      "question": "مما يحمي مبدأ «ابنِ مرة وانشر مرارًا»؟",
+      "options": [
+       "الشبكات البطيئة",
+       "الفروق بين ما اختُبر وما يعمل في الإنتاج",
+       "الشهادات المنتهية",
+       "أعطال الأقراص"
+      ],
+      "answer": 1,
+      "explanation": "إعادة البناء لكل بيئة قد تعطي نتائج مختلفة. ناتج واحد يبقي الاختبار والإنتاج متطابقين."
+     },
+     {
+      "question": "أي الإعدادات تقوّي حساب النشر؟ اختر كل ما ينطبق.",
+      "options": [
+       "مفتاح مقيّد بـ command= في authorized_keys",
+       "قاعدة sudoers محصورة بأمر إعادة تحميل واحد",
+       "استخدام حساب root",
+       "تبديل المفتاح وفق جدول"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تقييد ما يشغّله المفتاح وتبديله يحدّان الضرر إن تسرّب. أما root فيفعل العكس."
+     },
+     {
+      "question": "لماذا قد يكون النشر بالسحب أكثر أمانًا من الدفع؟",
+      "options": [
+       "لا يحتاج إلى وصول وارد من CI إلى الخادم",
+       "هو أسرع دائمًا",
+       "يتخطى الاختبارات",
+       "لا يحتاج إلى بيانات اعتماد إطلاقًا"
+      ],
+      "answer": 0,
+      "explanation": "يجلب الخادم الإصدارات ويتحقق منها بنفسه، فلا يستطيع خط أنابيب مخترق الدخول إليه."
+     },
+     {
+      "question": "ماذا ينبغي أن تفعل خطوة فحص الصحة بعد تبديل الإصدار؟",
+      "options": [
+       "لا شيء",
+       "تطلق تراجعًا تلقائيًا عند الفشل",
+       "تحذف السجلات",
+       "تفتح المنفذ 22"
+      ],
+      "answer": 1,
+      "explanation": "يقلص التراجع التلقائي المدة التي يبقى فيها إصدار معطوب حيًّا."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\nيحوّل النشر الآمن عبارة «دخل أحدهم وغيّر شيئًا» إلى عملية يمكنك مراجعتها وتكرارها والتراجع عنها. أبقِ كل شيء في التحكم بالإصدارات، وابنِ ناتجًا واحدًا غير قابل للتغيير، وتحقّق منه، وبدّل الإصدارات ذرّيًا، وافحص الصحة مع تراجع تلقائي.\n\nواحمِ المسار نفسه: حساب نشر مخصص ومقيّد، وبيانات اعتماد قصيرة العمر، وفروع محمية، وموافقة شخص ثانٍ، وأسرار خارج الناتج. وبعد ذلك راقب الانحراف بمراقبة سلامة الملفات وشيفرة للقراءة فقط.\n\nوحين تنشر بموثوقية تستطيع اختبار النتيجة منهجيًا: [تقييم ثغرات تطبيقات الويب](/learn/systems-infrastructure-security/web-application-vulnerability-assessment)."
+   }
+  ]
+ }
+}

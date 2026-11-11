@@ -1,0 +1,546 @@
+{
+ "slug": "network-traffic-analysis",
+ "title": "Network Traffic Analysis",
+ "summary": "Capture and read traffic on systems you own with tcpdump and tshark, build a baseline, and recognize scans, beaconing, tunneling and cleartext credentials.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Capture traffic safely with tcpdump and BPF filters",
+  "Read captures with tshark and extract fields, conversations and timing",
+  "Build a baseline of normal traffic and compare it with a suspect period",
+  "Recognize port scans, beaconing, DNS tunneling and cleartext credentials"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "An administrator notices that the outbound traffic of a web server doubled overnight. The firewall shows only allowed connections, the application logs look normal, and no alert has fired. Somebody must answer a simple question: **what is this machine actually saying on the network?**\n\nNetwork traffic analysis answers it by looking at the packets and flows themselves. Logs tell you what software *reported*. Packets tell you what *happened*. Even when the content is encrypted, the metadata still shows who talked to whom, when, how often and how much. This lesson teaches a repeatable method on systems you own: capture, summarize, compare with a baseline and investigate the differences.\n\nCapture traffic only on networks and hosts you own or are explicitly authorized to monitor. Packets contain passwords, personal data and business secrets, so treat capture files as sensitive and delete them when the investigation ends."
+  },
+  {
+   "id": "where",
+   "type": "text",
+   "markdown": "## Step 1: Choose what to collect\n\nDifferent data answers different questions, and each costs a different amount of storage.\n\n| Data | What it shows | Storage cost | Best for |\n|:--|:--|:--|:--|\n| Full packet capture (PCAP) | Every byte | Very high | Deep investigation, short windows |\n| Flow records (NetFlow, IPFIX) | Addresses, ports, bytes, times | Low | Baselines, long-term trends |\n| Protocol metadata (DNS, TLS, HTTP logs) | Names, certificates, requests | Medium | Daily hunting |\n| Connection table (`conntrack`, `ss`) | Live state on one host | None | Quick checks |\n\nUse flows and metadata continuously and keep full packets for short, targeted windows. **Where** you capture matters as much as what you capture. On a host you see only that host. On a switch you need a **SPAN (mirror) port** or a **network tap** to see traffic between other devices. Capturing at the edge shows traffic after NAT, so the inside address is hidden, while capturing inside the network shows the real source. The topology choices are discussed in [Network Security Architecture](/learn/systems-infrastructure-security/network-security-architecture)."
+  },
+  {
+   "id": "capture",
+   "type": "text",
+   "markdown": "## Step 2: Capture with tcpdump\n\n`tcpdump` is available on nearly every Linux server. It takes a **BPF (Berkeley Packet Filter)** expression that selects packets in the kernel, so you capture only what you need. Useful options:\n\n- `-i eth0` selects the interface, and `-nn` turns off name and port resolution, which is faster and avoids generating extra DNS traffic.\n- `-s 0` keeps the whole packet. `-w file.pcap` writes a file instead of printing.\n- `-C 100 -W 5` rotates files at 100 MB and keeps five, so a long capture cannot fill the disk.\n\nAlways filter out your own SSH session, otherwise the capture records itself."
+  },
+  {
+   "id": "tcpdump",
+   "type": "terminal",
+   "title": "Capturing on a web server you own",
+   "prompt": "web01$",
+   "lines": [
+    {
+     "cmd": "sudo tcpdump -i eth0 -nn -s 0 -C 100 -W 5 -w /var/tmp/web01.pcap 'not port 22'",
+     "output": "tcpdump: listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n^C48210 packets captured\n48267 packets received by filter\n0 packets dropped by kernel",
+     "comment": "0 packets dropped means the capture is complete. A non-zero value means you lost data and should narrow the filter."
+    },
+    {
+     "cmd": "sudo tcpdump -i eth0 -nn -c 3 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0 and dst port 443'",
+     "output": "10:02:11.104233 IP 198.51.100.23.50122 > 192.0.2.50.443: Flags [S], seq 1042, win 64240, length 0\n10:02:11.104871 IP 198.51.100.24.41876 > 192.0.2.50.443: Flags [S], seq 7731, win 64240, length 0\n10:02:11.106002 IP 198.51.100.25.39810 > 192.0.2.50.443: Flags [S], seq 2204, win 64240, length 0",
+     "comment": "Only new connection attempts (SYN without ACK) to port 443 are shown."
+    },
+    {
+     "cmd": "sudo tcpdump -i eth0 -nn -c 2 'dst host 192.0.2.50 and (port 80 or port 21 or port 23)'",
+     "output": "10:07:40.511002 IP 192.0.2.60.52044 > 192.0.2.50.21: Flags [P.], seq 1:15, ack 1, length 14: FTP: USER backup\n10:07:40.511950 IP 192.0.2.60.52044 > 192.0.2.50.21: Flags [P.], seq 15:30, ack 1, length 15: FTP: PASS ********",
+     "comment": "A login crossed the network in cleartext. Even with the password hidden here, it is visible in the raw capture. Replace FTP with SFTP."
+    }
+   ]
+  },
+  {
+   "id": "tshark",
+   "type": "text",
+   "markdown": "## Step 3: Summarize before you read\n\nOpening a 100 MB capture and scrolling is a mistake. Start from summaries, then drill down.\n\n1. **Who talks the most?** List endpoints by bytes. An unknown address near the top deserves a look.\n2. **Which protocols?** A web server that suddenly shows DNS over TCP, ICMP payloads or an unfamiliar port has changed behavior.\n3. **What is the timing?** Humans are irregular. Software is not.\n4. **What is in the clear?** Check HTTP, FTP, Telnet and unencrypted database protocols for credentials.\n\n`tshark` is the command-line version of Wireshark. Its `-T fields -e` option prints exactly the columns you ask for, which makes captures easy to sort, count and compare in a script."
+  },
+  {
+   "id": "tshark-term",
+   "type": "terminal",
+   "title": "Hunting in a capture with tshark",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "tshark -r web01.pcap -q -z endpoints,ip | head -6",
+     "output": "================ IPv4 Endpoints ================\n                 |  Packets | Bytes |\n192.0.2.50         48210    61 MB\n203.0.113.99        1480   44 MB\n198.51.100.23        902    1 MB",
+     "comment": "203.0.113.99 received 44 MB from a web server that should mostly send pages to many clients. This is the lead to follow."
+    },
+    {
+     "cmd": "tshark -r web01.pcap -Y 'ip.dst==203.0.113.99 && tcp.flags.syn==1 && tcp.flags.ack==0' -T fields -e frame.time_relative -e ip.src",
+     "output": "60.012\t192.0.2.50\n120.015\t192.0.2.50\n180.011\t192.0.2.50\n240.016\t192.0.2.50",
+     "comment": "A new connection exactly every 60 seconds is beaconing: software checking in on a schedule, not a person browsing."
+    },
+    {
+     "cmd": "tshark -r web01.pcap -Y 'dns.flags.response==0 && dns.qry.name matches \"^[a-z0-9]{30,}\\\\.\"' -T fields -e ip.src -e dns.qry.name | head -2",
+     "output": "192.0.2.50\tmfrgg43jnzqxe5dpnvtgq2lunbsw4zdsmfxgi.example.net\n192.0.2.50\tnb2gk43fmrzwk3tbnzsxg5dpobqxgzlsmuzte.example.net",
+     "comment": "Long random labels under one domain suggest DNS tunneling. See DNS Security and DNS Filtering for the controls."
+    }
+   ]
+  },
+  {
+   "id": "method-anim",
+   "type": "animation",
+   "kind": "cycle",
+   "title": "A repeatable analysis method",
+   "caption": "Analysis is a loop. Each finding raises a new question that sends you back to the data.",
+   "data": {
+    "center": "Traffic analysis",
+    "items": [
+     {
+      "label": "Question",
+      "sub": "What do you need to know?"
+     },
+     {
+      "label": "Collect",
+      "sub": "Capture at the right place"
+     },
+     {
+      "label": "Summarize",
+      "sub": "Endpoints, protocols, volume"
+     },
+     {
+      "label": "Compare",
+      "sub": "Against the baseline"
+     },
+     {
+      "label": "Investigate",
+      "sub": "Drill into the outliers"
+     },
+     {
+      "label": "Report",
+      "sub": "Record evidence, fix, monitor"
+     }
+    ],
+    "steps": [
+     {
+      "item": 0,
+      "caption": "Start from a specific question, for example why outbound traffic doubled."
+     },
+     {
+      "item": 1,
+      "caption": "Capture on the host or a mirror port with a filter that excludes your own session."
+     },
+     {
+      "item": 2,
+      "caption": "Count bytes per endpoint, list protocols and note the busiest ports."
+     },
+     {
+      "item": 3,
+      "caption": "Compare with last week's normal profile. What is new, larger or more regular?"
+     },
+     {
+      "item": 4,
+      "caption": "Follow the unusual stream: its timing, its size and what the process on the host is."
+     },
+     {
+      "item": 5,
+      "caption": "Document the evidence, contain or fix the cause and add a detection for next time."
+     }
+    ]
+   }
+  },
+  {
+   "id": "baseline",
+   "type": "text",
+   "markdown": "## Step 4: Know what normal looks like\n\nAnomalies only exist relative to a baseline. Record, for each important server: its usual peers, ports, daily volume, busiest hours and DNS names. Keep a week of flow data at minimum, because weekends and month-end jobs differ from weekdays. Then use this table to interpret what you see.\n\n| Pattern | Looks like | Likely meaning | Where to confirm |\n|:--|:--|:--|:--|\n| Port scan | One source, many ports or hosts, tiny packets | Reconnaissance or a misconfigured tool | Firewall deny counters, `ss` on targets |\n| Beaconing | Same size, same interval to one address | Malware check-in or a legitimate agent | Process list, `ss -tp` |\n| Large upload | Outbound bytes far above inbound to a new address | Backup or data exfiltration | Application logs, user activity |\n| DNS tunneling | Long labels, many unique names | Data hidden in DNS | Resolver query logs |\n| Cleartext login | Readable credentials | Weak protocol in use | Disable the service |\n\nA match is a **lead, not a verdict**. A backup agent beacons too. Confirm with the owning team, the process on the host and a second data source before you declare an incident.\n\nWrite down your findings as you go. For each lead, note the time window, the filter or command you used, the result and your conclusion. Another engineer should be able to repeat your steps and reach the same answer. Store the evidence with restricted access and a recorded checksum, such as the output of `sha256sum lab.pcap`, so you can show later that the file was not altered."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Encryption changes what you can see",
+   "markdown": "With TLS you cannot read the content, but you still see the destination, the server name in the handshake, the certificate, sizes and timing. That is usually enough to find beaconing and large uploads. Do not decrypt traffic unless policy, privacy law and approvals allow it, and never keep session keys longer than the investigation needs."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a Linux VM you own, with Wireshark or tshark installed.\n\n1. Start a capture with `sudo tcpdump -i any -nn -w lab.pcap` and generate some traffic: `curl http://example.com`, `ping -c 3 192.0.2.1`, and a few `dig` lookups.\n2. Stop it with Ctrl+C and run `tshark -r lab.pcap -q -z endpoints,ip`.\n3. List the DNS names you looked up with `tshark -r lab.pcap -Y dns.flags.response==0 -T fields -e dns.qry.name`.\n4. Make a repeating connection with `while true; do curl -s http://example.com >/dev/null; sleep 30; done`, capture for three minutes and print `frame.time_relative` for the SYN packets. Describe the pattern.\n5. Write down what a baseline for this VM would contain."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "PCAP",
+     "definition": "A file holding captured packets."
+    },
+    {
+     "term": "BPF",
+     "definition": "A filter language used to select packets at capture time."
+    },
+    {
+     "term": "SPAN port",
+     "definition": "A switch port that receives a copy of traffic from other ports."
+    },
+    {
+     "term": "Network tap",
+     "definition": "A device that copies traffic from a link without disturbing it."
+    },
+    {
+     "term": "Flow record",
+     "definition": "A summary of a conversation: addresses, ports, bytes and times."
+    },
+    {
+     "term": "Baseline",
+     "definition": "A record of normal behavior used to find anomalies."
+    },
+    {
+     "term": "Beaconing",
+     "definition": "Regular, repeated check-ins to a remote address."
+    },
+    {
+     "term": "Exfiltration",
+     "definition": "Unauthorized transfer of data out of a network."
+    },
+    {
+     "term": "Port scan",
+     "definition": "Probing many ports or hosts to find listening services."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "A server contacts one external address every 60 seconds with packets of identical size. What is this pattern called?",
+     "options": [
+      "Beaconing",
+      "A port scan",
+      "Fragmentation",
+      "Amplification"
+     ],
+     "answer": 0,
+     "explanation": "Regular intervals and sizes indicate automated check-ins. It needs confirmation, since legitimate agents behave the same way."
+    },
+    {
+     "question": "Why use -nn with tcpdump?",
+     "options": [
+      "It disables name and port resolution, avoiding delay and extra DNS traffic",
+      "It encrypts the capture file",
+      "It captures only TCP",
+      "It increases the snapshot length"
+     ],
+     "answer": 0,
+     "explanation": "Resolution slows output and can create DNS lookups that pollute the data you are examining."
+    },
+    {
+     "question": "Which data sources are suitable for long-term baselines at low storage cost? Choose all that apply.",
+     "options": [
+      "Flow records",
+      "Full packet capture of every link",
+      "DNS and TLS metadata logs",
+      "Screenshots of dashboards"
+     ],
+     "answer": [
+      0,
+      2
+     ],
+     "explanation": "Flows and metadata are compact and long-lived. Full capture is heavy and best kept for short windows."
+    },
+    {
+     "question": "You find a plaintext FTP login in a capture. What is the best fix?",
+     "options": [
+      "Replace FTP with SFTP or another encrypted protocol",
+      "Delete the capture file only",
+      "Change the FTP port",
+      "Block ICMP"
+     ],
+     "answer": 0,
+     "explanation": "The weakness is the protocol itself. Hiding the evidence or changing ports does not protect the password."
+    },
+    {
+     "question": "What should you do before declaring a suspicious traffic pattern an incident?",
+     "options": [
+      "Confirm with the system owner, the host process and a second data source",
+      "Reboot the server",
+      "Block the destination country",
+      "Disable logging"
+     ],
+     "answer": 0,
+     "explanation": "Traffic patterns are leads. Corroboration prevents false alarms and keeps evidence intact."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Traffic analysis shows what systems actually do on the network, even when payloads are encrypted.\n- Collect the right data: **flows and metadata** all the time, **full packets** for short windows, from the correct vantage point.\n- Capture with `tcpdump` and BPF filters, rotate files and exclude your own session.\n- Summarize with `tshark` before reading: endpoints, protocols, timing and cleartext.\n- Compare with a **baseline** and treat each match as a lead to confirm.\n- Turn what you find into continuous detection with [Network Security Monitoring](/learn/systems-infrastructure-security/network-security-monitoring)."
+  }
+ ],
+ "ar": {
+  "title": "تحليل حركة الشبكة",
+  "summary": "التقط الحركة واقرأها على أنظمة تملكها باستخدام tcpdump وtshark، وابنِ خط أساس، وتعرّف على المسح والإشارات الدورية والأنفاق وبيانات الاعتماد الصريحة.",
+  "objectives": [
+   "التقاط الحركة بأمان باستخدام tcpdump ومرشحات BPF",
+   "قراءة الالتقاطات باستخدام tshark واستخراج الحقول والمحادثات والتوقيت",
+   "بناء خط أساس للحركة الطبيعية ومقارنته بفترة مشبوهة",
+   "التعرف على مسح المنافذ والإشارات الدورية وأنفاق DNS وبيانات الاعتماد الصريحة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يلاحظ مسؤول نظام أن الحركة الصادرة من خادم ويب تضاعفت خلال الليل. جدار الحماية لا يُظهر إلا اتصالات مسموحة، وسجلات التطبيق تبدو طبيعية، ولم ينطلق أي تنبيه. لا بد أن يجيب أحدهم عن سؤال بسيط: **ماذا يقول هذا الجهاز فعلًا على الشبكة؟**\n\nيجيب تحليل حركة الشبكة عن ذلك بالنظر إلى الحزم والتدفقات نفسها. تخبرك السجلات بما *أبلغ عنه* البرنامج، وتخبرك الحزم بما *حدث*. وحتى عندما يكون المحتوى مشفرًا تبقى البيانات الوصفية تُظهر من تحدث إلى من، ومتى، وكم مرة، وبأي حجم. يعلّمك هذا الدرس طريقة قابلة للتكرار على أنظمة تملكها: التقاط ثم تلخيص ثم مقارنة بخط الأساس ثم تحقيق في الفروق.\n\nلا تلتقط الحركة إلا على شبكات ومضيفين تملكهم أو لديك تفويض صريح بمراقبتهم. تحتوي الحزم على كلمات مرور وبيانات شخصية وأسرار عمل، لذلك تعامل مع ملفات الالتقاط بوصفها حساسة واحذفها عند انتهاء التحقيق."
+   },
+   {
+    "id": "where",
+    "type": "text",
+    "markdown": "## الخطوة 1: اختر ما تجمعه\n\nتجيب البيانات المختلفة عن أسئلة مختلفة، ولكل منها كلفة تخزين مختلفة.\n\n| البيانات | ما تُظهره | كلفة التخزين | الأنسب لـ |\n|:--|:--|:--|:--|\n| التقاط الحزم الكامل (PCAP) | كل بايت | مرتفعة جدًا | التحقيق العميق ونوافذ قصيرة |\n| سجلات التدفق (NetFlow وIPFIX) | العناوين والمنافذ والبايتات والأوقات | منخفضة | خطوط الأساس والاتجاهات الطويلة |\n| بيانات البروتوكول الوصفية (سجلات DNS وTLS وHTTP) | الأسماء والشهادات والطلبات | متوسطة | الصيد اليومي |\n| جدول الاتصالات (`conntrack` و`ss`) | الحالة الحية على مضيف واحد | لا شيء | الفحوص السريعة |\n\nاستخدم التدفقات والبيانات الوصفية باستمرار، واحتفظ بالحزم الكاملة لنوافذ قصيرة مستهدفة. و**مكان** الالتقاط يهم بقدر ما تلتقطه. على المضيف ترى ذلك المضيف فقط. وعلى المبدّل تحتاج إلى **منفذ SPAN (منفذ عكس)** أو **وصلة تفرّع (Tap)** لترى الحركة بين أجهزة أخرى. الالتقاط عند الحافة يُظهر الحركة بعد NAT فيختفي العنوان الداخلي، بينما الالتقاط داخل الشبكة يُظهر المصدر الحقيقي. تناقش خيارات التوبولوجيا في درس [معمارية أمن الشبكات](/learn/systems-infrastructure-security/network-security-architecture)."
+   },
+   {
+    "id": "capture",
+    "type": "text",
+    "markdown": "## الخطوة 2: التقط باستخدام tcpdump\n\nيتوفر `tcpdump` تقريبًا على كل خادم Linux. يقبل تعبير **BPF (مرشح الحزم من بيركلي)** يختار الحزم داخل النواة، فتلتقط ما تحتاجه فقط. أهم الخيارات:\n\n- يختار `-i eth0` الواجهة، ويعطّل `-nn` تحليل الأسماء والمنافذ، وهذا أسرع ويتجنب توليد حركة DNS إضافية.\n- يحتفظ `-s 0` بالحزمة كاملة، ويكتب `-w file.pcap` ملفًا بدل الطباعة.\n- يدوّر `-C 100 -W 5` الملفات عند 100 ميغابايت ويبقي خمسة، فلا يستطيع التقاط طويل أن يملأ القرص.\n\nاستبعد دائمًا جلسة SSH الخاصة بك، وإلا سجّل الالتقاط نفسه."
+   },
+   {
+    "id": "tcpdump",
+    "type": "terminal",
+    "title": "الالتقاط على خادم ويب تملكه",
+    "prompt": "web01$",
+    "lines": [
+     {
+      "cmd": "sudo tcpdump -i eth0 -nn -s 0 -C 100 -W 5 -w /var/tmp/web01.pcap 'not port 22'",
+      "output": "tcpdump: listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n^C48210 packets captured\n48267 packets received by filter\n0 packets dropped by kernel",
+      "comment": "القيمة 0 للحزم المفقودة تعني أن الالتقاط كامل. أما القيمة غير الصفرية فتعني فقدان بيانات ويجب تضييق المرشح."
+     },
+     {
+      "cmd": "sudo tcpdump -i eth0 -nn -c 3 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0 and dst port 443'",
+      "output": "10:02:11.104233 IP 198.51.100.23.50122 > 192.0.2.50.443: Flags [S], seq 1042, win 64240, length 0\n10:02:11.104871 IP 198.51.100.24.41876 > 192.0.2.50.443: Flags [S], seq 7731, win 64240, length 0\n10:02:11.106002 IP 198.51.100.25.39810 > 192.0.2.50.443: Flags [S], seq 2204, win 64240, length 0",
+      "comment": "تُعرض محاولات الاتصال الجديدة فقط (SYN بدون ACK) نحو المنفذ 443."
+     },
+     {
+      "cmd": "sudo tcpdump -i eth0 -nn -c 2 'dst host 192.0.2.50 and (port 80 or port 21 or port 23)'",
+      "output": "10:07:40.511002 IP 192.0.2.60.52044 > 192.0.2.50.21: Flags [P.], seq 1:15, ack 1, length 14: FTP: USER backup\n10:07:40.511950 IP 192.0.2.60.52044 > 192.0.2.50.21: Flags [P.], seq 15:30, ack 1, length 15: FTP: PASS ********",
+      "comment": "مرّ تسجيل دخول عبر الشبكة بنص صريح. وحتى مع إخفاء كلمة المرور هنا فهي ظاهرة في الالتقاط الخام. استبدل FTP بـ SFTP."
+     }
+    ]
+   },
+   {
+    "id": "tshark",
+    "type": "text",
+    "markdown": "## الخطوة 3: لخّص قبل أن تقرأ\n\nفتح ملف التقاط بحجم 100 ميغابايت والتمرير فيه خطأ. ابدأ بالملخصات ثم تعمّق.\n\n1. **من يتحدث أكثر؟** اعرض النقاط الطرفية بحسب البايتات. العنوان المجهول قرب القمة يستحق نظرة.\n2. **ما البروتوكولات؟** خادم ويب يُظهر فجأة DNS عبر TCP أو حمولات ICMP أو منفذًا غير مألوف قد غيّر سلوكه.\n3. **ما التوقيت؟** البشر غير منتظمين، أما البرمجيات فمنتظمة.\n4. **ما الذي يمر بنص صريح؟** افحص HTTP وFTP وTelnet وبروتوكولات قواعد البيانات غير المشفرة بحثًا عن بيانات اعتماد.\n\n`tshark` هو النسخة بسطر الأوامر من Wireshark. يطبع الخيار `-T fields -e` الأعمدة التي تطلبها بالضبط، فيسهل فرز الالتقاطات وعدّها ومقارنتها ضمن سكربت."
+   },
+   {
+    "id": "tshark-term",
+    "type": "terminal",
+    "title": "الصيد في التقاط باستخدام tshark",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "tshark -r web01.pcap -q -z endpoints,ip | head -6",
+      "output": "================ IPv4 Endpoints ================\n                 |  Packets | Bytes |\n192.0.2.50         48210    61 MB\n203.0.113.99        1480   44 MB\n198.51.100.23        902    1 MB",
+      "comment": "استقبل العنوان 203.0.113.99 ما حجمه 44 ميغابايت من خادم ويب يُفترض أن يرسل صفحات إلى عملاء كثيرين. هذا هو الخيط الذي نتتبعه."
+     },
+     {
+      "cmd": "tshark -r web01.pcap -Y 'ip.dst==203.0.113.99 && tcp.flags.syn==1 && tcp.flags.ack==0' -T fields -e frame.time_relative -e ip.src",
+      "output": "60.012\t192.0.2.50\n120.015\t192.0.2.50\n180.011\t192.0.2.50\n240.016\t192.0.2.50",
+      "comment": "اتصال جديد كل 60 ثانية بالضبط هو إشارة دورية (Beaconing): برنامج يسجّل حضوره وفق جدول لا شخص يتصفح."
+     },
+     {
+      "cmd": "tshark -r web01.pcap -Y 'dns.flags.response==0 && dns.qry.name matches \"^[a-z0-9]{30,}\\\\.\"' -T fields -e ip.src -e dns.qry.name | head -2",
+      "output": "192.0.2.50\tmfrgg43jnzqxe5dpnvtgq2lunbsw4zdsmfxgi.example.net\n192.0.2.50\tnb2gk43fmrzwk3tbnzsxg5dpobqxgzlsmuzte.example.net",
+      "comment": "تسميات طويلة عشوائية تحت نطاق واحد توحي بنفق DNS. راجع درس أمن DNS والتصفية عبر DNS للضوابط."
+     }
+    ]
+   },
+   {
+    "id": "method-anim",
+    "type": "animation",
+    "kind": "cycle",
+    "title": "منهجية تحليل قابلة للتكرار",
+    "caption": "التحليل حلقة. كل اكتشاف يثير سؤالًا جديدًا يعيدك إلى البيانات.",
+    "data": {
+     "center": "تحليل الحركة",
+     "items": [
+      {
+       "label": "السؤال",
+       "sub": "ما الذي تريد معرفته؟"
+      },
+      {
+       "label": "الجمع",
+       "sub": "التقط في المكان الصحيح"
+      },
+      {
+       "label": "التلخيص",
+       "sub": "النقاط الطرفية والبروتوكولات والحجم"
+      },
+      {
+       "label": "المقارنة",
+       "sub": "مع خط الأساس"
+      },
+      {
+       "label": "التحقيق",
+       "sub": "تعمّق في القيم الشاذة"
+      },
+      {
+       "label": "التقرير",
+       "sub": "سجّل الأدلة وأصلح وراقب"
+      }
+     ],
+     "steps": [
+      {
+       "item": 0,
+       "caption": "ابدأ بسؤال محدد، مثل: لماذا تضاعفت الحركة الصادرة؟"
+      },
+      {
+       "item": 1,
+       "caption": "التقط على المضيف أو منفذ عكس بمرشح يستبعد جلستك."
+      },
+      {
+       "item": 2,
+       "caption": "عُدّ البايتات لكل نقطة طرفية واذكر البروتوكولات وأكثر المنافذ نشاطًا."
+      },
+      {
+       "item": 3,
+       "caption": "قارن بملف الأسبوع الماضي الطبيعي. ما الجديد أو الأكبر أو الأكثر انتظامًا؟"
+      },
+      {
+       "item": 4,
+       "caption": "تتبع التدفق غير المعتاد: توقيته وحجمه وما العملية المسؤولة على المضيف."
+      },
+      {
+       "item": 5,
+       "caption": "وثّق الأدلة واحتوِ السبب أو أصلحه وأضف كشفًا للمرة القادمة."
+      }
+     ]
+    }
+   },
+   {
+    "id": "baseline",
+    "type": "text",
+    "markdown": "## الخطوة 4: اعرف شكل الوضع الطبيعي\n\nلا توجد الشذوذات إلا بالنسبة إلى خط أساس. سجّل لكل خادم مهم: أقرانه المعتادين ومنافذه وحجمه اليومي وساعات ذروته وأسماء DNS التي يطلبها. احتفظ بأسبوع من بيانات التدفق على الأقل، لأن عطلات نهاية الأسبوع ومهام نهاية الشهر تختلف عن أيام العمل. ثم استخدم هذا الجدول لتفسير ما تراه.\n\n| النمط | كيف يبدو | المعنى المرجح | أين تتأكد |\n|:--|:--|:--|:--|\n| مسح المنافذ (Port scan) | مصدر واحد ومنافذ أو مضيفون كثيرون وحزم صغيرة | استطلاع أو أداة سيئة الإعداد | عدّادات الرفض في جدار الحماية و`ss` على الأهداف |\n| الإشارة الدورية (Beaconing) | الحجم نفسه والفاصل نفسه نحو عنوان واحد | تسجيل حضور برمجية خبيثة أو وكيل مشروع | قائمة العمليات و`ss -tp` |\n| رفع كبير | بايتات صادرة تفوق الواردة كثيرًا نحو عنوان جديد | نسخ احتياطي أو تسريب بيانات | سجلات التطبيق ونشاط المستخدم |\n| أنفاق DNS | تسميات طويلة وأسماء فريدة كثيرة | بيانات مخفية في DNS | سجلات استعلام المحلِّل |\n| تسجيل دخول صريح | بيانات اعتماد مقروءة | بروتوكول ضعيف قيد الاستخدام | عطّل الخدمة |\n\nالمطابقة **خيط لا حكم**. فوكيل النسخ الاحتياطي يرسل إشارات دورية أيضًا. تأكد مع الفريق المالك والعملية على المضيف ومصدر بيانات ثانٍ قبل إعلان حادثة.\n\nدوّن ما تجده أولًا بأول. لكل خيط سجّل النافذة الزمنية والمرشح أو الأمر الذي استخدمته والنتيجة واستنتاجك. ينبغي أن يستطيع مهندس آخر تكرار خطواتك والوصول إلى الجواب نفسه. احفظ الأدلة بصلاحيات مقيّدة مع بصمة مسجّلة، مثل ناتج `sha256sum lab.pcap`، لتثبت لاحقًا أن الملف لم يُعدَّل."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "التشفير يغيّر ما تستطيع رؤيته",
+    "markdown": "مع TLS لا تستطيع قراءة المحتوى، لكنك ترى الوجهة واسم الخادم في المصافحة والشهادة والأحجام والتوقيت. وهذا يكفي غالبًا لاكتشاف الإشارات الدورية والرفع الكبير. لا تفكّ تشفير الحركة إلا إذا سمحت السياسة وقانون الخصوصية والموافقات بذلك، ولا تحتفظ بمفاتيح الجلسات أطول مما يتطلبه التحقيق."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم آلة Linux افتراضية تملكها ومثبّت عليها Wireshark أو tshark.\n\n1. ابدأ التقاطًا بالأمر `sudo tcpdump -i any -nn -w lab.pcap` وولّد بعض الحركة: `curl http://example.com` و`ping -c 3 192.0.2.1` وبضعة استعلامات `dig`.\n2. أوقفه بـ Ctrl+C ونفّذ `tshark -r lab.pcap -q -z endpoints,ip`.\n3. اعرض أسماء DNS التي بحثت عنها بالأمر `tshark -r lab.pcap -Y dns.flags.response==0 -T fields -e dns.qry.name`.\n4. أنشئ اتصالًا متكررًا بالأمر `while true; do curl -s http://example.com >/dev/null; sleep 30; done` والتقط لمدة ثلاث دقائق ثم اطبع `frame.time_relative` لحزم SYN. صف النمط.\n5. اكتب ما الذي سيحتويه خط الأساس لهذه الآلة."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "PCAP",
+      "definition": "ملف يحتوي على حزم ملتقطة."
+     },
+     {
+      "term": "BPF",
+      "definition": "لغة مرشحات تُستخدم لاختيار الحزم أثناء الالتقاط."
+     },
+     {
+      "term": "منفذ SPAN",
+      "definition": "منفذ مبدّل يستقبل نسخة من حركة منافذ أخرى."
+     },
+     {
+      "term": "وصلة التفرّع (Tap)",
+      "definition": "جهاز ينسخ الحركة من وصلة دون التأثير عليها."
+     },
+     {
+      "term": "سجل التدفق",
+      "definition": "ملخص لمحادثة: العناوين والمنافذ والبايتات والأوقات."
+     },
+     {
+      "term": "خط الأساس",
+      "definition": "سجل للسلوك الطبيعي يُستخدم لاكتشاف الشذوذ."
+     },
+     {
+      "term": "الإشارة الدورية",
+      "definition": "تسجيل حضور منتظم ومتكرر نحو عنوان بعيد."
+     },
+     {
+      "term": "التسريب",
+      "definition": "نقل غير مصرح به للبيانات خارج الشبكة."
+     },
+     {
+      "term": "مسح المنافذ",
+      "definition": "فحص منافذ أو مضيفين كثيرين لإيجاد الخدمات المستمعة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "يتصل خادم بعنوان خارجي واحد كل 60 ثانية بحزم متطابقة الحجم. ما اسم هذا النمط؟",
+      "options": [
+       "الإشارة الدورية",
+       "مسح المنافذ",
+       "التجزئة",
+       "التضخيم"
+      ],
+      "answer": 0,
+      "explanation": "الفواصل والأحجام المنتظمة تدل على تسجيل حضور آلي. ويحتاج إلى تأكيد لأن الوكلاء المشروعين يتصرفون هكذا أيضًا."
+     },
+     {
+      "question": "لماذا نستخدم -nn مع tcpdump؟",
+      "options": [
+       "يعطّل تحليل الأسماء والمنافذ فيتجنب التأخير وحركة DNS الإضافية",
+       "يشفّر ملف الالتقاط",
+       "يلتقط TCP فقط",
+       "يزيد طول اللقطة"
+      ],
+      "answer": 0,
+      "explanation": "يبطئ التحليل المخرجات وقد ينشئ استعلامات DNS تلوّث البيانات التي تفحصها."
+     },
+     {
+      "question": "أي مصادر البيانات مناسبة لخطوط الأساس طويلة الأمد بكلفة تخزين منخفضة؟ اختر كل ما ينطبق.",
+      "options": [
+       "سجلات التدفق",
+       "التقاط حزم كامل لكل وصلة",
+       "سجلات بيانات DNS وTLS الوصفية",
+       "لقطات شاشة للوحات المعلومات"
+      ],
+      "answer": [
+       0,
+       2
+      ],
+      "explanation": "التدفقات والبيانات الوصفية مدمجة وتبقى طويلًا. أما الالتقاط الكامل فثقيل ويناسب النوافذ القصيرة."
+     },
+     {
+      "question": "وجدت تسجيل دخول FTP بنص صريح في التقاط. ما أفضل إصلاح؟",
+      "options": [
+       "استبدال FTP بـ SFTP أو بروتوكول مشفر آخر",
+       "حذف ملف الالتقاط فقط",
+       "تغيير منفذ FTP",
+       "حجب ICMP"
+      ],
+      "answer": 0,
+      "explanation": "الضعف في البروتوكول نفسه. إخفاء الدليل أو تغيير المنفذ لا يحمي كلمة المرور."
+     },
+     {
+      "question": "ماذا ينبغي أن تفعل قبل إعلان نمط حركة مشبوه حادثة؟",
+      "options": [
+       "التأكد مع مالك النظام والعملية على المضيف ومصدر بيانات ثانٍ",
+       "إعادة تشغيل الخادم",
+       "حجب الدولة المقصودة",
+       "تعطيل التسجيل"
+      ],
+      "answer": 0,
+      "explanation": "أنماط الحركة خيوط. التأكيد المتبادل يمنع الإنذارات الكاذبة ويحفظ الأدلة."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يُظهر تحليل الحركة ما تفعله الأنظمة فعلًا على الشبكة، حتى عندما تكون الحمولات مشفرة.\n- اجمع البيانات الصحيحة: **التدفقات والبيانات الوصفية** دائمًا، و**الحزم الكاملة** لنوافذ قصيرة، ومن نقطة المراقبة الصحيحة.\n- التقط باستخدام `tcpdump` ومرشحات BPF، ودوّر الملفات، واستبعد جلستك.\n- لخّص بـ `tshark` قبل القراءة: النقاط الطرفية والبروتوكولات والتوقيت والنص الصريح.\n- قارن بـ**خط الأساس** وعامل كل مطابقة كخيط يحتاج إلى تأكيد.\n- حوّل ما تجده إلى كشف مستمر عبر درس [المراقبة الأمنية للشبكات](/learn/systems-infrastructure-security/network-security-monitoring)."
+   }
+  ]
+ }
+}

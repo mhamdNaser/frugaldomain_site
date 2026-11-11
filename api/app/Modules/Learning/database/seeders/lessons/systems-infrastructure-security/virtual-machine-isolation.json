@@ -1,0 +1,592 @@
+{
+ "slug": "virtual-machine-isolation",
+ "title": "Virtual Machine Isolation",
+ "summary": "Understand what keeps VMs apart in Proxmox and shrink the device surface, limit resources and separate trust levels.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Name the layers that isolate a VM from its host and neighbors",
+  "Remove unneeded devices and use virtio models",
+  "Evaluate passthrough, KSM and SMT trade-offs",
+  "Apply resource limits and place guests by trust level"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Virtualization lets one physical server run many systems that should not trust each other: a public web server next to an internal database, or one customer's workload next to another's. The promise is that a compromise inside one virtual machine (VM) stays inside it.\n\nThat promise is strong, but it is not magic. Isolation is the sum of hardware features, hypervisor code, device models and your own configuration. A VM with a USB controller, a passed-through disk controller and an outdated agent is much less isolated than a plain one. This lesson shows what keeps VMs apart in Proxmox VE, where the boundary is thinnest, and how to tighten it. It builds on [virtualization escape risks](/learn/systems-infrastructure-security/virtualization-escape-risks) and the [hypervisor attack surface](/learn/systems-infrastructure-security/hypervisor-attack-surface)."
+  },
+  {
+   "type": "text",
+   "id": "layers",
+   "markdown": "## What keeps VMs apart\n\nProxmox VE uses KVM, the Linux kernel's hypervisor, with QEMU as the device emulator. Each VM is one QEMU process on the host. Four layers cooperate.\n\n| Layer | What it enforces | Weak point |\n|:--|:--|:--|\n| CPU virtualization (Intel VT-x, AMD-V) | Guest code runs in a restricted mode and cannot touch host registers | CPU flaws such as speculative-execution leaks |\n| Memory (EPT or NPT page tables) | Each guest sees only its own memory pages | Shared pages and side channels |\n| Device models (QEMU) | Guests talk to emulated hardware, never real hardware | Bugs in complex emulators |\n| Host controls (Linux permissions, cgroups, firewall) | Limits the QEMU process and its resources | Misconfiguration |\n\nThe most exposed part is the device model. QEMU is a large program written mostly in C, and the guest controls the input to every emulated device. A bug in a rarely used device can give a guest code execution in the host process. That is why the guiding rule is simple: **fewer devices, fewer bugs reachable.**"
+  },
+  {
+   "type": "text",
+   "id": "reduce",
+   "markdown": "## Step 1: Shrink the device surface\n\nStart from what a VM really needs and remove the rest. Check the configuration of a typical web server VM."
+  },
+  {
+   "type": "terminal",
+   "id": "reduce-term",
+   "title": "pve1 - reduce devices",
+   "lines": [
+    {
+     "cmd": "qm config 105",
+     "output": "agent: 1\nboot: order=scsi0\ncores: 2\ncpu: x86-64-v2-AES\nide2: local:iso/debian-12.iso,media=cdrom\nmemory: 4096\nname: web01\nnet0: e1000=BC:24:11:AA:BB:01,bridge=vmbr0,firewall=1\nscsi0: local-lvm:vm-105-disk-0,size=32G\nscsihw: lsi\nusb0: host=1234:5678\nserial0: socket",
+     "comment": "Several risks: an old emulated NIC and disk controller, a leftover ISO, a USB passthrough and a serial port."
+    },
+    {
+     "cmd": "qm set 105 --delete ide2,usb0,serial0",
+     "comment": "Remove the CD drive, USB device and serial port."
+    },
+    {
+     "cmd": "qm set 105 --net0 virtio=BC:24:11:AA:BB:01,bridge=vmbr0,firewall=1",
+     "comment": "Use paravirtualized virtio NIC (keep the same MAC to preserve guest network config)."
+    },
+    {
+     "cmd": "qm set 105 --scsihw virtio-scsi-single",
+     "comment": "Replace the legacy LSI controller with virtio-scsi."
+    }
+   ],
+   "caption": "Removing unneeded devices and switching to virtio models."
+  },
+  {
+   "type": "text",
+   "id": "reduce2",
+   "markdown": "Why this helps:\n\n- **Removed devices cannot be attacked.** No USB controller means no USB emulation bugs.\n- **virtio devices have a small, well-reviewed interface.** Old emulations such as `e1000` or `lsi` copy real hardware behavior, which is more complex.\n- **A leftover ISO leaks information** and can be a path to boot an unexpected image.\n\nChange devices on a test VM first. Switching a disk controller needs the guest to have the virtio driver installed, or it will not boot. Windows guests need the virtio driver ISO before you switch."
+  },
+  {
+   "type": "text",
+   "id": "risky",
+   "markdown": "## Step 2: Treat risky features as exceptions\n\nSome features trade isolation for convenience. Enable them only when you can name the reason.\n\n| Feature | Risk | Safer choice |\n|:--|:--|:--|\n| PCI or GPU passthrough | The guest controls real hardware that can use DMA to read host memory if the IOMMU is misconfigured | Enable the IOMMU, isolate groups, use only on dedicated hosts |\n| USB passthrough | Guest-triggered USB parsing in the host | Prefer network-attached devices |\n| Kernel Samepage Merging (KSM) | Shared pages can enable cross-VM side channels | Disable on hosts that mix trust levels |\n| Shared folders (virtiofs) | Guest reaches host file system code | Avoid for untrusted guests |\n| Guest agent | A channel into the guest that must be kept current | Enable only where needed and update it |\n\nFor hardware flaws, check what the kernel reports and keep firmware and microcode current."
+  },
+  {
+   "type": "terminal",
+   "id": "cpu-term",
+   "title": "pve1 - check CPU mitigations",
+   "lines": [
+    {
+     "cmd": "grep -H . /sys/devices/system/cpu/vulnerabilities/spectre_v2 /sys/devices/system/cpu/vulnerabilities/mds",
+     "output": "/sys/devices/system/cpu/vulnerabilities/spectre_v2:Mitigation: Enhanced / Automatic IBRS; IBPB: conditional; RSB filling\n/sys/devices/system/cpu/vulnerabilities/mds:Mitigation: Clear CPU buffers; SMT vulnerable",
+     "comment": "`SMT vulnerable` means sibling threads can share buffers. Illustrative output; yours depends on the CPU."
+    },
+    {
+     "cmd": "systemctl disable --now ksmtuned",
+     "comment": "Stop page merging on a mixed-trust host."
+    }
+   ],
+   "caption": "Reading mitigation status and disabling page merging."
+  },
+  {
+   "type": "animation",
+   "id": "iso-layers",
+   "kind": "layers",
+   "title": "Layers between a guest and the host",
+   "caption": "A guest request passes several controls before it can affect anything outside the VM.",
+   "data": {
+    "layers": [
+     {
+      "label": "Guest application",
+      "sub": "inside VM"
+     },
+     {
+      "label": "Guest kernel",
+      "sub": "drivers"
+     },
+     {
+      "label": "Device model",
+      "sub": "QEMU virtio"
+     },
+     {
+      "label": "KVM and CPU",
+      "sub": "VT-x, EPT"
+     },
+     {
+      "label": "Host Linux",
+      "sub": "cgroups, firewall"
+     }
+    ],
+    "steps": [
+     {
+      "layer": 0,
+      "packet": [
+       "I/O request"
+      ],
+      "caption": "An application inside the VM writes to disk."
+     },
+     {
+      "layer": 1,
+      "packet": [
+       "Driver",
+       "I/O request"
+      ],
+      "caption": "The guest kernel passes it to the virtio driver."
+     },
+     {
+      "layer": 2,
+      "packet": [
+       "QEMU",
+       "Driver",
+       "I/O request"
+      ],
+      "caption": "QEMU parses the request. This is the largest attack surface."
+     },
+     {
+      "layer": 3,
+      "packet": [
+       "KVM",
+       "QEMU"
+      ],
+      "caption": "Hardware virtualization keeps guest memory separate from host memory."
+     },
+     {
+      "layer": 4,
+      "packet": [
+       "Limits",
+       "Host"
+      ],
+      "caption": "Host controls cap CPU, memory and I/O so one VM cannot starve others."
+     }
+    ]
+   }
+  },
+  {
+   "type": "callout",
+   "id": "agent-note",
+   "variant": "note",
+   "title": "Guest agent and console access",
+   "markdown": "The QEMU guest agent is useful for clean shutdowns, snapshots and reading the guest IP address. It is also a channel from the host into the guest and a parser of guest-supplied data. Enable it only on VMs that need those functions, and update it with the guest operating system. Protect console access too: anyone with `VM.Console` on a VM can type as a local user, so grant that privilege through roles and not by sharing the root account."
+  },
+  {
+   "type": "callout",
+   "id": "monitor-note",
+   "variant": "tip",
+   "title": "Watch the QEMU process",
+   "markdown": "Each VM appears on the host as a `kvm` process named after its ID. Sudden spikes in CPU, unexpected child processes, or a VM that opens network connections from the host side are warning signs. Feed host logs to your central monitoring so these events are visible, as covered in [virtualization security monitoring](/learn/systems-infrastructure-security/virtualization-security-monitoring)."
+  },
+  {
+   "type": "text",
+   "id": "limits",
+   "markdown": "## Step 3: Limit resources and separate trust levels\n\nIsolation includes availability. A runaway VM that eats all memory or disk bandwidth is a denial of service against its neighbors.\n\nSet explicit limits in the VM configuration: fixed `memory`, `cores`, optional `cpulimit`, and disk throttles such as `mbps_rd` and `iops_wr`. Avoid unlimited ballooning on busy hosts.\n\nThen decide who may share a host. Treat these as a ladder:\n\n1. Same trust level and owner: share a node freely.\n2. Different owners, same company: separate bridges, firewall groups and pools.\n3. Internet-facing next to sensitive internal systems: put them on **different nodes**.\n4. Hostile or unknown tenants: dedicated hardware, disabled SMT, no passthrough.\n\nThe cost of separate nodes is real, but a hypervisor flaw makes the node the unit of compromise."
+  },
+  {
+   "type": "callout",
+   "id": "trap",
+   "variant": "warning",
+   "title": "Isolation is not a patch strategy",
+   "markdown": "Guests can still be compromised, and a hypervisor escape, while rare, does happen. Apply Proxmox and kernel updates regularly, update the CPU microcode, and monitor QEMU processes for unusual behavior. Isolation limits damage; it does not remove the need to patch."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a test VM in a lab you own:\n\n1. Run `qm config <vmid>` and list every device you do not need: CD drive, USB, serial, legacy NIC or controller.\n2. Remove them with `qm set <vmid> --delete ...` and switch the NIC to virtio.\n3. Set `memory`, `cores` and a disk limit such as `--scsi0 local-lvm:vm-<vmid>-disk-0,mbps_wr=50`.\n4. Read `/sys/devices/system/cpu/vulnerabilities/` on the host and note any entry that says `vulnerable` or `SMT vulnerable`."
+  },
+  {
+   "type": "keyterms",
+   "id": "kt",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "KVM",
+     "definition": "The Linux kernel module that turns Linux into a hypervisor using hardware virtualization."
+    },
+    {
+     "term": "QEMU",
+     "definition": "The user-space program that emulates devices for each VM."
+    },
+    {
+     "term": "Device model",
+     "definition": "The emulated hardware a guest talks to."
+    },
+    {
+     "term": "virtio",
+     "definition": "A paravirtualized device family with a small, efficient interface."
+    },
+    {
+     "term": "IOMMU",
+     "definition": "Hardware that restricts the memory a device can reach through DMA."
+    },
+    {
+     "term": "KSM",
+     "definition": "Kernel Samepage Merging, which shares identical memory pages between VMs."
+    },
+    {
+     "term": "Side channel",
+     "definition": "Leaking data by measuring timing or shared resources."
+    },
+    {
+     "term": "SMT",
+     "definition": "Simultaneous multithreading; sibling threads share core resources."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which part of the virtualization stack usually has the largest attack surface from a guest?",
+     "options": [
+      "The CPU's VT-x mode",
+      "The QEMU device models",
+      "The host's hostname",
+      "The Proxmox web theme"
+     ],
+     "answer": 1,
+     "explanation": "QEMU is large, written mostly in C, and processes guest-controlled input for every emulated device."
+    },
+    {
+     "question": "Why switch a VM from `e1000` to virtio networking?",
+     "options": [
+      "It encrypts traffic",
+      "It uses a simpler, well-reviewed interface",
+      "It disables the firewall",
+      "It removes the MAC address"
+     ],
+     "answer": 1,
+     "explanation": "Emulating old hardware needs complex code. Virtio exposes less to the guest."
+    },
+    {
+     "question": "Which are good isolation practices? (choose all that apply)",
+     "options": [
+      "Removing unused CD, USB and serial devices",
+      "Enabling PCI passthrough on every VM",
+      "Setting memory and I/O limits",
+      "Placing internet-facing and sensitive VMs on different nodes"
+     ],
+     "answer": [
+      0,
+      2,
+      3
+     ],
+     "explanation": "Removing devices, limiting resources and separating trust levels help. Passthrough adds hardware access and should be an exception."
+    },
+    {
+     "question": "What does `SMT vulnerable` in the MDS status mean?",
+     "options": [
+      "The VM has no network",
+      "Sibling hardware threads can share buffers, so hostile tenants should not share a core",
+      "The kernel crashed",
+      "Virtio is disabled"
+     ],
+     "answer": 1,
+     "explanation": "With SMT on, threads of one core share resources. For hostile tenants, disable SMT or use dedicated hosts."
+    },
+    {
+     "question": "Does strong isolation remove the need for patching?",
+     "options": [
+      "Yes",
+      "No, it limits damage but flaws still need patches",
+      "Only for Windows guests",
+      "Only for LXC"
+     ],
+     "answer": 1,
+     "explanation": "Isolation is a second line of defense. Updates and microcode still matter."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nVM isolation rests on CPU virtualization, memory separation, QEMU device models and host controls. The device model is the thinnest layer, so remove unneeded devices, use virtio, and treat passthrough, KSM, shared folders and agents as exceptions with a stated reason.\n\nLimit memory, CPU and disk I/O, check CPU mitigations, and keep hosts patched. Place guests of different trust levels on different nodes. Next, apply the same thinking to containers in [Linux container (LXC) security](/learn/systems-infrastructure-security/linux-container-lxc-security)."
+  }
+ ],
+ "ar": {
+  "title": "عزل الأجهزة الافتراضية",
+  "summary": "افهم ما يفصل الأجهزة الافتراضية في Proxmox، وقلّص سطح الأجهزة، وحدّد الموارد، وافصل مستويات الثقة.",
+  "objectives": [
+   "تسمية الطبقات التي تعزل الجهاز عن مضيفه وجيرانه",
+   "إزالة الأجهزة غير اللازمة واستخدام نماذج virtio",
+   "تقييم مفاضلات التمرير وKSM وSMT",
+   "تطبيق حدود الموارد وتوزيع الضيوف بحسب مستوى الثقة"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "تتيح الافتراضية تشغيل أنظمة كثيرة على خادم فيزيائي واحد رغم أنها لا ينبغي أن تثق ببعضها: خادم ويب عام بجوار قاعدة بيانات داخلية، أو حمل عمل عميل بجوار حمل عميل آخر. الوعد أن اختراق جهاز افتراضي (VM) واحد يبقى داخله.\n\nهذا الوعد قوي لكنه ليس سحرًا. العزل حصيلة ميزات العتاد وشيفرة الهايبرفايزر ونماذج الأجهزة وإعداداتك أنت. جهاز بوحدة USB ومتحكم قرص ممرَّر ووكيل قديم أقل عزلًا بكثير من جهاز بسيط. يوضّح هذا الدرس ما يفصل الأجهزة في Proxmox VE، وأين يكون الحاجز أرقّ، وكيف تشدّه. يبني الدرس على [مخاطر الهروب من الافتراضية](/learn/systems-infrastructure-security/virtualization-escape-risks) و[سطح هجوم الهايبرفايزر](/learn/systems-infrastructure-security/hypervisor-attack-surface)."
+   },
+   {
+    "type": "text",
+    "id": "layers",
+    "markdown": "## ما الذي يفصل الأجهزة\n\nيستخدم Proxmox VE نظام KVM، وهو هايبرفايزر نواة Linux، مع QEMU كمحاكٍ للأجهزة. كل جهاز افتراضي عملية QEMU واحدة على المضيف. تتعاون أربع طبقات.\n\n| الطبقة | ما تفرضه | نقطة الضعف |\n|:--|:--|:--|\n| افتراضية المعالج (Intel VT-x وAMD-V) | تعمل شيفرة الضيف في وضع مقيّد ولا تلمس سجلات المضيف | عيوب المعالج مثل تسريبات التنفيذ التخميني |\n| الذاكرة (جداول صفحات EPT أو NPT) | يرى كل ضيف صفحات ذاكرته فقط | الصفحات المشتركة والقنوات الجانبية |\n| نماذج الأجهزة (QEMU) | يتحدث الضيوف مع عتاد محاكى لا عتاد حقيقي | ثغرات في المحاكيات المعقدة |\n| ضوابط المضيف (صلاحيات Linux وcgroups وجدار الحماية) | تحدّ من عملية QEMU وموارد الجهاز | سوء الإعداد |\n\nأكثر الأجزاء تعرّضًا هو نموذج الجهاز. QEMU برنامج كبير مكتوب أغلبه بلغة C، والضيف يتحكم بمدخلات كل جهاز محاكى. قد تمنح ثغرة في جهاز نادر الاستخدام الضيفَ تنفيذ شيفرة في عملية المضيف. لذلك القاعدة الموجّهة بسيطة: **أجهزة أقل، ثغرات أقل يمكن الوصول إليها.**"
+   },
+   {
+    "type": "text",
+    "id": "reduce",
+    "markdown": "## الخطوة 1: قلّص سطح الأجهزة\n\nابدأ مما يحتاجه الجهاز فعلًا وأزل الباقي. افحص إعداد جهاز خادم ويب نموذجي."
+   },
+   {
+    "type": "terminal",
+    "id": "reduce-term",
+    "title": "pve1 - reduce devices",
+    "lines": [
+     {
+      "cmd": "qm config 105",
+      "output": "agent: 1\nboot: order=scsi0\ncores: 2\ncpu: x86-64-v2-AES\nide2: local:iso/debian-12.iso,media=cdrom\nmemory: 4096\nname: web01\nnet0: e1000=BC:24:11:AA:BB:01,bridge=vmbr0,firewall=1\nscsi0: local-lvm:vm-105-disk-0,size=32G\nscsihw: lsi\nusb0: host=1234:5678\nserial0: socket",
+      "comment": "عدة مخاطر: بطاقة شبكة ومتحكم قرص محاكيان قديمان، وISO متبقٍّ، وتمرير USB، ومنفذ تسلسلي."
+     },
+     {
+      "cmd": "qm set 105 --delete ide2,usb0,serial0",
+      "comment": "إزالة قارئ الأقراص وجهاز USB والمنفذ التسلسلي."
+     },
+     {
+      "cmd": "qm set 105 --net0 virtio=BC:24:11:AA:BB:01,bridge=vmbr0,firewall=1",
+      "comment": "استخدام بطاقة virtio المعدلة افتراضيًا مع الإبقاء على MAC نفسه للحفاظ على إعداد شبكة الضيف."
+     },
+     {
+      "cmd": "qm set 105 --scsihw virtio-scsi-single",
+      "comment": "استبدال متحكم LSI القديم بـ virtio-scsi."
+     }
+    ],
+    "caption": "إزالة الأجهزة غير اللازمة والتحول إلى نماذج virtio."
+   },
+   {
+    "type": "text",
+    "id": "reduce2",
+    "markdown": "سبب الفائدة:\n\n- **الأجهزة المزالة لا يمكن مهاجمتها.** لا وحدة USB تعني لا ثغرات في محاكاة USB.\n- **أجهزة virtio لها واجهة صغيرة تمت مراجعتها جيدًا.** المحاكيات القديمة مثل `e1000` أو `lsi` تنسخ سلوك العتاد الحقيقي وهو أعقد.\n- **ISO المتبقي يسرّب معلومات** وقد يكون طريقًا لإقلاع صورة غير متوقعة.\n\nغيّر الأجهزة على جهاز تجريبي أولًا. تبديل متحكم القرص يتطلب أن يكون برنامج تشغيل virtio مثبتًا في الضيف وإلا لن يُقلع. وأجهزة Windows تحتاج ISO برامج تشغيل virtio قبل التبديل."
+   },
+   {
+    "type": "text",
+    "id": "risky",
+    "markdown": "## الخطوة 2: عامل الميزات الخطرة كاستثناءات\n\nبعض الميزات تبادل العزل بالراحة. فعّلها فقط عندما تستطيع تسمية السبب.\n\n| الميزة | الخطر | الخيار الأأمن |\n|:--|:--|:--|\n| تمرير PCI أو GPU | يتحكم الضيف بعتاد حقيقي قد يستخدم DMA لقراءة ذاكرة المضيف إذا كان IOMMU مضبوطًا خطأ | فعّل IOMMU واعزل المجموعات واستخدمه على مضيفات مخصصة فقط |\n| تمرير USB | معالجة USB يطلقها الضيف داخل المضيف | فضّل الأجهزة المتصلة بالشبكة |\n| دمج الصفحات المتطابقة (KSM) | الصفحات المشتركة قد تتيح قنوات جانبية بين الأجهزة | عطّله على المضيفات التي تخلط مستويات الثقة |\n| المجلدات المشتركة (virtiofs) | يصل الضيف إلى شيفرة نظام ملفات المضيف | تجنّبه مع الضيوف غير الموثوقين |\n| وكيل الضيف | قناة إلى الضيف يجب إبقاؤها محدّثة | فعّله حيث يلزم وحدّثه |\n\nأما عيوب العتاد فافحص ما تبلغ عنه النواة وأبقِ البرامج الثابتة والمايكروكود محدّثة."
+   },
+   {
+    "type": "terminal",
+    "id": "cpu-term",
+    "title": "pve1 - check CPU mitigations",
+    "lines": [
+     {
+      "cmd": "grep -H . /sys/devices/system/cpu/vulnerabilities/spectre_v2 /sys/devices/system/cpu/vulnerabilities/mds",
+      "output": "/sys/devices/system/cpu/vulnerabilities/spectre_v2:Mitigation: Enhanced / Automatic IBRS; IBPB: conditional; RSB filling\n/sys/devices/system/cpu/vulnerabilities/mds:Mitigation: Clear CPU buffers; SMT vulnerable",
+      "comment": "العبارة `SMT vulnerable` تعني أن الخيوط الشقيقة قد تتشارك المخازن. خرج توضيحي ويختلف بحسب المعالج."
+     },
+     {
+      "cmd": "systemctl disable --now ksmtuned",
+      "comment": "إيقاف دمج الصفحات على مضيف مختلط الثقة."
+     }
+    ],
+    "caption": "قراءة حالة التخفيف وتعطيل دمج الصفحات."
+   },
+   {
+    "type": "animation",
+    "id": "iso-layers",
+    "kind": "layers",
+    "title": "الطبقات بين الضيف والمضيف",
+    "caption": "يمر طلب الضيف بعدة ضوابط قبل أن يؤثر على أي شيء خارج الجهاز.",
+    "data": {
+     "layers": [
+      {
+       "label": "تطبيق الضيف",
+       "sub": "داخل الجهاز"
+      },
+      {
+       "label": "نواة الضيف",
+       "sub": "برامج التشغيل"
+      },
+      {
+       "label": "نموذج الجهاز",
+       "sub": "QEMU virtio"
+      },
+      {
+       "label": "KVM والمعالج",
+       "sub": "VT-x وEPT"
+      },
+      {
+       "label": "Linux المضيف",
+       "sub": "cgroups وجدار الحماية"
+      }
+     ],
+     "steps": [
+      {
+       "layer": 0,
+       "packet": [
+        "طلب I/O"
+       ],
+       "caption": "يكتب تطبيق داخل الجهاز على القرص."
+      },
+      {
+       "layer": 1,
+       "packet": [
+        "برنامج التشغيل",
+        "طلب I/O"
+       ],
+       "caption": "تمرّر نواة الضيف الطلب إلى برنامج تشغيل virtio."
+      },
+      {
+       "layer": 2,
+       "packet": [
+        "QEMU",
+        "برنامج التشغيل",
+        "طلب I/O"
+       ],
+       "caption": "يحلّل QEMU الطلب. هذا أكبر سطح للهجوم."
+      },
+      {
+       "layer": 3,
+       "packet": [
+        "KVM",
+        "QEMU"
+       ],
+       "caption": "تبقي افتراضية العتاد ذاكرة الضيف منفصلة عن ذاكرة المضيف."
+      },
+      {
+       "layer": 4,
+       "packet": [
+        "حدود",
+        "المضيف"
+       ],
+       "caption": "تحدّ ضوابط المضيف المعالج والذاكرة والإدخال والإخراج كي لا يجوّع جهاز غيره."
+      }
+     ]
+    }
+   },
+   {
+    "type": "callout",
+    "id": "agent-note",
+    "variant": "note",
+    "title": "وكيل الضيف والوصول إلى الطرفية",
+    "markdown": "وكيل ضيف QEMU مفيد لإيقاف التشغيل النظيف واللقطات وقراءة عنوان IP للضيف. وهو أيضًا قناة من المضيف إلى الضيف ومحلّل لبيانات يقدّمها الضيف. فعّله فقط على الأجهزة التي تحتاج هذه الوظائف، وحدّثه مع نظام تشغيل الضيف. واحمِ الوصول إلى الطرفية أيضًا: من يملك `VM.Console` على جهاز يستطيع الكتابة كمستخدم محلي، فامنح هذه الصلاحية عبر الأدوار لا بمشاركة حساب root."
+   },
+   {
+    "type": "callout",
+    "id": "monitor-note",
+    "variant": "tip",
+    "title": "راقب عملية QEMU",
+    "markdown": "يظهر كل جهاز على المضيف كعملية `kvm` تحمل رقمه. قفزات مفاجئة في استهلاك المعالج أو عمليات فرعية غير متوقعة أو جهاز يفتح اتصالات شبكة من جهة المضيف كلها علامات تحذير. أرسل سجلات المضيف إلى المراقبة المركزية كي تكون هذه الأحداث مرئية، كما في [مراقبة أمن الافتراضية](/learn/systems-infrastructure-security/virtualization-security-monitoring)."
+   },
+   {
+    "type": "text",
+    "id": "limits",
+    "markdown": "## الخطوة 3: حدّد الموارد وافصل مستويات الثقة\n\nيشمل العزل التوافر. جهاز منفلت يلتهم كل الذاكرة أو عرض نطاق القرص هو حجب خدمة ضد جيرانه.\n\nاضبط حدودًا صريحة في إعداد الجهاز: `memory` و`cores` ثابتتان، و`cpulimit` اختياري، وخوانق للقرص مثل `mbps_rd` و`iops_wr`. تجنّب البالون غير المحدود على المضيفات المشغولة.\n\nثم قرّر من يحق له مشاركة مضيف. اعتبر ذلك سلّمًا:\n\n1. مستوى ثقة ومالك واحد: شاركوا العقدة بحرية.\n2. مالكون مختلفون في الشركة نفسها: جسور ومجموعات جدار حماية ومجموعات موارد منفصلة.\n3. أجهزة مواجهة للإنترنت بجوار أنظمة داخلية حساسة: ضعها على **عقد مختلفة**.\n4. مستأجرون معادون أو مجهولون: عتاد مخصص وتعطيل SMT ولا تمرير أجهزة.\n\nتكلفة العقد المنفصلة حقيقية، لكن ثغرة في الهايبرفايزر تجعل العقدة وحدة الاختراق."
+   },
+   {
+    "type": "callout",
+    "id": "trap",
+    "variant": "warning",
+    "title": "العزل ليس بديلًا عن التحديث",
+    "markdown": "يمكن اختراق الضيوف، والهروب من الهايبرفايزر وإن كان نادرًا يحدث فعلًا. طبّق تحديثات Proxmox والنواة بانتظام، وحدّث مايكروكود المعالج، وراقب عمليات QEMU بحثًا عن سلوك غير معتاد. العزل يحدّ من الضرر لكنه لا يلغي الحاجة إلى التحديث."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على جهاز تجريبي في مختبر تملكه:\n\n1. نفّذ `qm config <vmid>` واسرد كل جهاز لا تحتاجه: قارئ أقراص أو USB أو منفذ تسلسلي أو بطاقة أو متحكم قديم.\n2. أزلها بالأمر `qm set <vmid> --delete ...` وبدّل البطاقة إلى virtio.\n3. اضبط `memory` و`cores` وحدًّا للقرص مثل `--scsi0 local-lvm:vm-<vmid>-disk-0,mbps_wr=50`.\n4. اقرأ `/sys/devices/system/cpu/vulnerabilities/` على المضيف ودوّن أي بند يقول `vulnerable` أو `SMT vulnerable`."
+   },
+   {
+    "type": "keyterms",
+    "id": "kt",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "KVM",
+      "definition": "وحدة نواة Linux التي تحوّل Linux إلى هايبرفايزر باستخدام افتراضية العتاد."
+     },
+     {
+      "term": "QEMU",
+      "definition": "برنامج فضاء المستخدم الذي يحاكي الأجهزة لكل جهاز افتراضي."
+     },
+     {
+      "term": "نموذج الجهاز (Device model)",
+      "definition": "العتاد المحاكى الذي يتحدث معه الضيف."
+     },
+     {
+      "term": "virtio",
+      "definition": "عائلة أجهزة معدّلة افتراضيًا ذات واجهة صغيرة وفعالة."
+     },
+     {
+      "term": "IOMMU",
+      "definition": "عتاد يقيّد الذاكرة التي يصل إليها جهاز عبر DMA."
+     },
+     {
+      "term": "KSM",
+      "definition": "دمج الصفحات المتطابقة في النواة، ويشارك صفحات ذاكرة متطابقة بين الأجهزة."
+     },
+     {
+      "term": "القناة الجانبية (Side channel)",
+      "definition": "تسريب البيانات بقياس التوقيت أو الموارد المشتركة."
+     },
+     {
+      "term": "SMT",
+      "definition": "تعدد الخيوط المتزامن؛ تتشارك الخيوط الشقيقة موارد النواة."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي جزء من حزمة الافتراضية له غالبًا أكبر سطح هجوم من الضيف؟",
+      "options": [
+       "وضع VT-x في المعالج",
+       "نماذج أجهزة QEMU",
+       "اسم مضيف الخادم",
+       "سمة واجهة Proxmox"
+      ],
+      "answer": 1,
+      "explanation": "QEMU كبير ومكتوب أغلبه بلغة C ويعالج مدخلات يتحكم بها الضيف لكل جهاز محاكى."
+     },
+     {
+      "question": "لماذا نبدّل جهازًا من شبكة `e1000` إلى virtio؟",
+      "options": [
+       "لأنه يشفّر الحركة",
+       "لأنه يستخدم واجهة أبسط تمت مراجعتها جيدًا",
+       "لأنه يعطّل جدار الحماية",
+       "لأنه يزيل عنوان MAC"
+      ],
+      "answer": 1,
+      "explanation": "محاكاة عتاد قديم تحتاج شيفرة معقدة، وvirtio يكشف للضيف أقل."
+     },
+     {
+      "question": "أي من الآتي ممارسات عزل جيدة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "إزالة أجهزة الأقراص وUSB والمنفذ التسلسلي غير المستخدمة",
+       "تفعيل تمرير PCI على كل جهاز",
+       "ضبط حدود للذاكرة والإدخال والإخراج",
+       "وضع الأجهزة المواجهة للإنترنت والحساسة على عقد مختلفة"
+      ],
+      "answer": [
+       0,
+       2,
+       3
+      ],
+      "explanation": "إزالة الأجهزة وتحديد الموارد وفصل مستويات الثقة تفيد. أما التمرير فيضيف وصولًا إلى العتاد ويجب أن يكون استثناءً."
+     },
+     {
+      "question": "ماذا تعني العبارة `SMT vulnerable` في حالة MDS؟",
+      "options": [
+       "لا شبكة للجهاز",
+       "الخيوط الشقيقة قد تتشارك المخازن فلا يجوز أن يتشارك مستأجرون معادون نواة",
+       "انهارت النواة",
+       "تم تعطيل virtio"
+      ],
+      "answer": 1,
+      "explanation": "مع تفعيل SMT تتشارك خيوط النواة الواحدة الموارد. للمستأجرين المعادين عطّل SMT أو استخدم مضيفات مخصصة."
+     },
+     {
+      "question": "هل يلغي العزل القوي الحاجة إلى التحديثات؟",
+      "options": [
+       "نعم",
+       "لا، فهو يحدّ من الضرر لكن العيوب تحتاج إلى ترقيعات",
+       "فقط لأجهزة Windows",
+       "فقط لـ LXC"
+      ],
+      "answer": 1,
+      "explanation": "العزل خط دفاع ثانٍ. تبقى التحديثات والمايكروكود مهمة."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nيقوم عزل الأجهزة الافتراضية على افتراضية المعالج وفصل الذاكرة ونماذج أجهزة QEMU وضوابط المضيف. نموذج الجهاز أرقّ طبقة، فأزل الأجهزة غير اللازمة واستخدم virtio وعامل التمرير وKSM والمجلدات المشتركة والوكلاء كاستثناءات لها سبب معلن.\n\nحدّد الذاكرة والمعالج وإدخال/إخراج القرص، وافحص تخفيفات المعالج، وأبقِ المضيفات محدّثة. ضع الضيوف ذوي مستويات الثقة المختلفة على عقد مختلفة. بعد ذلك طبّق التفكير نفسه على الحاويات في [أمن حاويات Linux (LXC)](/learn/systems-infrastructure-security/linux-container-lxc-security)."
+   }
+  ]
+ }
+}

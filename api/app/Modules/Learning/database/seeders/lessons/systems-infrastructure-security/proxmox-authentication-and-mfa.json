@@ -1,0 +1,556 @@
+{
+  "slug": "proxmox-authentication-and-mfa",
+  "title": "Proxmox Authentication and MFA",
+  "summary": "Design Proxmox authentication with named accounts, the right realms, phishing-resistant second factors and a managed account lifecycle.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Compare the authentication realms available in Proxmox VE",
+    "Choose and register appropriate second factors",
+    "Create users and realms with pveum",
+    "Protect a break-glass account",
+    "Manage joiners, movers and leavers"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A systems team shares one account, `root@pam`, for everything on their Proxmox cluster. The password is on a sticky note inside a drawer and also in a chat message from two years ago. When a junior administrator leaves, nobody changes it, because changing it would break scripts that nobody remembers writing. If something is deleted tomorrow, the task log shows only \"root\".\n\nAuthentication answers the question \"who are you?\" Proxmox gives you several ways to answer it, and the right design uses named accounts, a central identity provider where possible, and a second factor on every account that can change anything. This lesson shows how."
+    },
+    {
+      "id": "realms",
+      "type": "text",
+      "markdown": "## Authentication realms\n\nA **realm** is a source of user identities. A user ID always names its realm, in the form `user@realm`. Proxmox VE supports several.\n\n| Realm type | Where passwords live | Typical use |\n|:--|:--|:--|\n| Linux PAM (`pam`) | The host's `/etc/shadow` | `root@pam`, break-glass access |\n| Proxmox VE (`pve`) | `/etc/pve/priv/shadow.cfg`, replicated | Small teams, service users |\n| LDAP | Your directory server | Linux-centric organizations |\n| Active Directory (`ad`) | Windows domain controllers | Windows-centric organizations |\n| OpenID Connect | An external identity provider | SSO with MFA handled by the provider |\n\nTwo observations guide the design. First, `pam` users must exist as Linux accounts on every node, which does not scale and ties console access to shell access. Second, a directory or SSO realm gives you one place to disable a leaver, enforce password rules and apply conditional access.\n\nA good pattern is: **directory or SSO accounts for people, the `pve` realm for a few service accounts, and `root@pam` kept only as a locked-away break-glass account.**"
+    },
+    {
+      "id": "mfa",
+      "type": "text",
+      "markdown": "## Second factors in Proxmox VE\n\nA password is something you know. A second factor adds something you have. Proxmox supports several types, and users can register more than one.\n\n| Factor | Phishing resistance | Notes |\n|:--|:--|:--|\n| TOTP (authenticator app) | Low to medium | Six-digit codes that change every 30 seconds |\n| WebAuthn / FIDO2 key | High | Bound to the site name; works with security keys and platform passkeys |\n| YubiKey OTP | Medium | Needs a Yubico validation setup |\n| Recovery keys | Not a login method | One-time codes for lockout recovery |\n\nPrefer **WebAuthn** for administrators. A hardware key refuses to sign in on a look-alike site, so a phishing page cannot capture a usable response. Use TOTP as a second registered method, and always generate **recovery keys** and store them in a vault, not on the same laptop as the authenticator.\n\nWebAuthn requires the console to be reached by a stable DNS name over HTTPS, and a cluster-wide setting under Datacenter, Options, WebAuthn Settings that names the relying party. See [the previous lesson](/learn/systems-infrastructure-security/proxmox-web-interface-security) for the certificate and name."
+    },
+    {
+      "id": "mfa-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Login with a password and a second factor",
+      "caption": "WebAuthn ties the second step to the real site name.",
+      "data": {
+        "actors": [
+          {
+            "id": "u",
+            "label": "Alice",
+            "sub": "alice@pve",
+            "icon": "user"
+          },
+          {
+            "id": "b",
+            "label": "Browser",
+            "sub": "pve1.example.com",
+            "icon": "laptop"
+          },
+          {
+            "id": "p",
+            "label": "Proxmox",
+            "sub": "pveproxy",
+            "icon": "server"
+          },
+          {
+            "id": "k",
+            "label": "Security key",
+            "sub": "FIDO2",
+            "icon": "key"
+          }
+        ],
+        "steps": [
+          {
+            "from": "u",
+            "to": "b",
+            "label": "Username + password",
+            "note": "Alice enters her credentials on the real console page."
+          },
+          {
+            "from": "b",
+            "to": "p",
+            "label": "POST /access/ticket",
+            "note": "The password is verified against the realm."
+          },
+          {
+            "from": "p",
+            "to": "b",
+            "label": "TFA challenge",
+            "detail": "webauthn",
+            "tone": "warning",
+            "note": "The password is correct, but no ticket is issued yet. A challenge names the site."
+          },
+          {
+            "from": "b",
+            "to": "k",
+            "label": "Sign challenge for pve1.example.com",
+            "note": "Alice touches the key. It signs only for the registered site name."
+          },
+          {
+            "from": "k",
+            "to": "p",
+            "label": "Signed assertion",
+            "tone": "secure",
+            "note": "Proxmox verifies the signature against the public key stored for Alice."
+          },
+          {
+            "from": "p",
+            "to": "u",
+            "label": "Ticket issued",
+            "tone": "success",
+            "note": "Only now does the session start. A phishing site would have failed at the signing step."
+          }
+        ]
+      }
+    },
+    {
+      "id": "config",
+      "type": "text",
+      "markdown": "## Putting it into practice\n\nCreate named accounts rather than sharing `root`. For a small team, the `pve` realm is enough to start. For a larger one, join a directory.\n\nWhen you add an Active Directory realm, use **LDAPS** (or StartTLS) with certificate verification, and bind with a dedicated read-only service account. Never bind as a domain administrator. Sync users and groups on a schedule so that a disabled directory account stops working on Proxmox as well.\n\nThe commands below are run on a node as root. Passwords are always prompted for, never typed on the command line, so they stay out of shell history."
+    },
+    {
+      "id": "pveum",
+      "type": "terminal",
+      "title": "Realms and users with pveum",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "pveum user add alice@pve --email alice@example.com --comment 'Infrastructure admin'",
+          "output": "",
+          "comment": "A named account. Set its password with the next command."
+        },
+        {
+          "cmd": "pveum passwd alice@pve",
+          "output": "Enter new password: ********\nRetype new password: ********",
+          "comment": "Prompted interactively, so it never enters shell history."
+        },
+        {
+          "cmd": "pveum realm add corp-ad --type ad --domain example.com --server1 dc1.example.com --mode ldaps --verify 1 --default 0",
+          "output": "",
+          "comment": "Active Directory over LDAPS with certificate verification. Add bind_dn/password with the realm settings or the GUI."
+        },
+        {
+          "cmd": "pveum realm list",
+          "output": "realm    type  comment\ncorp-ad  ad\npam      pam   Linux PAM standard authentication\npve      pve   Proxmox VE authentication server",
+          "comment": "Confirm the realms that can authenticate users."
+        },
+        {
+          "cmd": "pveum user tfa list",
+          "output": "userid       type      description\nalice@pve    webauthn  YubiKey 5\nalice@pve    recovery  \nroot@pam                (none)",
+          "comment": "root@pam has no second factor registered. Fix this before anything else."
+        }
+      ]
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Protect the break-glass account",
+      "markdown": "Keep `root@pam` for emergencies, such as the directory being down. Give it a long random password stored in an offline vault, register a hardware key, forbid its use in daily work, and alert whenever it logs in. A break-glass account that is never used and always monitored is both safe and useful."
+    },
+    {
+      "id": "policy",
+      "type": "text",
+      "markdown": "## Enforcing the policy\n\nRegistering a second factor is optional for a user unless you require it. Two controls turn a recommendation into a rule.\n\n- **Require TFA on a realm.** In the console, open Datacenter, Permissions, Authentication, edit the realm and set the second-factor requirement. Users in that realm who have not enrolled are then prompted to do so. For directory realms, it is often better to let the identity provider enforce MFA through OpenID Connect.\n- **Audit regularly.** The `pveum user tfa list` and `pveum user list` commands show who has no second factor. Run them monthly and treat each gap as a finding.\n\nPasswords still matter. The `pve` realm checks only a minimum length, so rely on a password manager and long random values, not complexity rules. For `pam` accounts, the usual Linux password policy applies, so configure it as you would on any server.\n\nFinally, remember that authentication events are evidence. Make sure logins, failures and second-factor changes are forwarded to your central log, because an attacker who adds their own key to an account has just created persistence."
+    },
+    {
+      "id": "lifecycle",
+      "type": "text",
+      "markdown": "## Account lifecycle and common mistakes\n\nAuthentication is not a one-time setup. People join, change roles and leave.\n\n1. **Joiners** get a named account and register two factors on their first login.\n2. **Movers** keep the same account but have their roles reviewed ([role-based access control](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac)).\n3. **Leavers** are disabled the same day, with `pveum user modify alice@pve --enable 0` for local accounts, or in the directory for synced accounts.\n4. **Everyone** is reviewed quarterly: remove unused accounts and anyone without a second factor.\n\nCommon mistakes include enrolling TOTP without saving recovery keys, so a lost phone means a locked account; letting automation use a person's password instead of an [API token](/learn/systems-infrastructure-security/proxmox-api-token-security); and leaving test accounts enabled after a project ends. Proxmox records failed attempts, and repeated second-factor failures lock further attempts for a period, which is useful but also means support staff need a clear unlock procedure."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a lab cluster you own:\n\n1. Create a named user: `pveum user add lab-admin@pve`, then set a password with `pveum passwd lab-admin@pve`.\n2. Log in as that user in a private browser window and register a TOTP authenticator under the user menu, then register recovery keys and save them.\n3. Run `pveum user tfa list` and confirm the entries.\n4. Log out and log in again to see the second-factor prompt.\n5. Disable the account with `pveum user modify lab-admin@pve --enable 0` and confirm that login now fails.\n6. Write down who would be able to unlock a locked account at your organization."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Realm",
+          "definition": "A source of user identities such as pam, pve, LDAP, AD or OpenID."
+        },
+        {
+          "term": "MFA",
+          "definition": "Authentication that requires more than one kind of proof."
+        },
+        {
+          "term": "TOTP",
+          "definition": "Time-based one-time passwords generated by an authenticator app."
+        },
+        {
+          "term": "WebAuthn",
+          "definition": "A standard for phishing-resistant sign-in with security keys or passkeys."
+        },
+        {
+          "term": "Recovery keys",
+          "definition": "One-time codes that let a user back in after losing a second factor."
+        },
+        {
+          "term": "LDAPS",
+          "definition": "LDAP over TLS, which protects directory credentials in transit."
+        },
+        {
+          "term": "Break-glass account",
+          "definition": "A rarely used, tightly monitored emergency account."
+        },
+        {
+          "term": "Service account",
+          "definition": "A non-human account used by an application or script."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which second factor best resists phishing?",
+          "options": [
+            "SMS codes",
+            "TOTP codes",
+            "WebAuthn security key",
+            "Recovery keys"
+          ],
+          "answer": 2,
+          "explanation": "WebAuthn signs only for the registered site name, so a look-alike page gets nothing usable."
+        },
+        {
+          "question": "Which practices belong in a sound Proxmox identity design? Choose all that apply.",
+          "options": [
+            "Named accounts for each person",
+            "A directory or SSO realm for people",
+            "One shared root password for the team",
+            "A monitored break-glass account"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Shared credentials destroy accountability and make leavers impossible to remove cleanly."
+        },
+        {
+          "question": "Why should an AD realm bind with a read-only service account over LDAPS?",
+          "options": [
+            "It speeds up login",
+            "It limits the damage if the bind credentials leak and protects them in transit",
+            "Proxmox cannot use any other account",
+            "It disables MFA"
+          ],
+          "answer": 1,
+          "explanation": "Least privilege and encryption in transit apply to service credentials as much as to people."
+        },
+        {
+          "question": "What happens to recovery keys if you never generate them?",
+          "options": [
+            "Nothing, they are optional and harmless",
+            "A lost authenticator can lock the account out",
+            "TOTP stops working",
+            "The realm is deleted"
+          ],
+          "answer": 1,
+          "explanation": "Recovery keys are the planned way back in. Without them an administrator must reset the factor."
+        },
+        {
+          "question": "How should a departing employee's access be handled?",
+          "options": [
+            "Wait for the next quarterly review",
+            "Disable the account the same day",
+            "Change nothing",
+            "Rename the account"
+          ],
+          "answer": 1,
+          "explanation": "Same-day disablement closes the window in which a leaver or a stolen credential can be misused."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nGood Proxmox authentication means named accounts, a directory or SSO realm for people, a few local service accounts, and a locked-away break-glass `root@pam`. Require a second factor everywhere, prefer WebAuthn, and always save recovery keys. Use LDAPS with a read-only bind account, disable leavers the same day, and review accounts regularly. Once you know who is logging in, decide what each person may do: [role-based access control](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac)."
+    }
+  ],
+  "ar": {
+    "title": "المصادقة والمصادقة متعددة العوامل (MFA) في Proxmox",
+    "summary": "صمّم مصادقة Proxmox بحسابات مسمّاة ونطاقات مناسبة وعوامل ثانية تقاوم التصيّد ودورة حياة حسابات مُدارة.",
+    "objectives": [
+      "قارن نطاقات المصادقة المتاحة في Proxmox VE",
+      "اختر العوامل الثانية المناسبة وسجّلها",
+      "أنشئ المستخدمين والنطاقات باستخدام pveum",
+      "احمِ حساب الطوارئ",
+      "أدِر المنضمّين والمنتقلين والمغادرين"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يشترك فريق أنظمة في حساب واحد هو `root@pam` لكل شيء على عنقود Proxmox. كلمة المرور على ورقة لاصقة في درج، وفي رسالة دردشة عمرها سنتان. وعندما يغادر مدير مبتدئ لا يغيّرها أحد لأن تغييرها سيعطّل نصوصًا برمجية لا يتذكر أحد من كتبها. وإذا حُذف شيء غدًا فلن يعرض سجل المهام سوى «root».\n\nتجيب المصادقة عن سؤال «من أنت؟» ويوفّر Proxmox عدة طرق للإجابة عنه. والتصميم الصحيح يستخدم حسابات مسمّاة، ومزوّد هوية مركزيًا حيثما أمكن، وعاملًا ثانيًا على كل حساب يستطيع تغيير أي شيء. يبيّن هذا الدرس كيف."
+      },
+      {
+        "id": "realms",
+        "type": "text",
+        "markdown": "## نطاقات المصادقة\n\n**النطاق (Realm)** مصدر لهويات المستخدمين. يسمّي معرّف المستخدم نطاقه دائمًا بالصيغة `user@realm`. ويدعم Proxmox VE عدة نطاقات.\n\n| نوع النطاق | مكان كلمات المرور | الاستخدام المعتاد |\n|:--|:--|:--|\n| Linux PAM (`pam`) | الملف `/etc/shadow` في المضيف | `root@pam` والوصول الطارئ |\n| Proxmox VE (`pve`) | الملف `/etc/pve/priv/shadow.cfg` المنسوخ | الفرق الصغيرة وحسابات الخدمة |\n| LDAP | خادم الدليل لديك | المؤسسات المعتمدة على لينكس |\n| Active Directory (`ad`) | وحدات تحكم نطاق Windows | المؤسسات المعتمدة على Windows |\n| OpenID Connect | مزوّد هوية خارجي | الدخول الموحّد (SSO) مع MFA من المزوّد |\n\nتوجّه ملاحظتان التصميم. الأولى أن مستخدمي `pam` يجب أن يكونوا حسابات لينكس على كل عقدة، وهذا لا يتوسع ويربط وصول الوحدة بوصول الصدفة. والثانية أن نطاق الدليل أو SSO يمنحك مكانًا واحدًا لتعطيل المغادر وفرض قواعد كلمات المرور وتطبيق الوصول المشروط.\n\nنمط جيد: **حسابات دليل أو SSO للأشخاص، ونطاق `pve` لبضعة حسابات خدمة، وإبقاء `root@pam` حساب طوارئ محفوظًا فقط.**"
+      },
+      {
+        "id": "mfa",
+        "type": "text",
+        "markdown": "## العوامل الثانية في Proxmox VE\n\nكلمة المرور شيء تعرفه، والعامل الثاني يضيف شيئًا تملكه. يدعم Proxmox عدة أنواع ويستطيع المستخدمون تسجيل أكثر من واحد.\n\n| العامل | مقاومة التصيّد | ملاحظات |\n|:--|:--|:--|\n| TOTP (تطبيق مصادقة) | منخفضة إلى متوسطة | رموز من ستة أرقام تتغير كل 30 ثانية |\n| مفتاح WebAuthn / FIDO2 | عالية | مرتبط باسم الموقع؛ يعمل مع مفاتيح الأمان ومفاتيح المرور في المنصة |\n| YubiKey OTP | متوسطة | يحتاج إعداد تحقق من Yubico |\n| مفاتيح الاسترداد | ليست طريقة دخول | رموز لمرة واحدة لاسترداد الحساب بعد الإقفال |\n\nفضّل **WebAuthn** للمدراء. فالمفتاح العتادي يرفض الدخول إلى موقع مشابه، فلا تستطيع صفحة تصيّد التقاط استجابة قابلة للاستخدام. استخدم TOTP طريقةً ثانية مسجّلة، وولّد دائمًا **مفاتيح الاسترداد** واحفظها في خزنة، لا على الحاسوب نفسه الذي فيه تطبيق المصادقة.\n\nيتطلب WebAuthn بلوغ الوحدة باسم DNS ثابت عبر HTTPS، وإعدادًا على مستوى العنقود تحت Datacenter ثم Options ثم WebAuthn Settings يسمّي الطرف المعتمد. راجع [الدرس السابق](/learn/systems-infrastructure-security/proxmox-web-interface-security) للشهادة والاسم."
+      },
+      {
+        "id": "mfa-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "الدخول بكلمة مرور وعامل ثانٍ",
+        "caption": "يربط WebAuthn الخطوة الثانية باسم الموقع الحقيقي.",
+        "data": {
+          "actors": [
+            {
+              "id": "u",
+              "label": "أليس",
+              "sub": "alice@pve",
+              "icon": "user"
+            },
+            {
+              "id": "b",
+              "label": "المتصفح",
+              "sub": "pve1.example.com",
+              "icon": "laptop"
+            },
+            {
+              "id": "p",
+              "label": "Proxmox",
+              "sub": "pveproxy",
+              "icon": "server"
+            },
+            {
+              "id": "k",
+              "label": "مفتاح الأمان",
+              "sub": "FIDO2",
+              "icon": "key"
+            }
+          ],
+          "steps": [
+            {
+              "from": "u",
+              "to": "b",
+              "label": "اسم المستخدم + كلمة المرور",
+              "note": "تدخل أليس بياناتها في صفحة الوحدة الحقيقية."
+            },
+            {
+              "from": "b",
+              "to": "p",
+              "label": "POST /access/ticket",
+              "note": "يُتحقق من كلمة المرور لدى النطاق."
+            },
+            {
+              "from": "p",
+              "to": "b",
+              "label": "تحدي TFA",
+              "detail": "webauthn",
+              "tone": "warning",
+              "note": "كلمة المرور صحيحة لكن لم تصدر تذكرة بعد، ويحمل التحدي اسم الموقع."
+            },
+            {
+              "from": "b",
+              "to": "k",
+              "label": "وقّع التحدي لـ pve1.example.com",
+              "note": "تلمس أليس المفتاح فيوقّع للاسم المسجّل فقط."
+            },
+            {
+              "from": "k",
+              "to": "p",
+              "label": "إثبات موقّع",
+              "tone": "secure",
+              "note": "يتحقق Proxmox من التوقيع بالمفتاح العام المخزّن لأليس."
+            },
+            {
+              "from": "p",
+              "to": "u",
+              "label": "صدور التذكرة",
+              "tone": "success",
+              "note": "الآن فقط تبدأ الجلسة. وكان موقع التصيّد سيفشل عند خطوة التوقيع."
+            }
+          ]
+        }
+      },
+      {
+        "id": "config",
+        "type": "text",
+        "markdown": "## التطبيق العملي\n\nأنشئ حسابات مسمّاة بدل مشاركة `root`. وتكفي الفريقَ الصغير البدءَ بنطاق `pve`، أما الفريق الأكبر فيربط دليلًا.\n\nعند إضافة نطاق Active Directory استخدم **LDAPS** (أو StartTLS) مع التحقق من الشهادة، واربط بحساب خدمة مخصص للقراءة فقط، ولا تربط أبدًا بمدير النطاق. زامن المستخدمين والمجموعات وفق جدول ليتوقف حساب الدليل المعطّل عن العمل في Proxmox أيضًا.\n\nتُنفَّذ الأوامر التالية على عقدة بصفة root. تُطلب كلمات المرور دائمًا عبر سؤال تفاعلي ولا تُكتب في سطر الأوامر لتبقى خارج تاريخ الصدفة."
+      },
+      {
+        "id": "pveum",
+        "type": "terminal",
+        "title": "النطاقات والمستخدمون عبر pveum",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "pveum user add alice@pve --email alice@example.com --comment 'Infrastructure admin'",
+            "output": "",
+            "comment": "حساب مسمّى. اضبط كلمة مروره بالأمر التالي."
+          },
+          {
+            "cmd": "pveum passwd alice@pve",
+            "output": "Enter new password: ********\nRetype new password: ********",
+            "comment": "تُطلب تفاعليًا فلا تدخل في تاريخ الصدفة."
+          },
+          {
+            "cmd": "pveum realm add corp-ad --type ad --domain example.com --server1 dc1.example.com --mode ldaps --verify 1 --default 0",
+            "output": "",
+            "comment": "Active Directory عبر LDAPS مع التحقق من الشهادة. أضف bind_dn وكلمة المرور من إعدادات النطاق أو الواجهة."
+          },
+          {
+            "cmd": "pveum realm list",
+            "output": "realm    type  comment\ncorp-ad  ad\npam      pam   Linux PAM standard authentication\npve      pve   Proxmox VE authentication server",
+            "comment": "تأكد من النطاقات التي يمكنها مصادقة المستخدمين."
+          },
+          {
+            "cmd": "pveum user tfa list",
+            "output": "userid       type      description\nalice@pve    webauthn  YubiKey 5\nalice@pve    recovery  \nroot@pam                (none)",
+            "comment": "لا عامل ثانيًا مسجّلًا لـ root@pam. أصلح هذا قبل أي شيء آخر."
+          }
+        ]
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "احمِ حساب الطوارئ",
+        "markdown": "احتفظ بـ `root@pam` للطوارئ مثل تعطل الدليل. أعطه كلمة مرور طويلة عشوائية في خزنة غير متصلة، وسجّل مفتاحًا عتاديًا، وامنع استخدامه في العمل اليومي، ونبّه عند كل دخول به. حساب الطوارئ الذي لا يُستخدم أبدًا ويُراقب دائمًا آمن ومفيد معًا."
+      },
+      {
+        "id": "policy",
+        "type": "text",
+        "markdown": "## فرض السياسة\n\nتسجيل العامل الثاني اختياري للمستخدم ما لم تشترطه. ضابطان يحوّلان التوصية إلى قاعدة.\n\n- **اشتراط TFA على نطاق.** في الوحدة افتح Datacenter ثم Permissions ثم Authentication وعدّل النطاق واضبط شرط العامل الثاني. عندئذ يُطلب من مستخدمي ذلك النطاق غير المسجّلين التسجيل. وفي نطاقات الدليل غالبًا يكون الأفضل أن يفرض مزوّد الهوية MFA عبر OpenID Connect.\n- **دقّق بانتظام.** يُظهر الأمران `pveum user tfa list` و`pveum user list` من لا يملك عاملًا ثانيًا. شغّلهما شهريًا وعامل كل ثغرة بوصفها نتيجة تدقيق.\n\nكلمات المرور ما زالت مهمة. يفحص نطاق `pve` طولًا أدنى فقط، فاعتمد على مدير كلمات مرور وقيم عشوائية طويلة لا على قواعد التعقيد. وفي حسابات `pam` تنطبق سياسة كلمات مرور لينكس المعتادة فاضبطها كما تفعل على أي خادم.\n\nوأخيرًا تذكّر أن أحداث المصادقة أدلة. تأكد من إرسال عمليات الدخول والإخفاق وتغييرات العامل الثاني إلى سجلك المركزي، فمهاجم يضيف مفتاحه إلى حساب قد أنشأ للتو وسيلة بقاء."
+      },
+      {
+        "id": "lifecycle",
+        "type": "text",
+        "markdown": "## دورة حياة الحساب والأخطاء الشائعة\n\nالمصادقة ليست إعدادًا يُنجز مرة واحدة. فالأشخاص ينضمون ويغيّرون أدوارهم ويغادرون.\n\n1. **المنضمّون** يحصلون على حساب مسمّى ويسجّلون عاملين عند أول دخول.\n2. **المنتقلون** يبقى حسابهم نفسه لكن تُراجع أدوارهم ([التحكم في الوصول القائم على الأدوار](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac)).\n3. **المغادرون** يُعطَّلون في اليوم نفسه بالأمر `pveum user modify alice@pve --enable 0` للحسابات المحلية، أو في الدليل للحسابات المتزامنة.\n4. **الجميع** يُراجعون كل ربع سنة: أزل الحسابات غير المستخدمة وكل من لا يملك عاملًا ثانيًا.\n\nمن الأخطاء الشائعة تسجيل TOTP دون حفظ مفاتيح الاسترداد فيعني ضياع الهاتف حسابًا مقفلًا؛ والسماح للأتمتة باستخدام كلمة مرور شخص بدل [رمز API](/learn/systems-infrastructure-security/proxmox-api-token-security)؛ وترك حسابات الاختبار مفعّلة بعد انتهاء المشروع. يسجّل Proxmox المحاولات الفاشلة، وتؤدي إخفاقات العامل الثاني المتكررة إلى قفل المحاولات مدة معينة، وهذا مفيد لكنه يعني أن موظفي الدعم يحتاجون إجراء فك قفل واضحًا."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على عنقود مختبر تملكه:\n\n1. أنشئ مستخدمًا مسمّى: `pveum user add lab-admin@pve` ثم اضبط كلمة مروره بـ `pveum passwd lab-admin@pve`.\n2. سجّل الدخول به في نافذة متصفح خاصة وسجّل تطبيق TOTP من قائمة المستخدم، ثم سجّل مفاتيح الاسترداد واحفظها.\n3. شغّل `pveum user tfa list` وتأكد من الإدخالات.\n4. سجّل الخروج ثم الدخول لترى طلب العامل الثاني.\n5. عطّل الحساب بـ `pveum user modify lab-admin@pve --enable 0` وتأكد أن الدخول يفشل الآن.\n6. دوّن من يستطيع فك قفل حساب مقفل في مؤسستك."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "النطاق (Realm)",
+            "definition": "مصدر لهويات المستخدمين مثل pam وpve وLDAP وAD وOpenID."
+          },
+          {
+            "term": "المصادقة متعددة العوامل (MFA)",
+            "definition": "مصادقة تتطلب أكثر من نوع واحد من الإثبات."
+          },
+          {
+            "term": "TOTP",
+            "definition": "كلمات مرور لمرة واحدة مبنية على الوقت يولّدها تطبيق مصادقة."
+          },
+          {
+            "term": "WebAuthn",
+            "definition": "معيار للدخول المقاوم للتصيّد بمفاتيح الأمان أو مفاتيح المرور."
+          },
+          {
+            "term": "مفاتيح الاسترداد",
+            "definition": "رموز لمرة واحدة تعيد المستخدم بعد فقدان العامل الثاني."
+          },
+          {
+            "term": "LDAPS",
+            "definition": "LDAP عبر TLS لحماية بيانات الدليل أثناء النقل."
+          },
+          {
+            "term": "حساب الطوارئ",
+            "definition": "حساب طوارئ نادر الاستخدام ومراقب بإحكام."
+          },
+          {
+            "term": "حساب الخدمة",
+            "definition": "حساب غير بشري يستخدمه تطبيق أو نص برمجي."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي عامل ثانٍ يقاوم التصيّد أكثر؟",
+            "options": [
+              "رموز SMS",
+              "رموز TOTP",
+              "مفتاح أمان WebAuthn",
+              "مفاتيح الاسترداد"
+            ],
+            "answer": 2,
+            "explanation": "يوقّع WebAuthn لاسم الموقع المسجّل فقط، فلا تحصل الصفحة المشابهة على شيء صالح."
+          },
+          {
+            "question": "أي الممارسات تنتمي إلى تصميم هوية سليم في Proxmox؟ اختر كل ما ينطبق.",
+            "options": [
+              "حسابات مسمّاة لكل شخص",
+              "نطاق دليل أو SSO للأشخاص",
+              "كلمة مرور root مشتركة للفريق",
+              "حساب طوارئ مراقب"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تدمّر الحسابات المشتركة المساءلة وتجعل إزالة المغادرين النظيفة مستحيلة."
+          },
+          {
+            "question": "لماذا يجب أن يرتبط نطاق AD بحساب خدمة للقراءة فقط عبر LDAPS؟",
+            "options": [
+              "يسرّع الدخول",
+              "يحدّ الضرر إن تسربت بيانات الربط ويحميها أثناء النقل",
+              "لا يستطيع Proxmox استخدام غيره",
+              "يعطّل MFA"
+            ],
+            "answer": 1,
+            "explanation": "ينطبق أقل قدر من الصلاحيات والتشفير أثناء النقل على بيانات الخدمة كما ينطبق على الأشخاص."
+          },
+          {
+            "question": "ماذا يحدث إذا لم تولّد مفاتيح الاسترداد؟",
+            "options": [
+              "لا شيء، فهي اختيارية وغير ضارة",
+              "قد يؤدي ضياع المصادِق إلى إقفال الحساب",
+              "يتوقف TOTP عن العمل",
+              "يُحذف النطاق"
+            ],
+            "answer": 1,
+            "explanation": "هي الطريق المخطط للعودة، وبدونها يضطر المدير إلى إعادة ضبط العامل."
+          },
+          {
+            "question": "كيف يُعامل وصول موظف مغادر؟",
+            "options": [
+              "انتظر المراجعة الربع سنوية القادمة",
+              "عطّل الحساب في اليوم نفسه",
+              "لا تغيّر شيئًا",
+              "أعد تسمية الحساب"
+            ],
+            "answer": 1,
+            "explanation": "التعطيل في اليوم نفسه يغلق النافذة التي يمكن فيها إساءة استخدام وصول مغادر أو بيانات مسروقة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتعني المصادقة الجيدة في Proxmox حسابات مسمّاة، ونطاق دليل أو SSO للأشخاص، وبضعة حسابات خدمة محلية، وحساب `root@pam` طوارئ محفوظًا. اشترط عاملًا ثانيًا في كل مكان، وفضّل WebAuthn، واحفظ مفاتيح الاسترداد دائمًا. استخدم LDAPS مع حساب ربط للقراءة فقط، وعطّل المغادرين في اليوم نفسه، وراجع الحسابات بانتظام. وبعد أن تعرف من يسجّل الدخول حدّد ما يحق لكل شخص فعله: [التحكم في الوصول القائم على الأدوار](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac)."
+      }
+    ]
+  }
+}

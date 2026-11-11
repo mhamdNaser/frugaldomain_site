@@ -1,0 +1,560 @@
+{
+ "slug": "postgresql-authentication-and-authorization",
+ "title": "PostgreSQL Authentication and Authorization",
+ "summary": "Compare PostgreSQL authentication methods, migrate from md5 to SCRAM-SHA-256, and design roles so a stolen login does little damage.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Compare PostgreSQL authentication methods",
+  "Migrate password storage from md5 to SCRAM-SHA-256",
+  "Separate group roles, login roles and owners",
+  "Test that permissions are not broader than intended"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A report job at a retail company logs in to PostgreSQL every night. Its password is \"Summer2019\", it connects as the table owner, and it has never been rotated. When the password leaks through an old script, the attacker does not need to break anything. They simply log in and read every table.\n\nThis failure has two halves. **Authentication** asked \"who are you?\" and accepted a weak answer. **Authorization** asked \"what may you do?\" and said \"everything\". In this lesson you will strengthen both halves: choose a modern authentication method, store passwords safely, and design permissions so a stolen login has limited value."
+  },
+  {
+   "id": "authn",
+   "type": "text",
+   "markdown": "## Authentication methods compared\n\nPostgreSQL supports many methods. They are selected per connection in `pg_hba.conf`. The common ones differ a lot in strength:\n\n| Method | How it works | Verdict |\n|:--|:--|:--|\n| `trust` | No check at all | Never on a network |\n| `password` | Sends the password in clear text | Avoid |\n| `md5` | Salted MD5 challenge | Legacy; weak hash |\n| `scram-sha-256` | Salted, iterated challenge-response | Recommended for passwords |\n| `cert` | TLS client certificate | Strong for services |\n| `peer` | Asks the OS who the local user is | Good for local admin |\n| `gss` / `ldap` | Kerberos or directory | Good for central identity |\n\nSCRAM-SHA-256 never sends the password over the wire, and the stored verifier cannot be replayed to log in. Enable it by setting `password_encryption = scram-sha-256` and then **resetting each password**, because existing md5 hashes do not convert automatically.\n\nFor application services, certificates or a secrets manager remove the long-lived human-style password altogether. See [Database Secrets and Credential Management](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+  },
+  {
+   "id": "scram",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "SCRAM-SHA-256 login",
+   "caption": "The password never crosses the network.",
+   "data": {
+    "actors": [
+     {
+      "id": "c",
+      "label": "Client",
+      "sub": "192.0.2.10",
+      "icon": "laptop"
+     },
+     {
+      "id": "s",
+      "label": "Server",
+      "sub": "db1.example.com",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "from": "c",
+      "to": "s",
+      "label": "client-first",
+      "detail": "user + nonce",
+      "note": "The client announces its user name and a random nonce."
+     },
+     {
+      "from": "s",
+      "to": "c",
+      "label": "server-first",
+      "detail": "salt + iterations",
+      "tone": "secure",
+      "note": "The server returns the stored salt and iteration count."
+     },
+     {
+      "from": "c",
+      "to": "c",
+      "label": "Derive proof",
+      "detail": "PBKDF2 + HMAC",
+      "note": "The client derives a proof from the password locally."
+     },
+     {
+      "from": "c",
+      "to": "s",
+      "label": "client-final",
+      "detail": "proof",
+      "note": "Only the proof is sent, never the password."
+     },
+     {
+      "from": "s",
+      "to": "s",
+      "label": "Verify proof",
+      "detail": "against stored key",
+      "note": "The server checks the proof against its stored key."
+     },
+     {
+      "from": "s",
+      "to": "c",
+      "label": "server-final",
+      "detail": "signature",
+      "tone": "success",
+      "note": "The server proves it knew the key too: mutual authentication."
+     }
+    ]
+   }
+  },
+  {
+   "id": "enable",
+   "type": "text",
+   "markdown": "## Moving to SCRAM step by step\n\nA safe migration has four steps, and the order matters:\n\n1. Set `password_encryption = scram-sha-256` in `postgresql.conf` and reload.\n2. Find roles that still hold md5 verifiers.\n3. Reset each password so it is stored as SCRAM. Use a secrets manager or generate a strong random value rather than typing one into your shell history.\n4. Change the matching `pg_hba.conf` lines from `md5` to `scram-sha-256` and reload.\n\nDo not change `pg_hba.conf` before step 3. Clients with md5 verifiers would then fail to connect. The terminal below shows the check and the reset on a lab server."
+  },
+  {
+   "id": "scram-term",
+   "type": "terminal",
+   "title": "Finding and replacing md5 verifiers",
+   "lines": [
+    {
+     "cmd": "sudo -u postgres psql -c \"SHOW password_encryption;\"",
+     "output": " password_encryption\n---------------------\n scram-sha-256",
+     "comment": "New passwords will use SCRAM."
+    },
+    {
+     "cmd": "sudo -u postgres psql -c \"SELECT rolname, left(rolpassword,14) AS format FROM pg_authid WHERE rolcanlogin;\"",
+     "output": "  rolname   |     format\n------------+----------------\n app_report | md5a1b2c3d4e5f\n app_web    | SCRAM-SHA-256$",
+     "comment": "app_report still holds an md5 hash and must be reset."
+    },
+    {
+     "cmd": "sudo -u postgres psql",
+     "output": "postgres=# \\password app_report\nEnter new password for user \"app_report\":\nEnter it again:",
+     "comment": "\\password hashes client-side, so the clear text never reaches the logs."
+    }
+   ],
+   "caption": "The first characters of the stored verifier reveal its format; never print the whole hash."
+  },
+  {
+   "id": "authz",
+   "type": "text",
+   "markdown": "## Authorization: roles and grants\n\nAuthentication gets a user in the door. Authorization decides which rooms they can enter. PostgreSQL uses **roles** for both users and groups. A role with `LOGIN` is a user; a role without it is a group that other roles join.\n\nA sound design follows three rules:\n\n1. **Group roles hold permissions.** Create roles such as `app_readonly` and `app_readwrite` and grant privileges to them.\n2. **Login roles inherit from groups.** Each application gets its own login role that is a member of one group.\n3. **Owners stay out of the application.** The role that owns tables runs migrations only. The application must never connect as the owner, because owners can drop and alter objects.\n\nCompare the blast radius: a leaked `app_readonly` login can read some tables; a leaked owner login can destroy the schema. Full syntax and examples are in [PostgreSQL Roles, Grants and Privileges](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+  },
+  {
+   "id": "grants",
+   "type": "code",
+   "language": "sql",
+   "filename": "roles.sql",
+   "caption": "Group roles hold privileges; the application login only joins a group. The password value is a placeholder.",
+   "code": "CREATE ROLE app_readonly NOLOGIN;\nGRANT CONNECT ON DATABASE shop TO app_readonly;\nGRANT USAGE ON SCHEMA public TO app_readonly;\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO app_readonly;\n\nCREATE ROLE app_report LOGIN PASSWORD '<generated-secret>' CONNECTION LIMIT 5;\nGRANT app_readonly TO app_report;\n\n-- Stop new databases being open to everyone by default\nREVOKE CONNECT ON DATABASE shop FROM PUBLIC;",
+   "highlight": [
+    1,
+    6,
+    7,
+    10
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "The PUBLIC pseudo-role",
+   "markdown": "Every role is automatically a member of `PUBLIC`. Historically that grants `CONNECT` on new databases and `CREATE` on the `public` schema. Revoke what you do not want, and check with `\\l` and `\\dn+` after creating a database."
+  },
+  {
+   "id": "controls",
+   "type": "text",
+   "markdown": "## Extra controls worth enabling\n\nSeveral smaller settings make credential theft less useful:\n\n- **`CONNECTION LIMIT`** on login roles stops one leaked account from exhausting all connections.\n- **`VALID UNTIL`** gives temporary accounts, such as contractors, an expiry date.\n- **Separate roles per application** let you revoke one service without affecting others, and make the logs readable.\n- **Network restriction in `pg_hba.conf`** allows each role only from its own host, covered in [PostgreSQL pg_hba.conf Security](/learn/systems-infrastructure-security/postgresql-pg-hba-conf-security).\n- **Password rotation** through a secrets manager makes a leak short-lived.\n\nFinally, test both halves together. Log in as each application role and try something it should not be allowed to do. A permission error is the result you want. These checks belong in your deployment pipeline, not only in an annual audit."
+  },
+  {
+   "id": "mistakes",
+   "type": "text",
+   "markdown": "## Common mistakes and how to detect them\n\nFour mistakes appear in almost every first audit:\n\n1. **Shared accounts.** Three applications use one login, so a leak affects all three and the logs cannot tell them apart. Detect it by listing distinct client addresses per role in `pg_stat_activity`.\n2. **Superuser applications.** Query `pg_roles` for `rolsuper` and `rolcreaterole`. Any application role with these flags is a finding.\n3. **Passwords in code and chat.** Search repositories and configuration management for connection strings. Move them into a secrets manager and rotate every value that was ever committed.\n4. **Never-expiring contractor access.** Use `VALID UNTIL` and review the list of login roles every quarter.\n\nEach of these is cheap to fix and expensive to ignore. A short monthly review of `pg_roles`, `pg_hba_file_rules` and recent failed logins catches most drift before an attacker does. Failed authentication attempts appear in the server log when `log_connections` is on, and a burst from one address is a strong signal worth alerting on."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Test denial, not only success",
+   "markdown": "A permissions test that only proves the application works can pass even when access is far too wide. Add at least one negative test per role, for example a `DROP TABLE` or a `SELECT` on a table the role should never see."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "1. On a lab PostgreSQL server **you own**, check `SHOW password_encryption;` and list login roles with `SELECT rolname, left(rolpassword,14) FROM pg_authid WHERE rolcanlogin;`.\n2. Create a group role `lab_readonly`, grant it `SELECT` on one test table, and create a login role that joins it.\n3. Connect as that login role. Confirm that `SELECT` works and that `INSERT` and `DROP TABLE` fail with permission errors.\n4. Set `VALID UNTIL` on the login role to tomorrow's date and confirm the value in `pg_roles`."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Authentication",
+     "definition": "Proving who a client is."
+    },
+    {
+     "term": "Authorization",
+     "definition": "Deciding what an authenticated identity may do."
+    },
+    {
+     "term": "SCRAM-SHA-256",
+     "definition": "A salted challenge-response password method that never sends the password."
+    },
+    {
+     "term": "Verifier",
+     "definition": "The stored value the server uses to check a password proof."
+    },
+    {
+     "term": "Role",
+     "definition": "A PostgreSQL identity that can act as a user, a group or both."
+    },
+    {
+     "term": "Group role",
+     "definition": "A role without LOGIN that holds privileges for member roles."
+    },
+    {
+     "term": "PUBLIC",
+     "definition": "A pseudo-role representing all roles, which can carry default privileges."
+    },
+    {
+     "term": "Blast radius",
+     "definition": "How much damage one compromised credential can cause."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which method should replace md5 for password logins?",
+     "options": [
+      "password",
+      "trust",
+      "scram-sha-256",
+      "peer over the network"
+     ],
+     "answer": 2,
+     "explanation": "SCRAM-SHA-256 uses salted, iterated challenge-response and never sends the password."
+    },
+    {
+     "question": "After setting password_encryption to scram-sha-256, what must you do for existing md5 users?",
+     "options": [
+      "Nothing, they convert automatically",
+      "Reset each password",
+      "Restart the operating system",
+      "Drop the database"
+     ],
+     "answer": 1,
+     "explanation": "Hashes cannot be converted; the new password must be set so it is stored as SCRAM."
+    },
+    {
+     "question": "Which are good practices for application accounts? Choose all that apply.",
+     "options": [
+      "Connect as the table owner",
+      "Use a separate login role per application",
+      "Inherit privileges from a group role",
+      "Set a CONNECTION LIMIT"
+     ],
+     "answer": [
+      1,
+      2,
+      3
+     ],
+     "explanation": "Owners can drop and alter objects, so applications must not use them."
+    },
+    {
+     "question": "What does an authentication method of trust do?",
+     "options": [
+      "Requires a certificate",
+      "Accepts the connection without any check",
+      "Encrypts the password",
+      "Uses Kerberos"
+     ],
+     "answer": 1,
+     "explanation": "trust skips authentication entirely and is unsafe for any network connection."
+    },
+    {
+     "question": "Why run negative permission tests?",
+     "options": [
+      "To slow queries",
+      "To prove access is not too broad",
+      "To rotate passwords",
+      "To create backups"
+     ],
+     "answer": 1,
+     "explanation": "Only a denied action proves a limit exists; success tests alone cannot show that."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Authentication proves identity; authorization limits what that identity can do. Both must be strong.\n- Use `scram-sha-256` for passwords, certificates or Kerberos for services, and never `trust` over a network.\n- Migrate to SCRAM by changing the setting, resetting each password, and only then updating `pg_hba.conf`.\n- Put privileges on group roles, give each application its own login role, and keep owners out of applications.\n- Limit blast radius with connection limits, expiry dates and negative permission tests.\n\nNext, you will build roles and grants in detail in [PostgreSQL Roles, Grants and Privileges](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+  }
+ ],
+ "ar": {
+  "title": "المصادقة والتفويض في PostgreSQL",
+  "summary": "قارن طرق المصادقة في PostgreSQL، وانتقل من md5 إلى SCRAM-SHA-256، وصمّم الأدوار بحيث يقلّ ضرر أي دخول مسروق.",
+  "objectives": [
+   "مقارنة طرق المصادقة في PostgreSQL",
+   "ترحيل تخزين كلمات المرور من md5 إلى SCRAM-SHA-256",
+   "الفصل بين أدوار المجموعات وأدوار الدخول والمالكين",
+   "اختبار أن الأذونات ليست أوسع من المقصود"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "تسجّل مهمة تقارير في شركة تجزئة الدخول إلى PostgreSQL كل ليلة. كلمة مرورها «Summer2019»، وتتصل بصفة مالك الجداول، ولم تُدوَّر قط. وحين تتسرب كلمة المرور من سكربت قديم لا يحتاج المهاجم إلى كسر أي شيء؛ يكتفي بتسجيل الدخول وقراءة كل الجداول.\n\nلهذا الإخفاق نصفان. **المصادقة (Authentication)** سألت «من أنت؟» وقبلت جوابًا ضعيفًا. و**التفويض (Authorization)** سأل «ماذا يحق لك؟» وأجاب «كل شيء». في هذا الدرس ستقوّي النصفين: تختار طريقة مصادقة حديثة، وتخزّن كلمات المرور بأمان، وتصمّم الأذونات بحيث تكون قيمة بيانات دخول مسروقة محدودة."
+   },
+   {
+    "id": "authn",
+    "type": "text",
+    "markdown": "## مقارنة طرق المصادقة\n\nيدعم PostgreSQL طرقًا كثيرة تُختار لكل اتصال في `pg_hba.conf`. وتتفاوت الطرق الشائعة كثيرًا في القوة:\n\n| الطريقة | كيف تعمل | الحكم |\n|:--|:--|:--|\n| `trust` | لا فحص إطلاقًا | لا تُستخدم أبدًا عبر الشبكة |\n| `password` | ترسل كلمة المرور نصًّا صريحًا | تجنّبها |\n| `md5` | تحدٍّ بتجزئة MD5 مملّحة | قديمة؛ تجزئة ضعيفة |\n| `scram-sha-256` | تحدٍّ واستجابة مملّحان ومكرّران | موصى بها لكلمات المرور |\n| `cert` | شهادة عميل TLS | قوية للخدمات |\n| `peer` | تسأل نظام التشغيل عن المستخدم المحلي | جيدة للإدارة المحلية |\n| `gss` / `ldap` | Kerberos أو دليل | جيدة للهوية المركزية |\n\nلا ترسل SCRAM-SHA-256 كلمة المرور عبر الشبكة، ولا يمكن استخدام المُتحقِّق المخزَّن لتسجيل الدخول. فعّلها بضبط `password_encryption = scram-sha-256` ثم **أعد تعيين كل كلمة مرور**، لأن تجزئات md5 الموجودة لا تتحول تلقائيًّا.\n\nأما لخدمات التطبيقات فتزيل الشهادات أو مدير الأسرار كلمة المرور طويلة العمر من أصلها. راجع [إدارة الأسرار وبيانات الاعتماد لقواعد البيانات](/learn/systems-infrastructure-security/database-secrets-and-credential-management)."
+   },
+   {
+    "id": "scram",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "تسجيل الدخول بـ SCRAM-SHA-256",
+    "caption": "لا تعبر كلمة المرور الشبكة أبدًا.",
+    "data": {
+     "actors": [
+      {
+       "id": "c",
+       "label": "العميل",
+       "sub": "192.0.2.10",
+       "icon": "laptop"
+      },
+      {
+       "id": "s",
+       "label": "الخادم",
+       "sub": "db1.example.com",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "from": "c",
+       "to": "s",
+       "label": "client-first",
+       "detail": "user + nonce",
+       "note": "يعلن العميل اسم المستخدم وقيمة عشوائية مؤقتة."
+      },
+      {
+       "from": "s",
+       "to": "c",
+       "label": "server-first",
+       "detail": "salt + iterations",
+       "tone": "secure",
+       "note": "يعيد الخادم الملح المخزَّن وعدد التكرارات."
+      },
+      {
+       "from": "c",
+       "to": "c",
+       "label": "Derive proof",
+       "detail": "PBKDF2 + HMAC",
+       "note": "يشتق العميل الإثبات من كلمة المرور محليًّا."
+      },
+      {
+       "from": "c",
+       "to": "s",
+       "label": "client-final",
+       "detail": "proof",
+       "note": "يُرسل الإثبات فقط لا كلمة المرور."
+      },
+      {
+       "from": "s",
+       "to": "s",
+       "label": "Verify proof",
+       "detail": "against stored key",
+       "note": "يتحقق الخادم من الإثبات بمفتاحه المخزَّن."
+      },
+      {
+       "from": "s",
+       "to": "c",
+       "label": "server-final",
+       "detail": "signature",
+       "tone": "success",
+       "note": "يثبت الخادم أنه يعرف المفتاح أيضًا: مصادقة متبادلة."
+      }
+     ]
+    }
+   },
+   {
+    "id": "enable",
+    "type": "text",
+    "markdown": "## الانتقال إلى SCRAM خطوة بخطوة\n\nللانتقال الآمن أربع خطوات، والترتيب فيها مهم:\n\n1. اضبط `password_encryption = scram-sha-256` في `postgresql.conf` وأعد التحميل.\n2. اعثر على الأدوار التي ما زالت تحمل مُتحقِّقات md5.\n3. أعد تعيين كل كلمة مرور لتُخزَّن بصيغة SCRAM. استخدم مدير أسرار أو قيمة عشوائية قوية مولَّدة بدل كتابة واحدة في سجل أوامر الصدفة.\n4. غيّر أسطر `pg_hba.conf` المقابلة من `md5` إلى `scram-sha-256` وأعد التحميل.\n\nلا تغيّر `pg_hba.conf` قبل الخطوة 3، وإلا فشل اتصال العملاء الذين لديهم مُتحقِّقات md5. يعرض الطرفية أدناه الفحص وإعادة التعيين على خادم مخبري."
+   },
+   {
+    "id": "scram-term",
+    "type": "terminal",
+    "title": "Finding and replacing md5 verifiers",
+    "lines": [
+     {
+      "cmd": "sudo -u postgres psql -c \"SHOW password_encryption;\"",
+      "output": " password_encryption\n---------------------\n scram-sha-256",
+      "comment": "ستستخدم كلمات المرور الجديدة SCRAM."
+     },
+     {
+      "cmd": "sudo -u postgres psql -c \"SELECT rolname, left(rolpassword,14) AS format FROM pg_authid WHERE rolcanlogin;\"",
+      "output": "  rolname   |     format\n------------+----------------\n app_report | md5a1b2c3d4e5f\n app_web    | SCRAM-SHA-256$",
+      "comment": "ما زال app_report يحمل تجزئة md5 ويجب إعادة تعيينه."
+     },
+     {
+      "cmd": "sudo -u postgres psql",
+      "output": "postgres=# \\password app_report\nEnter new password for user \"app_report\":\nEnter it again:",
+      "comment": "يجزّئ \\password كلمة المرور عند العميل فلا يصل النص الصريح إلى السجلات."
+     }
+    ],
+    "caption": "تكشف أول محارف المُتحقِّق المخزَّن صيغته؛ لا تطبع التجزئة كاملة."
+   },
+   {
+    "id": "authz",
+    "type": "text",
+    "markdown": "## التفويض: الأدوار والمنح\n\nتُدخل المصادقة المستخدم من الباب، ويقرر التفويض أي الغرف يدخلها. يستخدم PostgreSQL **الأدوار** للمستخدمين والمجموعات معًا. الدور الذي يملك `LOGIN` مستخدم، وغير الحامل له مجموعة تنضم إليها أدوار أخرى.\n\nيتبع التصميم السليم ثلاث قواعد:\n\n1. **تحمل أدوار المجموعات الأذونات.** أنشئ أدوارًا مثل `app_readonly` و`app_readwrite` وامنحها الامتيازات.\n2. **ترث أدوار الدخول من المجموعات.** يحصل كل تطبيق على دور دخول خاص به عضو في مجموعة واحدة.\n3. **يبقى المالكون خارج التطبيق.** الدور المالك للجداول يشغّل عمليات الترحيل فقط. ويجب ألا يتصل التطبيق بصفة المالك لأن المالك يستطيع حذف الكائنات وتعديلها.\n\nقارن نطاق الضرر: تسريب دخول `app_readonly` يتيح قراءة بعض الجداول، أما تسريب دخول المالك فقد يدمّر المخطط. تجد الصياغة الكاملة والأمثلة في [الأدوار والمنح والامتيازات في PostgreSQL](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+   },
+   {
+    "id": "grants",
+    "type": "code",
+    "language": "sql",
+    "filename": "roles.sql",
+    "caption": "تحمل أدوار المجموعات الامتيازات، ويكتفي دور دخول التطبيق بالانضمام إلى مجموعة. قيمة كلمة المرور بديل توضيحي.",
+    "code": "CREATE ROLE app_readonly NOLOGIN;\nGRANT CONNECT ON DATABASE shop TO app_readonly;\nGRANT USAGE ON SCHEMA public TO app_readonly;\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO app_readonly;\n\nCREATE ROLE app_report LOGIN PASSWORD '<generated-secret>' CONNECTION LIMIT 5;\nGRANT app_readonly TO app_report;\n\n-- Stop new databases being open to everyone by default\nREVOKE CONNECT ON DATABASE shop FROM PUBLIC;",
+    "highlight": [
+     1,
+     6,
+     7,
+     10
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "الدور الافتراضي PUBLIC",
+    "markdown": "كل دور عضو تلقائيًّا في `PUBLIC`. وتاريخيًّا يمنح ذلك `CONNECT` على القواعد الجديدة و`CREATE` على المخطط `public`. اسحب ما لا تريده وتحقق بـ `\\l` و`\\dn+` بعد إنشاء أي قاعدة بيانات."
+   },
+   {
+    "id": "controls",
+    "type": "text",
+    "markdown": "## ضوابط إضافية تستحق التفعيل\n\nتجعل عدة إعدادات أصغر سرقة بيانات الاعتماد أقل نفعًا:\n\n- **`CONNECTION LIMIT`** على أدوار الدخول يمنع حسابًا مسرَّبًا واحدًا من استنزاف كل الاتصالات.\n- **`VALID UNTIL`** يمنح الحسابات المؤقتة، مثل حسابات المتعاقدين، تاريخ انتهاء.\n- **أدوار منفصلة لكل تطبيق** تتيح سحب خدمة واحدة دون التأثير في غيرها، وتجعل السجلات مقروءة.\n- **تقييد الشبكة في `pg_hba.conf`** يسمح لكل دور من مضيفه وحده، وقد شرحناه في [أمن ملف pg_hba.conf في PostgreSQL](/learn/systems-infrastructure-security/postgresql-pg-hba-conf-security).\n- **تدوير كلمات المرور** عبر مدير أسرار يجعل عمر التسريب قصيرًا.\n\nوأخيرًا اختبر النصفين معًا. سجّل الدخول بكل دور تطبيقي وجرّب فعل ما لا يُسمح له به. وخطأ الأذونات هو النتيجة المرجوّة. وتنتمي هذه الفحوصات إلى خط النشر لديك لا إلى التدقيق السنوي وحده."
+   },
+   {
+    "id": "mistakes",
+    "type": "text",
+    "markdown": "## أخطاء شائعة وكيف تكتشفها\n\nتظهر أربعة أخطاء في كل تدقيق أول تقريبًا:\n\n1. **الحسابات المشتركة.** تستخدم ثلاثة تطبيقات دخولًا واحدًا، فيطال التسريب الثلاثة ولا تفرّق السجلات بينها. اكتشفه بسرد عناوين العملاء المختلفة لكل دور في `pg_stat_activity`.\n2. **تطبيقات بصلاحية المدير الأعلى.** استعلم في `pg_roles` عن `rolsuper` و`rolcreaterole`. أي دور تطبيقي يحمل هاتين السمتين ملاحظة تستوجب المعالجة.\n3. **كلمات المرور في الشيفرة والمحادثات.** ابحث في المستودعات وأدوات إدارة الإعدادات عن سلاسل الاتصال. انقلها إلى مدير أسرار ودوّر كل قيمة سبق أن أُودعت.\n4. **وصول متعاقدين لا ينتهي.** استخدم `VALID UNTIL` وراجع قائمة أدوار الدخول كل ربع سنة.\n\nكل واحد منها رخيص الإصلاح باهظ الإهمال. وتكشف مراجعة شهرية قصيرة لـ `pg_roles` و`pg_hba_file_rules` ومحاولات الدخول الفاشلة الأخيرة معظم الانحراف قبل أن يكتشفه مهاجم. تظهر محاولات المصادقة الفاشلة في سجل الخادم عند تفعيل `log_connections`، ودفقة منها من عنوان واحد إشارة قوية تستحق التنبيه."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "اختبر الرفض لا النجاح فقط",
+    "markdown": "اختبار الأذونات الذي يثبت عمل التطبيق فقط قد ينجح وإن كان الوصول أوسع بكثير مما ينبغي. أضف اختبارًا سلبيًّا واحدًا على الأقل لكل دور، مثل `DROP TABLE` أو `SELECT` على جدول لا يجوز للدور رؤيته."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "1. على خادم PostgreSQL مخبري **تملكه**، افحص `SHOW password_encryption;` واسرد أدوار الدخول بـ `SELECT rolname, left(rolpassword,14) FROM pg_authid WHERE rolcanlogin;`.\n2. أنشئ دور مجموعة `lab_readonly` وامنحه `SELECT` على جدول اختباري واحد، ثم أنشئ دور دخول ينضم إليه.\n3. اتصل بذلك الدور. تأكد أن `SELECT` يعمل وأن `INSERT` و`DROP TABLE` يفشلان بأخطاء أذونات.\n4. اضبط `VALID UNTIL` لدور الدخول على تاريخ الغد وتأكد من القيمة في `pg_roles`."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "المصادقة",
+      "definition": "إثبات هوية العميل."
+     },
+     {
+      "term": "التفويض",
+      "definition": "تحديد ما يحق للهوية الموثَّقة فعله."
+     },
+     {
+      "term": "SCRAM-SHA-256",
+      "definition": "طريقة كلمة مرور بالتحدي والاستجابة المملّحة لا ترسل كلمة المرور."
+     },
+     {
+      "term": "المُتحقِّق",
+      "definition": "القيمة المخزَّنة التي يستخدمها الخادم للتحقق من إثبات كلمة المرور."
+     },
+     {
+      "term": "الدور",
+      "definition": "هوية في PostgreSQL قد تعمل كمستخدم أو مجموعة أو كليهما."
+     },
+     {
+      "term": "دور مجموعة",
+      "definition": "دور بلا LOGIN يحمل الامتيازات لأدوار أعضاء."
+     },
+     {
+      "term": "PUBLIC",
+      "definition": "دور افتراضي يمثّل كل الأدوار وقد يحمل امتيازات افتراضية."
+     },
+     {
+      "term": "نطاق الضرر",
+      "definition": "حجم الضرر الذي يسببه اختراق بيان اعتماد واحد."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي طريقة تحل محل md5 في الدخول بكلمة المرور؟",
+      "options": [
+       "password",
+       "trust",
+       "scram-sha-256",
+       "peer عبر الشبكة"
+      ],
+      "answer": 2,
+      "explanation": "تستخدم SCRAM-SHA-256 التحدي والاستجابة المملّحين والمكرّرين ولا ترسل كلمة المرور."
+     },
+     {
+      "question": "بعد ضبط password_encryption على scram-sha-256، ماذا يجب فعله لمستخدمي md5 الحاليين؟",
+      "options": [
+       "لا شيء، فهم يتحولون تلقائيًّا",
+       "إعادة تعيين كل كلمة مرور",
+       "إعادة تشغيل نظام التشغيل",
+       "حذف قاعدة البيانات"
+      ],
+      "answer": 1,
+      "explanation": "لا يمكن تحويل التجزئات؛ يجب تعيين كلمة المرور من جديد لتُخزَّن بصيغة SCRAM."
+     },
+     {
+      "question": "أي مما يلي ممارسات جيدة لحسابات التطبيقات؟ اختر كل ما ينطبق.",
+      "options": [
+       "الاتصال بصفة مالك الجداول",
+       "دور دخول منفصل لكل تطبيق",
+       "وراثة الامتيازات من دور مجموعة",
+       "ضبط CONNECTION LIMIT"
+      ],
+      "answer": [
+       1,
+       2,
+       3
+      ],
+      "explanation": "يستطيع المالك حذف الكائنات وتعديلها، فلا يجوز أن تستخدمه التطبيقات."
+     },
+     {
+      "question": "ماذا تفعل طريقة المصادقة trust؟",
+      "options": [
+       "تشترط شهادة",
+       "تقبل الاتصال دون أي فحص",
+       "تشفّر كلمة المرور",
+       "تستخدم Kerberos"
+      ],
+      "answer": 1,
+      "explanation": "تتخطى trust المصادقة كليًّا وهي غير آمنة لأي اتصال شبكي."
+     },
+     {
+      "question": "لماذا نجري اختبارات أذونات سلبية؟",
+      "options": [
+       "لإبطاء الاستعلامات",
+       "لإثبات أن الوصول ليس أوسع من اللازم",
+       "لتدوير كلمات المرور",
+       "لإنشاء نسخ احتياطية"
+      ],
+      "answer": 1,
+      "explanation": "وحده الإجراء المرفوض يثبت وجود الحد؛ واختبارات النجاح وحدها لا تُظهر ذلك."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تثبت المصادقة الهوية ويقيّد التفويض ما تفعله، ويجب أن يكونا قويين معًا.\n- استخدم `scram-sha-256` لكلمات المرور والشهادات أو Kerberos للخدمات، ولا تستخدم `trust` عبر الشبكة.\n- انتقل إلى SCRAM بتغيير الإعداد ثم إعادة تعيين كل كلمة مرور، ثم تحديث `pg_hba.conf` بعد ذلك فقط.\n- ضع الامتيازات على أدوار المجموعات، وامنح كل تطبيق دور دخول خاصًّا، وأبعد المالكين عن التطبيقات.\n- قلّل نطاق الضرر بحدود الاتصالات وتواريخ الانتهاء واختبارات الأذونات السلبية.\n\nبعد ذلك ستبني الأدوار والمنح بالتفصيل في [الأدوار والمنح والامتيازات في PostgreSQL](/learn/systems-infrastructure-security/postgresql-roles-grants-and-privileges)."
+   }
+  ]
+ }
+}

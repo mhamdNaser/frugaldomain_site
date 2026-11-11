@@ -1,0 +1,578 @@
+{
+ "slug": "runtime-threat-detection",
+ "title": "Runtime Threat Detection",
+ "summary": "See how eBPF sensors and the Falco rule engine detect suspicious behavior inside running containers, then write, test and tune rules and plan a response.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain how runtime sensors observe container behavior",
+  "Write a Falco rule with condition, output, priority and tags",
+  "Deploy Falco and trigger a rule deliberately",
+  "Tune rules without losing coverage",
+  "Plan a proportionate response to each priority"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "The scanners from earlier lessons tell you which images are vulnerable before they run. The audit log tells you who changed the cluster. Neither tells you what a container is doing right now. If an attacker exploits a flaw in a running web application and starts a shell inside the pod, all of your build-time checks are already behind you.\n\n**Runtime threat detection** watches the behavior of running containers and raises an alert when something unexpected happens. In this lesson you will see how kernel-level sensors work, write and test rules for the open-source tool **Falco**, and learn how to tune and respond to alerts. Everything here is defensive and should be run on systems you own."
+  },
+  {
+   "id": "how",
+   "type": "text",
+   "markdown": "## How runtime detection works\n\nContainers share the host kernel, and every meaningful action a process takes goes through the kernel as a **system call**: opening a file, starting a program, connecting to an address. A runtime sensor sits at that choke point.\n\nModern sensors use **eBPF**, a safe mechanism for running small verified programs inside the kernel. The sensor streams events to a user-space engine that enriches each one with container and Kubernetes metadata, such as the pod name and image. Then rules decide which events are worth an alert.\n\n| Approach | How it sees events | Trade-off |\n|:--|:--|:--|\n| Kernel module | Loaded driver | Powerful, but ties you to kernel versions |\n| eBPF probe | Verified in-kernel program | Safer and more portable, needs a recent kernel |\n| Agent in each container | Library or sidecar | Easy to bypass, adds overhead per workload |\n| Audit logs only | API activity | Blind to what happens inside containers |\n\nThe key advantage is that the sensor lives on the node, outside the container. An attacker who controls a pod cannot simply switch the sensor off from inside it."
+  },
+  {
+   "id": "flow",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "From a syscall to an alert",
+   "data": {
+    "actors": [
+     {
+      "id": "app",
+      "label": "Container",
+      "sub": "shop-api",
+      "icon": "cpu"
+     },
+     {
+      "id": "kern",
+      "label": "Kernel + eBPF",
+      "sub": "sensor",
+      "icon": "server"
+     },
+     {
+      "id": "eng",
+      "label": "Falco",
+      "sub": "rule engine",
+      "icon": "eye"
+     },
+     {
+      "id": "side",
+      "label": "Falcosidekick",
+      "sub": "forwarder",
+      "icon": "mail"
+     },
+     {
+      "id": "soc",
+      "label": "SOC",
+      "sub": "SIEM / chat",
+      "icon": "user"
+     }
+    ],
+    "steps": [
+     {
+      "from": "app",
+      "to": "kern",
+      "label": "execve(/bin/sh)",
+      "tone": "attack",
+      "note": "A process in the pod starts a shell, perhaps after an application flaw was exploited."
+     },
+     {
+      "from": "kern",
+      "to": "eng",
+      "label": "event stream",
+      "note": "The eBPF probe sends the event to Falco with the process, user and container ID."
+     },
+     {
+      "from": "eng",
+      "to": "eng",
+      "label": "enrich + match",
+      "tone": "secure",
+      "note": "Falco adds pod and namespace names and matches the Shell Spawned in Production Container rule."
+     },
+     {
+      "from": "eng",
+      "to": "side",
+      "label": "WARNING",
+      "tone": "warning",
+      "note": "A structured JSON alert is emitted."
+     },
+     {
+      "from": "side",
+      "to": "soc",
+      "label": "ticket + chat",
+      "tone": "success",
+      "note": "The alert reaches the analysts within seconds, with the pod name and command line."
+     },
+     {
+      "from": "soc",
+      "to": "app",
+      "label": "isolate pod",
+      "tone": "blocked",
+      "note": "Analysts apply a deny-all network policy, keep the pod for forensics and replace it."
+     }
+    ]
+   }
+  },
+  {
+   "id": "rules",
+   "type": "text",
+   "markdown": "## Step 1: Write rules that describe behavior\n\nFalco rules have four parts: a **condition** (a boolean expression over event fields), an **output** (the message with fields filled in), a **priority** and **tags**. Reusable **lists** and **macros** keep conditions readable. Built-in macros such as `spawned_process` and `container` already exist.\n\nGood rules describe behavior that should be rare in your environment, not signatures of one specific attack. Strong candidates for containers are:\n\n- A shell started in a production container.\n- A write below `/etc`, `/usr/bin` or `/bin`, because images should be immutable.\n- A read of credential files or the service account token path by an unexpected process.\n- An outbound connection from a pod that should only receive traffic.\n- A package manager (`apt`, `apk`, `pip`) running after deployment.\n\nTag rules with MITRE ATT&CK tactics so analysts can group alerts quickly."
+  },
+  {
+   "id": "rulefile",
+   "type": "code",
+   "language": "yaml",
+   "filename": "/etc/falco/rules.d/custom-rules.yaml",
+   "code": "- list: prod_namespaces\n  items: [prod, payments]\n\n- rule: Shell Spawned in Production Container\n  desc: Detect an interactive shell started inside a container in a production namespace\n  condition: >\n    spawned_process and container\n    and proc.name in (bash, sh, zsh, ash)\n    and k8s.ns.name in (prod_namespaces)\n  output: >\n    Shell in container (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name\n    image=%container.image.repository cmd=%proc.cmdline)\n  priority: WARNING\n  tags: [container, shell, mitre_execution]\n\n- rule: Write Below Etc In Container\n  desc: Detect a write to /etc inside a container, which should be immutable\n  condition: >\n    open_write and container and fd.name startswith /etc/\n  output: >\n    File below /etc opened for writing (user=%user.name file=%fd.name\n    pod=%k8s.pod.name image=%container.image.repository)\n  priority: ERROR\n  tags: [container, filesystem, mitre_persistence]",
+   "highlight": [
+    8,
+    9,
+    10,
+    23
+   ],
+   "caption": "Two custom rules. The condition describes behavior, and the output includes pod, namespace and image so the alert is actionable."
+  },
+  {
+   "id": "test",
+   "type": "text",
+   "markdown": "## Step 2: Install, test and read the alert\n\nOn Kubernetes the usual path is the official Helm chart, which runs Falco as a DaemonSet so every node has a sensor. Always **test a new rule on purpose**. A detection you have never triggered is a detection you cannot trust.\n\nTrigger the shell rule yourself in a test pod. The alert line shows the fields from the `output` template, so check that it holds enough context for an analyst to act without logging into the node."
+  },
+  {
+   "id": "term",
+   "type": "terminal",
+   "title": "Deploying Falco and triggering the rule",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "helm install falco falcosecurity/falco -n falco --create-namespace --set driver.kind=modern_ebpf --set tty=true",
+     "output": "NAME: falco\nSTATUS: deployed\nREVISION: 1",
+     "comment": "The modern eBPF driver needs no kernel module. It requires a recent Linux kernel on the nodes."
+    },
+    {
+     "cmd": "kubectl -n falco get pods -l app.kubernetes.io/name=falco",
+     "output": "NAME          READY   STATUS    RESTARTS   AGE\nfalco-4kq7m   2/2     Running   0          94s\nfalco-x9d2v   2/2     Running   0          94s",
+     "comment": "One Falco pod per node, as expected for a DaemonSet."
+    },
+    {
+     "cmd": "kubectl -n prod exec -it shop-api-7d9c5b6f4-x8k2p -- sh",
+     "output": "/ $ exit",
+     "comment": "A deliberate test in your own lab pod."
+    },
+    {
+     "cmd": "kubectl -n falco logs -l app.kubernetes.io/name=falco -c falco --tail=1",
+     "output": "14:22:07.123456789: Warning Shell in container (user=root pod=shop-api-7d9c5b6f4-x8k2p ns=prod image=registry.example.com/shop/api cmd=sh)",
+     "comment": "The alert names the pod, namespace, image and command, so the analyst can act immediately."
+    }
+   ]
+  },
+  {
+   "id": "limits",
+   "type": "text",
+   "markdown": "## What runtime detection cannot do\n\nKnow the limits before you rely on the tool. Falco detects and reports; it does not block the system call. Prevention comes from other layers: seccomp profiles, read-only root filesystems, dropped capabilities and network policies. Think of detection as the alarm and those controls as the locks.\n\nA rule can only see what the kernel exposes. Activity that stays entirely inside an application, such as a SQL injection that reads the database through legitimate queries, produces normal system calls and will not trigger a shell rule. Pair runtime detection with application logs and web application protections.\n\nFinally, sensors cost resources. Measure CPU and memory on a busy node before you roll out to the whole cluster, and watch the event drop counters after the rollout. A sensor that silently drops events gives you the feeling of coverage without the reality of it."
+  },
+  {
+   "id": "tune",
+   "type": "text",
+   "markdown": "## Step 3: Tune, then respond\n\nThe first week of a new rule set is noisy. Healthy applications also spawn shells, write temporary files and call package managers during startup. Tune by narrowing the condition, not by silencing the rule:\n\n- Add an **exception** for a known image or process, with a comment naming the owner and reason.\n- Scope strict rules to namespaces that truly need them.\n- Keep a **baseline** of what each workload normally does and compare alerts against it.\n\nFor response, decide in advance what each priority triggers. Detection without a runbook is just a notification.\n\n| Priority | Example | Suggested response |\n|:--|:--|:--|\n| Notice / Warning | Shell in a prod container | Ticket, review within the day |\n| Error | Write below `/etc` | Page on-call, inspect the pod |\n| Critical | Credential file read plus outbound connection | Isolate the pod with a network policy, preserve evidence, replace |\n\nAutomatic killing of pods is tempting, but it destroys the evidence and can cause outages from a false positive. Start with alert and isolate, and automate only the actions you have proven safe."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Common mistakes",
+   "markdown": "- **Alerting on everything.** Hundreds of low-value alerts hide the one that matters.\n- **Never testing rules.** Trigger each rule deliberately in a lab pod after every change.\n- **Dropping events under load.** Watch Falco's drop counters; a busy node can lose events silently.\n- **Detection without context.** Alerts that lack pod, namespace and image force analysts to log into nodes.\n- **Running as the only layer.** Runtime detection complements, not replaces, hardening and network policy."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Related lessons",
+   "markdown": "Reduce what an attacker can do first with [Container Runtime Security](/learn/systems-infrastructure-security/container-runtime-security), and learn what attacks look like in [Container Escape Risks](/learn/systems-infrastructure-security/container-escape-risks). Collect and chart the resulting signals in [Container Security Monitoring](/learn/systems-infrastructure-security/container-security-monitoring)."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a disposable kind or minikube cluster that you own, with a recent Linux kernel.\n\n1. Install Falco with Helm and confirm one pod per node is running.\n2. Start a test pod with `kubectl run test --image=busybox -- sleep 3600`.\n3. Run `kubectl exec -it test -- sh` and find the matching built-in alert in the Falco logs.\n4. Add the custom shell rule above, restrict it to a `prod` namespace, and repeat the test in both namespaces.\n5. Bonus: add an exception for one image and document the reason in a comment."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Runtime threat detection",
+     "definition": "Monitoring the behavior of running workloads to spot unexpected or malicious activity."
+    },
+    {
+     "term": "System call",
+     "definition": "A request from a process to the kernel, such as opening a file or starting a program."
+    },
+    {
+     "term": "eBPF",
+     "definition": "A kernel feature that safely runs verified programs, used for tracing and security sensors."
+    },
+    {
+     "term": "Falco",
+     "definition": "An open-source runtime security engine that matches kernel events against rules."
+    },
+    {
+     "term": "Rule condition",
+     "definition": "The boolean expression over event fields that decides whether an alert fires."
+    },
+    {
+     "term": "Baseline",
+     "definition": "A record of normal behavior used to judge whether an event is unusual."
+    },
+    {
+     "term": "False positive",
+     "definition": "An alert for activity that is actually legitimate."
+    },
+    {
+     "term": "MITRE ATT&CK",
+     "definition": "A public knowledge base of attacker tactics and techniques used to label detections."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why does a node-level sensor resist tampering better than an agent inside each container?",
+     "options": [
+      "It runs outside the container, so a compromised pod cannot easily disable it",
+      "It uses less CPU in every case",
+      "It only watches the network",
+      "It does not need rules"
+     ],
+     "answer": 0,
+     "explanation": "A sensor in the host kernel is outside the attacker's reach in the container."
+    },
+    {
+     "question": "Which behaviors make good runtime detection rules for containers? (Choose all that apply.)",
+     "options": [
+      "A shell started in a production container",
+      "A write below /etc in a container",
+      "A normal HTTP request served by the app",
+      "A package manager running after deployment"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "These are rare and suspicious in an immutable container. Normal application traffic is not."
+    },
+    {
+     "question": "What is the best way to handle a noisy rule?",
+     "options": [
+      "Delete the rule",
+      "Add a narrow, documented exception or scope it",
+      "Lower every priority to Debug",
+      "Disable the sensor on busy nodes"
+     ],
+     "answer": 1,
+     "explanation": "Narrowing keeps the detection while removing known-good noise."
+    },
+    {
+     "question": "Why test a new detection rule deliberately?",
+     "options": [
+      "To make sure it fires and the alert has enough context",
+      "Because Falco requires a test before loading",
+      "To increase the alert count",
+      "Tests replace code review"
+     ],
+     "answer": 0,
+     "explanation": "An untested rule might never fire, which gives false confidence."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Runtime detection watches system calls from the node, outside the container.\n- eBPF sensors stream events to an engine like Falco that matches rules and adds Kubernetes context.\n- Write behavior-based rules, include pod, namespace and image in the output, and tag with MITRE ATT&CK.\n- Test every rule on purpose, tune with documented exceptions and set a response per priority.\n- Prefer alert and isolate before automatic kill, to preserve evidence."
+  }
+ ],
+ "ar": {
+  "title": "كشف التهديدات أثناء التشغيل",
+  "summary": "تعرّف إلى كيفية كشف مستشعرات eBPF ومحرك قواعد Falco للسلوك المشبوه داخل الحاويات العاملة، ثم اكتب القواعد واختبرها واضبطها وخطط للاستجابة.",
+  "objectives": [
+   "شرح كيف تراقب المستشعرات سلوك الحاويات أثناء التشغيل",
+   "كتابة قاعدة Falco بشرط ومخرجات وأولوية ووسوم",
+   "نشر Falco وإطلاق قاعدة عمداً",
+   "ضبط القواعد من دون فقدان التغطية",
+   "التخطيط لاستجابة متناسبة مع كل أولوية"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "تخبرك الماسحات التي تعلمتها في دروس سابقة أي الصور معرّضة للثغرات قبل تشغيلها، ويخبرك سجلّ التدقيق من غيّر العنقود، لكن أياً منهما لا يقول ما الذي تفعله الحاوية الآن. فإذا استغل مهاجم ثغرة في تطبيق ويب قيد التشغيل وفتح صدفة (Shell) داخل الـ Pod، تكون فحوصات البناء كلها قد صارت خلفك.\n\nيراقب **كشف التهديدات أثناء التشغيل (Runtime threat detection)** سلوك الحاويات العاملة وينبّه عند حدوث ما هو غير متوقع. في هذا الدرس سترى كيف تعمل المستشعرات على مستوى النواة، وتكتب قواعد لأداة **Falco** مفتوحة المصدر وتختبرها، وتتعلم ضبط التنبيهات والاستجابة لها. كل ما هنا دفاعي ويُنفَّذ على أنظمة تملكها."
+   },
+   {
+    "id": "how",
+    "type": "text",
+    "markdown": "## كيف يعمل الكشف أثناء التشغيل\n\nتتشارك الحاويات نواة المضيف، وكل فعل ذي معنى تنفّذه عملية يمرّ عبر النواة كـ **استدعاء نظام (System call)**: فتح ملف أو تشغيل برنامج أو الاتصال بعنوان. ويقف المستشعر عند نقطة الاختناق هذه.\n\nتستعمل المستشعرات الحديثة **eBPF**، وهي آلية آمنة لتشغيل برامج صغيرة موثّقة داخل النواة. يبث المستشعر الأحداث إلى محرك في فضاء المستخدم يثريها ببيانات الحاوية وKubernetes مثل اسم الـ Pod والصورة، ثم تقرر القواعد أي الأحداث تستحق تنبيهاً.\n\n| الأسلوب | كيف يرى الأحداث | المقابل |\n|:--|:--|:--|\n| وحدة نواة | مشغّل محمّل | قوي لكنه يربطك بإصدارات النواة |\n| مجس eBPF | برنامج موثّق داخل النواة | أكثر أماناً وقابلية للنقل ويحتاج نواة حديثة |\n| وكيل داخل كل حاوية | مكتبة أو Sidecar | سهل التجاوز ويضيف عبئاً لكل حِمل |\n| سجلّات التدقيق فقط | نشاط الواجهة البرمجية | أعمى عمّا يجري داخل الحاويات |\n\nالميزة الأساسية أن المستشعر يعيش على العقدة خارج الحاوية، فلا يستطيع المهاجم الذي يسيطر على Pod أن يطفئه من الداخل."
+   },
+   {
+    "id": "flow",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "من استدعاء النظام إلى التنبيه",
+    "data": {
+     "actors": [
+      {
+       "id": "app",
+       "label": "الحاوية",
+       "sub": "shop-api",
+       "icon": "cpu"
+      },
+      {
+       "id": "kern",
+       "label": "النواة وeBPF",
+       "sub": "المستشعر",
+       "icon": "server"
+      },
+      {
+       "id": "eng",
+       "label": "Falco",
+       "sub": "محرك القواعد",
+       "icon": "eye"
+      },
+      {
+       "id": "side",
+       "label": "Falcosidekick",
+       "sub": "المُرسِل",
+       "icon": "mail"
+      },
+      {
+       "id": "soc",
+       "label": "مركز العمليات",
+       "sub": "SIEM / محادثة",
+       "icon": "user"
+      }
+     ],
+     "steps": [
+      {
+       "from": "app",
+       "to": "kern",
+       "label": "execve(/bin/sh)",
+       "tone": "attack",
+       "note": "تبدأ عملية داخل الـ Pod صدفة، ربما بعد استغلال ثغرة في التطبيق."
+      },
+      {
+       "from": "kern",
+       "to": "eng",
+       "label": "تدفق الأحداث",
+       "note": "يرسل مجس eBPF الحدث إلى Falco مع العملية والمستخدم ومعرّف الحاوية."
+      },
+      {
+       "from": "eng",
+       "to": "eng",
+       "label": "إثراء ومطابقة",
+       "tone": "secure",
+       "note": "يضيف Falco أسماء الـ Pod والـ Namespace ويطابق قاعدة فتح صدفة في حاوية إنتاج."
+      },
+      {
+       "from": "eng",
+       "to": "side",
+       "label": "WARNING",
+       "tone": "warning",
+       "note": "يُصدَر تنبيه JSON منظّم."
+      },
+      {
+       "from": "side",
+       "to": "soc",
+       "label": "تذكرة ومحادثة",
+       "tone": "success",
+       "note": "يصل التنبيه إلى المحللين خلال ثوانٍ مع اسم الـ Pod وسطر الأمر."
+      },
+      {
+       "from": "soc",
+       "to": "app",
+       "label": "عزل الـ Pod",
+       "tone": "blocked",
+       "note": "يطبّق المحللون سياسة شبكة ترفض كل شيء، ويبقون على الـ Pod للتحقيق ثم يستبدلونه."
+      }
+     ]
+    }
+   },
+   {
+    "id": "rules",
+    "type": "text",
+    "markdown": "## الخطوة 1: اكتب قواعد تصف السلوك\n\nلقواعد Falco أربعة أجزاء: **شرط (Condition)** وهو تعبير منطقي على حقول الحدث، و**مخرجات (Output)** وهي الرسالة بعد ملء الحقول، و**أولوية (Priority)**، و**وسوم (Tags)**. وتُبقي **القوائم** و**الماكرو** الشروط مقروءة. وتوجد ماكرو جاهزة مثل `spawned_process` و`container`.\n\nالقواعد الجيدة تصف سلوكاً يُفترض أن يكون نادراً في بيئتك، لا توقيعاً لهجوم بعينه. ومن أقوى المرشحين للحاويات:\n\n- صدفة تبدأ في حاوية إنتاج.\n- كتابة تحت `/etc` أو `/usr/bin` أو `/bin`، لأن الصور ينبغي أن تكون غير قابلة للتعديل.\n- قراءة ملفات بيانات الدخول أو مسار رمز حساب الخدمة من عملية غير متوقعة.\n- اتصال صادر من Pod يُفترض أن يستقبل الحركة فقط.\n- مدير حزم (`apt` أو `apk` أو `pip`) يعمل بعد النشر.\n\nوسِم القواعد بتكتيكات MITRE ATT&CK ليجمع المحللون التنبيهات بسرعة."
+   },
+   {
+    "id": "rulefile",
+    "type": "code",
+    "language": "yaml",
+    "filename": "/etc/falco/rules.d/custom-rules.yaml",
+    "code": "- list: prod_namespaces\n  items: [prod, payments]\n\n- rule: Shell Spawned in Production Container\n  desc: Detect an interactive shell started inside a container in a production namespace\n  condition: >\n    spawned_process and container\n    and proc.name in (bash, sh, zsh, ash)\n    and k8s.ns.name in (prod_namespaces)\n  output: >\n    Shell in container (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name\n    image=%container.image.repository cmd=%proc.cmdline)\n  priority: WARNING\n  tags: [container, shell, mitre_execution]\n\n- rule: Write Below Etc In Container\n  desc: Detect a write to /etc inside a container, which should be immutable\n  condition: >\n    open_write and container and fd.name startswith /etc/\n  output: >\n    File below /etc opened for writing (user=%user.name file=%fd.name\n    pod=%k8s.pod.name image=%container.image.repository)\n  priority: ERROR\n  tags: [container, filesystem, mitre_persistence]",
+    "highlight": [
+     8,
+     9,
+     10,
+     23
+    ],
+    "caption": "قاعدتان مخصّصتان. يصف الشرط السلوك، وتتضمن المخرجات الـ Pod والـ Namespace والصورة ليكون التنبيه قابلاً للتنفيذ."
+   },
+   {
+    "id": "test",
+    "type": "text",
+    "markdown": "## الخطوة 2: ثبّت واختبر واقرأ التنبيه\n\nالمسار المعتاد في Kubernetes هو مخطط Helm الرسمي الذي يشغّل Falco كـ DaemonSet فيكون لكل عقدة مستشعر. و**اختبر أي قاعدة جديدة عمداً**، فالكشف الذي لم تُطلقه قط كشف لا تستطيع الوثوق به.\n\nأطلق قاعدة الصدفة بنفسك في Pod تجريبي. يعرض سطر التنبيه الحقول من قالب `output`، فتأكد أنه يحمل سياقاً كافياً يتيح للمحلل التصرف من دون الدخول إلى العقدة."
+   },
+   {
+    "id": "term",
+    "type": "terminal",
+    "title": "نشر Falco وإطلاق القاعدة",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "helm install falco falcosecurity/falco -n falco --create-namespace --set driver.kind=modern_ebpf --set tty=true",
+      "output": "NAME: falco\nSTATUS: deployed\nREVISION: 1",
+      "comment": "لا يحتاج مشغّل eBPF الحديث إلى وحدة نواة، لكنه يتطلب نواة Linux حديثة على العقد."
+     },
+     {
+      "cmd": "kubectl -n falco get pods -l app.kubernetes.io/name=falco",
+      "output": "NAME          READY   STATUS    RESTARTS   AGE\nfalco-4kq7m   2/2     Running   0          94s\nfalco-x9d2v   2/2     Running   0          94s",
+      "comment": "Pod واحد من Falco لكل عقدة كما هو متوقع في DaemonSet."
+     },
+     {
+      "cmd": "kubectl -n prod exec -it shop-api-7d9c5b6f4-x8k2p -- sh",
+      "output": "/ $ exit",
+      "comment": "اختبار متعمَّد في Pod تجريبي تملكه."
+     },
+     {
+      "cmd": "kubectl -n falco logs -l app.kubernetes.io/name=falco -c falco --tail=1",
+      "output": "14:22:07.123456789: Warning Shell in container (user=root pod=shop-api-7d9c5b6f4-x8k2p ns=prod image=registry.example.com/shop/api cmd=sh)",
+      "comment": "يذكر التنبيه الـ Pod والـ Namespace والصورة والأمر، فيتصرف المحلل فوراً."
+     }
+    ]
+   },
+   {
+    "id": "limits",
+    "type": "text",
+    "markdown": "## ما الذي لا يستطيع الكشف أثناء التشغيل فعله\n\nاعرف الحدود قبل أن تعتمد على الأداة. يكتشف Falco ويبلّغ، لكنه لا يمنع استدعاء النظام. فالمنع يأتي من طبقات أخرى: ملفات seccomp الشخصية، ونظم الملفات الجذرية للقراءة فقط، وإسقاط القدرات (Capabilities)، وسياسات الشبكة. اعتبر الكشف إنذاراً وتلك الضوابط أقفالاً.\n\nولا ترى القاعدة إلا ما تكشفه النواة. فالنشاط الذي يبقى بالكامل داخل التطبيق، مثل حقن SQL يقرأ قاعدة البيانات عبر استعلامات مشروعة، ينتج استدعاءات نظام عادية ولن يطلق قاعدة الصدفة. فاجمع الكشف أثناء التشغيل مع سجلّات التطبيق وحمايات تطبيقات الويب.\n\nوأخيراً تكلّف المستشعرات موارد. قِس المعالج والذاكرة على عقدة مشغولة قبل الطرح على العنقود كله، وراقب عدّادات إسقاط الأحداث بعده. فالمستشعر الذي يُسقط الأحداث بصمت يمنحك شعور التغطية من دون حقيقتها."
+   },
+   {
+    "id": "tune",
+    "type": "text",
+    "markdown": "## الخطوة 3: اضبط ثم استجب\n\nالأسبوع الأول من أي مجموعة قواعد جديدة صاخب. فالتطبيقات السليمة نفسها تفتح صدفاً وتكتب ملفات مؤقتة وتستدعي مديري الحزم عند الإقلاع. اضبط بتضييق الشرط لا بإسكات القاعدة:\n\n- أضف **استثناءً** لصورة أو عملية معروفة مع تعليق يذكر المالك والسبب.\n- حصر القواعد الصارمة في الـ Namespaces التي تحتاجها فعلاً.\n- احتفظ بـ **خط أساس (Baseline)** لما يفعله كل حِمل عادةً وقارن التنبيهات به.\n\nوفي الاستجابة قرّر مسبقاً ما الذي تطلقه كل أولوية. فالكشف من دون دليل إجراءات مجرد إشعار.\n\n| الأولوية | مثال | الاستجابة المقترحة |\n|:--|:--|:--|\n| Notice / Warning | صدفة في حاوية إنتاج | تذكرة ومراجعة خلال اليوم |\n| Error | كتابة تحت `/etc` | استدعاء المناوب وفحص الـ Pod |\n| Critical | قراءة ملف بيانات دخول مع اتصال صادر | عزل الـ Pod بسياسة شبكة وحفظ الأدلة واستبداله |\n\nقتل الـ Pods تلقائياً فكرة مغرية، لكنه يتلف الأدلة وقد يسبب انقطاعاً بسبب إنذار كاذب. ابدأ بالتنبيه والعزل، ولا تؤتمت إلا الإجراءات التي أثبتّ أمانها."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "أخطاء شائعة",
+    "markdown": "- **التنبيه على كل شيء.** مئات التنبيهات قليلة القيمة تخفي التنبيه المهم.\n- **عدم اختبار القواعد.** أطلق كل قاعدة عمداً في Pod تجريبي بعد كل تعديل.\n- **فقدان الأحداث تحت الضغط.** راقب عدّادات الإسقاط في Falco، فقد تفقد العقدة المشغولة أحداثاً بصمت.\n- **كشف بلا سياق.** التنبيهات التي تفتقر إلى الـ Pod والـ Namespace والصورة تجبر المحللين على الدخول إلى العقد.\n- **الاعتماد عليه طبقةً وحيدة.** يكمّل الكشف أثناء التشغيل التحصين وسياسات الشبكة ولا يحل محلهما."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "دروس ذات صلة",
+    "markdown": "قلّل أولاً ما يستطيع المهاجم فعله عبر [أمان وقت تشغيل الحاويات](/learn/systems-infrastructure-security/container-runtime-security)، وتعرّف إلى شكل الهجمات في [مخاطر الهروب من الحاويات](/learn/systems-infrastructure-security/container-escape-risks). واجمع الإشارات الناتجة وارسمها في [المراقبة الأمنية للحاويات](/learn/systems-infrastructure-security/container-security-monitoring)."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استعمل عنقود kind أو minikube مؤقتاً تملكه ونواة Linux حديثة.\n\n1. ثبّت Falco بـ Helm وتأكد من عمل Pod واحد لكل عقدة.\n2. شغّل Pod تجريبياً بالأمر `kubectl run test --image=busybox -- sleep 3600`.\n3. نفّذ `kubectl exec -it test -- sh` وابحث عن التنبيه المدمج المطابق في سجلّات Falco.\n4. أضف قاعدة الصدفة المخصّصة أعلاه وقيّدها بـ Namespace باسم `prod`، وكرّر الاختبار في الـ Namespaces.\n5. تحدٍّ إضافي: أضف استثناءً لصورة واحدة ووثّق السبب في تعليق."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "كشف التهديدات أثناء التشغيل",
+      "definition": "مراقبة سلوك أحمال العمل العاملة لاكتشاف النشاط غير المتوقع أو الخبيث."
+     },
+     {
+      "term": "استدعاء النظام (System call)",
+      "definition": "طلب من عملية إلى النواة، مثل فتح ملف أو تشغيل برنامج."
+     },
+     {
+      "term": "eBPF",
+      "definition": "ميزة في النواة تشغّل برامج موثّقة بأمان، وتُستعمل في التتبع ومستشعرات الأمن."
+     },
+     {
+      "term": "Falco",
+      "definition": "محرك أمن مفتوح المصدر يطابق أحداث النواة مع القواعد."
+     },
+     {
+      "term": "شرط القاعدة",
+      "definition": "التعبير المنطقي على حقول الحدث الذي يقرر إطلاق التنبيه من عدمه."
+     },
+     {
+      "term": "خط الأساس (Baseline)",
+      "definition": "سجلّ للسلوك الطبيعي يُستعمل للحكم هل الحدث غير معتاد."
+     },
+     {
+      "term": "إنذار كاذب",
+      "definition": "تنبيه على نشاط مشروع في الحقيقة."
+     },
+     {
+      "term": "MITRE ATT&CK",
+      "definition": "قاعدة معرفة عامة بتكتيكات المهاجمين وتقنياتهم تُستعمل لوسم الكشوفات."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يصمد مستشعر على مستوى العقدة أمام العبث أكثر من وكيل داخل كل حاوية؟",
+      "options": [
+       "يعمل خارج الحاوية فلا يستطيع Pod مخترَق تعطيله بسهولة",
+       "يستهلك معالجاً أقل في كل الحالات",
+       "يراقب الشبكة فقط",
+       "لا يحتاج إلى قواعد"
+      ],
+      "answer": 0,
+      "explanation": "المستشعر في نواة المضيف خارج متناول المهاجم داخل الحاوية."
+     },
+     {
+      "question": "أي السلوكيات تصلح قواعد كشف أثناء التشغيل للحاويات؟ (اختر كل ما ينطبق)",
+      "options": [
+       "صدفة تبدأ في حاوية إنتاج",
+       "كتابة تحت /etc في حاوية",
+       "طلب HTTP عادي يخدمه التطبيق",
+       "مدير حزم يعمل بعد النشر"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "هذه نادرة ومثيرة للشك في حاوية غير قابلة للتعديل، أما حركة التطبيق العادية فلا."
+     },
+     {
+      "question": "ما أفضل طريقة للتعامل مع قاعدة كثيرة الضجيج؟",
+      "options": [
+       "حذف القاعدة",
+       "إضافة استثناء ضيق وموثّق أو تحديد نطاقها",
+       "خفض كل الأولويات إلى Debug",
+       "تعطيل المستشعر على العقد المشغولة"
+      ],
+      "answer": 1,
+      "explanation": "التضييق يُبقي الكشف ويزيل الضجيج المعروف أنه سليم."
+     },
+     {
+      "question": "لماذا تختبر قاعدة كشف جديدة عمداً؟",
+      "options": [
+       "لتتأكد أنها تُطلق وأن التنبيه يحمل سياقاً كافياً",
+       "لأن Falco يشترط اختباراً قبل التحميل",
+       "لزيادة عدد التنبيهات",
+       "الاختبارات تحل محل مراجعة الشيفرة"
+      ],
+      "answer": 0,
+      "explanation": "قد لا تُطلق القاعدة غير المختبرة أبداً، وهذا يمنح ثقة زائفة."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يراقب الكشف أثناء التشغيل استدعاءات النظام من العقدة خارج الحاوية.\n- تبث مستشعرات eBPF الأحداث إلى محرك مثل Falco يطابق القواعد ويضيف سياق Kubernetes.\n- اكتب قواعد قائمة على السلوك، وضمّن المخرجات الـ Pod والـ Namespace والصورة، ووسِمها بـ MITRE ATT&CK.\n- اختبر كل قاعدة عمداً، واضبطها باستثناءات موثّقة، وحدّد استجابة لكل أولوية.\n- فضّل التنبيه والعزل على القتل التلقائي للحفاظ على الأدلة."
+   }
+  ]
+ }
+}

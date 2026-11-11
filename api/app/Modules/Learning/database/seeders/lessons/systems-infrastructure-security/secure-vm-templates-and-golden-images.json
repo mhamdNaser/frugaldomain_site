@@ -1,0 +1,606 @@
+{
+  "slug": "secure-vm-templates-and-golden-images",
+  "title": "Secure VM Templates and Golden Images",
+  "summary": "Build a hardened golden image, seal it so no keys or history travel with it, convert it to a Proxmox template, and keep it trustworthy with access control and regular refreshes.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Verify source images with checksums and signatures",
+    "Harden and script a reproducible base image",
+    "Seal an image and convert it to a Proxmox template",
+    "Inject unique credentials with cloud-init and manage the template lifecycle"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Every time someone builds a server by hand, the result is slightly different. One has an old package, another has a test account nobody removed, a third has a leftover SSH key. Multiply that by fifty servers and you cannot say with confidence what is running anywhere.\n\nA **golden image** solves this. It is one carefully built, hardened and tested VM that becomes the template for every new server. In Proxmox VE you convert it to a **template** and clone it. The security benefit is large: fix a weakness once in the image and every future clone inherits the fix. The risk is just as large, because a flaw or a secret baked into the image is copied everywhere. This lesson shows how to build, seal, store and refresh templates safely."
+    },
+    {
+      "id": "source",
+      "type": "text",
+      "markdown": "## Step 1: Start from a trusted source\n\nThe image is only as trustworthy as what you start with. Download installer ISOs and cloud images only from the vendor's official site, and verify them before use.\n\nVendors publish a **checksum** and often a **signature** file. The checksum proves the file was not corrupted. The signature proves it came from the publisher, which matters if the download location itself is compromised. Verify both when a signature exists, and record the version and hash in your build notes.\n\nPrefer the **smallest base** that fits the job. A minimal server install has fewer packages, fewer services and fewer vulnerabilities to patch than a full desktop image. If a workload needs something extra, add it in a role-specific image built on top of the base one rather than in the base itself.\n\nKeep your ISO storage tidy. Delete old installers and keep an inventory of what is there, since an unknown ISO on the storage is an unverified starting point waiting to be used. This ties directly to [Hypervisor Attack Surface](/learn/systems-infrastructure-security/hypervisor-attack-surface)."
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "Verifying a cloud image before use",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "cd /var/lib/vz/template/iso",
+          "output": ""
+        },
+        {
+          "cmd": "sha256sum -c SHA256SUMS --ignore-missing",
+          "output": "debian-12-genericcloud-amd64.qcow2: OK"
+        },
+        {
+          "comment": "Compare against the checksum file downloaded from the vendor's official site. FAILED means stop and download again."
+        },
+        {
+          "cmd": "gpg --verify SHA256SUMS.sign SHA256SUMS",
+          "output": "gpg: Good signature from \"Image Signing Key <images@example.com>\"\ngpg: WARNING: This key is not certified with a trusted signature!"
+        },
+        {
+          "comment": "The warning means you have not yet confirmed the key's fingerprint through a second channel. Do that once and record it."
+        }
+      ],
+      "caption": "File and key names are examples. Use the names your vendor publishes."
+    },
+    {
+      "id": "harden",
+      "type": "text",
+      "markdown": "## Step 2: Harden and patch the base\n\nBuild the base VM, then apply your standard baseline before you seal it.\n\n- **Update everything** to the latest security patches.\n- **Remove what you do not need:** compilers, development tools, sample accounts and unused services.\n- **Configure SSH safely:** key-based login only, no root login, and no password authentication. See the hardening topics in [Proxmox Host Hardening](/learn/systems-infrastructure-security/proxmox-host-hardening) for the pattern, which applies to guests as well.\n- **Enable the logging and time sync** that your monitoring expects.\n- **Turn on the host firewall** with a default-deny inbound policy.\n- **Install the guest agent** if your backup process uses it.\n\nRun a configuration audit and keep the report with the image. A short checklist or a scanner output that says \"this image passed\" gives you a way to prove that the standard was met on the day you built it.\n\nDo not hand-edit and forget. Record every step in a script or configuration management playbook so the image can be **rebuilt from scratch**. An image that nobody knows how to recreate becomes a liability the moment it needs a fix."
+    },
+    {
+      "id": "seal",
+      "type": "text",
+      "markdown": "## Step 3: Seal the image so no secrets travel with it\n\nThis is the step teams forget, and it is the one that causes real incidents. A VM that has been running holds **identity and state** that must not be copied to other machines.\n\n| Item left in the image | What goes wrong in every clone |\n|:--|:--|\n| SSH host keys | All servers share one identity, so a stolen key impersonates all of them |\n| `/etc/machine-id` | Clones appear as one machine to monitoring and DHCP |\n| Shell history and logs | Passwords typed on the command line are copied |\n| Admin SSH keys or passwords | Everyone who clones the image shares one credential |\n| Cloud-init state | New clones skip first-boot setup |\n\nThe fix is to **clean the image just before converting it to a template**: delete the host keys (they are regenerated on first boot), empty the machine ID, clear history and logs, and reset cloud-init. Then use **cloud-init** to inject a unique user, SSH public key and hostname into each clone at first boot, so no credential lives in the template at all."
+    },
+    {
+      "id": "seal-script",
+      "type": "code",
+      "language": "bash",
+      "title": "Sealing a Debian-based image (run inside the VM)",
+      "code": "#!/bin/bash\n# Run as root on the golden image, then shut down. Do not boot it again before templating.\nset -euo pipefail\n\napt-get update && apt-get -y full-upgrade\napt-get -y autoremove --purge && apt-get clean\n\n# Host identity is regenerated on first boot of each clone\nrm -f /etc/ssh/ssh_host_*\ntruncate -s 0 /etc/machine-id\n\n# Remove accumulated state and history\ncloud-init clean --logs\nfind /var/log -type f -exec truncate -s 0 {} \\;\nrm -f /root/.bash_history /home/*/.bash_history\nrm -rf /root/.ssh/authorized_keys /tmp/* /var/tmp/*\n\nhistory -c\nshutdown -h now\n",
+      "caption": "The script keeps the machine-id file but empties it, so systemd generates a new ID on the next boot."
+    },
+    {
+      "id": "template-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "From golden image to a new server",
+      "caption": "Harden once, seal, convert to a template, then clone with unique identity injected at first boot.",
+      "data": {
+        "actors": [
+          {
+            "id": "b",
+            "label": "Builder VM",
+            "sub": "Hardened base",
+            "icon": "server"
+          },
+          {
+            "id": "t",
+            "label": "Template 9000",
+            "sub": "Read-only",
+            "icon": "file"
+          },
+          {
+            "id": "c",
+            "label": "Clone",
+            "sub": "web02",
+            "icon": "server"
+          },
+          {
+            "id": "ci",
+            "label": "cloud-init",
+            "sub": "Unique identity",
+            "icon": "key"
+          }
+        ],
+        "steps": [
+          {
+            "from": "b",
+            "to": "b",
+            "label": "Patch + harden",
+            "tone": "secure",
+            "note": "Apply updates, remove extras and run the baseline. Record the steps in a script."
+          },
+          {
+            "from": "b",
+            "to": "b",
+            "label": "Seal",
+            "tone": "secure",
+            "note": "Delete host keys, empty machine-id, clear history and logs, then shut down."
+          },
+          {
+            "from": "b",
+            "to": "t",
+            "label": "qm template 9000",
+            "tone": "success",
+            "note": "Convert the VM into a template. It can no longer be started, only cloned."
+          },
+          {
+            "from": "t",
+            "to": "c",
+            "label": "qm clone 9000 120",
+            "note": "A full clone copies the disk. A linked clone shares the template's base disk."
+          },
+          {
+            "from": "ci",
+            "to": "c",
+            "label": "Inject user + key",
+            "tone": "secure",
+            "note": "At first boot cloud-init creates the admin user, installs the public key and sets the hostname."
+          },
+          {
+            "from": "c",
+            "to": "c",
+            "label": "Unique host keys",
+            "tone": "success",
+            "note": "SSH regenerates its host keys, so every clone has its own identity."
+          }
+        ]
+      }
+    },
+    {
+      "id": "tpl",
+      "type": "terminal",
+      "title": "Creating and using a template in Proxmox VE",
+      "prompt": "root@pve1:~#",
+      "lines": [
+        {
+          "cmd": "qm template 9000",
+          "output": ""
+        },
+        {
+          "cmd": "qm clone 9000 120 --name web02 --full 1",
+          "output": "create full clone of drive scsi0 (local-lvm:base-9000-disk-0)\n  Logical volume \"vm-120-disk-0\" created.\ntransferred 0.0 B of 32.0 GiB (0.00%)\ntransferred 32.0 GiB of 32.0 GiB (100.00%)"
+        },
+        {
+          "cmd": "qm set 120 --ciuser deploy --sshkeys /root/keys/deploy.pub --ipconfig0 ip=10.20.0.50/24,gw=10.20.0.1",
+          "output": "update VM 120: -ciuser deploy -ipconfig0 ip=10.20.0.50/24,gw=10.20.0.1 -sshkeys ..."
+        },
+        {
+          "comment": "No password is set. The clone accepts only the public key you inject, so the template holds no credential."
+        }
+      ],
+      "caption": "Template ID 9000 and the address are examples from a lab network."
+    },
+    {
+      "id": "lifecycle",
+      "type": "text",
+      "markdown": "## Step 4: Control access and refresh on a schedule\n\nA template is a trusted starting point, so protect it like a production asset.\n\n**Limit who can change or clone it.** Give most staff clone permission on a template pool, and reserve edit and delete for the small team that maintains images. The role design is covered in [Proxmox Role-Based Access Control (RBAC)](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac). An attacker who can quietly alter a template compromises everything built afterward.\n\n**Refresh regularly.** A golden image ages the day it is created. Rebuild monthly, or sooner when a serious vulnerability appears, and give each build a version in the name, such as `tpl-debian12-2025-06`. Retire old templates and make the current one obvious.\n\n**Remember existing clones.** Updating a template does not change servers already cloned from it. Track which clones came from which template version, and patch them through your normal update process.\n\nFinally, store a copy of every approved template in your backups. That connects to [VM Snapshot and Backup Security](/learn/systems-infrastructure-security/vm-snapshot-and-backup-security)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where teams go wrong",
+      "markdown": "- **Booting the template again after sealing.** The VM regenerates keys and logs. Seal as the very last step, then convert.\n- **Baking in a shared admin password or key** \"to make first login easy\". Use cloud-init to inject per-server credentials.\n- **Never refreshing.** Every clone from a two-year-old image starts with two years of known vulnerabilities.\n- **Using linked clones for sensitive systems without thought.** They depend on the template's base disk, so protect that disk like a production volume."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a lab Proxmox VE that you own:\n\n1. Download a Debian cloud image and verify it with `sha256sum -c`. Note the version and hash.\n2. Import it as a new VM, add a cloud-init drive, update it, and remove any packages you do not need.\n3. Run the sealing steps from this lesson inside the VM, then shut it down.\n4. Convert it with `qm template <id>`.\n5. Clone it twice with unique names, set `--ciuser` and `--sshkeys` for each, and start both.\n6. Log in to each and compare `/etc/machine-id` and `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. They must differ.\n7. List what you would have to change to refresh the template next month."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Golden image",
+          "definition": "A hardened, tested VM used as the approved starting point for new servers."
+        },
+        {
+          "term": "Template",
+          "definition": "A Proxmox VM converted so it can be cloned but not started."
+        },
+        {
+          "term": "cloud-init",
+          "definition": "A first-boot tool that sets hostname, users and keys from injected configuration."
+        },
+        {
+          "term": "Sealing",
+          "definition": "Removing identity and state from an image before it becomes a template."
+        },
+        {
+          "term": "Full clone",
+          "definition": "A copy that has its own independent disk."
+        },
+        {
+          "term": "Linked clone",
+          "definition": "A clone that shares the template's base disk and stores only its changes."
+        },
+        {
+          "term": "Checksum",
+          "definition": "A hash used to confirm a downloaded file is intact."
+        },
+        {
+          "term": "Configuration baseline",
+          "definition": "The documented set of settings every system must meet."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main security benefit of a golden image?",
+          "options": [
+            "A fix made once is inherited by future clones",
+            "VMs boot faster",
+            "It removes the need for patching",
+            "It encrypts all guests"
+          ],
+          "answer": 0,
+          "explanation": "Consistency is the benefit. Patching is still required, both in the image and in existing clones."
+        },
+        {
+          "question": "Which items should be removed when sealing an image? (Choose all that apply.)",
+          "options": [
+            "SSH host keys",
+            "Shell history",
+            "The machine ID contents",
+            "The operating system kernel"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Identity and history must not travel to clones. The kernel is part of the working system and stays."
+        },
+        {
+          "question": "Why use cloud-init instead of baking an admin key into the template?",
+          "options": [
+            "It makes the disk smaller",
+            "Each clone gets its own credentials and the template holds none",
+            "It disables SSH",
+            "It prevents cloning"
+          ],
+          "answer": 1,
+          "explanation": "A shared credential in the template is shared by every server built from it."
+        },
+        {
+          "question": "An SHA-256 check on a downloaded image prints FAILED. What do you do?",
+          "options": [
+            "Use it anyway",
+            "Delete it and download again from the official source",
+            "Rename the file",
+            "Skip the signature step"
+          ],
+          "answer": 1,
+          "explanation": "A failed check means the file is corrupted or altered. Never build from it."
+        },
+        {
+          "question": "Which practices keep templates trustworthy? (Choose all that apply.)",
+          "options": [
+            "Restricting who can edit templates",
+            "Rebuilding on a schedule with version names",
+            "Letting everyone modify the template",
+            "Backing up approved templates"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Controlled change, regular refresh and backups protect the template. Open editing destroys trust in it."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A **golden image** gives every new VM the same hardened start, and a fix made once benefits all future clones.\n- **Verify** downloads with checksums and signatures, and start from a minimal base.\n- **Harden, patch and script** the build so it can be repeated.\n- **Seal** the image: remove host keys, machine ID, history and credentials, then convert it with `qm template`.\n- Inject unique identity with **cloud-init**, restrict who may edit templates, and **refresh** them on a schedule.\n\nNext, learn how to protect the snapshots and backups that capture these systems in [VM Snapshot and Backup Security](/learn/systems-infrastructure-security/vm-snapshot-and-backup-security)."
+    }
+  ],
+  "ar": {
+    "title": "قوالب الأجهزة الافتراضية الآمنة والصور الذهبية",
+    "summary": "ابنِ صورة ذهبية محصَّنة، واختمها حتى لا تنتقل معها مفاتيح أو سجلات، وحوّلها إلى قالب في Proxmox، وأبقها موثوقة بالتحكم في الوصول والتجديد المنتظم.",
+    "objectives": [
+      "التحقق من الصور المصدرية بقيم التحقق والتواقيع",
+      "تحصين صورة أساسية قابلة لإعادة الإنتاج وكتابتها في سكربت",
+      "ختم صورة وتحويلها إلى قالب في Proxmox",
+      "حقن بيانات اعتماد فريدة عبر cloud-init وإدارة دورة حياة القالب"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في كل مرة يبني فيها أحدهم خادمًا يدويًا تختلف النتيجة قليلًا. أحدها فيه حزمة قديمة، وآخر فيه حساب اختبار لم يُحذف، وثالث فيه مفتاح SSH متبقٍّ. وإذا ضربت ذلك في خمسين خادمًا فلن تستطيع القول بثقة ما الذي يعمل في أي مكان.\n\nتحل **الصورة الذهبية (Golden image)** هذه المشكلة. وهي جهاز افتراضي واحد مبني بعناية ومحصَّن ومختبَر يصبح قالبًا لكل خادم جديد. وفي Proxmox VE تحوّله إلى **قالب (Template)** وتستنسخه. والفائدة الأمنية كبيرة: أصلح الضعف مرة واحدة في الصورة فيرثه كل نسخ لاحق. والخطر كبير بالقدر نفسه، لأن أي خلل أو سر مضمَّن في الصورة يُنسخ في كل مكان. يريك هذا الدرس كيف تبني القوالب وتختمها وتخزنها وتجدّدها بأمان."
+      },
+      {
+        "id": "source",
+        "type": "text",
+        "markdown": "## الخطوة 1: ابدأ من مصدر موثوق\n\nلا تزيد الصورة موثوقية عن موثوقية ما بدأت منه. نزّل ملفات ISO للتثبيت وصور السحابة من موقع المورّد الرسمي فقط، وتحقق منها قبل الاستخدام.\n\nينشر الموردون **قيمة تحقق (Checksum)** وكثيرًا ما ينشرون ملف **توقيع**. تثبت قيمة التحقق أن الملف لم يتلف، ويثبت التوقيع أنه جاء من الناشر، وهذا مهم إن كان موقع التنزيل نفسه مخترقًا. تحقق من الاثنين متى وُجد توقيع، وسجّل الإصدار والقيمة في ملاحظات البناء.\n\nوفضّل **أصغر قاعدة** تناسب العمل. فالتثبيت الأدنى للخادم فيه حزم وخدمات أقل وثغرات أقل تحتاج إلى ترقيع من صورة مكتب كاملة. وإن احتاج عمل ما إلى شيء إضافي فأضفه في صورة خاصة بالدور مبنية فوق الصورة الأساسية لا في الأساس نفسه.\n\nورتّب مخزن ملفات ISO. احذف المثبّتات القديمة وأبقِ جردًا لما هو موجود، فملف ISO مجهول على المخزن نقطة بداية غير موثقة تنتظر من يستخدمها. ويرتبط هذا مباشرة بدرس [سطح الهجوم للمشرف الافتراضي](/learn/systems-infrastructure-security/hypervisor-attack-surface)."
+      },
+      {
+        "id": "verify",
+        "type": "terminal",
+        "title": "التحقق من صورة سحابة قبل استخدامها",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "cd /var/lib/vz/template/iso",
+            "output": ""
+          },
+          {
+            "cmd": "sha256sum -c SHA256SUMS --ignore-missing",
+            "output": "debian-12-genericcloud-amd64.qcow2: OK"
+          },
+          {
+            "comment": "قارن بملف قيمة التحقق المنزَّل من موقع المورّد الرسمي. والنتيجة FAILED تعني أن تتوقف وتنزّل من جديد."
+          },
+          {
+            "cmd": "gpg --verify SHA256SUMS.sign SHA256SUMS",
+            "output": "gpg: Good signature from \"Image Signing Key <images@example.com>\"\ngpg: WARNING: This key is not certified with a trusted signature!"
+          },
+          {
+            "comment": "يعني التحذير أنك لم تؤكد بصمة المفتاح بعدُ عبر قناة ثانية. افعل ذلك مرة واحدة وسجّلها."
+          }
+        ],
+        "caption": "أسماء الملفات والمفاتيح أمثلة. استخدم الأسماء التي ينشرها مورّدك."
+      },
+      {
+        "id": "harden",
+        "type": "text",
+        "markdown": "## الخطوة 2: حصّن القاعدة وحدّثها\n\nابنِ الجهاز الأساسي، ثم طبّق خط الأساس القياسي لديك قبل أن تختمه.\n\n- **حدّث كل شيء** إلى أحدث التصحيحات الأمنية.\n- **أزل ما لا تحتاج إليه:** المترجمات وأدوات التطوير وحسابات الأمثلة والخدمات غير المستخدمة.\n- **اضبط SSH بأمان:** الدخول بالمفاتيح فقط، ومن دون دخول root، ومن دون مصادقة بكلمة مرور. راجع موضوعات التحصين في [تحصين مضيف Proxmox](/learn/systems-infrastructure-security/proxmox-host-hardening) للنمط، فهو ينطبق على الضيوف أيضًا.\n- **فعّل التسجيل ومزامنة الوقت** اللذين تتوقعهما المراقبة.\n- **شغّل جدار حماية المضيف** بسياسة رفض افتراضي للداخل.\n- **ثبّت وكيل الضيف** إن كانت عملية النسخ الاحتياطي لديك تستخدمه.\n\nشغّل تدقيقًا للإعدادات واحتفظ بتقريره مع الصورة. فقائمة فحص قصيرة أو مخرجات ماسح تقول «اجتازت هذه الصورة» تمنحك وسيلة لإثبات أن المعيار استُوفي يوم بنيتها.\n\nولا تعدّل يدويًا ثم تنسَ. سجّل كل خطوة في سكربت أو في دليل أتمتة الإعدادات (Playbook) لتتمكن من **إعادة بناء الصورة من الصفر**. فالصورة التي لا يعرف أحد كيف يعيد إنشاءها تصبح عبئًا لحظة تحتاج إلى إصلاح."
+      },
+      {
+        "id": "seal",
+        "type": "text",
+        "markdown": "## الخطوة 3: اختم الصورة حتى لا تنتقل معها أسرار\n\nهذه الخطوة التي ينساها الفرق، وهي التي تسبب حوادث حقيقية. فالجهاز الذي عمل مدة يحمل **هوية وحالة** لا يجوز نسخها إلى أجهزة أخرى.\n\n| العنصر المتروك في الصورة | ما يسوء في كل نسخة |\n|:--|:--|\n| مفاتيح مضيف SSH | تتشارك الخوادم كلها هوية واحدة، فيستطيع مفتاح مسروق انتحال جميعها |\n| `/etc/machine-id` | تبدو النسخ جهازًا واحدًا للمراقبة ولـ DHCP |\n| سجل الصدفة والسجلات | تُنسخ كلمات المرور المكتوبة في سطر الأوامر |\n| مفاتيح SSH أو كلمات مرور المسؤول | يتشارك كل من يستنسخ الصورة بيانات اعتماد واحدة |\n| حالة cloud-init | تتخطى النسخ الجديدة إعداد أول إقلاع |\n\nوالحل أن **تنظّف الصورة قبل تحويلها إلى قالب مباشرةً**: احذف مفاتيح المضيف (تُعاد توليدها عند أول إقلاع)، وفرّغ معرّف الجهاز، وامسح السجل والسجلات، وأعد ضبط cloud-init. ثم استخدم **cloud-init** لحقن مستخدم فريد ومفتاح SSH عام واسم مضيف في كل نسخة عند أول إقلاع، فلا تعيش أي بيانات اعتماد في القالب أصلًا."
+      },
+      {
+        "id": "seal-script",
+        "type": "code",
+        "language": "bash",
+        "title": "ختم صورة مبنية على Debian (تُنفَّذ داخل الجهاز)",
+        "code": "#!/bin/bash\n# Run as root on the golden image, then shut down. Do not boot it again before templating.\nset -euo pipefail\n\napt-get update && apt-get -y full-upgrade\napt-get -y autoremove --purge && apt-get clean\n\n# Host identity is regenerated on first boot of each clone\nrm -f /etc/ssh/ssh_host_*\ntruncate -s 0 /etc/machine-id\n\n# Remove accumulated state and history\ncloud-init clean --logs\nfind /var/log -type f -exec truncate -s 0 {} \\;\nrm -f /root/.bash_history /home/*/.bash_history\nrm -rf /root/.ssh/authorized_keys /tmp/* /var/tmp/*\n\nhistory -c\nshutdown -h now\n",
+        "caption": "يُبقي السكربت ملف machine-id لكنه يفرّغه، فيولّد systemd معرّفًا جديدًا عند الإقلاع التالي."
+      },
+      {
+        "id": "template-anim",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "من الصورة الذهبية إلى خادم جديد",
+        "caption": "حصّن مرة، ثم اختم، ثم حوّل إلى قالب، ثم استنسخ مع حقن هوية فريدة عند أول إقلاع.",
+        "data": {
+          "actors": [
+            {
+              "id": "b",
+              "label": "جهاز البناء",
+              "sub": "قاعدة محصَّنة",
+              "icon": "server"
+            },
+            {
+              "id": "t",
+              "label": "القالب 9000",
+              "sub": "للقراءة فقط",
+              "icon": "file"
+            },
+            {
+              "id": "c",
+              "label": "النسخة",
+              "sub": "web02",
+              "icon": "server"
+            },
+            {
+              "id": "ci",
+              "label": "cloud-init",
+              "sub": "هوية فريدة",
+              "icon": "key"
+            }
+          ],
+          "steps": [
+            {
+              "from": "b",
+              "to": "b",
+              "label": "تحديث وتحصين",
+              "tone": "secure",
+              "note": "طبّق التحديثات وأزل الإضافات وشغّل خط الأساس. وسجّل الخطوات في سكربت."
+            },
+            {
+              "from": "b",
+              "to": "b",
+              "label": "ختم",
+              "tone": "secure",
+              "note": "احذف مفاتيح المضيف وفرّغ machine-id وامسح السجل والسجلات، ثم أوقف التشغيل."
+            },
+            {
+              "from": "b",
+              "to": "t",
+              "label": "qm template 9000",
+              "tone": "success",
+              "note": "حوّل الجهاز إلى قالب. لم يعد قابلًا للتشغيل بل للاستنساخ فقط."
+            },
+            {
+              "from": "t",
+              "to": "c",
+              "label": "qm clone 9000 120",
+              "note": "الاستنساخ الكامل ينسخ القرص، والمرتبط يتشارك القرص الأساسي للقالب."
+            },
+            {
+              "from": "ci",
+              "to": "c",
+              "label": "حقن المستخدم والمفتاح",
+              "tone": "secure",
+              "note": "عند أول إقلاع ينشئ cloud-init مستخدم الإدارة ويثبّت المفتاح العام ويضبط اسم المضيف."
+            },
+            {
+              "from": "c",
+              "to": "c",
+              "label": "مفاتيح مضيف فريدة",
+              "tone": "success",
+              "note": "يعيد SSH توليد مفاتيح المضيف، فتملك كل نسخة هويتها الخاصة."
+            }
+          ]
+        }
+      },
+      {
+        "id": "tpl",
+        "type": "terminal",
+        "title": "إنشاء قالب واستخدامه في Proxmox VE",
+        "prompt": "root@pve1:~#",
+        "lines": [
+          {
+            "cmd": "qm template 9000",
+            "output": ""
+          },
+          {
+            "cmd": "qm clone 9000 120 --name web02 --full 1",
+            "output": "create full clone of drive scsi0 (local-lvm:base-9000-disk-0)\n  Logical volume \"vm-120-disk-0\" created.\ntransferred 0.0 B of 32.0 GiB (0.00%)\ntransferred 32.0 GiB of 32.0 GiB (100.00%)"
+          },
+          {
+            "cmd": "qm set 120 --ciuser deploy --sshkeys /root/keys/deploy.pub --ipconfig0 ip=10.20.0.50/24,gw=10.20.0.1",
+            "output": "update VM 120: -ciuser deploy -ipconfig0 ip=10.20.0.50/24,gw=10.20.0.1 -sshkeys ..."
+          },
+          {
+            "comment": "لا تُضبط كلمة مرور. تقبل النسخة المفتاح العام الذي تحقنه فقط، فلا يحمل القالب أي بيانات اعتماد."
+          }
+        ],
+        "caption": "رقم القالب 9000 والعنوان أمثلة من شبكة تجريبية."
+      },
+      {
+        "id": "lifecycle",
+        "type": "text",
+        "markdown": "## الخطوة 4: تحكّم في الوصول وجدّد وفق جدول\n\nالقالب نقطة بداية موثوقة، فاحمِه كما تحمي أصلًا إنتاجيًا.\n\n**قيّد من يستطيع تغييره أو استنساخه.** امنح أغلب الموظفين صلاحية الاستنساخ على مجموعة القوالب، واحصر التعديل والحذف في الفريق الصغير الذي يصون الصور. ويغطي درس [التحكم بالصلاحيات المبني على الأدوار في Proxmox (RBAC)](/learn/systems-infrastructure-security/proxmox-role-based-access-control-rbac) تصميم الأدوار. فمن يستطيع تغيير قالب بهدوء يخترق كل ما يُبنى بعده.\n\n**جدّد بانتظام.** تشيخ الصورة الذهبية من يوم إنشائها. أعد البناء شهريًا، أو أبكر عند ظهور ثغرة خطيرة، وأعطِ كل بناء رقم إصدار في الاسم مثل `tpl-debian12-2025-06`. وأحِل القوالب القديمة إلى التقاعد واجعل الحالي واضحًا.\n\n**تذكّر النسخ القائمة.** لا يغيّر تحديث القالب الخوادم المستنسخة منه سابقًا. تتبّع أي نسخ جاءت من أي إصدار قالب، وحدّثها عبر عملية التحديث المعتادة.\n\nوأخيرًا، احتفظ بنسخة من كل قالب معتمد في نسخك الاحتياطية. ويرتبط هذا بدرس [أمن اللقطات والنسخ الاحتياطية للأجهزة الافتراضية](/learn/systems-infrastructure-security/vm-snapshot-and-backup-security)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أين تخطئ الفرق",
+        "markdown": "- **تشغيل القالب مجددًا بعد الختم.** يعيد الجهاز توليد المفاتيح والسجلات. اجعل الختم الخطوة الأخيرة تمامًا ثم حوّل.\n- **تضمين كلمة مرور أو مفتاح إداري مشترك** «لتسهيل أول دخول». استخدم cloud-init لحقن بيانات اعتماد لكل خادم.\n- **عدم التجديد أبدًا.** كل نسخة من صورة عمرها سنتان تبدأ بسنتين من الثغرات المعروفة.\n- **استخدام الاستنساخ المرتبط للأنظمة الحساسة دون تفكير.** فهو يعتمد على القرص الأساسي للقالب، فاحمِ ذلك القرص كما تحمي وحدة تخزين إنتاجية."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في Proxmox VE تجريبي تملكه:\n\n1. نزّل صورة سحابة Debian وتحقق منها بالأمر `sha256sum -c`، ودوّن الإصدار والقيمة.\n2. استورِدها جهازًا جديدًا وأضف قرص cloud-init وحدّثها وأزل الحزم غير اللازمة.\n3. نفّذ خطوات الختم من هذا الدرس داخل الجهاز، ثم أوقفه.\n4. حوّله بالأمر `qm template <id>`.\n5. استنسخه مرتين بأسماء فريدة، واضبط `--ciuser` و`--sshkeys` لكل نسخة، ثم شغّلهما.\n6. سجّل الدخول إلى كل منهما وقارن `/etc/machine-id` والأمر `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. يجب أن يختلفا.\n7. اكتب ما ستحتاج إلى تغييره لتجديد القالب في الشهر القادم."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "الصورة الذهبية",
+            "definition": "جهاز افتراضي محصَّن ومختبَر يُستخدم نقطة بداية معتمدة للخوادم الجديدة."
+          },
+          {
+            "term": "القالب",
+            "definition": "جهاز في Proxmox حُوّل بحيث يمكن استنساخه ولا يمكن تشغيله."
+          },
+          {
+            "term": "cloud-init",
+            "definition": "أداة أول إقلاع تضبط اسم المضيف والمستخدمين والمفاتيح من إعداد محقون."
+          },
+          {
+            "term": "الختم",
+            "definition": "إزالة الهوية والحالة من الصورة قبل أن تصبح قالبًا."
+          },
+          {
+            "term": "الاستنساخ الكامل",
+            "definition": "نسخة لها قرصها المستقل الخاص بها."
+          },
+          {
+            "term": "الاستنساخ المرتبط",
+            "definition": "نسخة تتشارك القرص الأساسي للقالب وتخزّن تغييراتها فقط."
+          },
+          {
+            "term": "قيمة التحقق",
+            "definition": "قيمة تجزئة تُستخدم للتأكد من سلامة ملف منزَّل."
+          },
+          {
+            "term": "خط أساس الإعدادات",
+            "definition": "مجموعة الإعدادات الموثقة التي يجب أن يستوفيها كل نظام."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما الفائدة الأمنية الرئيسية للصورة الذهبية؟",
+            "options": [
+              "أي إصلاح يُجرى مرة واحدة ترثه النسخ المستقبلية",
+              "تقلع الأجهزة أسرع",
+              "تلغي الحاجة إلى التحديثات",
+              "تشفّر كل الضيوف"
+            ],
+            "answer": 0,
+            "explanation": "الفائدة هي الاتساق. أما التحديث فيظل لازمًا في الصورة وفي النسخ القائمة."
+          },
+          {
+            "question": "أي العناصر ينبغي إزالتها عند ختم الصورة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "مفاتيح مضيف SSH",
+              "سجل الصدفة",
+              "محتويات معرّف الجهاز",
+              "نواة نظام التشغيل"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "لا يجوز أن تنتقل الهوية والسجل إلى النسخ. أما النواة فجزء من النظام العامل وتبقى."
+          },
+          {
+            "question": "لماذا تستخدم cloud-init بدل تضمين مفتاح إداري في القالب؟",
+            "options": [
+              "يجعل القرص أصغر",
+              "تحصل كل نسخة على بيانات اعتماد خاصة بها ولا يحمل القالب أي منها",
+              "يعطّل SSH",
+              "يمنع الاستنساخ"
+            ],
+            "answer": 1,
+            "explanation": "بيانات الاعتماد المشتركة في القالب تتشاركها كل الخوادم المبنية منه."
+          },
+          {
+            "question": "فحص SHA-256 على صورة منزَّلة يطبع FAILED. ماذا تفعل؟",
+            "options": [
+              "تستخدمها على أي حال",
+              "تحذفها وتنزّلها من جديد من المصدر الرسمي",
+              "تعيد تسمية الملف",
+              "تتخطى خطوة التوقيع"
+            ],
+            "answer": 1,
+            "explanation": "الفحص الفاشل يعني أن الملف تالف أو معدَّل. لا تبنِ منه أبدًا."
+          },
+          {
+            "question": "أي الممارسات تُبقي القوالب موثوقة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تقييد من يستطيع تعديل القوالب",
+              "إعادة البناء وفق جدول مع أسماء إصدارات",
+              "السماح للجميع بتعديل القالب",
+              "نسخ القوالب المعتمدة احتياطيًا"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "التغيير المضبوط والتجديد المنتظم والنسخ الاحتياطي تحمي القالب، أما التعديل المفتوح فيهدم الثقة به."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- تمنح **الصورة الذهبية** كل جهاز جديد بداية محصَّنة واحدة، والإصلاح المنفَّذ مرة واحدة يفيد كل النسخ المستقبلية.\n- **تحقق** من التنزيلات بقيم التحقق والتواقيع، وابدأ من قاعدة دنيا.\n- **حصّن وحدّث ووثّق بسكربت** عملية البناء لتكون قابلة للتكرار.\n- **اختم** الصورة: أزل مفاتيح المضيف ومعرّف الجهاز والسجل وبيانات الاعتماد، ثم حوّلها بالأمر `qm template`.\n- احقن هوية فريدة عبر **cloud-init**، وقيّد من يحق له تعديل القوالب، و**جدّدها** وفق جدول.\n\nتابع لتتعلم كيف تحمي اللقطات والنسخ الاحتياطية التي تلتقط هذه الأنظمة في درس [أمن اللقطات والنسخ الاحتياطية للأجهزة الافتراضية](/learn/systems-infrastructure-security/vm-snapshot-and-backup-security)."
+      }
+    ]
+  }
+}

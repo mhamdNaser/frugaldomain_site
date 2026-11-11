@@ -1,0 +1,586 @@
+{
+ "slug": "virtual-bridges-and-vlan-aware-networking",
+ "title": "Virtual Bridges and VLAN-Aware Networking",
+ "summary": "Build a VLAN-aware Proxmox bridge, tag VMs into zones, restrict the trunk on both ends and defend against VLAN attacks.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Compare per-VLAN bridges with a VLAN-aware bridge",
+  "Configure bridge-vids, tags and a management VLAN",
+  "Match the physical switch trunk configuration",
+  "Describe VLAN weaknesses and verify the setup"
+ ],
+ "blocks": [
+  {
+   "type": "text",
+   "id": "intro",
+   "markdown": "Every Proxmox VM network card plugs into a virtual switch called a bridge. Most security problems here are not exotic attacks. They are ordinary mistakes: a management interface placed on the same bridge as guests, a trunk that carries every VLAN, or a native VLAN that nobody remembers.\n\nA **VLAN** (virtual LAN) splits one physical network into several isolated Layer 2 segments by adding a 12-bit tag to Ethernet frames. Proxmox can act as a VLAN-aware switch, so one physical uplink carries many tenants, tiers or zones. This is convenient, and it moves part of your trust boundary into the host and the physical switch. In this lesson you will build a VLAN-aware bridge, attach VMs to the right VLANs, restrict the trunk, and verify it. It extends [VM-to-VM network isolation](/learn/systems-infrastructure-security/vm-to-vm-network-isolation) and [management network isolation](/learn/systems-infrastructure-security/management-network-isolation)."
+  },
+  {
+   "type": "text",
+   "id": "models",
+   "markdown": "## Two ways to use VLANs on Proxmox\n\n| Model | How it works | Trade-off |\n|:--|:--|:--|\n| One bridge per VLAN | A sub-interface such as `eno1.20` joins a bridge `vmbr20` | Simple to read, but many bridges to manage |\n| VLAN-aware bridge | One bridge `vmbr0` with `bridge-vlan-aware yes`; each VM NIC carries a `tag=` | Fewer objects; a wrong tag moves a VM to another zone |\n\nThe VLAN-aware model is the common choice today. The bridge then behaves like a managed switch with an access port per VM NIC. A VM with `tag=20` sees only untagged frames and is placed in VLAN 20. The VM never sees the tag, and it cannot choose another.\n\nThe security consequences are clear:\n\n- The VM's **tag setting is a security setting**. Treat edits to it like a firewall change.\n- The bridge and the upstream switch must **agree** on which VLANs exist.\n- Anything not explicitly allowed on the trunk should not cross it."
+  },
+  {
+   "type": "text",
+   "id": "build",
+   "markdown": "## Step 1: Build the VLAN-aware bridge\n\nPut the management address on its own VLAN interface, not on the bridge itself. List only the VLAN IDs you use in `bridge-vids`. The default allows 2 to 4094, which means any VLAN a guest could ask for."
+  },
+  {
+   "type": "code",
+   "id": "br-code",
+   "language": "ini",
+   "code": "auto eno1\niface eno1 inet manual\n\nauto vmbr0\niface vmbr0 inet manual\n    bridge-ports eno1\n    bridge-stp off\n    bridge-fd 0\n    bridge-vlan-aware yes\n    bridge-vids 20 30 99\n\nauto vmbr0.99\niface vmbr0.99 inet static\n    address 192.0.2.11/24\n    gateway 192.0.2.1\n    # management lives on VLAN 99, not on the bridge itself",
+   "filename": "/etc/network/interfaces",
+   "caption": "A VLAN-aware bridge that allows only VLANs 20, 30 and 99."
+  },
+  {
+   "type": "text",
+   "id": "attach",
+   "markdown": "## Step 2: Attach guests to the right VLAN\n\nSet the tag on each VM network device. A VM that needs several VLANs, such as a virtual router, receives a `trunks=` list. Give trunk access only to guests that must route or inspect between VLANs, and filter them with a firewall.\n\nNever put guests in the management VLAN. If the hypervisor's own address and a VM share a VLAN, a compromised VM can attack the web interface at Layer 2."
+  },
+  {
+   "type": "terminal",
+   "id": "attach-term",
+   "title": "pve1 - assign VLAN tags",
+   "lines": [
+    {
+     "cmd": "qm set 105 --net0 virtio=BC:24:11:AA:BB:01,bridge=vmbr0,tag=20,firewall=1",
+     "comment": "Web VM in VLAN 20, firewall on."
+    },
+    {
+     "cmd": "qm set 130 --net0 virtio=BC:24:11:AA:BB:30,bridge=vmbr0,tag=30,firewall=1",
+     "comment": "Database VM in VLAN 30."
+    },
+    {
+     "cmd": "qm set 140 --net0 virtio=BC:24:11:AA:BB:40,bridge=vmbr0,trunks=20\\;30,firewall=1",
+     "comment": "Router VM may carry VLANs 20 and 30 only. The semicolon is escaped for the shell."
+    },
+    {
+     "cmd": "bridge vlan show",
+     "output": "port              vlan-id\neno1              20 30 99\nvmbr0             1 PVID Egress Untagged\ntap105i0          20 PVID Egress Untagged\ntap130i0          30 PVID Egress Untagged\ntap140i0          20 30",
+     "comment": "Each VM port shows its VLAN. `eno1` carries only the three allowed IDs. Output abbreviated."
+    }
+   ],
+   "caption": "Setting tags and checking the bridge VLAN table."
+  },
+  {
+   "type": "animation",
+   "id": "vlan-seq",
+   "kind": "sequence",
+   "title": "Tagged traffic across the trunk",
+   "caption": "How a frame is tagged and filtered between a VM and the physical switch.",
+   "data": {
+    "actors": [
+     {
+      "id": "vm",
+      "label": "Web VM",
+      "sub": "tag=20",
+      "icon": "server"
+     },
+     {
+      "id": "br",
+      "label": "vmbr0",
+      "sub": "VLAN-aware",
+      "icon": "switch"
+     },
+     {
+      "id": "sw",
+      "label": "Physical switch",
+      "sub": "trunk 20,30,99",
+      "icon": "router"
+     }
+    ],
+    "steps": [
+     {
+      "from": "vm",
+      "to": "br",
+      "label": "Untagged frame",
+      "note": "The VM sends an ordinary Ethernet frame. It is unaware of VLANs."
+     },
+     {
+      "from": "br",
+      "to": "br",
+      "label": "Add tag 20",
+      "tone": "secure",
+      "note": "The bridge assigns the port VLAN ID from the VM configuration."
+     },
+     {
+      "from": "br",
+      "to": "sw",
+      "label": "Tagged frame, VLAN 20",
+      "note": "VLAN 20 is in the bridge's allowed list, so it exits the trunk."
+     },
+     {
+      "from": "sw",
+      "to": "sw",
+      "label": "Allowed VLAN check",
+      "tone": "success",
+      "note": "The switch permits VLAN 20 on this trunk and forwards the frame."
+     },
+     {
+      "from": "sw",
+      "to": "br",
+      "label": "Tagged frame, VLAN 50",
+      "tone": "attack",
+      "note": "A frame for a VLAN that is not allowed arrives."
+     },
+     {
+      "from": "br",
+      "to": "br",
+      "label": "Dropped",
+      "tone": "blocked",
+      "note": "VLAN 50 is not in bridge-vids, so it is discarded."
+     }
+    ]
+   }
+  },
+  {
+   "type": "callout",
+   "id": "cluster-note",
+   "variant": "note",
+   "title": "Keep every node identical",
+   "markdown": "In a cluster, a VM can migrate to any node, and it keeps its `tag=` value. If node 2 has a bridge with different `bridge-vids`, or if its uplink goes to a switch port without the same allowed VLANs, the VM will lose connectivity after migration or, worse, land in a different segment than planned. Manage the network files with configuration management so all nodes match, and test a live migration of a lab VM whenever you change a trunk. Proxmox SDN can define VLAN zones once for the whole cluster and reduce this drift."
+  },
+  {
+   "type": "callout",
+   "id": "monitor-note",
+   "variant": "tip",
+   "title": "Detect tag drift",
+   "markdown": "Export `qm config` for every VM on a schedule and compare the `bridge=` and `tag=` values with your approved plan. A mismatch is either an unreviewed change or an attempt to move a machine into a more sensitive zone. Both deserve a ticket."
+  },
+  {
+   "type": "text",
+   "id": "switch",
+   "markdown": "## Step 3: Match the physical switch\n\nThe upstream port is a trunk. Restrict it to the VLANs you use, and move the native VLAN to an unused ID so untagged frames cannot land in a production network.\n\nThis Cisco IOS example configures the port that connects to `eno1`. The `switchport trunk encapsulation dot1q` line comes first on platforms that also support ISL, and it is rejected on switches that only support 802.1Q."
+  },
+  {
+   "type": "code",
+   "id": "sw-code",
+   "language": "cisco",
+   "code": "SW1(config)# interface GigabitEthernet1/0/10\nSW1(config-if)# description pve1-eno1 trunk\nSW1(config-if)# switchport trunk encapsulation dot1q\nSW1(config-if)# switchport mode trunk\nSW1(config-if)# switchport trunk native vlan 999\nSW1(config-if)# switchport trunk allowed vlan 20,30,99\nSW1(config-if)# switchport nonegotiate\nSW1(config-if)# spanning-tree portfast trunk",
+   "filename": "SW1",
+   "caption": "A trunk limited to VLANs 20, 30 and 99, with an unused native VLAN and no DTP negotiation."
+  },
+  {
+   "type": "text",
+   "id": "threats",
+   "markdown": "## Step 4: Know the VLAN attacks and their defenses\n\nVLAN isolation is strong when configured correctly, and fails in predictable ways. The table pairs each failure with its defense.\n\n| Weakness | What it allows | Defense |\n|:--|:--|:--|\n| Trunk negotiation left on | A device talks the switch into trunking and sees all VLANs | `switchport nonegotiate`, explicit access or trunk mode |\n| Used native VLAN | A double-tagged frame can reach a VLAN other than the sender's | Use an unused native VLAN such as 999 and tag everything |\n| Trunk carries all VLANs | A guest with trunk access sees every segment | Allowed-VLAN lists on both bridge and switch |\n| Guest in the management VLAN | Layer 2 access to the hypervisor | Dedicated management VLAN with no guests |\n| Wrong tag after an edit | A VM silently moves zones | Review config changes, and compare running tags with the plan |\n\nVerify with a regular audit: list the tags of every NIC, compare with the plan, and alert on differences. The relevant hypervisor setting is also covered in [Proxmox cluster security](/learn/systems-infrastructure-security/proxmox-cluster-security), since cluster traffic needs a protected VLAN too."
+  },
+  {
+   "type": "callout",
+   "id": "pitfall",
+   "variant": "warning",
+   "title": "Avoid these mistakes",
+   "markdown": "- Leaving `bridge-vids` at its default 2-4094, so any VLAN can be reached.\n- Assigning the management IP to `vmbr0` itself, which puts it on the untagged network.\n- Editing `/etc/network/interfaces` remotely and applying with `ifreload -a` without a console path back.\n- Assuming the guest firewall replaces VLANs. Use both: VLANs separate segments, firewall rules filter flows."
+  },
+  {
+   "type": "callout",
+   "id": "lab",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab node you own, with console access:\n\n1. Turn on `bridge-vlan-aware yes` for a lab bridge and set `bridge-vids 20 30`.\n2. Put two VMs on VLAN 20 and one on VLAN 30 using `tag=`. Check with `bridge vlan show`.\n3. From a VM in VLAN 20, ping its VLAN neighbor (should work) and the VLAN 30 VM (should fail, unless you routed between them).\n4. Change one VM to `tag=40`, observe that it loses connectivity because 40 is not allowed, then restore the tag."
+  },
+  {
+   "type": "keyterms",
+   "id": "kt",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Bridge",
+     "definition": "A virtual Layer 2 switch inside the host."
+    },
+    {
+     "term": "VLAN",
+     "definition": "A logical Layer 2 segment identified by a 12-bit tag."
+    },
+    {
+     "term": "Trunk",
+     "definition": "A link that carries several VLANs using 802.1Q tags."
+    },
+    {
+     "term": "Access port",
+     "definition": "A port that belongs to a single VLAN and carries untagged frames."
+    },
+    {
+     "term": "Native VLAN",
+     "definition": "The VLAN used for untagged frames on a trunk."
+    },
+    {
+     "term": "PVID",
+     "definition": "Port VLAN ID, the VLAN assigned to untagged frames entering a port."
+    },
+    {
+     "term": "bridge-vids",
+     "definition": "The list of VLAN IDs a VLAN-aware bridge accepts."
+    },
+    {
+     "term": "Double tagging",
+     "definition": "Sending a frame with two tags to cross a native VLAN boundary."
+    }
+   ]
+  },
+  {
+   "type": "quiz",
+   "id": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What does `tag=20` on a VM NIC do in a VLAN-aware bridge?",
+     "options": [
+      "Encrypts traffic",
+      "Places the VM's untagged traffic in VLAN 20",
+      "Forces the VM to use IPv6",
+      "Assigns the VM IP 20"
+     ],
+     "answer": 1,
+     "explanation": "The bridge acts like an access port: it tags the VM's frames with VLAN 20 and removes the tag on the way back."
+    },
+    {
+     "question": "Why should `bridge-vids` list only the VLANs you use?",
+     "options": [
+      "It speeds up boot",
+      "Otherwise any VLAN from 2 to 4094 is accepted on the bridge",
+      "It is required by corosync",
+      "It encrypts tags"
+     ],
+     "answer": 1,
+     "explanation": "A narrow list keeps unexpected VLANs from crossing the bridge or reaching the trunk."
+    },
+    {
+     "question": "Which measures reduce VLAN attack risk? (choose all that apply)",
+     "options": [
+      "`switchport nonegotiate` on trunks",
+      "An unused native VLAN",
+      "Allowing all VLANs on every trunk",
+      "A dedicated management VLAN without guests"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Disable negotiation, avoid a used native VLAN and isolate management. Allowing every VLAN widens exposure."
+    },
+    {
+     "question": "Where should the hypervisor's management IP be configured?",
+     "options": [
+      "On `vmbr0` with the guests",
+      "On a VLAN interface such as `vmbr0.99` for a management VLAN",
+      "On the guest NIC",
+      "On the physical switch only"
+     ],
+     "answer": 1,
+     "explanation": "A dedicated management VLAN interface keeps the host address away from guest networks."
+    },
+    {
+     "question": "A VM was edited to `tag=40` but VLAN 40 is not in `bridge-vids`. What is the likely result?",
+     "options": [
+      "The VM moves to the management VLAN",
+      "The VM loses connectivity",
+      "The VM gets two tags",
+      "The trunk shuts down"
+     ],
+     "answer": 1,
+     "explanation": "The bridge does not carry VLAN 40, so the frames are dropped. This is the safe failure mode."
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "id": "summary",
+   "markdown": "## Summary\n\nA VLAN-aware bridge turns Proxmox into a managed switch. Each VM tag decides its zone, so treat tag edits as security changes. Restrict `bridge-vids`, keep the hypervisor's address on a dedicated management VLAN, and never put guests there.\n\nOn the physical switch, allow only the VLANs you use, disable negotiation, and choose an unused native VLAN. Audit tags regularly and verify with `bridge vlan show`. You have now covered access, firewalling, isolation and virtual networking; continue with [secure VM templates and golden images](/learn/systems-infrastructure-security/secure-vm-templates-and-golden-images)."
+  }
+ ],
+ "ar": {
+  "title": "الجسور الافتراضية والشبكات المدركة لـ VLAN",
+  "summary": "ابنِ جسر Proxmox مدركًا لـ VLAN، ووسم الأجهزة في مناطق، وقيّد الجذع من الطرفين، وادفع هجمات VLAN.",
+  "objectives": [
+   "المقارنة بين جسر لكل VLAN وجسر مدرك لـ VLAN",
+   "ضبط bridge-vids والوسوم وشبكة الإدارة",
+   "مطابقة إعداد جذع المبدّل الفيزيائي",
+   "وصف نقاط ضعف VLAN والتحقق من الإعداد"
+  ],
+  "blocks": [
+   {
+    "type": "text",
+    "id": "intro",
+    "markdown": "تتصل كل بطاقة شبكة لجهاز Proxmox بمبدّل افتراضي يسمى الجسر (bridge). أغلب المشكلات الأمنية هنا ليست هجمات غريبة بل أخطاء عادية: واجهة إدارة وُضعت على الجسر نفسه مع الضيوف، أو جذع (trunk) يحمل كل شبكات VLAN، أو شبكة VLAN أصلية لا يتذكرها أحد.\n\nتقسم **VLAN** (الشبكة المحلية الافتراضية) شبكة فيزيائية واحدة إلى عدة مقاطع معزولة من الطبقة الثانية بإضافة وسم من 12 بت إلى إطارات Ethernet. يستطيع Proxmox أن يعمل مبدّلًا مدركًا لـ VLAN، فيحمل منفذ فيزيائي واحد مستأجرين أو طبقات أو مناطق كثيرة. هذا مريح، وينقل جزءًا من حدود الثقة إلى المضيف والمبدّل الفيزيائي. في هذا الدرس تبني جسرًا مدركًا لـ VLAN، وتربط الأجهزة بالشبكات الصحيحة، وتقيّد الجذع، وتتحقق من النتيجة. يوسّع الدرس [العزل الشبكي بين الأجهزة الافتراضية](/learn/systems-infrastructure-security/vm-to-vm-network-isolation) و[عزل شبكة الإدارة](/learn/systems-infrastructure-security/management-network-isolation)."
+   },
+   {
+    "type": "text",
+    "id": "models",
+    "markdown": "## طريقتان لاستخدام VLAN في Proxmox\n\n| النموذج | طريقة العمل | المفاضلة |\n|:--|:--|:--|\n| جسر لكل VLAN | واجهة فرعية مثل `eno1.20` تنضم إلى جسر `vmbr20` | سهل القراءة لكن جسور كثيرة يجب إدارتها |\n| جسر مدرك لـ VLAN | جسر واحد `vmbr0` مع `bridge-vlan-aware yes`؛ وتحمل كل بطاقة جهاز وسم `tag=` | كائنات أقل؛ والوسم الخاطئ ينقل الجهاز إلى منطقة أخرى |\n\nالنموذج المدرك لـ VLAN هو الاختيار الشائع اليوم. يتصرف الجسر عندها كمبدّل مُدار بمنفذ وصول لكل بطاقة جهاز. الجهاز ذو `tag=20` يرى إطارات غير موسومة فقط ويوضع في VLAN 20. لا يرى الجهاز الوسم ولا يستطيع اختيار وسم آخر.\n\nالنتائج الأمنية واضحة:\n\n- **إعداد وسم الجهاز إعداد أمني.** عامل تعديله كتغيير في جدار الحماية.\n- يجب أن **يتفق** الجسر والمبدّل الأعلى على شبكات VLAN الموجودة.\n- كل ما لم يُسمح به صراحة على الجذع يجب ألا يعبره."
+   },
+   {
+    "type": "text",
+    "id": "build",
+    "markdown": "## الخطوة 1: ابنِ الجسر المدرك لـ VLAN\n\nضع عنوان الإدارة على واجهة VLAN خاصة به لا على الجسر نفسه. اسرد في `bridge-vids` معرّفات VLAN التي تستخدمها فقط. الافتراضي يسمح من 2 إلى 4094 أي أي VLAN قد يطلبها ضيف."
+   },
+   {
+    "type": "code",
+    "id": "br-code",
+    "language": "ini",
+    "code": "auto eno1\niface eno1 inet manual\n\nauto vmbr0\niface vmbr0 inet manual\n    bridge-ports eno1\n    bridge-stp off\n    bridge-fd 0\n    bridge-vlan-aware yes\n    bridge-vids 20 30 99\n\nauto vmbr0.99\niface vmbr0.99 inet static\n    address 192.0.2.11/24\n    gateway 192.0.2.1\n    # management lives on VLAN 99, not on the bridge itself",
+    "filename": "/etc/network/interfaces",
+    "caption": "جسر مدرك لـ VLAN يسمح بالشبكات 20 و30 و99 فقط."
+   },
+   {
+    "type": "text",
+    "id": "attach",
+    "markdown": "## الخطوة 2: اربط الضيوف بالشبكة الصحيحة\n\nاضبط الوسم على جهاز الشبكة لكل جهاز افتراضي. الجهاز الذي يحتاج عدة شبكات VLAN، مثل موجّه افتراضي، يحصل على قائمة `trunks=`. امنح الوصول بالجذع للضيوف الذين يجب أن يوجّهوا أو يفحصوا بين الشبكات فقط، ورشّحهم بجدار حماية.\n\nلا تضع ضيوفًا في VLAN الإدارة أبدًا. إذا اشترك عنوان الهايبرفايزر وجهاز افتراضي في VLAN واحدة فقد يهاجم جهاز مخترَق الواجهة الويب في الطبقة الثانية."
+   },
+   {
+    "type": "terminal",
+    "id": "attach-term",
+    "title": "pve1 - assign VLAN tags",
+    "lines": [
+     {
+      "cmd": "qm set 105 --net0 virtio=BC:24:11:AA:BB:01,bridge=vmbr0,tag=20,firewall=1",
+      "comment": "جهاز الويب في VLAN 20 مع تفعيل جدار الحماية."
+     },
+     {
+      "cmd": "qm set 130 --net0 virtio=BC:24:11:AA:BB:30,bridge=vmbr0,tag=30,firewall=1",
+      "comment": "جهاز قاعدة البيانات في VLAN 30."
+     },
+     {
+      "cmd": "qm set 140 --net0 virtio=BC:24:11:AA:BB:40,bridge=vmbr0,trunks=20\\;30,firewall=1",
+      "comment": "جهاز الموجّه يحمل VLAN 20 و30 فقط. الفاصلة المنقوطة مهرّبة للصدفة."
+     },
+     {
+      "cmd": "bridge vlan show",
+      "output": "port              vlan-id\neno1              20 30 99\nvmbr0             1 PVID Egress Untagged\ntap105i0          20 PVID Egress Untagged\ntap130i0          30 PVID Egress Untagged\ntap140i0          20 30",
+      "comment": "يظهر لكل منفذ جهاز شبكته. ويحمل `eno1` المعرّفات الثلاثة المسموحة فقط. الخرج مختصر."
+     }
+    ],
+    "caption": "ضبط الوسوم وفحص جدول VLAN للجسر."
+   },
+   {
+    "type": "animation",
+    "id": "vlan-seq",
+    "kind": "sequence",
+    "title": "حركة موسومة عبر الجذع",
+    "caption": "كيف يُوسَم الإطار ويُرشَّح بين الجهاز والمبدّل الفيزيائي.",
+    "data": {
+     "actors": [
+      {
+       "id": "vm",
+       "label": "جهاز الويب",
+       "sub": "tag=20",
+       "icon": "server"
+      },
+      {
+       "id": "br",
+       "label": "vmbr0",
+       "sub": "مدرك لـ VLAN",
+       "icon": "switch"
+      },
+      {
+       "id": "sw",
+       "label": "المبدّل الفيزيائي",
+       "sub": "جذع 20,30,99",
+       "icon": "router"
+      }
+     ],
+     "steps": [
+      {
+       "from": "vm",
+       "to": "br",
+       "label": "إطار غير موسوم",
+       "note": "يرسل الجهاز إطار Ethernet عاديًا ولا يعلم شيئًا عن VLAN."
+      },
+      {
+       "from": "br",
+       "to": "br",
+       "label": "إضافة الوسم 20",
+       "tone": "secure",
+       "note": "يعيّن الجسر معرّف VLAN للمنفذ من إعداد الجهاز."
+      },
+      {
+       "from": "br",
+       "to": "sw",
+       "label": "إطار موسوم، VLAN 20",
+       "note": "VLAN 20 ضمن القائمة المسموحة للجسر فيخرج عبر الجذع."
+      },
+      {
+       "from": "sw",
+       "to": "sw",
+       "label": "فحص VLAN المسموحة",
+       "tone": "success",
+       "note": "يسمح المبدّل بـ VLAN 20 على هذا الجذع ويمرّر الإطار."
+      },
+      {
+       "from": "sw",
+       "to": "br",
+       "label": "إطار موسوم، VLAN 50",
+       "tone": "attack",
+       "note": "يصل إطار لشبكة VLAN غير مسموحة."
+      },
+      {
+       "from": "br",
+       "to": "br",
+       "label": "يُسقط",
+       "tone": "blocked",
+       "note": "VLAN 50 ليست في bridge-vids فتُهمل."
+      }
+     ]
+    }
+   },
+   {
+    "type": "callout",
+    "id": "cluster-note",
+    "variant": "note",
+    "title": "أبقِ كل العقد متطابقة",
+    "markdown": "في العنقود يمكن لجهاز افتراضي أن ينتقل إلى أي عقدة ويحتفظ بقيمة `tag=`. إذا كان للعقدة 2 جسر بـ `bridge-vids` مختلفة، أو كان منفذها الصاعد يتصل بمنفذ مبدّل لا يسمح بالشبكات نفسها، فسيفقد الجهاز اتصاله بعد الترحيل أو يهبط، وهو الأسوأ، في مقطع غير المخطط. أدر ملفات الشبكة بأداة إدارة إعدادات كي تتطابق كل العقد، واختبر ترحيلًا حيًّا لجهاز مخبري كلما غيّرت جذعًا. ويستطيع Proxmox SDN تعريف مناطق VLAN مرة واحدة للعنقود كله فيقلل هذا الانحراف."
+   },
+   {
+    "type": "callout",
+    "id": "monitor-note",
+    "variant": "tip",
+    "title": "اكتشف انحراف الوسوم",
+    "markdown": "صدّر `qm config` لكل جهاز افتراضي دوريًا وقارن قيم `bridge=` و`tag=` بالخطة المعتمدة. عدم التطابق إما تغيير غير مراجَع وإما محاولة لنقل جهاز إلى منطقة أكثر حساسية. وكلاهما يستحق تذكرة."
+   },
+   {
+    "type": "text",
+    "id": "switch",
+    "markdown": "## الخطوة 3: طابق المبدّل الفيزيائي\n\nالمنفذ الأعلى جذع. قيّده بشبكات VLAN التي تستخدمها، وانقل VLAN الأصلية إلى معرّف غير مستخدم كي لا تهبط الإطارات غير الموسومة في شبكة إنتاج.\n\nيهيئ مثال Cisco IOS هذا المنفذ الذي يتصل بـ `eno1`. يأتي السطر `switchport trunk encapsulation dot1q` أولًا على المنصات التي تدعم ISL أيضًا، ويُرفض على المبدّلات التي تدعم 802.1Q فقط."
+   },
+   {
+    "type": "code",
+    "id": "sw-code",
+    "language": "cisco",
+    "code": "SW1(config)# interface GigabitEthernet1/0/10\nSW1(config-if)# description pve1-eno1 trunk\nSW1(config-if)# switchport trunk encapsulation dot1q\nSW1(config-if)# switchport mode trunk\nSW1(config-if)# switchport trunk native vlan 999\nSW1(config-if)# switchport trunk allowed vlan 20,30,99\nSW1(config-if)# switchport nonegotiate\nSW1(config-if)# spanning-tree portfast trunk",
+    "filename": "SW1",
+    "caption": "جذع محدود بالشبكات 20 و30 و99 مع VLAN أصلية غير مستخدمة وبلا تفاوض DTP."
+   },
+   {
+    "type": "text",
+    "id": "threats",
+    "markdown": "## الخطوة 4: اعرف هجمات VLAN ودفاعاتها\n\nعزل VLAN قوي عند ضبطه صحيحًا، ويفشل بطرق متوقعة. يقرن الجدول كل إخفاق بدفاعه.\n\n| نقطة الضعف | ما تتيحه | الدفاع |\n|:--|:--|:--|\n| ترك تفاوض الجذع مفعّلًا | جهاز يقنع المبدّل بالتحول إلى جذع فيرى كل الشبكات | `switchport nonegotiate` ووضع وصول أو جذع صريح |\n| VLAN أصلية مستخدمة | إطار مزدوج الوسم قد يصل إلى VLAN غير VLAN المرسل | استخدم VLAN أصلية غير مستخدمة مثل 999 ووسّم كل شيء |\n| الجذع يحمل كل الشبكات | ضيف بوصول جذعي يرى كل المقاطع | قوائم VLAN مسموحة على الجسر والمبدّل |\n| ضيف في VLAN الإدارة | وصول طبقة ثانية إلى الهايبرفايزر | VLAN إدارة مخصصة بلا ضيوف |\n| وسم خاطئ بعد تعديل | ينتقل جهاز بصمت إلى منطقة أخرى | راجع تغييرات الإعداد وقارن الوسوم الجارية بالخطة |\n\nتحقق بتدقيق منتظم: اسرد وسوم كل بطاقة وقارنها بالخطة ونبّه على الفروق. ويرد الإعداد المعني أيضًا في [أمن عنقود Proxmox](/learn/systems-infrastructure-security/proxmox-cluster-security)، لأن حركة العنقود تحتاج VLAN محمية كذلك."
+   },
+   {
+    "type": "callout",
+    "id": "pitfall",
+    "variant": "warning",
+    "title": "تجنّب هذه الأخطاء",
+    "markdown": "- ترك `bridge-vids` على الافتراضي 2-4094 فيمكن بلوغ أي VLAN.\n- تعيين عنوان الإدارة على `vmbr0` نفسه فيصبح في الشبكة غير الموسومة.\n- تعديل `/etc/network/interfaces` عن بُعد وتطبيقه بـ `ifreload -a` دون طريق عودة عبر الطرفية.\n- افتراض أن جدار حماية الضيف يغني عن VLAN. استخدم الاثنين: تفصل VLAN المقاطع وترشّح قواعد الجدار التدفقات."
+   },
+   {
+    "type": "callout",
+    "id": "lab",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على عقدة مخبرية تملكها مع وصول عبر الطرفية:\n\n1. فعّل `bridge-vlan-aware yes` لجسر مخبري واضبط `bridge-vids 20 30`.\n2. ضع جهازين على VLAN 20 وجهازًا على VLAN 30 باستخدام `tag=`. تحقق بالأمر `bridge vlan show`.\n3. من جهاز في VLAN 20 نفّذ ping إلى جاره في الشبكة (يجب أن ينجح) وإلى جهاز VLAN 30 (يجب أن يفشل ما لم توجّه بينهما).\n4. غيّر جهازًا إلى `tag=40` ولاحظ فقدانه الاتصال لأن 40 غير مسموحة، ثم أعد الوسم."
+   },
+   {
+    "type": "keyterms",
+    "id": "kt",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "الجسر (Bridge)",
+      "definition": "مبدّل افتراضي من الطبقة الثانية داخل المضيف."
+     },
+     {
+      "term": "VLAN",
+      "definition": "مقطع منطقي من الطبقة الثانية يُعرَّف بوسم من 12 بت."
+     },
+     {
+      "term": "الجذع (Trunk)",
+      "definition": "وصلة تحمل عدة شبكات VLAN باستخدام وسوم 802.1Q."
+     },
+     {
+      "term": "منفذ الوصول (Access port)",
+      "definition": "منفذ ينتمي إلى VLAN واحدة ويحمل إطارات غير موسومة."
+     },
+     {
+      "term": "VLAN الأصلية (Native VLAN)",
+      "definition": "VLAN المستخدمة للإطارات غير الموسومة على الجذع."
+     },
+     {
+      "term": "PVID",
+      "definition": "معرّف VLAN للمنفذ، وهي الشبكة المعيَّنة للإطارات غير الموسومة الداخلة إليه."
+     },
+     {
+      "term": "bridge-vids",
+      "definition": "قائمة معرّفات VLAN التي يقبلها الجسر المدرك لـ VLAN."
+     },
+     {
+      "term": "الوسم المزدوج (Double tagging)",
+      "definition": "إرسال إطار بوسمين لعبور حد VLAN الأصلية."
+     }
+    ]
+   },
+   {
+    "type": "quiz",
+    "id": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ماذا يفعل `tag=20` على بطاقة جهاز في جسر مدرك لـ VLAN؟",
+      "options": [
+       "يشفّر الحركة",
+       "يضع حركة الجهاز غير الموسومة في VLAN 20",
+       "يجبر الجهاز على IPv6",
+       "يعيّن للجهاز العنوان 20"
+      ],
+      "answer": 1,
+      "explanation": "يعمل الجسر كمنفذ وصول: يوسم إطارات الجهاز بـ VLAN 20 ويزيل الوسم في طريق العودة."
+     },
+     {
+      "question": "لماذا يجب أن يسرد `bridge-vids` شبكات VLAN المستخدمة فقط؟",
+      "options": [
+       "لتسريع الإقلاع",
+       "وإلا قُبلت أي VLAN من 2 إلى 4094 على الجسر",
+       "لأن corosync يتطلبه",
+       "ليشفّر الوسوم"
+      ],
+      "answer": 1,
+      "explanation": "القائمة الضيقة تمنع شبكات VLAN غير المتوقعة من عبور الجسر أو بلوغ الجذع."
+     },
+     {
+      "question": "أي الإجراءات تقلّل خطر هجمات VLAN؟ (اختر كل ما ينطبق)",
+      "options": [
+       "`switchport nonegotiate` على الجذوع",
+       "VLAN أصلية غير مستخدمة",
+       "السماح بكل VLAN على كل جذع",
+       "VLAN إدارة مخصصة بلا ضيوف"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "عطّل التفاوض وتجنب VLAN أصلية مستخدمة واعزل الإدارة. أما السماح بكل VLAN فيوسّع التعرض."
+     },
+     {
+      "question": "أين يُضبط عنوان إدارة الهايبرفايزر؟",
+      "options": [
+       "على `vmbr0` مع الضيوف",
+       "على واجهة VLAN مثل `vmbr0.99` لشبكة إدارة",
+       "على بطاقة الضيف",
+       "على المبدّل الفيزيائي فقط"
+      ],
+      "answer": 1,
+      "explanation": "واجهة VLAN إدارة مخصصة تُبعد عنوان المضيف عن شبكات الضيوف."
+     },
+     {
+      "question": "عُدّل جهاز إلى `tag=40` لكن VLAN 40 ليست في `bridge-vids`. ما النتيجة المرجّحة؟",
+      "options": [
+       "ينتقل الجهاز إلى VLAN الإدارة",
+       "يفقد الجهاز الاتصال",
+       "يحصل الجهاز على وسمين",
+       "ينطفئ الجذع"
+      ],
+      "answer": 1,
+      "explanation": "لا يحمل الجسر VLAN 40 فتُسقط الإطارات. هذا نمط الفشل الآمن."
+     }
+    ]
+   },
+   {
+    "type": "text",
+    "id": "summary",
+    "markdown": "## الخلاصة\n\nيحوّل الجسر المدرك لـ VLAN جهاز Proxmox إلى مبدّل مُدار. وسم كل جهاز يحدد منطقته، فعامل تعديل الوسوم كتغيير أمني. قيّد `bridge-vids`، وأبقِ عنوان الهايبرفايزر على VLAN إدارة مخصصة، ولا تضع ضيوفًا فيها أبدًا.\n\nعلى المبدّل الفيزيائي اسمح بشبكات VLAN المستخدمة فقط، وعطّل التفاوض، واختر VLAN أصلية غير مستخدمة. دقّق الوسوم بانتظام وتحقق بالأمر `bridge vlan show`. تكون قد غطيت الآن الوصول وجدار الحماية والعزل والشبكات الافتراضية؛ تابع مع [قوالب الأجهزة الافتراضية الآمنة والصور الذهبية](/learn/systems-infrastructure-security/secure-vm-templates-and-golden-images)."
+   }
+  ]
+ }
+}
