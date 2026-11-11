@@ -1,0 +1,518 @@
+{
+  "slug": "firewall-and-segmentation-validation",
+  "title": "Firewall and Segmentation Validation",
+  "summary": "How to test firewall policy and network segmentation from each zone, read the results correctly, and turn failed tests into verified fixes.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Express segmentation intent as a flow matrix",
+    "Run and interpret negative and positive tests from each zone",
+    "Use hit counts, packet-tracer and syslog to find the deciding rule",
+    "Fix and automatically re-verify segmentation"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A company segments its network into user, server, DMZ and management zones. The diagram looks excellent. Then an audit finds that a contractor laptop in the user zone can open a remote desktop session to a database server. A rule written for a temporary project three years ago was never removed, and a broad `permit ip any any` sits above the rule that was supposed to block it.\n\nA firewall policy is a claim about what traffic is allowed. **Firewall and segmentation validation** is the practice of testing that claim from the attacker's side. A tester stands in each zone with an authorized lab or test host, tries the flows the policy should deny, and compares the result with the documented intent. This lesson shows you how to do it safely, which results to trust, and how to turn findings into fixes. Run these tests only on networks you own or are authorized to test, and agree on a change window first."
+    },
+    {
+      "id": "intent",
+      "type": "text",
+      "markdown": "## Step 1: Write the intent as a flow matrix\n\nYou cannot test a policy that nobody wrote down. Start by building a **flow matrix**: rows are source zones, columns are destination zones, and each cell lists the allowed services. Anything not listed must be denied.\n\n| Source / Destination | Users 10.10.10.0/24 | Servers 10.10.20.0/24 | DMZ 172.16.30.0/24 | Management 10.10.99.0/24 | Internet |\n|:--|:--|:--|:--|:--|:--|\n| Users | allow | HTTPS, SMB to file server only | HTTPS | deny | HTTPS, DNS via proxy |\n| Servers | deny | allow | deny | syslog, backup | patching only |\n| DMZ | deny | database port from web tier only | allow | deny | deny |\n| Management | SSH, RDP | SSH, RDP | SSH | allow | updates |\n| Internet | deny | deny | HTTPS to web tier | deny | n/a |\n\nThe matrix gives every test a pass or fail. Each denied cell becomes a negative test and each allowed cell a positive test. Positive tests prove the business still works, so run both.\n\nAlso record the **path**: does traffic between two VLANs pass through the firewall, or does a layer 3 switch route it without inspection? A policy cannot protect a path that bypasses the firewall."
+    },
+    {
+      "id": "think",
+      "type": "text",
+      "markdown": "## Step 2: Understand what an adversary tries\n\nAn adversary with a foothold in the user zone asks the same question your matrix answers: what can I reach from here? They map reachable services (MITRE ATT&CK T1046, Network Service Discovery), then try management protocols such as RDP, SSH and WinRM to move on (T1021, Remote Services). If a firewall treats two zones as one trust boundary, the adversary can cross it without any exploit (T1599, Network Boundary Bridging, when the device itself is abused).\n\nThe common gaps are not exotic:\n\n- **Shadowed or overly broad rules**, such as `permit ip any any` placed too high.\n- **Temporary rules that never expire**, often with no owner or comment.\n- **Any-any on the return path**, written because stateful return traffic was misunderstood.\n- **Management plane exposure**, where SSH or the web interface of the firewall listens on a user-facing interface.\n- **Asymmetric or bypass routes** that skip the firewall.\n- **Ruleset drift** between the documented policy and the running one, or between a high-availability pair.\n\nEach gap leaves evidence in the configuration, the hit counters and the logs. Validation reads all three."
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Validating one denied flow from the user zone",
+      "caption": "The test host sends the packet, the firewall decides, and the log proves the decision.",
+      "data": {
+        "token": "TCP/3389",
+        "nodes": [
+          {
+            "id": "t",
+            "label": "Test host",
+            "sub": "10.10.10.50",
+            "icon": "laptop"
+          },
+          {
+            "id": "fw",
+            "label": "Firewall",
+            "sub": "users_in ACL",
+            "icon": "firewall"
+          },
+          {
+            "id": "log",
+            "label": "Syslog",
+            "sub": "%ASA-4-106023",
+            "icon": "log"
+          },
+          {
+            "id": "srv",
+            "label": "Database server",
+            "sub": "10.10.20.15",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "t",
+            "caption": "The matrix says Users must not reach Servers on RDP. The tester sends one TCP/3389 probe."
+          },
+          {
+            "at": "fw",
+            "caption": "The firewall evaluates the ACL top-down. The first matching rule is the deny for 3389."
+          },
+          {
+            "at": "log",
+            "caption": "A deny message is written with the source, destination and the ACL name.",
+            "tone": "success"
+          },
+          {
+            "at": "srv",
+            "caption": "Nothing arrives. The port appears filtered from the test host: the test passes.",
+            "tone": "blocked"
+          },
+          {
+            "at": "fw",
+            "token": "TCP/3389",
+            "caption": "If a broad permit sat above the deny, the packet would pass and the hit counter of that permit would rise: the test fails.",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "test",
+      "type": "text",
+      "markdown": "## Step 3: Test, read the results and detect"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "One negative test, three views of the result",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "nmap -Pn -n -p 22,80,443,445,3389 10.10.20.15",
+          "output": "Nmap scan report for 10.10.20.15\nHost is up.\nPORT     STATE    SERVICE\n22/tcp   filtered ssh\n80/tcp   filtered http\n443/tcp  open     https\n445/tcp  filtered microsoft-ds\n3389/tcp filtered ms-wbt-server",
+          "comment": "Run from the users zone against your own server. Only 443 is open, which matches the matrix. filtered means no reply, usually a firewall drop; closed means the host answered with a reset."
+        },
+        {
+          "prompt": "asa1#",
+          "cmd": "packet-tracer input users tcp 10.10.10.50 49152 10.10.20.15 3389",
+          "output": "Phase: 3\nType: ACCESS-LIST\nSubtype: log\nResult: DROP\nConfig:\naccess-group users_in in interface users\naccess-list users_in extended deny ip any any log\nResult:\ninput-interface: users\noutput-interface: servers\nAction: drop\nDrop-reason: (acl-drop) Flow is denied by configured rule",
+          "comment": "The firewall simulates the flow without sending traffic and names the rule that decides it. The result is abbreviated."
+        },
+        {
+          "prompt": "asa1#",
+          "cmd": "show access-list users_in | include 3389|any any",
+          "output": "access-list users_in line 4 extended permit tcp 10.10.10.0 255.255.255.0 host 10.10.20.15 eq 443 (hitcnt=1288)\naccess-list users_in line 9 extended deny ip any any log (hitcnt=17)",
+          "comment": "Hit counters show which rules traffic really uses. A permit with a hit count of 0 for months is a cleanup candidate."
+        }
+      ]
+    },
+    {
+      "id": "detect",
+      "type": "text",
+      "markdown": "### Reading the results\n\nA scanner can only see what the firewall lets it see, so interpret carefully. `filtered` is the expected answer for a denied port. `open` on a denied flow is a **fail** and needs a rule change. `closed` means the packet reached the host, so the firewall allowed it even though no service listens, which is still a policy gap. Test UDP separately, because silence can mean open or dropped. Repeat each test from every zone and from both ends of a high-availability pair.\n\n### Detecting validation and real probing\n\nYour SIEM should treat the activity the same way it treats an adversary:\n\n- Cisco ASA syslog `%ASA-4-106023` (deny by access-group) and `%ASA-6-106100` (flow logged by ACL): alert when one source is denied on more than 20 distinct destination ports or 20 distinct hosts within five minutes.\n- A firewall configuration change event (`%ASA-5-111008`, `%ASA-5-111010`): alert on any change outside an approved window, with the user and the command.\n- Flows that should never exist, such as Users to Management on SSH, should alert on a single permitted connection.\n- Flow logs from NetFlow or cloud security groups give you the same detection when there is no firewall in the path.\n\nTell the SOC before an authorized test, so the alerts you expect are treated as exercise results and not as incidents."
+    },
+    {
+      "id": "fix",
+      "type": "text",
+      "markdown": "## Step 4: Fix and harden\n\nTurn each failed test into a change with an owner:\n\n1. **Remove or narrow the offending rule.** Replace `any` with the specific source, destination and port. Put the narrowest rules first.\n2. **Default deny with logging** at the end of every zone-to-zone policy, so unknown flows are visible.\n3. **Expire temporary rules.** Require a ticket, an owner and an expiry date in the rule comment, and review rules whose hit count has been zero for 90 days.\n4. **Lock down the management plane.** Allow SSH and the web interface of the firewall only from the management zone, with MFA and central authentication.\n5. **Close bypass paths.** Make the firewall the only route between zones, or apply equivalent ACLs on the layer 3 device that routes them.\n6. **Use identity and application context** (Cisco Secure Firewall with ISE security group tags, for example) so rules follow users and roles instead of fragile IP lists.\n7. **Manage configuration as code,** with review and automated comparison against the intended policy to catch drift.\n\nPrefer a small number of understandable rules. Complexity is itself a vulnerability, because nobody can validate a policy they cannot read."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Test the policy, not the patience of production",
+      "markdown": "Scanning every port of every server can overload old devices and fill logs. Limit tests to the ports in the matrix, use a low scan rate, and never test denial of service. Get written approval, name the source IP of the test host, and have a rollback plan before you change any rule."
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Step 5: Verify the fix\n\nValidation is a loop, not a one-time event.\n\n1. **Retest the failed flow** from the same zone with the same tool and confirm `filtered`.\n2. **Retest the allowed flows** to prove nothing broke. Confirm that HTTPS to the web tier still works.\n3. **Check hit counts and logs.** The new deny rule should show a rising counter, and the old broad permit should be gone or silent.\n4. **Compare the running configuration** with the approved version on both firewalls of the pair.\n5. **Automate the matrix.** Schedule the same negative and positive tests from lab hosts in each zone and send the results to the SIEM. A change that opens a path now fails a test the same day.\n6. **Record evidence:** the matrix cell, test output, rule ID, owner and date.\n\nFor the deeper rule-by-rule review technique, including shadowed rules and object groups, continue with [Firewall rule review and validation](/learn/offensive-security-for-defense/firewall-rule-review-and-validation)."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Build a small lab with three virtual networks (users, servers, DMZ) and any firewall you own, such as a virtual Cisco ASA or FTD, or a Linux router with `nftables`.\n\n1. Draw the flow matrix with at least six cells and decide which are allowed.\n2. Configure the firewall to match, then add one deliberate mistake, such as a broad permit above a deny.\n3. From the users network, run `nmap -Pn -n -p 22,80,443,3389` against the server and compare the result with the matrix.\n4. Find the failing cell, then use the hit counters or `packet-tracer` to name the rule responsible.\n5. Fix the rule, retest both a denied and an allowed flow, and note the syslog message produced by the deny.\n\nWrite down the evidence for each step."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Segmentation",
+          "definition": "Splitting a network into zones with enforced rules between them."
+        },
+        {
+          "term": "Flow matrix",
+          "definition": "A table of allowed services between each source and destination zone."
+        },
+        {
+          "term": "Negative test",
+          "definition": "A test that expects the traffic to be denied."
+        },
+        {
+          "term": "Implicit deny",
+          "definition": "The final rule that drops traffic no earlier rule matched."
+        },
+        {
+          "term": "Shadowed rule",
+          "definition": "A rule that never matches because an earlier broader rule catches the traffic."
+        },
+        {
+          "term": "Hit count",
+          "definition": "A counter of how many flows matched a rule."
+        },
+        {
+          "term": "packet-tracer",
+          "definition": "An ASA and FTD tool that simulates a packet and shows the deciding rule."
+        },
+        {
+          "term": "Rule drift",
+          "definition": "A running policy that no longer matches the approved one."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "In an authorized scan of a denied port, which result passes the test?",
+          "options": [
+            "open",
+            "filtered",
+            "The scan ends faster",
+            "Host is up with a banner"
+          ],
+          "answer": 1,
+          "explanation": "A filtered port means the firewall silently dropped the probe, which is what a deny rule should do. Open means the flow is allowed."
+        },
+        {
+          "question": "Which are common causes of segmentation failure? Choose all that apply.",
+          "options": [
+            "A broad permit above a deny",
+            "Temporary rules never removed",
+            "A layer 3 switch routing between VLANs around the firewall",
+            "Having a default deny rule"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "The first three create paths the policy does not control. A default deny is a protection, not a cause."
+        },
+        {
+          "question": "What does the ASA command packet-tracer give you that a scan does not?",
+          "options": [
+            "It floods the target",
+            "The name of the exact rule that decides the flow, without sending real traffic",
+            "A list of server passwords",
+            "An automatic fix"
+          ],
+          "answer": 1,
+          "explanation": "It simulates the flow through the policy and reports the deciding phase and rule."
+        },
+        {
+          "question": "Which log message from an ASA indicates a flow denied by an access group?",
+          "options": [
+            "%ASA-4-106023",
+            "%ASA-6-302013",
+            "%ASA-5-111008",
+            "%ASA-6-113005"
+          ],
+          "answer": 0,
+          "explanation": "106023 is the deny-by-access-group message. 302013 is a built connection, 111008 a command executed, 113005 an AAA rejection."
+        },
+        {
+          "question": "Why run positive tests as well as negative tests?",
+          "options": [
+            "To confirm approved business flows still work after a change",
+            "To look for more open ports",
+            "To avoid logging",
+            "They are not needed"
+          ],
+          "answer": 0,
+          "explanation": "Tightening a rule must not break legitimate traffic, so each allowed cell is tested too."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nFirewall and segmentation validation tests the policy from the attacker's side. Write the intent as a flow matrix, run negative and positive tests from each zone, and read `filtered`, `open` and `closed` correctly. Use hit counters, `packet-tracer` and syslog to find the rule that decided each flow. Fix shadowed, temporary and over-broad rules, lock down the management plane, close bypass paths and automate the matrix so every change is tested the same day."
+    }
+  ],
+  "ar": {
+    "title": "التحقق من جدران الحماية والتجزئة",
+    "summary": "كيف تختبر سياسة جدار الحماية وتجزئة الشبكة من كل منطقة، وتقرأ النتائج قراءة صحيحة، وتحوّل الاختبارات الفاشلة إلى إصلاحات مُتحقَّق منها.",
+    "objectives": [
+      "التعبير عن نية التجزئة بمصفوفة تدفقات",
+      "تنفيذ الاختبارات السلبية والإيجابية من كل منطقة وتفسيرها",
+      "استخدام عدّادات الإصابة وpacket-tracer وsyslog لإيجاد القاعدة الحاسمة",
+      "إصلاح التجزئة وإعادة التحقق منها آليًا"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تقسّم شركة شبكتها إلى مناطق للمستخدمين والخوادم والمنطقة المنزوعة السلاح (DMZ) والإدارة. يبدو المخطط ممتازًا. ثم يكتشف التدقيق أنّ حاسوبًا محمولًا لمتعاقد في منطقة المستخدمين يستطيع فتح جلسة سطح مكتب بعيد إلى خادم قاعدة بيانات. قاعدة كُتبت لمشروع مؤقت قبل ثلاث سنوات لم تُزَل، وتوجد قاعدة واسعة `permit ip any any` فوق القاعدة التي كان يفترض أن تحجب الوصول.\n\nسياسة جدار الحماية ادعاء بما يُسمح به من حركة. و**التحقق من جدران الحماية والتجزئة (Firewall and segmentation validation)** هو ممارسة اختبار هذا الادعاء من جهة المهاجم. يقف المختبِر في كل منطقة بجهاز اختبار مصرّح به، ويجرّب التدفقات التي ينبغي أن ترفضها السياسة، ثم يقارن النتيجة بالنية الموثّقة. يوضح هذا الدرس كيف تفعل ذلك بأمان، وأي النتائج تثق بها، وكيف تحوّل النتائج إلى إصلاحات. لا تجرِ هذه الاختبارات إلا على شبكات تملكها أو مصرّح لك باختبارها، واتفق على نافذة تغيير مسبقًا."
+      },
+      {
+        "id": "intent",
+        "type": "text",
+        "markdown": "## الخطوة 1: اكتب النية على شكل مصفوفة تدفقات\n\nلا يمكنك اختبار سياسة لم يكتبها أحد. ابدأ ببناء **مصفوفة تدفقات (Flow matrix)**: الصفوف مناطق المصدر والأعمدة مناطق الوجهة، وتسرد كل خلية الخدمات المسموح بها. وكل ما لم يُذكر يجب أن يُرفض.\n\n| المصدر / الوجهة | المستخدمون 10.10.10.0/24 | الخوادم 10.10.20.0/24 | DMZ 172.16.30.0/24 | الإدارة 10.10.99.0/24 | الإنترنت |\n|:--|:--|:--|:--|:--|:--|\n| المستخدمون | مسموح | HTTPS وSMB إلى خادم الملفات فقط | HTTPS | مرفوض | HTTPS وDNS عبر الوسيط |\n| الخوادم | مرفوض | مسموح | مرفوض | syslog والنسخ الاحتياطي | التحديثات فقط |\n| DMZ | مرفوض | منفذ قاعدة البيانات من طبقة الويب فقط | مسموح | مرفوض | مرفوض |\n| الإدارة | SSH وRDP | SSH وRDP | SSH | مسموح | التحديثات |\n| الإنترنت | مرفوض | مرفوض | HTTPS إلى طبقة الويب | مرفوض | لا ينطبق |\n\nتمنح المصفوفة كل اختبار نتيجة نجاح أو فشل. تتحول كل خلية مرفوضة إلى اختبار سلبي وكل خلية مسموحة إلى اختبار إيجابي. تثبت الاختبارات الإيجابية أنّ العمل ما زال يسير، فنفّذ النوعين.\n\nسجّل كذلك **المسار**: هل تمر الحركة بين شبكتين محليتين افتراضيتين عبر جدار الحماية، أم يوجّهها مبدّل من الطبقة الثالثة دون فحص؟ لا تستطيع السياسة حماية مسار يتجاوز جدار الحماية."
+      },
+      {
+        "id": "think",
+        "type": "text",
+        "markdown": "## الخطوة 2: افهم ما يحاوله الخصم\n\nيسأل الخصم الذي له موطئ قدم في منطقة المستخدمين السؤال نفسه الذي تجيب عنه مصفوفتك: ماذا أستطيع الوصول إليه من هنا؟ يحصر الخدمات التي يمكن بلوغها (تقنية MITRE ATT&CK رقم T1046، اكتشاف خدمات الشبكة)، ثم يجرّب بروتوكولات الإدارة مثل RDP وSSH وWinRM للتنقل (T1021، الخدمات البعيدة). وإذا عامل جدار الحماية منطقتين كحدّ ثقة واحد فيستطيع الخصم عبوره دون أي ثغرة (T1599، جسر حدود الشبكة، عندما يُستغل الجهاز نفسه).\n\nالفجوات الشائعة ليست غريبة:\n\n- **قواعد مظلَّلة أو واسعة أكثر من اللازم**، مثل `permit ip any any` في موضع مرتفع.\n- **قواعد مؤقتة لا تنتهي**، وغالبًا بلا مالك أو تعليق.\n- **قاعدة any-any لمسار العودة**، كُتبت بسبب سوء فهم الحركة العائدة في الجدار ذي الحالة.\n- **تعرّض مستوى الإدارة**، حيث يستمع SSH أو واجهة الويب لجدار الحماية على واجهة تواجه المستخدمين.\n- **مسارات غير متناظرة أو التفافية** تتجاوز جدار الحماية.\n- **انحراف مجموعة القواعد** بين السياسة الموثّقة والعاملة، أو بين زوجي الإتاحة العالية.\n\nتترك كل فجوة أثرًا في الإعدادات وعدّادات الإصابة والسجلات. ويقرأ التحقق الثلاثة جميعًا."
+      },
+      {
+        "id": "anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "التحقق من تدفق مرفوض واحد من منطقة المستخدمين",
+        "caption": "يرسل جهاز الاختبار الحزمة، ويقرر جدار الحماية، ويثبت السجل القرار.",
+        "data": {
+          "token": "TCP/3389",
+          "nodes": [
+            {
+              "id": "t",
+              "label": "جهاز الاختبار",
+              "sub": "10.10.10.50",
+              "icon": "laptop"
+            },
+            {
+              "id": "fw",
+              "label": "جدار الحماية",
+              "sub": "users_in ACL",
+              "icon": "firewall"
+            },
+            {
+              "id": "log",
+              "label": "السجل",
+              "sub": "%ASA-4-106023",
+              "icon": "log"
+            },
+            {
+              "id": "srv",
+              "label": "خادم قاعدة البيانات",
+              "sub": "10.10.20.15",
+              "icon": "database"
+            }
+          ],
+          "steps": [
+            {
+              "at": "t",
+              "caption": "تقول المصفوفة إنّ المستخدمين يجب ألا يصلوا إلى الخوادم عبر RDP. يرسل المختبِر مسبارًا واحدًا إلى TCP/3389."
+            },
+            {
+              "at": "fw",
+              "caption": "يقيّم جدار الحماية قائمة التحكم من الأعلى إلى الأسفل. أول قاعدة مطابقة هي رفض 3389."
+            },
+            {
+              "at": "log",
+              "caption": "تُكتب رسالة رفض مع المصدر والوجهة واسم القائمة.",
+              "tone": "success"
+            },
+            {
+              "at": "srv",
+              "caption": "لا يصل شيء. يظهر المنفذ مفلترًا من جهاز الاختبار، فينجح الاختبار.",
+              "tone": "blocked"
+            },
+            {
+              "at": "fw",
+              "token": "TCP/3389",
+              "caption": "لو وُجدت قاعدة سماح واسعة فوق قاعدة الرفض لمرت الحزمة وارتفع عدّاد تلك القاعدة، فيفشل الاختبار.",
+              "tone": "danger"
+            }
+          ]
+        }
+      },
+      {
+        "id": "test",
+        "type": "text",
+        "markdown": "## الخطوة 3: اختبر واقرأ النتائج واكتشف"
+      },
+      {
+        "id": "term",
+        "type": "terminal",
+        "title": "اختبار سلبي واحد بثلاث زوايا للنتيجة",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "nmap -Pn -n -p 22,80,443,445,3389 10.10.20.15",
+            "output": "Nmap scan report for 10.10.20.15\nHost is up.\nPORT     STATE    SERVICE\n22/tcp   filtered ssh\n80/tcp   filtered http\n443/tcp  open     https\n445/tcp  filtered microsoft-ds\n3389/tcp filtered ms-wbt-server",
+            "comment": "يُشغَّل من منطقة المستخدمين ضد خادمك. المنفذ 443 وحده مفتوح، وهذا يطابق المصفوفة. القيمة filtered تعني غياب الرد وغالبًا إسقاطًا من الجدار، بينما closed تعني ردّ المضيف بإعادة ضبط."
+          },
+          {
+            "prompt": "asa1#",
+            "cmd": "packet-tracer input users tcp 10.10.10.50 49152 10.10.20.15 3389",
+            "output": "Phase: 3\nType: ACCESS-LIST\nSubtype: log\nResult: DROP\nConfig:\naccess-group users_in in interface users\naccess-list users_in extended deny ip any any log\nResult:\ninput-interface: users\noutput-interface: servers\nAction: drop\nDrop-reason: (acl-drop) Flow is denied by configured rule",
+            "comment": "يحاكي جدار الحماية التدفق دون إرسال حركة ويسمّي القاعدة الحاسمة. النتيجة مختصرة."
+          },
+          {
+            "prompt": "asa1#",
+            "cmd": "show access-list users_in | include 3389|any any",
+            "output": "access-list users_in line 4 extended permit tcp 10.10.10.0 255.255.255.0 host 10.10.20.15 eq 443 (hitcnt=1288)\naccess-list users_in line 9 extended deny ip any any log (hitcnt=17)",
+            "comment": "تُظهر عدّادات الإصابة القواعد التي تستخدمها الحركة فعلًا. قاعدة سماح بعدّاد 0 لأشهر مرشحة للتنظيف."
+          }
+        ]
+      },
+      {
+        "id": "detect",
+        "type": "text",
+        "markdown": "### قراءة النتائج\n\nلا يرى الماسح إلا ما يسمح له جدار الحماية برؤيته، فافسّر بحذر. القيمة `filtered` هي الجواب المتوقع للمنفذ المرفوض. أمّا `open` على تدفق مرفوض فهو **فشل** يحتاج إلى تغيير قاعدة. و`closed` تعني أنّ الحزمة وصلت إلى المضيف، أي أنّ جدار الحماية سمح بها وإن لم تكن هناك خدمة تستمع، وهذه فجوة في السياسة أيضًا. اختبر UDP على حدة لأنّ الصمت قد يعني مفتوحًا أو مُسقَطًا. كرّر كل اختبار من كل منطقة ومن طرفي زوج الإتاحة العالية.\n\n### اكتشاف التحقق والتحسس الحقيقي\n\nينبغي أن يعامل SIEM هذا النشاط كما يعامل الخصم:\n\n- رسالة سجل ASA رقم `%ASA-4-106023` (رفض بمجموعة الوصول) و`%ASA-6-106100` (تدفق مسجَّل بقائمة التحكم): نبّه عندما يُرفض مصدر واحد على أكثر من 20 منفذ وجهة مختلفًا أو 20 مضيفًا مختلفًا خلال خمس دقائق.\n- حدث تغيير إعداد جدار الحماية (`%ASA-5-111008` و`%ASA-5-111010`): نبّه على أي تغيير خارج نافذة معتمدة، مع المستخدم والأمر.\n- التدفقات التي لا ينبغي أن توجد أبدًا، مثل المستخدمين إلى الإدارة عبر SSH، يجب أن تنبّه عند اتصال واحد مسموح.\n- تمنحك سجلات التدفق من NetFlow أو مجموعات الأمان السحابية الاكتشاف نفسه حين لا يوجد جدار حماية في المسار.\n\nأبلغ مركز العمليات الأمنية قبل أي اختبار مصرّح به، ليُعامل التنبيه المتوقع كنتيجة تمرين لا كحادثة."
+      },
+      {
+        "id": "fix",
+        "type": "text",
+        "markdown": "## الخطوة 4: أصلح وحصّن\n\nحوّل كل اختبار فاشل إلى تغيير له مالك:\n\n1. **أزل القاعدة المخالفة أو ضيّقها.** استبدل `any` بالمصدر والوجهة والمنفذ المحددة. وضع القواعد الأضيق أولًا.\n2. **ارفض افتراضيًا مع التسجيل** في نهاية كل سياسة بين منطقتين، لتظهر التدفقات المجهولة.\n3. **أنهِ القواعد المؤقتة.** اشترط تذكرة ومالكًا وتاريخ انتهاء في تعليق القاعدة، وراجع القواعد التي بقي عدّادها صفرًا 90 يومًا.\n4. **أحكم مستوى الإدارة.** اسمح بـ SSH وواجهة الويب لجدار الحماية من منطقة الإدارة فقط، مع MFA ومصادقة مركزية.\n5. **أغلق المسارات الالتفافية.** اجعل جدار الحماية المسار الوحيد بين المناطق، أو طبّق قوائم تحكم مكافئة على جهاز الطبقة الثالثة الذي يوجّهها.\n6. **استخدم سياق الهوية والتطبيق** (مثل Cisco Secure Firewall مع وسوم مجموعات الأمان من ISE) لتتبع القواعد المستخدمين والأدوار بدل قوائم عناوين هشة.\n7. **أدر الإعدادات كشيفرة،** مع مراجعة ومقارنة آلية بالسياسة المقصودة لرصد الانحراف.\n\nفضّل عددًا قليلًا من القواعد المفهومة. التعقيد نفسه ثغرة، فلا أحد يستطيع التحقق من سياسة لا يستطيع قراءتها."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "اختبر السياسة لا صبر الإنتاج",
+        "markdown": "قد يؤدي مسح كل منفذ في كل خادم إلى إجهاد الأجهزة القديمة وإغراق السجلات. اقصر الاختبارات على المنافذ الواردة في المصفوفة، واستخدم معدل مسح منخفضًا، ولا تختبر حجب الخدمة أبدًا. احصل على موافقة كتابية، وحدّد عنوان IP لجهاز الاختبار، وجهّز خطة تراجع قبل تغيير أي قاعدة."
+      },
+      {
+        "id": "verify",
+        "type": "text",
+        "markdown": "## الخطوة 5: تحقّق من الإصلاح\n\nالتحقق حلقة وليس حدثًا لمرة واحدة.\n\n1. **أعد اختبار التدفق الفاشل** من المنطقة نفسها وبالأداة نفسها وتأكد من النتيجة `filtered`.\n2. **أعد اختبار التدفقات المسموحة** لتثبت أنّ شيئًا لم يتعطل. تأكد أنّ HTTPS إلى طبقة الويب ما زال يعمل.\n3. **افحص عدّادات الإصابة والسجلات.** ينبغي أن تُظهر قاعدة الرفض الجديدة عدّادًا متصاعدًا، وأن تختفي قاعدة السماح الواسعة القديمة أو تصمت.\n4. **قارن الإعداد العامل** بالنسخة المعتمدة على جدارَي الزوج كليهما.\n5. **أتمت المصفوفة.** جدول الاختبارات السلبية والإيجابية نفسها من أجهزة مخبرية في كل منطقة وأرسل النتائج إلى SIEM. فيفشل أي تغيير يفتح مسارًا اختبارًا في اليوم نفسه.\n6. **سجّل الأدلة:** خلية المصفوفة ونتيجة الاختبار ومعرّف القاعدة والمالك والتاريخ.\n\nولتقنية المراجعة الأعمق قاعدة بقاعدة، بما فيها القواعد المظلَّلة ومجموعات الكائنات، تابع مع [مراجعة قواعد جدار الحماية والتحقق منها](/learn/offensive-security-for-defense/firewall-rule-review-and-validation)."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "أنشئ مختبرًا صغيرًا بثلاث شبكات افتراضية (المستخدمون والخوادم وDMZ) وأي جدار حماية تملكه، مثل Cisco ASA أو FTD افتراضي أو موجّه Linux مع `nftables`.\n\n1. ارسم مصفوفة التدفقات بست خلايا على الأقل وحدد المسموح منها.\n2. اضبط جدار الحماية ليطابقها، ثم أضف خطأ متعمدًا واحدًا مثل قاعدة سماح واسعة فوق قاعدة رفض.\n3. من شبكة المستخدمين، شغّل `nmap -Pn -n -p 22,80,443,3389` ضد الخادم وقارن النتيجة بالمصفوفة.\n4. ابحث عن الخلية الفاشلة، ثم استخدم عدّادات الإصابة أو `packet-tracer` لتسمية القاعدة المسؤولة.\n5. أصلح القاعدة، وأعد اختبار تدفق مرفوض وآخر مسموح، ودوّن رسالة السجل الناتجة عن الرفض.\n\nدوّن الدليل في كل خطوة."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسية",
+        "items": [
+          {
+            "term": "التجزئة",
+            "definition": "تقسيم الشبكة إلى مناطق مع قواعد مفروضة بينها."
+          },
+          {
+            "term": "مصفوفة التدفقات",
+            "definition": "جدول بالخدمات المسموحة بين كل منطقة مصدر ووجهة."
+          },
+          {
+            "term": "اختبار سلبي",
+            "definition": "اختبار يتوقع أن تُرفض الحركة."
+          },
+          {
+            "term": "الرفض الضمني",
+            "definition": "القاعدة الأخيرة التي تُسقط الحركة التي لم تطابقها أي قاعدة سابقة."
+          },
+          {
+            "term": "قاعدة مظلَّلة",
+            "definition": "قاعدة لا تطابق أبدًا لأنّ قاعدة سابقة أوسع تلتقط الحركة."
+          },
+          {
+            "term": "Hit count",
+            "definition": "عدّاد لعدد التدفقات التي طابقت القاعدة."
+          },
+          {
+            "term": "packet-tracer",
+            "definition": "أداة في ASA وFTD تحاكي حزمة وتُظهر القاعدة الحاسمة."
+          },
+          {
+            "term": "انحراف القواعد",
+            "definition": "سياسة عاملة لم تعد تطابق السياسة المعتمدة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "في مسح مصرّح به لمنفذ مرفوض، أي نتيجة تنجح في الاختبار؟",
+            "options": [
+              "open",
+              "filtered",
+              "ينتهي المسح أسرع",
+              "المضيف يعمل مع شعار"
+            ],
+            "answer": 1,
+            "explanation": "المنفذ filtered يعني أنّ جدار الحماية أسقط المسبار بصمت وهذا ما ينبغي لقاعدة الرفض فعله. أما open فتعني أن التدفق مسموح."
+          },
+          {
+            "question": "ما الأسباب الشائعة لفشل التجزئة؟ اختر كل ما ينطبق.",
+            "options": [
+              "قاعدة سماح واسعة فوق قاعدة رفض",
+              "قواعد مؤقتة لم تُزَل",
+              "مبدّل طبقة ثالثة يوجّه بين الشبكات الافتراضية متجاوزًا الجدار",
+              "وجود قاعدة رفض افتراضية"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الثلاثة الأولى تنشئ مسارات لا تضبطها السياسة. والرفض الافتراضي حماية لا سبب."
+          },
+          {
+            "question": "ماذا يمنحك الأمر packet-tracer في ASA مما لا يمنحه المسح؟",
+            "options": [
+              "يغرق الهدف بالحركة",
+              "اسم القاعدة الدقيقة التي تحسم التدفق دون إرسال حركة حقيقية",
+              "قائمة كلمات مرور الخوادم",
+              "إصلاح تلقائي"
+            ],
+            "answer": 1,
+            "explanation": "يحاكي التدفق عبر السياسة ويبلّغ عن المرحلة والقاعدة الحاسمة."
+          },
+          {
+            "question": "أي رسالة سجل من ASA تدل على رفض تدفق بمجموعة وصول؟",
+            "options": [
+              "%ASA-4-106023",
+              "%ASA-6-302013",
+              "%ASA-5-111008",
+              "%ASA-6-113005"
+            ],
+            "answer": 0,
+            "explanation": "106023 هي رسالة الرفض بمجموعة الوصول. و302013 اتصال مبني، و111008 أمر منفَّذ، و113005 رفض AAA."
+          },
+          {
+            "question": "لماذا نجري الاختبارات الإيجابية مع السلبية؟",
+            "options": [
+              "لتأكيد أنّ تدفقات العمل المعتمدة ما زالت تعمل بعد التغيير",
+              "للبحث عن منافذ مفتوحة أكثر",
+              "لتجنب التسجيل",
+              "ليست مطلوبة"
+            ],
+            "answer": 0,
+            "explanation": "تشديد القاعدة يجب ألا يكسر الحركة المشروعة، لذا تُختبر كل خلية مسموحة أيضًا."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nيختبر التحقق من جدران الحماية والتجزئة السياسة من جهة المهاجم. اكتب النية كمصفوفة تدفقات، ونفّذ اختبارات سلبية وإيجابية من كل منطقة، واقرأ النتائج `filtered` و`open` و`closed` قراءة صحيحة. استخدم عدّادات الإصابة و`packet-tracer` وسجلات syslog لإيجاد القاعدة التي حسمت كل تدفق. أصلح القواعد المظلَّلة والمؤقتة والواسعة، وأحكم مستوى الإدارة، وأغلق المسارات الالتفافية، وأتمت المصفوفة ليُختبر كل تغيير في اليوم نفسه."
+      }
+    ]
+  }
+}

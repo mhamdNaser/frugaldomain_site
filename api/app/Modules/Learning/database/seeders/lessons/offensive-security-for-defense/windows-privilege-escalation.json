@@ -1,0 +1,650 @@
+{
+ "slug": "windows-privilege-escalation",
+ "title": "Windows Privilege Escalation",
+ "summary": "Learn how weak service permissions, unquoted paths, impersonation privileges and stored credentials let a standard user reach SYSTEM, and how to audit, detect, harden and verify each path.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain access tokens, privileges and how services inherit authority",
+  "Map Windows escalation families to MITRE ATT&CK IDs",
+  "Audit services, folder ACLs and token privileges with read-only commands",
+  "Detect attempts with Windows and Sysmon event IDs",
+  "Harden with LAPS, gMSA, ACL fixes and allow-listing, then verify"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A help-desk workstation in your lab domain has been reached by an authorized tester as `CORP\\jdoe`, a standard user. The question now is whether anything on that machine lets `jdoe` act as **SYSTEM** or as a local administrator. In real incidents this step is rarely a zero-day. It is usually a service installed with a sloppy path, a folder that grants write access to everyone, or an everyday account that holds a powerful privilege it does not need.\n\nIn this lesson you will learn the main Windows escalation families at the concept level, each with its MITRE ATT&CK ID. For every family you will see how to audit it with built-in commands, which event IDs reveal an attempt, how to harden it and how to verify the fix. There is no exploit code, because the defender's job is to remove the condition."
+  },
+  {
+   "id": "model",
+   "type": "text",
+   "markdown": "## Where Windows privilege comes from\n\nA Windows process carries an **access token** that lists the user, their groups, the integrity level and a set of **privileges** such as `SeDebugPrivilege` or `SeImpersonatePrivilege`. Services run under accounts such as `LocalSystem`, `NetworkService` or a named service account, and the **Service Control Manager (SCM)** starts their executables at boot.\n\nThat design creates the three questions every assessor asks:\n\n- **Who controls what a privileged account executes?** Service binaries, their folders, scheduled tasks and the DLLs they load.\n- **Who controls the configuration that tells Windows what to run?** Service registry keys, task definitions and installer policy.\n- **Which privileges does the token already hold?** Some privileges, notably impersonation rights, are intended for service accounts but are powerful in the wrong hands.\n\nWhen the answer to any question is \"a standard user\", the host has an escalation path. **User Account Control (UAC)** is a convenience prompt for administrators, not a security boundary, so a user who is already a local administrator should be treated as already elevated."
+  },
+  {
+   "id": "paths",
+   "type": "text",
+   "markdown": "## Common paths and their ATT&CK mapping\n\n| Weakness | What it abuses | ATT&CK | Primary fix |\n|:--|:--|:--|:--|\n| Unquoted service path | A path with spaces and no quotes makes Windows try shorter executable names first | T1574.009 | Quote the path; restrict writes to program folders |\n| Weak service permissions | A user can change a service's binary path or replace its executable | T1574.010, T1543.003 | Correct service and file ACLs |\n| DLL search order | A privileged program loads a DLL from a user-writable folder | T1574.001, T1574.002 | Fix ACLs; load by full path; use signed-DLL policy |\n| AlwaysInstallElevated | Installer packages run as SYSTEM when two policy keys are both set | T1548 | Disable the policy in both hives |\n| Impersonation privileges | `SeImpersonatePrivilege` on an exposed service account can yield a SYSTEM token | T1134.001 | Patch; use managed service accounts; isolate exposed services |\n| Stored credentials | Passwords in unattended setup files, old Group Policy Preferences, scripts | T1552.001, T1552.006 | Remove files; rotate; use LAPS and gMSA |\n| UAC bypass | Auto-elevating built-ins that trust user-controlled settings | T1548.002 | Remove local admin rights; set UAC to always notify |\n| Unpatched local flaws | Public bugs in the kernel, print and driver components | T1068 | Patch fast; disable unneeded services such as Print Spooler on servers |\n\nNotice the pattern: almost every row is a **permissions or configuration** problem. That is good news, because configuration can be audited at scale and fixed through Group Policy, Intune or configuration management."
+  },
+  {
+   "id": "audit",
+   "type": "terminal",
+   "title": "Auditing a Windows host you administer",
+   "prompt": "PS C:\\>",
+   "caption": "Read-only checks for a lab or production host you are authorized to assess.",
+   "lines": [
+    {
+     "cmd": "Get-CimInstance Win32_Service | Where-Object { $_.PathName -notmatch '^\"' -and $_.PathName -match ' ' -and $_.PathName -notmatch '^C:\\\\Windows' } | Select Name,StartName,PathName",
+     "comment": "Services with spaces in an unquoted path"
+    },
+    {
+     "output": "Name       StartName   PathName\n----       ---------   --------\nAcmeSync   LocalSystem C:\\Program Files\\Acme Sync\\sync.exe"
+    },
+    {
+     "comment": "Finding: the path is unquoted and runs as LocalSystem. Quote it, then check who can write to C:\\ and C:\\Program Files."
+    },
+    {
+     "cmd": "icacls \"C:\\Program Files\\Acme Sync\"",
+     "comment": "Who can modify the service folder?"
+    },
+    {
+     "output": "C:\\Program Files\\Acme Sync NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n                            BUILTIN\\Administrators:(OI)(CI)(F)\n                            BUILTIN\\Users:(OI)(CI)(M)"
+    },
+    {
+     "comment": "Finding: BUILTIN\\Users has Modify rights on a folder whose binary runs as SYSTEM. Remove it."
+    },
+    {
+     "cmd": "reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated",
+     "comment": "Must be absent or 0 (check HKCU too)"
+    },
+    {
+     "output": "ERROR: The system was unable to find the specified registry key or value."
+    },
+    {
+     "comment": "Good: the policy is not set."
+    },
+    {
+     "cmd": "whoami /priv",
+     "comment": "Privileges held by the current token"
+    },
+    {
+     "output": "PRIVILEGES INFORMATION\nPrivilege Name                Description                    State\n============================= ============================== ========\nSeChangeNotifyPrivilege       Bypass traverse checking       Enabled\nSeIncreaseWorkingSetPrivilege Increase a process working set Disabled"
+    },
+    {
+     "comment": "A standard user holds only these two. SeImpersonate, SeDebug or SeBackup on a user account would be a finding."
+    }
+   ]
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "A weak service folder: attempt, telemetry, detection",
+   "caption": "The configuration weakness is exercised once in a lab using an approved emulation framework; every step leaves a log.",
+   "data": {
+    "actors": [
+     {
+      "id": "t",
+      "label": "Tester",
+      "sub": "CORP\\jdoe",
+      "icon": "user"
+     },
+     {
+      "id": "h",
+      "label": "Workstation",
+      "sub": "WS-017",
+      "icon": "desktop"
+     },
+     {
+      "id": "s",
+      "label": "Sysmon + Security log",
+      "sub": "Endpoint telemetry",
+      "icon": "log"
+     },
+     {
+      "id": "x",
+      "label": "SIEM",
+      "sub": "Detection rules",
+      "icon": "shield"
+     }
+    ],
+    "steps": [
+     {
+      "from": "t",
+      "to": "h",
+      "label": "Enumerate",
+      "detail": "icacls, sc qc",
+      "tone": "warning",
+      "note": "The tester reviews service paths and folder permissions with built-in tools."
+     },
+     {
+      "from": "h",
+      "to": "s",
+      "label": "4688 / Sysmon 1",
+      "detail": "icacls.exe by jdoe",
+      "note": "Process creation events record the enumeration commands and their parent."
+     },
+     {
+      "from": "t",
+      "to": "h",
+      "label": "Write to folder",
+      "detail": "Sysmon 11",
+      "tone": "attack",
+      "note": "A harmless marker file is written to the weak folder, as the approved test plan allows."
+     },
+     {
+      "from": "h",
+      "to": "s",
+      "label": "Sysmon 11 + 4663",
+      "detail": "FileCreate in service dir",
+      "note": "File-creation and object-access events show a standard user writing under a service directory."
+     },
+     {
+      "from": "s",
+      "to": "x",
+      "label": "Forward",
+      "detail": "WEF / agent",
+      "tone": "secure",
+      "note": "Logs reach the SIEM within seconds."
+     },
+     {
+      "from": "x",
+      "to": "x",
+      "label": "High alert",
+      "detail": "User write in service path",
+      "tone": "success",
+      "note": "The rule fires, and the fix is to correct the ACL and rerun the same test."
+     }
+    ]
+   }
+  },
+  {
+   "id": "detect",
+   "type": "text",
+   "markdown": "## Detection: the events that matter\n\nUse these sources and build rules around the *combination*, not a single event.\n\n| Event | Log | What it shows |\n|:--|:--|:--|\n| 4672 | Security | Special privileges assigned to a new logon; alert on unexpected accounts |\n| 4688 | Security | Process creation, with command line when auditing is enabled |\n| 4697 / 7045 | Security / System | A service was installed; unusual for workstations |\n| 4670 | Security | Permissions on an object changed |\n| 4732 / 4728 | Security | Member added to a local or global privileged group |\n| 4657 | Security | Registry value changed (service `ImagePath`, installer policy) |\n| Sysmon 1, 7, 11, 13 | Sysmon | Process, image (DLL) load, file create, registry set |\n\nExample Sigma-style logic: select Sysmon event 11 where the target path begins with `C:\\Program Files\\` or `C:\\Windows\\System32\\` and the creating user is not `SYSTEM`, `TrustedInstaller` or an approved installer; alert at high severity. A second rule watches event 13 where the target is `HKLM\\System\\CurrentControlSet\\Services\\*\\ImagePath` and the process is not `services.exe` or your deployment tool.\n\nEDR products add behavioral detections for token manipulation and for a service-account process spawning an interactive shell, which is the typical shape of impersonation abuse."
+  },
+  {
+   "id": "hard",
+   "type": "code",
+   "language": "powershell",
+   "filename": "Verify-ServiceHardening.ps1",
+   "caption": "Read-only verification to run before and after remediation; the output should change from findings to nothing.",
+   "highlight": [
+    2,
+    3,
+    9,
+    14
+   ],
+   "code": "# 1. Unquoted service paths outside Windows\nGet-CimInstance Win32_Service |\n  Where-Object { $_.PathName -notmatch '^\"' -and $_.PathName -match ' ' -and $_.PathName -notmatch '^C:\\\\Windows' } |\n  Select-Object Name, StartName, PathName\n\n# 2. Program folders where non-admin groups hold write rights\nGet-ChildItem 'C:\\Program Files' -Directory | ForEach-Object {\n  $acl = Get-Acl $_.FullName\n  $acl.Access | Where-Object { $_.IdentityReference -match 'Users|Everyone|Authenticated' -and $_.FileSystemRights -match 'Modify|FullControl|Write' } |\n    Select-Object @{n='Folder';e={$_.FullName}}, IdentityReference, FileSystemRights\n}\n\n# 3. Members of the local Administrators group\nGet-LocalGroupMember -Group 'Administrators' | Select-Object Name, ObjectClass\n"
+  },
+  {
+   "id": "harden",
+   "type": "text",
+   "markdown": "## Prevention, hardening and verification\n\n1. **Remove local administrator rights** from daily accounts and manage the built-in administrator with **Windows LAPS** so every machine has a unique, rotating password.\n2. **Fix permissions at the source.** Program directories and service registry keys should be writable only by SYSTEM, Administrators and TrustedInstaller. Quote every service path.\n3. **Use managed service accounts** (gMSA) with only the privileges the service needs. Treat any internet-facing service that holds `SeImpersonatePrivilege` as high-risk and isolate it.\n4. **Allow-list execution** with App Control for Business (WDAC) or AppLocker, so a file dropped in a service folder cannot run.\n5. **Patch quickly**, starting with local privilege flaws listed in the CISA KEV catalog, and disable Print Spooler where it is not needed.\n6. **Audit.** Enable process-creation auditing with command lines, install Sysmon with a maintained configuration, and forward logs centrally.\n\n**Verify** by repeating the exact test that produced the finding, as the same low-privilege account. The write should now fail with *Access denied*, event 4663 or a Sysmon record should show the denied attempt, and the audit script should return no rows. Keep the before and after output for the report, and read [Active Directory attack paths](/learn/offensive-security-for-defense/active-directory-attack-paths) next to see how a local administrator becomes a domain-wide problem."
+  },
+  {
+   "id": "worked",
+   "type": "callout",
+   "variant": "note",
+   "title": "Worked example: a lab finding end to end",
+   "markdown": "In the lab, the audit shows `AcmeSync` with an unquoted path and `BUILTIN\\Users` holding Modify on its folder. The tester, using an approved emulation framework such as Atomic Red Team for the matching T1574 test, writes a marker file. Sysmon event 11 logs `User: CORP\\jdoe`, `TargetFilename: C:\\Program Files\\Acme Sync\\marker.txt`, and your SIEM rule raises an alert in under a minute. You remove the Users entry with `icacls`, quote the service path, rerun the test and see *Access denied*. The finding is closed with evidence of both prevention and detection."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Elevate in the lab, not on production",
+   "markdown": "Reproducing an escalation on a production workstation can disrupt services and trigger incident response. Do it only in a lab you own or with written authorization, name the framework and test ID in the plan, and tell the SOC in advance whether it is a blind or announced test."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a Windows VM that you own, with a snapshot:\n\n1. Run the audit script above and save the output.\n2. Create a test folder `C:\\LabSvc` and run `icacls C:\\LabSvc /grant Users:(OI)(CI)M`. Create a service pointing to a harmless executable in that folder with `sc.exe create LabSvc binPath= \"C:\\Lab Svc\\app.exe\"` (the space and missing quotes are deliberate).\n3. Run the audit again and confirm both findings appear.\n4. Install Sysmon with a public community configuration, create a text file in the folder as a standard user, and find event 11 in `Microsoft-Windows-Sysmon/Operational`.\n5. Remove the grant with `icacls C:\\LabSvc /remove Users`, delete the service with `sc.exe delete LabSvc`, rerun the audit and restore the snapshot."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Access token",
+     "definition": "The object that holds a process's identity, groups, integrity level and privileges."
+    },
+    {
+     "term": "SeImpersonatePrivilege",
+     "definition": "A privilege that lets a process act as another authenticated identity."
+    },
+    {
+     "term": "Unquoted service path",
+     "definition": "A service path with spaces and no quotes, which Windows parses ambiguously."
+    },
+    {
+     "term": "UAC",
+     "definition": "User Account Control: an elevation prompt, not a security boundary."
+    },
+    {
+     "term": "LAPS",
+     "definition": "Windows LAPS manages unique, rotating local administrator passwords."
+    },
+    {
+     "term": "gMSA",
+     "definition": "A group managed service account whose password AD rotates automatically."
+    },
+    {
+     "term": "Sysmon",
+     "definition": "A Microsoft Sysinternals service that logs process, file, registry and DLL events."
+    },
+    {
+     "term": "WDAC",
+     "definition": "App Control for Business: policy that allows only approved code to run."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why is an unquoted service path dangerous?",
+     "options": [
+      "It disables logging",
+      "Windows may try shorter executable names in folders a user can write to",
+      "It forces the service to run as a user",
+      "It exposes the service to the internet"
+     ],
+     "answer": 1,
+     "explanation": "The ambiguity matters only when a standard user can write to a folder earlier in the path. The service itself runs with its own, often higher, privileges."
+    },
+    {
+     "question": "Which events help detect a service being installed or its path changed? Choose all that apply.",
+     "options": [
+      "7045 in the System log",
+      "4697 in the Security log",
+      "Sysmon 13 on the service ImagePath",
+      "4624 logon type 2 only"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "7045 and 4697 record service installation, and Sysmon 13 records registry value changes. A logon event alone says nothing about service changes."
+    },
+    {
+     "question": "A standard user token should NOT normally contain which privilege?",
+     "options": [
+      "SeChangeNotifyPrivilege",
+      "SeIncreaseWorkingSetPrivilege",
+      "SeImpersonatePrivilege",
+      "None of them"
+     ],
+     "answer": 2,
+     "explanation": "Impersonation is meant for service accounts. On an ordinary user it is a finding."
+    },
+    {
+     "question": "What is the strongest way to verify a permission fix?",
+     "options": [
+      "Read the ticket",
+      "Repeat the original test as the same low-privilege user and confirm denial plus a log entry",
+      "Reboot",
+      "Disable UAC"
+     ],
+     "answer": 1,
+     "explanation": "Verification should show both prevention (access denied) and detection (the denied attempt is logged)."
+    },
+    {
+     "question": "Which controls reduce Windows privilege escalation risk? Choose all that apply.",
+     "options": [
+      "Windows LAPS",
+      "WDAC or AppLocker allow-listing",
+      "gMSA with minimal privileges",
+      "Giving users local admin for convenience"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The first three remove reusable admin passwords, block unapproved code and shrink service privilege. Local admin for convenience does the opposite."
+    }
+   ]
+  },
+  {
+   "id": "deeper",
+   "type": "text",
+   "markdown": "## Go deeper\n\nFor a side-by-side comparison with Linux and network devices, see [Privilege Escalation Techniques](/learn/offensive-security-for-defense/privilege-escalation-techniques). The Linux counterpart is [Linux Privilege Escalation](/learn/offensive-security-for-defense/linux-privilege-escalation)."
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Windows escalation comes from weak permissions, weak configuration and over-granted privileges, not from unknown exploits.\n- Map findings to ATT&CK (T1574, T1543.003, T1548, T1134.001, T1552, T1068) and report them that way.\n- Detect with events 4672, 4688, 4697, 7045, 4670 and 4657, plus Sysmon 1, 7, 11 and 13.\n- Harden with no daily admin rights, LAPS, gMSA, correct ACLs, quoted paths, allow-listing and fast patching.\n- Verify by repeating the test as the low-privilege user and confirming denial and a log entry."
+  }
+ ],
+ "ar": {
+  "title": "تصعيد الامتيازات في Windows",
+  "summary": "تعلّم كيف تتيح صلاحيات الخدمات الضعيفة والمسارات بلا اقتباس وصلاحيات انتحال الهوية وبيانات الاعتماد المخزّنة وصول مستخدم عادي إلى SYSTEM، وكيف تدقّق وتكشف وتحصّن وتتحقق لكل مسار.",
+  "objectives": [
+   "اشرح رموز الوصول والامتيازات وكيف ترث الخدمات سلطتها",
+   "اربط عائلات التصعيد في Windows بمعرّفات MITRE ATT&CK",
+   "دقّق الخدمات وصلاحيات المجلدات وامتيازات الرمز بأوامر للقراءة فقط",
+   "اكشف المحاولات بأرقام أحداث Windows وSysmon",
+   "حصّن بـ LAPS وgMSA وتصحيح الصلاحيات والقائمة البيضاء ثم تحقق"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "وصل مختبِر مصرَّح له إلى محطة عمل في مكتب الدعم داخل نطاق مختبرك بالحساب `CORP\\jdoe`، وهو مستخدم عادي. والسؤال الآن: هل يوجد في هذا الجهاز ما يتيح لـ `jdoe` أن يعمل بهوية **SYSTEM** أو كمدير محلي؟ في الحوادث الحقيقية نادراً ما تكون هذه الخطوة ثغرة غير معروفة، بل غالباً خدمة ثُبّتت بمسار مهمل، أو مجلد يمنح الجميع صلاحية الكتابة، أو حساب يومي يحمل امتيازاً قوياً لا يحتاجه.\n\nفي هذا الدرس ستتعرف على عائلات تصعيد الامتيازات (Privilege Escalation) الرئيسية في Windows على مستوى المفاهيم، مع معرّف MITRE ATT&CK لكل منها. ولكل عائلة ستعرف كيف تدقّق فيها بأوامر مدمجة، وأي أرقام أحداث تكشف المحاولة، وكيف تحصّنها وتتحقق من الإصلاح. لا توجد شيفرة استغلال هنا، لأن مهمة المدافع إزالة الشرط الذي يجعل الهجوم ممكناً."
+   },
+   {
+    "id": "model",
+    "type": "text",
+    "markdown": "## من أين تأتي الامتيازات في Windows\n\nتحمل كل عملية في Windows **رمز وصول (Access Token)** يسرد المستخدم ومجموعاته ومستوى السلامة ومجموعة من **الامتيازات** مثل `SeDebugPrivilege` و`SeImpersonatePrivilege`. وتعمل الخدمات بحسابات مثل `LocalSystem` أو `NetworkService` أو حساب خدمة مسمّى، ويبدأ **مدير التحكم بالخدمات (SCM)** تشغيل ملفاتها التنفيذية عند الإقلاع.\n\nيولّد هذا التصميم ثلاثة أسئلة يطرحها كل مقيّم:\n\n- **من يتحكم في ما ينفّذه الحساب المميز؟** ملفات الخدمات ومجلداتها والمهام المجدولة والمكتبات (DLL) التي تحمّلها.\n- **من يتحكم في الإعدادات التي تخبر Windows بما يجب تشغيله؟** مفاتيح سجل الخدمات وتعريفات المهام وسياسة المثبّت.\n- **ما الامتيازات التي يحملها الرمز أصلاً؟** بعض الامتيازات، وأبرزها صلاحيات انتحال الهوية، مخصصة لحسابات الخدمات لكنها قوية في اليد الخطأ.\n\nإذا كان الجواب عن أي سؤال هو «مستخدم عادي» فالجهاز فيه مسار تصعيد. أما **التحكم في حساب المستخدم (UAC)** فهو نافذة تأكيد مريحة للمدراء وليس حدّ أمان، فيجب اعتبار المستخدم الذي هو مدير محلي أصلاً مرتفع الصلاحية."
+   },
+   {
+    "id": "paths",
+    "type": "text",
+    "markdown": "## المسارات الشائعة وربطها بـ ATT&CK\n\n| الضعف | ما الذي يُساء استخدامه | ATT&CK | المعالجة الأساسية |\n|:--|:--|:--|:--|\n| مسار خدمة بلا علامات اقتباس | مسار فيه مسافات دون اقتباس يجعل Windows يجرّب أسماء ملفات أقصر أولاً | T1574.009 | ضع المسار بين علامتي اقتباس وقيّد الكتابة في مجلدات البرامج |\n| صلاحيات خدمة ضعيفة | يستطيع مستخدم تغيير مسار ملف الخدمة أو استبدال ملفها التنفيذي | T1574.010 وT1543.003 | تصحيح قوائم التحكم بالوصول للخدمات والملفات |\n| ترتيب البحث عن DLL | برنامج مميز يحمّل مكتبة من مجلد يستطيع المستخدم الكتابة فيه | T1574.001 وT1574.002 | تصحيح الصلاحيات والتحميل بالمسار الكامل وسياسة المكتبات الموقّعة |\n| AlwaysInstallElevated | تعمل حزم التثبيت بهوية SYSTEM عند ضبط مفتاحي سياسة معاً | T1548 | تعطيل السياسة في الخليتين |\n| صلاحيات انتحال الهوية | `SeImpersonatePrivilege` على حساب خدمة مكشوف قد ينتج رمز SYSTEM | T1134.001 | الترقيع واستخدام حسابات خدمة مُدارة وعزل الخدمات المكشوفة |\n| بيانات اعتماد مخزّنة | كلمات مرور في ملفات الإعداد الآلي وتفضيلات سياسة المجموعة القديمة والسكربتات | T1552.001 وT1552.006 | حذف الملفات والتدوير واستخدام LAPS وgMSA |\n| تجاوز UAC | مكوّنات مدمجة ترتفع تلقائياً وتثق بإعدادات يتحكم بها المستخدم | T1548.002 | إزالة صلاحيات المدير المحلي وضبط UAC على التنبيه دائماً |\n| ثغرات محلية غير مرقَّعة | أخطاء معروفة في النواة ومكوّنات الطباعة والتعريفات | T1068 | ترقيع سريع وتعطيل الخدمات غير اللازمة مثل Print Spooler على الخوادم |\n\nلاحظ النمط: كل صف تقريباً مشكلة في **الصلاحيات أو الإعدادات**. وهذا خبر جيد لأن الإعدادات يمكن تدقيقها على نطاق واسع وإصلاحها عبر سياسة المجموعة أو Intune أو أدوات إدارة الإعدادات."
+   },
+   {
+    "id": "audit",
+    "type": "terminal",
+    "title": "تدقيق جهاز Windows تديره",
+    "prompt": "PS C:\\>",
+    "caption": "فحوص للقراءة فقط لجهاز مختبر أو إنتاج مصرَّح لك بتقييمه.",
+    "lines": [
+     {
+      "cmd": "Get-CimInstance Win32_Service | Where-Object { $_.PathName -notmatch '^\"' -and $_.PathName -match ' ' -and $_.PathName -notmatch '^C:\\\\Windows' } | Select Name,StartName,PathName",
+      "comment": "خدمات في مسارها مسافات ودون علامات اقتباس"
+     },
+     {
+      "output": "Name       StartName   PathName\n----       ---------   --------\nAcmeSync   LocalSystem C:\\Program Files\\Acme Sync\\sync.exe"
+     },
+     {
+      "comment": "الملاحظة: المسار بلا اقتباس ويعمل بهوية LocalSystem. ضعه بين علامتي اقتباس ثم افحص من يستطيع الكتابة في C:\\ وC:\\Program Files."
+     },
+     {
+      "cmd": "icacls \"C:\\Program Files\\Acme Sync\"",
+      "comment": "من يستطيع تعديل مجلد الخدمة؟"
+     },
+     {
+      "output": "C:\\Program Files\\Acme Sync NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n                            BUILTIN\\Administrators:(OI)(CI)(F)\n                            BUILTIN\\Users:(OI)(CI)(M)"
+     },
+     {
+      "comment": "الملاحظة: المجموعة BUILTIN\\Users لديها صلاحية Modify على مجلد يعمل ملفه بهوية SYSTEM. أزلها."
+     },
+     {
+      "cmd": "reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated",
+      "comment": "يجب أن يكون غائباً أو 0 (افحص HKCU أيضاً)"
+     },
+     {
+      "output": "ERROR: The system was unable to find the specified registry key or value."
+     },
+     {
+      "comment": "جيد: السياسة غير مضبوطة."
+     },
+     {
+      "cmd": "whoami /priv",
+      "comment": "الامتيازات التي يحملها الرمز الحالي"
+     },
+     {
+      "output": "PRIVILEGES INFORMATION\nPrivilege Name                Description                    State\n============================= ============================== ========\nSeChangeNotifyPrivilege       Bypass traverse checking       Enabled\nSeIncreaseWorkingSetPrivilege Increase a process working set Disabled"
+     },
+     {
+      "comment": "المستخدم العادي لا يحمل سوى هذين. وجود SeImpersonate أو SeDebug أو SeBackup لحساب مستخدم يُعد ملاحظة."
+     }
+    ]
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "مجلد خدمة ضعيف: المحاولة والقياسات والكشف",
+    "caption": "يُختبر الضعف مرة واحدة في المختبر عبر إطار محاكاة معتمد، وكل خطوة تترك سجلاً.",
+    "data": {
+     "actors": [
+      {
+       "id": "t",
+       "label": "المختبِر",
+       "sub": "CORP\\jdoe",
+       "icon": "user"
+      },
+      {
+       "id": "h",
+       "label": "محطة العمل",
+       "sub": "WS-017",
+       "icon": "desktop"
+      },
+      {
+       "id": "s",
+       "label": "Sysmon + Security log",
+       "sub": "قياسات الجهاز",
+       "icon": "log"
+      },
+      {
+       "id": "x",
+       "label": "SIEM",
+       "sub": "قواعد الكشف",
+       "icon": "shield"
+      }
+     ],
+     "steps": [
+      {
+       "from": "t",
+       "to": "h",
+       "label": "Enumerate",
+       "detail": "icacls, sc qc",
+       "tone": "warning",
+       "note": "يراجع المختبِر مسارات الخدمات وصلاحيات المجلدات بأدوات مدمجة."
+      },
+      {
+       "from": "h",
+       "to": "s",
+       "label": "4688 / Sysmon 1",
+       "detail": "icacls.exe by jdoe",
+       "note": "تسجل أحداث إنشاء العمليات أوامر الاستطلاع وعمليتها الأم."
+      },
+      {
+       "from": "t",
+       "to": "h",
+       "label": "كتابة في المجلد",
+       "detail": "Sysmon 11",
+       "tone": "attack",
+       "note": "تُكتب علامة غير ضارة في المجلد الضعيف كما تسمح خطة الاختبار المعتمدة."
+      },
+      {
+       "from": "h",
+       "to": "s",
+       "label": "Sysmon 11 + 4663",
+       "detail": "FileCreate in service dir",
+       "note": "تظهر أحداث إنشاء الملفات والوصول للكائنات مستخدماً عادياً يكتب تحت مجلد خدمة."
+      },
+      {
+       "from": "s",
+       "to": "x",
+       "label": "إرسال",
+       "detail": "WEF / agent",
+       "tone": "secure",
+       "note": "تصل السجلات إلى الـ SIEM خلال ثوانٍ."
+      },
+      {
+       "from": "x",
+       "to": "x",
+       "label": "تنبيه عالٍ",
+       "detail": "كتابة مستخدم في مسار خدمة",
+       "tone": "success",
+       "note": "تعمل القاعدة، والإصلاح هو تصحيح قائمة التحكم بالوصول وإعادة الاختبار نفسه."
+      }
+     ]
+    }
+   },
+   {
+    "id": "detect",
+    "type": "text",
+    "markdown": "## الكشف: الأحداث المهمة\n\nاستخدم هذه المصادر وابنِ القواعد على **تركيبة** الأحداث وليس على حدث واحد.\n\n| الحدث | السجل | ما يُظهره |\n|:--|:--|:--|\n| 4672 | Security | امتيازات خاصة مُنحت لدخول جديد؛ نبّه عند حسابات غير متوقعة |\n| 4688 | Security | إنشاء عملية مع سطر الأوامر عند تفعيل التدقيق |\n| 4697 / 7045 | Security / System | تثبيت خدمة؛ أمر غير معتاد على محطات العمل |\n| 4670 | Security | تغيير صلاحيات كائن |\n| 4732 / 4728 | Security | إضافة عضو إلى مجموعة مميزة محلية أو عامة |\n| 4657 | Security | تغيير قيمة في السجل (`ImagePath` للخدمة وسياسة المثبّت) |\n| Sysmon 1 و7 و11 و13 | Sysmon | العملية وتحميل المكتبة وإنشاء الملف وكتابة السجل |\n\nمثال منطق بأسلوب Sigma: اختر حدث Sysmon رقم 11 حيث يبدأ المسار الهدف بـ `C:\\Program Files\\` أو `C:\\Windows\\System32\\` والمستخدم المنشئ ليس `SYSTEM` ولا `TrustedInstaller` ولا مثبّتاً معتمداً؛ ونبّه بخطورة عالية. وقاعدة ثانية تراقب الحدث 13 حيث الهدف `HKLM\\System\\CurrentControlSet\\Services\\*\\ImagePath` والعملية ليست `services.exe` ولا أداة النشر لديك.\n\nوتضيف منتجات EDR كشفاً سلوكياً للتلاعب بالرموز ولعملية حساب خدمة تطلق صدفة تفاعلية، وهي الصورة المعتادة لإساءة استخدام انتحال الهوية."
+   },
+   {
+    "id": "hard",
+    "type": "code",
+    "language": "powershell",
+    "filename": "Verify-ServiceHardening.ps1",
+    "caption": "تحقق للقراءة فقط يُشغَّل قبل المعالجة وبعدها؛ يجب أن تتحول المخرجات من ملاحظات إلى فراغ.",
+    "highlight": [
+     2,
+     3,
+     9,
+     14
+    ],
+    "code": "# 1. Unquoted service paths outside Windows\nGet-CimInstance Win32_Service |\n  Where-Object { $_.PathName -notmatch '^\"' -and $_.PathName -match ' ' -and $_.PathName -notmatch '^C:\\\\Windows' } |\n  Select-Object Name, StartName, PathName\n\n# 2. Program folders where non-admin groups hold write rights\nGet-ChildItem 'C:\\Program Files' -Directory | ForEach-Object {\n  $acl = Get-Acl $_.FullName\n  $acl.Access | Where-Object { $_.IdentityReference -match 'Users|Everyone|Authenticated' -and $_.FileSystemRights -match 'Modify|FullControl|Write' } |\n    Select-Object @{n='Folder';e={$_.FullName}}, IdentityReference, FileSystemRights\n}\n\n# 3. Members of the local Administrators group\nGet-LocalGroupMember -Group 'Administrators' | Select-Object Name, ObjectClass\n"
+   },
+   {
+    "id": "harden",
+    "type": "text",
+    "markdown": "## الوقاية والتحصين والتحقق\n\n1. **أزل صلاحيات المدير المحلي** من الحسابات اليومية وأدر حساب المدير المدمج عبر **Windows LAPS** ليكون لكل جهاز كلمة مرور فريدة ودوّارة.\n2. **أصلح الصلاحيات من المصدر.** يجب ألا يكتب في مجلدات البرامج ومفاتيح سجل الخدمات إلا SYSTEM والمدراء وTrustedInstaller. وضع كل مسار خدمة بين علامتي اقتباس.\n3. **استخدم حسابات خدمة مُدارة** (gMSA) بالامتيازات التي تحتاجها الخدمة فقط. واعتبر أي خدمة مكشوفة للإنترنت تحمل `SeImpersonatePrivilege` عالية الخطورة واعزلها.\n4. **القائمة البيضاء للتنفيذ** عبر App Control for Business (WDAC) أو AppLocker حتى لا يعمل ملف يُلقى في مجلد خدمة.\n5. **رقِّع بسرعة** بادئاً بالثغرات المحلية المدرجة في كتالوج CISA KEV، وعطّل Print Spooler حيث لا حاجة إليه.\n6. **دقّق.** فعّل تدقيق إنشاء العمليات مع سطر الأوامر، وثبّت Sysmon بإعداد محدَّث، وأرسل السجلات إلى مكان مركزي.\n\n**تحقق** بتكرار الاختبار نفسه الذي أنتج الملاحظة وبالحساب المحدود نفسه. يجب أن تفشل الكتابة الآن برسالة *Access denied*، ويظهر الحدث 4663 أو سجل Sysmon للمحاولة المرفوضة، ويعيد سكربت التدقيق صفوفاً فارغة. احتفظ بالمخرجات قبل المعالجة وبعدها للتقرير، ثم اقرأ درس [مسارات الهجوم في Active Directory](/learn/offensive-security-for-defense/active-directory-attack-paths) لترى كيف يتحول مدير محلي إلى مشكلة على مستوى النطاق كله."
+   },
+   {
+    "id": "worked",
+    "type": "callout",
+    "variant": "note",
+    "title": "مثال تطبيقي: ملاحظة مختبر من البداية إلى النهاية",
+    "markdown": "في المختبر يُظهر التدقيق الخدمة `AcmeSync` بمسار بلا اقتباس وأن المجموعة `BUILTIN\\Users` تملك صلاحية Modify على مجلدها. يكتب المختبِر ملف علامة باستخدام إطار محاكاة معتمد مثل Atomic Red Team للاختبار المقابل لـ T1574. يسجل حدث Sysmon رقم 11 القيمة `User: CORP\\jdoe` و`TargetFilename: C:\\Program Files\\Acme Sync\\marker.txt`، وترفع قاعدة الـ SIEM تنبيهاً خلال أقل من دقيقة. تزيل إدخال Users بالأمر `icacls` وتضع مسار الخدمة بين علامتي اقتباس وتعيد الاختبار فتظهر *Access denied*. وتُغلق الملاحظة بدليل على المنع والكشف معاً."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "ارفع الصلاحيات في المختبر لا في الإنتاج",
+    "markdown": "قد يؤدي تكرار التصعيد على محطة إنتاج إلى تعطيل الخدمات وإطلاق الاستجابة للحوادث. افعله فقط في مختبر تملكه أو بتصريح خطي، وسمِّ الإطار ورقم الاختبار في الخطة، وأخبر الـ SOC مسبقاً هل الاختبار أعمى أم معلن."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على آلة Windows افتراضية تملكها ومعك لقطة منها:\n\n1. شغّل سكربت التدقيق أعلاه واحفظ المخرجات.\n2. أنشئ مجلداً تجريبياً `C:\\LabSvc` ونفّذ `icacls C:\\LabSvc /grant Users:(OI)(CI)M`. أنشئ خدمة تشير إلى ملف تنفيذي غير ضار في المجلد بالأمر `sc.exe create LabSvc binPath= \"C:\\Lab Svc\\app.exe\"` (المسافة وغياب الاقتباس مقصودان).\n3. أعد التدقيق وتأكد من ظهور الملاحظتين.\n4. ثبّت Sysmon بإعداد مجتمعي عام، وأنشئ ملفاً نصياً في المجلد كمستخدم عادي، وابحث عن الحدث 11 في `Microsoft-Windows-Sysmon/Operational`.\n5. أزل الصلاحية بـ `icacls C:\\LabSvc /remove Users` واحذف الخدمة بـ `sc.exe delete LabSvc` وأعد التدقيق واسترجع اللقطة."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "رمز الوصول",
+      "definition": "الكائن الذي يحمل هوية العملية ومجموعاتها ومستوى سلامتها وامتيازاتها."
+     },
+     {
+      "term": "SeImpersonatePrivilege",
+      "definition": "امتياز يتيح للعملية أن تعمل بهوية مصادَق عليها أخرى."
+     },
+     {
+      "term": "مسار خدمة بلا اقتباس",
+      "definition": "مسار خدمة فيه مسافات ودون علامات اقتباس، يفسّره Windows بغموض."
+     },
+     {
+      "term": "UAC",
+      "definition": "التحكم في حساب المستخدم: نافذة طلب رفع صلاحيات وليست حدّ أمان."
+     },
+     {
+      "term": "LAPS",
+      "definition": "يدير Windows LAPS كلمات مرور فريدة ودوّارة للمدير المحلي."
+     },
+     {
+      "term": "gMSA",
+      "definition": "حساب خدمة مُدار جماعياً يدوّر Active Directory كلمة مروره تلقائياً."
+     },
+     {
+      "term": "Sysmon",
+      "definition": "خدمة من Sysinternals تسجل أحداث العمليات والملفات والسجل والمكتبات."
+     },
+     {
+      "term": "WDAC",
+      "definition": "التحكم بالتطبيقات للأعمال: سياسة تسمح بتشغيل الشيفرة المعتمدة فقط."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يُعد مسار الخدمة بلا اقتباس خطراً؟",
+      "options": [
+       "يعطّل التسجيل",
+       "قد يجرّب Windows أسماء ملفات أقصر في مجلدات يستطيع المستخدم الكتابة فيها",
+       "يجبر الخدمة على العمل بهوية مستخدم",
+       "يعرّض الخدمة للإنترنت"
+      ],
+      "answer": 1,
+      "explanation": "لا يهم الغموض إلا إذا استطاع مستخدم عادي الكتابة في مجلد يسبق ما في المسار. وتعمل الخدمة بامتيازاتها الخاصة وهي غالباً أعلى."
+     },
+     {
+      "question": "أي الأحداث تساعد في كشف تثبيت خدمة أو تغيير مسارها؟ اختر كل ما ينطبق.",
+      "options": [
+       "الحدث 7045 في سجل System",
+       "الحدث 4697 في سجل Security",
+       "حدث Sysmon رقم 13 على ImagePath للخدمة",
+       "الحدث 4624 من النوع 2 فقط"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "يسجّل 7045 و4697 تثبيت الخدمة ويسجل Sysmon 13 تغيير قيم السجل. أما حدث الدخول وحده فلا يدل على تغيير الخدمات."
+     },
+     {
+      "question": "أي امتياز لا يُتوقع عادة في رمز مستخدم عادي؟",
+      "options": [
+       "SeChangeNotifyPrivilege",
+       "SeIncreaseWorkingSetPrivilege",
+       "SeImpersonatePrivilege",
+       "لا شيء منها"
+      ],
+      "answer": 2,
+      "explanation": "انتحال الهوية مخصص لحسابات الخدمات، ووجوده لدى مستخدم عادي ملاحظة."
+     },
+     {
+      "question": "ما أقوى طريقة للتحقق من إصلاح صلاحية؟",
+      "options": [
+       "قراءة التذكرة",
+       "تكرار الاختبار الأصلي بالمستخدم المحدود نفسه والتأكد من الرفض مع سجل",
+       "إعادة التشغيل",
+       "تعطيل UAC"
+      ],
+      "answer": 1,
+      "explanation": "يجب أن يُظهر التحقق المنع (رفض الوصول) والكشف (تسجيل المحاولة المرفوضة) معاً."
+     },
+     {
+      "question": "أي الضوابط تقلل خطر تصعيد الامتيازات في Windows؟ اختر كل ما ينطبق.",
+      "options": [
+       "Windows LAPS",
+       "القائمة البيضاء عبر WDAC أو AppLocker",
+       "حسابات gMSA بأقل امتيازات",
+       "منح المستخدمين صلاحية مدير محلي للراحة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "الثلاثة الأولى تزيل كلمات مرور المدراء المعاد استخدامها وتمنع الشيفرة غير المعتمدة وتقلص امتيازات الخدمات. أما منح المدير المحلي للراحة فيفعل العكس."
+     }
+    ]
+   },
+   {
+    "id": "deeper",
+    "type": "text",
+    "markdown": "## تعمّق أكثر\n\nللمقارنة جنباً إلى جنب مع Linux وأجهزة الشبكة راجع [تقنيات تصعيد الامتيازات](/learn/offensive-security-for-defense/privilege-escalation-techniques). ونظيره في Linux هو درس [تصعيد الامتيازات في Linux](/learn/offensive-security-for-defense/linux-privilege-escalation)."
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- ينشأ تصعيد الامتيازات في Windows من ضعف الصلاحيات والإعدادات ومن امتيازات ممنوحة بإفراط، لا من ثغرات مجهولة.\n- اربط النتائج بـ ATT&CK (T1574 وT1543.003 وT1548 وT1134.001 وT1552 وT1068) واكتب التقارير بهذه اللغة.\n- اكشف بالأحداث 4672 و4688 و4697 و7045 و4670 و4657 مع أحداث Sysmon رقم 1 و7 و11 و13.\n- حصّن بإزالة صلاحيات المدير اليومية واستخدام LAPS وgMSA وتصحيح قوائم الوصول ومسارات الاقتباس والقائمة البيضاء والترقيع السريع.\n- تحقق بتكرار الاختبار بالمستخدم المحدود والتأكد من الرفض ومن وجود سجل."
+   }
+  ]
+ }
+}

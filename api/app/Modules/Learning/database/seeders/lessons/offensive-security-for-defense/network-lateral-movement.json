@@ -1,0 +1,602 @@
+{
+ "slug": "network-lateral-movement",
+ "title": "Network Lateral Movement",
+ "summary": "Understand how attackers hop between hosts with remote services and valid credentials, and how to detect, segment and verify against it using Windows events, Cisco TrustSec, port ACLs and firewalls.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain the three ingredients of a lateral hop",
+  "Map remote-service techniques to MITRE ATT&CK IDs",
+  "Detect hops with logon types and service, share and flow events",
+  "Apply east-west segmentation with Cisco port ACLs, TrustSec and firewalls",
+  "Verify controls with evidence from a controlled lab test"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "During an authorized exercise, a tester controls one workstation, `WS-017` at `192.168.10.17`. The business value is not on that machine. It sits on the file server, the database and the management network. To reach them the tester must **move laterally**: use legitimate remote-access services and valid credentials to hop from host to host, usually without any malware at all.\n\nLateral movement is where many breaches become expensive, because one compromised laptop becomes a compromised network. It is also where defenders have their best chance. Hops create authentication events, new connections and unusual east-west traffic, and a well-segmented network can refuse them outright. This lesson covers the concepts, ATT&CK mapping, detection, segmentation and verification, with Cisco examples. It contains no tooling to perform the movement."
+  },
+  {
+   "id": "how",
+   "type": "text",
+   "markdown": "## How lateral movement works, conceptually\n\nEvery hop needs three things: **a path** (a reachable port), **a credential** (a password, hash, ticket or key) and **a remote execution or access service**. Remove any one and the hop fails. Defenders can therefore attack the problem from three directions: block reachability, protect credentials and restrict the services.\n\n| Service abused | ATT&CK | Typical port | What a hop looks like |\n|:--|:--|:--|:--|\n| Remote Desktop | T1021.001 | TCP 3389 | Interactive logon, type 10 |\n| SMB and admin shares | T1021.002 | TCP 445 | Network logon, type 3, file-share access |\n| Windows Remote Management | T1021.006 | TCP 5985/5986 | Network logon plus `wsmprovhost.exe` |\n| SSH | T1021.004 | TCP 22 | `sshd` session from an internal source |\n| Remote service or task creation | T1569.002, T1053.005 | TCP 445/135 | Event 7045 or 4698 on the target |\n| Alternate authentication material | T1550.002, T1550.003 | Any | Valid logon without a normal password prompt |\n| Tunneling and proxies | T1572, T1090 | Often 443 | One host forwarding for another |\n\nThe common thread is **valid accounts** (T1078). Attackers prefer these tools because they look like administration. The practical test is not \"is this service used?\" but \"is this service used *from this source, to this target, by this account, at this time*?\""
+  },
+  {
+   "id": "host",
+   "type": "text",
+   "markdown": "## Detection on the hosts\n\nHost logs show the identity and the method of each hop.\n\n- **4624** (successful logon): the *logon type* separates the methods. Type 3 is a network logon (SMB, WinRM), type 10 is Remote Desktop and type 9 or 3 with explicit credentials hints at alternate credentials.\n- **4648** (logon with explicit credentials) from a workstation toward a server.\n- **4625** bursts: the same account failing against many hosts (spraying) or one source failing against many accounts.\n- **5140 / 5145**: access to `ADMIN$`, `C$` or `IPC$` from a source that is not a management server.\n- **7045 / 4697** and **4698**: a service or scheduled task created remotely shortly after a type 3 logon.\n- **Sysmon 3**: network connections from unexpected processes. Sysmon 1: `wsmprovhost.exe`, `mstsc.exe` and `ssh.exe` started by users who are not administrators.\n\nA useful correlation, in Sigma style: *a 4624 type 3 from workstation A to server B, followed within 60 seconds by 7045 on B, where A is not on the approved management list.* Workstation-to-workstation SMB and RDP is almost never legitimate and makes an excellent low-noise rule."
+  },
+  {
+   "id": "audit",
+   "type": "terminal",
+   "title": "Reading logon events and listening ports on your lab server",
+   "prompt": "PS C:\\>",
+   "caption": "Read-only. Run on a lab file server (192.168.20.5) you own.",
+   "lines": [
+    {
+     "cmd": "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4624} -MaxEvents 200 | ForEach-Object { $x=[xml]$_.ToXml(); [pscustomobject]@{Time=$_.TimeCreated; User=($x.Event.EventData.Data | ? Name -eq 'TargetUserName').'#text'; Type=($x.Event.EventData.Data | ? Name -eq 'LogonType').'#text'; Src=($x.Event.EventData.Data | ? Name -eq 'IpAddress').'#text'} } | Where-Object { $_.Type -in '3','10' -and $_.Src -notmatch '^-|::1|127.0.0.1' } | Group-Object Src,User,Type | Sort Count -Desc | Select -First 4 Count,Name",
+     "comment": "Who is logging on over the network, from where, and how often?"
+    },
+    {
+     "output": "Count Name\n----- ----\n  118 192.168.20.8, backup-svc, 3\n   31 192.168.30.4, admin-jump, 10\n    6 192.168.10.17, jdoe, 3\n    2 192.168.10.17, helpdesk-adm, 3"
+    },
+    {
+     "comment": "Finding: 192.168.10.17 is a workstation, yet it reaches this server with network logons. backup-svc and admin-jump are expected sources; the workstation is not."
+    },
+    {
+     "cmd": "Get-NetTCPConnection -State Listen | Where-Object LocalPort -in 135,445,3389,5985 | Select LocalPort,OwningProcess",
+     "comment": "Which remote-administration ports does this server expose?"
+    },
+    {
+     "output": "LocalPort OwningProcess\n--------- -------------\n      135           912\n      445             4\n     3389          1104\n     5985             4"
+    },
+    {
+     "cmd": "Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow | Get-NetFirewallAddressFilter | Where-Object RemoteAddress -eq 'Any' | Measure-Object",
+     "comment": "How many inbound rules accept any source?"
+    },
+    {
+     "output": "Count    : 14"
+    },
+    {
+     "comment": "Finding: 14 allow-any rules. Scope RDP, WinRM and SMB to the jump-host range."
+    }
+   ]
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A lateral hop that segmentation stops and logs",
+   "caption": "The same hop succeeds on a flat network and is denied and alerted on a segmented one.",
+   "data": {
+    "token": "SMB 445",
+    "nodes": [
+     {
+      "id": "ws",
+      "label": "WS-017",
+      "sub": "Compromised workstation",
+      "icon": "laptop"
+     },
+     {
+      "id": "sw",
+      "label": "Access switch",
+      "sub": "PACL / TrustSec",
+      "icon": "switch"
+     },
+     {
+      "id": "fw",
+      "label": "Secure Firewall",
+      "sub": "Zone policy",
+      "icon": "firewall"
+     },
+     {
+      "id": "fs",
+      "label": "FS-01",
+      "sub": "192.168.20.5",
+      "icon": "server"
+     },
+     {
+      "id": "sec",
+      "label": "SIEM / XDR",
+      "sub": "Correlation",
+      "icon": "alert"
+     }
+    ],
+    "steps": [
+     {
+      "at": "ws",
+      "tone": "warning",
+      "caption": "The tester, with a valid but low-value account, tries to open an SMB session toward the file server."
+     },
+     {
+      "at": "sw",
+      "tone": "blocked",
+      "caption": "Workstation-to-workstation SMB is denied at the port ACL and logged. Traffic to other zones continues."
+     },
+     {
+      "at": "fw",
+      "tone": "blocked",
+      "caption": "The firewall allows only the helpdesk jump host to reach FS-01 on SMB; the workstation source is denied by policy."
+     },
+     {
+      "at": "fs",
+      "token": "No hit",
+      "tone": "secure",
+      "caption": "FS-01 never sees the connection, so no logon or share access event appears there."
+     },
+     {
+      "at": "sec",
+      "token": "Alert",
+      "tone": "secure",
+      "caption": "Switch and firewall deny logs reach the SIEM, which flags a workstation scanning internal ports."
+     },
+     {
+      "at": "ws",
+      "token": "Isolate",
+      "tone": "success",
+      "caption": "The playbook isolates WS-017 through Secure Endpoint and ISE quarantine while the team investigates."
+     }
+    ]
+   }
+  },
+  {
+   "id": "prevent",
+   "type": "text",
+   "markdown": "## Prevention: segmentation, credentials and services\n\n**1. Segment east-west traffic.** Most networks protect the perimeter and trust everything inside. Break that trust.\n\n- Workstations should not talk to workstations. Use private VLANs, port ACLs or Cisco **TrustSec** security group tags with **ISE** so policy follows identity, not IP.\n- Place servers in zones behind **Cisco Secure Firewall** and allow only the documented ports from documented sources.\n- Use **Cisco Secure Workload** or similar microsegmentation for server-to-server rules.\n\n**2. Protect credentials.** Deploy Windows LAPS so a local administrator password is never valid on two machines. Use the GPO setting *Deny access to this computer from the network* for local accounts, put privileged users in Protected Users, enable Credential Guard and adopt tiered administration.\n\n**3. Restrict the services.** Allow RDP, WinRM and SSH only from jump hosts, require MFA at the jump host, enable SMB signing, disable SMBv1 and turn off unused services.\n\n**4. Add friction and visibility.** Send NetFlow or Secure Network Analytics telemetry for east-west flows, and turn on firewall logging for denies."
+  },
+  {
+   "id": "pacl",
+   "type": "code",
+   "language": "cisco",
+   "filename": "access-sw1 (IOS XE) port ACL on a workstation port",
+   "caption": "Blocks workstation-to-workstation SMB, RDP and WinRM at the access port and logs the attempts. Addresses are lab examples.",
+   "highlight": [
+    2,
+    3,
+    4,
+    9
+   ],
+   "code": "ip access-list extended PACL-WS-EASTWEST\n deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 eq 445 log\n deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 eq 3389 log\n deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 range 5985 5986 log\n permit ip any any\n!\ninterface GigabitEthernet1/0/10\n description Workstation WS-017\n switchport mode access\n ip access-group PACL-WS-EASTWEST in\n!\nshow ip access-lists PACL-WS-EASTWEST\n"
+  },
+  {
+   "id": "worked",
+   "type": "callout",
+   "variant": "note",
+   "title": "Worked example: reading the deny counters",
+   "markdown": "After the lab test, `show ip access-lists PACL-WS-EASTWEST` prints `10 deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 eq 445 log (14 matches)`. The 14 matches are the tester's attempts to open SMB sessions to neighboring workstations. The syslog message names the source `192.168.10.17`, which the SIEM matches against the red-team schedule. Because the attempts were denied, the finding is rated as prevented, with detection confirmed. Had the counters stayed at zero while the tester succeeded, the ACL would not be doing its job and the finding would stay open."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Do not rely on the host firewall alone",
+   "markdown": "An attacker with administrator rights on a host can change its local firewall. Network-level controls on switches and firewalls hold even when an endpoint is compromised, so use both layers. Also check that your segmentation covers IPv6 and that management VLANs are not reachable from user VLANs."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use three virtual machines on an isolated lab network that you own (two Windows clients and one Windows server).\n\n1. On the server, run the first command from the terminal above and note the baseline of logon sources.\n2. From client A, browse to `\\\\server\\share` with a lab account, then to `\\\\clientB\\C$` with a lab administrator. Re-run the command and find the new events, including 5140 and 4624 type 3.\n3. Apply Windows Defender Firewall inbound rules on client B that allow SMB only from the server's address, and repeat the attempt. Confirm it now fails and check event 5157 (blocked connection) if auditing is on.\n4. Write one Sigma-style rule that flags SMB from a client to another client.\n5. Revert the VMs to their snapshots."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Lateral movement",
+     "definition": "Using remote services and valid credentials to move between systems after initial access (TA0008)."
+    },
+    {
+     "term": "East-west traffic",
+     "definition": "Traffic between internal hosts, as opposed to traffic entering or leaving the network."
+    },
+    {
+     "term": "Logon type",
+     "definition": "A field in event 4624 that shows how a logon happened, such as 3 for network and 10 for remote interactive."
+    },
+    {
+     "term": "Jump host",
+     "definition": "A hardened, monitored system through which administrators reach sensitive zones."
+    },
+    {
+     "term": "TrustSec",
+     "definition": "Cisco technology that applies policy using security group tags instead of IP addresses."
+    },
+    {
+     "term": "Microsegmentation",
+     "definition": "Fine-grained policy between workloads, such as Cisco Secure Workload provides."
+    },
+    {
+     "term": "Windows LAPS",
+     "definition": "Creates unique, rotating local administrator passwords per machine."
+    },
+    {
+     "term": "Port ACL (PACL)",
+     "definition": "An access list applied to a Layer 2 switch port to filter traffic inside a VLAN."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which three elements does every lateral hop need?",
+     "options": [
+      "A path, a credential and a remote service",
+      "A DNS name, a printer and a VPN",
+      "A firewall, a proxy and a switch",
+      "An email, a macro and a link"
+     ],
+     "answer": 0,
+     "explanation": "Removing any one of these breaks the hop, which is why defenders work on reachability, credentials and services together."
+    },
+    {
+     "question": "Which events help detect remote service or share activity? Choose all that apply.",
+     "options": [
+      "4624 logon type 3",
+      "5140 or 5145 on ADMIN$",
+      "7045 service installed",
+      "4634 only"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Network logon, administrative share access and remote service creation are the typical trail. A logoff event alone does not show a hop."
+    },
+    {
+     "question": "Why is workstation-to-workstation SMB a good detection rule?",
+     "options": [
+      "It is rarely legitimate, so false positives are low",
+      "It always indicates ransomware",
+      "It uses UDP only",
+      "It is encrypted"
+     ],
+     "answer": 0,
+     "explanation": "Users normally reach servers, not each other's machines, so the traffic is a strong signal."
+    },
+    {
+     "question": "A deny counter on your port ACL stays at zero after a lab test that succeeded. What does that mean?",
+     "options": [
+      "The control works",
+      "The ACL is not in the path or not matching, so the finding stays open",
+      "The test was invalid",
+      "The switch is overheating"
+     ],
+     "answer": 1,
+     "explanation": "Evidence beats assumption: if the test succeeded, the control did not stop it."
+    },
+    {
+     "question": "Which controls reduce the value of a stolen local admin credential? Choose all that apply.",
+     "options": [
+      "Windows LAPS",
+      "Deny network logon for local accounts",
+      "Scoping RDP and WinRM to jump hosts",
+      "One shared admin password"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Unique passwords, denied network logons and restricted services make a single stolen credential useful on one machine at most."
+    }
+   ]
+  },
+  {
+   "id": "deeper",
+   "type": "text",
+   "markdown": "## Go deeper\n\nFor how lateral movement fits with persistence and post-exploitation planning, read [Post-Exploitation, Persistence and Lateral Movement](/learn/offensive-security-for-defense/post-exploitation-persistence-and-lateral-movement). To test your segmentation formally, continue with [firewall and segmentation validation](/learn/offensive-security-for-defense/firewall-and-segmentation-validation)."
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- A lateral hop needs a path, a credential and a remote service; remove any one to stop it.\n- Map the techniques to ATT&CK T1021, T1550, T1569, T1053 and T1572, and note the valid-accounts theme (T1078).\n- Detect with 4624 logon types, 4648, 5140/5145, 7045/4698, Sysmon 3 and east-west flow data.\n- Prevent with east-west segmentation (port ACLs, TrustSec, Secure Firewall, Secure Workload), LAPS, Protected Users and jump hosts.\n- Verify with a controlled test and evidence: denied traffic, deny counters and an alert in the SIEM."
+  }
+ ],
+ "ar": {
+  "title": "التحرك الجانبي في الشبكة",
+  "summary": "افهم كيف ينتقل المهاجمون بين الأجهزة بخدمات الوصول عن بعد وبيانات اعتماد صالحة، وكيف تكشف ذلك وتجزّئ الشبكة وتتحقق باستخدام أحداث Windows وCisco TrustSec وقوائم وصول المنافذ والجدران النارية.",
+  "objectives": [
+   "اشرح العناصر الثلاثة للقفزة الجانبية",
+   "اربط تقنيات الخدمات عن بعد بمعرّفات MITRE ATT&CK",
+   "اكشف القفزات بأنواع الدخول وأحداث الخدمات والمشاركات والتدفقات",
+   "طبّق تجزئة شرق-غرب بقوائم وصول المنافذ وTrustSec والجدران النارية من Cisco",
+   "تحقق من الضوابط بأدلة من اختبار مخبري مضبوط"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "خلال تمرين مصرَّح به يسيطر المختبِر على محطة عمل واحدة هي `WS-017` بالعنوان `192.168.10.17`. لكن قيمة العمل ليست في هذا الجهاز، بل في خادم الملفات وقاعدة البيانات وشبكة الإدارة. وللوصول إليها عليه **التحرك جانبياً (Lateral Movement)**: أي استخدام خدمات الوصول عن بعد المشروعة وبيانات اعتماد صالحة للقفز من جهاز إلى آخر، وغالباً دون أي برمجية خبيثة.\n\nفي التحرك الجانبي تصبح كثير من الاختراقات مكلفة، لأن حاسوباً محمولاً واحداً مخترَقاً يتحول إلى شبكة مخترَقة. وهنا أيضاً أفضل فرص المدافع، فالقفزات تنتج أحداث مصادقة واتصالات جديدة وحركة شرق-غرب غير معتادة، والشبكة المقسّمة جيداً تستطيع رفضها من الأساس. يغطي هذا الدرس المفاهيم والربط بـ ATT&CK والكشف والتجزئة والتحقق مع أمثلة من Cisco. ولا يتضمن أي أداة لتنفيذ التحرك."
+   },
+   {
+    "id": "how",
+    "type": "text",
+    "markdown": "## كيف يعمل التحرك الجانبي من حيث المفهوم\n\nتحتاج كل قفزة إلى ثلاثة أشياء: **مسار** (منفذ يمكن الوصول إليه) و**بيانات اعتماد** (كلمة مرور أو بصمة أو تذكرة أو مفتاح) و**خدمة وصول أو تنفيذ عن بعد**. وإذا أزلت أياً منها فشلت القفزة. لذلك يستطيع المدافع معالجة المشكلة من ثلاث جهات: منع الوصولية وحماية بيانات الاعتماد وتقييد الخدمات.\n\n| الخدمة المستغَلة | ATT&CK | المنفذ المعتاد | شكل القفزة |\n|:--|:--|:--|:--|\n| سطح المكتب البعيد | T1021.001 | TCP 3389 | دخول تفاعلي من النوع 10 |\n| SMB والمشاركات الإدارية | T1021.002 | TCP 445 | دخول شبكي من النوع 3 مع وصول لمشاركة |\n| الإدارة عن بعد في Windows | T1021.006 | TCP 5985/5986 | دخول شبكي مع `wsmprovhost.exe` |\n| SSH | T1021.004 | TCP 22 | جلسة `sshd` من مصدر داخلي |\n| إنشاء خدمة أو مهمة عن بعد | T1569.002 وT1053.005 | TCP 445/135 | الحدث 7045 أو 4698 على الهدف |\n| مواد مصادقة بديلة | T1550.002 وT1550.003 | أي منفذ | دخول صالح دون مطالبة عادية بكلمة مرور |\n| الأنفاق والوكلاء | T1572 وT1090 | غالباً 443 | جهاز يمرّر الحركة لجهاز آخر |\n\nالخيط المشترك هو **الحسابات الصالحة** (T1078). يفضّل المهاجمون هذه الأدوات لأنها تشبه الإدارة. والاختبار العملي ليس «هل تُستخدم هذه الخدمة؟» بل «هل تُستخدم من **هذا المصدر إلى هذا الهدف بهذا الحساب في هذا الوقت**؟»"
+   },
+   {
+    "id": "host",
+    "type": "text",
+    "markdown": "## الكشف على الأجهزة\n\nتُظهر سجلات الأجهزة هوية كل قفزة وطريقتها.\n\n- **4624** (دخول ناجح): يفرّق *نوع الدخول* بين الطرق. النوع 3 دخول شبكي (SMB وWinRM) والنوع 10 سطح المكتب البعيد، أما النوع 9 أو 3 مع بيانات اعتماد صريحة فيوحي ببيانات اعتماد بديلة.\n- **4648** (دخول ببيانات اعتماد صريحة) من محطة عمل باتجاه خادم.\n- دفعات **4625**: الحساب نفسه يفشل على أجهزة كثيرة (رش كلمات المرور) أو مصدر واحد يفشل على حسابات كثيرة.\n- **5140 / 5145**: وصول إلى `ADMIN$` أو `C$` أو `IPC$` من مصدر ليس خادم إدارة.\n- **7045 / 4697** و**4698**: إنشاء خدمة أو مهمة مجدولة عن بعد بعد وقت قصير من دخول من النوع 3.\n- **Sysmon 3**: اتصالات شبكية من عمليات غير متوقعة. وSysmon 1: تشغيل `wsmprovhost.exe` و`mstsc.exe` و`ssh.exe` من مستخدمين ليسوا مدراء.\n\nارتباط مفيد بأسلوب Sigma: *الحدث 4624 من النوع 3 من المحطة A إلى الخادم B يتبعه خلال 60 ثانية الحدث 7045 على B حيث A ليست ضمن قائمة الإدارة المعتمدة.* وSMB وRDP بين محطات العمل نادراً ما يكون مشروعاً، ولهذا يصلح قاعدة ممتازة قليلة الضجيج."
+   },
+   {
+    "id": "audit",
+    "type": "terminal",
+    "title": "قراءة أحداث الدخول والمنافذ المنصتة على خادم المختبر",
+    "prompt": "PS C:\\>",
+    "caption": "للقراءة فقط. شغّلها على خادم ملفات مختبر (192.168.20.5) تملكه.",
+    "lines": [
+     {
+      "cmd": "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4624} -MaxEvents 200 | ForEach-Object { $x=[xml]$_.ToXml(); [pscustomobject]@{Time=$_.TimeCreated; User=($x.Event.EventData.Data | ? Name -eq 'TargetUserName').'#text'; Type=($x.Event.EventData.Data | ? Name -eq 'LogonType').'#text'; Src=($x.Event.EventData.Data | ? Name -eq 'IpAddress').'#text'} } | Where-Object { $_.Type -in '3','10' -and $_.Src -notmatch '^-|::1|127.0.0.1' } | Group-Object Src,User,Type | Sort Count -Desc | Select -First 4 Count,Name",
+      "comment": "من يسجل الدخول عبر الشبكة، ومن أين، وكم مرة؟"
+     },
+     {
+      "output": "Count Name\n----- ----\n  118 192.168.20.8, backup-svc, 3\n   31 192.168.30.4, admin-jump, 10\n    6 192.168.10.17, jdoe, 3\n    2 192.168.10.17, helpdesk-adm, 3"
+     },
+     {
+      "comment": "الملاحظة: العنوان 192.168.10.17 محطة عمل ومع ذلك يصل إلى الخادم بدخول شبكي. المصدران backup-svc وadmin-jump متوقعان أما المحطة فلا."
+     },
+     {
+      "cmd": "Get-NetTCPConnection -State Listen | Where-Object LocalPort -in 135,445,3389,5985 | Select LocalPort,OwningProcess",
+      "comment": "أي منافذ الإدارة عن بعد يعرضها هذا الخادم؟"
+     },
+     {
+      "output": "LocalPort OwningProcess\n--------- -------------\n      135           912\n      445             4\n     3389          1104\n     5985             4"
+     },
+     {
+      "cmd": "Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow | Get-NetFirewallAddressFilter | Where-Object RemoteAddress -eq 'Any' | Measure-Object",
+      "comment": "كم قاعدة واردة تقبل أي مصدر؟"
+     },
+     {
+      "output": "Count    : 14"
+     },
+     {
+      "comment": "الملاحظة: 14 قاعدة تسمح لأي مصدر. حدّد RDP وWinRM وSMB بنطاق خادم القفز."
+     }
+    ]
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "قفزة جانبية توقفها التجزئة وتسجلها",
+    "caption": "القفزة نفسها تنجح في شبكة مسطحة وتُرفض ويُنبَّه عليها في شبكة مقسّمة.",
+    "data": {
+     "token": "SMB 445",
+     "nodes": [
+      {
+       "id": "ws",
+       "label": "WS-017",
+       "sub": "محطة عمل مخترَقة",
+       "icon": "laptop"
+      },
+      {
+       "id": "sw",
+       "label": "Access switch",
+       "sub": "PACL / TrustSec",
+       "icon": "switch"
+      },
+      {
+       "id": "fw",
+       "label": "Secure Firewall",
+       "sub": "سياسة المناطق",
+       "icon": "firewall"
+      },
+      {
+       "id": "fs",
+       "label": "FS-01",
+       "sub": "192.168.20.5",
+       "icon": "server"
+      },
+      {
+       "id": "sec",
+       "label": "SIEM / XDR",
+       "sub": "الربط والتحليل",
+       "icon": "alert"
+      }
+     ],
+     "steps": [
+      {
+       "at": "ws",
+       "tone": "warning",
+       "caption": "يحاول المختبِر بحساب صالح منخفض القيمة فتح جلسة SMB باتجاه خادم الملفات."
+      },
+      {
+       "at": "sw",
+       "tone": "blocked",
+       "caption": "يُرفض SMB بين محطات العمل عند قائمة وصول المنفذ ويُسجَّل. وتستمر الحركة إلى المناطق الأخرى."
+      },
+      {
+       "at": "fw",
+       "tone": "blocked",
+       "caption": "يسمح الجدار الناري لخادم قفز الدعم وحده بالوصول إلى FS-01 عبر SMB، ويرفض مصدر محطة العمل بالسياسة."
+      },
+      {
+       "at": "fs",
+       "token": "No hit",
+       "tone": "secure",
+       "caption": "لا يرى FS-01 الاتصال أصلاً، فلا يظهر عنده حدث دخول ولا وصول لمشاركة."
+      },
+      {
+       "at": "sec",
+       "token": "Alert",
+       "tone": "secure",
+       "caption": "تصل سجلات الرفض من المبدل والجدار الناري إلى الـ SIEM الذي يبلغ عن محطة تمسح منافذ داخلية."
+      },
+      {
+       "at": "ws",
+       "token": "Isolate",
+       "tone": "success",
+       "caption": "يعزل دليل الاستجابة WS-017 عبر Secure Endpoint وحجر ISE بينما يحقق الفريق."
+      }
+     ]
+    }
+   },
+   {
+    "id": "prevent",
+    "type": "text",
+    "markdown": "## الوقاية: التجزئة وبيانات الاعتماد والخدمات\n\n**1. قسّم حركة شرق-غرب.** تحمي معظم الشبكات المحيط وتثق بكل ما في الداخل. اكسر هذه الثقة.\n\n- يجب ألا تتحدث محطات العمل مع محطات العمل. استخدم شبكات VLAN خاصة أو قوائم وصول للمنافذ أو وسوم مجموعات الأمان في **Cisco TrustSec** مع **ISE** لتتبع السياسة الهوية لا عنوان IP.\n- ضع الخوادم في مناطق خلف **Cisco Secure Firewall** واسمح بالمنافذ الموثقة فقط من المصادر الموثقة.\n- استخدم **Cisco Secure Workload** أو ما يماثله للتجزئة الدقيقة بين الخوادم.\n\n**2. احمِ بيانات الاعتماد.** انشر Windows LAPS كي لا تصلح كلمة مرور المدير المحلي على جهازين. استخدم إعداد سياسة المجموعة *Deny access to this computer from the network* للحسابات المحلية، وضع المستخدمين المميزين في Protected Users وفعّل Credential Guard واعتمد الإدارة المتدرجة.\n\n**3. قيّد الخدمات.** اسمح بـ RDP وWinRM وSSH من خوادم القفز فقط، واشترط المصادقة متعددة العوامل عند خادم القفز، وفعّل توقيع SMB وعطّل SMBv1 وأوقف الخدمات غير المستخدمة.\n\n**4. أضف احتكاكاً ورؤية.** أرسل قياسات NetFlow أو Secure Network Analytics لتدفقات شرق-غرب، وفعّل تسجيل الرفض في الجدار الناري."
+   },
+   {
+    "id": "pacl",
+    "type": "code",
+    "language": "cisco",
+    "filename": "access-sw1 (IOS XE) port ACL on a workstation port",
+    "caption": "يمنع SMB وRDP وWinRM بين محطات العمل عند منفذ الوصول ويسجل المحاولات. العناوين أمثلة مختبر.",
+    "highlight": [
+     2,
+     3,
+     4,
+     9
+    ],
+    "code": "ip access-list extended PACL-WS-EASTWEST\n deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 eq 445 log\n deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 eq 3389 log\n deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 range 5985 5986 log\n permit ip any any\n!\ninterface GigabitEthernet1/0/10\n description Workstation WS-017\n switchport mode access\n ip access-group PACL-WS-EASTWEST in\n!\nshow ip access-lists PACL-WS-EASTWEST\n"
+   },
+   {
+    "id": "worked",
+    "type": "callout",
+    "variant": "note",
+    "title": "مثال تطبيقي: قراءة عدّادات الرفض",
+    "markdown": "بعد اختبار المختبر يعرض الأمر `show ip access-lists PACL-WS-EASTWEST` السطر `10 deny tcp 192.168.10.0 0.0.0.255 192.168.10.0 0.0.0.255 eq 445 log (14 matches)`. الـ 14 مطابقة هي محاولات المختبِر لفتح جلسات SMB إلى محطات مجاورة. وتسمّي رسالة syslog المصدر `192.168.10.17` الذي يطابقه الـ SIEM مع جدول الفريق الأحمر. ولأن المحاولات رُفضت يُصنَّف الاستنتاج «ممنوع مع تأكيد الكشف». ولو بقيت العدّادات صفراً ونجح المختبِر لما كانت القائمة تؤدي عملها ولبقيت الملاحظة مفتوحة."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تعتمد على جدار الجهاز وحده",
+    "markdown": "يستطيع المهاجم الذي يملك صلاحيات مدير على الجهاز تغيير جداره المحلي. أما ضوابط الشبكة على المبدلات والجدران النارية فتصمد حتى لو اختُرق الجهاز، فاستخدم الطبقتين. وتحقق أيضاً أن التجزئة تغطي IPv6 وأن شبكات VLAN للإدارة غير قابلة للوصول من شبكات المستخدمين."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم ثلاثة أجهزة افتراضية على شبكة مختبر معزولة تملكها (عميلان Windows وخادم Windows).\n\n1. على الخادم شغّل أول أمر في الطرفية أعلاه ودوّن خط الأساس لمصادر الدخول.\n2. من العميل A تصفح `\\\\server\\share` بحساب مختبر ثم `\\\\clientB\\C$` بحساب مدير مختبر. أعد تشغيل الأمر وابحث عن الأحداث الجديدة بما فيها 5140 و4624 من النوع 3.\n3. طبّق قواعد جدار Windows Defender الواردة على العميل B بحيث تسمح بـ SMB من عنوان الخادم فقط، وكرر المحاولة. تأكد أنها تفشل الآن وافحص الحدث 5157 (اتصال محظور) إن كان التدقيق مفعلاً.\n4. اكتب قاعدة واحدة بأسلوب Sigma تنبّه على SMB من عميل إلى عميل آخر.\n5. أعد الأجهزة إلى لقطاتها."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "التحرك الجانبي",
+      "definition": "استخدام خدمات عن بعد وبيانات اعتماد صالحة للانتقال بين الأنظمة بعد الوصول الأولي (TA0008)."
+     },
+     {
+      "term": "حركة شرق-غرب",
+      "definition": "الحركة بين الأجهزة الداخلية، بخلاف الحركة الداخلة إلى الشبكة أو الخارجة منها."
+     },
+     {
+      "term": "نوع الدخول",
+      "definition": "حقل في الحدث 4624 يبين كيف جرى الدخول، مثل 3 للشبكي و10 للتفاعلي عن بعد."
+     },
+     {
+      "term": "خادم القفز",
+      "definition": "نظام محصّن ومراقب يصل المدراء عبره إلى المناطق الحساسة."
+     },
+     {
+      "term": "TrustSec",
+      "definition": "تقنية من Cisco تطبق السياسة بوسوم مجموعات الأمان بدل عناوين IP."
+     },
+     {
+      "term": "التجزئة الدقيقة",
+      "definition": "سياسة دقيقة بين أحمال العمل، كما يوفرها Cisco Secure Workload."
+     },
+     {
+      "term": "Windows LAPS",
+      "definition": "ينشئ كلمة مرور مدير محلي فريدة ودوّارة لكل جهاز."
+     },
+     {
+      "term": "Port ACL (PACL)",
+      "definition": "قائمة وصول تُطبَّق على منفذ مبدل من الطبقة الثانية لتصفية الحركة داخل الشبكة المحلية الافتراضية."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما العناصر الثلاثة التي تحتاجها كل قفزة جانبية؟",
+      "options": [
+       "مسار وبيانات اعتماد وخدمة عن بعد",
+       "اسم DNS وطابعة وشبكة VPN",
+       "جدار ناري ووكيل ومبدل",
+       "بريد وماكرو ورابط"
+      ],
+      "answer": 0,
+      "explanation": "إزالة أي عنصر تكسر القفزة، ولذلك يعمل المدافعون على الوصولية وبيانات الاعتماد والخدمات معاً."
+     },
+     {
+      "question": "أي الأحداث تساعد في كشف نشاط الخدمات أو المشاركات عن بعد؟ اختر كل ما ينطبق.",
+      "options": [
+       "4624 من نوع الدخول 3",
+       "5140 أو 5145 على ADMIN$",
+       "7045 تثبيت خدمة",
+       "4634 فقط"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "الدخول الشبكي والوصول للمشاركات الإدارية وإنشاء الخدمات عن بعد هو الأثر المعتاد. أما حدث الخروج وحده فلا يدل على قفزة."
+     },
+     {
+      "question": "لماذا يُعد SMB بين محطات العمل قاعدة كشف جيدة؟",
+      "options": [
+       "نادراً ما يكون مشروعاً فتقل الإنذارات الكاذبة",
+       "يدل دائماً على برمجية فدية",
+       "يستخدم UDP فقط",
+       "مشفّر"
+      ],
+      "answer": 0,
+      "explanation": "يصل المستخدمون عادة إلى الخوادم لا إلى أجهزة بعضهم، فالحركة إشارة قوية."
+     },
+     {
+      "question": "بقي عدّاد الرفض في قائمة وصول المنفذ صفراً بعد اختبار مخبري نجح. ماذا يعني ذلك؟",
+      "options": [
+       "الضابط يعمل",
+       "القائمة ليست في المسار أو لا تطابق، فتبقى الملاحظة مفتوحة",
+       "الاختبار غير صالح",
+       "المبدل ساخن"
+      ],
+      "answer": 1,
+      "explanation": "الدليل أقوى من الافتراض: إذا نجح الاختبار فالضابط لم يمنعه."
+     },
+     {
+      "question": "أي الضوابط تقلل قيمة بيانات اعتماد مدير محلي مسروقة؟ اختر كل ما ينطبق.",
+      "options": [
+       "Windows LAPS",
+       "منع الدخول الشبكي للحسابات المحلية",
+       "حصر RDP وWinRM بخوادم القفز",
+       "كلمة مرور مدير واحدة مشتركة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "كلمات المرور الفريدة ومنع الدخول الشبكي وتقييد الخدمات تجعل الاعتماد المسروق الواحد مفيداً في جهاز واحد على الأكثر."
+     }
+    ]
+   },
+   {
+    "id": "deeper",
+    "type": "text",
+    "markdown": "## تعمّق أكثر\n\nلمعرفة كيف يرتبط التحرك الجانبي بالإبقاء على الوجود وتخطيط ما بعد الاستغلال اقرأ [ما بعد الاستغلال والإبقاء على الوجود والتحرك الجانبي](/learn/offensive-security-for-defense/post-exploitation-persistence-and-lateral-movement). ولاختبار التجزئة رسمياً تابع مع درس [التحقق من الجدران النارية والتجزئة](/learn/offensive-security-for-defense/firewall-and-segmentation-validation)."
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تحتاج القفزة الجانبية إلى مسار وبيانات اعتماد وخدمة عن بعد؛ وإزالة أي منها توقفها.\n- اربط التقنيات بـ ATT&CK T1021 وT1550 وT1569 وT1053 وT1572 ولاحظ محور الحسابات الصالحة (T1078).\n- اكشف بأنواع دخول 4624 و4648 و5140/5145 و7045/4698 وSysmon 3 وبيانات تدفقات شرق-غرب.\n- امنع بتجزئة شرق-غرب (قوائم وصول المنافذ وTrustSec وSecure Firewall وSecure Workload) وLAPS وProtected Users وخوادم القفز.\n- تحقق باختبار مضبوط وبالأدلة: حركة مرفوضة وعدّادات رفض وتنبيه في الـ SIEM."
+   }
+  ]
+ }
+}

@@ -1,0 +1,568 @@
+{
+ "slug": "database-security-testing",
+ "title": "Database Security Testing",
+ "summary": "Learn to assess database servers you own: discovery, account and privilege review, encryption, auditing and verification, with ATT&CK mapping and detections.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Describe the three routes attackers use to reach a database",
+  "Discover and fingerprint database listeners safely",
+  "Audit accounts, privileges and TLS with read-only queries",
+  "Write detections for service-account misuse and bulk reads",
+  "Verify each fix by repeating the original test"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A retailer's web application passes its annual test with no critical findings. Six months later, an analyst notices that a reporting account has been reading the full customer table every night. The account belongs to a contractor who left last year. Nobody disabled it, and it holds read access to every schema.\n\nDatabases hold the most valuable thing an organization owns, and they are often the least reviewed system in the stack. In this lesson you will learn how an authorized tester assesses a database server at the concept level: discovery, authentication, privileges, encryption, auditing and patching. For each area you will see the ATT&CK technique, the detection and the fix. All work is done on databases you own or are explicitly authorized to test, and the techniques stay conceptual."
+  },
+  {
+   "id": "threat",
+   "type": "text",
+   "markdown": "## What attackers want from a database\n\nAdversaries reach databases by three routes, and a good assessment covers all three:\n\n| Route | What it abuses | ATT&CK |\n|:--|:--|:--|\n| Through the application | Unsafe query construction, covered in [Web Application Penetration Testing](/learn/offensive-security-for-defense/web-application-penetration-testing) | T1190 Exploit Public-Facing Application |\n| Directly over the network | Exposed listener, default or weak credentials, old protocol versions | T1078 Valid Accounts, T1110 Brute Force |\n| Through the host or backups | Readable data files, backup copies, config files with passwords | T1213 Data from Information Repositories, T1552 Unsecured Credentials |\n\nThe goal is usually **collection and exfiltration** of data (T1005, T1041), but the same access can also support tampering and destruction (T1565, T1485). Database servers also often run with powerful features, such as command execution helpers or file access, that expand impact if the account is over-privileged."
+  },
+  {
+   "id": "discover",
+   "type": "text",
+   "markdown": "## Step 1: Discover and fingerprint listeners\n\nYou cannot secure a database you do not know exists. Start with an authorized scan of the lab subnet for the common database ports: 1433 (SQL Server), 1521 (Oracle), 3306 (MySQL/MariaDB), 5432 (PostgreSQL), 27017 (MongoDB) and 6379 (Redis).\n\nThe questions to answer are defensive:\n\n- Which listeners exist, and is each one **meant** to be reachable from this network segment?\n- What version does each report? Compare it with the vendor's end-of-life and advisory lists.\n- Does the server require TLS, or does it accept clear-text connections?\n\nNmap's service detection and its information scripts (for example `mysql-info`, `ms-sql-info`) are enough for this. Run only discovery and information scripts. Do not run credential-guessing scripts unless the rules of engagement allow it. See [Active Scanning and Enumeration with Nmap](/learn/offensive-security-for-defense/active-scanning-and-enumeration-with-nmap) for scan hygiene."
+  },
+  {
+   "type": "terminal",
+   "title": "Database discovery (authorized lab)",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "nmap -sV -p 1433,3306,5432,6379,27017 --open 198.51.100.0/28 -oN db-discovery.txt",
+     "output": "Nmap scan report for db01.corp.example.com (198.51.100.10)\nPORT     STATE SERVICE    VERSION\n5432/tcp open  postgresql PostgreSQL DB 13.4\n\nNmap scan report for cache01.corp.example.com (198.51.100.15)\nPORT     STATE SERVICE VERSION\n6379/tcp open  redis   Redis key-value store 5.0.7\n\nNmap done: 16 IP addresses (2 hosts up) scanned in 9.31 seconds",
+     "comment": "Two listeners found. Is Redis meant to be reachable from this VLAN? Is PostgreSQL 13.4 still supported?"
+    }
+   ],
+   "caption": "Discovery only, against a documentation range in a lab you own. Findings: an old PostgreSQL build and a cache listener open to the segment.",
+   "id": "nmap"
+  },
+  {
+   "id": "auth",
+   "type": "text",
+   "markdown": "## Step 2: Review authentication and privileges\n\nMost database breaches use a **valid account** (T1078). So the heart of the assessment is an account review, done with a read-only audit login:\n\n1. **List every account**, with its owner, last login and whether it is shared.\n2. **Find blank, default and non-expiring passwords.** Compare against the vendor's default account list.\n3. **Find excessive privileges**: superuser or `sysadmin` roles given to application accounts, `GRANT ALL`, wildcard host entries such as `'user'@'%'`.\n4. **Check how applications connect**: one shared account for all apps hides who read what.\n5. **Check authentication method**: prefer directory or certificate-based login over local passwords, and require TLS.\n\nThe audit queries below run on PostgreSQL. Every major engine has equivalents in its system catalog."
+  },
+  {
+   "type": "code",
+   "language": "sql",
+   "filename": "db-account-audit.sql",
+   "caption": "Read-only audit queries on PostgreSQL: privileged roles, expired passwords and who may log in.",
+   "code": "-- Roles with superuser or role-creation rights (should be very few)\nSELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin\nFROM pg_roles\nWHERE rolsuper OR rolcreaterole\nORDER BY rolname;\n\n-- Login roles with no password expiry set\nSELECT rolname, rolvaliduntil\nFROM pg_roles\nWHERE rolcanlogin AND rolvaliduntil IS NULL;\n\n-- Who can read the customers table?\nSELECT grantee, privilege_type\nFROM information_schema.role_table_grants\nWHERE table_name = 'customers';\n\n-- Is TLS in use for current connections?\nSELECT usename, client_addr, ssl\nFROM pg_stat_ssl JOIN pg_stat_activity USING (pid);",
+   "highlight": [
+    2,
+    3,
+    9,
+    14
+   ],
+   "id": "audit-sql"
+  },
+  {
+   "id": "data",
+   "type": "text",
+   "markdown": "## Step 3: Encryption, backups and the host\n\nEven a perfectly configured server leaks if its files do not. Check these four items:\n\n| Area | Question | Fix |\n|:--|:--|:--|\n| Encryption in transit | Do clients connect with TLS and verify the certificate? | Require TLS and reject clear-text clients |\n| Encryption at rest | Are data files and backups encrypted? | Transparent data encryption or volume encryption, with keys held elsewhere |\n| Backups | Who can read the backup share, and how old are copies? | Restrict by role, expire copies, encrypt them |\n| Configuration files | Do they store passwords in clear text, and are they world-readable? | Use a secrets manager; set file mode 600 |\n\nPay special attention to **test and reporting copies** of production data. They carry real customer records with weaker controls (**T1213**). Prefer masked or synthetic data in non-production environments."
+  },
+  {
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Account review and detection loop",
+   "caption": "The tester audits read-only; the same data feeds the detection that would catch a real misuse.",
+   "data": {
+    "actors": [
+     {
+      "id": "t",
+      "label": "Tester",
+      "sub": "Audit login",
+      "icon": "user"
+     },
+     {
+      "id": "db",
+      "label": "Database",
+      "sub": "db01.corp.example.com",
+      "icon": "database"
+     },
+     {
+      "id": "log",
+      "label": "Audit log",
+      "sub": "pgaudit",
+      "icon": "log"
+     },
+     {
+      "id": "siem",
+      "label": "SIEM",
+      "sub": "Rules",
+      "icon": "eye"
+     }
+    ],
+    "steps": [
+     {
+      "from": "t",
+      "to": "db",
+      "label": "Connect over TLS",
+      "detail": "read-only role",
+      "note": "The tester uses a named, approved audit account.",
+      "tone": "secure"
+     },
+     {
+      "from": "t",
+      "to": "db",
+      "label": "List roles and grants",
+      "detail": "catalog queries",
+      "note": "Catalog queries reveal superusers and broad grants."
+     },
+     {
+      "from": "db",
+      "to": "t",
+      "label": "Finding: app account is superuser",
+      "tone": "warning",
+      "note": "The result is evidence for the report."
+     },
+     {
+      "from": "db",
+      "to": "log",
+      "label": "Audit events",
+      "detail": "login, SELECT",
+      "note": "Every query by the audit account is itself logged."
+     },
+     {
+      "from": "log",
+      "to": "siem",
+      "label": "Forward",
+      "note": "Logs are shipped off the database host."
+     },
+     {
+      "from": "siem",
+      "to": "siem",
+      "label": "Alert: bulk read by service account",
+      "tone": "success",
+      "note": "A rule on unusual row counts would catch real misuse."
+     }
+    ]
+   },
+   "id": "db-anim"
+  },
+  {
+   "id": "detect",
+   "type": "text",
+   "markdown": "## Detection: what the log should tell you\n\nTurn on **database auditing** (pgaudit for PostgreSQL, the audit plugin for MySQL, SQL Server Audit, Oracle Unified Auditing) and forward events to the SIEM. Useful events and rules:\n\n- **Failed logins**: SQL Server Event ID 18456; many from one source suggests brute force (T1110).\n- **Successful login from a new source** for a service account (T1078).\n- **Privilege changes**: `GRANT`, `CREATE ROLE`, `ALTER ROLE`, SQL Server Event ID 33205 audit records.\n- **Bulk reads**: a `SELECT` returning far more rows than the account's baseline, or a full-table export at night (T1005).\n- **Schema changes and drops** outside change windows (T1485).\n- **Reads of backup files** by accounts that are not the backup agent.\n\nThe pseudo-rule `login_success AND account in service_accounts AND src_ip NOT IN app_servers` is one of the best low-noise detections you can write. Application accounts should only ever connect from application servers."
+  },
+  {
+   "id": "fix",
+   "type": "text",
+   "markdown": "## Prevention and verification\n\n| Hardening step | How you verify it |\n|:--|:--|\n| Restrict network access to app servers with a firewall rule | Re-run the discovery scan from a user VLAN; the port must be closed or filtered |\n| Remove default, shared and orphaned accounts | Re-run the account audit query; the list must match the owner register |\n| Least privilege per application, no superuser | Query `role_table_grants` again and compare |\n| Require TLS | Attempt a clear-text connection from the lab; it must be refused |\n| Encrypt backups and restrict the share | Check share permissions and try a restore with and without the key |\n| Patch to a supported version | Re-run service detection and compare the version |\n| Alert on service-account logins from new sources | Connect from a lab host not on the list; the alert must fire |\n\nKeep the before and after output in the report. A fix is complete only when the same test that found the problem no longer finds it. See [Remediation and Retesting](/learn/offensive-security-for-defense/remediation-and-retesting)."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Protect the data you touch",
+   "markdown": "Even an audit login can read sensitive rows. Use a read-only role, avoid selecting real customer data (query counts and metadata instead), never copy data out of the environment, and log everything you run. If you see personal data you should not have seen, stop and report it under the rules of engagement."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab you own, install PostgreSQL or MySQL in a VM (or a container) with synthetic data:\n\n1. Scan the VM from another lab machine with Nmap service detection and note the version.\n2. Create a read-only audit role and run the account audit queries. Record each superuser and each login role without an expiry.\n3. Create a fake application role with `GRANT ALL`, re-run the queries and see it appear.\n4. Enable connection logging and forward it to a syslog server. Log in from two different lab addresses and write a rule that alerts on the second source.\n5. Fix the grant to least privilege and re-run to prove the fix."
+  },
+  {
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Least privilege",
+     "definition": "Giving an account only the rights it needs for its task."
+    },
+    {
+     "term": "Service account",
+     "definition": "A non-human account used by an application to connect to a database."
+    },
+    {
+     "term": "Database audit",
+     "definition": "A built-in log of logins, queries and privilege changes."
+    },
+    {
+     "term": "TDE",
+     "definition": "Transparent data encryption: files on disk are encrypted without changing the application."
+    },
+    {
+     "term": "Default credentials",
+     "definition": "Vendor-supplied accounts and passwords that must be changed or removed."
+    },
+    {
+     "term": "Data masking",
+     "definition": "Replacing real values with realistic fake ones in non-production copies."
+    },
+    {
+     "term": "Exfiltration",
+     "definition": "Moving data out of the environment (T1041)."
+    },
+    {
+     "term": "Baseline",
+     "definition": "The normal behavior of an account used to spot anomalies."
+    }
+   ],
+   "id": "keyterms"
+  },
+  {
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which route to a database does a web vulnerability in the application represent?",
+     "options": [
+      "Through the host",
+      "Through the application",
+      "Through backups",
+      "Through physical access"
+     ],
+     "answer": 1,
+     "explanation": "Unsafe query construction in the application is the application route (T1190). The other routes are direct network access and host or backup access."
+    },
+    {
+     "question": "Which are valid items in a database account review? (Choose all that apply.)",
+     "options": [
+      "Superuser roles given to application accounts",
+      "Login roles with no password expiry",
+      "The color of the console",
+      "Wildcard host entries such as 'user'@'%'"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Excessive privileges, non-expiring passwords and wildcard hosts are all audit findings."
+    },
+    {
+     "question": "What is the best low-noise detection for stolen service-account credentials?",
+     "options": [
+      "Alert on every SELECT",
+      "Alert on a successful login from a source that is not an application server",
+      "Alert on database restarts",
+      "Disable logging"
+     ],
+     "answer": 1,
+     "explanation": "Service accounts should only connect from known application servers, so a new source is a strong signal."
+    },
+    {
+     "question": "Why should non-production copies use masked data?",
+     "options": [
+      "To save disk space",
+      "They often have weaker controls but hold real records",
+      "Masked data runs faster",
+      "It is required by Nmap"
+     ],
+     "answer": 1,
+     "explanation": "Test and reporting copies carry real customer records with weaker controls (T1213)."
+    },
+    {
+     "question": "Which steps verify a network restriction fix? (Choose all that apply.)",
+     "options": [
+      "Re-scan from a user VLAN",
+      "Confirm the port is closed or filtered",
+      "Read the ticket and close it",
+      "Try a connection from an unapproved host and see it fail"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Verification repeats the original test and expects a different result. A ticket alone is not evidence."
+    }
+   ],
+   "id": "quiz"
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Attackers reach databases through the application, directly over the network, or through the host and backups.\n- Assess in order: discover listeners, review accounts and privileges, check encryption, backups and files.\n- Most breaches use a valid account (T1078), so account hygiene and least privilege matter most.\n- Enable database auditing and alert on new sources for service accounts, bulk reads, privilege changes and off-hours schema changes.\n- Mask non-production data and use read-only audit roles to protect what you touch.\n- Verify every fix by repeating the test that found the problem.\n\nContinue with the cloud perspective in [Cloud and Infrastructure Attack Surface](/learn/offensive-security-for-defense/cloud-and-infrastructure-attack-surface)."
+  }
+ ],
+ "ar": {
+  "title": "الاختبار الأمني لقواعد البيانات",
+  "summary": "تعلّم تقييم خوادم قواعد البيانات التي تملكها: الاكتشاف ومراجعة الحسابات والصلاحيات والتشفير والتدقيق والتحقق، مع ربط ATT&CK والكشف.",
+  "objectives": [
+   "وصف الطرق الثلاثة التي يصل بها المهاجمون إلى قاعدة البيانات",
+   "اكتشاف منافذ قواعد البيانات وتحديد هويتها بأمان",
+   "تدقيق الحسابات والصلاحيات وTLS باستعلامات للقراءة فقط",
+   "كتابة قواعد كشف لإساءة حسابات الخدمة والقراءات الجماعية",
+   "التحقق من كل إصلاح بإعادة الاختبار الأصلي"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يجتاز تطبيق ويب لمتجر تجزئة اختباره السنوي دون ملاحظات حرجة. وبعد ستة أشهر يلاحظ محلل أن حساب تقارير يقرأ جدول العملاء كاملًا كل ليلة. الحساب يعود إلى متعاقد غادر العام الماضي، ولم يعطّله أحد، ولديه صلاحية قراءة على كل المخططات.\n\nتحتفظ قواعد البيانات بأثمن ما تملكه المؤسسة، وكثيرًا ما تكون أقل الأنظمة مراجعةً. ستتعلم في هذا الدرس كيف يقيّم المختبِر المصرَّح له خادم قاعدة بيانات على المستوى المفاهيمي: الاكتشاف والمصادقة والصلاحيات والتشفير والتدقيق والترقيع. ولكل مجال ستجد تقنية ATT&CK والكشف والإصلاح. كل العمل على قواعد بيانات تملكها أو مصرَّح لك صراحةً باختبارها، وتبقى التقنيات مفاهيمية."
+   },
+   {
+    "id": "threat",
+    "type": "text",
+    "markdown": "## ماذا يريد المهاجمون من قاعدة البيانات\n\nيصل الخصوم إلى قواعد البيانات بثلاثة طرق، والتقييم الجيد يغطيها كلها:\n\n| الطريق | ما الذي يُساء استخدامه | ATT&CK |\n|:--|:--|:--|\n| عبر التطبيق | بناء استعلامات غير آمن، يُغطى في [Web Application Penetration Testing](/learn/offensive-security-for-defense/web-application-penetration-testing) | T1190 Exploit Public-Facing Application |\n| مباشرة عبر الشبكة | منفذ مكشوف، بيانات اعتماد افتراضية أو ضعيفة، إصدارات بروتوكول قديمة | T1078 Valid Accounts وT1110 Brute Force |\n| عبر المضيف أو النسخ الاحتياطية | ملفات بيانات قابلة للقراءة، نسخ احتياطية، ملفات إعداد فيها كلمات مرور | T1213 Data from Information Repositories وT1552 Unsecured Credentials |\n\nالهدف عادةً **جمع البيانات وتسريبها** (T1005 وT1041)، لكن الوصول نفسه قد يتيح العبث والإتلاف (T1565 وT1485). وغالبًا تعمل خوادم قواعد البيانات بميزات قوية، مثل مساعدات تنفيذ الأوامر والوصول إلى الملفات، توسّع الأثر إذا كان الحساب مفرط الصلاحيات."
+   },
+   {
+    "id": "discover",
+    "type": "text",
+    "markdown": "## الخطوة 1: اكتشاف المنافذ المستمعة وتحديد هويتها\n\nلا يمكنك تأمين قاعدة بيانات لا تعرف بوجودها. ابدأ بفحص مصرَّح لشبكة المختبر على منافذ قواعد البيانات الشائعة: 1433 (SQL Server) و1521 (Oracle) و3306 (MySQL/MariaDB) و5432 (PostgreSQL) و27017 (MongoDB) و6379 (Redis).\n\nالأسئلة المطلوب الإجابة عنها دفاعية:\n\n- ما المنافذ المستمعة، وهل يُقصد فعلًا أن يكون كل منها قابلًا للوصول من هذا المقطع من الشبكة؟\n- ما الإصدار الذي يعلنه كل منها؟ قارنه بقوائم نهاية الدعم والنشرات لدى المورّد.\n- هل يشترط الخادم TLS أم يقبل اتصالات بنص صريح؟\n\nتكفي لهذا خاصية كشف الخدمات في Nmap وسكربتاتها المعلوماتية (مثل `mysql-info` و`ms-sql-info`). شغّل الاكتشاف والسكربتات المعلوماتية فقط، ولا تشغّل سكربتات تخمين بيانات الاعتماد ما لم تسمح قواعد الاشتباك. راجع [Active Scanning and Enumeration with Nmap](/learn/offensive-security-for-defense/active-scanning-and-enumeration-with-nmap) لآداب الفحص."
+   },
+   {
+    "type": "terminal",
+    "title": "اكتشاف قواعد البيانات (مختبر مصرَّح)",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "nmap -sV -p 1433,3306,5432,6379,27017 --open 198.51.100.0/28 -oN db-discovery.txt",
+      "output": "Nmap scan report for db01.corp.example.com (198.51.100.10)\nPORT     STATE SERVICE    VERSION\n5432/tcp open  postgresql PostgreSQL DB 13.4\n\nNmap scan report for cache01.corp.example.com (198.51.100.15)\nPORT     STATE SERVICE VERSION\n6379/tcp open  redis   Redis key-value store 5.0.7\n\nNmap done: 16 IP addresses (2 hosts up) scanned in 9.31 seconds",
+      "comment": "Two listeners found. Is Redis meant to be reachable from this VLAN? Is PostgreSQL 13.4 still supported?"
+     }
+    ],
+    "caption": "اكتشاف فقط على نطاق توثيقي في مختبر تملكه. الملاحظات: إصدار PostgreSQL قديم ومنفذ ذاكرة مؤقتة مفتوح للمقطع.",
+    "id": "nmap"
+   },
+   {
+    "id": "auth",
+    "type": "text",
+    "markdown": "## الخطوة 2: مراجعة المصادقة والصلاحيات\n\nتستخدم معظم اختراقات قواعد البيانات **حسابًا صالحًا** (T1078). لذلك قلب التقييم مراجعة الحسابات بتسجيل دخول تدقيق للقراءة فقط:\n\n1. **اسرد كل الحسابات** مع مالكها وآخر دخول وهل هي مشتركة.\n2. **ابحث عن كلمات المرور الفارغة والافتراضية وغير المنتهية.** قارن بقائمة الحسابات الافتراضية لدى المورّد.\n3. **ابحث عن الصلاحيات المفرطة**: أدوار المدير العام أو `sysadmin` الممنوحة لحسابات التطبيقات، و`GRANT ALL`، وإدخالات المضيف الشاملة مثل `'user'@'%'`.\n4. **افحص كيف تتصل التطبيقات**: حساب واحد مشترك لكل التطبيقات يخفي من قرأ ماذا.\n5. **افحص طريقة المصادقة**: فضّل الدخول عبر الدليل أو الشهادات على كلمات المرور المحلية، واشترط TLS.\n\nاستعلامات التدقيق التالية تعمل على PostgreSQL، ولكل محرك رئيسي ما يقابلها في كتالوج النظام."
+   },
+   {
+    "type": "code",
+    "language": "sql",
+    "filename": "db-account-audit.sql",
+    "caption": "استعلامات تدقيق للقراءة فقط في PostgreSQL: الأدوار المميزة وكلمات المرور المنتهية ومن يسمح له بالدخول.",
+    "code": "-- Roles with superuser or role-creation rights (should be very few)\nSELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin\nFROM pg_roles\nWHERE rolsuper OR rolcreaterole\nORDER BY rolname;\n\n-- Login roles with no password expiry set\nSELECT rolname, rolvaliduntil\nFROM pg_roles\nWHERE rolcanlogin AND rolvaliduntil IS NULL;\n\n-- Who can read the customers table?\nSELECT grantee, privilege_type\nFROM information_schema.role_table_grants\nWHERE table_name = 'customers';\n\n-- Is TLS in use for current connections?\nSELECT usename, client_addr, ssl\nFROM pg_stat_ssl JOIN pg_stat_activity USING (pid);",
+    "highlight": [
+     2,
+     3,
+     9,
+     14
+    ],
+    "id": "audit-sql"
+   },
+   {
+    "id": "data",
+    "type": "text",
+    "markdown": "## الخطوة 3: التشفير والنسخ الاحتياطية والمضيف\n\nحتى الخادم المضبوط تمامًا يسرّب إن لم تُؤمَّن ملفاته. افحص هذه العناصر الأربعة:\n\n| المجال | السؤال | الإصلاح |\n|:--|:--|:--|\n| التشفير أثناء النقل | هل يتصل العملاء عبر TLS ويتحققون من الشهادة؟ | اشترط TLS وارفض العملاء بنص صريح |\n| التشفير أثناء التخزين | هل ملفات البيانات والنسخ الاحتياطية مشفّرة؟ | تشفير البيانات الشفاف أو تشفير الأقراص، مع حفظ المفاتيح في مكان آخر |\n| النسخ الاحتياطية | من يقرأ مشاركة النسخ، وما عمر النسخ؟ | قيّد بالأدوار، وأنهِ صلاحية النسخ، وشفّرها |\n| ملفات الإعداد | هل تخزن كلمات المرور بنص صريح وهل هي مقروءة للجميع؟ | استخدم مدير أسرار، واضبط صلاحية الملف 600 |\n\nانتبه خصوصًا إلى **نسخ الاختبار والتقارير** من بيانات الإنتاج. فهي تحمل سجلات عملاء حقيقية بضوابط أضعف (**T1213**). فضّل البيانات المقنَّعة أو الاصطناعية في بيئات غير الإنتاج."
+   },
+   {
+    "type": "animation",
+    "kind": "sequence",
+    "title": "حلقة مراجعة الحسابات والكشف",
+    "caption": "يدقّق المختبِر بصلاحية قراءة فقط؛ والبيانات نفسها تغذّي الكشف الذي يلتقط أي إساءة فعلية.",
+    "data": {
+     "actors": [
+      {
+       "id": "t",
+       "label": "المختبِر",
+       "sub": "حساب تدقيق",
+       "icon": "user"
+      },
+      {
+       "id": "db",
+       "label": "قاعدة البيانات",
+       "sub": "db01.corp.example.com",
+       "icon": "database"
+      },
+      {
+       "id": "log",
+       "label": "سجل التدقيق",
+       "sub": "pgaudit",
+       "icon": "log"
+      },
+      {
+       "id": "siem",
+       "label": "SIEM",
+       "sub": "قواعد",
+       "icon": "eye"
+      }
+     ],
+     "steps": [
+      {
+       "from": "t",
+       "to": "db",
+       "label": "اتصال عبر TLS",
+       "detail": "دور للقراءة فقط",
+       "note": "يستخدم المختبِر حساب تدقيق مسمًّى ومعتمدًا.",
+       "tone": "secure"
+      },
+      {
+       "from": "t",
+       "to": "db",
+       "label": "سرد الأدوار والمنح",
+       "detail": "استعلامات الكتالوج",
+       "note": "تكشف استعلامات الكتالوج المديرين العامين والمنح الواسعة."
+      },
+      {
+       "from": "db",
+       "to": "t",
+       "label": "ملاحظة: حساب التطبيق مدير عام",
+       "tone": "warning",
+       "note": "النتيجة دليل للتقرير."
+      },
+      {
+       "from": "db",
+       "to": "log",
+       "label": "أحداث التدقيق",
+       "detail": "دخول، SELECT",
+       "note": "كل استعلام من حساب التدقيق يُسجَّل بدوره."
+      },
+      {
+       "from": "log",
+       "to": "siem",
+       "label": "إرسال",
+       "note": "تُشحن السجلات خارج مضيف قاعدة البيانات."
+      },
+      {
+       "from": "siem",
+       "to": "siem",
+       "label": "تنبيه: قراءة جماعية من حساب خدمة",
+       "tone": "success",
+       "note": "قاعدة على أعداد الصفوف غير المعتادة تلتقط الإساءة الفعلية."
+      }
+     ]
+    },
+    "id": "db-anim"
+   },
+   {
+    "id": "detect",
+    "type": "text",
+    "markdown": "## الكشف: ماذا ينبغي أن يخبرك السجل\n\nفعّل **تدقيق قاعدة البيانات** (pgaudit في PostgreSQL، وإضافة التدقيق في MySQL، وSQL Server Audit، وOracle Unified Auditing) وأرسل الأحداث إلى SIEM. أحداث وقواعد مفيدة:\n\n- **محاولات الدخول الفاشلة**: معرّف الحدث 18456 في SQL Server؛ وكثرتها من مصدر واحد توحي بتخمين كلمات المرور (T1110).\n- **دخول ناجح من مصدر جديد** لحساب خدمة (T1078).\n- **تغييرات الصلاحيات**: `GRANT` و`CREATE ROLE` و`ALTER ROLE`، وسجلات التدقيق ذات المعرّف 33205 في SQL Server.\n- **القراءات الجماعية**: استعلام `SELECT` يعيد صفوفًا أكثر بكثير من خط الأساس للحساب، أو تصدير جدول كامل ليلًا (T1005).\n- **تغييرات المخطط وعمليات الحذف** خارج نوافذ التغيير (T1485).\n- **قراءة ملفات النسخ الاحتياطي** من حسابات غير وكيل النسخ.\n\nالقاعدة الشبه-برمجية `login_success AND account in service_accounts AND src_ip NOT IN app_servers` من أفضل قواعد الكشف قليلة الضجيج التي تكتبها. ينبغي ألا تتصل حسابات التطبيقات إلا من خوادم التطبيقات."
+   },
+   {
+    "id": "fix",
+    "type": "text",
+    "markdown": "## الوقاية والتحقق\n\n| خطوة التحصين | كيف تتحقق منها |\n|:--|:--|\n| تقييد الوصول الشبكي إلى خوادم التطبيقات بقاعدة جدار حماية | أعد فحص الاكتشاف من شبكة مستخدمين؛ يجب أن يكون المنفذ مغلقًا أو مفلترًا |\n| إزالة الحسابات الافتراضية والمشتركة واليتيمة | أعد استعلام تدقيق الحسابات؛ يجب أن تطابق القائمة سجل الملاك |\n| أقل صلاحية لكل تطبيق ودون مدير عام | أعد الاستعلام عن `role_table_grants` وقارن |\n| اشتراط TLS | جرّب اتصالًا بنص صريح من المختبر؛ يجب أن يُرفض |\n| تشفير النسخ الاحتياطية وتقييد المشاركة | افحص صلاحيات المشاركة وجرّب الاستعادة بالمفتاح ودونه |\n| الترقيع إلى إصدار مدعوم | أعد كشف الخدمة وقارن الإصدار |\n| التنبيه على دخول حسابات الخدمة من مصادر جديدة | اتصل من مضيف مخبري غير مدرج؛ يجب أن ينطلق التنبيه |\n\nاحتفظ بمخرجات ما قبل الإصلاح وبعده في التقرير. لا يكتمل الإصلاح إلا حين لا يجد الاختبار الذي كشف المشكلة المشكلةَ نفسها. راجع [Remediation and Retesting](/learn/offensive-security-for-defense/remediation-and-retesting)."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "احمِ البيانات التي تلمسها",
+    "markdown": "حتى حساب التدقيق قد يقرأ صفوفًا حساسة. استخدم دورًا للقراءة فقط، وتجنّب استعلام بيانات العملاء الحقيقية (استعلم عن الأعداد والبيانات الوصفية)، ولا تنسخ بيانات خارج البيئة، وسجّل كل ما تنفذه. وإن رأيت بيانات شخصية لا ينبغي لك رؤيتها فتوقف وأبلغ وفق قواعد الاشتباك."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في مختبر تملكه، ثبّت PostgreSQL أو MySQL في جهاز افتراضي (أو حاوية) ببيانات اصطناعية:\n\n1. افحص الجهاز من جهاز مخبري آخر بكشف الخدمات في Nmap ودوّن الإصدار.\n2. أنشئ دور تدقيق للقراءة فقط ونفّذ استعلامات تدقيق الحسابات. سجّل كل مدير عام وكل دور دخول بلا انتهاء صلاحية.\n3. أنشئ دور تطبيق وهميًا بـ `GRANT ALL`، وأعد الاستعلامات وشاهد ظهوره.\n4. فعّل تسجيل الاتصالات وأرسله إلى خادم syslog. ادخل من عنوانين مخبريين مختلفين واكتب قاعدة تنبّه على المصدر الثاني.\n5. أصلح المنحة إلى أقل صلاحية وأعد التنفيذ لإثبات الإصلاح."
+   },
+   {
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "أقل صلاحية (Least privilege)",
+      "definition": "منح الحساب الحقوق التي تلزم مهمته فقط."
+     },
+     {
+      "term": "حساب الخدمة",
+      "definition": "حساب غير بشري يستخدمه تطبيق للاتصال بقاعدة البيانات."
+     },
+     {
+      "term": "تدقيق قاعدة البيانات",
+      "definition": "سجل مدمج لعمليات الدخول والاستعلامات وتغييرات الصلاحيات."
+     },
+     {
+      "term": "التشفير الشفاف للبيانات (TDE)",
+      "definition": "تشفير الملفات على القرص دون تغيير التطبيق."
+     },
+     {
+      "term": "بيانات الاعتماد الافتراضية",
+      "definition": "حسابات وكلمات مرور يوفرها المورّد ويجب تغييرها أو إزالتها."
+     },
+     {
+      "term": "إخفاء البيانات (Masking)",
+      "definition": "استبدال القيم الحقيقية بقيم وهمية واقعية في نسخ غير الإنتاج."
+     },
+     {
+      "term": "التسريب (Exfiltration)",
+      "definition": "نقل البيانات خارج البيئة (T1041)."
+     },
+     {
+      "term": "خط الأساس (Baseline)",
+      "definition": "السلوك الطبيعي للحساب الذي يُستخدم لرصد الشذوذ."
+     }
+    ],
+    "id": "keyterms"
+   },
+   {
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي طريق إلى قاعدة البيانات تمثّله ثغرة ويب في التطبيق؟",
+      "options": [
+       "عبر المضيف",
+       "عبر التطبيق",
+       "عبر النسخ الاحتياطية",
+       "عبر الوصول المادي"
+      ],
+      "answer": 1,
+      "explanation": "بناء الاستعلامات غير الآمن في التطبيق هو طريق التطبيق (T1190). والطرق الأخرى هي الوصول الشبكي المباشر والوصول عبر المضيف أو النسخ."
+     },
+     {
+      "question": "أي مما يلي بنود صحيحة في مراجعة حسابات قاعدة البيانات؟ (اختر كل ما ينطبق)",
+      "options": [
+       "أدوار المدير العام الممنوحة لحسابات التطبيقات",
+       "أدوار دخول بلا انتهاء كلمة مرور",
+       "لون وحدة التحكم",
+       "إدخالات مضيف شاملة مثل 'user'@'%'"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "الصلاحيات المفرطة وكلمات المرور غير المنتهية والمضيفات الشاملة كلها ملاحظات تدقيق."
+     },
+     {
+      "question": "ما أفضل كشف قليل الضجيج لبيانات اعتماد حساب خدمة مسروقة؟",
+      "options": [
+       "التنبيه على كل SELECT",
+       "التنبيه على دخول ناجح من مصدر ليس خادم تطبيق",
+       "التنبيه على إعادة تشغيل القاعدة",
+       "تعطيل التسجيل"
+      ],
+      "answer": 1,
+      "explanation": "ينبغي ألا تتصل حسابات الخدمة إلا من خوادم التطبيقات المعروفة، فالمصدر الجديد إشارة قوية."
+     },
+     {
+      "question": "لماذا ينبغي أن تستخدم نسخ غير الإنتاج بيانات مقنَّعة؟",
+      "options": [
+       "لتوفير مساحة القرص",
+       "لأن ضوابطها أضعف وهي تحمل سجلات حقيقية",
+       "لأن المقنَّعة أسرع",
+       "لأن Nmap يشترط ذلك"
+      ],
+      "answer": 1,
+      "explanation": "تحمل نسخ الاختبار والتقارير سجلات عملاء حقيقية بضوابط أضعف (T1213)."
+     },
+     {
+      "question": "أي الخطوات تتحقق من إصلاح تقييد الشبكة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "إعادة الفحص من شبكة مستخدمين",
+       "التأكد أن المنفذ مغلق أو مفلتر",
+       "قراءة التذكرة وإغلاقها",
+       "تجربة اتصال من مضيف غير معتمد ورؤيته يفشل"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يعيد التحقق الاختبار الأصلي ويتوقع نتيجة مختلفة. والتذكرة وحدها ليست دليلًا."
+     }
+    ],
+    "id": "quiz"
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يصل المهاجمون إلى قواعد البيانات عبر التطبيق أو مباشرة عبر الشبكة أو عبر المضيف والنسخ الاحتياطية.\n- قيّم بالترتيب: اكتشف المنافذ المستمعة، راجع الحسابات والصلاحيات، افحص التشفير والنسخ والملفات.\n- تستخدم معظم الاختراقات حسابًا صالحًا (T1078)، لذا فنظافة الحسابات وأقل صلاحية هما الأهم.\n- فعّل التدقيق ونبّه على المصادر الجديدة لحسابات الخدمة والقراءات الجماعية وتغييرات الصلاحيات وتغييرات المخطط خارج الدوام.\n- قنِّع بيانات غير الإنتاج واستخدم أدوار تدقيق للقراءة فقط لحماية ما تلمسه.\n- تحقق من كل إصلاح بإعادة الاختبار الذي كشف المشكلة.\n\nتابع بالمنظور السحابي في [Cloud and Infrastructure Attack Surface](/learn/offensive-security-for-defense/cloud-and-infrastructure-attack-surface)."
+   }
+  ]
+ }
+}
