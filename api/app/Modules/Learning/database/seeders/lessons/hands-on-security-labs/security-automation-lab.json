@@ -1,0 +1,604 @@
+{
+  "slug": "security-automation-lab",
+  "title": "Security Automation Lab",
+  "summary": "Automate a safe response task: a Python script turns SIEM brute-force alerts into expiring nftables blocks, with allowlist, dry-run, circuit breaker and audit log.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Choose tasks that are safe to automate",
+    "Design guardrails: dry-run, allowlist, expiry, circuit breaker",
+    "Write a validated Python block script for nftables",
+    "Schedule with a systemd timer and a kill switch",
+    "Test failure paths on purpose"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Security teams repeat the same small tasks all day: check an alert, look up an address, block it, write the ticket. Each task is easy, and the sum of them is exhausting. **Automation** hands the repetitive part to a script so that people spend their time on judgment. It also has a dark side: a script that blocks the wrong address at 3 a.m. can cause an outage faster than any attacker.\n\nIn this lab you build a small, safe automation on the SIEM from [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab): a Python script reads brute-force alerts, validates the source address, and adds it to a firewall set that expires on its own. You will design it with guardrails first, because the guardrails are the lesson. Run it only on VMs you own."
+    },
+    {
+      "id": "choose",
+      "type": "text",
+      "markdown": "## Step 1: Choose what to automate\n\nNot every task deserves a script. Good candidates are frequent, rule-based, low-risk and easy to undo. Poor candidates need judgment or have a costly failure mode.\n\n| Task | Automate? | Why |\n|:--|:--|:--|\n| Enrich an alert with whois and reputation data | Yes | Read-only, saves minutes per alert |\n| Block a brute-force source for one hour | Yes, with guardrails | Reversible, expires |\n| Open a ticket with the alert details | Yes | No effect on production |\n| Disable a user account | Only with approval | Can lock out a real person |\n| Delete a file or isolate a server | Human decision | High impact, hard to undo |\n\nA useful ladder is **notify, then recommend, then act with approval, then act alone**. Start at the bottom of the ladder and climb only when the script has earned trust in logs."
+    },
+    {
+      "id": "guard",
+      "type": "text",
+      "markdown": "## Step 2: Build the guardrails first\n\nBefore the script touches a firewall, decide how it can fail safely.\n\n- **Dry-run by default.** The script prints what it would do. A separate `--apply` flag acts.\n- **Allowlist.** Never block your management network, your own jump host or your monitoring probes.\n- **Validate input.** Parse the address with `ipaddress`. Never paste log text into a shell command.\n- **Expiry.** Every block times out. A forgotten permanent block is a future outage.\n- **Circuit breaker.** If one run wants to block more than a set number of addresses, something is wrong. Stop and alert a human.\n- **Audit log.** Record each action with a timestamp, so a person can explain it later.\n- **Least privilege.** Run it as a dedicated user that may change only the blocklist set.\n\nThe log line is attacker-influenced data. A failed SSH login can carry any username the attacker types, so treat every field as untrusted input."
+    },
+    {
+      "id": "flow-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "From alert to expiring block",
+      "caption": "Each stage is a checkpoint where the script can refuse to act.",
+      "data": {
+        "token": "Alert",
+        "nodes": [
+          {
+            "id": "siem",
+            "label": "SIEM alert",
+            "sub": "rule 5712",
+            "icon": "log"
+          },
+          {
+            "id": "parse",
+            "label": "Parse and validate",
+            "sub": "ipaddress",
+            "icon": "cpu"
+          },
+          {
+            "id": "allow",
+            "label": "Allowlist check",
+            "sub": "10.10.0.0/16",
+            "icon": "shield"
+          },
+          {
+            "id": "breaker",
+            "label": "Circuit breaker",
+            "sub": "max 20",
+            "icon": "alert"
+          },
+          {
+            "id": "fw",
+            "label": "Firewall set",
+            "sub": "timeout 1h",
+            "icon": "firewall"
+          },
+          {
+            "id": "audit",
+            "label": "Audit log",
+            "sub": "auto-block.log",
+            "icon": "file"
+          }
+        ],
+        "steps": [
+          {
+            "at": "siem",
+            "caption": "Rule 5712 fires for repeated SSH failures from 198.51.100.23."
+          },
+          {
+            "at": "parse",
+            "caption": "The script parses the address; a malformed value is skipped.",
+            "tone": "secure"
+          },
+          {
+            "at": "allow",
+            "caption": "The address is outside the allowlist, so it may be blocked.",
+            "tone": "success"
+          },
+          {
+            "at": "allow",
+            "token": "Alert",
+            "caption": "An address inside 10.10.0.0/16 would stop here and never be blocked.",
+            "tone": "blocked"
+          },
+          {
+            "at": "breaker",
+            "caption": "Fewer than 20 sources in this run, so the batch is normal.",
+            "tone": "warning"
+          },
+          {
+            "at": "fw",
+            "caption": "With --apply, nft adds the address to the set with a one-hour timeout.",
+            "tone": "danger"
+          },
+          {
+            "at": "audit",
+            "caption": "A timestamped line records who, what and why.",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "script",
+      "type": "code",
+      "language": "python",
+      "filename": "/opt/auto-block/auto_block.py",
+      "caption": "A minimal auto-block script with the guardrails built in. It runs as a dedicated user and defaults to dry-run.",
+      "code": "#!/usr/bin/env python3\n\"\"\"Block brute-force sources found in Wazuh alerts. Dry-run unless --apply.\"\"\"\nimport ipaddress, json, subprocess, sys, logging\n\nALERTS = \"/var/ossec/logs/alerts/alerts.json\"\nALLOW = [ipaddress.ip_network(n) for n in (\"10.10.0.0/16\", \"192.0.2.0/24\")]\nRULES = {\"5712\"}          # sshd brute force (built-in correlation)\nMAX_BLOCKS = 20           # circuit breaker per run\nAPPLY = \"--apply\" in sys.argv\nlogging.basicConfig(filename=\"/var/log/auto-block.log\", level=logging.INFO,\n                    format=\"%(asctime)s %(message)s\")\n\ndef sources():\n    seen = set()\n    for line in open(ALERTS):\n        try:\n            a = json.loads(line)\n            ip = ipaddress.ip_address(a[\"data\"][\"srcip\"])\n        except (ValueError, KeyError):\n            continue\n        if a[\"rule\"][\"id\"] in RULES and not any(ip in n for n in ALLOW):\n            seen.add(str(ip))\n    return sorted(seen)\n\ntodo = sources()\nif len(todo) > MAX_BLOCKS:\n    logging.error(\"refusing %d blocks (limit %d)\", len(todo), MAX_BLOCKS)\n    sys.exit(2)\nfor ip in todo:\n    cmd = [\"nft\", \"add\", \"element\", \"inet\", \"filter\", \"blocklist\",\n           \"{ \" + ip + \" timeout 1h }\"]\n    logging.info(\"%s %s\", \"BLOCK\" if APPLY else \"DRY-RUN\", ip)\n    if APPLY:\n        subprocess.run(cmd, check=True)\n",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        30,
+        31,
+        32
+      ]
+    },
+    {
+      "id": "deploy",
+      "type": "text",
+      "markdown": "## Step 3: Prepare the firewall and test in dry-run\n\nThe script needs an nftables set with timeouts and a rule that drops traffic from it. Create both once, then test with sample alerts before trusting live ones. Keep the firewall rules you validated in [Firewall Rule Testing Lab](/learn/hands-on-security-labs/firewall-rule-testing-lab), and add the set rule above the general allow rules.\n\nThe first run must be a dry run. Read the output and ask: would a human agree with every line?"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "gw-01",
+      "prompt": "$",
+      "caption": "Create the set, dry-run, apply, and inspect. 198.51.100.23 is a documentation address standing in for the attacker.",
+      "lines": [
+        {
+          "cmd": "sudo nft add set inet filter blocklist '{ type ipv4_addr; flags timeout; }' && sudo nft insert rule inet filter input ip saddr @blocklist drop",
+          "output": "",
+          "comment": "One-time setup. insert places the drop rule at the top of the input chain."
+        },
+        {
+          "cmd": "sudo -u autoblock python3 /opt/auto-block/auto_block.py && tail -n 2 /var/log/auto-block.log",
+          "output": "2026-11-12 10:30:01,114 DRY-RUN 198.51.100.23\n2026-11-12 10:30:01,115 DRY-RUN 198.51.100.77",
+          "comment": "Dry-run: nothing changed. Check each address by hand before applying."
+        },
+        {
+          "cmd": "sudo -u autoblock python3 /opt/auto-block/auto_block.py --apply && sudo nft list set inet filter blocklist",
+          "output": "table inet filter {\n\tset blocklist {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t\telements = { 198.51.100.23 timeout 1h expires 59m58s,\n\t\t\t     198.51.100.77 timeout 1h expires 59m58s }\n\t}\n}",
+          "comment": "The blocks exist and will expire in an hour without any cleanup job."
+        }
+      ]
+    },
+    {
+      "id": "schedule",
+      "type": "text",
+      "markdown": "## Step 4: Schedule it and test the failure paths\n\nRun the script every minute with a **systemd timer** rather than a long-lived loop. A timer is easy to inspect with `systemctl list-timers`, and a crash does not leave a zombie process. Give the service `User=autoblock`, `NoNewPrivileges=yes` and `ProtectSystem=strict`, and grant that user only the `CAP_NET_ADMIN` capability it needs.\n\nThen test the bad cases on purpose:\n\n1. Add your own management address to a fake alert and confirm it is skipped.\n2. Feed a line with a garbage `srcip` and confirm the script does not crash.\n3. Generate 25 distinct fake sources and confirm the circuit breaker refuses and logs an error.\n\nAutomation that has only been tested on the happy path is untested. Also note the limit of this design: a block based on one rule is blunt, and attackers rotate addresses. It reduces noise; it is not a complete defense."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Automation amplifies mistakes",
+      "markdown": "A wrong rule applied by hand harms one system. The same rule applied by a script harms every system, every minute. Never give automation write access to production without an allowlist, an expiry and a kill switch, such as disabling the timer with `systemctl stop auto-block.timer`."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Keep secrets out of the script",
+      "markdown": "When your automation grows to call APIs for a ticketing system or a reputation service, load tokens from environment files owned by the service user, with mode 600. Never hard-code them or commit them to git. In documentation and examples, show only placeholders such as `API_TOKEN=<your-token>`."
+    },
+    {
+      "id": "measure",
+      "type": "text",
+      "markdown": "## Step 5: Review, measure and grow carefully\n\nAfter a week, read the audit log. Count the blocks, the false positives and the minutes saved. Compare them with the time you spent building and maintaining the script. If a block ever hit a legitimate user, add the address to the allowlist and write down why.\n\nWhen you are ready for the next step, connect this pattern to detection results from [Wazuh and Suricata Integration Lab](/learn/hands-on-security-labs/wazuh-and-suricata-integration-lab), then move to [Attack Detection and Remediation Lab](/learn/hands-on-security-labs/attack-detection-and-remediation-lab), where detection and response run together. In a portfolio, describe the guardrails and the failure tests, not just the script. That is what shows engineering maturity."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a gateway VM and a SIEM VM **you own**:\n\n1. Create the `blocklist` set in nftables and the drop rule, then confirm with `nft list ruleset`.\n2. Save the script, create a user `autoblock`, and run it in dry-run mode against real or sample alerts.\n3. Make five failed SSH logins from a second VM you own, wait for rule 5712, and run the script with `--apply`.\n4. Confirm that the second VM can no longer connect, then wait for the timeout or run `nft delete element` to undo it.\n5. Add your management address to a test alert and prove it is not blocked.\n6. Write a systemd timer and service, run `systemctl list-timers`, and test the kill switch.\n7. Record in a short note which guardrail you would add next."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Automation",
+          "definition": "Using software to perform repetitive tasks consistently, with less manual effort."
+        },
+        {
+          "term": "Dry-run",
+          "definition": "A mode that reports what would happen without changing anything."
+        },
+        {
+          "term": "Allowlist",
+          "definition": "A list of addresses or items the automation must never act on."
+        },
+        {
+          "term": "Circuit breaker",
+          "definition": "A limit that stops automation when it behaves abnormally, such as too many actions in one run."
+        },
+        {
+          "term": "nftables set",
+          "definition": "A named collection of addresses that firewall rules can match, optionally with per-element timeouts."
+        },
+        {
+          "term": "Audit log",
+          "definition": "A record of every automated action with time and reason."
+        },
+        {
+          "term": "systemd timer",
+          "definition": "A scheduler unit that starts a service at set intervals."
+        },
+        {
+          "term": "Kill switch",
+          "definition": "A fast, documented way to turn automation off."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why should an automation script default to dry-run?",
+          "options": [
+            "It runs faster",
+            "Mistakes show as output instead of production changes",
+            "It hides the logs",
+            "It needs fewer permissions"
+          ],
+          "answer": 1,
+          "explanation": "Dry-run lets a human review decisions before anything changes."
+        },
+        {
+          "question": "Which guardrails belong in an auto-block script? (Choose all that apply.)",
+          "options": [
+            "An allowlist of management addresses",
+            "An expiry on every block",
+            "Permanent blocks for simplicity",
+            "A limit on blocks per run"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Allowlist, expiry and a circuit breaker limit the damage of a wrong decision. Permanent blocks turn mistakes into lasting outages."
+        },
+        {
+          "question": "Why parse the source address with the ipaddress module instead of using the log text directly?",
+          "options": [
+            "Log fields can contain attacker-chosen text",
+            "It is required by nftables",
+            "It encrypts the address",
+            "Logs never contain addresses"
+          ],
+          "answer": 0,
+          "explanation": "Log data is untrusted input. Validation and list-style subprocess calls prevent command injection."
+        },
+        {
+          "question": "Where on the automation ladder should a new script start?",
+          "options": [
+            "Act alone immediately",
+            "Notify or recommend, then earn trust",
+            "Disable logging",
+            "Run as root with no limits"
+          ],
+          "answer": 1,
+          "explanation": "Climb from notify to act alone only when logs show the decisions are correct."
+        },
+        {
+          "question": "What does a timeout on an nftables set element achieve?",
+          "options": [
+            "The block removes itself, so no cleanup job is needed",
+            "It speeds up packets",
+            "It encrypts traffic",
+            "It permanently bans the address"
+          ],
+          "answer": 0,
+          "explanation": "Expiring blocks limit the harm of false positives and stale entries."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou picked a safe task to automate, wrote down guardrails before code, and built a Python script that validates alerts, respects an allowlist, stops at a circuit breaker, logs every action and adds expiring blocks to an nftables set. You tested it in dry-run, scheduled it with a systemd timer and rehearsed the failure paths. Good automation is boring and reversible. Carry this pattern into [Attack Detection and Remediation Lab](/learn/hands-on-security-labs/attack-detection-and-remediation-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر أتمتة الأمن",
+    "summary": "أتمتة مهمة استجابة آمنة: سكربت بايثون يحوّل تنبيهات القوة الغاشمة في SIEM إلى حظر منتهٍ في nftables مع قائمة سماح وتشغيل تجريبي وقاطع دائرة وسجل تدقيق.",
+    "objectives": [
+      "اختيار المهام الآمنة للأتمتة",
+      "تصميم الضوابط: تشغيل تجريبي وقائمة سماح ومهلة وقاطع دائرة",
+      "كتابة سكربت حظر بايثون متحقَّق للمدخلات مع nftables",
+      "الجدولة بمؤقّت systemd ومفتاح إيقاف",
+      "اختبار مسارات الفشل عمدًا"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يكرّر فريق الأمن مهامّ صغيرة نفسها طوال اليوم: فحص تنبيه، والاستعلام عن عنوان، وحظره، وكتابة التذكرة. كل مهمة سهلة، لكن مجموعها مُنهِك. تُسلّم **الأتمتة (Automation)** الجزء المتكرر إلى سكربت ليصرف الناس وقتهم في الحكم والتقدير. وللأتمتة وجه مظلم أيضًا: سكربت يحظر عنوانًا خاطئًا في الثالثة فجرًا قد يسبب انقطاعًا أسرع من أي مهاجم.\n\nستبني في هذا المختبر أتمتة صغيرة وآمنة على نظام SIEM من [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab): سكربت بايثون يقرأ تنبيهات القوة الغاشمة، ويتحقق من عنوان المصدر، ويضيفه إلى مجموعة في جدار الحماية تنتهي صلاحيتها تلقائيًا. وستصممه بالضوابط الواقية أولًا لأنها جوهر الدرس. شغّله على أجهزة افتراضية تملكها فقط."
+      },
+      {
+        "id": "choose",
+        "type": "text",
+        "markdown": "## الخطوة 1: اختر ما ستؤتمته\n\nليست كل مهمة جديرة بسكربت. المرشّحات الجيدة متكررة وقائمة على قواعد وقليلة الخطر وسهلة التراجع، أما الضعيفة فتحتاج إلى حكم بشري أو تكون كلفة فشلها عالية.\n\n| المهمة | هل تُؤتمت؟ | السبب |\n|:--|:--|:--|\n| إثراء التنبيه ببيانات whois والسمعة | نعم | للقراءة فقط وتوفر دقائق لكل تنبيه |\n| حظر مصدر قوة غاشمة لمدة ساعة | نعم مع ضوابط | قابل للتراجع وينتهي تلقائيًا |\n| فتح تذكرة بتفاصيل التنبيه | نعم | لا أثر له على الإنتاج |\n| تعطيل حساب مستخدم | بموافقة فقط | قد يحجب شخصًا حقيقيًا |\n| حذف ملف أو عزل خادم | قرار بشري | أثر كبير وصعب التراجع |\n\nوالسلّم المفيد هو: **أبلِغ، ثم أوصِ، ثم نفّذ بموافقة، ثم نفّذ وحدك**. ابدأ من أسفل السلّم ولا تصعد إلا حين يكسب السكربت الثقة من خلال السجلات."
+      },
+      {
+        "id": "guard",
+        "type": "text",
+        "markdown": "## الخطوة 2: ابنِ الضوابط الواقية أولًا\n\nقبل أن يلمس السكربت جدار الحماية، قرّر كيف يفشل بأمان.\n\n- **التشغيل التجريبي افتراضيًا.** يطبع السكربت ما كان سيفعله، ولا ينفّذ إلا بعلم `--apply` المنفصل.\n- **قائمة السماح.** لا تحظر أبدًا شبكة الإدارة ولا خادم القفز ولا مجسّات المراقبة.\n- **تحقّق من المدخلات.** حلّل العنوان بمكتبة `ipaddress`، ولا تلصق نص السجل في أمر صدفة (Shell) أبدًا.\n- **انتهاء الصلاحية.** كل حظر ينتهي بمهلة، فالحظر الدائم المنسي انقطاع مؤجَّل.\n- **قاطع الدائرة (Circuit breaker).** إذا أراد تشغيل واحد حظر عدد أكبر من الحد فثمة خلل؛ توقف ونبّه إنسانًا.\n- **سجل تدقيق.** سجّل كل إجراء بوقته ليتمكن إنسان من تفسيره لاحقًا.\n- **أقل الصلاحيات.** شغّله بمستخدم مخصص لا يغيّر إلا مجموعة قائمة الحظر.\n\nسطر السجل بيانات يؤثر فيها المهاجم؛ فمحاولة دخول SSH فاشلة قد تحمل أي اسم مستخدم يكتبه، فعامل كل حقل على أنه مدخل غير موثوق."
+      },
+      {
+        "id": "flow-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "من التنبيه إلى حظر ينتهي تلقائيًا",
+        "caption": "كل مرحلة نقطة فحص يستطيع السكربت عندها أن يرفض التنفيذ.",
+        "data": {
+          "token": "تنبيه",
+          "nodes": [
+            {
+              "id": "siem",
+              "label": "تنبيه SIEM",
+              "sub": "rule 5712",
+              "icon": "log"
+            },
+            {
+              "id": "parse",
+              "label": "التحليل والتحقق",
+              "sub": "ipaddress",
+              "icon": "cpu"
+            },
+            {
+              "id": "allow",
+              "label": "فحص قائمة السماح",
+              "sub": "10.10.0.0/16",
+              "icon": "shield"
+            },
+            {
+              "id": "breaker",
+              "label": "قاطع الدائرة",
+              "sub": "max 20",
+              "icon": "alert"
+            },
+            {
+              "id": "fw",
+              "label": "مجموعة جدار الحماية",
+              "sub": "timeout 1h",
+              "icon": "firewall"
+            },
+            {
+              "id": "audit",
+              "label": "سجل التدقيق",
+              "sub": "auto-block.log",
+              "icon": "file"
+            }
+          ],
+          "steps": [
+            {
+              "at": "siem",
+              "caption": "تنطلق القاعدة 5712 لإخفاقات SSH متكررة من 198.51.100.23."
+            },
+            {
+              "at": "parse",
+              "caption": "يحلّل السكربت العنوان ويتجاوز أي قيمة مشوهة.",
+              "tone": "secure"
+            },
+            {
+              "at": "allow",
+              "caption": "العنوان خارج قائمة السماح فيجوز حظره.",
+              "tone": "success"
+            },
+            {
+              "at": "allow",
+              "token": "تنبيه",
+              "caption": "أي عنوان داخل 10.10.0.0/16 يتوقف هنا ولا يُحظر أبدًا.",
+              "tone": "blocked"
+            },
+            {
+              "at": "breaker",
+              "caption": "أقل من 20 مصدرًا في هذا التشغيل، فالدفعة طبيعية.",
+              "tone": "warning"
+            },
+            {
+              "at": "fw",
+              "caption": "مع `--apply` يضيف nft العنوان إلى المجموعة بمهلة ساعة.",
+              "tone": "danger"
+            },
+            {
+              "at": "audit",
+              "caption": "سطر مؤرَّخ يسجل من ومتى ولماذا.",
+              "tone": "secure"
+            }
+          ]
+        }
+      },
+      {
+        "id": "script",
+        "type": "code",
+        "language": "python",
+        "filename": "/opt/auto-block/auto_block.py",
+        "caption": "سكربت حظر آلي مبسّط تتضمنه الضوابط الواقية. يعمل بمستخدم مخصص وتجريبيًا افتراضيًا.",
+        "code": "#!/usr/bin/env python3\n\"\"\"Block brute-force sources found in Wazuh alerts. Dry-run unless --apply.\"\"\"\nimport ipaddress, json, subprocess, sys, logging\n\nALERTS = \"/var/ossec/logs/alerts/alerts.json\"\nALLOW = [ipaddress.ip_network(n) for n in (\"10.10.0.0/16\", \"192.0.2.0/24\")]\nRULES = {\"5712\"}          # sshd brute force (built-in correlation)\nMAX_BLOCKS = 20           # circuit breaker per run\nAPPLY = \"--apply\" in sys.argv\nlogging.basicConfig(filename=\"/var/log/auto-block.log\", level=logging.INFO,\n                    format=\"%(asctime)s %(message)s\")\n\ndef sources():\n    seen = set()\n    for line in open(ALERTS):\n        try:\n            a = json.loads(line)\n            ip = ipaddress.ip_address(a[\"data\"][\"srcip\"])\n        except (ValueError, KeyError):\n            continue\n        if a[\"rule\"][\"id\"] in RULES and not any(ip in n for n in ALLOW):\n            seen.add(str(ip))\n    return sorted(seen)\n\ntodo = sources()\nif len(todo) > MAX_BLOCKS:\n    logging.error(\"refusing %d blocks (limit %d)\", len(todo), MAX_BLOCKS)\n    sys.exit(2)\nfor ip in todo:\n    cmd = [\"nft\", \"add\", \"element\", \"inet\", \"filter\", \"blocklist\",\n           \"{ \" + ip + \" timeout 1h }\"]\n    logging.info(\"%s %s\", \"BLOCK\" if APPLY else \"DRY-RUN\", ip)\n    if APPLY:\n        subprocess.run(cmd, check=True)\n",
+        "highlight": [
+          6,
+          7,
+          8,
+          9,
+          10,
+          30,
+          31,
+          32
+        ]
+      },
+      {
+        "id": "deploy",
+        "type": "text",
+        "markdown": "## الخطوة 3: جهّز جدار الحماية واختبر تجريبيًا\n\nيحتاج السكربت إلى مجموعة nftables ذات مهل وإلى قاعدة تُسقط الحزم الصادرة منها. أنشئهما مرة واحدة، ثم اختبر بتنبيهات عيّنة قبل الوثوق بالتنبيهات الحية. أبقِ قواعد جدار الحماية التي تحققت منها في [Firewall Rule Testing Lab](/learn/hands-on-security-labs/firewall-rule-testing-lab)، وأضف قاعدة المجموعة فوق قواعد السماح العامة.\n\nويجب أن يكون أول تشغيل تجريبيًا. اقرأ الخرج واسأل: هل يوافق إنسان على كل سطر؟"
+      },
+      {
+        "id": "term",
+        "type": "terminal",
+        "title": "gw-01",
+        "prompt": "$",
+        "caption": "أنشئ المجموعة ثم شغّل تجريبيًا ثم نفّذ وافحص. العنوان 198.51.100.23 عنوان توثيقي يمثل المهاجم.",
+        "lines": [
+          {
+            "cmd": "sudo nft add set inet filter blocklist '{ type ipv4_addr; flags timeout; }' && sudo nft insert rule inet filter input ip saddr @blocklist drop",
+            "output": "",
+            "comment": "إعداد لمرة واحدة. يضع `insert` قاعدة الإسقاط أعلى سلسلة input."
+          },
+          {
+            "cmd": "sudo -u autoblock python3 /opt/auto-block/auto_block.py && tail -n 2 /var/log/auto-block.log",
+            "output": "2026-11-12 10:30:01,114 DRY-RUN 198.51.100.23\n2026-11-12 10:30:01,115 DRY-RUN 198.51.100.77",
+            "comment": "تشغيل تجريبي: لم يتغير شيء. افحص كل عنوان يدويًا قبل التنفيذ."
+          },
+          {
+            "cmd": "sudo -u autoblock python3 /opt/auto-block/auto_block.py --apply && sudo nft list set inet filter blocklist",
+            "output": "table inet filter {\n\tset blocklist {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t\telements = { 198.51.100.23 timeout 1h expires 59m58s,\n\t\t\t     198.51.100.77 timeout 1h expires 59m58s }\n\t}\n}",
+            "comment": "الحظران قائمان وسينتهيان بعد ساعة دون مهمة تنظيف."
+          }
+        ]
+      },
+      {
+        "id": "schedule",
+        "type": "text",
+        "markdown": "## الخطوة 4: جدوِله واختبر مسارات الفشل\n\nشغّل السكربت كل دقيقة بـ **مؤقّت systemd** بدل حلقة طويلة العمر. فالمؤقّت سهل الفحص بـ `systemctl list-timers`، ولا يترك عملية عالقة عند الانهيار. اضبط للخدمة `User=autoblock` و`NoNewPrivileges=yes` و`ProtectSystem=strict`، ومنح هذا المستخدم القدرة `CAP_NET_ADMIN` وحدها.\n\nثم اختبر الحالات السيئة عمدًا:\n\n1. ضع عنوان الإدارة الخاص بك في تنبيه مزيّف وتأكد من تجاوزه.\n2. مرّر سطرًا بقيمة `srcip` عشوائية وتأكد أن السكربت لا ينهار.\n3. ولّد 25 مصدرًا مزيفًا مختلفًا وتأكد أن قاطع الدائرة يرفض ويسجل خطأً.\n\nالأتمتة التي اختُبرت على المسار السعيد فقط غير مختبرة. وانتبه إلى حدّ هذا التصميم: الحظر القائم على قاعدة واحدة فظّ، والمهاجمون يبدّلون العناوين؛ فهو يخفف الضجيج ولا يشكّل دفاعًا كاملًا."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "الأتمتة تضخّم الأخطاء",
+        "markdown": "القاعدة الخاطئة المطبّقة يدويًا تضر نظامًا واحدًا، أما إذا طبّقها سكربت فتضر كل الأنظمة كل دقيقة. لا تمنح الأتمتة صلاحية كتابة على الإنتاج دون قائمة سماح ومهلة انتهاء ومفتاح إيقاف، كتعطيل المؤقّت بالأمر `systemctl stop auto-block.timer`."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "أبقِ الأسرار خارج السكربت",
+        "markdown": "حين تكبر أتمتتك وتستدعي واجهات برمجية لنظام التذاكر أو خدمة السمعة، حمّل الرموز من ملفات بيئة يملكها مستخدم الخدمة بصلاحية 600. لا تكتبها داخل الشيفرة ولا ترفعها إلى git. وفي التوثيق والأمثلة اعرض نصوصًا بديلة فقط مثل `API_TOKEN=<your-token>`."
+      },
+      {
+        "id": "measure",
+        "type": "text",
+        "markdown": "## الخطوة 5: راجع وقِس ووسّع بحذر\n\nبعد أسبوع اقرأ سجل التدقيق. عُدَّ الحظر والإيجابيات الكاذبة والدقائق الموفَّرة، وقارنها بالوقت الذي أنفقته في بناء السكربت وصيانته. وإذا أصاب حظرٌ مستخدمًا مشروعًا فأضف عنوانه إلى قائمة السماح ودوّن السبب.\n\nوحين تكون مستعدًا للخطوة التالية، اربط هذا النمط بنتائج الكشف من [Wazuh and Suricata Integration Lab](/learn/hands-on-security-labs/wazuh-and-suricata-integration-lab)، ثم انتقل إلى [Attack Detection and Remediation Lab](/learn/hands-on-security-labs/attack-detection-and-remediation-lab) حيث يعمل الكشف والاستجابة معًا. وفي ملف أعمالك صِف الضوابط واختبارات الفشل لا السكربت وحده، فهذا ما يُظهر النضج الهندسي."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على جهاز بوابة وجهاز SIEM **تملكهما**:\n\n1. أنشئ مجموعة `blocklist` في nftables وقاعدة الإسقاط، وتأكد بالأمر `nft list ruleset`.\n2. احفظ السكربت وأنشئ المستخدم `autoblock` وشغّله تجريبيًا على تنبيهات حقيقية أو عيّنة.\n3. نفّذ خمس محاولات دخول SSH فاشلة من جهاز ثانٍ تملكه، وانتظر القاعدة 5712، ثم شغّل السكربت بـ `--apply`.\n4. تأكد أن الجهاز الثاني لم يعد يتصل، ثم انتظر انتهاء المهلة أو نفّذ `nft delete element` للتراجع.\n5. ضع عنوان الإدارة في تنبيه تجريبي وأثبت أنه لا يُحظر.\n6. اكتب مؤقّت systemd وخدمته، وشغّل `systemctl list-timers`، واختبر مفتاح الإيقاف.\n7. دوّن في ملاحظة قصيرة الضابط الذي ستضيفه لاحقًا."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "الأتمتة",
+            "definition": "استخدام البرمجيات لأداء مهام متكررة باتساق وبجهد يدوي أقل."
+          },
+          {
+            "term": "التشغيل التجريبي",
+            "definition": "وضع يبلغ بما كان سيحدث دون تغيير أي شيء."
+          },
+          {
+            "term": "قائمة السماح",
+            "definition": "قائمة عناوين أو عناصر يجب ألا تتصرف الأتمتة عليها أبدًا."
+          },
+          {
+            "term": "قاطع الدائرة",
+            "definition": "حدّ يوقف الأتمتة عند سلوك غير طبيعي كعدد إجراءات مفرط في تشغيل واحد."
+          },
+          {
+            "term": "مجموعة nftables",
+            "definition": "مجموعة مسمّاة من العناوين تطابقها قواعد جدار الحماية، مع مهل اختيارية لكل عنصر."
+          },
+          {
+            "term": "سجل التدقيق",
+            "definition": "سجل لكل إجراء آلي مع وقته وسببه."
+          },
+          {
+            "term": "مؤقّت systemd",
+            "definition": "وحدة جدولة تشغّل خدمة على فترات محددة."
+          },
+          {
+            "term": "مفتاح الإيقاف",
+            "definition": "وسيلة سريعة موثّقة لإيقاف الأتمتة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا ينبغي أن يكون السكربت تجريبيًا افتراضيًا؟",
+            "options": [
+              "يعمل أسرع",
+              "تظهر الأخطاء كخرج لا كتغييرات في الإنتاج",
+              "يخفي السجلات",
+              "يحتاج صلاحيات أقل"
+            ],
+            "answer": 1,
+            "explanation": "يتيح التشغيل التجريبي لإنسان مراجعة القرارات قبل تغيير أي شيء."
+          },
+          {
+            "question": "أي الضوابط ينبغي أن تكون في سكربت الحظر الآلي؟ (اختر كل ما ينطبق)",
+            "options": [
+              "قائمة سماح بعناوين الإدارة",
+              "مهلة انتهاء لكل حظر",
+              "حظر دائم للتبسيط",
+              "حد لعدد الحظر في كل تشغيل"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "قائمة السماح والمهلة وقاطع الدائرة تحدّ ضرر القرار الخاطئ، أما الحظر الدائم فيحوّل الأخطاء إلى انقطاعات طويلة."
+          },
+          {
+            "question": "لماذا نحلّل عنوان المصدر بوحدة ipaddress بدل استخدام نص السجل مباشرة؟",
+            "options": [
+              "قد تحتوي حقول السجل نصًا يختاره المهاجم",
+              "تشترطه nftables",
+              "يشفّر العنوان",
+              "السجلات لا تحوي عناوين"
+            ],
+            "answer": 0,
+            "explanation": "بيانات السجل مدخلات غير موثوقة، والتحقق واستدعاء العمليات بصيغة قائمة يمنعان حقن الأوامر."
+          },
+          {
+            "question": "أين على سلّم الأتمتة ينبغي أن يبدأ سكربت جديد؟",
+            "options": [
+              "ينفّذ وحده فورًا",
+              "يبلغ أو يوصي ثم يكسب الثقة",
+              "يعطّل التسجيل",
+              "يعمل بـ root دون حدود"
+            ],
+            "answer": 1,
+            "explanation": "اصعد من الإبلاغ إلى التنفيذ المنفرد حين تُظهر السجلات صواب القرارات."
+          },
+          {
+            "question": "ما فائدة مهلة عنصر مجموعة nftables؟",
+            "options": [
+              "يزول الحظر ذاتيًا فلا حاجة إلى مهمة تنظيف",
+              "يسرّع الحزم",
+              "يشفّر الحركة",
+              "يحظر العنوان دائمًا"
+            ],
+            "answer": 0,
+            "explanation": "الحظر المنتهي يحدّ من ضرر الإيجابيات الكاذبة والإدخالات القديمة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nاخترت مهمة آمنة للأتمتة، وكتبت الضوابط قبل الشيفرة، وبنيت سكربت بايثون يتحقق من التنبيهات ويحترم قائمة السماح ويتوقف عند قاطع الدائرة ويسجل كل إجراء ويضيف حظرًا منتهيًا إلى مجموعة nftables. اختبرته تجريبيًا وجدولته بمؤقّت systemd وجرّبت مسارات الفشل. الأتمتة الجيدة مملّة وقابلة للتراجع. انقل هذا النمط إلى [Attack Detection and Remediation Lab](/learn/hands-on-security-labs/attack-detection-and-remediation-lab)."
+      }
+    ]
+  }
+}

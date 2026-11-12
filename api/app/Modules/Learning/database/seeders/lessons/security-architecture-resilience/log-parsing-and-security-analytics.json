@@ -1,0 +1,608 @@
+{
+  "slug": "log-parsing-and-security-analytics",
+  "title": "Log Parsing and Security Analytics",
+  "summary": "Parse, normalize and enrich raw logs with Python, jq and SQL, then write analytics that find brute force, odd logins and missing telemetry.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Describe the log pipeline from raw line to alert",
+    "Parse syslog and JSON logs into structured fields",
+    "Normalize fields and enrich events with context",
+    "Write queries that detect brute force followed by success",
+    "Test analytics for false positives and missing data"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Your SIEM holds two billion events, and an analyst needs to know one thing: did anyone log in successfully right after a burst of failures? The raw lines are a mix of syslog text, JSON from a cloud service and vendor formats nobody documented. Without parsing, the answer is a long afternoon of searching for strings.\n\nLog analytics is the discipline of turning messy text into trustworthy fields, then asking precise questions of those fields. In this lesson you will parse real log shapes, normalize and enrich them, and write analytics you can test. The tools shown are plain Python, jq and SQL, because the same ideas carry to Splunk, Elastic, Sentinel or any other platform."
+    },
+    {
+      "id": "pipeline",
+      "type": "text",
+      "markdown": "## The log pipeline\n\nEvery log platform performs the same five stages, whatever the vendor calls them.\n\n| Stage | Purpose | Example |\n|:--|:--|:--|\n| Collect | Move lines off the source reliably | Agent, syslog over TCP/TLS |\n| Parse | Split text into named fields | Regex, grok, JSON decode |\n| Normalize | Use one name per concept | `src_ip` everywhere, not `IpAddress` or `client` |\n| Enrich | Add context | Asset owner, GeoIP, threat intelligence |\n| Detect | Apply rules and queries | Threshold, sequence, rare value |\n\nMost analytic failures are earlier than the rule. A rule on `src_ip` returns nothing if one source calls the field `ClientAddress`. A clock skew of three minutes breaks a \"within five minutes\" sequence. Store the raw line next to the parsed fields so you can always re-parse after fixing a bug."
+    },
+    {
+      "id": "pipeline-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "From raw line to alert",
+      "data": {
+        "token": "Log line",
+        "nodes": [
+          {
+            "id": "src",
+            "label": "Source",
+            "sub": "s",
+            "icon": "server"
+          },
+          {
+            "id": "parse",
+            "label": "Parser",
+            "sub": "r",
+            "icon": "cpu"
+          },
+          {
+            "id": "norm",
+            "label": "Normalizer",
+            "sub": "c",
+            "icon": "file"
+          },
+          {
+            "id": "enrich",
+            "label": "Enricher",
+            "sub": "o",
+            "icon": "globe"
+          },
+          {
+            "id": "det",
+            "label": "Detection",
+            "sub": "q",
+            "icon": "eye"
+          },
+          {
+            "id": "soc",
+            "label": "Analyst",
+            "sub": "c",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "src",
+            "caption": "sshd writes: Failed password for admin from 198.51.100.23."
+          },
+          {
+            "at": "parse",
+            "caption": "The parser extracts user, source address, port and timestamp.",
+            "tone": "secure"
+          },
+          {
+            "at": "norm",
+            "caption": "Fields are renamed to `user.name` and `src_ip`; time becomes UTC."
+          },
+          {
+            "at": "enrich",
+            "caption": "The address is tagged external and the account tagged privileged.",
+            "tone": "warning"
+          },
+          {
+            "at": "det",
+            "caption": "Twenty failures followed by one success trips the rule.",
+            "tone": "danger"
+          },
+          {
+            "at": "soc",
+            "caption": "A case opens with the timeline and the raw lines attached.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "parse",
+      "type": "text",
+      "markdown": "## Parsing text and JSON\n\nStart with the log you actually have. A syslog line from `sshd` looks like this:\n\n`Nov 12 02:14:07 web01 sshd[2211]: Failed password for invalid user admin from 198.51.100.23 port 51842 ssh2`\n\nA regular expression with **named groups** turns it into fields. Keep the pattern anchored and tested; an unanchored pattern is slow and matches the wrong lines. Always provide a path for lines that do not match, and count them. A rising unparsed count is how you notice a format change after an upgrade.\n\nJSON logs are easier: decode them and select fields with `jq`. The risk there is different. Fields can be missing or have different types between events, so use defaults instead of assuming each key exists."
+    },
+    {
+      "id": "parser-py",
+      "type": "code",
+      "language": "python",
+      "filename": "parse_auth.py",
+      "caption": "Named groups give field names. Unmatched lines are counted rather than dropped silently.",
+      "code": "import re, sys, json\nfrom datetime import datetime\n\nPATTERN = re.compile(\n    r\"^(?P<ts>\\w{3}\\s+\\d+ [\\d:]{8}) (?P<host>\\S+) sshd\\[\\d+\\]: \"\n    r\"(?P<result>Failed|Accepted) (?P<method>\\w+) for (?:invalid user )?\"\n    r\"(?P<user>\\S+) from (?P<src_ip>[\\d.]+) port (?P<port>\\d+)\"\n)\nunparsed = 0\nfor line in sys.stdin:\n    m = PATTERN.match(line)\n    if not m:\n        unparsed += 1\n        continue\n    e = m.groupdict()\n    e[\"ts\"] = datetime.strptime(f\"2026 {e['ts']}\", \"%Y %b %d %H:%M:%S\").isoformat()\n    e[\"outcome\"] = \"failure\" if e.pop(\"result\") == \"Failed\" else \"success\"\n    print(json.dumps(e))\nprint(f\"unparsed={unparsed}\", file=sys.stderr)\n",
+      "highlight": [
+        4,
+        5,
+        11,
+        12,
+        13
+      ]
+    },
+    {
+      "id": "parse-run",
+      "type": "terminal",
+      "title": "Parsing and querying",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "python parse_auth.py < auth.log > events.ndjson",
+          "output": "unparsed=2",
+          "comment": "Two lines did not match, perhaps from another daemon. Inspect them before trusting the totals."
+        },
+        {
+          "cmd": "jq -r 'select(.outcome==\"failure\") | .src_ip' events.ndjson | sort | uniq -c | sort -rn | head -3",
+          "output": "     47 198.51.100.23\n      3 203.0.113.9\n      1 192.0.2.77",
+          "comment": "One source made 47 failures. That is the lead to pursue."
+        },
+        {
+          "cmd": "jq -c 'select(.src_ip==\"198.51.100.23\" and .outcome==\"success\")' events.ndjson",
+          "output": "{\"ts\":\"2026-11-12T02:16:41\",\"host\":\"web01\",\"method\":\"password\",\"user\":\"admin\",\"src_ip\":\"198.51.100.23\",\"port\":\"51901\",\"outcome\":\"success\"}",
+          "comment": "A success from the same source after the burst. This is the high-value finding."
+        }
+      ],
+      "caption": "Example data using a documentation address range. Lines and counts are illustrative."
+    },
+    {
+      "id": "enrich",
+      "type": "text",
+      "markdown": "## Normalizing and enriching\n\n**Normalization** maps vendor fields to one schema. Pick a standard, such as Elastic Common Schema or OCSF, and keep a mapping table per source. Convert all times to UTC ISO 8601 at parse time and record the source time zone if it is not obvious.\n\n**Enrichment** adds context the log does not contain:\n\n- asset criticality and owner from your inventory\n- whether the account is privileged, from your directory\n- GeoIP and reputation for external addresses\n- whether the address belongs to a known scanner or VPN\n\nEnrich at ingest for stable facts (asset owner) and at query time for facts that change (reputation). Never enrich with private data you would not show an analyst. The identity context in [identity threat detection and response](/learn/security-architecture-resilience/identity-threat-detection-and-response) is a good example of what makes a login event meaningful."
+    },
+    {
+      "id": "analytics",
+      "type": "text",
+      "markdown": "## Writing analytics that work\n\nA useful detection states a **behavior**, a **window** and a **threshold**, and says what it will ignore.\n\n| Pattern | Question it answers | Typical use |\n|:--|:--|:--|\n| Threshold | Too many of one thing? | Failed logons per source |\n| Sequence | Did B follow A? | Failures then success |\n| Rare value | Is this new? | First login from a country |\n| Absence | Did expected data stop? | No logs from a firewall for 15 minutes |\n| Ratio | Is the mix unusual? | High share of 4xx errors |\n\nThe example query finds a sequence: five or more failures from a source followed by a success within ten minutes. Run it on historical data first and count the hits. If it fires 300 times a day, add exclusions for known scanners and service accounts, or raise the threshold, before sending it to the on-call queue. See [authentication anomaly detection](/learn/security-architecture-resilience/authentication-anomaly-detection) for related patterns."
+    },
+    {
+      "id": "sql-detect",
+      "type": "code",
+      "language": "sql",
+      "filename": "brute_force_then_success.sql",
+      "caption": "A sequence detection in generic SQL. Adapt the date functions to your platform; the logic carries over to SPL, KQL or ES|QL.",
+      "code": "WITH failures AS (\n  SELECT src_ip, user_name, COUNT(*) AS fails, MAX(ts) AS last_fail\n  FROM auth_events\n  WHERE outcome = 'failure' AND ts > NOW() - INTERVAL '1 hour'\n  GROUP BY src_ip, user_name\n  HAVING COUNT(*) >= 5\n)\nSELECT s.ts, s.host, s.user_name, s.src_ip, f.fails\nFROM auth_events s\nJOIN failures f\n  ON s.src_ip = f.src_ip AND s.user_name = f.user_name\nWHERE s.outcome = 'success'\n  AND s.ts BETWEEN f.last_fail AND f.last_fail + INTERVAL '10 minutes'\nORDER BY s.ts DESC;\n",
+      "highlight": [
+        6,
+        12,
+        13
+      ]
+    },
+    {
+      "id": "quality",
+      "type": "text",
+      "markdown": "## Testing and measuring quality\n\nAn analytic is software, so test it.\n\n1. **Positive test.** Replay a known bad sample and confirm an alert. Generate the sample yourself in a lab; never rely on production incidents for testing.\n2. **Negative test.** Replay a day of normal traffic and count false positives.\n3. **Coverage test.** For each source, count events per hour and alert when the number drops to zero.\n4. **Parser test.** Keep a file of sample lines with the expected fields and run it in CI whenever a parser changes.\n\nTrack three numbers per rule: alerts per week, the share closed as benign, and the median time to triage. A rule with a 95 percent benign rate is a candidate for tuning or retirement. Treat the rules themselves as code, an idea developed in [detection as code](/learn/security-architecture-resilience/detection-as-code)."
+    },
+    {
+      "id": "retention",
+      "type": "callout",
+      "variant": "note",
+      "title": "Retention and privacy",
+      "markdown": "Logs often contain usernames, addresses and sometimes pasted secrets, so treat the log store as sensitive data. Decide retention by need: perhaps 90 days of hot, searchable data for investigations and a year of cheaper archive for compliance. Restrict who can read raw logs, mask tokens and passwords at ingest, and make the store append-only so an intruder cannot erase their own trail. Good retention policy balances investigation value against exposure and cost."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common mistakes",
+      "markdown": "- **Ignoring time zones.** Mixing local time and UTC creates false sequences and missed ones.\n- **Dropping unparsed lines.** Silent loss is invisible loss; count and review them.\n- **Parsing with unanchored, greedy regexes** that are slow and match wrongly.\n- **Searching raw text** for IP addresses and missing the same address in another field name.\n- **Putting secrets or full personal data** into searchable fields and dashboards."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use the `/var/log/auth.log` of a Linux VM you own (or create a sample file).\n\n1. Generate a few failed logins to a lab account from a second VM, then one successful login.\n2. Save `parse_auth.py` and run it on the log. Check the `unparsed` count and look at those lines.\n3. Use the `jq` commands to find the busiest source and the success that followed.\n4. Load the NDJSON into SQLite or DuckDB and adapt the SQL query to find the same sequence.\n5. Raise the threshold from 5 to 50 and note what you stop seeing."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Parsing",
+          "definition": "Splitting a raw log line into named fields."
+        },
+        {
+          "term": "Normalization",
+          "definition": "Mapping different field names to one common schema."
+        },
+        {
+          "term": "Enrichment",
+          "definition": "Adding context such as owner, geography or reputation."
+        },
+        {
+          "term": "NDJSON",
+          "definition": "Newline-delimited JSON, one event per line."
+        },
+        {
+          "term": "ECS / OCSF",
+          "definition": "Open schemas that standardize security event field names."
+        },
+        {
+          "term": "Sequence detection",
+          "definition": "A rule that matches events in a specific order within a time window."
+        },
+        {
+          "term": "False positive",
+          "definition": "An alert raised on benign activity."
+        },
+        {
+          "term": "Coverage",
+          "definition": "The set of systems whose logs actually reach the analytics platform."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why store the raw log line next to parsed fields?",
+          "options": [
+            "To use more disk",
+            "So you can re-parse after fixing a parser bug",
+            "Because JSON requires it",
+            "To avoid normalization"
+          ],
+          "answer": 1,
+          "explanation": "Parsers have bugs and formats change. The raw line is the source of truth for reprocessing."
+        },
+        {
+          "question": "Which are stages of the log pipeline? (Choose all that apply.)",
+          "options": [
+            "Parse",
+            "Normalize",
+            "Enrich",
+            "Format the disk"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Collect, parse, normalize, enrich and detect are the stages. Disk formatting is unrelated."
+        },
+        {
+          "question": "What does the sequence rule in the lesson detect?",
+          "options": [
+            "Many failures followed by a success from the same source",
+            "A single failed login",
+            "A change in disk usage",
+            "A new DNS record"
+          ],
+          "answer": 0,
+          "explanation": "This pattern suggests a password guessing attempt that may have succeeded."
+        },
+        {
+          "question": "A rule returns no results although attacks occurred. What is a likely cause?",
+          "options": [
+            "The field names differ between sources",
+            "The attacker was too fast",
+            "Logs are too detailed",
+            "The network is encrypted"
+          ],
+          "answer": 0,
+          "explanation": "Without normalization, a query on `src_ip` misses sources that call it something else."
+        },
+        {
+          "question": "How do you detect that a log source has silently stopped?",
+          "options": [
+            "Alert when its event count falls to zero for a window",
+            "Wait for users to complain",
+            "Delete its old logs",
+            "Raise the threshold"
+          ],
+          "answer": 0,
+          "explanation": "Absence detection catches broken forwarders and attackers who disable logging."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nLog analytics is a pipeline: collect, parse, normalize, enrich and detect. Most failures happen before the rule, in field names, clocks and unparsed lines, so test parsers and watch coverage. Write detections that state a behavior, a window and a threshold, replay them against both bad and normal data, and measure their benign rate. Continue with [automated vulnerability reporting](/learn/security-architecture-resilience/automated-vulnerability-reporting) to apply the same automation mindset to exposure data."
+    }
+  ],
+  "ar": {
+    "title": "تحليل السجلات والتحليلات الأمنية",
+    "summary": "حلّل السجلات الخام ووحّد صيغتها وأثرِها باستخدام Python وjq وSQL، ثم اكتب تحليلات تجد القوة الغاشمة وعمليات الدخول الغريبة والقياسات المفقودة.",
+    "objectives": [
+      "وصف مسار السجل من السطر الخام إلى التنبيه",
+      "تحليل سجلات syslog وJSON إلى حقول منظّمة",
+      "توحيد الحقول وإثراء الأحداث بالسياق",
+      "كتابة استعلامات تكشف القوة الغاشمة المتبوعة بنجاح",
+      "اختبار التحليلات لمعرفة الإيجابيات الكاذبة والبيانات المفقودة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يضم نظام SIEM لديك ملياري حدث، ويحتاج المحلل إلى معرفة أمر واحد: هل سجّل أحدهم الدخول بنجاح بعد سيل من الإخفاقات مباشرة؟ الأسطر الخام خليط من نص syslog وJSON من خدمة سحابية وصيغ موردين لم يوثّقها أحد. ودون تحليل تصبح الإجابة عصرًا طويلًا من البحث عن سلاسل نصية.\n\nتحليل السجلات هو فن تحويل النص الفوضوي إلى حقول موثوقة، ثم طرح أسئلة دقيقة عليها. في هذا الدرس ستحلّل أشكال سجلات حقيقية، وتوحّد صيغتها وتثريها، وتكتب تحليلات يمكنك اختبارها. الأدوات المعروضة هي Python العادي وjq وSQL لأن الأفكار نفسها تنتقل إلى Splunk وElastic وSentinel وأي منصة أخرى."
+      },
+      {
+        "id": "pipeline",
+        "type": "text",
+        "markdown": "## مسار السجل\n\nتؤدي كل منصة سجلات المراحل الخمس نفسها مهما سمّاها المورد.\n\n| المرحلة | الغرض | مثال |\n|:--|:--|:--|\n| الجمع | نقل الأسطر من المصدر بموثوقية | وكيل أو syslog عبر TCP/TLS |\n| التحليل | تقسيم النص إلى حقول مسمّاة | تعبير نمطي أو grok أو فك JSON |\n| التوحيد | اسم واحد لكل مفهوم | `src_ip` في كل مكان لا `IpAddress` أو `client` |\n| الإثراء | إضافة السياق | مالك الأصل وGeoIP واستخبارات التهديد |\n| الكشف | تطبيق القواعد والاستعلامات | عتبة أو تسلسل أو قيمة نادرة |\n\nمعظم إخفاقات التحليل تقع قبل القاعدة. تُعيد القاعدة المبنية على `src_ip` نتيجة فارغة إذا سمّى مصدر الحقل `ClientAddress`. وانحراف ساعة بثلاث دقائق يكسر تسلسل «خلال خمس دقائق». احفظ السطر الخام بجانب الحقول المحللة لتستطيع إعادة التحليل بعد إصلاح الخطأ."
+      },
+      {
+        "id": "pipeline-flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "من السطر الخام إلى التنبيه",
+        "data": {
+          "token": "سطر سجل",
+          "nodes": [
+            {
+              "id": "src",
+              "label": "المصدر",
+              "sub": "s",
+              "icon": "server"
+            },
+            {
+              "id": "parse",
+              "label": "المحلِّل",
+              "sub": "e",
+              "icon": "cpu"
+            },
+            {
+              "id": "norm",
+              "label": "الموحِّد",
+              "sub": "o",
+              "icon": "file"
+            },
+            {
+              "id": "enrich",
+              "label": "المُثري",
+              "sub": "w",
+              "icon": "globe"
+            },
+            {
+              "id": "det",
+              "label": "الكشف",
+              "sub": "u",
+              "icon": "eye"
+            },
+            {
+              "id": "soc",
+              "label": "المحلل",
+              "sub": "a",
+              "icon": "user"
+            }
+          ],
+          "steps": [
+            {
+              "at": "src",
+              "caption": "يكتب sshd: Failed password for admin from 198.51.100.23."
+            },
+            {
+              "at": "parse",
+              "caption": "يستخرج المحلِّل المستخدم وعنوان المصدر والمنفذ والطابع الزمني.",
+              "tone": "secure"
+            },
+            {
+              "at": "norm",
+              "caption": "تُعاد تسمية الحقول إلى `user.name` و`src_ip` ويتحول الوقت إلى UTC."
+            },
+            {
+              "at": "enrich",
+              "caption": "يُوسم العنوان بأنه خارجي ويُوسم الحساب بأنه ذو امتيازات.",
+              "tone": "warning"
+            },
+            {
+              "at": "det",
+              "caption": "عشرون إخفاقًا يليها نجاح واحد تُطلق القاعدة.",
+              "tone": "danger"
+            },
+            {
+              "at": "soc",
+              "caption": "تُفتح حالة ومعها الخط الزمني والأسطر الخام.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "parse",
+        "type": "text",
+        "markdown": "## تحليل النص وJSON\n\nابدأ بالسجل الذي تملكه فعلًا. يبدو سطر syslog من `sshd` هكذا:\n\n`Nov 12 02:14:07 web01 sshd[2211]: Failed password for invalid user admin from 198.51.100.23 port 51842 ssh2`\n\nيحوّل التعبير النمطي ذو **المجموعات المسمّاة** هذا السطر إلى حقول. اجعل النمط مثبَّتًا ومختبرًا؛ فالنمط غير المثبَّت بطيء ويطابق أسطرًا خاطئة. وفّر دائمًا مسارًا للأسطر غير المطابقة وعُدّها. ارتفاع عدد الأسطر غير المحللة هو ما ينبهك إلى تغيّر الصيغة بعد ترقية.\n\nسجلات JSON أسهل: فكّها واختر الحقول بـ `jq`. لكن الخطر هنا مختلف، فقد تغيب الحقول أو تختلف أنواعها بين الأحداث، لذا استخدم قيمًا افتراضية بدل افتراض وجود كل مفتاح."
+      },
+      {
+        "id": "parser-py",
+        "type": "code",
+        "language": "python",
+        "filename": "parse_auth.py",
+        "caption": "تمنح المجموعات المسمّاة أسماء للحقول. تُعدّ الأسطر غير المطابقة بدل إسقاطها بصمت.",
+        "code": "import re, sys, json\nfrom datetime import datetime\n\nPATTERN = re.compile(\n    r\"^(?P<ts>\\w{3}\\s+\\d+ [\\d:]{8}) (?P<host>\\S+) sshd\\[\\d+\\]: \"\n    r\"(?P<result>Failed|Accepted) (?P<method>\\w+) for (?:invalid user )?\"\n    r\"(?P<user>\\S+) from (?P<src_ip>[\\d.]+) port (?P<port>\\d+)\"\n)\nunparsed = 0\nfor line in sys.stdin:\n    m = PATTERN.match(line)\n    if not m:\n        unparsed += 1\n        continue\n    e = m.groupdict()\n    e[\"ts\"] = datetime.strptime(f\"2026 {e['ts']}\", \"%Y %b %d %H:%M:%S\").isoformat()\n    e[\"outcome\"] = \"failure\" if e.pop(\"result\") == \"Failed\" else \"success\"\n    print(json.dumps(e))\nprint(f\"unparsed={unparsed}\", file=sys.stderr)\n",
+        "highlight": [
+          4,
+          5,
+          11,
+          12,
+          13
+        ]
+      },
+      {
+        "id": "parse-run",
+        "type": "terminal",
+        "title": "التحليل والاستعلام",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "python parse_auth.py < auth.log > events.ndjson",
+            "output": "unparsed=2",
+            "comment": "سطران لم يطابقا، ربما من خدمة أخرى. افحصهما قبل الوثوق بالمجاميع."
+          },
+          {
+            "cmd": "jq -r 'select(.outcome==\"failure\") | .src_ip' events.ndjson | sort | uniq -c | sort -rn | head -3",
+            "output": "     47 198.51.100.23\n      3 203.0.113.9\n      1 192.0.2.77",
+            "comment": "مصدر واحد أجرى 47 إخفاقًا. هذا هو الخيط الذي يُتتبَّع."
+          },
+          {
+            "cmd": "jq -c 'select(.src_ip==\"198.51.100.23\" and .outcome==\"success\")' events.ndjson",
+            "output": "{\"ts\":\"2026-11-12T02:16:41\",\"host\":\"web01\",\"method\":\"password\",\"user\":\"admin\",\"src_ip\":\"198.51.100.23\",\"port\":\"51901\",\"outcome\":\"success\"}",
+            "comment": "نجاح من المصدر نفسه بعد السيل. هذه هي النتيجة عالية القيمة."
+          }
+        ],
+        "caption": "بيانات توضيحية بنطاق عناوين للتوثيق. الأسطر والأعداد للتمثيل."
+      },
+      {
+        "id": "enrich",
+        "type": "text",
+        "markdown": "## التوحيد والإثراء\n\n**التوحيد (Normalization)** يربط حقول الموردين بمخطط واحد. اختر معيارًا مثل Elastic Common Schema أو OCSF واحتفظ بجدول ربط لكل مصدر. حوّل كل الأوقات إلى UTC بصيغة ISO 8601 عند التحليل وسجّل المنطقة الزمنية للمصدر إذا لم تكن واضحة.\n\n**الإثراء (Enrichment)** يضيف سياقًا لا يحتويه السجل:\n\n- أهمية الأصل ومالكه من جردك\n- هل الحساب ذو امتيازات، من دليلك\n- GeoIP والسمعة للعناوين الخارجية\n- هل العنوان لماسح معروف أو VPN\n\nأثرِ عند الاستيعاب للحقائق الثابتة (مالك الأصل) وعند الاستعلام للحقائق المتغيرة (السمعة). ولا تثرِ ببيانات خاصة لا تريد عرضها على المحلل. والسياق الهوياتي في درس [كشف التهديدات الهوياتية والاستجابة لها](/learn/security-architecture-resilience/identity-threat-detection-and-response) مثال جيد على ما يمنح حدث الدخول معناه."
+      },
+      {
+        "id": "analytics",
+        "type": "text",
+        "markdown": "## كتابة تحليلات تعمل\n\nيحدد الكشف المفيد **سلوكًا** و**نافذة** و**عتبة**، ويذكر ما سيتجاهله.\n\n| النمط | السؤال الذي يجيب عنه | الاستخدام المعتاد |\n|:--|:--|:--|\n| العتبة | هل كثر شيء واحد؟ | إخفاقات الدخول لكل مصدر |\n| التسلسل | هل جاء B بعد A؟ | إخفاقات ثم نجاح |\n| القيمة النادرة | هل هذا جديد؟ | أول دخول من بلد ما |\n| الغياب | هل توقفت بيانات متوقعة؟ | لا سجلات من جدار حماية لمدة 15 دقيقة |\n| النسبة | هل المزيج غير معتاد؟ | حصة مرتفعة من أخطاء 4xx |\n\nيجد الاستعلام التالي تسلسلًا: خمسة إخفاقات أو أكثر من مصدر يتبعها نجاح خلال عشر دقائق. شغّله أولًا على بيانات تاريخية وعُدّ النتائج. وإذا أُطلق 300 مرة يوميًا فأضف استثناءات للماسحات المعروفة وحسابات الخدمة، أو ارفع العتبة، قبل إرساله إلى طابور المناوب. راجع [كشف شذوذ المصادقة](/learn/security-architecture-resilience/authentication-anomaly-detection) لأنماط ذات صلة."
+      },
+      {
+        "id": "sql-detect",
+        "type": "code",
+        "language": "sql",
+        "filename": "brute_force_then_success.sql",
+        "caption": "كشف تسلسل بـ SQL عام. كيّف دوال التاريخ مع منصتك؛ فالمنطق ينتقل إلى SPL وKQL وES|QL.",
+        "code": "WITH failures AS (\n  SELECT src_ip, user_name, COUNT(*) AS fails, MAX(ts) AS last_fail\n  FROM auth_events\n  WHERE outcome = 'failure' AND ts > NOW() - INTERVAL '1 hour'\n  GROUP BY src_ip, user_name\n  HAVING COUNT(*) >= 5\n)\nSELECT s.ts, s.host, s.user_name, s.src_ip, f.fails\nFROM auth_events s\nJOIN failures f\n  ON s.src_ip = f.src_ip AND s.user_name = f.user_name\nWHERE s.outcome = 'success'\n  AND s.ts BETWEEN f.last_fail AND f.last_fail + INTERVAL '10 minutes'\nORDER BY s.ts DESC;\n",
+        "highlight": [
+          6,
+          12,
+          13
+        ]
+      },
+      {
+        "id": "quality",
+        "type": "text",
+        "markdown": "## الاختبار وقياس الجودة\n\nالتحليل برمجية، فاختبره.\n\n1. **اختبار إيجابي.** أعد تشغيل عينة سيئة معروفة وتأكد من إطلاق تنبيه. ولّد العينة بنفسك في مختبر؛ ولا تعتمد على حوادث الإنتاج في الاختبار.\n2. **اختبار سلبي.** أعد تشغيل يوم من الحركة الطبيعية وعُدّ الإيجابيات الكاذبة.\n3. **اختبار التغطية.** لكل مصدر، عُدّ الأحداث في الساعة ونبّه عندما ينخفض العدد إلى الصفر.\n4. **اختبار المحلِّل.** احتفظ بملف أسطر نموذجية مع الحقول المتوقعة وشغّله في CI كلما تغيّر محلِّل.\n\nتتبّع ثلاثة أرقام لكل قاعدة: التنبيهات أسبوعيًا، ونسبة ما أُغلق بوصفه حميدًا، ووسيط زمن الفرز. القاعدة التي تبلغ نسبة الحميد فيها 95 بالمئة مرشحة للضبط أو الإحالة إلى التقاعد. وعامل القواعد نفسها بوصفها شيفرة، وهي فكرة تتوسع في [الكشف بوصفه شيفرة](/learn/security-architecture-resilience/detection-as-code)."
+      },
+      {
+        "id": "retention",
+        "type": "callout",
+        "variant": "note",
+        "title": "الاحتفاظ والخصوصية",
+        "markdown": "تحتوي السجلات غالبًا على أسماء مستخدمين وعناوين وأحيانًا أسرار ملصوقة، فعامل مخزن السجلات بوصفه بيانات حساسة. حدّد مدة الاحتفاظ بحسب الحاجة: ربما 90 يومًا من البيانات الساخنة القابلة للبحث للتحقيقات وسنة من أرشيف أرخص للامتثال. قيّد من يقرأ السجلات الخام، وأخفِ الرموز وكلمات المرور عند الاستيعاب، واجعل المخزن للإضافة فقط كي لا يمسح المتسلل أثره. توازن سياسة الاحتفاظ الجيدة بين قيمة التحقيق والتعرّض والتكلفة."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة",
+        "markdown": "- **إهمال المناطق الزمنية.** خلط التوقيت المحلي وUTC يخلق تسلسلات كاذبة ويفوّت أخرى حقيقية.\n- **إسقاط الأسطر غير المحللة.** الفقد الصامت فقد غير مرئي؛ عُدّها وراجعها.\n- **التحليل بتعابير نمطية غير مثبَّتة وجشعة** تكون بطيئة وتطابق خطأ.\n- **البحث في النص الخام** عن عناوين IP وتفويت العنوان نفسه تحت اسم حقل آخر.\n- **وضع أسرار أو بيانات شخصية كاملة** في حقول قابلة للبحث ولوحات المعلومات."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم الملف `/var/log/auth.log` من جهاز Linux افتراضي تملكه (أو أنشئ ملفًا نموذجيًا).\n\n1. ولّد بضع محاولات دخول فاشلة إلى حساب مخبري من جهاز ثانٍ، ثم دخولًا ناجحًا واحدًا.\n2. احفظ `parse_auth.py` وشغّله على السجل. افحص عدد `unparsed` وانظر إلى تلك الأسطر.\n3. استخدم أوامر `jq` لإيجاد المصدر الأكثر نشاطًا والنجاح الذي تلاه.\n4. حمّل ملف NDJSON في SQLite أو DuckDB وكيّف استعلام SQL لإيجاد التسلسل نفسه.\n5. ارفع العتبة من 5 إلى 50 ولاحظ ما توقفت عن رؤيته."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "التحليل (Parsing)",
+            "definition": "تقسيم سطر السجل الخام إلى حقول مسمّاة."
+          },
+          {
+            "term": "التوحيد",
+            "definition": "ربط أسماء الحقول المختلفة بمخطط مشترك واحد."
+          },
+          {
+            "term": "الإثراء",
+            "definition": "إضافة سياق مثل المالك أو الموقع الجغرافي أو السمعة."
+          },
+          {
+            "term": "NDJSON",
+            "definition": "JSON مفصول بأسطر جديدة، حدث واحد في كل سطر."
+          },
+          {
+            "term": "ECS / OCSF",
+            "definition": "مخططات مفتوحة توحّد أسماء حقول أحداث الأمن."
+          },
+          {
+            "term": "كشف التسلسل",
+            "definition": "قاعدة تطابق أحداثًا بترتيب محدد خلال نافذة زمنية."
+          },
+          {
+            "term": "إيجابي كاذب",
+            "definition": "تنبيه يُطلَق على نشاط حميد."
+          },
+          {
+            "term": "التغطية",
+            "definition": "مجموعة الأنظمة التي تصل سجلاتها فعلًا إلى منصة التحليل."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا نحفظ السطر الخام بجانب الحقول المحللة؟",
+            "options": [
+              "لاستهلاك مساحة أكبر",
+              "لتستطيع إعادة التحليل بعد إصلاح خطأ في المحلِّل",
+              "لأن JSON يتطلب ذلك",
+              "لتجنب التوحيد"
+            ],
+            "answer": 1,
+            "explanation": "للمحلِّلات أخطاء وتتغير الصيغ. السطر الخام هو مصدر الحقيقة لإعادة المعالجة."
+          },
+          {
+            "question": "أي مما يلي من مراحل مسار السجل؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "التحليل",
+              "التوحيد",
+              "الإثراء",
+              "تهيئة القرص"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الجمع والتحليل والتوحيد والإثراء والكشف هي المراحل. أما تهيئة القرص فلا علاقة لها."
+          },
+          {
+            "question": "ماذا تكشف قاعدة التسلسل في الدرس؟",
+            "options": [
+              "إخفاقات كثيرة يتبعها نجاح من المصدر نفسه",
+              "محاولة دخول فاشلة واحدة",
+              "تغيّر في استخدام القرص",
+              "سجل DNS جديد"
+            ],
+            "answer": 0,
+            "explanation": "يوحي هذا النمط بمحاولة تخمين كلمة مرور ربما نجحت."
+          },
+          {
+            "question": "تُعيد قاعدة نتيجة فارغة رغم وقوع هجمات. ما السبب المرجّح؟",
+            "options": [
+              "اختلاف أسماء الحقول بين المصادر",
+              "كان المهاجم سريعًا جدًا",
+              "السجلات مفصّلة أكثر من اللازم",
+              "الشبكة مشفّرة"
+            ],
+            "answer": 0,
+            "explanation": "دون توحيد يفوّت استعلام `src_ip` المصادر التي تسميه باسم آخر."
+          },
+          {
+            "question": "كيف تكشف أن مصدر سجلات توقف بصمت؟",
+            "options": [
+              "نبّه عندما ينخفض عدد أحداثه إلى صفر خلال نافذة",
+              "انتظر شكاوى المستخدمين",
+              "احذف سجلاته القديمة",
+              "ارفع العتبة"
+            ],
+            "answer": 0,
+            "explanation": "يلتقط كشف الغياب المُرسِلات المعطلة والمهاجمين الذين يعطّلون التسجيل."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتحليل السجلات مسار: جمع، فتحليل، فتوحيد، فإثراء، فكشف. تقع معظم الإخفاقات قبل القاعدة، في أسماء الحقول والساعات والأسطر غير المحللة، لذا اختبر المحلِّلات وراقب التغطية. اكتب كشوفات تحدد سلوكًا ونافذة وعتبة، وأعد تشغيلها على بيانات سيئة وأخرى طبيعية، وقِس نسبة ما يُغلق منها بوصفه حميدًا. تابع مع [الإبلاغ الآلي عن الثغرات](/learn/security-architecture-resilience/automated-vulnerability-reporting) لتطبيق عقلية الأتمتة نفسها على بيانات التعرّض."
+      }
+    ]
+  }
+}

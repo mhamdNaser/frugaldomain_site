@@ -1,0 +1,556 @@
+{
+  "slug": "advanced-network-traffic-analysis",
+  "title": "Advanced Network Traffic Analysis",
+  "summary": "Learn to analyze network traffic at scale: choose between full packets, flow records and protocol logs, read Zeek logs, spot beaconing and DNS tunneling by behavior, and handle encrypted traffic with metadata.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Compare full packet capture, flow records and protocol logs",
+    "Read Zeek conn.log and dns.log to answer investigation questions",
+    "Detect beaconing and DNS tunneling from behavioral statistics",
+    "Analyze encrypted traffic using TLS metadata and JA3/JA4 fingerprints",
+    "Apply a repeatable network analysis workflow on traffic you are authorized to inspect"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "An analyst receives an alert: a workstation in the finance VLAN contacted an unfamiliar external host at 02:00. The EDR shows nothing unusual, and the user was asleep. The only witness is the network. Endpoints can be tampered with, but a packet that crossed your sensor was really sent, and that makes network data a strong second source of truth.\n\nThis lesson builds on the basics in [Security Monitoring Architecture](/learn/security-operations-dfir/security-monitoring-architecture) and moves from reading single packets to analyzing behavior across millions of connections. Work only on traffic from networks you own or are authorized to inspect."
+    },
+    {
+      "id": "data",
+      "type": "text",
+      "markdown": "## Three kinds of network evidence\n\nNo team can keep every packet forever, so you choose a mix. Each source answers different questions at a different cost.\n\n| Source | What it holds | Storage cost | Best for |\n|:--|:--|:--|:--|\n| **Full packet capture (PCAP)** | Every byte, including payloads | Very high | Deep dives, file extraction, proof |\n| **Flow records (NetFlow/IPFIX)** | Who talked to whom, ports, bytes, duration | Very low | Long retention, volume and scope questions |\n| **Protocol logs (Zeek, Suricata EVE)** | Parsed metadata: DNS names, HTTP hosts, TLS details | Low to medium | Hunting, enrichment, SIEM search |\n\nA common design keeps protocol logs for 12 months, flows for a similar period, and PCAP only for a rolling few days or for selected segments such as the DMZ. When an alert fires, a short on-demand capture can supplement the logs.\n\nPlace sensors where traffic is concentrated: the internet edge, data center ingress, and between sensitive zones. East-west traffic inside the network matters as much as the perimeter, because attackers spend most of their time moving laterally."
+    },
+    {
+      "id": "zeek",
+      "type": "text",
+      "markdown": "## Reading Zeek logs\n\nZeek turns raw packets into structured logs. Two files answer most questions. `conn.log` has one row per connection (addresses, ports, duration, bytes, state). `dns.log` has one row per query with the name asked and the answer returned. Every row carries a `uid` that ties all logs for one connection together.\n\nStart with the question, not the tool. \"Which internal hosts sent more than 100 MB outbound last night?\" is a `conn.log` aggregation. \"Did anyone resolve this domain?\" is a `dns.log` filter. The terminal below uses `zeek-cut` to extract columns from a log of a lab network."
+    },
+    {
+      "id": "zeek-term",
+      "type": "terminal",
+      "title": "Top outbound talkers",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "cat conn.log | zeek-cut id.orig_h id.resp_h id.resp_p orig_bytes | awk '$4>100000000' | sort -k4 -nr | head -3",
+          "output": "192.168.20.14  203.0.113.50  443  412883201\n192.168.20.77  198.51.100.9  22   180442910\n192.168.20.14  203.0.113.50  8443 15002211",
+          "comment": "Extract four columns, keep rows over 100 MB sent, sort by bytes."
+        },
+        {
+          "cmd": "cat dns.log | zeek-cut id.orig_h query answers | grep update-check.example.net",
+          "output": "192.168.20.14  update-check.example.net  203.0.113.50",
+          "comment": "Host 192.168.20.14 resolved the same destination, a pivot for scoping."
+        }
+      ],
+      "caption": "Output from a lab network using documentation addresses."
+    },
+    {
+      "id": "behavior",
+      "type": "text",
+      "markdown": "## Finding beaconing\n\nMalware that checks in with a server must call home repeatedly. Even with random jitter, a human rarely connects to the same host every 60 seconds for 12 hours. Beaconing detection measures **regularity**.\n\nFor each source and destination pair, collect connection timestamps, compute the gaps between them, and look at the spread. A low standard deviation relative to the average gap, with many connections and small, similar byte counts, is suspicious. Legitimate software such as update agents and NTP also beacon, so always compare against an allow list of known services.\n\n### DNS tunneling\n\nData hidden in DNS shows up as many long, high-entropy subdomains under one parent domain, a large share of TXT queries, or one host making thousands of unique names. Count unique subdomains per parent domain per host per hour, then review the outliers.\n\nNeither detection proves compromise. Each gives you a ranked list of suspects, and context decides: is the destination new, is the process known, is the host sensitive?"
+    },
+    {
+      "id": "beacon-py",
+      "type": "code",
+      "language": "python",
+      "code": "import statistics as st\nfrom collections import defaultdict\n\npairs = defaultdict(list)\nfor ts, src, dst in rows:          # rows parsed from conn.log\n    pairs[(src, dst)].append(ts)\n\nfor (src, dst), t in pairs.items():\n    if len(t) < 30:\n        continue                   # too few samples to judge\n    t.sort()\n    gaps = [b - a for a, b in zip(t, t[1:])]\n    cv = st.pstdev(gaps) / st.mean(gaps)   # coefficient of variation\n    if cv < 0.15:                  # very regular\n        print(f\"{src} -> {dst} n={len(t)} mean_gap={st.mean(gaps):.0f}s cv={cv:.2f}\")",
+      "filename": "beacon_score.py",
+      "caption": "A simple regularity score. Tune the thresholds on your own baseline."
+    },
+    {
+      "id": "tls",
+      "type": "text",
+      "markdown": "## Encrypted traffic\n\nMost traffic is now TLS, so payloads are hidden. Metadata remains visible and useful:\n\n- **SNI and certificate fields**: the requested server name, issuer, validity period and whether the certificate is self-signed.\n- **JA3/JA4 fingerprints**: a hash of how a client builds its TLS handshake. Different software produces different fingerprints, so an unusual one from a server that normally runs only a browser deserves a look.\n- **Timing and size patterns**: connection duration, byte ratio and packet sizes reveal behavior such as uploads or interactive sessions.\n\nDecrypting traffic at a proxy is possible, but it brings privacy, legal and operational duties. Metadata analysis gives you detection value without those costs, so use it first."
+    },
+    {
+      "id": "pairing",
+      "type": "text",
+      "markdown": "## Pairing Zeek with Suricata\n\nZeek and Suricata complement each other. Suricata matches known signatures and writes alerts to `eve.json`. Zeek describes everything that happened, including the traffic that triggered no alert. An alert tells you where to look, and Zeek tells you what else the same host did before and after.\n\nA practical routine is to take the `community_id` from the Suricata alert, search for it in Zeek logs and in flow records, and build a short timeline: first contact, volume, protocols used and last contact. Ten minutes on this timeline usually decides whether the alert is noise or the start of an incident.\n\n### Common pitfalls\n\n- **Blind spots**: a sensor on the wrong span port, or a tap that drops packets under load, silently hides traffic. Check the sensor's drop counters every week.\n- **Clock drift**: logs from devices with different clocks cannot be correlated. Use NTP everywhere.\n- **NAT and proxies**: behind a proxy, many users share one source address. Join proxy logs to identify the real client.\n- **Over-trusting a single number**: a long connection can be a video call or a remote shell. Look at direction, ratio and destination together."
+    },
+    {
+      "id": "wf",
+      "type": "animation",
+      "kind": "flow",
+      "title": "A network investigation workflow",
+      "caption": "Each step narrows the question and widens the evidence.",
+      "data": {
+        "token": "Finding",
+        "nodes": [
+          {
+            "id": "alert",
+            "label": "Alert",
+            "sub": "IDS or SIEM",
+            "icon": "alert"
+          },
+          {
+            "id": "flows",
+            "label": "Flows",
+            "sub": "Scope and volume",
+            "icon": "log"
+          },
+          {
+            "id": "zeek",
+            "label": "Zeek logs",
+            "sub": "DNS, TLS, HTTP",
+            "icon": "eye"
+          },
+          {
+            "id": "pcap",
+            "label": "Packets",
+            "sub": "Targeted capture",
+            "icon": "file"
+          },
+          {
+            "id": "verdict",
+            "label": "Verdict",
+            "sub": "Benign or incident",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "alert",
+            "caption": "Suricata flags a periodic connection from 192.168.20.14.",
+            "tone": "warning"
+          },
+          {
+            "at": "flows",
+            "caption": "Flow data shows 412 MB sent to 203.0.113.50 in one night, the largest outbound transfer.",
+            "tone": "warning"
+          },
+          {
+            "at": "zeek",
+            "caption": "dns.log and ssl.log show a new domain, a self-signed certificate and an unusual JA3.",
+            "tone": "danger"
+          },
+          {
+            "at": "pcap",
+            "caption": "A targeted capture confirms a 60-second rhythm with equal request sizes.",
+            "tone": "danger"
+          },
+          {
+            "at": "verdict",
+            "caption": "Escalate as an incident and hand the host to responders.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "note",
+      "type": "callout",
+      "variant": "note",
+      "title": "Why flows survive when packets do not",
+      "markdown": "Six months after an intrusion, the packets are long gone, but a flow record still shows that a server talked to an unknown address every night. Teams that keep even thin flow data can answer how long and how much, the first two questions leadership asks after a breach. Keep it, protect it from tampering, and index it so a search takes seconds rather than hours."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Baseline first",
+      "markdown": "Spend a week learning what normal looks like for each zone before writing thresholds. A beaconing rule tuned on someone else's network produces noise on yours."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Handle captures as evidence",
+      "markdown": "PCAP files contain user data. Restrict access, hash each file when captured, and record who accessed it. Capture only on networks you are authorized to monitor."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a lab VM, install Zeek or use a sample PCAP from a public training set. Run `zeek -r sample.pcap`, then answer: which internal host sent the most bytes, which destination had the most evenly spaced connections, and which DNS parent domain had the most unique subdomains? Write the three commands you used."
+    },
+    {
+      "id": "kt",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "PCAP",
+          "definition": "A file holding captured packets, including payloads."
+        },
+        {
+          "term": "NetFlow/IPFIX",
+          "definition": "Records summarizing each conversation without payloads."
+        },
+        {
+          "term": "Zeek",
+          "definition": "A network monitor that turns traffic into structured protocol logs."
+        },
+        {
+          "term": "uid",
+          "definition": "A Zeek identifier that links all logs of one connection."
+        },
+        {
+          "term": "Beaconing",
+          "definition": "Regular check-ins from malware to a controller."
+        },
+        {
+          "term": "DNS tunneling",
+          "definition": "Hiding data inside DNS queries and answers."
+        },
+        {
+          "term": "JA3/JA4",
+          "definition": "Fingerprints of a client's TLS handshake."
+        },
+        {
+          "term": "SNI",
+          "definition": "The server name a client requests during the TLS handshake."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which source is cheapest to keep for a year?",
+          "options": [
+            "Full packet capture",
+            "Flow records",
+            "Memory images",
+            "Disk images"
+          ],
+          "answer": 1,
+          "explanation": "Flow records store only summary fields, so they are small enough for long retention."
+        },
+        {
+          "question": "What does a Zeek uid do?",
+          "options": [
+            "Identifies the analyst",
+            "Links the logs belonging to one connection",
+            "Encrypts the log",
+            "Counts bytes"
+          ],
+          "answer": 1,
+          "explanation": "The uid is the key for pivoting between conn, dns, ssl and other logs."
+        },
+        {
+          "question": "Which signals suggest beaconing? Choose all that apply.",
+          "options": [
+            "Low variation in gaps between connections",
+            "Many connections with similar small sizes",
+            "One huge download",
+            "A fixed destination over many hours"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Regularity, similar sizes and a persistent destination define beaconing. A single large download does not."
+        },
+        {
+          "question": "Why use TLS metadata before decrypting traffic?",
+          "options": [
+            "It is faster to forge",
+            "It gives detection value without the privacy and legal burden",
+            "It reveals passwords",
+            "Decryption is impossible"
+          ],
+          "answer": 1,
+          "explanation": "Metadata such as SNI, certificates and JA3 is visible without breaking encryption."
+        },
+        {
+          "question": "Which DNS pattern suggests tunneling?",
+          "options": [
+            "One query per day",
+            "Thousands of unique long subdomains under one domain",
+            "Only A records",
+            "Queries to the internal resolver"
+          ],
+          "answer": 1,
+          "explanation": "Encoding data in subdomains creates many unique, high-entropy names under one parent."
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## Summary\n\nNetwork data lets you verify what endpoints report. Mix PCAP, flows and protocol logs to balance depth against cost. Use Zeek's `conn.log` and `dns.log` with the `uid` to pivot, measure regularity to find beaconing, count unique subdomains to find tunneling, and use TLS metadata when payloads are hidden. Next, see how these findings feed hunts in [Advanced Threat Hunting](/learn/security-operations-dfir/advanced-threat-hunting)."
+    }
+  ],
+  "ar": {
+    "title": "التحليل المتقدم لحركة الشبكة",
+    "summary": "تعلّم تحليل حركة الشبكة على نطاق واسع: المفاضلة بين الحزم الكاملة وسجلات التدفق وسجلات البروتوكولات، وقراءة سجلات Zeek، واكتشاف الاتصالات الدورية وأنفاق DNS من سلوكها، والتعامل مع الحركة المشفّرة عبر البيانات الوصفية.",
+    "objectives": [
+      "المقارنة بين التقاط الحزم الكامل وسجلات التدفق وسجلات البروتوكولات",
+      "قراءة `conn.log` و`dns.log` في Zeek للإجابة عن أسئلة التحقيق",
+      "اكتشاف الاتصالات الدورية وأنفاق DNS من الإحصاءات السلوكية",
+      "تحليل الحركة المشفّرة باستخدام بيانات TLS الوصفية وبصمات JA3/JA4",
+      "تطبيق سير عمل متكرر لتحليل الشبكة على حركة مصرّح لك بفحصها"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يصلك تنبيه: جهاز في شبكة قسم المالية الافتراضية اتصل بمضيف خارجي غير مألوف عند الساعة الثانية فجرًا. لا يُظهر نظام حماية الأجهزة الطرفية (EDR) شيئًا مريبًا، والمستخدم نائم. الشاهد الوحيد هو الشبكة. يمكن العبث بالأجهزة الطرفية، لكن الحزمة التي عبرت مستشعرك أُرسلت فعلًا، ولذلك تُعدّ بيانات الشبكة مصدرًا ثانيًا قويًا للحقيقة.\n\nيبني هذا الدرس على الأساسيات الواردة في [بنية المراقبة الأمنية](/learn/security-operations-dfir/security-monitoring-architecture)، وينتقل من قراءة حزم منفردة إلى تحليل السلوك عبر ملايين الاتصالات. اعمل فقط على حركة من شبكات تملكها أو مصرّح لك بفحصها."
+      },
+      {
+        "id": "data",
+        "type": "text",
+        "markdown": "## ثلاثة أنواع من أدلة الشبكة\n\nلا يستطيع أي فريق الاحتفاظ بكل الحزم إلى الأبد، لذلك تختار مزيجًا. يجيب كل مصدر عن أسئلة مختلفة وبتكلفة مختلفة.\n\n| المصدر | ما يحتويه | تكلفة التخزين | الأفضل لـ |\n|:--|:--|:--|:--|\n| **التقاط الحزم الكامل (PCAP)** | كل بايت بما فيه المحتوى | مرتفعة جدًا | التحليل العميق واستخراج الملفات والإثبات |\n| **سجلات التدفق (NetFlow/IPFIX)** | من تحدّث مع من، والمنافذ، والحجم، والمدة | منخفضة جدًا | الاحتفاظ الطويل وأسئلة الحجم والنطاق |\n| **سجلات البروتوكولات (Zeek وSuricata EVE)** | بيانات وصفية مفسَّرة: أسماء DNS ومضيفات HTTP وتفاصيل TLS | منخفضة إلى متوسطة | الصيد والإثراء والبحث في SIEM |\n\nيعتمد تصميم شائع على الاحتفاظ بسجلات البروتوكولات اثني عشر شهرًا، والتدفقات لمدة مماثلة، وحزم PCAP لبضعة أيام متجددة فقط أو لقطاعات مختارة مثل المنطقة المنزوعة السلاح (DMZ). وعند إطلاق تنبيه يمكن لالتقاط قصير عند الطلب أن يكمّل السجلات.\n\nضع المستشعرات حيث تتركز الحركة: حافة الإنترنت، ومدخل مركز البيانات، وبين المناطق الحساسة. وتهمّ الحركة الأفقية داخل الشبكة بقدر المحيط، لأن المهاجمين يقضون معظم وقتهم في التنقل الجانبي."
+      },
+      {
+        "id": "zeek",
+        "type": "text",
+        "markdown": "## قراءة سجلات Zeek\n\nيحوّل Zeek الحزم الخام إلى سجلات منظّمة. يجيب ملفان عن معظم الأسئلة: يحتوي `conn.log` على صف لكل اتصال (العناوين والمنافذ والمدة والبايتات والحالة)، ويحتوي `dns.log` على صف لكل استعلام مع الاسم المطلوب والإجابة. ويحمل كل صف معرّفًا `uid` يربط كل السجلات الخاصة باتصال واحد.\n\nابدأ بالسؤال لا بالأداة. «أي مضيفات داخلية أرسلت أكثر من 100 ميغابايت إلى الخارج الليلة الماضية؟» هو تجميع على `conn.log`. «هل حلّ أحد هذا النطاق؟» هو ترشيح على `dns.log`. تستخدم الطرفية أدناه `zeek-cut` لاستخراج الأعمدة من سجل شبكة مختبر."
+      },
+      {
+        "id": "zeek-term",
+        "type": "terminal",
+        "title": "Top outbound talkers",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "cat conn.log | zeek-cut id.orig_h id.resp_h id.resp_p orig_bytes | awk '$4>100000000' | sort -k4 -nr | head -3",
+            "output": "192.168.20.14  203.0.113.50  443  412883201\n192.168.20.77  198.51.100.9  22   180442910\n192.168.20.14  203.0.113.50  8443 15002211",
+            "comment": "نستخرج أربعة أعمدة، ونُبقي الصفوف التي تجاوزت 100 ميغابايت مُرسَلة، ونرتّبها بحسب البايتات."
+          },
+          {
+            "cmd": "cat dns.log | zeek-cut id.orig_h query answers | grep update-check.example.net",
+            "output": "192.168.20.14  update-check.example.net  203.0.113.50",
+            "comment": "المضيف 192.168.20.14 حلّ الوجهة نفسها، وهذه نقطة ارتكاز لتحديد النطاق."
+          }
+        ],
+        "caption": "مخرجات من شبكة مختبر باستخدام عناوين التوثيق."
+      },
+      {
+        "id": "behavior",
+        "type": "text",
+        "markdown": "## اكتشاف الاتصالات الدورية (Beaconing)\n\nيجب على البرمجية الخبيثة التي تتواصل مع خادم أن تتصل مرارًا. حتى مع التذبذب العشوائي، نادرًا ما يتصل إنسان بالمضيف نفسه كل 60 ثانية طوال 12 ساعة. يقيس اكتشاف الاتصالات الدورية **الانتظام**.\n\nلكل زوج مصدر ووجهة، اجمع الأختام الزمنية للاتصالات، واحسب الفواصل بينها، وانظر إلى مدى تشتتها. الانحراف المعياري المنخفض قياسًا بمتوسط الفاصل، مع اتصالات كثيرة وأحجام بايتات صغيرة متقاربة، أمر مريب. غير أن البرمجيات المشروعة مثل وكلاء التحديث وNTP تتصل دوريًا أيضًا، فقارن دائمًا بقائمة سماح للخدمات المعروفة.\n\n### أنفاق DNS\n\nتظهر البيانات المخبّأة في DNS على شكل نطاقات فرعية طويلة عالية الإنتروبيا تحت نطاق أب واحد، أو نسبة كبيرة من استعلامات TXT، أو مضيف واحد يولّد آلاف الأسماء الفريدة. احسب عدد النطاقات الفرعية الفريدة لكل نطاق أب ولكل مضيف في الساعة، ثم راجع القيم الشاذة.\n\nلا يُثبت أي من الاكتشافين الاختراق. يمنحك كلٌّ منهما قائمة مشتبه بهم مرتبة، ويحسم السياق الأمر: هل الوجهة جديدة؟ وهل العملية معروفة؟ وهل المضيف حساس؟"
+      },
+      {
+        "id": "beacon-py",
+        "type": "code",
+        "language": "python",
+        "code": "import statistics as st\nfrom collections import defaultdict\n\npairs = defaultdict(list)\nfor ts, src, dst in rows:          # rows parsed from conn.log\n    pairs[(src, dst)].append(ts)\n\nfor (src, dst), t in pairs.items():\n    if len(t) < 30:\n        continue                   # too few samples to judge\n    t.sort()\n    gaps = [b - a for a, b in zip(t, t[1:])]\n    cv = st.pstdev(gaps) / st.mean(gaps)   # coefficient of variation\n    if cv < 0.15:                  # very regular\n        print(f\"{src} -> {dst} n={len(t)} mean_gap={st.mean(gaps):.0f}s cv={cv:.2f}\")",
+        "filename": "beacon_score.py",
+        "caption": "درجة انتظام بسيطة. اضبط العتبات بحسب خط الأساس لديك."
+      },
+      {
+        "id": "tls",
+        "type": "text",
+        "markdown": "## الحركة المشفّرة\n\nأصبحت معظم الحركة اليوم مشفّرة بـ TLS، فالمحتوى مخفي. لكن البيانات الوصفية تبقى ظاهرة ومفيدة:\n\n- **حقل SNI وحقول الشهادة**: اسم الخادم المطلوب والجهة المُصدِرة وفترة الصلاحية، وهل الشهادة موقّعة ذاتيًا.\n- **بصمات JA3/JA4**: تجزئة لطريقة بناء العميل لمصافحة TLS. تُنتج البرمجيات المختلفة بصمات مختلفة، فالبصمة غير المعتادة من خادم لا يشغّل عادة سوى متصفح تستحق الفحص.\n- **أنماط التوقيت والحجم**: مدة الاتصال ونسبة البايتات وأحجام الحزم تكشف سلوكًا مثل الرفع أو الجلسات التفاعلية.\n\nفكّ التشفير عند وكيل ممكن، لكنه يجلب التزامات تتعلق بالخصوصية والقانون والتشغيل. يمنحك تحليل البيانات الوصفية قيمة كشف دون هذه الكلفة، فابدأ به."
+      },
+      {
+        "id": "pairing",
+        "type": "text",
+        "markdown": "## الجمع بين Zeek وSuricata\n\nيكمّل Zeek وSuricata أحدهما الآخر. يطابق Suricata التواقيع المعروفة ويكتب التنبيهات في `eve.json`، بينما يصف Zeek كل ما جرى بما فيه الحركة التي لم تُطلق أي تنبيه. يخبرك التنبيه أين تنظر، ويخبرك Zeek بما فعله المضيف نفسه قبل ذلك وبعده.\n\nوتتمثل ممارسة عملية في أخذ `community_id` من تنبيه Suricata والبحث عنه في سجلات Zeek وسجلات التدفق، ثم بناء خط زمني قصير: أول اتصال، والحجم، والبروتوكولات المستخدمة، وآخر اتصال. وغالبًا ما تحسم عشر دقائق مع هذا الخط الزمني ما إذا كان التنبيه ضجيجًا أم بداية حادثة.\n\n### أخطاء شائعة\n\n- **نقاط عمياء**: مستشعر على منفذ مراقبة (SPAN) خاطئ، أو نقطة تجميع (TAP) تُسقط الحزم عند الحمل، يخفيان الحركة بصمت. افحص عدّادات الإسقاط في المستشعر أسبوعيًا.\n- **انحراف الساعات**: لا يمكن ربط سجلات أجهزة تختلف ساعاتها. استخدم NTP في كل مكان.\n- **ترجمة العناوين والوكلاء**: خلف الوكيل يشترك مستخدمون كثيرون في عنوان مصدر واحد. اربط سجلات الوكيل لمعرفة العميل الحقيقي.\n- **الاعتماد على رقم واحد**: قد يكون الاتصال الطويل مكالمة فيديو أو صدفة بعيدة. انظر إلى الاتجاه والنسبة والوجهة معًا."
+      },
+      {
+        "id": "wf",
+        "type": "animation",
+        "kind": "flow",
+        "title": "سير عمل التحقيق في الشبكة",
+        "caption": "كل خطوة تضيّق السؤال وتوسّع الأدلة.",
+        "data": {
+          "token": "نتيجة",
+          "nodes": [
+            {
+              "id": "alert",
+              "label": "تنبيه",
+              "sub": "IDS أو SIEM",
+              "icon": "alert"
+            },
+            {
+              "id": "flows",
+              "label": "التدفقات",
+              "sub": "النطاق والحجم",
+              "icon": "log"
+            },
+            {
+              "id": "zeek",
+              "label": "سجلات Zeek",
+              "sub": "DNS وTLS وHTTP",
+              "icon": "eye"
+            },
+            {
+              "id": "pcap",
+              "label": "الحزم",
+              "sub": "التقاط مستهدف",
+              "icon": "file"
+            },
+            {
+              "id": "verdict",
+              "label": "الحكم",
+              "sub": "سليم أم حادثة",
+              "icon": "shield"
+            }
+          ],
+          "steps": [
+            {
+              "at": "alert",
+              "caption": "رصد Suricata اتصالًا دوريًا من 192.168.20.14.",
+              "tone": "warning"
+            },
+            {
+              "at": "flows",
+              "caption": "تُظهر بيانات التدفق إرسال 412 ميغابايت إلى 203.0.113.50 في ليلة واحدة، وهو أكبر نقل خارجي.",
+              "tone": "warning"
+            },
+            {
+              "at": "zeek",
+              "caption": "يُظهر `dns.log` و`ssl.log` نطاقًا جديدًا وشهادة موقّعة ذاتيًا وبصمة JA3 غير معتادة.",
+              "tone": "danger"
+            },
+            {
+              "at": "pcap",
+              "caption": "يؤكد التقاط مستهدف إيقاعًا كل 60 ثانية بأحجام طلبات متساوية.",
+              "tone": "danger"
+            },
+            {
+              "at": "verdict",
+              "caption": "التصعيد كحادثة وتسليم المضيف للمستجيبين.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "note",
+        "type": "callout",
+        "variant": "note",
+        "title": "لماذا تبقى التدفقات حين تغيب الحزم",
+        "markdown": "بعد ستة أشهر من الاختراق تكون الحزم قد اختفت منذ زمن، لكن سجل التدفق ما زال يُظهر أن خادمًا كان يتحدث مع عنوان مجهول كل ليلة. الفرق التي تحتفظ بحتى بيانات تدفق خفيفة تستطيع الإجابة عن مدة الاختراق وحجمه، وهما أول سؤالين تطرحهما الإدارة بعد الحادثة. احتفظ بها، واحمها من العبث، وفهرسها ليستغرق البحث ثواني لا ساعات."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "ابدأ بخط الأساس",
+        "markdown": "اقضِ أسبوعًا في معرفة الوضع الطبيعي لكل منطقة قبل كتابة العتبات. تُنتج قاعدة الاتصالات الدورية المضبوطة على شبكة غيرك ضجيجًا على شبكتك."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "تعامل مع الالتقاطات كأدلة",
+        "markdown": "تحتوي ملفات PCAP على بيانات المستخدمين. قيّد الوصول، واحسب تجزئة كل ملف عند التقاطه، وسجّل من اطّلع عليه. التقط فقط على شبكات مصرّح لك بمراقبتها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في آلة افتراضية للمختبر، ثبّت Zeek أو استخدم ملف PCAP تجريبيًا من مجموعة تدريب عامة. شغّل `zeek -r sample.pcap` ثم أجب: أي مضيف داخلي أرسل أكبر عدد من البايتات؟ وأي وجهة كانت اتصالاتها الأكثر انتظامًا؟ وأي نطاق أب في DNS له أكبر عدد من النطاقات الفرعية الفريدة؟ دوّن الأوامر الثلاثة التي استخدمتها."
+      },
+      {
+        "id": "kt",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "PCAP",
+            "definition": "ملف يحتوي الحزم الملتقطة بما فيها المحتوى."
+          },
+          {
+            "term": "NetFlow/IPFIX",
+            "definition": "سجلات تلخّص كل محادثة دون المحتوى."
+          },
+          {
+            "term": "Zeek",
+            "definition": "مراقب شبكة يحوّل الحركة إلى سجلات بروتوكولات منظّمة."
+          },
+          {
+            "term": "uid",
+            "definition": "معرّف في Zeek يربط كل سجلات اتصال واحد."
+          },
+          {
+            "term": "الاتصال الدوري (Beaconing)",
+            "definition": "اتصالات منتظمة من البرمجية الخبيثة بجهة التحكم."
+          },
+          {
+            "term": "أنفاق DNS",
+            "definition": "إخفاء البيانات داخل استعلامات DNS وإجاباتها."
+          },
+          {
+            "term": "JA3/JA4",
+            "definition": "بصمات لمصافحة TLS الخاصة بالعميل."
+          },
+          {
+            "term": "SNI",
+            "definition": "اسم الخادم الذي يطلبه العميل أثناء مصافحة TLS."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي مصدر هو الأرخص للاحتفاظ به لمدة عام؟",
+            "options": [
+              "التقاط الحزم الكامل",
+              "سجلات التدفق",
+              "صور الذاكرة",
+              "صور الأقراص"
+            ],
+            "answer": 1,
+            "explanation": "تخزّن سجلات التدفق حقولًا ملخّصة فقط، فتصغر بما يكفي للاحتفاظ الطويل."
+          },
+          {
+            "question": "ما وظيفة `uid` في Zeek؟",
+            "options": [
+              "يحدد المحلل",
+              "يربط السجلات التابعة لاتصال واحد",
+              "يشفّر السجل",
+              "يحسب البايتات"
+            ],
+            "answer": 1,
+            "explanation": "المعرّف `uid` هو مفتاح الانتقال بين سجلات conn وdns وssl وغيرها."
+          },
+          {
+            "question": "أي إشارات توحي بالاتصال الدوري؟ اختر كل ما ينطبق.",
+            "options": [
+              "تباين منخفض في الفواصل بين الاتصالات",
+              "اتصالات كثيرة بأحجام صغيرة متقاربة",
+              "تنزيل واحد ضخم",
+              "وجهة ثابتة على مدى ساعات"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تعرّف الانتظام والأحجام المتقاربة والوجهة الدائمة الاتصال الدوري، أما التنزيل الواحد الكبير فلا."
+          },
+          {
+            "question": "لماذا نستخدم البيانات الوصفية لـ TLS قبل فكّ التشفير؟",
+            "options": [
+              "لأن تزويرها أسرع",
+              "لأنها تمنح قيمة كشف دون عبء الخصوصية والقانون",
+              "لأنها تكشف كلمات المرور",
+              "لأن فكّ التشفير مستحيل"
+            ],
+            "answer": 1,
+            "explanation": "البيانات الوصفية مثل SNI والشهادات وJA3 ظاهرة دون كسر التشفير."
+          },
+          {
+            "question": "أي نمط في DNS يوحي بوجود نفق؟",
+            "options": [
+              "استعلام واحد يوميًا",
+              "آلاف النطاقات الفرعية الطويلة الفريدة تحت نطاق واحد",
+              "سجلات A فقط",
+              "استعلامات إلى المحلل الداخلي"
+            ],
+            "answer": 1,
+            "explanation": "يؤدي ترميز البيانات في النطاقات الفرعية إلى أسماء فريدة كثيرة عالية الإنتروبيا تحت نطاق أب واحد."
+          }
+        ]
+      },
+      {
+        "id": "sum",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتتيح بيانات الشبكة التحقق مما تبلغ عنه الأجهزة الطرفية. امزج PCAP والتدفقات وسجلات البروتوكولات لتوازن بين العمق والكلفة. استخدم `conn.log` و`dns.log` في Zeek مع `uid` للانتقال بين السجلات، وقِس الانتظام لاكتشاف الاتصالات الدورية، وعُدّ النطاقات الفرعية الفريدة لاكتشاف الأنفاق، واستخدم البيانات الوصفية لـ TLS حين يكون المحتوى مخفيًا. وفي الدرس التالي سترى كيف تغذّي هذه النتائج عمليات الصيد في [صيد التهديدات المتقدم](/learn/security-operations-dfir/advanced-threat-hunting)."
+      }
+    ]
+  }
+}

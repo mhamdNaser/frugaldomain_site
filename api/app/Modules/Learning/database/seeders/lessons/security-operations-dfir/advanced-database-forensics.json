@@ -1,0 +1,574 @@
+{
+  "slug": "advanced-database-forensics",
+  "title": "Advanced Database Forensics",
+  "summary": "Investigate suspected data theft or tampering in a database you are authorized to examine: preserve volatile and persistent evidence, read audit, binary and transaction logs, reconstruct a timeline, and report findings.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain what database evidence exists and how volatile each source is",
+    "Preserve a database for examination without destroying evidence",
+    "Read MySQL binary logs, PostgreSQL logs and SQL Server audit data to reconstruct activity",
+    "Build a timeline of suspicious access, privilege changes and bulk reads",
+    "Recommend logging and access controls that make future investigations easier"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A retailer's security team receives a call from a payment processor: customer card tokens from the retailer's database appear in a breach feed. The application servers show nothing unusual. The question for the forensic examiner is precise and urgent. Who read the customer table, when, from where, and with which account?\n\nDatabases are rich evidence sources but they are not forgiving ones. Much of the useful state, such as active sessions, cached query plans and buffer contents, disappears on restart. Logging is often off by default. And a careless examiner who runs queries on the live system changes timestamps and statistics, which weakens the evidence. This lesson gives you a disciplined approach on systems you are legally authorized to examine, building on the host-level methods in [Server Compromise Investigation](/learn/security-operations-dfir/server-compromise-investigation)."
+    },
+    {
+      "id": "evidence",
+      "type": "text",
+      "markdown": "## What evidence a database holds\n\nCollect from the most volatile source to the least volatile, the same order of volatility used in all forensics.\n\n| Evidence | Where | Volatility | What it shows |\n|:--|:--|:--|:--|\n| Active sessions and running queries | `SHOW PROCESSLIST`, `pg_stat_activity`, `sys.dm_exec_requests` | Very high | Who is connected right now and what they run |\n| Memory and caches | Process memory, buffer pool, plan cache | Very high | Recent queries and data pages |\n| Audit and general logs | Audit plugin, `pgaudit`, SQL Server Audit | Medium | Logins, statements, permission changes |\n| Binary and transaction logs | MySQL binlog, PostgreSQL WAL, SQL Server log | Medium | Every committed data change, in order |\n| Data files and system tables | Tablespaces, `mysql.user`, `pg_roles` | Low | Current data, users, grants, routines |\n| Backups and snapshots | Backup store, storage snapshots | Low | Past states for comparison |\n\nTwo caveats shape the analysis. First, **binary and transaction logs record changes, not reads**. A bulk `SELECT` that steals data leaves no trace there; only audit logging, network capture or query logs show reads. Second, administrators can delete or rotate logs, so copy them off the server first and record hashes."
+    },
+    {
+      "id": "preserve",
+      "type": "text",
+      "markdown": "## Preserve before you analyze\n\nGet written authorization and decide the scope first: which servers, which databases, which period. Then follow a consistent order.\n\n1. **Record the system state** with date, time zone, host name and your identity. Compare the server clock with a trusted source and note the offset.\n2. **Capture volatile data** with the least invasive tools: a saved process list, current connections and relevant status variables. Use a read-only account and write output to external media.\n3. **Copy logs** (audit, error, binary or WAL, slow query) and hash each copy with SHA-256.\n4. **Image or snapshot** the data volume. On virtual machines or cloud databases use a storage snapshot; on a physical server use a write-blocked image where possible.\n5. **Work on the copy.** Restore the snapshot to an isolated lab instance and analyze there.\n6. **Maintain chain of custody** for every artifact,.\n\nNever shut the database down before capturing volatile state unless there is an immediate risk of data destruction, and document that decision if you must."
+    },
+    {
+      "id": "workflow-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Database forensic workflow",
+      "caption": "Preservation steps come before any analysis, and analysis happens on a copy.",
+      "data": {
+        "token": "Evidence",
+        "nodes": [
+          {
+            "id": "auth",
+            "label": "Authorization",
+            "sub": "Scope and legal sign-off",
+            "icon": "lock"
+          },
+          {
+            "id": "vol",
+            "label": "Volatile capture",
+            "sub": "Sessions, status",
+            "icon": "eye"
+          },
+          {
+            "id": "logs",
+            "label": "Log copy",
+            "sub": "Audit, binlog, WAL",
+            "icon": "log"
+          },
+          {
+            "id": "snap",
+            "label": "Snapshot",
+            "sub": "Hash and seal",
+            "icon": "database"
+          },
+          {
+            "id": "lab",
+            "label": "Isolated lab",
+            "sub": "Restore the copy",
+            "icon": "server"
+          },
+          {
+            "id": "time",
+            "label": "Timeline",
+            "sub": "Who, what, when",
+            "icon": "file"
+          },
+          {
+            "id": "report",
+            "label": "Report",
+            "sub": "Findings and fixes",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "auth",
+            "caption": "Legal and the data owner approve examining db-prod-01 for the period 1 to 10 November.",
+            "tone": "secure"
+          },
+          {
+            "at": "vol",
+            "caption": "The examiner saves active sessions and connection counts to external media; one session from 203.0.113.50 is still open.",
+            "tone": "warning"
+          },
+          {
+            "at": "logs",
+            "caption": "Audit logs and binary logs are copied off the server before routine rotation can remove them."
+          },
+          {
+            "at": "snap",
+            "caption": "A storage snapshot is taken, hashed with SHA-256 and recorded in the chain-of-custody form.",
+            "tone": "secure"
+          },
+          {
+            "at": "lab",
+            "caption": "The snapshot is restored to an isolated lab instance; the production system is not queried further."
+          },
+          {
+            "at": "time",
+            "caption": "Audit and binary logs reveal a new account, a privilege grant and a 2.1 GB read of the customers table.",
+            "tone": "danger"
+          },
+          {
+            "at": "report",
+            "caption": "Findings, confidence levels and recommendations are delivered to the incident commander.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "analysis",
+      "type": "text",
+      "markdown": "## Reconstruct activity from the logs\n\nOnce you work from copies, extract three kinds of facts and correlate them by time.\n\n- **Authentication:** successful and failed logins, source addresses, new or modified accounts.\n- **Privilege change:** `GRANT`, `CREATE USER`, role membership and routine ownership changes.\n- **Data access:** statements touching sensitive tables, result sizes, and changes shown in the binary or transaction log.\n\nOn MySQL, `mysqlbinlog` decodes binary logs into readable events with timestamps and server positions. On PostgreSQL, enable `log_connections`, `log_disconnections` and `pgaudit` going forward; for the past, rely on the server log and any available WAL archive. On SQL Server, read SQL Server Audit files or extended event files with `sys.fn_get_audit_file`.\n\nAlways record the **confidence** of each finding: a binary-log entry proves a change was committed; an absence in the log proves nothing about reads."
+    },
+    {
+      "id": "binlog",
+      "type": "terminal",
+      "title": "Reading a MySQL binary log copy (lab restore)",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "sha256sum evidence/binlog.000412 && cat evidence/binlog.000412.sha256",
+          "output": "9f2c1a...e41b  evidence/binlog.000412\n9f2c1a...e41b  binlog.000412",
+          "comment": "Hashes match: the copy is intact"
+        },
+        {
+          "cmd": "mysqlbinlog --base64-output=DECODE-ROWS -v --start-datetime='2026-11-04 01:00:00' --stop-datetime='2026-11-04 03:00:00' evidence/binlog.000412 | grep -E '^#2611|CREATE USER|GRANT'",
+          "output": "#261104  1:47:12 server id 1  end_log_pos 88213 CRC32 0x5e1d  Query  thread_id=18842\nCREATE USER 'svc_report'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '<REDACTED>'\n#261104  1:47:13 server id 1  end_log_pos 88441 CRC32 0x7a02  Query  thread_id=18842\nGRANT SELECT ON shop.* TO 'svc_report'@'%'",
+          "comment": "A new wildcard-host account with read access to the whole shop schema, created at 01:47 UTC"
+        },
+        {
+          "cmd": "grep 'svc_report' evidence/audit.log | head -3",
+          "output": "{\"time\":\"2026-11-04 01:52:30\",\"user\":\"svc_report\",\"host\":\"203.0.113.50\",\"command_class\":\"select\",\"query\":\"SELECT * FROM shop.customers\",\"rows\":2417000}",
+          "comment": "The audit log shows the read that the binary log cannot: 2.4 million rows"
+        }
+      ],
+      "caption": "Binary logs prove the account creation and grant; the audit log provides the bulk read. Both are needed."
+    },
+    {
+      "id": "timeline",
+      "type": "text",
+      "markdown": "## Build the timeline and test alternatives\n\nPlace every event on one UTC timeline. Convert time zones explicitly and note any clock offset you measured. A compact timeline for the retailer case might look like this:\n\n| Time (UTC) | Event | Source | Confidence |\n|:--|:--|:--|:--|\n| 01:31 | Successful login of an admin account from 203.0.113.50 | Audit log | High |\n| 01:47 | `CREATE USER svc_report` | Binary log | High |\n| 01:47 | `GRANT SELECT ON shop.*` | Binary log | High |\n| 01:52 | `SELECT * FROM shop.customers` returns 2,417,000 rows | Audit log | High |\n| 02:05 | `DROP USER svc_report` | Binary log | High |\n\nThe last row matters: the attacker cleaned up the account, but the logs preserved the whole sequence. Before you conclude, test alternative explanations. Could a legitimate reporting tool use the same address? Was the admin credential shared? Does the pattern match any scheduled job? A good report separates **facts** (what the logs show), **inferences** (what you conclude) and **gaps** (what cannot be known, such as reads before audit logging started)."
+    },
+    {
+      "id": "warn-live",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not investigate on the production instance",
+      "markdown": "Every query on the live server alters caches, statistics and sometimes the very logs you need. Capture first, then restore to an isolated lab. Also be careful with credentials: never paste real database passwords into tickets or reports; use placeholders and store secrets in the approved vault."
+    },
+    {
+      "id": "tip-prep",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Make the next investigation easier",
+      "markdown": "Enable audit logging for sensitive tables, forward database logs to the SIEM described in [Security Monitoring Architecture](/learn/security-operations-dfir/security-monitoring-architecture), restrict wildcard-host accounts, alert on `CREATE USER` and `GRANT`, and keep binary logs long enough to cover your detection delay."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "1. In a lab VM you own, install MySQL or MariaDB and enable the binary log (`log_bin`) and general or audit logging.\n2. Create a test database, then run `CREATE USER`, `GRANT`, a few `INSERT` and `UPDATE` statements, and a large `SELECT` on dummy data.\n3. Copy the binary log and audit log to a separate folder, hash them with `sha256sum`, and decode the binary log with `mysqlbinlog`.\n4. Write down which of your actions appear in the binary log, which appear only in the audit log, and which appear nowhere.\n5. Build a five-row timeline with a confidence rating for each row."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Order of volatility",
+          "definition": "The rule to collect the most short-lived evidence first, such as sessions and memory."
+        },
+        {
+          "term": "Binary log (binlog)",
+          "definition": "MySQL's ordered record of committed data changes, used for replication and recovery."
+        },
+        {
+          "term": "Write-ahead log (WAL)",
+          "definition": "PostgreSQL's log of changes written before data files are updated."
+        },
+        {
+          "term": "Audit log",
+          "definition": "A record of logins, statements and permission changes, which can include reads."
+        },
+        {
+          "term": "Chain of custody",
+          "definition": "Documentation of who handled evidence, when, and how it was protected."
+        },
+        {
+          "term": "Snapshot",
+          "definition": "A point-in-time copy of a storage volume used to analyze without touching production."
+        },
+        {
+          "term": "Wildcard-host account",
+          "definition": "A database account allowed to connect from any address, such as 'user'@'%'."
+        },
+        {
+          "term": "Timeline",
+          "definition": "A single ordered record of events from all sources, normalized to UTC."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why can a MySQL binary log not prove that a bulk SELECT stole data?",
+          "options": [
+            "Binary logs are encrypted",
+            "Binary logs record data changes, not reads",
+            "SELECT statements are blocked",
+            "Binary logs only cover logins"
+          ],
+          "answer": 1,
+          "explanation": "Binary logs capture committed changes. Reads appear only in audit logs, query logs or network capture."
+        },
+        {
+          "question": "Which are correct early steps when preserving a database? (Choose all that apply.)",
+          "options": [
+            "Record the server time and compare it with a trusted source",
+            "Copy logs off the server and hash them",
+            "Run exploratory queries on production to find the attacker",
+            "Capture active sessions with a read-only account"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Recording time, hashing log copies and capturing sessions preserve evidence. Exploratory queries on production alter state and risk the evidence."
+        },
+        {
+          "question": "Which source is the MOST volatile?",
+          "options": [
+            "Backups",
+            "Data files on disk",
+            "Active sessions and running queries",
+            "Archived audit files"
+          ],
+          "answer": 2,
+          "explanation": "Sessions and running queries vanish when connections close or the service restarts, so they are captured first."
+        },
+        {
+          "question": "Which belong in a forensic report as separate categories? (Choose all that apply.)",
+          "options": [
+            "Facts shown by the logs",
+            "Inferences with confidence levels",
+            "Gaps where evidence is missing",
+            "Unverified rumors as facts"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Separating facts, reasoned inferences and known gaps keeps the report honest and defensible."
+        },
+        {
+          "question": "An account was created and dropped within 20 minutes. What does that suggest for logging?",
+          "options": [
+            "The account never existed",
+            "Change logs can preserve evidence even after cleanup",
+            "The database is corrupted",
+            "Audit logging is unnecessary"
+          ],
+          "answer": 1,
+          "explanation": "Dropping the account removes it from the system tables, but the binary log still records both statements."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Databases hold evidence in sessions, caches, audit logs, binary or transaction logs, data files and backups; collect from **most to least volatile**.\n- **Preserve first:** get authorization, record time, capture volatile state, copy and hash logs, snapshot, and analyze a restored copy.\n- **Change logs prove writes; audit logs show reads.** Use both and state the confidence of each finding.\n- Build a **UTC timeline**, test alternative explanations, and separate facts, inferences and gaps in the report.\n- Improve readiness with audit logging, log forwarding and alerts on account and privilege changes.\n\nDatabases are structured stores; memory holds the unstructured traces of what ran. Continue with [Memory Forensics and Malware Analysis](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)."
+    }
+  ],
+  "ar": {
+    "title": "التحليل الجنائي المتقدم لقواعد البيانات",
+    "summary": "حقّق في اشتباه بسرقة بيانات أو عبث بها في قاعدة بيانات مصرّح لك بفحصها: احفظ الأدلة المتطايرة والدائمة، واقرأ سجلات التدقيق والسجلات الثنائية وسجلات المعاملات، وأعد بناء الخط الزمني، وأعدّ التقرير.",
+    "objectives": [
+      "شرح أنواع الأدلة في قواعد البيانات ومدى تطايرها",
+      "حفظ قاعدة بيانات للفحص دون إتلاف الأدلة",
+      "قراءة السجلات الثنائية في MySQL وسجلات PostgreSQL وبيانات تدقيق SQL Server لإعادة بناء النشاط",
+      "بناء خط زمني للوصول المشبوه وتغييرات الصلاحيات وعمليات القراءة الكبيرة",
+      "التوصية بضوابط تسجيل ووصول تسهّل التحقيقات المستقبلية"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يتلقى فريق الأمن في شركة تجزئة اتصالًا من معالج مدفوعات: رموز بطاقات العملاء من قاعدة بيانات الشركة تظهر في خلاصة اختراق. لا يُظهر خادما التطبيق شيئًا غير عادي. والسؤال أمام الفاحص الجنائي دقيق وعاجل: من قرأ جدول العملاء، ومتى، ومن أين، وبأي حساب؟\n\nقواعد البيانات مصادر أدلة غنية لكنها لا تسامح. فكثير من الحالة المفيدة، كالجلسات النشطة وخطط الاستعلام المخزنة مؤقتًا ومحتويات الذاكرة المؤقتة، يختفي عند إعادة التشغيل. والتسجيل غالبًا معطّل افتراضيًا. والفاحص المتهاون الذي ينفّذ استعلامات على النظام الحي يغيّر الطوابع الزمنية والإحصاءات فيُضعف الدليل. يقدم هذا الدرس منهجًا منضبطًا على أنظمة مصرّح لك قانونيًا بفحصها، ويبني على أساليب مستوى الجهاز في درس [التحقيق في اختراق الخوادم](/learn/security-operations-dfir/server-compromise-investigation)."
+      },
+      {
+        "id": "evidence",
+        "type": "text",
+        "markdown": "## الأدلة التي تحتفظ بها قاعدة البيانات\n\nاجمع من الأكثر تطايرًا إلى الأقل، وهو ترتيب التطاير نفسه المستخدم في كل التحليل الجنائي.\n\n| الدليل | موضعه | التطاير | ما يُظهره |\n|:--|:--|:--|:--|\n| الجلسات النشطة والاستعلامات الجارية | `SHOW PROCESSLIST` و`pg_stat_activity` و`sys.dm_exec_requests` | مرتفع جدًا | من متصل الآن وماذا ينفّذ |\n| الذاكرة والذاكرة المؤقتة | ذاكرة العملية ومجمّع المخزن المؤقت وذاكرة الخطط | مرتفع جدًا | الاستعلامات الحديثة وصفحات البيانات |\n| سجلات التدقيق والسجلات العامة | ملحق التدقيق و`pgaudit` وSQL Server Audit | متوسط | عمليات الدخول والعبارات وتغييرات الصلاحيات |\n| السجلات الثنائية وسجلات المعاملات | binlog في MySQL وWAL في PostgreSQL وسجل SQL Server | متوسط | كل تغيير بيانات مُثبَّت بالترتيب |\n| ملفات البيانات وجداول النظام | مساحات الجداول و`mysql.user` و`pg_roles` | منخفض | البيانات الحالية والمستخدمون والمنح والإجراءات |\n| النسخ الاحتياطية واللقطات | مخزن النسخ ولقطات التخزين | منخفض | حالات سابقة للمقارنة |\n\nتحكم تحذيران في التحليل. الأول أن **السجلات الثنائية وسجلات المعاملات تسجّل التغييرات لا القراءات**؛ فعبارة `SELECT` ضخمة تسرق البيانات لا تترك أثرًا فيها، ولا تُظهر القراءات إلا سجلات التدقيق أو التقاط الشبكة أو سجلات الاستعلام. والثاني أن المديرين يستطيعون حذف السجلات أو تدويرها، فانسخها خارج الخادم أولًا وسجّل بصماتها."
+      },
+      {
+        "id": "preserve",
+        "type": "text",
+        "markdown": "## احفظ قبل أن تحلّل\n\nاحصل على تفويض مكتوب وحدّد النطاق أولًا: أيّ الخوادم وأيّ قواعد البيانات وأيّ فترة. ثم اتبع ترتيبًا ثابتًا.\n\n1. **سجّل حالة النظام** بالتاريخ والوقت والمنطقة الزمنية واسم الجهاز وهويتك. وقارن ساعة الخادم بمصدر موثوق ودوّن الفارق.\n2. **التقط البيانات المتطايرة** بأقل الأدوات تدخلًا: قائمة عمليات محفوظة والاتصالات الحالية ومتغيرات الحالة ذات الصلة. استخدم حسابًا للقراءة فقط واكتب المخرجات على وسيط خارجي.\n3. **انسخ السجلات** (التدقيق والأخطاء والثنائي أو WAL والاستعلامات البطيئة) وسجّل بصمة SHA-256 لكل نسخة.\n4. **أنشئ صورة أو لقطة** لوحدة تخزين البيانات. في الأجهزة الافتراضية أو قواعد البيانات السحابية استخدم لقطة تخزين؛ وفي الخادم الفعلي استخدم صورة بمانع كتابة حيثما أمكن.\n5. **اعمل على النسخة**: استعد اللقطة في نسخة مخبرية معزولة وحلّل هناك.\n6. **حافظ على سلسلة الحيازة** لكل قطعة أثرية.\n\nلا توقف قاعدة البيانات قبل التقاط الحالة المتطايرة إلا إذا كان هناك خطر مباشر لإتلاف البيانات، ووثّق هذا القرار إن اضطررت إليه."
+      },
+      {
+        "id": "workflow-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "سير عمل التحليل الجنائي لقاعدة البيانات",
+        "caption": "تأتي خطوات الحفظ قبل أي تحليل، ويجري التحليل على نسخة.",
+        "data": {
+          "token": "دليل",
+          "nodes": [
+            {
+              "id": "auth",
+              "label": "التفويض",
+              "sub": "النطاق والموافقة القانونية",
+              "icon": "lock"
+            },
+            {
+              "id": "vol",
+              "label": "التقاط المتطاير",
+              "sub": "الجلسات والحالة",
+              "icon": "eye"
+            },
+            {
+              "id": "logs",
+              "label": "نسخ السجلات",
+              "sub": "التدقيق وbinlog وWAL",
+              "icon": "log"
+            },
+            {
+              "id": "snap",
+              "label": "اللقطة",
+              "sub": "البصمة والختم",
+              "icon": "database"
+            },
+            {
+              "id": "lab",
+              "label": "مختبر معزول",
+              "sub": "استعادة النسخة",
+              "icon": "server"
+            },
+            {
+              "id": "time",
+              "label": "الخط الزمني",
+              "sub": "من وماذا ومتى",
+              "icon": "file"
+            },
+            {
+              "id": "report",
+              "label": "التقرير",
+              "sub": "النتائج والإصلاحات",
+              "icon": "shield"
+            }
+          ],
+          "steps": [
+            {
+              "at": "auth",
+              "caption": "يعتمد القسم القانوني ومالك البيانات فحص db-prod-01 للفترة من 1 إلى 10 نوفمبر.",
+              "tone": "secure"
+            },
+            {
+              "at": "vol",
+              "caption": "يحفظ الفاحص الجلسات النشطة وأعداد الاتصالات على وسيط خارجي؛ وجلسة واحدة من 203.0.113.50 ما زالت مفتوحة.",
+              "tone": "warning"
+            },
+            {
+              "at": "logs",
+              "caption": "تُنسخ سجلات التدقيق والسجلات الثنائية خارج الخادم قبل أن يزيلها التدوير الروتيني."
+            },
+            {
+              "at": "snap",
+              "caption": "تُؤخذ لقطة تخزين وتُسجَّل بصمتها SHA-256 في نموذج سلسلة الحيازة.",
+              "tone": "secure"
+            },
+            {
+              "at": "lab",
+              "caption": "تُستعاد اللقطة في نسخة مخبرية معزولة، ولا يُستعلم عن النظام الإنتاجي بعد ذلك."
+            },
+            {
+              "at": "time",
+              "caption": "تكشف سجلات التدقيق والسجلات الثنائية حسابًا جديدًا ومنح صلاحية وقراءة بحجم 2.1 غيغابايت من جدول العملاء.",
+              "tone": "danger"
+            },
+            {
+              "at": "report",
+              "caption": "تُسلَّم النتائج ومستويات الثقة والتوصيات إلى قائد الحادثة.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "analysis",
+        "type": "text",
+        "markdown": "## أعد بناء النشاط من السجلات\n\nبعد أن تعمل على نسخ، استخرج ثلاثة أنواع من الوقائع واربطها بالزمن.\n\n- **المصادقة**: عمليات الدخول الناجحة والفاشلة وعناوين المصدر والحسابات الجديدة أو المعدَّلة.\n- **تغيير الصلاحيات**: `GRANT` و`CREATE USER` وعضوية الأدوار وتغييرات ملكية الإجراءات.\n- **الوصول إلى البيانات**: العبارات التي تمس الجداول الحساسة وأحجام النتائج والتغييرات الظاهرة في السجل الثنائي أو سجل المعاملات.\n\nفي MySQL يفك `mysqlbinlog` السجلات الثنائية إلى أحداث مقروءة بطوابع زمنية ومواضع على الخادم. وفي PostgreSQL فعّل `log_connections` و`log_disconnections` و`pgaudit` للمستقبل؛ أما للماضي فاعتمد على سجل الخادم وأي أرشيف WAL متاح. وفي SQL Server اقرأ ملفات SQL Server Audit أو ملفات الأحداث الموسّعة بالدالة `sys.fn_get_audit_file`.\n\nسجّل دائمًا **مستوى الثقة** لكل نتيجة: إدخال في السجل الثنائي يثبت أن التغيير أُثبت؛ أما غياب الإدخال فلا يثبت شيئًا عن القراءات."
+      },
+      {
+        "id": "binlog",
+        "type": "terminal",
+        "title": "Reading a MySQL binary log copy (lab restore)",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "sha256sum evidence/binlog.000412 && cat evidence/binlog.000412.sha256",
+            "output": "9f2c1a...e41b  evidence/binlog.000412\n9f2c1a...e41b  binlog.000412",
+            "comment": "تطابق البصمتان: النسخة سليمة"
+          },
+          {
+            "cmd": "mysqlbinlog --base64-output=DECODE-ROWS -v --start-datetime='2026-11-04 01:00:00' --stop-datetime='2026-11-04 03:00:00' evidence/binlog.000412 | grep -E '^#2611|CREATE USER|GRANT'",
+            "output": "#261104  1:47:12 server id 1  end_log_pos 88213 CRC32 0x5e1d  Query  thread_id=18842\nCREATE USER 'svc_report'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '<REDACTED>'\n#261104  1:47:13 server id 1  end_log_pos 88441 CRC32 0x7a02  Query  thread_id=18842\nGRANT SELECT ON shop.* TO 'svc_report'@'%'",
+            "comment": "حساب جديد بمضيف عام وصلاحية قراءة على مخطط shop كاملًا، أُنشئ عند 01:47 بالتوقيت العالمي"
+          },
+          {
+            "cmd": "grep 'svc_report' evidence/audit.log | head -3",
+            "output": "{\"time\":\"2026-11-04 01:52:30\",\"user\":\"svc_report\",\"host\":\"203.0.113.50\",\"command_class\":\"select\",\"query\":\"SELECT * FROM shop.customers\",\"rows\":2417000}",
+            "comment": "يُظهر سجل التدقيق القراءة التي لا يظهرها السجل الثنائي: 2.4 مليون صف"
+          }
+        ],
+        "caption": "تثبت السجلات الثنائية إنشاء الحساب ومنح الصلاحية، ويقدّم سجل التدقيق القراءة الضخمة. وكلاهما لازم."
+      },
+      {
+        "id": "timeline",
+        "type": "text",
+        "markdown": "## ابنِ الخط الزمني واختبر التفسيرات البديلة\n\nضع كل حدث على خط زمني واحد بالتوقيت العالمي UTC. حوّل المناطق الزمنية صراحةً ودوّن أي فارق ساعة قِستَه. قد يبدو خط زمني موجز لقضية شركة التجزئة هكذا:\n\n| الوقت (UTC) | الحدث | المصدر | الثقة |\n|:--|:--|:--|:--|\n| 01:31 | دخول ناجح لحساب مدير من 203.0.113.50 | سجل التدقيق | عالية |\n| 01:47 | `CREATE USER svc_report` | السجل الثنائي | عالية |\n| 01:47 | `GRANT SELECT ON shop.*` | السجل الثنائي | عالية |\n| 01:52 | `SELECT * FROM shop.customers` يعيد 2,417,000 صف | سجل التدقيق | عالية |\n| 02:05 | `DROP USER svc_report` | السجل الثنائي | عالية |\n\nالصف الأخير مهم: فقد نظّف المهاجم الحساب لكن السجلات حفظت التسلسل كله. وقبل أن تستنتج اختبر التفسيرات البديلة. هل يمكن أن تستخدم أداة تقارير مشروعة العنوان نفسه؟ هل كانت بيانات اعتماد المدير مشتركة؟ هل يطابق النمط أي مهمة مجدولة؟ ويفصل التقرير الجيد بين **الوقائع** (ما تُظهره السجلات) و**الاستنتاجات** (ما تخلص إليه) و**الفجوات** (ما لا يمكن معرفته، كالقراءات قبل بدء تسجيل التدقيق)."
+      },
+      {
+        "id": "warn-live",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تحقّق على النسخة الإنتاجية",
+        "markdown": "كل استعلام على الخادم الحي يغيّر الذاكرة المؤقتة والإحصاءات وأحيانًا السجلات نفسها التي تحتاجها. التقط أولًا ثم استعد في مختبر معزول. وانتبه كذلك لبيانات الاعتماد: لا تلصق كلمات مرور قواعد بيانات حقيقية في التذاكر أو التقارير؛ استخدم نوائب وخزّن الأسرار في الخزنة المعتمدة."
+      },
+      {
+        "id": "tip-prep",
+        "type": "callout",
+        "variant": "tip",
+        "title": "اجعل التحقيق القادم أسهل",
+        "markdown": "فعّل تدقيق الجداول الحساسة، وأرسل سجلات قاعدة البيانات إلى نظام SIEM الموصوف في درس [بنية المراقبة الأمنية](/learn/security-operations-dfir/security-monitoring-architecture)، وقيّد الحسابات ذات المضيف العام، ونبّه على `CREATE USER` و`GRANT`، واحتفظ بالسجلات الثنائية مدة تغطي زمن تأخر اكتشافك."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "1. في جهاز افتراضي مخبري تملكه، ثبّت MySQL أو MariaDB وفعّل السجل الثنائي (`log_bin`) وتسجيل الاستعلامات العام أو التدقيق.\n2. أنشئ قاعدة بيانات اختبارية، ثم نفّذ `CREATE USER` و`GRANT` وبضع عبارات `INSERT` و`UPDATE` وعبارة `SELECT` كبيرة على بيانات وهمية.\n3. انسخ السجل الثنائي وسجل التدقيق إلى مجلد منفصل، وسجّل بصمتيهما بالأمر `sha256sum`، وفك السجل الثنائي بالأمر `mysqlbinlog`.\n4. دوّن أيّ إجراءاتك تظهر في السجل الثنائي، وأيّها لا يظهر إلا في سجل التدقيق، وأيّها لا يظهر في أي منهما.\n5. ابنِ خطًا زمنيًا من خمسة صفوف مع تقدير للثقة في كل صف."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "ترتيب التطاير (Order of volatility)",
+            "definition": "قاعدة جمع الأدلة الأسرع زوالًا أولًا، كالجلسات والذاكرة."
+          },
+          {
+            "term": "السجل الثنائي (binlog)",
+            "definition": "سجل مرتب في MySQL للتغييرات المُثبَّتة في البيانات، يُستخدم للنسخ المتماثل والاستعادة."
+          },
+          {
+            "term": "سجل الكتابة المسبقة (WAL)",
+            "definition": "سجل في PostgreSQL للتغييرات يُكتب قبل تحديث ملفات البيانات."
+          },
+          {
+            "term": "سجل التدقيق (Audit log)",
+            "definition": "سجل لعمليات الدخول والعبارات وتغييرات الصلاحيات، ويمكن أن يشمل القراءات."
+          },
+          {
+            "term": "سلسلة الحيازة (Chain of custody)",
+            "definition": "توثيق من تعامل مع الدليل ومتى وكيف حُمي."
+          },
+          {
+            "term": "اللقطة (Snapshot)",
+            "definition": "نسخة من وحدة تخزين في لحظة محددة تُستخدم للتحليل دون المساس بالإنتاج."
+          },
+          {
+            "term": "حساب المضيف العام",
+            "definition": "حساب قاعدة بيانات مسموح له بالاتصال من أي عنوان، مثل 'user'@'%'."
+          },
+          {
+            "term": "الخط الزمني (Timeline)",
+            "definition": "سجل واحد مرتب للأحداث من جميع المصادر موحَّد بالتوقيت العالمي UTC."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا لا يستطيع السجل الثنائي في MySQL إثبات أن عبارة SELECT ضخمة سرقت بيانات؟",
+            "options": [
+              "لأن السجلات الثنائية مشفّرة",
+              "لأن السجلات الثنائية تسجل تغييرات البيانات لا القراءات",
+              "لأن عبارات SELECT محظورة",
+              "لأن السجلات الثنائية تغطي عمليات الدخول فقط"
+            ],
+            "answer": 1,
+            "explanation": "تلتقط السجلات الثنائية التغييرات المُثبَّتة، ولا تظهر القراءات إلا في سجلات التدقيق أو الاستعلام أو التقاط الشبكة."
+          },
+          {
+            "question": "أيّ الخطوات التالية صحيحة في بداية حفظ قاعدة بيانات؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تسجيل وقت الخادم ومقارنته بمصدر موثوق",
+              "نسخ السجلات خارج الخادم وتسجيل بصماتها",
+              "تنفيذ استعلامات استكشافية على الإنتاج للعثور على المهاجم",
+              "التقاط الجلسات النشطة بحساب للقراءة فقط"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تسجيل الوقت وبصمات نسخ السجلات والتقاط الجلسات تحفظ الأدلة، أما الاستعلامات الاستكشافية على الإنتاج فتغيّر الحالة وتخاطر بالدليل."
+          },
+          {
+            "question": "أيّ المصادر التالية هو الأكثر تطايرًا؟",
+            "options": [
+              "النسخ الاحتياطية",
+              "ملفات البيانات على القرص",
+              "الجلسات النشطة والاستعلامات الجارية",
+              "ملفات التدقيق المؤرشفة"
+            ],
+            "answer": 2,
+            "explanation": "تختفي الجلسات والاستعلامات الجارية عند إغلاق الاتصالات أو إعادة تشغيل الخدمة، لذا تُلتقط أولًا."
+          },
+          {
+            "question": "أيّ مما يلي ينبغي أن يرد في التقرير الجنائي كفئات منفصلة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "وقائع تُظهرها السجلات",
+              "استنتاجات مع مستويات ثقة",
+              "فجوات حيث الدليل مفقود",
+              "إشاعات غير مثبتة كأنها وقائع"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الفصل بين الوقائع والاستنتاجات المسببة والفجوات المعروفة يُبقي التقرير صادقًا وقابلًا للدفاع عنه."
+          },
+          {
+            "question": "أُنشئ حساب وحُذف خلال 20 دقيقة. ماذا يوحي ذلك بشأن التسجيل؟",
+            "options": [
+              "لم يوجد الحساب أبدًا",
+              "يمكن لسجلات التغيير أن تحفظ الدليل حتى بعد التنظيف",
+              "قاعدة البيانات تالفة",
+              "تدقيق السجلات غير ضروري"
+            ],
+            "answer": 1,
+            "explanation": "يزيل حذف الحساب أثره من جداول النظام، لكن السجل الثنائي ما زال يسجل العبارتين."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- تحتفظ قواعد البيانات بالأدلة في الجلسات والذاكرة المؤقتة وسجلات التدقيق والسجلات الثنائية أو سجلات المعاملات وملفات البيانات والنسخ الاحتياطية؛ فاجمع **من الأكثر تطايرًا إلى الأقل**.\n- **احفظ أولًا**: احصل على التفويض، وسجّل الوقت، والتقط الحالة المتطايرة، وانسخ السجلات وسجّل بصماتها، وأنشئ لقطة، وحلّل نسخة مستعادة.\n- **سجلات التغيير تثبت الكتابة وسجلات التدقيق تُظهر القراءة.** استخدم الاثنين وبيّن ثقتك في كل نتيجة.\n- ابنِ **خطًا زمنيًا بتوقيت UTC**، واختبر التفسيرات البديلة، وافصل في التقرير بين الوقائع والاستنتاجات والفجوات.\n- حسّن الجاهزية بتدقيق السجلات وإرسالها وبالتنبيه على تغييرات الحسابات والصلاحيات.\n\nقواعد البيانات مخازن منظمة، أما الذاكرة فتحتفظ بآثار غير منظمة لما جرى تشغيله. تابع مع درس [التحليل الجنائي للذاكرة وتحليل البرمجيات الخبيثة](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)."
+      }
+    ]
+  }
+}

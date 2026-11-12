@@ -1,0 +1,698 @@
+{
+  "slug": "postgresql-security-lab",
+  "title": "PostgreSQL Security Lab",
+  "summary": "Harden a PostgreSQL 16 server you own in layers: network exposure, pg_hba.conf authentication, TLS, least-privilege roles and audit logging, then test every control.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain the layers that control access to PostgreSQL",
+    "Write pg_hba.conf rules that require SCRAM and TLS",
+    "Create least-privilege group and login roles",
+    "Verify allowed and denied connections from the application host",
+    "Enable logging and auditing that supports investigation"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A small web app keeps its customers, orders and password hashes in PostgreSQL. The database was installed with defaults, the application connects as the `postgres` superuser, and the server listens on every network interface. Nothing is broken yet, but one SQL injection bug or one leaked `.env` file would hand an attacker the entire database and a path to the operating system.\n\nIn this lab you harden a PostgreSQL 16 server that **you own**, such as a VM in your home lab described in [Cybersecurity Home Lab Design](/learn/hands-on-security-labs/cybersecurity-home-lab-design). You will restrict who can connect, split privileges into roles, enforce encrypted connections, turn on auditing and then prove each control works."
+    },
+    {
+      "id": "layers",
+      "type": "text",
+      "markdown": "## Step 1: Understand the layers of access\n\nPostgreSQL decides access in several independent layers. Hardening means tightening every one of them, because a mistake in one layer should not expose the data.\n\n| Layer | Controlled by | Question it answers |\n|:--|:--|:--|\n| Network | `listen_addresses`, host firewall | Can the packet reach the port at all? |\n| Authentication | `pg_hba.conf` | Which user, from where, using which method? |\n| Transport | `ssl` settings | Is the session encrypted? |\n| Authorization | Roles and `GRANT` | What may this role read or change? |\n| Auditing | `log_*` settings, `pgaudit` | Can we see what happened afterward? |\n\nThe animation walks one application connection through these layers."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "One application connection through the layers",
+      "caption": "Every layer can say no. Only a connection that passes all of them reaches the data.",
+      "data": {
+        "token": "Connection",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "App server",
+            "sub": "10.20.0.15",
+            "icon": "server"
+          },
+          {
+            "id": "fw",
+            "label": "Host firewall",
+            "sub": "TCP/5432",
+            "icon": "firewall"
+          },
+          {
+            "id": "hba",
+            "label": "pg_hba.conf",
+            "sub": "scram-sha-256",
+            "icon": "key"
+          },
+          {
+            "id": "tls",
+            "label": "TLS",
+            "sub": "hostssl",
+            "icon": "lock"
+          },
+          {
+            "id": "role",
+            "label": "Role",
+            "sub": "app_rw",
+            "icon": "user"
+          },
+          {
+            "id": "db",
+            "label": "PostgreSQL",
+            "sub": "shop",
+            "icon": "database"
+          },
+          {
+            "id": "log",
+            "label": "Audit log",
+            "sub": "pgaudit",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "The app opens a connection to 10.20.0.5:5432 as user app_rw."
+          },
+          {
+            "at": "fw",
+            "caption": "The host firewall allows 5432 only from 10.20.0.15.",
+            "tone": "success"
+          },
+          {
+            "at": "hba",
+            "caption": "A matching hostssl line demands a SCRAM-SHA-256 password.",
+            "tone": "secure"
+          },
+          {
+            "at": "tls",
+            "caption": "The session is encrypted before any password is checked.",
+            "tone": "secure"
+          },
+          {
+            "at": "role",
+            "caption": "app_rw may only SELECT, INSERT and UPDATE on the shop tables."
+          },
+          {
+            "at": "db",
+            "caption": "The query runs. DROP TABLE would be refused for this role.",
+            "tone": "success"
+          },
+          {
+            "at": "log",
+            "caption": "The statement and the role are written to the audit log."
+          },
+          {
+            "at": "fw",
+            "token": "TCP/5432",
+            "caption": "A scan from 192.0.2.50 is dropped by the firewall and never reaches PostgreSQL.",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "network",
+      "type": "text",
+      "markdown": "## Step 2: Shrink the network exposure\n\nBy default PostgreSQL listens on `localhost` only, but many tutorials change it to `*`. Bind to the one interface the application needs, and let the host firewall allow only the application server.\n\nEdit `postgresql.conf`, then restart the service. Never expose 5432 to the internet. If remote administration is needed, use an SSH tunnel or a VPN."
+    },
+    {
+      "id": "conf",
+      "type": "code",
+      "language": "ini",
+      "filename": "postgresql.conf",
+      "caption": "Network, password and TLS settings (excerpt).",
+      "highlight": [
+        2,
+        4,
+        5,
+        6
+      ],
+      "code": "# Network\nlisten_addresses = '10.20.0.5'          # not '*'\n# Authentication and TLS\npassword_encryption = scram-sha-256     # no md5 for new passwords\nssl = on\nssl_cert_file = '/etc/postgresql/16/main/server.crt'\nssl_key_file  = '/etc/postgresql/16/main/server.key'\nssl_min_protocol_version = 'TLSv1.2'\n# Logging\nlog_connections = on\nlog_disconnections = on\nlog_line_prefix = '%m [%p] %u@%d %h '\nlog_statement = 'ddl'\n"
+    },
+    {
+      "id": "hba",
+      "type": "text",
+      "markdown": "## Step 3: Lock down authentication with pg_hba.conf\n\nPostgreSQL reads `pg_hba.conf` from top to bottom and uses the **first** matching line. Order matters. Start with the most specific rules, and end with an explicit reject.\n\nAvoid `trust`, which accepts any claimed user without a password. Avoid `md5` for new setups, because SCRAM-SHA-256 resists replay and offline guessing far better. Use `hostssl` so a non-TLS attempt fails to match."
+    },
+    {
+      "id": "hbacode",
+      "type": "code",
+      "language": "plain",
+      "filename": "pg_hba.conf",
+      "caption": "First match wins, so the final reject line is the safety net.",
+      "highlight": [
+        3,
+        4,
+        6
+      ],
+      "code": "# TYPE   DATABASE  USER      ADDRESS          METHOD\nlocal    all       postgres                   peer\nhostssl  shop      app_rw    10.20.0.15/32    scram-sha-256\nhostssl  shop      app_ro    10.20.0.16/32    scram-sha-256\nhostssl  all       dba_alice 10.20.0.99/32    scram-sha-256\nhost     all       all       0.0.0.0/0        reject\n"
+    },
+    {
+      "id": "roles",
+      "type": "text",
+      "markdown": "## Step 4: Apply least privilege with roles\n\nThe application should never be a superuser. Create a **group** role per job, grant it only what that job needs, and let login roles inherit from it. Revoke the broad default rights on the `public` schema as well.\n\nThe commands below use placeholder passwords. In a real setup, generate long random values and store them in a secrets manager, not in shell history."
+    },
+    {
+      "id": "sql",
+      "type": "code",
+      "language": "sql",
+      "filename": "harden.sql",
+      "caption": "Run as postgres with: sudo -u postgres psql -d shop -f harden.sql",
+      "highlight": [
+        2,
+        3,
+        7,
+        8
+      ],
+      "code": "-- Remove broad defaults\nREVOKE ALL ON DATABASE shop FROM PUBLIC;\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\n-- Group roles (cannot log in)\nCREATE ROLE shop_rw NOLOGIN;\nCREATE ROLE shop_ro NOLOGIN;\nGRANT CONNECT ON DATABASE shop TO shop_rw, shop_ro;\nGRANT USAGE ON SCHEMA public TO shop_rw, shop_ro;\nGRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO shop_rw;\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO shop_ro;\n\n-- Login roles inherit from groups\nCREATE ROLE app_rw LOGIN PASSWORD 'REPLACE_WITH_GENERATED_SECRET' CONNECTION LIMIT 20 IN ROLE shop_rw;\nCREATE ROLE app_ro LOGIN PASSWORD 'REPLACE_WITH_GENERATED_SECRET' CONNECTION LIMIT 5 IN ROLE shop_ro;\n"
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Step 5: Prove the controls work\n\nA control you never tested is only an assumption. Test from the application host with the roles you just created, and check both the allowed and the denied cases.\n\n1. Connect with TLS required and confirm the session is encrypted.\n2. Try a destructive statement as `app_rw` and confirm PostgreSQL refuses it.\n3. Try connecting from an address that has no `pg_hba.conf` line and confirm it is rejected.\n4. Read the log and confirm each attempt left a trace."
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "app-host",
+      "prompt": "$",
+      "caption": "Annotated test run from the application host (10.20.0.15).",
+      "lines": [
+        {
+          "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=require\" -c \"\\conninfo\"",
+          "output": "You are connected to database \"shop\" as user \"app_rw\" on host \"10.20.0.5\" at port \"5432\".\nSSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)",
+          "comment": "TLS 1.3 is in use."
+        },
+        {
+          "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=require\" -c \"DROP TABLE orders;\"",
+          "output": "ERROR:  must be owner of table orders",
+          "comment": "Least privilege works: the application cannot destroy data."
+        },
+        {
+          "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=disable\" -c \"SELECT 1;\"",
+          "output": "psql: error: connection to server at \"10.20.0.5\", port 5432 failed: FATAL:  no pg_hba.conf entry for host \"10.20.0.15\", user \"app_rw\", database \"shop\", no encryption",
+          "comment": "hostssl lines reject plaintext sessions."
+        },
+        {
+          "prompt": "$ (on the server)",
+          "cmd": "sudo tail -n 3 /var/log/postgresql/postgresql-16-main.log",
+          "output": "2026-11-12 09:14:02.118 UTC [4121] app_rw@shop 10.20.0.15 ERROR:  must be owner of table orders\n2026-11-12 09:14:02.118 UTC [4121] app_rw@shop 10.20.0.15 STATEMENT:  DROP TABLE orders;\n2026-11-12 09:14:09.771 UTC [4130] [unknown]@[unknown] 10.20.0.15 FATAL:  no pg_hba.conf entry for host \"10.20.0.15\"",
+          "comment": "Every denied attempt is logged with the role and source address."
+        }
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "text",
+      "markdown": "## Step 6: Audit, back up and patch\n\nThe `log_*` settings above record connections and DDL. For statement-level audit of reads and writes on sensitive tables, install the `pgaudit` extension and log only the classes you need, such as `write` and `role`. Logging everything fills the disk and hides the useful lines.\n\nThen close three common gaps:\n\n- **Backups** must be encrypted and restored regularly. See [Backup and Disaster Recovery Lab](/learn/hands-on-security-labs/backup-and-disaster-recovery-lab).\n- **Patching**: apply PostgreSQL minor releases promptly, since they carry security fixes.\n- **Monitoring**: ship the log to your SIEM, as built in [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab), and alert on repeated authentication failures."
+    },
+    {
+      "id": "mistakes",
+      "type": "text",
+      "markdown": "## Common mistakes to look for\n\nWhen you review a database you inherit, check this short list first. Each item is a real pattern behind many data breaches, and each is cheap to fix.\n\n| Finding | Why it hurts | Fix |\n|:--|:--|:--|\n| `trust` or `0.0.0.0/0` in `pg_hba.conf` | Anyone who reaches the port can log in | Specific addresses, SCRAM, final `reject` |\n| Application uses `postgres` | One injection bug becomes full control, including file access | Dedicated login role with a group role |\n| Same password in every environment | A leak from development exposes production | Unique generated secret per environment |\n| No TLS between app and database | Credentials and data cross the network in clear text | `hostssl` and `sslmode=verify-full` |\n| Logs kept only on the database host | An attacker can erase the evidence | Forward logs to a central collector |\n\nNotice that none of these fixes needs a commercial product. They need a checklist and the discipline to retest after every change. Treat the checklist as code: store it next to your configuration, run it after each upgrade, and record the result. A hardening that is verified once a year drifts; a hardening that is verified on every change stays real."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not lock yourself out",
+      "markdown": "Always keep one working admin session open while you edit `pg_hba.conf`, and check the file before reloading. A typo in the wrong line can block everyone, including you. Reload with `SELECT pg_reload_conf();` and test from a second terminal."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Check the file before you reload",
+      "markdown": "Query the `pg_hba_file_rules` view and look at the `error` column. It shows syntax errors in each line without applying anything, so you catch mistakes before they cost you access."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a PostgreSQL VM **you own**:\n\n1. Take a snapshot, then apply the `postgresql.conf` and `pg_hba.conf` examples with your own addresses.\n2. Run `harden.sql` and create the two login roles with generated passwords.\n3. Repeat the three tests from Step 5 and record the exact error messages.\n4. From another VM, run `nmap -p 5432 <db-ip>` before and after enabling the firewall rule, and note the difference.\n5. Query `SELECT usename, passwd LIKE 'SCRAM%' FROM pg_shadow;` and confirm every password uses SCRAM.\n6. Write one paragraph on which layer would have stopped a stolen app password used from a different host."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Least privilege",
+          "definition": "Giving a role only the access its job requires."
+        },
+        {
+          "term": "pg_hba.conf",
+          "definition": "The host-based authentication file; the first matching line decides how a connection authenticates."
+        },
+        {
+          "term": "SCRAM-SHA-256",
+          "definition": "A challenge-response password method that never sends the password and resists offline guessing better than md5."
+        },
+        {
+          "term": "hostssl",
+          "definition": "A pg_hba.conf connection type that matches only TLS-encrypted TCP connections."
+        },
+        {
+          "term": "Role",
+          "definition": "A PostgreSQL identity that can own objects, hold privileges and, if allowed, log in."
+        },
+        {
+          "term": "Superuser",
+          "definition": "A role that bypasses all permission checks; applications should never use it."
+        },
+        {
+          "term": "pgaudit",
+          "definition": "An extension that writes detailed session and object audit records to the PostgreSQL log."
+        },
+        {
+          "term": "Defense in depth",
+          "definition": "Stacking independent controls so one failure does not expose the data."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which file decides which users may connect from which addresses, and with what method?",
+          "options": [
+            "postgresql.conf",
+            "pg_hba.conf",
+            "pg_ident.conf",
+            "recovery.conf"
+          ],
+          "answer": 1,
+          "explanation": "pg_hba.conf holds the host-based authentication rules. postgresql.conf holds server settings such as listen_addresses."
+        },
+        {
+          "question": "Why is the order of lines in pg_hba.conf important?",
+          "options": [
+            "The first matching line is used and the rest are ignored",
+            "The last matching line is used",
+            "All matching lines are combined",
+            "Order only affects logging"
+          ],
+          "answer": 0,
+          "explanation": "PostgreSQL stops at the first match, so a broad early line can override a stricter later one."
+        },
+        {
+          "question": "Which settings improve the security of the database server in this lab? (Choose all that apply.)",
+          "options": [
+            "listen_addresses = '*'",
+            "password_encryption = scram-sha-256",
+            "hostssl lines with a final reject rule",
+            "The application connecting as postgres"
+          ],
+          "answer": [
+            1,
+            2
+          ],
+          "explanation": "SCRAM and hostssl with a closing reject improve security. Listening on every interface and using a superuser for the application widen the attack surface."
+        },
+        {
+          "question": "The application role runs DROP TABLE orders and gets an error. Which principle caused this?",
+          "options": [
+            "Least privilege",
+            "Security through obscurity",
+            "Fail open",
+            "Key escrow"
+          ],
+          "answer": 0,
+          "explanation": "The role was granted only SELECT, INSERT and UPDATE and does not own the table, so destructive DDL is refused."
+        },
+        {
+          "question": "What is the safest way to test a pg_hba.conf change?",
+          "options": [
+            "Edit it and restart without a backup session",
+            "Keep one admin session open, check pg_hba_file_rules, reload, test from a second terminal",
+            "Set every method to trust first",
+            "Test only in production"
+          ],
+          "answer": 1,
+          "explanation": "An open admin session and a syntax check let you roll back instantly if a rule blocks legitimate users."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou hardened PostgreSQL in layers: a narrow listen address and host firewall, `pg_hba.conf` rules with SCRAM and TLS, least-privilege roles, and logging that proves what happened. Each control was tested for both the allowed and the denied case. Keep the SQL and configuration files in version control so the next server starts hardened. The next lab applies the same thinking to the web tier: [Nginx and Laravel Security Lab](/learn/hands-on-security-labs/nginx-and-laravel-security-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر أمن PostgreSQL",
+    "summary": "حصّن خادم PostgreSQL 16 تملكه على طبقات: التعرّض على الشبكة، ومصادقة pg_hba.conf، وTLS، وأدوار بأقل الصلاحيات، وتسجيل التدقيق، ثم اختبر كل ضابط.",
+    "objectives": [
+      "شرح الطبقات التي تتحكم بالوصول إلى PostgreSQL",
+      "كتابة قواعد pg_hba.conf تشترط SCRAM وTLS",
+      "إنشاء أدوار جماعية وأدوار دخول بأقل الصلاحيات",
+      "التحقق من الاتصالات المسموحة والمرفوضة من مضيف التطبيق",
+      "تفعيل تسجيل وتدقيق يدعمان التحقيق"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يحتفظ تطبيق ويب صغير ببيانات عملائه وطلباته وتجزئات كلمات المرور في PostgreSQL. ثُبّتت قاعدة البيانات بالإعدادات الافتراضية، ويتصل التطبيق بحساب المدير الأعلى `postgres`، ويستمع الخادم على كل واجهات الشبكة. لا شيء معطّل بعدُ، لكنّ ثغرة حقن SQL واحدة أو تسرّب ملف `.env` واحد كفيلان بتسليم المهاجم قاعدة البيانات كاملة وطريقًا إلى نظام التشغيل.\n\nستقوم في هذا المختبر بتحصين خادم PostgreSQL 16 **تملكه أنت**، مثل آلة افتراضية في مختبرك المنزلي الموصوف في [تصميم مختبر الأمن السيبراني المنزلي](/learn/hands-on-security-labs/cybersecurity-home-lab-design). ستقيّد من يستطيع الاتصال، وتقسّم الصلاحيات على أدوار، وتفرض الاتصالات المشفّرة، وتفعّل التدقيق، ثم تثبت أن كل ضابط يعمل فعلًا."
+      },
+      {
+        "id": "layers",
+        "type": "text",
+        "markdown": "## الخطوة 1: فهم طبقات الوصول\n\nيقرر PostgreSQL الوصول عبر عدة طبقات مستقلة. والتحصين يعني إحكام كل طبقة منها، لأن خطأً في إحداها ينبغي ألا يكشف البيانات.\n\n| الطبقة | يتحكم بها | السؤال الذي تجيب عنه |\n|:--|:--|:--|\n| الشبكة | `listen_addresses` وجدار الحماية على المضيف | هل تصل الحزمة إلى المنفذ أصلًا؟ |\n| المصادقة | `pg_hba.conf` | أي مستخدم، ومن أين، وبأي طريقة؟ |\n| النقل | إعدادات `ssl` | هل الجلسة مشفّرة؟ |\n| التفويض | الأدوار و`GRANT` | ماذا يستطيع هذا الدور أن يقرأ أو يغيّر؟ |\n| التدقيق | إعدادات `log_*` و`pgaudit` | هل نستطيع معرفة ما جرى لاحقًا؟ |\n\nيتتبّع الرسم المتحرك اتصالًا واحدًا للتطبيق عبر هذه الطبقات."
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "اتصال واحد للتطبيق عبر الطبقات",
+        "caption": "كل طبقة تستطيع الرفض. والاتصال الذي يجتاز جميعها وحده يصل إلى البيانات.",
+        "data": {
+          "token": "اتصال",
+          "nodes": [
+            {
+              "id": "app",
+              "label": "خادم التطبيق",
+              "sub": "10.20.0.15",
+              "icon": "server"
+            },
+            {
+              "id": "fw",
+              "label": "جدار المضيف",
+              "sub": "TCP/5432",
+              "icon": "firewall"
+            },
+            {
+              "id": "hba",
+              "label": "pg_hba.conf",
+              "sub": "scram-sha-256",
+              "icon": "key"
+            },
+            {
+              "id": "tls",
+              "label": "TLS",
+              "sub": "hostssl",
+              "icon": "lock"
+            },
+            {
+              "id": "role",
+              "label": "الدور",
+              "sub": "app_rw",
+              "icon": "user"
+            },
+            {
+              "id": "db",
+              "label": "PostgreSQL",
+              "sub": "shop",
+              "icon": "database"
+            },
+            {
+              "id": "log",
+              "label": "سجل التدقيق",
+              "sub": "pgaudit",
+              "icon": "log"
+            }
+          ],
+          "steps": [
+            {
+              "at": "app",
+              "caption": "يفتح التطبيق اتصالًا بالعنوان 10.20.0.5:5432 باسم المستخدم app_rw."
+            },
+            {
+              "at": "fw",
+              "caption": "يسمح جدار المضيف بالمنفذ 5432 من 10.20.0.15 فقط.",
+              "tone": "success"
+            },
+            {
+              "at": "hba",
+              "caption": "يطلب سطر hostssl مطابق كلمة مرور بطريقة SCRAM-SHA-256.",
+              "tone": "secure"
+            },
+            {
+              "at": "tls",
+              "caption": "تُشفَّر الجلسة قبل التحقق من أي كلمة مرور.",
+              "tone": "secure"
+            },
+            {
+              "at": "role",
+              "caption": "يملك app_rw صلاحيات SELECT وINSERT وUPDATE فقط على جداول shop."
+            },
+            {
+              "at": "db",
+              "caption": "ينفَّذ الاستعلام. أما DROP TABLE فيُرفض لهذا الدور.",
+              "tone": "success"
+            },
+            {
+              "at": "log",
+              "caption": "تُكتب العبارة والدور في سجل التدقيق."
+            },
+            {
+              "at": "fw",
+              "token": "TCP/5432",
+              "caption": "يُسقط الجدار الناري فحصًا قادمًا من 192.0.2.50 فلا يصل إلى PostgreSQL.",
+              "tone": "blocked"
+            }
+          ]
+        }
+      },
+      {
+        "id": "network",
+        "type": "text",
+        "markdown": "## الخطوة 2: تقليص التعرّض على الشبكة\n\nيستمع PostgreSQL افتراضيًا على `localhost` فقط، لكنّ كثيرًا من الشروحات تغيّره إلى `*`. اربطه بالواجهة الوحيدة التي يحتاجها التطبيق، ودع جدار المضيف يسمح بخادم التطبيق وحده.\n\nعدّل الملف `postgresql.conf` ثم أعد تشغيل الخدمة. لا تعرّض المنفذ 5432 للإنترنت أبدًا. وإن لزمت الإدارة عن بُعد فاستخدم نفق SSH أو شبكة VPN."
+      },
+      {
+        "id": "conf",
+        "type": "code",
+        "language": "ini",
+        "filename": "postgresql.conf",
+        "caption": "إعدادات الشبكة وكلمات المرور وTLS (مقتطف).",
+        "highlight": [
+          2,
+          4,
+          5,
+          6
+        ],
+        "code": "# Network\nlisten_addresses = '10.20.0.5'          # not '*'\n# Authentication and TLS\npassword_encryption = scram-sha-256     # no md5 for new passwords\nssl = on\nssl_cert_file = '/etc/postgresql/16/main/server.crt'\nssl_key_file  = '/etc/postgresql/16/main/server.key'\nssl_min_protocol_version = 'TLSv1.2'\n# Logging\nlog_connections = on\nlog_disconnections = on\nlog_line_prefix = '%m [%p] %u@%d %h '\nlog_statement = 'ddl'\n"
+      },
+      {
+        "id": "hba",
+        "type": "text",
+        "markdown": "## الخطوة 3: إحكام المصادقة عبر pg_hba.conf\n\nيقرأ PostgreSQL الملف `pg_hba.conf` من الأعلى إلى الأسفل ويستخدم **أول** سطر مطابق. فالترتيب مهم. ابدأ بالقواعد الأكثر تحديدًا، وأنهِ بقاعدة رفض صريحة.\n\nتجنّب `trust` لأنه يقبل أي مستخدم مُدّعى بلا كلمة مرور. وتجنّب `md5` في الإعدادات الجديدة، فطريقة SCRAM-SHA-256 أقدر بكثير على مقاومة إعادة الإرسال والتخمين دون اتصال. واستخدم `hostssl` كي يفشل أي اتصال غير مشفّر في المطابقة."
+      },
+      {
+        "id": "hbacode",
+        "type": "code",
+        "language": "plain",
+        "filename": "pg_hba.conf",
+        "caption": "أول تطابق هو الفائز، لذا يعمل سطر الرفض الأخير شبكةَ أمان.",
+        "highlight": [
+          3,
+          4,
+          6
+        ],
+        "code": "# TYPE   DATABASE  USER      ADDRESS          METHOD\nlocal    all       postgres                   peer\nhostssl  shop      app_rw    10.20.0.15/32    scram-sha-256\nhostssl  shop      app_ro    10.20.0.16/32    scram-sha-256\nhostssl  all       dba_alice 10.20.0.99/32    scram-sha-256\nhost     all       all       0.0.0.0/0        reject\n"
+      },
+      {
+        "id": "roles",
+        "type": "text",
+        "markdown": "## الخطوة 4: تطبيق أقل الصلاحيات بالأدوار\n\nيجب ألا يكون التطبيق مديرًا أعلى أبدًا. أنشئ دورًا **جماعيًا** لكل وظيفة، وامنحه ما تتطلبه تلك الوظيفة فقط، ودع أدوار الدخول ترث منه. واسحب الصلاحيات الافتراضية الواسعة على المخطط `public` أيضًا.\n\nتستخدم الأوامر أدناه كلمات مرور بديلة. وفي الإعداد الحقيقي ولّد قيمًا عشوائية طويلة واحفظها في مدير أسرار لا في سجل الصدفة."
+      },
+      {
+        "id": "sql",
+        "type": "code",
+        "language": "sql",
+        "filename": "harden.sql",
+        "caption": "نفّذه بحساب postgres عبر: sudo -u postgres psql -d shop -f harden.sql",
+        "highlight": [
+          2,
+          3,
+          7,
+          8
+        ],
+        "code": "-- Remove broad defaults\nREVOKE ALL ON DATABASE shop FROM PUBLIC;\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\n-- Group roles (cannot log in)\nCREATE ROLE shop_rw NOLOGIN;\nCREATE ROLE shop_ro NOLOGIN;\nGRANT CONNECT ON DATABASE shop TO shop_rw, shop_ro;\nGRANT USAGE ON SCHEMA public TO shop_rw, shop_ro;\nGRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO shop_rw;\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO shop_ro;\n\n-- Login roles inherit from groups\nCREATE ROLE app_rw LOGIN PASSWORD 'REPLACE_WITH_GENERATED_SECRET' CONNECTION LIMIT 20 IN ROLE shop_rw;\nCREATE ROLE app_ro LOGIN PASSWORD 'REPLACE_WITH_GENERATED_SECRET' CONNECTION LIMIT 5 IN ROLE shop_ro;\n"
+      },
+      {
+        "id": "verify",
+        "type": "text",
+        "markdown": "## الخطوة 5: أثبت أن الضوابط تعمل\n\nالضابط الذي لم تختبره مجرد افتراض. اختبر من مضيف التطبيق بالأدوار التي أنشأتها للتو، وتحقق من حالات السماح وحالات الرفض معًا.\n\n1. اتصل مع اشتراط TLS وتأكد أن الجلسة مشفّرة.\n2. جرّب عبارة مدمّرة بدور `app_rw` وتأكد أن PostgreSQL يرفضها.\n3. جرّب الاتصال من عنوان ليس له سطر في `pg_hba.conf` وتأكد من رفضه.\n4. اقرأ السجل وتأكد أن كل محاولة تركت أثرًا."
+      },
+      {
+        "id": "term",
+        "type": "terminal",
+        "title": "app-host",
+        "prompt": "$",
+        "caption": "تشغيل اختباري موضّح من مضيف التطبيق (10.20.0.15).",
+        "lines": [
+          {
+            "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=require\" -c \"\\conninfo\"",
+            "output": "You are connected to database \"shop\" as user \"app_rw\" on host \"10.20.0.5\" at port \"5432\".\nSSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)",
+            "comment": "يُستخدم TLS 1.3."
+          },
+          {
+            "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=require\" -c \"DROP TABLE orders;\"",
+            "output": "ERROR:  must be owner of table orders",
+            "comment": "يعمل مبدأ أقل الصلاحيات: لا يستطيع التطبيق إتلاف البيانات."
+          },
+          {
+            "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=disable\" -c \"SELECT 1;\"",
+            "output": "psql: error: connection to server at \"10.20.0.5\", port 5432 failed: FATAL:  no pg_hba.conf entry for host \"10.20.0.15\", user \"app_rw\", database \"shop\", no encryption",
+            "comment": "تَرفض أسطر hostssl الجلسات غير المشفّرة."
+          },
+          {
+            "prompt": "$ (on the server)",
+            "cmd": "sudo tail -n 3 /var/log/postgresql/postgresql-16-main.log",
+            "output": "2026-11-12 09:14:02.118 UTC [4121] app_rw@shop 10.20.0.15 ERROR:  must be owner of table orders\n2026-11-12 09:14:02.118 UTC [4121] app_rw@shop 10.20.0.15 STATEMENT:  DROP TABLE orders;\n2026-11-12 09:14:09.771 UTC [4130] [unknown]@[unknown] 10.20.0.15 FATAL:  no pg_hba.conf entry for host \"10.20.0.15\"",
+            "comment": "يُسجَّل كل طلب مرفوض مع الدور وعنوان المصدر."
+          }
+        ]
+      },
+      {
+        "id": "audit",
+        "type": "text",
+        "markdown": "## الخطوة 6: التدقيق والنسخ الاحتياطي والتحديث\n\nتسجّل إعدادات `log_*` أعلاه الاتصالات وعبارات DDL. أما للتدقيق على مستوى العبارات في القراءة والكتابة على الجداول الحساسة فثبّت الامتداد `pgaudit` وسجّل الفئات التي تحتاجها فقط، مثل `write` و`role`. فتسجيل كل شيء يملأ القرص ويخفي الأسطر المفيدة.\n\nثم سُدّ ثلاث ثغرات شائعة:\n\n- يجب **تشفير النسخ الاحتياطية** واستعادتها بانتظام. راجع [مختبر النسخ الاحتياطي والتعافي من الكوارث](/learn/hands-on-security-labs/backup-and-disaster-recovery-lab).\n- **التحديث**: طبّق الإصدارات الفرعية من PostgreSQL سريعًا لأنها تحمل إصلاحات أمنية.\n- **المراقبة**: أرسل السجل إلى نظام SIEM الذي بنيته في [مختبر SIEM المركزي](/learn/hands-on-security-labs/centralized-siem-lab) ونبّه عند تكرار فشل المصادقة."
+      },
+      {
+        "id": "mistakes",
+        "type": "text",
+        "markdown": "## أخطاء شائعة ابحث عنها\n\nعندما تراجع قاعدة بيانات ورثتها، افحص هذه القائمة القصيرة أولًا. كل بند منها نمط حقيقي وراء كثير من حوادث تسرّب البيانات، وإصلاح كل منها رخيص.\n\n| الملاحظة | لماذا تضرّ | الإصلاح |\n|:--|:--|:--|\n| `trust` أو `0.0.0.0/0` في `pg_hba.conf` | يستطيع أي شخص يصل إلى المنفذ تسجيل الدخول | عناوين محددة وSCRAM وقاعدة `reject` أخيرة |\n| التطبيق يستخدم `postgres` | تتحول ثغرة حقن واحدة إلى سيطرة كاملة تشمل الوصول إلى الملفات | دور دخول مخصص مع دور جماعي |\n| كلمة المرور نفسها في كل البيئات | تسرّب من بيئة التطوير يكشف الإنتاج | سر مولَّد فريد لكل بيئة |\n| لا TLS بين التطبيق وقاعدة البيانات | تعبر بيانات الاعتماد والبيانات الشبكة بنص صريح | `hostssl` و`sslmode=verify-full` |\n| السجلات على مضيف قاعدة البيانات فقط | يستطيع المهاجم محو الأدلة | إعادة توجيه السجلات إلى مجمّع مركزي |\n\nلاحظ أن أيًّا من هذه الإصلاحات لا يحتاج منتجًا تجاريًا. إنها تحتاج إلى قائمة تحقق وانضباط في إعادة الاختبار بعد كل تغيير. تعامل مع القائمة كأنها شيفرة: احفظها بجانب إعداداتك، ونفّذها بعد كل ترقية، وسجّل النتيجة. فالتحصين الذي يُتحقق منه مرة في السنة ينحرف، أما الذي يُتحقق منه عند كل تغيير فيبقى حقيقيًا."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "تنبّه كي لا تُقفل على نفسك",
+        "markdown": "أبقِ جلسة إدارة عاملة مفتوحة دائمًا أثناء تعديل `pg_hba.conf`، وافحص الملف قبل إعادة التحميل. فخطأ مطبعي في السطر الخطأ قد يمنع الجميع ومنهم أنت. أعد التحميل بالأمر `SELECT pg_reload_conf();` واختبر من طرفية ثانية."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "افحص الملف قبل إعادة التحميل",
+        "markdown": "استعلم عن العرض `pg_hba_file_rules` وانظر إلى العمود `error`. فهو يُظهر الأخطاء النحوية في كل سطر دون تطبيق أي شيء، فتلتقط الأخطاء قبل أن تخسر الوصول."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة PostgreSQL افتراضية **تملكها**:\n\n1. التقط لقطة (Snapshot) ثم طبّق مثالَي `postgresql.conf` و`pg_hba.conf` بعناوينك.\n2. نفّذ `harden.sql` وأنشئ دوري الدخول بكلمات مرور مولَّدة.\n3. كرّر الاختبارات الثلاثة من الخطوة 5 وسجّل رسائل الخطأ بنصها.\n4. من آلة أخرى نفّذ `nmap -p 5432 <db-ip>` قبل تفعيل قاعدة الجدار الناري وبعده ولاحظ الفرق.\n5. استعلم `SELECT usename, passwd LIKE 'SCRAM%' FROM pg_shadow;` وتأكد أن كل كلمات المرور تستخدم SCRAM.\n6. اكتب فقرة عن الطبقة التي كانت ستوقف كلمة مرور تطبيق مسروقة تُستخدم من مضيف مختلف."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "أقل الصلاحيات",
+            "definition": "منح الدور الوصول الذي تتطلبه وظيفته فقط."
+          },
+          {
+            "term": "pg_hba.conf",
+            "definition": "ملف المصادقة المعتمدة على المضيف؛ أول سطر مطابق يقرر كيف تُصادَق الجلسة."
+          },
+          {
+            "term": "SCRAM-SHA-256",
+            "definition": "طريقة كلمات مرور بالتحدي والاستجابة لا ترسل كلمة المرور وتقاوم التخمين دون اتصال أفضل من md5."
+          },
+          {
+            "term": "hostssl",
+            "definition": "نوع اتصال في pg_hba.conf لا يطابق إلا اتصالات TCP المشفّرة بـ TLS."
+          },
+          {
+            "term": "الدور (Role)",
+            "definition": "هوية في PostgreSQL تستطيع امتلاك الكائنات وحمل الصلاحيات وتسجيل الدخول إن سُمح لها."
+          },
+          {
+            "term": "المدير الأعلى (Superuser)",
+            "definition": "دور يتجاوز كل فحوص الصلاحيات؛ ولا ينبغي أن تستخدمه التطبيقات."
+          },
+          {
+            "term": "pgaudit",
+            "definition": "امتداد يكتب سجلات تدقيق مفصلة للجلسات والكائنات في سجل PostgreSQL."
+          },
+          {
+            "term": "الدفاع المتعدد الطبقات",
+            "definition": "تراكم ضوابط مستقلة بحيث لا يكشف فشل واحد منها البيانات."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي ملف يقرر أي المستخدمين يتصلون من أي العناوين وبأي طريقة؟",
+            "options": [
+              "postgresql.conf",
+              "pg_hba.conf",
+              "pg_ident.conf",
+              "recovery.conf"
+            ],
+            "answer": 1,
+            "explanation": "يحتوي pg_hba.conf على قواعد المصادقة المعتمدة على المضيف، بينما يحتوي postgresql.conf على إعدادات الخادم مثل listen_addresses."
+          },
+          {
+            "question": "لماذا يهم ترتيب الأسطر في pg_hba.conf؟",
+            "options": [
+              "يُستخدم أول سطر مطابق وتُهمل البقية",
+              "يُستخدم آخر سطر مطابق",
+              "تُدمج كل الأسطر المطابقة",
+              "الترتيب يؤثر في التسجيل فقط"
+            ],
+            "answer": 0,
+            "explanation": "يتوقف PostgreSQL عند أول تطابق، فقد يُبطل سطر واسع مبكر سطرًا أشد منه يأتي بعده."
+          },
+          {
+            "question": "أي الإعدادات تحسّن أمن خادم قاعدة البيانات في هذا المختبر؟ (اختر كل ما ينطبق)",
+            "options": [
+              "listen_addresses = '*'",
+              "password_encryption = scram-sha-256",
+              "أسطر hostssl مع قاعدة رفض أخيرة",
+              "اتصال التطبيق بحساب postgres"
+            ],
+            "answer": [
+              1,
+              2
+            ],
+            "explanation": "يحسّن SCRAM وhostssl مع رفض ختامي الأمن. أما الاستماع على كل الواجهات واستخدام مدير أعلى للتطبيق فيوسّعان سطح الهجوم."
+          },
+          {
+            "question": "ينفّذ دور التطبيق DROP TABLE orders ويتلقى خطأ. أي مبدأ تسبب في ذلك؟",
+            "options": [
+              "أقل الصلاحيات",
+              "الأمن بالغموض",
+              "الفشل المفتوح",
+              "إيداع المفاتيح"
+            ],
+            "answer": 0,
+            "explanation": "مُنح الدور SELECT وINSERT وUPDATE فقط ولا يملك الجدول، لذلك تُرفض عبارات DDL المدمّرة."
+          },
+          {
+            "question": "ما أأمن طريقة لاختبار تعديل pg_hba.conf؟",
+            "options": [
+              "تعديله وإعادة التشغيل دون جلسة احتياطية",
+              "إبقاء جلسة إدارة مفتوحة وفحص pg_hba_file_rules ثم إعادة التحميل والاختبار من طرفية ثانية",
+              "ضبط كل الطرق على trust أولًا",
+              "الاختبار في الإنتاج فقط"
+            ],
+            "answer": 1,
+            "explanation": "تتيح جلسة إدارة مفتوحة وفحص للصياغة التراجع فورًا إذا حجبت قاعدة ما المستخدمين الشرعيين."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nحصّنت PostgreSQL على طبقات: عنوان استماع ضيّق وجدار حماية على المضيف، وقواعد `pg_hba.conf` مع SCRAM وTLS، وأدوار بأقل الصلاحيات، وتسجيل يثبت ما حدث. واختُبر كل ضابط في حالتَي السماح والرفض. احتفظ بملفات SQL والإعدادات في نظام تحكم بالإصدارات كي يبدأ الخادم التالي محصّنًا. ويطبّق المختبر التالي الفكرة نفسها على طبقة الويب: [مختبر أمن Nginx وLaravel](/learn/hands-on-security-labs/nginx-and-laravel-security-lab)."
+      }
+    ]
+  }
+}

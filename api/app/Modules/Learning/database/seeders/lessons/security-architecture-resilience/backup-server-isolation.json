@@ -1,0 +1,570 @@
+{
+  "slug": "backup-server-isolation",
+  "title": "Backup Server Isolation",
+  "summary": "Place backup servers in a dedicated, tightly filtered zone with their own identity, management path and hardening so a compromised network cannot reach them.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain why backup servers need their own network zone",
+    "Write firewall rules that allow only required backup flows",
+    "Compare push and pull backup models for isolation",
+    "Harden a backup server and its management path",
+    "Verify isolation by testing from a production host"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A manufacturer places its backup server in the main server VLAN, joined to the company domain, with Remote Desktop open to every administrator. An attacker compromises one workstation, steals a cached domain admin credential and connects straight to the backup server. Total time from first access to deleted backups: forty minutes.\n\nNothing about the backup software was weak. The weakness was placement. A backup server that sits beside the systems it protects shares their fate. **Isolation** breaks that link, so that a compromise of production does not automatically become a compromise of recovery."
+    },
+    {
+      "id": "zone",
+      "type": "text",
+      "markdown": "## A dedicated backup zone\n\nPlace the backup server, its storage and its management tools in a separate **security zone**, usually a dedicated VLAN and subnet behind a firewall. The zone should have a short, written list of what may enter and leave.\n\nA typical flow list for the zone `198.51.100.0/28`:\n\n| Direction | Source | Destination | Port | Purpose |\n|:--|:--|:--|:--|:--|\n| Inbound | Agent hosts | Backup server | TCP/443 | Backup data and agent control |\n| Inbound | Jump host only | Backup server | TCP/22 or TCP/443 | Administration |\n| Outbound | Backup server | Vault, example.net | TCP/443 | Off-site copy |\n| Outbound | Backup server | NTP, DNS, update mirror | UDP/123, 53, TCP/443 | Infrastructure |\n| Everything else | Any | Any | Any | Deny and log |\n\nDo not allow general inbound access from user networks, and do not allow outbound internet access to arbitrary sites. Both directions matter: inbound stops attacks, outbound stops data theft and command channels. The pattern follows standard network segmentation principles."
+    },
+    {
+      "id": "fw-code",
+      "type": "code",
+      "language": "bash",
+      "code": "# /etc/nftables.conf on the backup server (default-deny host firewall)\ntable inet backup {\n  set agents  { type ipv4_addr; elements = { 192.0.2.20, 192.0.2.21 } }\n  set jump    { type ipv4_addr; elements = { 198.51.100.5 } }\n\n  chain input {\n    type filter hook input priority 0; policy drop;\n    ct state established,related accept\n    iif lo accept\n    ip saddr @agents tcp dport 443 accept          # backup traffic\n    ip saddr @jump   tcp dport { 22, 443 } accept  # administration\n    log prefix \"backup-drop: \" limit rate 5/minute\n  }\n  chain output {\n    type filter hook output priority 0; policy drop;\n    ct state established,related accept\n    udp dport { 53, 123 } accept\n    ip daddr 203.0.113.40 tcp dport 443 accept     # off-site vault gateway\n  }\n}",
+      "filename": "nftables.conf",
+      "caption": "Host firewall as a second layer, in case the network firewall is changed or bypassed."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## Push or pull\n\nThe direction of the connection changes your exposure.\n\n- **Push model.** Each production host runs an agent that sends data to the backup server. The agents need credentials to write into the repository. If a host is compromised, those credentials can often damage the repository.\n- **Pull model.** The backup server connects to the host and reads the data. Production holds no credentials for the repository, and the server can sit in a zone that production cannot reach at all. The server still needs a read credential for each host, so that credential must be least-privilege and stored protected.\n\nFor the strongest isolation, combine the pull model with a **write-only** path to the repository, so that reaching the server lets an attacker add data but never read or delete it. Many products let you scope an agent key to append-only operations. Details of those scopes are in [Backup access control](/learn/security-architecture-resilience/backup-access-control)."
+    },
+    {
+      "id": "layers-anim",
+      "type": "animation",
+      "kind": "layers",
+      "title": "Isolation layers around the backup server",
+      "data": {
+        "layers": [
+          {
+            "label": "Network zone",
+            "sub": "VLAN + firewall"
+          },
+          {
+            "label": "Host firewall",
+            "sub": "default deny"
+          },
+          {
+            "label": "Identity",
+            "sub": "local accounts + MFA"
+          },
+          {
+            "label": "Hardened OS",
+            "sub": "minimal services"
+          },
+          {
+            "label": "Backup repository",
+            "sub": "immutable storage"
+          }
+        ],
+        "steps": [
+          {
+            "layer": 0,
+            "packet": [
+              "Mgmt"
+            ],
+            "caption": "A management request must first cross the zone firewall. Only the jump host is allowed."
+          },
+          {
+            "layer": 1,
+            "packet": [
+              "Mgmt",
+              "Allow"
+            ],
+            "caption": "The host firewall checks the source address again, so a firewall change elsewhere does not open the server."
+          },
+          {
+            "layer": 2,
+            "packet": [
+              "Mgmt",
+              "Allow",
+              "MFA"
+            ],
+            "caption": "The user authenticates with a local account and a second factor, not a domain credential."
+          },
+          {
+            "layer": 3,
+            "packet": [
+              "Mgmt",
+              "Allow",
+              "MFA",
+              "Least"
+            ],
+            "caption": "Only the services the backup product needs are running, so there is less to attack."
+          },
+          {
+            "layer": 4,
+            "packet": [
+              "Mgmt",
+              "Allow",
+              "MFA",
+              "Least",
+              "Locked"
+            ],
+            "caption": "Even an authenticated administrator meets the storage lock and cannot delete protected restore points."
+          }
+        ]
+      }
+    },
+    {
+      "id": "harden",
+      "type": "text",
+      "markdown": "## Hardening the server and its management path\n\nIsolation includes the machine itself. Use this checklist:\n\n1. **No domain join.** Use local accounts or a separate identity provider with MFA. Do not reuse domain admin passwords.\n2. **One management path.** Administer only through a hardened jump host or privileged access tool, and block direct Remote Desktop and SSH from other networks.\n3. **Minimal software.** Remove browsers, office tools and unused services. Do not browse the web from this server.\n4. **Patch on a schedule.** Backup products are attacked often. Subscribe to the vendor's security advisories and apply fixes quickly.\n5. **Protect the console.** Disable default accounts, enforce MFA and restrict the web console to the management subnet.\n6. **Log centrally.** Forward logins, configuration changes and failed deletes to the SIEM, and keep those logs off the server.\n7. **Protect the hypervisor and storage.** If the server is a virtual machine, an attacker who controls the hypervisor controls the backups. Keep the vault copy on infrastructure that has no shared admin credentials with production.\n\nCompare this with the hardening baselines in [Secure configuration backups](/learn/security-architecture-resilience/secure-configuration-backups), where the same discipline applies to device configurations."
+    },
+    {
+      "id": "clean",
+      "type": "text",
+      "markdown": "## A clean recovery zone\n\nIsolation also matters during recovery. When you restore after an incident, the restored systems may still carry the attacker's tools, and the production network may still be compromised. Restoring straight into it can restart the attack.\n\nPrepare a **clean recovery zone**: a separate network, with no route to production, where you restore, scan and validate systems before they return to service. The sequence is:\n\n1. Rebuild identity services first, and rotate every credential the backup system stored.\n2. Restore into the clean zone, then scan each system for known malicious files and persistence.\n3. Check the restore point date against the incident timeline, and choose one from before the first compromise.\n4. Move systems to production in small groups, watching the logs closely.\n\nThe clean zone should be built and tested in advance, because during an incident nobody has time to design a network. Link its capacity to your [Disaster recovery planning](/learn/security-architecture-resilience/disaster-recovery-planning) and test it during recovery drills."
+    },
+    {
+      "id": "note",
+      "type": "callout",
+      "variant": "note",
+      "title": "Keep the zone small and documented",
+      "markdown": "A backup zone works only while the rules stay narrow. Record every allowed flow with an owner and a reason in your change system. When someone asks to open a new port, ask which flow it supports and whether a jump host can serve the need instead. Review the rule base every quarter and remove entries nobody can explain."
+    },
+    {
+      "id": "verify-term",
+      "type": "terminal",
+      "title": "Verify isolation from a production host (systems you own)",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "nmap -Pn -p 22,443,3389,445 198.51.100.10",
+          "prompt": "prod-web01$",
+          "output": "Starting Nmap 7.94 ( https://nmap.org )\nNmap scan report for 198.51.100.10\nPORT     STATE    SERVICE\n22/tcp   filtered ssh\n443/tcp  open     https\n3389/tcp filtered ms-wbt-server\n445/tcp  filtered microsoft-ds",
+          "comment": "Only TCP/443 for the agent answers. Administration and file-sharing ports are filtered from production."
+        },
+        {
+          "cmd": "nmap -Pn -p 22,443 198.51.100.10",
+          "prompt": "jump01$",
+          "output": "PORT    STATE SERVICE\n22/tcp  open  ssh\n443/tcp open  https",
+          "comment": "From the jump host the management port is open, as designed."
+        },
+        {
+          "cmd": "sudo nft list ruleset | grep -c backup-drop",
+          "prompt": "bk01$",
+          "output": "1",
+          "comment": "Confirms the logging rule exists. Check the SIEM for backup-drop entries after the scan."
+        }
+      ]
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Test from the attacker's point of view",
+      "markdown": "Run the verification scan from at least three places: a user workstation, a production server and the jump host. Only the last should reach the management ports. Repeat the test after every firewall change, and add it to your change checklist."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Build a small isolation test in a lab you own, using three virtual machines: a backup server, a production host and a jump host.\n\n1. Put the backup server on its own subnet, such as `198.51.100.0/28`, with the host firewall set to default deny.\n2. Allow TCP/443 from the production host and TCP/22 from the jump host only.\n3. From each host, scan the server with `nmap -Pn -p 22,443,3389` and compare the results with your intended table.\n4. Change one rule on purpose, repeat the scan and note how the difference is detected.\n\nOnly scan machines you own."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Security zone",
+          "definition": "A network segment with its own rules for what may enter and leave."
+        },
+        {
+          "term": "Jump host",
+          "definition": "A hardened system that is the only allowed path for administration."
+        },
+        {
+          "term": "Push model",
+          "definition": "Production hosts send data to the backup server."
+        },
+        {
+          "term": "Pull model",
+          "definition": "The backup server connects out and reads data from the hosts."
+        },
+        {
+          "term": "Default deny",
+          "definition": "A policy that blocks everything not explicitly allowed."
+        },
+        {
+          "term": "Append-only",
+          "definition": "A permission that can add data but not read, change or delete it."
+        },
+        {
+          "term": "Egress filtering",
+          "definition": "Restricting outbound connections to prevent data theft and command channels."
+        },
+        {
+          "term": "Hardening",
+          "definition": "Removing unneeded services and tightening settings to reduce attack surface."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main risk of placing a backup server in the production server VLAN?",
+          "options": [
+            "A production compromise can reach the backups directly",
+            "Backups run slower",
+            "The server needs more RAM",
+            "DNS stops working"
+          ],
+          "answer": 0,
+          "explanation": "Shared placement means shared fate. Isolation limits the blast radius."
+        },
+        {
+          "question": "Which belong in the backup zone's allow list? (Choose all that apply.)",
+          "options": [
+            "Agents to the server on the backup port",
+            "Jump host to the management port",
+            "User workstations to Remote Desktop",
+            "Server to the off-site vault on TCP/443"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Workstations have no reason to administer the backup server. The other flows are required."
+        },
+        {
+          "question": "Why can the pull model improve isolation?",
+          "options": [
+            "Production hosts hold no credentials to write to or delete from the repository",
+            "It uses no network",
+            "It needs no firewall",
+            "It removes the need for backups"
+          ],
+          "answer": 0,
+          "explanation": "If production is compromised, there are no repository credentials to steal from it."
+        },
+        {
+          "question": "Why should the backup server not be joined to the production domain?",
+          "options": [
+            "Domain compromise would give the attacker access to it",
+            "Domains cannot run backups",
+            "Domain accounts cannot have MFA",
+            "It breaks TLS"
+          ],
+          "answer": 0,
+          "explanation": "The domain is the usual attack path. A separate identity removes that path."
+        },
+        {
+          "question": "A scan from a production host shows TCP/3389 open on the backup server. What should you conclude? (Choose all that apply.)",
+          "options": [
+            "The isolation rules are not working as designed",
+            "Remote Desktop should be restricted to the jump host",
+            "The result is acceptable",
+            "You should investigate recent firewall changes"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Management ports should be reachable only from the jump host, so an open port is a finding to fix."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A backup server beside production shares its fate, so place it in a dedicated, filtered zone.\n- Allow only the listed flows in both directions, and add a default-deny host firewall.\n- Prefer the pull model and append-only agent keys so production holds nothing it can use to damage backups.\n- Harden the server: no domain join, one management path, minimal software, central logs.\n- Prove isolation by scanning from several places, only against systems you own.\n\nNext, decide who may do what inside the isolated system in [Backup access control](/learn/security-architecture-resilience/backup-access-control)."
+    }
+  ],
+  "ar": {
+    "title": "عزل خوادم النسخ الاحتياطي",
+    "summary": "ضع خوادم النسخ في منطقة مخصصة مفلترة بإحكام بهوية ومسار إدارة وتحصين خاصة بها، فلا تصل إليها شبكة مخترقة.",
+    "objectives": [
+      "اشرح لماذا تحتاج خوادم النسخ إلى منطقة شبكة خاصة بها",
+      "اكتب قواعد جدار حماية تسمح بتدفقات النسخ المطلوبة فقط",
+      "قارن بين نموذجي الدفع والسحب من حيث العزل",
+      "حصّن خادم النسخ ومسار إدارته",
+      "تحقّق من العزل بالاختبار من مضيف إنتاج"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تضع شركة تصنيع خادم النسخ في شبكة VLAN الخوادم الرئيسية، منضمًّا إلى نطاق الشركة، مع بروتوكول سطح المكتب البعيد مفتوح لكل المسؤولين. يخترق مهاجم محطة عمل واحدة ويسرق بيانات اعتماد مسؤول نطاق مخزنة مؤقتًا ويتصل مباشرة بخادم النسخ. الزمن الكلي من أول وصول حتى حذف النسخ: أربعون دقيقة.\n\nلم يكن في برنامج النسخ ضعف. كان الضعف في الموضع. فخادم النسخ الذي يجاور الأنظمة التي يحميها يشاركها المصير. و**العزل** يقطع هذه الصلة، فلا يتحول اختراق الإنتاج تلقائيًا إلى اختراق التعافي."
+      },
+      {
+        "id": "zone",
+        "type": "text",
+        "markdown": "## منطقة نسخ مخصصة\n\nضع خادم النسخ وتخزينه وأدوات إدارته في **منطقة أمنية** منفصلة، عادةً شبكة VLAN وشبكة فرعية مخصصتين خلف جدار حماية. ينبغي أن يكون للمنطقة قائمة مكتوبة قصيرة بما يدخل وما يخرج.\n\nقائمة تدفقات نموذجية للمنطقة `198.51.100.0/28`:\n\n| الاتجاه | المصدر | الوجهة | المنفذ | الغرض |\n|:--|:--|:--|:--|:--|\n| وارد | مضيفات الوكلاء | خادم النسخ | TCP/443 | بيانات النسخ وتحكم الوكيل |\n| وارد | مضيف القفز فقط | خادم النسخ | TCP/22 أو TCP/443 | الإدارة |\n| صادر | خادم النسخ | الخزنة example.net | TCP/443 | النسخة خارج الموقع |\n| صادر | خادم النسخ | NTP وDNS ومرآة التحديثات | UDP/123 و53 وTCP/443 | البنية التحتية |\n| كل ما عداه | أي | أي | أي | رفض وتسجيل |\n\nلا تسمح بوصول وارد عام من شبكات المستخدمين، ولا بوصول صادر إلى مواقع الإنترنت عشوائيًا. الاتجاهان مهمان: الوارد يوقف الهجمات والصادر يوقف سرقة البيانات وقنوات التحكم. ويتبع النمط مبادئ تجزئة الشبكات المعتادة."
+      },
+      {
+        "id": "fw-code",
+        "type": "code",
+        "language": "bash",
+        "code": "# /etc/nftables.conf on the backup server (default-deny host firewall)\ntable inet backup {\n  set agents  { type ipv4_addr; elements = { 192.0.2.20, 192.0.2.21 } }\n  set jump    { type ipv4_addr; elements = { 198.51.100.5 } }\n\n  chain input {\n    type filter hook input priority 0; policy drop;\n    ct state established,related accept\n    iif lo accept\n    ip saddr @agents tcp dport 443 accept          # backup traffic\n    ip saddr @jump   tcp dport { 22, 443 } accept  # administration\n    log prefix \"backup-drop: \" limit rate 5/minute\n  }\n  chain output {\n    type filter hook output priority 0; policy drop;\n    ct state established,related accept\n    udp dport { 53, 123 } accept\n    ip daddr 203.0.113.40 tcp dport 443 accept     # off-site vault gateway\n  }\n}",
+        "filename": "nftables.conf",
+        "caption": "جدار حماية على المضيف كطبقة ثانية، تحسبًا لتغيير جدار الشبكة أو الالتفاف عليه."
+      },
+      {
+        "id": "model",
+        "type": "text",
+        "markdown": "## الدفع أم السحب\n\nيغيّر اتجاه الاتصال مقدار تعرّضك.\n\n- **نموذج الدفع (Push).** يشغّل كل مضيف إنتاج وكيلًا يرسل البيانات إلى خادم النسخ. يحتاج الوكلاء إلى بيانات اعتماد للكتابة في المستودع. وإذا اختُرق مضيف فقد تتيح هذه البيانات إتلاف المستودع.\n- **نموذج السحب (Pull).** يتصل خادم النسخ بالمضيف ويقرأ البيانات. فلا يحمل الإنتاج بيانات اعتماد للمستودع، ويمكن أن يقع الخادم في منطقة لا يصل إليها الإنتاج أصلًا. ويحتاج الخادم مع ذلك إلى بيانات قراءة لكل مضيف، فيجب أن تكون بأدنى صلاحية ومخزنة بحماية.\n\nلأقوى عزل اجمع نموذج السحب مع مسار **كتابة فقط** إلى المستودع، فيستطيع المهاجم عند بلوغ الخادم إضافة بيانات لكنه لا يقرأ ولا يحذف. تتيح منتجات كثيرة تقييد مفتاح الوكيل بعمليات الإلحاق فقط. وتفاصيل هذه النطاقات في [Backup access control](/learn/security-architecture-resilience/backup-access-control)."
+      },
+      {
+        "id": "layers-anim",
+        "type": "animation",
+        "kind": "layers",
+        "title": "طبقات العزل حول خادم النسخ",
+        "data": {
+          "layers": [
+            {
+              "label": "منطقة الشبكة",
+              "sub": "VLAN + firewall"
+            },
+            {
+              "label": "جدار المضيف",
+              "sub": "default deny"
+            },
+            {
+              "label": "الهوية",
+              "sub": "حسابات محلية + MFA"
+            },
+            {
+              "label": "نظام مُحصَّن",
+              "sub": "خدمات أدنى"
+            },
+            {
+              "label": "مستودع النسخ",
+              "sub": "تخزين ثابت"
+            }
+          ],
+          "steps": [
+            {
+              "layer": 0,
+              "packet": [
+                "Mgmt"
+              ],
+              "caption": "يجب أن يعبر طلب الإدارة جدار المنطقة أولًا. ولا يُسمح إلا لمضيف القفز."
+            },
+            {
+              "layer": 1,
+              "packet": [
+                "Mgmt",
+                "Allow"
+              ],
+              "caption": "يفحص جدار المضيف عنوان المصدر مرة أخرى، فلا يفتح تغيير في مكان آخر الخادم."
+            },
+            {
+              "layer": 2,
+              "packet": [
+                "Mgmt",
+                "Allow",
+                "MFA"
+              ],
+              "caption": "يصادق المستخدم بحساب محلي وعامل ثانٍ لا ببيانات اعتماد النطاق."
+            },
+            {
+              "layer": 3,
+              "packet": [
+                "Mgmt",
+                "Allow",
+                "MFA",
+                "Least"
+              ],
+              "caption": "لا تعمل سوى الخدمات التي يحتاجها منتج النسخ، فيقل ما يمكن مهاجمته."
+            },
+            {
+              "layer": 4,
+              "packet": [
+                "Mgmt",
+                "Allow",
+                "MFA",
+                "Least",
+                "Locked"
+              ],
+              "caption": "حتى المسؤول المصادَق عليه يواجه قفل التخزين ولا يستطيع حذف نقاط الاستعادة المحمية."
+            }
+          ]
+        }
+      },
+      {
+        "id": "harden",
+        "type": "text",
+        "markdown": "## تحصين الخادم ومسار إدارته\n\nيشمل العزل الجهاز نفسه. استخدم قائمة التحقق هذه:\n\n1. **لا ضمّ إلى النطاق.** استخدم حسابات محلية أو مزوّد هوية منفصلًا مع MFA. ولا تعد استخدام كلمات مرور مسؤول النطاق.\n2. **مسار إدارة واحد.** أدِر الخادم عبر مضيف قفز محصّن أو أداة وصول مميز فقط، واحجب سطح المكتب البعيد وSSH المباشرين من الشبكات الأخرى.\n3. **برمجيات أدنى.** أزل المتصفحات وأدوات المكتب والخدمات غير المستخدمة. ولا تتصفح الويب من هذا الخادم.\n4. **ترقيع وفق جدول.** تتعرض منتجات النسخ لهجمات كثيرة. اشترك في نشرات المورّد الأمنية وطبّق الإصلاحات سريعًا.\n5. **احمِ وحدة التحكم.** عطّل الحسابات الافتراضية وافرض MFA وقصر وحدة تحكم الويب على شبكة الإدارة الفرعية.\n6. **سجّل مركزيًا.** أرسل عمليات الدخول وتغييرات الإعدادات وعمليات الحذف الفاشلة إلى SIEM، وأبقِ هذه السجلات بعيدًا عن الخادم.\n7. **احمِ المحاكي الافتراضي والتخزين.** إذا كان الخادم آلة افتراضية فمن يتحكم بالمحاكي يتحكم بالنسخ. أبقِ نسخة الخزنة على بنية لا تتشارك مع الإنتاج بيانات اعتماد المسؤول.\n\nقارن ذلك بخطوط الأساس في [Secure configuration backups](/learn/security-architecture-resilience/secure-configuration-backups) حيث ينطبق الانضباط نفسه على إعدادات الأجهزة."
+      },
+      {
+        "id": "clean",
+        "type": "text",
+        "markdown": "## منطقة تعافٍ نظيفة\n\nيهم العزل أيضًا أثناء التعافي. فعند الاستعادة بعد حادث قد تحمل الأنظمة المستعادة أدوات المهاجم، وقد تبقى شبكة الإنتاج مخترقة. والاستعادة المباشرة إليها قد تعيد الهجوم من جديد.\n\nجهّز **منطقة تعافٍ نظيفة**: شبكة منفصلة لا مسار فيها إلى الإنتاج، تستعيد فيها الأنظمة وتفحصها وتتحقق منها قبل عودتها إلى الخدمة. والتسلسل:\n\n1. أعد بناء خدمات الهوية أولًا، وبدّل كل بيانات الاعتماد التي خزّنها نظام النسخ.\n2. استعد إلى المنطقة النظيفة ثم افحص كل نظام بحثًا عن الملفات الخبيثة المعروفة وآليات البقاء.\n3. قارن تاريخ نقطة الاستعادة بالجدول الزمني للحادث، واختر نقطة سبقت أول اختراق.\n4. انقل الأنظمة إلى الإنتاج على دفعات صغيرة مع مراقبة السجلات عن كثب.\n\nيجب بناء المنطقة النظيفة واختبارها مسبقًا، فلا وقت لتصميم شبكة أثناء حادث. اربط سعتها بـ [Disaster recovery planning](/learn/security-architecture-resilience/disaster-recovery-planning) واختبرها في تمارين التعافي."
+      },
+      {
+        "id": "note",
+        "type": "callout",
+        "variant": "note",
+        "title": "أبقِ المنطقة صغيرة وموثقة",
+        "markdown": "لا تنجح منطقة النسخ إلا ما دامت القواعد ضيقة. سجّل كل تدفق مسموح مع مالك وسبب في نظام التغيير لديك. وحين يطلب أحد فتح منفذ جديد فاسأل أي تدفق يخدمه وهل يمكن لمضيف القفز تلبية الحاجة بدلًا منه. راجع قاعدة القواعد كل ربع سنة وأزل المدخلات التي لا يستطيع أحد تفسيرها."
+      },
+      {
+        "id": "verify-term",
+        "type": "terminal",
+        "title": "التحقق من العزل من مضيف إنتاج (أنظمة تملكها)",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "nmap -Pn -p 22,443,3389,445 198.51.100.10",
+            "prompt": "prod-web01$",
+            "output": "Starting Nmap 7.94 ( https://nmap.org )\nNmap scan report for 198.51.100.10\nPORT     STATE    SERVICE\n22/tcp   filtered ssh\n443/tcp  open     https\n3389/tcp filtered ms-wbt-server\n445/tcp  filtered microsoft-ds",
+            "comment": "لا يستجيب سوى TCP/443 الخاص بالوكيل. منافذ الإدارة ومشاركة الملفات مفلترة من الإنتاج."
+          },
+          {
+            "cmd": "nmap -Pn -p 22,443 198.51.100.10",
+            "prompt": "jump01$",
+            "output": "PORT    STATE SERVICE\n22/tcp  open  ssh\n443/tcp open  https",
+            "comment": "من مضيف القفز يكون منفذ الإدارة مفتوحًا كما صُمم."
+          },
+          {
+            "cmd": "sudo nft list ruleset | grep -c backup-drop",
+            "prompt": "bk01$",
+            "output": "1",
+            "comment": "يؤكد وجود قاعدة التسجيل. راجع SIEM بحثًا عن مدخلات backup-drop بعد الفحص."
+          }
+        ]
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "اختبر من وجهة نظر المهاجم",
+        "markdown": "شغّل فحص التحقق من ثلاثة أماكن على الأقل: محطة مستخدم وخادم إنتاج ومضيف القفز. يجب ألا يصل إلى منافذ الإدارة سوى الأخير. كرّر الاختبار بعد كل تغيير في جدار الحماية وأضفه إلى قائمة التغيير."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "ابنِ اختبار عزل صغيرًا في مختبر تملكه باستخدام ثلاث آلات افتراضية: خادم نسخ ومضيف إنتاج ومضيف قفز.\n\n1. ضع خادم النسخ في شبكة فرعية خاصة مثل `198.51.100.0/28` مع جدار المضيف على الرفض الافتراضي.\n2. اسمح بـ TCP/443 من مضيف الإنتاج وبـ TCP/22 من مضيف القفز فقط.\n3. افحص الخادم من كل مضيف بالأمر `nmap -Pn -p 22,443,3389` وقارن النتائج بجدولك المقصود.\n4. غيّر قاعدة واحدة عمدًا وكرّر الفحص ولاحظ كيف يُكتشف الفرق.\n\nافحص الأجهزة التي تملكها فقط."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "المنطقة الأمنية",
+            "definition": "قطاع شبكة له قواعده الخاصة لما يدخل ويخرج."
+          },
+          {
+            "term": "مضيف القفز",
+            "definition": "نظام محصّن هو المسار الوحيد المسموح للإدارة."
+          },
+          {
+            "term": "نموذج الدفع",
+            "definition": "ترسل مضيفات الإنتاج البيانات إلى خادم النسخ."
+          },
+          {
+            "term": "نموذج السحب",
+            "definition": "يتصل خادم النسخ بالمضيفات ويقرأ منها البيانات."
+          },
+          {
+            "term": "الرفض الافتراضي",
+            "definition": "سياسة تحجب كل ما لم يُسمح به صراحة."
+          },
+          {
+            "term": "الإلحاق فقط",
+            "definition": "إذن يستطيع إضافة البيانات دون قراءتها أو تغييرها أو حذفها."
+          },
+          {
+            "term": "تصفية الصادر",
+            "definition": "تقييد الاتصالات الصادرة لمنع سرقة البيانات وقنوات التحكم."
+          },
+          {
+            "term": "التحصين",
+            "definition": "إزالة الخدمات غير اللازمة وتشديد الإعدادات لتقليل سطح الهجوم."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما الخطر الرئيسي من وضع خادم النسخ في شبكة VLAN خوادم الإنتاج؟",
+            "options": [
+              "اختراق الإنتاج قد يصل إلى النسخ مباشرة",
+              "تعمل النسخ أبطأ",
+              "يحتاج الخادم إلى ذاكرة أكبر",
+              "يتوقف DNS"
+            ],
+            "answer": 0,
+            "explanation": "الموضع المشترك يعني المصير المشترك. والعزل يحدّ من نطاق الضرر."
+          },
+          {
+            "question": "أي مما يلي ينتمي إلى قائمة السماح في منطقة النسخ؟ (اختر كل ما ينطبق)",
+            "options": [
+              "الوكلاء إلى الخادم على منفذ النسخ",
+              "مضيف القفز إلى منفذ الإدارة",
+              "محطات المستخدمين إلى سطح المكتب البعيد",
+              "الخادم إلى الخزنة خارج الموقع على TCP/443"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "لا مبرر لمحطات العمل أن تدير خادم النسخ. أما التدفقات الأخرى فمطلوبة."
+          },
+          {
+            "question": "لماذا يمكن لنموذج السحب أن يحسّن العزل؟",
+            "options": [
+              "لا تحمل مضيفات الإنتاج بيانات اعتماد للكتابة في المستودع أو الحذف منه",
+              "لا يستخدم الشبكة",
+              "لا يحتاج جدار حماية",
+              "يلغي الحاجة إلى النسخ"
+            ],
+            "answer": 0,
+            "explanation": "إذا اختُرق الإنتاج فلا بيانات اعتماد للمستودع تُسرق منه."
+          },
+          {
+            "question": "لماذا لا ينبغي ضمّ خادم النسخ إلى نطاق الإنتاج؟",
+            "options": [
+              "اختراق النطاق سيمنح المهاجم الوصول إليه",
+              "لا تستطيع النطاقات تشغيل النسخ",
+              "لا يمكن لحسابات النطاق أن تملك MFA",
+              "يكسر TLS"
+            ],
+            "answer": 0,
+            "explanation": "النطاق هو مسار الهجوم المعتاد. والهوية المنفصلة تزيل هذا المسار."
+          },
+          {
+            "question": "يُظهر فحص من مضيف إنتاج أن TCP/3389 مفتوح على خادم النسخ. ماذا تستنتج؟ (اختر كل ما ينطبق)",
+            "options": [
+              "قواعد العزل لا تعمل كما صُمّمت",
+              "ينبغي حصر سطح المكتب البعيد بمضيف القفز",
+              "النتيجة مقبولة",
+              "ينبغي التحقيق في تغييرات جدار الحماية الأخيرة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "يجب ألا تُبلغ منافذ الإدارة إلا من مضيف القفز، فالمنفذ المفتوح نتيجة تستوجب الإصلاح."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- خادم النسخ المجاور للإنتاج يشاركه المصير، فضعه في منطقة مخصصة مفلترة.\n- اسمح بالتدفقات المدرجة فقط في الاتجاهين وأضف جدار مضيف بالرفض الافتراضي.\n- فضّل نموذج السحب ومفاتيح الوكلاء للإلحاق فقط كي لا يحمل الإنتاج ما يضر بالنسخ.\n- حصّن الخادم: بلا ضم إلى النطاق، ومسار إدارة واحد، وبرمجيات أدنى، وسجلات مركزية.\n- أثبت العزل بالفحص من أماكن عدة وعلى أنظمة تملكها فقط.\n\nبعد ذلك حدّد من يفعل ماذا داخل النظام المعزول في [Backup access control](/learn/security-architecture-resilience/backup-access-control)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,698 @@
+{
+  "slug": "persistence-mechanism-detection",
+  "title": "Persistence Mechanism Detection",
+  "summary": "Learn to find the mechanisms attackers use to survive reboots and cleanup on Windows and Linux, to collect the right telemetry, to write a Sigma rule and a hunt query, and to triage and remove persistence without destroying evidence.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Classify persistence into six families and map them to MITRE ATT&CK",
+    "Enumerate Windows and Linux autostart locations on a system you own",
+    "Identify the telemetry (Sysmon, Security events, auditd) that exposes persistence",
+    "Write and tune a Sigma rule and an SPL hunt for suspicious Run key values",
+    "Triage a persistence alert and preserve evidence before removal"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Last week workstation WS-0142 was cleaned and rebooted after a phishing incident. At 02:10 today the EDR shows it beaconing again. Nothing new was delivered: the attacker simply left a door open. This is **persistence**, and it is why deleting one malicious file is never the end of an investigation.\n\nPersistence detection means finding every mechanism that restarts attacker code after a reboot, logoff or cleanup, and building alerts so that new mechanisms surface in minutes. It supports the host work in [Windows Incident Response](/learn/security-operations-dfir/windows-incident-response) and [Linux Incident Response](/learn/security-operations-dfir/linux-incident-response)."
+    },
+    {
+      "id": "categories",
+      "type": "text",
+      "markdown": "## Persistence in six families\n\nAttackers choose persistence by the privileges they hold and by how likely a defender is to look. Group the mechanisms into families so your checklist is systematic:\n\n| Family | Examples | ATT&CK |\n|:--|:--|:--|\n| **Autostart entries** | Run and RunOnce keys, Startup folder, shell profiles | T1547 |\n| **Scheduled execution** | Windows scheduled tasks, cron, systemd timers | T1053 |\n| **Services and daemons** | New Windows service, systemd unit, init script | T1543 |\n| **Event-triggered** | WMI subscriptions, IFEO debugger, `LD_PRELOAD` | T1546 |\n| **Account and access** | New local user, SSH `authorized_keys`, added OAuth app | T1136, T1098 |\n| **Boot and firmware** | Bootkits, modified boot configuration | T1542 |\n\nThe first four account for most real cases. The fifth is easy to forget because nothing executes on the host: the attacker simply keeps a valid key."
+    },
+    {
+      "id": "windows",
+      "type": "text",
+      "markdown": "## Where to look on Windows\n\nWork through these locations in order. Each takes a minute to check and each has been used in real intrusions.\n\n1. **Run keys.** `HKLM` and `HKCU` under `Software\\Microsoft\\Windows\\CurrentVersion\\Run` and `RunOnce`. The `HKCU` copy needs no administrator rights, so attackers love it.\n2. **Startup folders.** The per-user and all-users `Startup` directories execute anything placed in them at logon.\n3. **Scheduled tasks.** Look at the trigger (logon, boot, every five minutes), the action, and the account it runs as. Tasks that run `powershell.exe` or `cmd.exe` with encoded arguments are suspicious.\n4. **Services.** A service whose binary sits in `ProgramData`, `Temp` or a user profile is almost never legitimate.\n5. **WMI event subscriptions.** A filter, a consumer and a binding stored in the WMI repository leave no file in the Startup folder at all.\n6. **Winlogon and IFEO.** Values such as `Userinit`, `Shell` and `Image File Execution Options` debuggers redirect normal program launches.\n\nThe terminal below inspects three of these on a machine you own. Read the comments: each output line is judged by its path and parent, not by its name alone."
+    },
+    {
+      "id": "term-win",
+      "type": "terminal",
+      "title": "PowerShell on a host you own",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' | Format-List",
+          "comment": "Autostart registry keys for the machine and the current user"
+        },
+        {
+          "output": "SecurityHealth : %windir%\\system32\\SecurityHealthSystray.exe\nOneDrive       : \"C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe\" /background\nUpdaterSvc     : C:\\Users\\Public\\Libraries\\upd.exe -q",
+          "comment": "The first two are normal. A binary in Public\\Libraries is not."
+        },
+        {
+          "cmd": "Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.State -ne 'Disabled' } | Select-Object TaskName, @{n='Run';e={$_.Actions.Execute}}",
+          "comment": "Root-level tasks are where hand-made tasks usually land"
+        },
+        {
+          "output": "TaskName            Run\n--------            ---\nGoogleUpdateTaskX   C:\\ProgramData\\GoogleUpdate\\gu.exe\nSystemHealthCheck   powershell.exe",
+          "comment": "A task that launches powershell.exe directly deserves a look at its arguments"
+        },
+        {
+          "cmd": "Get-CimInstance -Namespace root\\subscription -ClassName __EventConsumer | Select-Object Name, __CLASS",
+          "comment": "WMI event subscriptions: a common fileless persistence spot"
+        },
+        {
+          "output": "Name        __CLASS\n----        -------\nBVTConsumer CommandLineEventConsumer",
+          "comment": "BVTConsumer is a known built-in name on some systems; verify its command line before judging"
+        }
+      ],
+      "caption": "Enumerating common autostart locations. Run this only on systems you administer."
+    },
+    {
+      "id": "linux",
+      "type": "text",
+      "markdown": "## Where to look on Linux\n\nLinux persistence is mostly text files, which makes it easy to diff and easy to monitor.\n\n- **Cron.** `/etc/crontab`, `/etc/cron.d/`, per-user files in `/var/spool/cron/`, and anacron directories.\n- **systemd.** New `.service` and `.timer` units in `/etc/systemd/system/` or a user's `~/.config/systemd/user/`. Check `ExecStart` and the `WantedBy` target.\n- **Shell and login files.** `.bashrc`, `.profile` and `/etc/profile.d/*.sh` run on every login.\n- **SSH.** A key appended to `~/.ssh/authorized_keys` gives silent, password-free access.\n- **Preload and modules.** `/etc/ld.so.preload` and loadable kernel modules load code into every process or the kernel.\n- **Accounts.** A new UID 0 user or a changed sudoers file.\n\nBecause these are files, `auditd` can watch them directly. See [Suspicious Process and Service Analysis](/learn/security-operations-dfir/suspicious-process-and-service-analysis) for judging what you find."
+    },
+    {
+      "id": "auditd",
+      "type": "code",
+      "language": "bash",
+      "filename": "/etc/audit/rules.d/persistence.rules",
+      "caption": "auditd watches Linux persistence locations on a host you manage. The keys let you search with `ausearch -k persist`.",
+      "code": "-w /etc/crontab -p wa -k persist\n-w /etc/cron.d/ -p wa -k persist\n-w /var/spool/cron/ -p wa -k persist\n-w /etc/systemd/system/ -p wa -k persist\n-w /usr/lib/systemd/system/ -p wa -k persist\n-w /etc/rc.local -p wa -k persist\n-w /root/.ssh/authorized_keys -p wa -k persist_ssh\n-w /etc/ld.so.preload -p wa -k persist_preload\n"
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## Telemetry that catches persistence\n\nDetection needs the right logs switched on before the incident. The table lists the sources you should confirm are collected.\n\n| Source | Event | What it shows |\n|:--|:--|:--|\n| Sysmon | 12, 13, 14 | Registry key and value created, set or renamed |\n| Sysmon | 19, 20, 21 | WMI filter, consumer and binding created |\n| Windows Security | 4698 | A scheduled task was created |\n| Windows System | 7045 | A new service was installed |\n| Windows Security | 4720, 4732 | A local account was created or added to a group |\n| auditd | `PATH`, `SYSCALL` | Writes to watched files and directories |\n| EDR | Autostart telemetry | Process ancestry and the file that was dropped |\n\nCollect the raw event, not a summary. The registry value data (the path of the binary) is the field you will alert on."
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "run-key-user-writable.yml",
+      "caption": "A Sigma rule for suspicious Run key values. The same logic follows as Splunk SPL.",
+      "highlight": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "code": "title: Run Key Persistence Pointing to a User-Writable Path\nid: 00000000-0000-4000-8000-000000000001   # placeholder id\nstatus: experimental\ndescription: A Run or RunOnce value was set to a binary in a folder that ordinary users can write to.\nlogsource:\n  category: registry_set\n  product: windows\ndetection:\n  selection_key:\n    TargetObject|contains:\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\'\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\'\n  selection_path:\n    Details|contains:\n      - '\\AppData\\'\n      - '\\Users\\Public\\'\n      - '\\ProgramData\\'\n      - '\\Temp\\'\n  filter_known:\n    Image|endswith: '\\OneDriveSetup.exe'\n  condition: selection_key and selection_path and not filter_known\nfalsepositives:\n  - Per-user installers that register themselves in AppData\nlevel: medium\ntags:\n  - attack.persistence\n  - attack.t1547.001\n"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "run-key-hunt.spl",
+      "caption": "The hunt query: the first-seen time per host gives you the anchor for a timeline.",
+      "code": "index=sysmon EventCode=13 TargetObject=\"*\\\\CurrentVersion\\\\Run*\" (Details=\"*\\\\AppData\\\\*\" OR Details=\"*\\\\Users\\\\Public\\\\*\")\n| stats count min(_time) as first_seen by host, Image, TargetObject, Details\n| sort first_seen"
+    },
+    {
+      "id": "flow-intro",
+      "type": "text",
+      "markdown": "## Following one intrusion\n\nThe animation shows how two persistence mechanisms and one well-placed rule work together. Notice that the analyst's first discovery is not the end: the second mechanism was found only because the timeline was built around the first event."
+    },
+    {
+      "id": "persist-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Persistence planted and detected",
+      "caption": "Redundant persistence defeats single-item cleanup, so detection must cover every family.",
+      "data": {
+        "token": "Event",
+        "nodes": [
+          {
+            "id": "init",
+            "label": "Initial access",
+            "sub": "Phishing foothold",
+            "icon": "attacker"
+          },
+          {
+            "id": "reg",
+            "label": "Run key",
+            "sub": "HKCU autostart value",
+            "icon": "key"
+          },
+          {
+            "id": "task",
+            "label": "Scheduled task",
+            "sub": "Logon trigger",
+            "icon": "cpu"
+          },
+          {
+            "id": "sysmon",
+            "label": "Sysmon + EDR",
+            "sub": "Events 12, 13, 1",
+            "icon": "eye"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM rule",
+            "sub": "Sigma converted to SPL",
+            "icon": "log"
+          },
+          {
+            "id": "ir",
+            "label": "Analyst",
+            "sub": "Triage and scope",
+            "icon": "user"
+          },
+          {
+            "id": "clean",
+            "label": "Eradication",
+            "sub": "Remove after imaging",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "init",
+            "caption": "An attacker runs code on WS-0142 through a phishing attachment. The payload will not survive a reboot on its own.",
+            "tone": "danger"
+          },
+          {
+            "at": "reg",
+            "caption": "The attacker writes an HKCU Run value named UpdaterSvc that points to C:\\Users\\Public\\Libraries\\upd.exe.",
+            "tone": "attack"
+          },
+          {
+            "at": "task",
+            "caption": "As a backup, a task named SystemHealthCheck is created with a logon trigger, so removing one mechanism is not enough.",
+            "tone": "attack"
+          },
+          {
+            "at": "sysmon",
+            "caption": "Sysmon records a registry value set (event 13) and the task creation; the EDR sensor forwards both within seconds.",
+            "tone": "warning"
+          },
+          {
+            "at": "siem",
+            "caption": "The Sigma rule fires because the value data contains \\Users\\Public\\. An alert is opened with host, user and process.",
+            "tone": "warning"
+          },
+          {
+            "at": "ir",
+            "caption": "The analyst builds a timeline around the first event, finds the second mechanism, and searches the fleet for the same value name."
+          },
+          {
+            "at": "clean",
+            "caption": "After the key, task and binary are collected as evidence, they are removed and the host is watched for a return.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## Triage workflow\n\nWhen the alert fires, work the same way every time:\n\n1. **Anchor on time.** Take the timestamp of the first persistence event and list everything that host did in the surrounding five minutes: process creation, network connections, file writes.\n2. **Judge the target.** Where is the binary? Is it signed, and by whom? How old is the file compared with the registry change? A signed Microsoft binary used as a launcher (a living-off-the-land binary) still needs its arguments read.\n3. **Look for siblings.** Attackers rarely plant one mechanism. Check every family on the host, then search the fleet for the same value name, task name, file hash and path.\n4. **Preserve, then remove.** Export the key, copy the task XML and image the binary before changing anything.\n5. **Verify.** After cleanup, reboot in a monitored state and confirm nothing returns. If it does, you missed a mechanism or the attacker still has access.\n\nIf the account itself was abused, continue with [Lateral Movement Detection](/learn/security-operations-dfir/lateral-movement-detection)."
+    },
+    {
+      "id": "warn-delete",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not delete first",
+      "markdown": "Deleting a Run value or a task before you copy it destroys the evidence that tells you when persistence was planted and who planted it. Export the key with `reg export`, save the task with `schtasks /query /xml`, and hash the binary. Then remove."
+    },
+    {
+      "id": "tip-baseline",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Baseline beats memory",
+      "markdown": "Nobody can recall what every autostart entry on a server should be. Capture an Autoruns or osquery snapshot of each gold image and compare against it. A diff of ten new entries is far faster to judge than a list of three hundred, and it is a strong starting point for [Advanced Threat Hunting](/learn/security-operations-dfir/advanced-threat-hunting)."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a **virtual machine you own**, never a production system.\n\n1. Create a harmless Run value: `reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v LabTest /d \"C:\\Windows\\System32\\notepad.exe\"`.\n2. Install Sysmon with a common configuration, repeat the command and find event 13 in Event Viewer. Note the `Image`, `TargetObject` and `Details` fields.\n3. Run the PowerShell commands from this lesson and confirm your value appears.\n4. Adapt the Sigma rule so it matches `\\Temp\\` only, then test that it does not match your notepad value.\n5. Remove the value with `reg delete` and write three sentences describing how you would detect the same value on a hundred hosts."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Persistence",
+          "definition": "Any technique that lets attacker code survive a reboot, logoff or partial cleanup."
+        },
+        {
+          "term": "Run key",
+          "definition": "A registry location whose values are executed at user logon or system start."
+        },
+        {
+          "term": "Scheduled task",
+          "definition": "A Windows or cron job that runs on a trigger, often abused for timed or logon persistence."
+        },
+        {
+          "term": "WMI subscription",
+          "definition": "A filter, consumer and binding stored in the WMI repository that runs a command when an event occurs."
+        },
+        {
+          "term": "Autoruns",
+          "definition": "A Sysinternals tool that lists nearly every autostart location on a Windows host."
+        },
+        {
+          "term": "Sysmon",
+          "definition": "A Windows service that logs process, registry, file and WMI activity in detail."
+        },
+        {
+          "term": "Sigma",
+          "definition": "A vendor-neutral rule format for log detections that converts to many SIEM query languages."
+        },
+        {
+          "term": "Living off the land",
+          "definition": "Abusing legitimate system binaries, such as PowerShell, to avoid dropping custom tools."
+        },
+        {
+          "term": "Baseline",
+          "definition": "A recorded known-good state used to spot differences quickly."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which Sysmon event ID records a registry value being set?",
+          "options": [
+            "1",
+            "3",
+            "13",
+            "22"
+          ],
+          "answer": 2,
+          "explanation": "Event 13 is RegistryEvent (Value Set). Event 1 is process creation, 3 is a network connection and 22 is a DNS query."
+        },
+        {
+          "question": "Why do attackers often use the HKCU Run key instead of HKLM?",
+          "options": [
+            "HKCU entries run before the kernel loads",
+            "HKCU needs no administrator rights",
+            "HKLM keys are not logged",
+            "HKCU entries cannot be exported"
+          ],
+          "answer": 1,
+          "explanation": "Writing to the current user's hive works for a standard user, so it needs no privilege escalation."
+        },
+        {
+          "question": "Which items are persistence locations worth checking? (Choose all that apply.)",
+          "options": [
+            "Scheduled tasks with a logon trigger",
+            "`~/.ssh/authorized_keys` on a Linux server",
+            "The browser history file",
+            "`/etc/systemd/system/` unit files"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Tasks, SSH keys and systemd units all restart or re-enable attacker access. Browser history is not an execution or access mechanism."
+        },
+        {
+          "question": "You find one malicious scheduled task on a host. What is the best next step?",
+          "options": [
+            "Delete it and close the ticket",
+            "Search all persistence families on the host and the fleet for siblings",
+            "Reinstall the browser",
+            "Disable Sysmon to reduce noise"
+          ],
+          "answer": 1,
+          "explanation": "Attackers commonly plant redundant mechanisms, so removing one without looking for others invites a return."
+        },
+        {
+          "question": "Which evidence should be preserved before removing a Run value? (Choose all that apply.)",
+          "options": [
+            "An export of the key",
+            "A hash and a copy of the referenced binary",
+            "The timestamp of the registry change",
+            "Nothing, because evidence is not needed after detection"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "The key, the binary and the change time show what was planted, when and by which process. They also support scoping across the fleet."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- **Persistence** lets attacker code survive reboots and cleanup, so detection must find every mechanism, not just the first.\n- Check six families: autostart entries, scheduled execution, services, event-triggered mechanisms, accounts and access, and boot components.\n- Windows locations include Run keys, Startup folders, tasks, services, WMI subscriptions and Winlogon values; Linux locations include cron, systemd, shell files, SSH keys and preload.\n- Sysmon events 12, 13, 14 and 19 to 21, Security 4698 and 7045, and `auditd` watches supply the telemetry; Sigma rules turn it into alerts.\n- Anchor on time, judge the target, look for siblings, **preserve before removing**, and verify after a monitored reboot.\n\nNext, extend your visibility from the host to the wire in [Network Forensics](/learn/security-operations-dfir/network-forensics)."
+    }
+  ],
+  "ar": {
+    "title": "كشف آليات الثبات",
+    "summary": "تعلّم كيف تجد الآليات التي يستخدمها المهاجمون للبقاء بعد إعادة التشغيل والتنظيف في Windows وLinux، وكيف تجمع القياس عن بُعد المناسب، وتكتب قاعدة Sigma واستعلام صيد، وتفرز الثبات وتزيله دون إتلاف الأدلة.",
+    "objectives": [
+      "تصنيف الثبات في ست عائلات وربطها بإطار MITRE ATT&CK",
+      "تعداد مواضع التشغيل الذاتي في Windows وLinux على نظام تملكه",
+      "تحديد القياس عن بُعد (Sysmon وأحداث Security وauditd) الذي يكشف الثبات",
+      "كتابة قاعدة Sigma واستعلام صيد SPL لقيم Run المشبوهة وضبطهما",
+      "فرز تنبيه ثبات وحفظ الأدلة قبل الإزالة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "نُظّف الأسبوع الماضي حاسوب العمل WS-0142 وأُعيد تشغيله بعد حادثة تصيّد. وفي الساعة 02:10 اليوم يُظهر نظام EDR أنه يرسل إشارات اتصال دورية مجددًا. لم يصل شيء جديد؛ فقد ترك المهاجم بابًا مفتوحًا. هذا هو **الثبات (Persistence)**، ولهذا لا يكون حذف ملف خبيث واحد نهاية التحقيق أبدًا.\n\nيعني كشف الثبات العثور على كل آلية تعيد تشغيل شيفرة المهاجم بعد إعادة التشغيل أو تسجيل الخروج أو التنظيف، وبناء تنبيهات تُظهر الآليات الجديدة خلال دقائق. وهو يدعم العمل على الأجهزة في درسَي [الاستجابة للحوادث في Windows](/learn/security-operations-dfir/windows-incident-response) و[الاستجابة للحوادث في Linux](/learn/security-operations-dfir/linux-incident-response)."
+      },
+      {
+        "id": "categories",
+        "type": "text",
+        "markdown": "## الثبات في ست عائلات\n\nيختار المهاجمون آلية الثبات بحسب الصلاحيات التي يملكونها وبحسب احتمال أن يبحث المدافع عنها. صنّف الآليات في عائلات لتكون قائمة الفحص منهجية:\n\n| العائلة | أمثلة | ATT&CK |\n|:--|:--|:--|\n| **مدخلات التشغيل الذاتي** | مفاتيح Run وRunOnce، ومجلد Startup، وملفات الصدفة | T1547 |\n| **التنفيذ المجدول** | مهام Windows المجدولة، وcron، ومؤقّتات systemd | T1053 |\n| **الخدمات والعمليات الخلفية** | خدمة Windows جديدة، ووحدة systemd، وسكربت init | T1543 |\n| **المُطلَقة بالأحداث** | اشتراكات WMI، ومنقّح IFEO، و`LD_PRELOAD` | T1546 |\n| **الحسابات والوصول** | مستخدم محلي جديد، و`authorized_keys` في SSH، وتطبيق OAuth مضاف | T1136, T1098 |\n| **الإقلاع والبرمجيات الثابتة** | حزم الإقلاع الخبيثة، وتعديل إعدادات الإقلاع | T1542 |\n\nتمثّل الأربع الأولى معظم الحالات الواقعية. أما الخامسة فيسهل نسيانها لأن شيئًا لا يُنفَّذ على الجهاز: فالمهاجم يحتفظ بمفتاح صالح فحسب."
+      },
+      {
+        "id": "windows",
+        "type": "text",
+        "markdown": "## أين تبحث في Windows\n\nمرّ على هذه المواضع بالترتيب. يستغرق فحص كل منها دقيقة، وقد استُخدم كل منها في اختراقات حقيقية.\n\n1. **مفاتيح Run.** في `HKLM` و`HKCU` تحت `Software\\Microsoft\\Windows\\CurrentVersion\\Run` و`RunOnce`. لا تحتاج نسخة `HKCU` إلى صلاحيات مسؤول، ولذلك يفضّلها المهاجمون.\n2. **مجلدات Startup.** يُنفَّذ عند تسجيل الدخول كل ما يوضع في مجلد Startup الخاص بالمستخدم أو بجميع المستخدمين.\n3. **المهام المجدولة.** انظر إلى المحفّز (تسجيل الدخول، أو الإقلاع، أو كل خمس دقائق)، والإجراء، والحساب الذي تعمل به. المهام التي تشغّل `powershell.exe` أو `cmd.exe` بوسائط مشفّرة مشبوهة.\n4. **الخدمات.** الخدمة التي يقع ملفها التنفيذي في `ProgramData` أو `Temp` أو ملف مستخدم نادرًا ما تكون مشروعة.\n5. **اشتراكات أحداث WMI.** المرشّح والمستهلك والربط المخزَّنة في مستودع WMI لا تترك أي ملف في مجلد Startup.\n6. **Winlogon وIFEO.** قيم مثل `Userinit` و`Shell` ومنقّحات `Image File Execution Options` تعيد توجيه تشغيل البرامج العادية.\n\nيفحص الطرفية أدناه ثلاثة منها على جهاز تملكه. اقرأ التعليقات: يُحكم على كل سطر في المخرجات بمساره وعمليته الأصل، لا باسمه وحده."
+      },
+      {
+        "id": "term-win",
+        "type": "terminal",
+        "title": "PowerShell على جهاز تملكه",
+        "prompt": "PS C:\\>",
+        "lines": [
+          {
+            "cmd": "Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' | Format-List",
+            "comment": "مفاتيح التشغيل الذاتي للجهاز وللمستخدم الحالي"
+          },
+          {
+            "output": "SecurityHealth : %windir%\\system32\\SecurityHealthSystray.exe\nOneDrive       : \"C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe\" /background\nUpdaterSvc     : C:\\Users\\Public\\Libraries\\upd.exe -q",
+            "comment": "الأولان طبيعيان، أما ملف تنفيذي في Public\\Libraries فليس كذلك."
+          },
+          {
+            "cmd": "Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.State -ne 'Disabled' } | Select-Object TaskName, @{n='Run';e={$_.Actions.Execute}}",
+            "comment": "المهام في الجذر هي المكان الذي تُنشأ فيه المهام اليدوية غالبًا"
+          },
+          {
+            "output": "TaskName            Run\n--------            ---\nGoogleUpdateTaskX   C:\\ProgramData\\GoogleUpdate\\gu.exe\nSystemHealthCheck   powershell.exe",
+            "comment": "مهمة تشغّل powershell.exe مباشرةً تستحق فحص وسائطها"
+          },
+          {
+            "cmd": "Get-CimInstance -Namespace root\\subscription -ClassName __EventConsumer | Select-Object Name, __CLASS",
+            "comment": "اشتراكات WMI: موضع شائع للثبات من دون ملفات"
+          },
+          {
+            "output": "Name        __CLASS\n----        -------\nBVTConsumer CommandLineEventConsumer",
+            "comment": "BVTConsumer اسم مدمج معروف في بعض الأنظمة؛ تحقق من سطر أوامره قبل الحكم"
+          }
+        ],
+        "caption": "تعداد مواضع التشغيل الذاتي الشائعة. شغّل هذا على الأنظمة التي تديرها فقط."
+      },
+      {
+        "id": "linux",
+        "type": "text",
+        "markdown": "## أين تبحث في Linux\n\nثبات Linux ملفات نصية في الغالب، ما يسهّل مقارنتها ومراقبتها.\n\n- **Cron.** `/etc/crontab` و`/etc/cron.d/` وملفات المستخدمين في `/var/spool/cron/` ومجلدات anacron.\n- **systemd.** وحدات `.service` و`.timer` الجديدة في `/etc/systemd/system/` أو في `~/.config/systemd/user/` للمستخدم. افحص `ExecStart` والهدف `WantedBy`.\n- **ملفات الصدفة وتسجيل الدخول.** `.bashrc` و`.profile` و`/etc/profile.d/*.sh` تعمل عند كل دخول.\n- **SSH.** المفتاح المُضاف إلى `~/.ssh/authorized_keys` يمنح وصولًا صامتًا من دون كلمة مرور.\n- **التحميل المسبق والوحدات.** يحمّل `/etc/ld.so.preload` ووحدات النواة القابلة للتحميل شيفرة في كل عملية أو في النواة.\n- **الحسابات.** مستخدم جديد بمعرّف UID 0 أو ملف sudoers معدَّل.\n\nولأنها ملفات، يستطيع `auditd` مراقبتها مباشرةً. راجع درس [تحليل العمليات والخدمات المشبوهة](/learn/security-operations-dfir/suspicious-process-and-service-analysis) للحكم على ما تجده."
+      },
+      {
+        "id": "auditd",
+        "type": "code",
+        "language": "bash",
+        "filename": "/etc/audit/rules.d/persistence.rules",
+        "caption": "يراقب auditd مواضع الثبات في Linux على جهاز تديره. تتيح لك المفاتيح البحث بالأمر `ausearch -k persist`.",
+        "code": "-w /etc/crontab -p wa -k persist\n-w /etc/cron.d/ -p wa -k persist\n-w /var/spool/cron/ -p wa -k persist\n-w /etc/systemd/system/ -p wa -k persist\n-w /usr/lib/systemd/system/ -p wa -k persist\n-w /etc/rc.local -p wa -k persist\n-w /root/.ssh/authorized_keys -p wa -k persist_ssh\n-w /etc/ld.so.preload -p wa -k persist_preload\n"
+      },
+      {
+        "id": "sources",
+        "type": "text",
+        "markdown": "## القياس عن بُعد الذي يكشف الثبات\n\nيحتاج الكشف إلى تفعيل السجلات الصحيحة قبل الحادثة. يعرض الجدول المصادر التي ينبغي أن تتأكد من جمعها.\n\n| المصدر | الحدث | ما يُظهره |\n|:--|:--|:--|\n| Sysmon | 12 و13 و14 | إنشاء مفتاح أو قيمة في السجل أو ضبطها أو إعادة تسميتها |\n| Sysmon | 19 و20 و21 | إنشاء مرشّح WMI ومستهلكه وربطه |\n| Windows Security | 4698 | إنشاء مهمة مجدولة |\n| Windows System | 7045 | تثبيت خدمة جديدة |\n| Windows Security | 4720 و4732 | إنشاء حساب محلي أو إضافته إلى مجموعة |\n| auditd | `PATH` و`SYSCALL` | الكتابة في الملفات والمجلدات المراقَبة |\n| EDR | قياس التشغيل الذاتي | سلسلة العمليات والملف الذي أُسقط |\n\nاجمع الحدث الخام لا ملخصًا عنه. بيانات قيمة السجل (مسار الملف التنفيذي) هي الحقل الذي ستبني عليه التنبيه."
+      },
+      {
+        "id": "sigma",
+        "type": "code",
+        "language": "yaml",
+        "filename": "run-key-user-writable.yml",
+        "caption": "قاعدة Sigma لقيم Run المشبوهة. ويلي ذلك المنطق نفسه بصيغة Splunk SPL.",
+        "highlight": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "code": "title: Run Key Persistence Pointing to a User-Writable Path\nid: 00000000-0000-4000-8000-000000000001   # placeholder id\nstatus: experimental\ndescription: A Run or RunOnce value was set to a binary in a folder that ordinary users can write to.\nlogsource:\n  category: registry_set\n  product: windows\ndetection:\n  selection_key:\n    TargetObject|contains:\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\'\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\'\n  selection_path:\n    Details|contains:\n      - '\\AppData\\'\n      - '\\Users\\Public\\'\n      - '\\ProgramData\\'\n      - '\\Temp\\'\n  filter_known:\n    Image|endswith: '\\OneDriveSetup.exe'\n  condition: selection_key and selection_path and not filter_known\nfalsepositives:\n  - Per-user installers that register themselves in AppData\nlevel: medium\ntags:\n  - attack.persistence\n  - attack.t1547.001\n"
+      },
+      {
+        "id": "spl",
+        "type": "code",
+        "language": "plain",
+        "filename": "run-key-hunt.spl",
+        "caption": "استعلام الصيد: وقت أول ظهور لكل جهاز يمنحك نقطة الارتكاز للخط الزمني.",
+        "code": "index=sysmon EventCode=13 TargetObject=\"*\\\\CurrentVersion\\\\Run*\" (Details=\"*\\\\AppData\\\\*\" OR Details=\"*\\\\Users\\\\Public\\\\*\")\n| stats count min(_time) as first_seen by host, Image, TargetObject, Details\n| sort first_seen"
+      },
+      {
+        "id": "flow-intro",
+        "type": "text",
+        "markdown": "## تتبّع اختراق واحد\n\nتُظهر الحركة التوضيحية كيف تعمل آليتا ثبات وقاعدة واحدة موضوعة جيدًا معًا. لاحظ أن أول اكتشاف للمحلّل ليس النهاية: فالآلية الثانية لم تُكتشف إلا لأن الخط الزمني بُني حول الحدث الأول."
+      },
+      {
+        "id": "persist-flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "زرع الثبات وكشفه",
+        "caption": "يتغلب الثبات المتكرر على تنظيف عنصر واحد، لذا يجب أن يغطي الكشف كل العائلات.",
+        "data": {
+          "token": "حدث",
+          "nodes": [
+            {
+              "id": "init",
+              "label": "الوصول الأولي",
+              "sub": "موطئ قدم عبر التصيّد",
+              "icon": "attacker"
+            },
+            {
+              "id": "reg",
+              "label": "مفتاح Run",
+              "sub": "قيمة تشغيل ذاتي في HKCU",
+              "icon": "key"
+            },
+            {
+              "id": "task",
+              "label": "مهمة مجدولة",
+              "sub": "محفّز عند تسجيل الدخول",
+              "icon": "cpu"
+            },
+            {
+              "id": "sysmon",
+              "label": "Sysmon وEDR",
+              "sub": "الأحداث 12 و13 و1",
+              "icon": "eye"
+            },
+            {
+              "id": "siem",
+              "label": "قاعدة SIEM",
+              "sub": "Sigma محوّلة إلى SPL",
+              "icon": "log"
+            },
+            {
+              "id": "ir",
+              "label": "المحلّل",
+              "sub": "الفرز وتحديد النطاق",
+              "icon": "user"
+            },
+            {
+              "id": "clean",
+              "label": "الاستئصال",
+              "sub": "الإزالة بعد أخذ نسخة",
+              "icon": "shield"
+            }
+          ],
+          "steps": [
+            {
+              "at": "init",
+              "caption": "ينفّذ المهاجم شيفرة على WS-0142 عبر مرفق تصيّد. ولن تبقى الحمولة بعد إعادة التشغيل من تلقاء نفسها.",
+              "tone": "danger"
+            },
+            {
+              "at": "reg",
+              "caption": "يكتب المهاجم قيمة Run في HKCU باسم UpdaterSvc تشير إلى C:\\Users\\Public\\Libraries\\upd.exe.",
+              "tone": "attack"
+            },
+            {
+              "at": "task",
+              "caption": "وكإجراء احتياطي تُنشأ مهمة باسم SystemHealthCheck بمحفّز عند تسجيل الدخول، فلا تكفي إزالة آلية واحدة.",
+              "tone": "attack"
+            },
+            {
+              "at": "sysmon",
+              "caption": "يسجّل Sysmon ضبط قيمة السجل (الحدث 13) وإنشاء المهمة، ويمرّر حساس EDR الحدثين خلال ثوانٍ.",
+              "tone": "warning"
+            },
+            {
+              "at": "siem",
+              "caption": "تُطلَق قاعدة Sigma لأن بيانات القيمة تحتوي على \\Users\\Public\\، فيُفتح تنبيه يتضمن الجهاز والمستخدم والعملية.",
+              "tone": "warning"
+            },
+            {
+              "at": "ir",
+              "caption": "يبني المحلّل خطًا زمنيًا حول أول حدث، ويكتشف الآلية الثانية، ويبحث في الأسطول عن اسم القيمة نفسه."
+            },
+            {
+              "at": "clean",
+              "caption": "بعد جمع المفتاح والمهمة والملف التنفيذي بوصفها أدلة، تُزال جميعها ويُراقب الجهاز تحسبًا لعودة المهاجم.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "triage",
+        "type": "text",
+        "markdown": "## مسار الفرز\n\nعند إطلاق التنبيه اعمل بالطريقة نفسها في كل مرة:\n\n1. **ارتكز على الزمن.** خذ الطابع الزمني لأول حدث ثبات واسرد كل ما فعله الجهاز في الدقائق الخمس المحيطة: إنشاء العمليات، والاتصالات الشبكية، وكتابة الملفات.\n2. **احكم على الهدف.** أين الملف التنفيذي؟ هل هو موقَّع، ومن وقّعه؟ ما عمر الملف مقارنةً بتغيير السجل؟ الملف الموقَّع من Microsoft المستخدم كمُطلِق (ملف نظام يُساء استخدامه، أي living-off-the-land) لا يزال يتطلب قراءة وسائطه.\n3. **ابحث عن الأشقاء.** نادرًا ما يزرع المهاجمون آلية واحدة. افحص كل العائلات على الجهاز، ثم ابحث في الأسطول عن اسم القيمة نفسه واسم المهمة والبصمة والمسار.\n4. **احفظ ثم أزل.** صدّر المفتاح وانسخ ملف XML للمهمة وخذ نسخة من الملف التنفيذي قبل أي تغيير.\n5. **تحقّق.** بعد التنظيف أعد التشغيل في حالة مراقَبة وتأكد من عدم عودة شيء. فإن عاد فقد فاتتك آلية، أو ما زال المهاجم يملك وصولًا.\n\nوإن أُسيء استخدام الحساب نفسه فتابع بدرس [كشف الحركة الجانبية](/learn/security-operations-dfir/lateral-movement-detection)."
+      },
+      {
+        "id": "warn-delete",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تحذف أولًا",
+        "markdown": "حذف قيمة Run أو مهمة قبل نسخها يدمّر الدليل الذي يخبرك متى زُرع الثبات ومن زرعه. صدّر المفتاح بالأمر `reg export`، واحفظ المهمة بالأمر `schtasks /query /xml`، واحسب بصمة الملف التنفيذي. ثم أزل."
+      },
+      {
+        "id": "tip-baseline",
+        "type": "callout",
+        "variant": "tip",
+        "title": "خط الأساس أفضل من الذاكرة",
+        "markdown": "لا يستطيع أحد أن يتذكر ما ينبغي أن تكون عليه كل مدخلات التشغيل الذاتي في خادم. التقط لقطة Autoruns أو osquery لكل صورة مرجعية وقارن بها. الحكم على فرق من عشرة مدخلات جديدة أسرع بكثير من الحكم على قائمة من ثلاثمئة، وهو نقطة انطلاق قوية لدرس [صيد التهديدات المتقدم](/learn/security-operations-dfir/advanced-threat-hunting)."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم **آلة افتراضية تملكها** ولا تستخدم نظام إنتاج أبدًا.\n\n1. أنشئ قيمة Run غير ضارة: `reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v LabTest /d \"C:\\Windows\\System32\\notepad.exe\"`.\n2. ثبّت Sysmon بإعدادات شائعة، وكرّر الأمر، وابحث عن الحدث 13 في Event Viewer. دوّن الحقول `Image` و`TargetObject` و`Details`.\n3. شغّل أوامر PowerShell من هذا الدرس وتأكد من ظهور قيمتك.\n4. عدّل قاعدة Sigma لتطابق `\\Temp\\` فقط، ثم اختبر أنها لا تطابق قيمة notepad.\n5. احذف القيمة بالأمر `reg delete` واكتب ثلاث جمل تصف كيف تكشف القيمة نفسها على مئة جهاز."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "الثبات (Persistence)",
+            "definition": "أي تقنية تتيح لشيفرة المهاجم البقاء بعد إعادة التشغيل أو تسجيل الخروج أو التنظيف الجزئي."
+          },
+          {
+            "term": "مفتاح Run",
+            "definition": "موضع في السجل تُنفَّذ قيمه عند تسجيل دخول المستخدم أو بدء النظام."
+          },
+          {
+            "term": "المهمة المجدولة (Scheduled task)",
+            "definition": "مهمة في Windows أو cron تعمل عند محفّز، وكثيرًا ما يُساء استخدامها للثبات عند وقت محدد أو عند الدخول."
+          },
+          {
+            "term": "اشتراك WMI",
+            "definition": "مرشّح ومستهلك وربط مخزَّنة في مستودع WMI تشغّل أمرًا عند وقوع حدث."
+          },
+          {
+            "term": "Autoruns",
+            "definition": "أداة من Sysinternals تسرد كل مواضع التشغيل الذاتي تقريبًا في جهاز Windows."
+          },
+          {
+            "term": "Sysmon",
+            "definition": "خدمة Windows تسجّل بالتفصيل نشاط العمليات والسجل والملفات وWMI."
+          },
+          {
+            "term": "Sigma",
+            "definition": "صيغة قواعد محايدة تجاه المورّدين لكشف السجلات، وتتحول إلى لغات استعلام كثير من أنظمة SIEM."
+          },
+          {
+            "term": "استغلال أدوات النظام (Living off the land)",
+            "definition": "إساءة استخدام ملفات النظام المشروعة، مثل PowerShell، لتجنّب إسقاط أدوات مخصصة."
+          },
+          {
+            "term": "خط الأساس (Baseline)",
+            "definition": "حالة سليمة معروفة مسجَّلة تُستخدم لاكتشاف الفروق بسرعة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أيّ معرّف حدث في Sysmon يسجّل ضبط قيمة في السجل؟",
+            "options": [
+              "1",
+              "3",
+              "13",
+              "22"
+            ],
+            "answer": 2,
+            "explanation": "الحدث 13 هو RegistryEvent (Value Set). أما الحدث 1 فهو إنشاء عملية، و3 اتصال شبكي، و22 استعلام DNS."
+          },
+          {
+            "question": "لماذا يستخدم المهاجمون غالبًا مفتاح Run في HKCU بدلًا من HKLM؟",
+            "options": [
+              "لأن مدخلات HKCU تعمل قبل تحميل النواة",
+              "لأن HKCU لا يحتاج إلى صلاحيات مسؤول",
+              "لأن مفاتيح HKLM لا تُسجَّل",
+              "لأن مدخلات HKCU لا يمكن تصديرها"
+            ],
+            "answer": 1,
+            "explanation": "الكتابة في خلية المستخدم الحالي تنجح مع مستخدم عادي، فلا تحتاج إلى رفع صلاحيات."
+          },
+          {
+            "question": "أيّ العناصر التالية مواضع ثبات تستحق الفحص؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "مهام مجدولة بمحفّز عند تسجيل الدخول",
+              "الملف `~/.ssh/authorized_keys` على خادم Linux",
+              "ملف سجل المتصفح",
+              "ملفات الوحدات في `/etc/systemd/system/`"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "المهام ومفاتيح SSH ووحدات systemd كلها تعيد تشغيل وصول المهاجم أو تمكّنه. أما سجل المتصفح فليس آلية تنفيذ أو وصول."
+          },
+          {
+            "question": "وجدت مهمة مجدولة خبيثة واحدة على جهاز. ما أفضل خطوة تالية؟",
+            "options": [
+              "حذفها وإغلاق التذكرة",
+              "البحث في كل عائلات الثبات على الجهاز وفي الأسطول عن آليات شقيقة",
+              "إعادة تثبيت المتصفح",
+              "تعطيل Sysmon لتقليل الضجيج"
+            ],
+            "answer": 1,
+            "explanation": "يزرع المهاجمون عادةً آليات متكررة، فإزالة واحدة دون البحث عن غيرها تدعو إلى عودتهم."
+          },
+          {
+            "question": "أيّ الأدلة ينبغي حفظها قبل إزالة قيمة Run؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تصدير للمفتاح",
+              "بصمة ونسخة من الملف التنفيذي المشار إليه",
+              "الطابع الزمني لتغيير السجل",
+              "لا شيء، فلا حاجة إلى الأدلة بعد الكشف"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "يبيّن المفتاح والملف التنفيذي ووقت التغيير ما زُرع ومتى وبأي عملية، وتدعم تحديد النطاق عبر الأسطول."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- **الثبات** يتيح لشيفرة المهاجم البقاء بعد إعادة التشغيل والتنظيف، لذا يجب أن يجد الكشف كل آلية لا أولاها فقط.\n- افحص ست عائلات: مدخلات التشغيل الذاتي، والتنفيذ المجدول، والخدمات، والآليات المُطلَقة بالأحداث، والحسابات والوصول، ومكونات الإقلاع.\n- مواضع Windows تشمل مفاتيح Run ومجلدات Startup والمهام والخدمات واشتراكات WMI وقيم Winlogon؛ ومواضع Linux تشمل cron وsystemd وملفات الصدفة ومفاتيح SSH والتحميل المسبق.\n- يوفّر القياس عن بُعد أحداث Sysmon 12 و13 و14 و19 إلى 21 وأحداث Security 4698 و7045 وقواعد مراقبة `auditd`، وتحوّلها قواعد Sigma إلى تنبيهات.\n- ارتكز على الزمن، واحكم على الهدف، وابحث عن الأشقاء، و**احفظ قبل الإزالة**، وتحقّق بعد إعادة تشغيل مراقَبة.\n\nثم وسّع رؤيتك من الجهاز إلى الشبكة في درس [التحليل الجنائي للشبكات](/learn/security-operations-dfir/network-forensics)."
+      }
+    ]
+  }
+}

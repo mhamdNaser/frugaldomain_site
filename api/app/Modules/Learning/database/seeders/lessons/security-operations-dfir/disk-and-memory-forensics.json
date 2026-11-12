@@ -1,0 +1,632 @@
+{
+  "slug": "disk-and-memory-forensics",
+  "title": "Disk and Memory Forensics",
+  "summary": "Learn to preserve and examine a compromised system in the right order: capture RAM, analyze it with Volatility, image the disk with verified hashes, read key artifacts and build a timeline with Plaso.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Apply the order of volatility when collecting evidence",
+    "Analyze a memory image with Volatility 3 process, network and command-line plugins",
+    "Create and verify a forensic disk image with hashes",
+    "Match investigative questions to Windows disk artifacts",
+    "Build and read a Plaso super-timeline and separate facts from inferences"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A network sensor has pointed at file server FS01, and your analysis in [Network Forensics](/learn/security-operations-dfir/network-forensics) names a likely window: 08:58 to 09:41 today. Now you need to look inside the machine. What you do in the next ten minutes decides whether your evidence will stand up. Reboot the server and you lose the running malware's memory. Copy files carelessly and you overwrite timestamps.\n\n**Disk and memory forensics** examines a system's storage and its RAM to determine what ran, what changed and who did it. This lesson shows the order, the tools and the questions each artifact answers."
+    },
+    {
+      "id": "volatility",
+      "type": "text",
+      "markdown": "## Order of volatility\n\nEvidence disappears at different speeds. Collect the most fragile first.\n\n| Order | Evidence | Lifetime |\n|:--|:--|:--|\n| 1 | CPU registers and cache | Nanoseconds |\n| 2 | **RAM**: processes, connections, keys, command lines | Until power loss |\n| 3 | Network state and ARP cache | Until it changes |\n| 4 | **Disk**: files, registry, logs, hibernation file | Until overwritten |\n| 5 | Remote logs and backups | Retention period |\n\nIn practice that means: isolate, capture RAM, image or triage the disk, then collect logs. Never run tools from the suspect's own disk if you can avoid it, and write every action in your notes with the time."
+    },
+    {
+      "id": "memory",
+      "type": "text",
+      "markdown": "## Memory acquisition and analysis\n\nAcquire memory with a tool suited to the platform: WinPmem or a vendor agent on Windows, AVML or LiME on Linux, or a hypervisor snapshot for a virtual machine. Save to an external drive, hash it and record the tool version. Acquisition changes memory slightly, and your notes should say so.\n\n**Volatility 3** parses the image offline. Four plugins answer most first questions: `windows.pstree` (who started what), `windows.netscan` (network connections), `windows.cmdline` (how a process was launched) and `windows.malfind` (memory regions that are executable and writable, which legitimate code rarely needs).\n\nThe terminal walks one suspicious process from the tree to its connection."
+    },
+    {
+      "id": "term-vol",
+      "type": "terminal",
+      "title": "Volatility 3 on a memory image",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.info",
+          "comment": "Confirm the OS build and capture time before trusting any plugin output"
+        },
+        {
+          "output": "Kernel Base     0xf80123400000\nIs64Bit         True\nSystemTime      2026-11-12 09:41:07\nNTBuildLab      19041.1.amd64fre.vb_release.191206-1406",
+          "comment": "The capture time anchors every timestamp that follows"
+        },
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.pstree",
+          "comment": "Show the process tree to see parent-child relationships"
+        },
+        {
+          "output": "PID   PPID  ImageFileName   CreateTime\n624   4     smss.exe        2026-11-12 06:02:11\n* 756  624   services.exe    2026-11-12 06:02:14\n** 1032 756  svchost.exe     2026-11-12 06:02:15\n2760  2744  explorer.exe    2026-11-12 06:05:40\n* 3188 2760  WINWORD.EXE     2026-11-12 08:58:02\n** 4412 3188 svchost.exe     2026-11-12 08:58:31",
+          "comment": "A real svchost.exe is started by services.exe. This one has WINWORD.EXE as its parent."
+        },
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.netscan | grep 4412",
+          "comment": "Find network connections for the odd process"
+        },
+        {
+          "output": "TCPv4  192.0.2.10:49822  203.0.113.50:443  ESTABLISHED  4412  svchost.exe",
+          "comment": "It holds an established HTTPS session to the address seen in the network evidence"
+        },
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.cmdline --pid 4412",
+          "comment": "Check how it was started"
+        },
+        {
+          "output": "4412  svchost.exe  C:\\Users\\Public\\Libraries\\svchost.exe",
+          "comment": "The binary runs from a user-writable folder, not System32: not the genuine svchost"
+        }
+      ],
+      "caption": "Annotated output from a lab image. A name alone proves nothing: parent, path and connections decide the verdict."
+    },
+    {
+      "id": "disk",
+      "type": "text",
+      "markdown": "## Disk acquisition\n\nA forensic image is a bit-for-bit copy of a disk, so deleted data and unallocated space survive. The rules are simple:\n\n- **Never write to the source.** Use a hardware write blocker, or image from a snapshot or a bootable forensic environment that mounts read-only.\n- **Hash before and after,** and verify the image against the source hash.\n- **Keep the original sealed** and analyze a working copy.\n- **Handle encryption.** If BitLocker or LUKS is on, a powered-off image is unreadable without the key. Capture memory or retrieve the recovery key first.\n\nFor cloud and virtual machines, snapshot the disk through the platform, then copy the snapshot into your evidence store and hash it there."
+    },
+    {
+      "id": "acq",
+      "type": "code",
+      "language": "bash",
+      "filename": "acquire-and-timeline.sh",
+      "caption": "Imaging, verification and timeline creation for an authorized examination. The hash lines are the proof that nothing changed.",
+      "code": "# 1. Hash the source first, through a write blocker, then image it (a disk you are authorized to examine).\nsudo sha256sum /dev/sdb > /evidence/FS01-source.sha256\nsudo ewfacquire -u -t /evidence/FS01 -f encase6 -c fast -C CASE-2026-114 -D \"FS01 system disk\" -e \"A. Examiner\" /dev/sdb\n\n# 2. Verify that the image matches what was read.\newfverify /evidence/FS01.E01\n#   MD5 hash calculated over data:   <hash>   ... ewfverify: SUCCESS\n\n# 3. Build a timeline from a read-only copy of the image.\nlog2timeline.py --storage-file /cases/fs01.plaso /evidence/FS01.E01\npsort.py -o l2tcsv -w /cases/fs01-timeline.csv /cases/fs01.plaso \\\n  \"date > '2026-11-10 00:00:00' AND date < '2026-11-12 12:00:00'\"\ngrep -i \"Public\\\\\\\\Libraries\" /cases/fs01-timeline.csv | head\n",
+      "highlight": [
+        2,
+        3,
+        6,
+        7,
+        10,
+        11,
+        12
+      ]
+    },
+    {
+      "id": "artifacts",
+      "type": "text",
+      "markdown": "## Disk artifacts and the questions they answer\n\nDo not read the disk file by file. Ask a question, then go to the artifact that answers it.\n\n| Question | Artifact |\n|:--|:--|\n| Did this program run, and when? | Prefetch, Amcache, ShimCache, UserAssist |\n| When was a file created, changed or deleted? | `$MFT`, `$UsnJrnl` |\n| What was set to survive a reboot? | Registry hives, scheduled tasks, services (see [Persistence Mechanism Detection](/learn/security-operations-dfir/persistence-mechanism-detection)) |\n| Who logged on? | Security event log 4624, 4625 |\n| What did the user open or download? | LNK files, Jump Lists, browser history |\n| What was removed? | Recycle Bin, unallocated space, VSS snapshots |\n\nThe **MFT** keeps two sets of timestamps, `$STANDARD_INFORMATION` and `$FILE_NAME`. An attacker can alter the first with a tool; the second is much harder to change. A mismatch is a classic sign of timestamp tampering."
+    },
+    {
+      "id": "kape",
+      "type": "code",
+      "language": "powershell",
+      "filename": "kape-triage.ps1",
+      "caption": "KAPE collects and parses the high-value artifacts quickly. Use it on systems you are authorized to examine.",
+      "code": "# Triage collection from a live Windows system you are authorized to examine.\n.\\kape.exe --tsource C: --tdest E:\\evidence\\FS01\\collected --target !SANS_Triage --vss\n# Parse the collected artifacts into CSV files on the analysis workstation.\n.\\kape.exe --msource E:\\evidence\\FS01\\collected --mdest E:\\evidence\\FS01\\parsed --module !EZParser\n# Expected output folders include: Amcache, AppCompatCache (ShimCache), MFT, Prefetch, EventLogs, RegistryHives\n"
+    },
+    {
+      "id": "process",
+      "type": "text",
+      "markdown": "## A repeatable process\n\nThe animation shows the whole examination as a cycle. It is a cycle because findings from analysis send you back: a new account name means you collect more logs, and a new IP address means you search the network evidence again.\n\nFor Linux hosts, use the same order with `LiME` or `AVML` and the Volatility Linux symbol tables, as practiced in [Linux Incident Response](/learn/security-operations-dfir/linux-incident-response)."
+    },
+    {
+      "id": "dfir-cycle",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "The forensic examination cycle",
+      "caption": "Isolate and preserve first, acquire by volatility, analyze copies and report with limits.",
+      "data": {
+        "center": "Forensic examination",
+        "items": [
+          {
+            "label": "Identify",
+            "sub": "Scope and authority"
+          },
+          {
+            "label": "Preserve",
+            "sub": "Isolate, do not power off"
+          },
+          {
+            "label": "Acquire memory",
+            "sub": "Most volatile first"
+          },
+          {
+            "label": "Acquire disk",
+            "sub": "Hash and verify"
+          },
+          {
+            "label": "Analyze",
+            "sub": "Processes, artifacts, timeline"
+          },
+          {
+            "label": "Report",
+            "sub": "Findings and limits"
+          }
+        ],
+        "steps": [
+          {
+            "item": 0,
+            "caption": "Confirm written authority, the system and what question the examination must answer."
+          },
+          {
+            "item": 1,
+            "caption": "Isolate the host from the network but keep it powered on. Powering off destroys memory and may trigger disk encryption."
+          },
+          {
+            "item": 2,
+            "caption": "Capture RAM first, because processes, connections and keys vanish at shutdown. Hash the file at once."
+          },
+          {
+            "item": 3,
+            "caption": "Image the disk through a write blocker or from a powered-off snapshot, then verify the hash."
+          },
+          {
+            "item": 4,
+            "caption": "Analyze memory for process trees and connections, then disk for files, registry and a timeline. Work on copies only."
+          },
+          {
+            "item": 5,
+            "caption": "Report what you found, what you could not determine and how each fact can be reproduced."
+          }
+        ]
+      }
+    },
+    {
+      "id": "timeline",
+      "type": "text",
+      "markdown": "## Building and reading a timeline\n\nA **super-timeline** merges file system times, registry changes, event logs, browser visits and more into one sorted list. Plaso builds it with `log2timeline.py`, and `psort.py` filters it by date. Start from a known point, such as the 08:58 process creation, and read 10 minutes either way.\n\nLook for clusters: a document opened, a new executable written to `Public\\Libraries`, a Prefetch file created, a registry value set, a connection logged. Each cluster is one event in the story. Write the story as a list of timestamped facts and mark each as *observed* or *inferred*. A timeline built from several independent sources is far stronger than one built from a single artifact.\n\nThe findings feed directly into [Server Compromise Investigation](/learn/security-operations-dfir/server-compromise-investigation) and, once you know the scope, into [Incident Recovery and System Rebuilding](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding)."
+    },
+    {
+      "id": "warn-power",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not power off to be safe",
+      "markdown": "Many analysts reflexively pull the plug. That destroys running processes, network connections and decryption keys, and it can leave a hibernation or page file stale. Isolate the network instead, capture memory, and shut the system down only as a deliberate, documented decision."
+    },
+    {
+      "id": "tip-copy",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Work on copies, and log your hashes",
+      "markdown": "Mount the working image read-only and re-hash the original at the end of the case. When the two hashes match, you can state that your analysis did not alter the evidence."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a **virtual machine you own**.\n\n1. Boot a Windows or Linux lab VM, open a few programs and then suspend it. Your hypervisor writes the memory to a file such as a `.vmem`.\n2. Copy that file to a case folder and record its `sha256sum` and the time.\n3. Install Volatility 3 and run `windows.info` and `windows.pstree` (or the Linux equivalents) against your copy.\n4. Pick one process and find its parent, command line and network connections.\n5. Write a four-line note: the question you asked, the plugin you used, what you saw and your confidence."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Order of volatility",
+          "definition": "The sequence for collecting evidence, from the most short-lived (RAM) to the most durable (backups)."
+        },
+        {
+          "term": "Forensic image",
+          "definition": "A bit-for-bit copy of a storage device, including deleted and unallocated data."
+        },
+        {
+          "term": "Write blocker",
+          "definition": "A device or setting that lets you read a disk without ever writing to it."
+        },
+        {
+          "term": "Volatility",
+          "definition": "An open-source framework that analyzes memory images offline."
+        },
+        {
+          "term": "$MFT",
+          "definition": "The NTFS Master File Table that records every file and its timestamps."
+        },
+        {
+          "term": "Prefetch",
+          "definition": "Windows files that record when a program ran and which files it loaded."
+        },
+        {
+          "term": "KAPE",
+          "definition": "A triage tool that collects and parses forensic artifacts quickly."
+        },
+        {
+          "term": "Plaso",
+          "definition": "A toolset (log2timeline, psort) that builds a super-timeline from many sources."
+        },
+        {
+          "term": "Hash",
+          "definition": "A fixed-length fingerprint of data used to prove it has not changed."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which evidence should normally be collected first from a running compromised server?",
+          "options": [
+            "The disk image",
+            "RAM",
+            "Backups",
+            "Remote log archives"
+          ],
+          "answer": 1,
+          "explanation": "RAM is the most volatile of these and is lost at shutdown, so it is collected first."
+        },
+        {
+          "question": "In a process tree, svchost.exe has WINWORD.EXE as its parent and runs from C:\\Users\\Public\\Libraries. What does this suggest?",
+          "options": [
+            "A normal Windows service",
+            "A masquerading process",
+            "A Windows update",
+            "A broken memory image"
+          ],
+          "answer": 1,
+          "explanation": "Genuine svchost.exe is started by services.exe and runs from System32. A different parent and path indicate masquerading."
+        },
+        {
+          "question": "Which practices protect the integrity of a disk image? (Choose all that apply.)",
+          "options": [
+            "Using a write blocker",
+            "Hashing before and after imaging",
+            "Analyzing the original disk directly",
+            "Verifying the image against the source hash"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "A write blocker, matching hashes and verification show the image is faithful. Analyzing the original risks altering it."
+        },
+        {
+          "question": "Why can $FILE_NAME timestamps help detect tampering?",
+          "options": [
+            "They are stored in the registry",
+            "They are harder for an attacker to modify than $STANDARD_INFORMATION",
+            "They are always identical to the creation time",
+            "They are only used for deleted files"
+          ],
+          "answer": 1,
+          "explanation": "Common tools alter $STANDARD_INFORMATION times, but $FILE_NAME is updated by the kernel, so a mismatch reveals tampering."
+        },
+        {
+          "question": "Why is powering off a suspect system usually a poor first step? (Choose all that apply.)",
+          "options": [
+            "It destroys running processes and connections",
+            "It may lose encryption keys held in memory",
+            "It makes the disk impossible to image",
+            "It removes the chance to capture RAM"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Shutdown erases volatile evidence. The disk can still be imaged afterward, though it may be encrypted."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Collect by **order of volatility**: isolate, capture RAM, then the disk, then logs.\n- **Volatility 3** reveals process trees, command lines, connections and injected code; judge by parent, path and behavior, not by name.\n- A **forensic image** needs a write blocker, hashes before and after, and a sealed original.\n- Ask a question first, then use the artifact that answers it: Prefetch, Amcache, `$MFT`, `$UsnJrnl`, event logs.\n- **Plaso timelines** combine sources; separate observed facts from inferences and state your limits.\n\nWhen the examination ends in ransomware, continue with [Ransomware Detection and Response](/learn/security-operations-dfir/ransomware-detection-and-response)."
+    }
+  ],
+  "ar": {
+    "title": "التحليل الجنائي للأقراص والذاكرة",
+    "summary": "تعلّم كيف تحفظ نظامًا مخترقًا وتفحصه بالترتيب الصحيح: التقاط الذاكرة وتحليلها بـ Volatility، وتصوير القرص مع بصمات موثَّقة، وقراءة الآثار الرئيسة، وبناء خط زمني بـ Plaso.",
+    "objectives": [
+      "تطبيق ترتيب التطاير عند جمع الأدلة",
+      "تحليل صورة ذاكرة بإضافات Volatility 3 للعمليات والشبكة وأسطر الأوامر",
+      "إنشاء صورة قرص جنائية والتحقق منها بالبصمات",
+      "مطابقة أسئلة التحقيق مع آثار القرص في Windows",
+      "بناء خط Plaso زمني شامل وقراءته والفصل بين الحقائق والاستنتاجات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "أشار حساس الشبكة إلى خادم الملفات FS01، وحدّد تحليلك في درس [التحليل الجنائي للشبكات](/learn/security-operations-dfir/network-forensics) نافذة محتملة: من 08:58 إلى 09:41 اليوم. الآن عليك النظر داخل الجهاز. وما تفعله في الدقائق العشر التالية يقرر ما إذا كانت أدلتك ستصمد. فإن أعدت تشغيل الخادم فقدت ذاكرة البرمجية العاملة، وإن نسخت الملفات بإهمال كتبت فوق الطوابع الزمنية.\n\n**التحليل الجنائي للأقراص والذاكرة (Disk and Memory Forensics)** يفحص تخزين النظام وذاكرته العشوائية لتحديد ما الذي عمل وما الذي تغيّر ومن فعل ذلك. يعرض هذا الدرس الترتيب والأدوات والأسئلة التي يجيب عنها كل أثر."
+      },
+      {
+        "id": "volatility",
+        "type": "text",
+        "markdown": "## ترتيب التطاير\n\nتختفي الأدلة بسرعات مختلفة. اجمع الأكثر هشاشة أولًا.\n\n| الترتيب | الدليل | العمر |\n|:--|:--|:--|\n| 1 | سجلات المعالج والذاكرة المخبّئة | نانوثوانٍ |\n| 2 | **الذاكرة (RAM)**: العمليات والاتصالات والمفاتيح وأسطر الأوامر | حتى انقطاع الطاقة |\n| 3 | حالة الشبكة وذاكرة ARP | حتى تتغير |\n| 4 | **القرص**: الملفات والسجل والسجلات وملف السبات | حتى يُكتب فوقها |\n| 5 | السجلات البعيدة والنسخ الاحتياطية | مدة الاحتفاظ |\n\nيعني ذلك عمليًا: اعزل، والتقط الذاكرة، ثم خذ صورة القرص أو افرزه، ثم اجمع السجلات. ولا تشغّل أدوات من قرص الجهاز المشتبه فيه إن أمكنك تجنب ذلك، ودوّن كل إجراء في ملاحظاتك مع الوقت."
+      },
+      {
+        "id": "memory",
+        "type": "text",
+        "markdown": "## اقتناء الذاكرة وتحليلها\n\nاقتنِ الذاكرة بأداة تناسب المنصة: WinPmem أو وكيل من المورّد في Windows، وAVML أو LiME في Linux، أو لقطة من المحاكي الافتراضي (Hypervisor) للآلة الافتراضية. احفظ على قرص خارجي واحسب البصمة وسجّل إصدار الأداة. الاقتناء يغيّر الذاكرة قليلًا، وينبغي أن تذكر ملاحظاتك ذلك.\n\nيحلّل **Volatility 3** الصورة دون اتصال. وأربع إضافات تجيب عن معظم الأسئلة الأولى: `windows.pstree` (من بدأ ماذا)، و`windows.netscan` (الاتصالات الشبكية)، و`windows.cmdline` (كيف أُطلقت العملية)، و`windows.malfind` (مناطق الذاكرة القابلة للتنفيذ والكتابة معًا، وهي نادرًا ما تحتاج إليها الشيفرة المشروعة).\n\nتتبّع الطرفية عمليةً مشبوهة واحدة من الشجرة إلى اتصالها."
+      },
+      {
+        "id": "term-vol",
+        "type": "terminal",
+        "title": "Volatility 3 على صورة ذاكرة",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "vol -f /evidence/FS01.mem windows.info",
+            "comment": "أكّد إصدار نظام التشغيل ووقت الالتقاط قبل الوثوق بأي مخرجات"
+          },
+          {
+            "output": "Kernel Base     0xf80123400000\nIs64Bit         True\nSystemTime      2026-11-12 09:41:07\nNTBuildLab      19041.1.amd64fre.vb_release.191206-1406",
+            "comment": "وقت الالتقاط هو مرساة كل طابع زمني لاحق"
+          },
+          {
+            "cmd": "vol -f /evidence/FS01.mem windows.pstree",
+            "comment": "اعرض شجرة العمليات لترى علاقات الأصل والفرع"
+          },
+          {
+            "output": "PID   PPID  ImageFileName   CreateTime\n624   4     smss.exe        2026-11-12 06:02:11\n* 756  624   services.exe    2026-11-12 06:02:14\n** 1032 756  svchost.exe     2026-11-12 06:02:15\n2760  2744  explorer.exe    2026-11-12 06:05:40\n* 3188 2760  WINWORD.EXE     2026-11-12 08:58:02\n** 4412 3188 svchost.exe     2026-11-12 08:58:31",
+            "comment": "svchost.exe الحقيقي تبدؤه services.exe. أما هذه فأصلها WINWORD.EXE."
+          },
+          {
+            "cmd": "vol -f /evidence/FS01.mem windows.netscan | grep 4412",
+            "comment": "ابحث عن الاتصالات الشبكية للعملية الغريبة"
+          },
+          {
+            "output": "TCPv4  192.0.2.10:49822  203.0.113.50:443  ESTABLISHED  4412  svchost.exe",
+            "comment": "لديها جلسة HTTPS قائمة مع العنوان الظاهر في الأدلة الشبكية"
+          },
+          {
+            "cmd": "vol -f /evidence/FS01.mem windows.cmdline --pid 4412",
+            "comment": "افحص كيف بدأت"
+          },
+          {
+            "output": "4412  svchost.exe  C:\\Users\\Public\\Libraries\\svchost.exe",
+            "comment": "يعمل الملف من مجلد يمكن للمستخدم الكتابة فيه لا من System32: فليس svchost الحقيقي"
+          }
+        ],
+        "caption": "مخرجات موضَّحة من صورة مخبرية. الاسم وحده لا يثبت شيئًا: فالأصل والمسار والاتصالات تحسم الحكم."
+      },
+      {
+        "id": "disk",
+        "type": "text",
+        "markdown": "## اقتناء القرص\n\nصورة الأدلة الجنائية (Forensic image) نسخة بتًّا ببت من القرص، فتبقى البيانات المحذوفة والمساحة غير المخصصة. القواعد بسيطة:\n\n- **لا تكتب أبدًا على المصدر.** استخدم جهاز منع كتابة عتاديًا، أو خذ الصورة من لقطة أو من بيئة جنائية قابلة للإقلاع تركّب القرص للقراءة فقط.\n- **احسب البصمة قبل الاقتناء وبعده،** وتحقق من الصورة بمقارنتها ببصمة المصدر.\n- **أبقِ الأصل مختومًا** وحلّل نسخة عمل.\n- **تعامل مع التشفير.** إن كان BitLocker أو LUKS مفعّلًا فصورة الجهاز المطفأ غير مقروءة من دون المفتاح. التقط الذاكرة أو استرجع مفتاح الاسترداد أولًا.\n\nأما في السحابة والآلات الافتراضية فخذ لقطة للقرص عبر المنصة، ثم انسخها إلى مخزن الأدلة واحسب بصمتها هناك."
+      },
+      {
+        "id": "acq",
+        "type": "code",
+        "language": "bash",
+        "filename": "acquire-and-timeline.sh",
+        "caption": "أخذ الصورة والتحقق وبناء الخط الزمني لفحص مصرَّح به. أسطر البصمة هي الدليل على أن شيئًا لم يتغير.",
+        "code": "# 1. Hash the source first, through a write blocker, then image it (a disk you are authorized to examine).\nsudo sha256sum /dev/sdb > /evidence/FS01-source.sha256\nsudo ewfacquire -u -t /evidence/FS01 -f encase6 -c fast -C CASE-2026-114 -D \"FS01 system disk\" -e \"A. Examiner\" /dev/sdb\n\n# 2. Verify that the image matches what was read.\newfverify /evidence/FS01.E01\n#   MD5 hash calculated over data:   <hash>   ... ewfverify: SUCCESS\n\n# 3. Build a timeline from a read-only copy of the image.\nlog2timeline.py --storage-file /cases/fs01.plaso /evidence/FS01.E01\npsort.py -o l2tcsv -w /cases/fs01-timeline.csv /cases/fs01.plaso \\\n  \"date > '2026-11-10 00:00:00' AND date < '2026-11-12 12:00:00'\"\ngrep -i \"Public\\\\\\\\Libraries\" /cases/fs01-timeline.csv | head\n",
+        "highlight": [
+          2,
+          3,
+          6,
+          7,
+          10,
+          11,
+          12
+        ]
+      },
+      {
+        "id": "artifacts",
+        "type": "text",
+        "markdown": "## آثار القرص والأسئلة التي تجيب عنها\n\nلا تقرأ القرص ملفًا ملفًا. اطرح سؤالًا، ثم اذهب إلى الأثر الذي يجيب عنه.\n\n| السؤال | الأثر |\n|:--|:--|\n| هل عمل هذا البرنامج، ومتى؟ | Prefetch وAmcache وShimCache وUserAssist |\n| متى أُنشئ ملف أو تغيّر أو حُذف؟ | `$MFT` و`$UsnJrnl` |\n| ما الذي ضُبط ليبقى بعد إعادة التشغيل؟ | خلايا السجل والمهام المجدولة والخدمات (انظر [كشف آليات الثبات](/learn/security-operations-dfir/persistence-mechanism-detection)) |\n| من سجّل الدخول؟ | سجل الأمان 4624 و4625 |\n| ماذا فتح المستخدم أو نزّل؟ | ملفات LNK وقوائم Jump Lists وسجل المتصفح |\n| ما الذي أُزيل؟ | سلة المحذوفات والمساحة غير المخصصة ولقطات VSS |\n\nيحتفظ **MFT** بمجموعتين من الطوابع الزمنية: `$STANDARD_INFORMATION` و`$FILE_NAME`. يستطيع المهاجم تغيير الأولى بأداة، أما الثانية فتغييرها أصعب كثيرًا. وعدم التطابق علامة كلاسيكية على العبث بالطوابع الزمنية."
+      },
+      {
+        "id": "kape",
+        "type": "code",
+        "language": "powershell",
+        "filename": "kape-triage.ps1",
+        "caption": "يجمع KAPE الآثار عالية القيمة ويحللها بسرعة. استخدمه على أنظمة مصرَّح لك بفحصها.",
+        "code": "# Triage collection from a live Windows system you are authorized to examine.\n.\\kape.exe --tsource C: --tdest E:\\evidence\\FS01\\collected --target !SANS_Triage --vss\n# Parse the collected artifacts into CSV files on the analysis workstation.\n.\\kape.exe --msource E:\\evidence\\FS01\\collected --mdest E:\\evidence\\FS01\\parsed --module !EZParser\n# Expected output folders include: Amcache, AppCompatCache (ShimCache), MFT, Prefetch, EventLogs, RegistryHives\n"
+      },
+      {
+        "id": "process",
+        "type": "text",
+        "markdown": "## عملية قابلة للتكرار\n\nتعرض الحركة التوضيحية الفحص كله على هيئة دورة. وهو دورة لأن نتائج التحليل تعيدك إلى الخلف: فاسم حساب جديد يعني جمع سجلات أكثر، وعنوان IP جديد يعني البحث مجددًا في الأدلة الشبكية.\n\nوفي أجهزة Linux اتبع الترتيب نفسه مع `LiME` أو `AVML` وجداول رموز Volatility الخاصة بـ Linux، كما في درس [الاستجابة للحوادث في Linux](/learn/security-operations-dfir/linux-incident-response)."
+      },
+      {
+        "id": "dfir-cycle",
+        "type": "animation",
+        "kind": "cycle",
+        "title": "دورة الفحص الجنائي",
+        "caption": "اعزل واحفظ أولًا، واقتنِ بحسب التطاير، وحلّل النسخ، واكتب التقرير مع الحدود.",
+        "data": {
+          "center": "الفحص الجنائي",
+          "items": [
+            {
+              "label": "التحديد",
+              "sub": "النطاق والتفويض"
+            },
+            {
+              "label": "الحفظ",
+              "sub": "اعزل ولا تُطفئ"
+            },
+            {
+              "label": "اقتناء الذاكرة",
+              "sub": "الأكثر تطايرًا أولًا"
+            },
+            {
+              "label": "اقتناء القرص",
+              "sub": "البصمة والتحقق"
+            },
+            {
+              "label": "التحليل",
+              "sub": "العمليات والآثار والخط الزمني"
+            },
+            {
+              "label": "التقرير",
+              "sub": "النتائج وحدودها"
+            }
+          ],
+          "steps": [
+            {
+              "item": 0,
+              "caption": "تأكد من التفويض المكتوب والنظام المعني والسؤال الذي يجب أن يجيب عنه الفحص."
+            },
+            {
+              "item": 1,
+              "caption": "اعزل الجهاز عن الشبكة وأبقِه قيد التشغيل. فإطفاؤه يدمّر الذاكرة وقد يفعّل تشفير القرص."
+            },
+            {
+              "item": 2,
+              "caption": "التقط الذاكرة أولًا لأن العمليات والاتصالات والمفاتيح تختفي عند الإيقاف. واحسب بصمة الملف فورًا."
+            },
+            {
+              "item": 3,
+              "caption": "خذ صورة القرص عبر جهاز منع الكتابة أو من لقطة جهاز مطفأ، ثم تحقق من البصمة."
+            },
+            {
+              "item": 4,
+              "caption": "حلّل الذاكرة بحثًا عن شجرة العمليات والاتصالات، ثم القرص بحثًا عن الملفات والسجل وخط زمني. اعمل على النسخ فقط."
+            },
+            {
+              "item": 5,
+              "caption": "اكتب ما وجدته وما لم تستطع تحديده وكيف يمكن إعادة إنتاج كل حقيقة."
+            }
+          ]
+        }
+      },
+      {
+        "id": "timeline",
+        "type": "text",
+        "markdown": "## بناء الخط الزمني وقراءته\n\nيدمج **الخط الزمني الشامل (Super-timeline)** أوقات نظام الملفات وتغييرات السجل وسجلات الأحداث وزيارات المتصفح وغيرها في قائمة واحدة مرتبة. يبنيه Plaso بالأداة `log2timeline.py`، ويرشّحه `psort.py` بحسب التاريخ. ابدأ من نقطة معروفة، كإنشاء العملية عند 08:58، واقرأ عشر دقائق في كل اتجاه.\n\nابحث عن العناقيد: مستند فُتح، وملف تنفيذي جديد كُتب في `Public\\Libraries`، وملف Prefetch أُنشئ، وقيمة سجل ضُبطت، واتصال سُجّل. كل عنقود حدث واحد في القصة. اكتب القصة قائمةً بحقائق مؤرَّخة وعلّم كلًّا منها بأنها *مشاهَدة* أو *مستنتَجة*. والخط الزمني المبني من مصادر مستقلة عدة أقوى بكثير من المبني من أثر واحد.\n\nتغذّي النتائج مباشرةً درس [التحقيق في اختراق الخوادم](/learn/security-operations-dfir/server-compromise-investigation)، وبعد معرفة النطاق تغذّي درس [التعافي من الحوادث وإعادة بناء الأنظمة](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding)."
+      },
+      {
+        "id": "warn-power",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تُطفئ الجهاز احتياطًا",
+        "markdown": "يسحب كثير من المحللين القابس تلقائيًا. وهذا يدمّر العمليات الجارية والاتصالات ومفاتيح فك التشفير، وقد يترك ملف السبات أو ملف الصفحات قديمًا. اعزل الشبكة بدلًا من ذلك، والتقط الذاكرة، ولا تُوقف النظام إلا بقرار مقصود وموثَّق."
+      },
+      {
+        "id": "tip-copy",
+        "type": "callout",
+        "variant": "tip",
+        "title": "اعمل على نسخ وسجّل بصماتك",
+        "markdown": "ركّب صورة العمل للقراءة فقط وأعد حساب بصمة الأصل في نهاية القضية. وحين تتطابق البصمتان تستطيع القول إن تحليلك لم يغيّر الدليل."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم **آلة افتراضية تملكها**.\n\n1. شغّل آلة مخبرية بنظام Windows أو Linux، وافتح بعض البرامج، ثم علّقها (Suspend). يكتب المحاكي الذاكرة في ملف مثل `.vmem`.\n2. انسخ الملف إلى مجلد القضية وسجّل `sha256sum` والوقت.\n3. ثبّت Volatility 3 وشغّل `windows.info` و`windows.pstree` (أو ما يقابلها في Linux) على نسختك.\n4. اختر عملية واحدة وابحث عن أصلها وسطر أوامرها واتصالاتها الشبكية.\n5. اكتب مذكرة من أربعة أسطر: السؤال الذي طرحته، والإضافة التي استخدمتها، وما رأيته، ودرجة ثقتك."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "ترتيب التطاير (Order of volatility)",
+            "definition": "تسلسل جمع الأدلة من الأقصر عمرًا (الذاكرة) إلى الأكثر ثباتًا (النسخ الاحتياطية)."
+          },
+          {
+            "term": "صورة جنائية (Forensic image)",
+            "definition": "نسخة بتًّا ببت من جهاز تخزين تشمل البيانات المحذوفة وغير المخصصة."
+          },
+          {
+            "term": "جهاز منع الكتابة (Write blocker)",
+            "definition": "جهاز أو إعداد يتيح قراءة القرص دون الكتابة عليه أبدًا."
+          },
+          {
+            "term": "Volatility",
+            "definition": "إطار مفتوح المصدر يحلل صور الذاكرة دون اتصال."
+          },
+          {
+            "term": "$MFT",
+            "definition": "جدول الملفات الرئيس في NTFS الذي يسجّل كل ملف وطوابعه الزمنية."
+          },
+          {
+            "term": "Prefetch",
+            "definition": "ملفات Windows التي تسجّل وقت تشغيل البرنامج والملفات التي حمّلها."
+          },
+          {
+            "term": "KAPE",
+            "definition": "أداة فرز تجمع الآثار الجنائية وتحللها بسرعة."
+          },
+          {
+            "term": "Plaso",
+            "definition": "مجموعة أدوات (log2timeline وpsort) تبني خطًا زمنيًا شاملًا من مصادر كثيرة."
+          },
+          {
+            "term": "البصمة (Hash)",
+            "definition": "بصمة ثابتة الطول للبيانات تثبت أنها لم تتغير."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أيّ الأدلة ينبغي عادةً جمعه أولًا من خادم مخترق قيد التشغيل؟",
+            "options": [
+              "صورة القرص",
+              "الذاكرة العشوائية (RAM)",
+              "النسخ الاحتياطية",
+              "أرشيفات السجلات البعيدة"
+            ],
+            "answer": 1,
+            "explanation": "الذاكرة أكثر هذه الأدلة تطايرًا وتضيع عند الإيقاف، فتُجمع أولًا."
+          },
+          {
+            "question": "في شجرة العمليات، أصل svchost.exe هو WINWORD.EXE وهي تعمل من C:\\Users\\Public\\Libraries. ما الذي يوحي به هذا؟",
+            "options": [
+              "خدمة Windows طبيعية",
+              "عملية متنكّرة",
+              "تحديث Windows",
+              "صورة ذاكرة معطوبة"
+            ],
+            "answer": 1,
+            "explanation": "يبدؤها svchost.exe الحقيقي services.exe ويعمل من System32. واختلاف الأصل والمسار يدل على التنكر."
+          },
+          {
+            "question": "أيّ الممارسات التالية تحمي سلامة صورة القرص؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "استخدام جهاز منع الكتابة",
+              "حساب البصمة قبل الاقتناء وبعده",
+              "تحليل القرص الأصلي مباشرة",
+              "التحقق من الصورة ببصمة المصدر"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "جهاز منع الكتابة وتطابق البصمات والتحقق تثبت أمانة الصورة. أما تحليل الأصل فيخاطر بتغييره."
+          },
+          {
+            "question": "لماذا تساعد الطوابع الزمنية في $FILE_NAME على كشف العبث؟",
+            "options": [
+              "لأنها مخزنة في السجل",
+              "لأن تعديلها على المهاجم أصعب من $STANDARD_INFORMATION",
+              "لأنها تطابق وقت الإنشاء دائمًا",
+              "لأنها تُستخدم للملفات المحذوفة فقط"
+            ],
+            "answer": 1,
+            "explanation": "تغيّر الأدوات الشائعة أوقات $STANDARD_INFORMATION، أما $FILE_NAME فتحدّثه النواة، فيكشف عدم التطابق العبث."
+          },
+          {
+            "question": "لماذا يكون إطفاء النظام المشتبه فيه عادةً خطوة أولى سيئة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "يدمّر العمليات والاتصالات الجارية",
+              "قد يفقد مفاتيح التشفير المحفوظة في الذاكرة",
+              "يجعل تصوير القرص مستحيلًا",
+              "يزيل فرصة التقاط الذاكرة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الإيقاف يمحو الأدلة المتطايرة. ويمكن تصوير القرص بعده، لكنه قد يكون مشفّرًا."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- اجمع بحسب **ترتيب التطاير**: اعزل، والتقط الذاكرة، ثم القرص، ثم السجلات.\n- يكشف **Volatility 3** أشجار العمليات وأسطر الأوامر والاتصالات والشيفرة المحقونة؛ واحكم بالأصل والمسار والسلوك لا بالاسم.\n- **الصورة الجنائية** تحتاج جهاز منع كتابة وبصمات قبل الاقتناء وبعده وأصلًا مختومًا.\n- اطرح السؤال أولًا ثم استخدم الأثر الذي يجيب عنه: Prefetch وAmcache و`$MFT` و`$UsnJrnl` وسجلات الأحداث.\n- **خطوط Plaso الزمنية** تجمع المصادر؛ فافصل الحقائق المشاهَدة عن الاستنتاجات واذكر حدودك.\n\nوإذا انتهى الفحص إلى برمجية فدية فتابع بدرس [كشف برمجيات الفدية والاستجابة لها](/learn/security-operations-dfir/ransomware-detection-and-response)."
+      }
+    ]
+  }
+}

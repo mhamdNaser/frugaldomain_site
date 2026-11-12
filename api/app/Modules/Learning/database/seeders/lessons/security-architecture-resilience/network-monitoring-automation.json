@@ -1,0 +1,562 @@
+{
+  "slug": "network-monitoring-automation",
+  "title": "Network Monitoring Automation",
+  "summary": "Automate network visibility with SNMPv3, flow export, syslog and API polling, and turn raw telemetry into alerts and configuration-change detection.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Choose between SNMP, flow export, syslog and model-driven telemetry",
+    "Configure secure device-side monitoring on Cisco IOS XE",
+    "Poll device state through RESTCONF with a short Python script",
+    "Design alert thresholds that avoid noise",
+    "Detect and report configuration changes automatically"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 02:10 a core switch uplink starts flapping. The monitoring system shows green because it polls every five minutes and the link was up at each poll. Users complain at 08:00, and nobody can say when the problem began or whether someone changed a configuration just before it.\n\nNetwork monitoring automation closes that gap. Devices push events as they happen, collectors store them, and scripts compare state against what you expect. For security teams the same data reveals scans, rogue devices and unauthorized configuration changes. This lesson covers the data sources, a secure device configuration, an API polling script and alert design."
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## Choosing the right data source\n\nNo single protocol answers every question. Use each for what it does best.\n\n| Source | Answers | Strength | Weakness |\n|:--|:--|:--|:--|\n| SNMP polling | Is it up? How full is the link? | Universal support | Polling gaps, weak v1/v2c security |\n| SNMP traps and syslog | What just happened? | Event-driven | Unreliable UDP, free-form text |\n| NetFlow or IPFIX | Who talked to whom? | Traffic context for investigations | Samples or summaries, no payload |\n| Streaming telemetry (gNMI, MDT) | What is the state every few seconds? | High resolution, structured | Newer, needs collector support |\n| API polling (RESTCONF, REST) | What is the exact config and state? | Structured data | Load on the device if overused |\n\nA practical design uses SNMP or telemetry for health, syslog for events, flow for security context and an API for configuration. Always use **SNMPv3 with authentication and encryption**; community strings in v2c travel in clear text and are a well-known weakness."
+    },
+    {
+      "id": "ios-config",
+      "type": "code",
+      "language": "cisco",
+      "filename": "R1-monitoring.cfg",
+      "caption": "Secure monitoring on IOS XE. The SNMPv3 user needs both `auth` and `priv`, and the ACL limits polling to the collector. Replace placeholders with vault-managed secrets.",
+      "code": "R1(config)# ip access-list standard SNMP-COLLECTOR\nR1(config-std-nacl)# permit 192.0.2.50\nR1(config-std-nacl)# deny any log\nR1(config-std-nacl)# exit\nR1(config)# snmp-server group MON-RO v3 priv read MON-VIEW access SNMP-COLLECTOR\nR1(config)# snmp-server view MON-VIEW iso included\nR1(config)# snmp-server user monitor MON-RO v3 auth sha <AUTH-SECRET> priv aes 128 <PRIV-SECRET>\nR1(config)# logging host 192.0.2.60 transport tcp port 601\nR1(config)# logging trap informational\nR1(config)# logging source-interface Loopback0\nR1(config)# ntp server 192.0.2.1\nR1(config)# service timestamps log datetime msec\n",
+      "highlight": [
+        5,
+        7,
+        8
+      ]
+    },
+    {
+      "id": "telemetry-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Telemetry pipeline",
+      "data": {
+        "token": "Event",
+        "nodes": [
+          {
+            "id": "dev",
+            "label": "Switch",
+            "sub": "G",
+            "icon": "switch"
+          },
+          {
+            "id": "col",
+            "label": "Collector",
+            "sub": "1",
+            "icon": "log"
+          },
+          {
+            "id": "db",
+            "label": "Time-series store",
+            "sub": "m",
+            "icon": "database"
+          },
+          {
+            "id": "alert",
+            "label": "Alert rule",
+            "sub": "t",
+            "icon": "alert"
+          },
+          {
+            "id": "eng",
+            "label": "On-call engineer",
+            "sub": "t",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "dev",
+            "caption": "The uplink drops and the switch emits a syslog line and an SNMP trap."
+          },
+          {
+            "at": "col",
+            "caption": "The collector receives the message over TCP and parses the interface name.",
+            "tone": "secure"
+          },
+          {
+            "at": "db",
+            "caption": "The event is stored with a timestamp and device tag."
+          },
+          {
+            "at": "alert",
+            "caption": "The rule fires only if the link flaps three times in ten minutes.",
+            "tone": "warning"
+          },
+          {
+            "at": "eng",
+            "caption": "A ticket opens with the interface, the device and a link to the graph.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "api",
+      "type": "text",
+      "markdown": "## Polling state through an API\n\nModern IOS XE exposes **RESTCONF**, which returns YANG-modeled data as JSON. This is better than screen-scraping `show` commands because the field names are stable and the output is already structured.\n\nTwo safeguards apply. Use HTTPS with certificate validation and a read-only account whose privilege level cannot change configuration. And poll sensibly: one query per device every minute is plenty, and you should add jitter so a hundred devices do not answer in the same second. To feed these results into other tools, see [security API integration](/learn/security-architecture-resilience/security-api-integration)."
+    },
+    {
+      "id": "restconf-py",
+      "type": "code",
+      "language": "python",
+      "filename": "poll_interfaces.py",
+      "caption": "Read-only polling. The token comes from the environment, and `verify` points to the internal CA bundle rather than disabling validation.",
+      "code": "import os\nimport requests\n\nDEVICES = [\"sw1.example.net\", \"sw2.example.net\"]\nHEADERS = {\"Accept\": \"application/yang-data+json\"}\nAUTH = (os.environ[\"MON_USER\"], os.environ[\"MON_PASS\"])\nPATH = \"/restconf/data/ietf-interfaces:interfaces-state/interface\"\n\nfor host in DEVICES:\n    r = requests.get(f\"https://{host}{PATH}\", headers=HEADERS, auth=AUTH,\n                     verify=\"/etc/pki/internal-ca.pem\", timeout=10)\n    r.raise_for_status()\n    for i in r.json()[\"ietf-interfaces:interface\"]:\n        if i[\"oper-status\"] != \"up\" and i[\"name\"].startswith(\"GigabitEthernet\"):\n            print(f\"{host} {i['name']} oper-status={i['oper-status']}\")\n",
+      "highlight": [
+        6,
+        11,
+        15
+      ]
+    },
+    {
+      "id": "poll-run",
+      "type": "terminal",
+      "title": "Polling run",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "python poll_interfaces.py",
+          "output": "sw1.example.net GigabitEthernet1/0/24 oper-status=down\nsw2.example.net GigabitEthernet1/0/3 oper-status=lower-layer-down",
+          "comment": "Two interfaces need attention. Compare them with the expected-state list before alerting."
+        }
+      ],
+      "caption": "Example output. A port that is meant to be down should be in an exception list, not paged on."
+    },
+    {
+      "id": "inventory",
+      "type": "text",
+      "markdown": "## Start from an inventory you trust\n\nMonitoring only covers devices it knows about. Keep an inventory (a CMDB, NetBox or even a reviewed YAML file) as the source of truth: hostname, management address, role, owner and expected state. Generate your collector targets and ACL entries from it, so adding a device in one place configures monitoring everywhere.\n\nThen turn the inventory into a check. Compare it with what the network actually shows: ARP and MAC tables, DHCP leases and flow records. A device that talks but is not in the inventory is a **rogue or shadow device**. A device in the inventory that has not been seen for a week is either decommissioned or broken. Both lists deserve a ticket each week.\n\nFinally, give every monitored device a named owner. An alert without an owner is just a notification, and nobody is accountable for fixing the cause."
+    },
+    {
+      "id": "alerts",
+      "type": "text",
+      "markdown": "## Designing alerts people trust\n\nAn alert that fires every day trains the team to ignore it. Good alert design follows a few rules.\n\n- **Alert on symptoms and impact**, such as packet loss on the internet edge, not on every high CPU reading.\n- **Add duration.** \"CPU above 90 percent for 10 minutes\" is useful; a single spike is not.\n- **Use baselines for traffic.** A fixed threshold at 80 percent fails on links that normally run at 85. Compare against the same hour last week.\n- **Route by severity.** Page for outages, ticket for trends, dashboard for context.\n- **Attach context**: device, interface, owner, runbook link.\n\nFor security, add rules for new MAC addresses on server VLANs, a device that stops sending logs, and unusual outbound flow volume. A silent log source is often more alarming than a noisy one, so alert on missing data too."
+    },
+    {
+      "id": "changes",
+      "type": "text",
+      "markdown": "## Detecting configuration changes\n\nThe fastest way to find the cause of an outage, or an intrusion, is to know what changed. Two complementary methods work well.\n\n1. **Event-driven.** Configure the device to log configuration commands (`archive` with `log config`) and send them to syslog. Each change then shows who, when and which command.\n2. **Scheduled.** Back up `running-config` nightly to version control and diff it against yesterday. Store the files in Git so history, authorship and review come free.\n\nCompare the two sources. A change that appears in the nightly diff but has no matching ticket and no logged command is a serious finding: someone bypassed your process. The same principle supports [detection as code](/learn/security-architecture-resilience/detection-as-code), where detections are written, reviewed and versioned like software."
+    },
+    {
+      "id": "capacity",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Watch the monitoring system itself",
+      "markdown": "Monitoring is infrastructure and it fails too. Track the collector's queue depth, disk usage and the age of the newest event from each source. Send a heartbeat event every minute from a test device and alert when it stops arriving. Keep the collector and its credentials on a management network that ordinary users cannot reach, because an attacker who controls it can silence your alerts or read every device secret it stores."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common mistakes",
+      "markdown": "- **SNMP v2c with a default community** such as `public`. Anyone on the path can read it.\n- **Unrestricted SNMP.** Always bind it to an ACL listing only the collector.\n- **Only polling.** Short events fall between polls. Pair polling with traps, syslog or telemetry.\n- **Clock drift.** Without NTP, logs from different devices cannot be correlated.\n- **No alert on missing data.** A dead collector looks the same as a quiet network."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a Cisco Modeling Labs, Packet Tracer or other lab device that you own, plus a Linux VM as collector.\n\n1. Apply the SNMPv3 and logging configuration with your own lab secrets.\n2. On the VM, run `snmpwalk -v3 -l authPriv -u monitor <device>` and confirm it works only from the collector address.\n3. Shut and re-enable an interface three times, then find the messages on the collector.\n4. Run the polling script against the lab device and note the down interface.\n5. Save `show running-config` before and after a small change, and read the `diff`."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "SNMPv3",
+          "definition": "SNMP version with user-based authentication and encryption."
+        },
+        {
+          "term": "NetFlow / IPFIX",
+          "definition": "Records of conversations between hosts, without payload."
+        },
+        {
+          "term": "Syslog",
+          "definition": "Standard protocol for sending log messages to a collector."
+        },
+        {
+          "term": "Streaming telemetry",
+          "definition": "Device-pushed, structured state data at short intervals."
+        },
+        {
+          "term": "RESTCONF",
+          "definition": "HTTP interface to YANG-modeled device configuration and state."
+        },
+        {
+          "term": "Baseline",
+          "definition": "The normal range of a metric, used to detect anomalies."
+        },
+        {
+          "term": "Config drift",
+          "definition": "A difference between running configuration and the approved one."
+        },
+        {
+          "term": "Alert fatigue",
+          "definition": "Ignoring alerts because too many are noisy or low value."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why is SNMPv3 preferred over v2c?",
+          "options": [
+            "It is faster",
+            "It supports authentication and encryption per user",
+            "It needs no ACL",
+            "It works without a collector"
+          ],
+          "answer": 1,
+          "explanation": "v2c sends community strings in clear text. v3 adds user authentication and optional encryption."
+        },
+        {
+          "question": "Which data source best shows who communicated with whom during an investigation?",
+          "options": [
+            "Interface counters",
+            "NetFlow or IPFIX",
+            "CPU graphs",
+            "NTP offset"
+          ],
+          "answer": 1,
+          "explanation": "Flow records summarize conversations (addresses, ports, volume) and are the standard security context source."
+        },
+        {
+          "question": "Which practices reduce alert noise? (Choose all that apply.)",
+          "options": [
+            "Requiring a duration before firing",
+            "Comparing with a traffic baseline",
+            "Alerting on every single spike",
+            "Routing by severity"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Duration, baselines and severity routing keep alerts meaningful. Alerting on every spike creates fatigue."
+        },
+        {
+          "question": "A config change appears in the nightly diff but not in the change tickets or syslog. What does this suggest?",
+          "options": [
+            "A normal automatic update",
+            "Someone bypassed the change process",
+            "The diff tool is broken",
+            "NTP failed"
+          ],
+          "answer": 1,
+          "explanation": "An unexplained change is a finding: investigate who made it and through which path."
+        },
+        {
+          "question": "Why alert on missing data from a log source?",
+          "options": [
+            "Silence can mean a failed collector or an attacker disabling logging",
+            "Missing data saves storage",
+            "It speeds up polling",
+            "It replaces baselines"
+          ],
+          "answer": 0,
+          "explanation": "A quiet source is not necessarily a healthy one. Detect the absence of expected events."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nEffective network monitoring combines several data sources: SNMPv3 or telemetry for health, syslog for events, flows for security context and APIs for exact state. Secure the device side with ACLs and strong credentials, poll gently with read-only accounts, and design alerts around duration, baselines and impact. Detect configuration change with both logged commands and nightly diffs. Next, see [log parsing and security analytics](/learn/security-architecture-resilience/log-parsing-and-security-analytics) to turn the collected data into answers."
+    }
+  ],
+  "ar": {
+    "title": "أتمتة مراقبة الشبكات",
+    "summary": "أتمتة رؤية الشبكة باستخدام SNMPv3 وتصدير التدفقات وsyslog واستعلام واجهات API، وتحويل القياسات الخام إلى تنبيهات وكشف لتغيّر الإعدادات.",
+    "objectives": [
+      "الاختيار بين SNMP وتصدير التدفقات وsyslog والقياس عن بُعد المبني على النماذج",
+      "ضبط المراقبة الآمنة على جهة الجهاز في Cisco IOS XE",
+      "استعلام حالة الجهاز عبر RESTCONF بسكربت Python قصير",
+      "تصميم عتبات تنبيه تتجنب الضجيج",
+      "كشف تغيّر الإعدادات والإبلاغ عنه تلقائيًا"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "عند الساعة 02:10 يبدأ رابط صاعد في سويتش النواة بالتذبذب. يُظهر نظام المراقبة اللون الأخضر لأنه يستعلم كل خمس دقائق وكان الرابط يعمل عند كل استعلام. يشتكي المستخدمون عند 08:00، ولا أحد يعرف متى بدأت المشكلة أو هل غيّر أحدهم الإعدادات قبلها مباشرة.\n\nتسدّ أتمتة مراقبة الشبكات هذه الفجوة. تدفع الأجهزة الأحداث لحظة وقوعها، وتخزّنها المجمِّعات، وتقارن السكربتات الحالة بما تتوقعه. وبالنسبة لفرق الأمن تكشف البيانات نفسها عمليات المسح والأجهزة المارقة وتغييرات الإعدادات غير المصرّح بها. يغطي هذا الدرس مصادر البيانات، وإعدادًا آمنًا للجهاز، وسكربت استعلام عبر API، وتصميم التنبيهات."
+      },
+      {
+        "id": "sources",
+        "type": "text",
+        "markdown": "## اختيار مصدر البيانات المناسب\n\nلا يجيب بروتوكول واحد عن كل الأسئلة. استخدم كلًّا منها فيما يتفوق فيه.\n\n| المصدر | يجيب عن | نقطة القوة | نقطة الضعف |\n|:--|:--|:--|:--|\n| استعلام SNMP | هل يعمل؟ ما امتلاء الرابط؟ | دعم شامل | فجوات الاستعلام وضعف أمن v1/v2c |\n| مصائد SNMP وsyslog | ماذا حدث للتو؟ | مدفوع بالأحداث | UDP غير موثوق ونص حر |\n| NetFlow أو IPFIX | من كلّم من؟ | سياق حركة المرور للتحقيقات | عينات أو ملخصات دون المحتوى |\n| القياس المتدفق (gNMI وMDT) | ما الحالة كل بضع ثوانٍ؟ | دقة عالية وبنية منظّمة | أحدث ويتطلب دعمًا من المجمِّع |\n| استعلام API (RESTCONF وREST) | ما الإعداد والحالة بدقة؟ | بيانات منظّمة | حمل على الجهاز عند الإفراط |\n\nيستخدم التصميم العملي SNMP أو القياس المتدفق للصحة، وsyslog للأحداث، والتدفقات للسياق الأمني، وAPI للإعدادات. استخدم دائمًا **SNMPv3 مع المصادقة والتشفير**؛ فسلاسل المجتمع (community strings) في v2c تسير بنص صريح وهي ضعف معروف."
+      },
+      {
+        "id": "ios-config",
+        "type": "code",
+        "language": "cisco",
+        "filename": "R1-monitoring.cfg",
+        "caption": "مراقبة آمنة على IOS XE. يحتاج مستخدم SNMPv3 إلى `auth` و`priv` معًا، ويقصر الـ ACL الاستعلام على المجمِّع. استبدل العناصر النائبة بأسرار تديرها خزنة.",
+        "code": "R1(config)# ip access-list standard SNMP-COLLECTOR\nR1(config-std-nacl)# permit 192.0.2.50\nR1(config-std-nacl)# deny any log\nR1(config-std-nacl)# exit\nR1(config)# snmp-server group MON-RO v3 priv read MON-VIEW access SNMP-COLLECTOR\nR1(config)# snmp-server view MON-VIEW iso included\nR1(config)# snmp-server user monitor MON-RO v3 auth sha <AUTH-SECRET> priv aes 128 <PRIV-SECRET>\nR1(config)# logging host 192.0.2.60 transport tcp port 601\nR1(config)# logging trap informational\nR1(config)# logging source-interface Loopback0\nR1(config)# ntp server 192.0.2.1\nR1(config)# service timestamps log datetime msec\n",
+        "highlight": [
+          5,
+          7,
+          8
+        ]
+      },
+      {
+        "id": "telemetry-flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "مسار القياسات",
+        "data": {
+          "token": "حدث",
+          "nodes": [
+            {
+              "id": "dev",
+              "label": "السويتش",
+              "sub": "i",
+              "icon": "switch"
+            },
+            {
+              "id": "col",
+              "label": "المجمِّع",
+              "sub": "9",
+              "icon": "log"
+            },
+            {
+              "id": "db",
+              "label": "مخزن السلاسل الزمنية",
+              "sub": "e",
+              "icon": "database"
+            },
+            {
+              "id": "alert",
+              "label": "قاعدة التنبيه",
+              "sub": "h",
+              "icon": "alert"
+            },
+            {
+              "id": "eng",
+              "label": "المهندس المناوب",
+              "sub": "i",
+              "icon": "user"
+            }
+          ],
+          "steps": [
+            {
+              "at": "dev",
+              "caption": "ينقطع الرابط الصاعد فيُصدر السويتش سطر syslog ومصيدة SNMP."
+            },
+            {
+              "at": "col",
+              "caption": "يستقبل المجمِّع الرسالة عبر TCP ويحلّل اسم الواجهة.",
+              "tone": "secure"
+            },
+            {
+              "at": "db",
+              "caption": "يُخزَّن الحدث مع طابع زمني ووسم الجهاز."
+            },
+            {
+              "at": "alert",
+              "caption": "تُطلَق القاعدة فقط إذا تذبذب الرابط ثلاث مرات خلال عشر دقائق.",
+              "tone": "warning"
+            },
+            {
+              "at": "eng",
+              "caption": "تُفتح تذكرة فيها الواجهة والجهاز ورابط للرسم البياني.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "api",
+        "type": "text",
+        "markdown": "## استعلام الحالة عبر API\n\nتوفّر إصدارات IOS XE الحديثة **RESTCONF** الذي يُعيد بيانات مبنية على نماذج YANG بصيغة JSON. وهذا أفضل من تحليل مخرجات أوامر `show` لأن أسماء الحقول ثابتة والمخرجات منظّمة أصلًا.\n\nوتنطبق ضمانتان. استخدم HTTPS مع التحقق من الشهادة وحساب قراءة فقط لا يستطيع مستوى امتيازه تغيير الإعدادات. واستعلم بعقلانية: استعلام واحد لكل جهاز كل دقيقة يكفي، وأضف تأخيرًا عشوائيًا كي لا تجيب مئة جهاز في الثانية نفسها. ولتغذية أدوات أخرى بهذه النتائج انظر [تكامل واجهات API الأمنية](/learn/security-architecture-resilience/security-api-integration)."
+      },
+      {
+        "id": "restconf-py",
+        "type": "code",
+        "language": "python",
+        "filename": "poll_interfaces.py",
+        "caption": "استعلام للقراءة فقط. يأتي الرمز من متغيرات البيئة، ويشير `verify` إلى حزمة شهادات المرجع الداخلي بدل تعطيل التحقق.",
+        "code": "import os\nimport requests\n\nDEVICES = [\"sw1.example.net\", \"sw2.example.net\"]\nHEADERS = {\"Accept\": \"application/yang-data+json\"}\nAUTH = (os.environ[\"MON_USER\"], os.environ[\"MON_PASS\"])\nPATH = \"/restconf/data/ietf-interfaces:interfaces-state/interface\"\n\nfor host in DEVICES:\n    r = requests.get(f\"https://{host}{PATH}\", headers=HEADERS, auth=AUTH,\n                     verify=\"/etc/pki/internal-ca.pem\", timeout=10)\n    r.raise_for_status()\n    for i in r.json()[\"ietf-interfaces:interface\"]:\n        if i[\"oper-status\"] != \"up\" and i[\"name\"].startswith(\"GigabitEthernet\"):\n            print(f\"{host} {i['name']} oper-status={i['oper-status']}\")\n",
+        "highlight": [
+          6,
+          11,
+          15
+        ]
+      },
+      {
+        "id": "poll-run",
+        "type": "terminal",
+        "title": "تشغيل الاستعلام",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "python poll_interfaces.py",
+            "output": "sw1.example.net GigabitEthernet1/0/24 oper-status=down\nsw2.example.net GigabitEthernet1/0/3 oper-status=lower-layer-down",
+            "comment": "واجهتان تحتاجان إلى انتباه. قارنهما بقائمة الحالة المتوقعة قبل التنبيه."
+          }
+        ],
+        "caption": "مخرجات توضيحية. المنفذ الذي يُفترض أن يكون معطّلًا يوضع في قائمة استثناءات ولا يُنبَّه عنه."
+      },
+      {
+        "id": "inventory",
+        "type": "text",
+        "markdown": "## ابدأ من جرد تثق به\n\nلا تغطي المراقبة إلا الأجهزة التي تعرفها. احتفظ بجرد (CMDB أو NetBox أو حتى ملف YAML مراجَع) بوصفه مصدر الحقيقة: اسم المضيف وعنوان الإدارة والدور والمالك والحالة المتوقعة. ولّد أهداف المجمِّع وبنود الـ ACL منه، فتؤدي إضافة جهاز في مكان واحد إلى ضبط المراقبة في كل مكان.\n\nثم حوّل الجرد إلى فحص. قارنه بما تُظهره الشبكة فعلًا: جداول ARP وMAC وعقود DHCP وسجلات التدفق. الجهاز الذي يتحدث وليس في الجرد هو **جهاز مارق أو خفي (Shadow device)**. والجهاز الموجود في الجرد ولم يُرَ منذ أسبوع إما أُخرج من الخدمة أو معطّل. تستحق القائمتان تذكرة لكل منهما أسبوعيًا.\n\nوأخيرًا، عيّن لكل جهاز مراقَب مالكًا مسمًّى. التنبيه بلا مالك مجرد إشعار، ولا أحد مسؤول عن إصلاح السبب."
+      },
+      {
+        "id": "alerts",
+        "type": "text",
+        "markdown": "## تصميم تنبيهات يثق بها الناس\n\nالتنبيه الذي يُطلَق كل يوم يدرّب الفريق على تجاهله. ويتبع التصميم الجيد للتنبيهات بضع قواعد.\n\n- **نبّه على الأعراض والأثر**، مثل فقد الحزم على حافة الإنترنت، لا على كل قراءة مرتفعة للمعالج.\n- **أضف المدة.** «المعالج فوق 90 بالمئة لمدة عشر دقائق» مفيد، أما ارتفاع لحظي واحد فلا.\n- **استخدم خطوط الأساس لحركة المرور.** تفشل العتبة الثابتة عند 80 بالمئة على روابط تعمل عادة عند 85. قارن بالساعة نفسها من الأسبوع الماضي.\n- **وجّه حسب الخطورة.** نداء للانقطاعات، وتذكرة للاتجاهات، ولوحة معلومات للسياق.\n- **أرفق السياق**: الجهاز والواجهة والمالك ورابط دليل التشغيل.\n\nوللأمن، أضف قواعد لعناوين MAC الجديدة في شبكات الخوادم، وللجهاز الذي يتوقف عن إرسال السجلات، ولحجم تدفقات صادرة غير معتاد. المصدر الصامت للسجلات كثيرًا ما يكون أخطر من المصدر الصاخب، فنبّه على غياب البيانات أيضًا."
+      },
+      {
+        "id": "changes",
+        "type": "text",
+        "markdown": "## كشف تغيّرات الإعدادات\n\nأسرع طريقة لمعرفة سبب انقطاع، أو اختراق، هي معرفة ما الذي تغيّر. وتعمل طريقتان متكاملتان جيدًا.\n\n1. **المدفوعة بالأحداث.** اضبط الجهاز لتسجيل أوامر الإعداد (`archive` مع `log config`) وإرسالها إلى syslog. فيُظهر كل تغيير من فعله ومتى وأي أمر.\n2. **المجدولة.** انسخ `running-config` ليلًا إلى نظام إدارة الإصدارات وقارنه بإعداد الأمس. احفظ الملفات في Git فيأتيك التاريخ ونسبة التغيير والمراجعة مجانًا.\n\nقارن المصدرين. التغيير الذي يظهر في المقارنة الليلية دون تذكرة مطابقة ودون أمر مسجَّل يُعدّ نتيجة خطيرة: لقد تجاوز أحدهم عمليتك. والمبدأ نفسه يدعم [الكشف بوصفه شيفرة](/learn/security-architecture-resilience/detection-as-code) حيث تُكتب الكشوفات وتُراجَع وتُدار إصداراتها كالبرمجيات."
+      },
+      {
+        "id": "capacity",
+        "type": "callout",
+        "variant": "tip",
+        "title": "راقب نظام المراقبة نفسه",
+        "markdown": "المراقبة بنية تحتية وهي تفشل أيضًا. تتبّع عمق طابور المجمِّع واستخدام القرص وعمر أحدث حدث من كل مصدر. أرسل حدث نبض كل دقيقة من جهاز اختبار ونبّه عندما يتوقف وصوله. وأبقِ المجمِّع وبيانات اعتماده على شبكة إدارة لا يصل إليها المستخدمون العاديون، لأن المهاجم الذي يتحكم به يستطيع إسكات تنبيهاتك أو قراءة كل سر جهاز يخزّنه."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة",
+        "markdown": "- **استخدام SNMP v2c بسلسلة مجتمع افتراضية** مثل `public`. يستطيع أي طرف على المسار قراءتها.\n- **SNMP غير مقيَّد.** اربطه دائمًا بـ ACL لا يسرد إلا المجمِّع.\n- **الاستعلام وحده.** الأحداث القصيرة تقع بين الاستعلامات. اقرن الاستعلام بالمصائد أو syslog أو القياس المتدفق.\n- **انحراف الساعة.** دون NTP يتعذّر ربط سجلات الأجهزة المختلفة.\n- **عدم التنبيه على غياب البيانات.** المجمِّع الميت يشبه شبكة هادئة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم جهاز مختبر تملكه مثل Cisco Modeling Labs أو Packet Tracer، مع جهاز Linux افتراضي بوصفه مجمِّعًا.\n\n1. طبّق إعدادات SNMPv3 والتسجيل بأسرار مختبرك الخاصة.\n2. على الجهاز الافتراضي شغّل `snmpwalk -v3 -l authPriv -u monitor <device>` وتأكد أنه يعمل من عنوان المجمِّع فقط.\n3. عطّل واجهة وأعد تفعيلها ثلاث مرات، ثم ابحث عن الرسائل على المجمِّع.\n4. شغّل سكربت الاستعلام على جهاز المختبر ولاحظ الواجهة المعطّلة.\n5. احفظ `show running-config` قبل تغيير صغير وبعده، واقرأ نتيجة `diff`."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "SNMPv3",
+            "definition": "إصدار من SNMP يوفّر مصادقة وتشفيرًا قائمين على المستخدم."
+          },
+          {
+            "term": "NetFlow / IPFIX",
+            "definition": "سجلات للمحادثات بين المضيفات دون المحتوى."
+          },
+          {
+            "term": "Syslog",
+            "definition": "بروتوكول معياري لإرسال رسائل السجلات إلى مجمِّع."
+          },
+          {
+            "term": "القياس المتدفق",
+            "definition": "بيانات حالة منظّمة تدفعها الأجهزة على فترات قصيرة."
+          },
+          {
+            "term": "RESTCONF",
+            "definition": "واجهة HTTP لإعدادات الجهاز وحالته المبنية على نماذج YANG."
+          },
+          {
+            "term": "خط الأساس",
+            "definition": "المدى الطبيعي لمقياس ما، يُستخدم لكشف الشذوذ."
+          },
+          {
+            "term": "انحراف الإعدادات",
+            "definition": "فرق بين الإعداد العامل والإعداد المعتمد."
+          },
+          {
+            "term": "إرهاق التنبيهات",
+            "definition": "تجاهل التنبيهات لكثرة الضجيج أو قلة القيمة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا يُفضَّل SNMPv3 على v2c؟",
+            "options": [
+              "أسرع",
+              "يدعم المصادقة والتشفير لكل مستخدم",
+              "لا يحتاج إلى ACL",
+              "يعمل دون مجمِّع"
+            ],
+            "answer": 1,
+            "explanation": "يرسل v2c سلاسل المجتمع بنص صريح، بينما يضيف v3 مصادقة المستخدم وتشفيرًا اختياريًا."
+          },
+          {
+            "question": "أي مصدر بيانات يُظهر بأفضل صورة من تواصل مع من أثناء التحقيق؟",
+            "options": [
+              "عدّادات الواجهات",
+              "NetFlow أو IPFIX",
+              "رسوم المعالج البيانية",
+              "انحراف NTP"
+            ],
+            "answer": 1,
+            "explanation": "تلخّص سجلات التدفق المحادثات (العناوين والمنافذ والحجم) وهي مصدر السياق الأمني المعتاد."
+          },
+          {
+            "question": "أي الممارسات تقلّل ضجيج التنبيهات؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "اشتراط مدة قبل الإطلاق",
+              "المقارنة بخط أساس لحركة المرور",
+              "التنبيه على كل ارتفاع لحظي",
+              "التوجيه حسب الخطورة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تُبقي المدة وخطوط الأساس والتوجيه حسب الخطورة التنبيهات ذات معنى، أما التنبيه على كل ارتفاع فيصنع الإرهاق."
+          },
+          {
+            "question": "يظهر تغيير إعدادات في المقارنة الليلية دون تذكرة تغيير أو سجل syslog. ماذا يوحي ذلك؟",
+            "options": [
+              "تحديث تلقائي عادي",
+              "شخص تجاوز عملية التغيير",
+              "أداة المقارنة معطلة",
+              "فشل NTP"
+            ],
+            "answer": 1,
+            "explanation": "التغيير غير المبرَّر نتيجة تستحق التحقيق: من أجراه وعبر أي مسار."
+          },
+          {
+            "question": "لماذا ننبّه على غياب البيانات من مصدر سجلات؟",
+            "options": [
+              "الصمت قد يعني فشل المجمِّع أو تعطيل مهاجم للتسجيل",
+              "غياب البيانات يوفّر التخزين",
+              "يسرّع الاستعلام",
+              "يحل محل خطوط الأساس"
+            ],
+            "answer": 0,
+            "explanation": "المصدر الهادئ ليس بالضرورة سليمًا. اكشف غياب الأحداث المتوقعة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتجمع المراقبة الفعّالة للشبكات بين عدة مصادر: SNMPv3 أو القياس المتدفق للصحة، وsyslog للأحداث، والتدفقات للسياق الأمني، وواجهات API للحالة الدقيقة. أمّن جهة الجهاز بقوائم ACL وبيانات اعتماد قوية، واستعلم برفق بحسابات للقراءة فقط، وصمّم التنبيهات حول المدة وخطوط الأساس والأثر. واكشف تغيّر الإعدادات بالأوامر المسجَّلة وبالمقارنة الليلية معًا. انتقل بعد ذلك إلى [تحليل السجلات والتحليلات الأمنية](/learn/security-architecture-resilience/log-parsing-and-security-analytics) لتحويل البيانات المجمّعة إلى إجابات."
+      }
+    ]
+  }
+}

@@ -1,0 +1,624 @@
+{
+  "slug": "windows-incident-response",
+  "title": "Windows Incident Response",
+  "summary": "Triage a suspect Windows host: use event logs, process and persistence checks, execution artifacts such as Prefetch and Amcache, and collection tools like KAPE and Velociraptor to scope an intrusion.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Collect volatile and persistent Windows evidence in a safe order",
+    "Use key Security, System and PowerShell event IDs to reconstruct activity",
+    "Check processes, services, scheduled tasks and Run keys for persistence",
+    "Explain what Prefetch, Amcache and Shimcache prove about execution",
+    "Use KAPE and Velociraptor to collect artifacts at scale"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A user reports a slow laptop and a strange pop-up. EDR shows `powershell.exe` launched by a Word document on Tuesday, then nothing else. Was it blocked, or did it succeed quietly? On Windows, the answer is spread across event logs, the registry, the file system and memory.\n\nWindows is generous with evidence: nearly every action leaves a trace somewhere. The skill is knowing where to look first and how to collect without altering what you find. This lesson gives a defender's workflow for hosts you are authorized to examine, and it connects to [Suspicious Process and Service Analysis](/learn/security-operations-dfir/suspicious-process-and-service-analysis) and [Disk and Memory Forensics](/learn/security-operations-dfir/disk-and-memory-forensics)."
+    },
+    {
+      "id": "events",
+      "type": "text",
+      "markdown": "## Start with the event logs\n\nEvent logs are the fastest source and are usually forwarded to your SIEM, so an attacker who clears them locally leaves a gap you can see. Learn a short list of event IDs.\n\n| Log | Event ID | Meaning |\n|:--|:--|:--|\n| Security | 4624 / 4625 | Successful / failed logon (note the logon type) |\n| Security | 4688 | Process created (with command line if enabled) |\n| Security | 4720 / 4732 | Account created / added to a group |\n| Security | 1102 | Audit log cleared |\n| System | 7045 | New service installed |\n| Security | 4698 | Scheduled task created |\n| PowerShell | 4104 | Script block logged |\n| Sysmon | 1 / 3 / 11 | Process, network connection, file created |\n\nLogon types matter: type 2 is interactive, type 3 is network, type 10 is Remote Desktop. A burst of type 3 logons from one workstation to many servers is covered in [Lateral Movement Detection](/learn/security-operations-dfir/lateral-movement-detection)."
+    },
+    {
+      "id": "win-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "A Word document starts PowerShell",
+      "caption": "Parent and child process relationships are one of the strongest signals in Windows response.",
+      "data": {
+        "actors": [
+          {
+            "id": "user",
+            "icon": "user",
+            "label": "User",
+            "sub": "jsmith"
+          },
+          {
+            "id": "word",
+            "icon": "file",
+            "label": "WINWORD",
+            "sub": "Office"
+          },
+          {
+            "id": "ps",
+            "icon": "cpu",
+            "label": "PowerShell",
+            "sub": "Child process"
+          },
+          {
+            "id": "sys",
+            "icon": "log",
+            "label": "Event logs",
+            "sub": "4688, 4104"
+          },
+          {
+            "id": "net",
+            "icon": "globe",
+            "label": "Remote host",
+            "sub": "203.0.113.80"
+          }
+        ],
+        "steps": [
+          {
+            "from": "user",
+            "to": "word",
+            "label": "Open invoice.docm",
+            "detail": "Macros enabled",
+            "note": "The user opens an attachment and enables macros.",
+            "tone": "warning"
+          },
+          {
+            "from": "word",
+            "to": "ps",
+            "label": "Spawn child",
+            "detail": "powershell.exe -enc ...",
+            "note": "Word starts PowerShell with an encoded command, which is rare for normal documents.",
+            "tone": "danger"
+          },
+          {
+            "from": "ps",
+            "to": "sys",
+            "label": "Event 4688",
+            "detail": "ParentImage=WINWORD.EXE",
+            "note": "Process creation records the unusual parent and the command line."
+          },
+          {
+            "from": "ps",
+            "to": "sys",
+            "label": "Event 4104",
+            "detail": "Script block",
+            "note": "Script block logging stores the decoded script text.",
+            "tone": "secure"
+          },
+          {
+            "from": "ps",
+            "to": "net",
+            "label": "HTTPS request",
+            "detail": "Sysmon 3",
+            "note": "PowerShell connects out to a rarely seen address.",
+            "tone": "danger"
+          },
+          {
+            "from": "sys",
+            "to": "user",
+            "label": "Analyst pivots",
+            "detail": "EDR + SIEM",
+            "note": "The analyst uses the parent, command line and address to scope other hosts.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "live",
+      "type": "text",
+      "markdown": "## Check processes, services and persistence\n\nOn the live host, look for processes whose parent makes no sense (`winword.exe` to `powershell.exe`, `svchost.exe` started by anything but `services.exe`), running from user-writable paths such as `%TEMP%` and `%APPDATA%`, or having names that mimic system files.\n\nThen check the usual persistence points: the `Run` and `RunOnce` registry keys, scheduled tasks, new services, the Startup folder and WMI event subscriptions. Compare what you find with a known-good baseline when you have one. Collect the evidence read-only and save output to external media with a hash. The commands below are PowerShell, run as administrator on an authorized host."
+    },
+    {
+      "id": "ps-term",
+      "type": "terminal",
+      "title": "Live checks in PowerShell",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId,Name,CommandLine | Where-Object Name -eq 'powershell.exe' | Format-List",
+          "output": "ProcessId       : 7312\nParentProcessId : 5540\nName            : powershell.exe\nCommandLine     : powershell.exe -nop -w hidden -enc <BASE64-PLACEHOLDER>",
+          "comment": "Hidden window and an encoded command: decode it in a sandbox, never run it."
+        },
+        {
+          "cmd": "Get-CimInstance Win32_Process -Filter 'ProcessId=5540' | Select Name,ExecutablePath",
+          "output": "Name        ExecutablePath\n----        --------------\nWINWORD.EXE C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+          "comment": "The parent is Word, confirming the document origin."
+        },
+        {
+          "cmd": "Get-ScheduledTask | Where-Object {$_.Date -gt (Get-Date).AddDays(-7)} | Select TaskName,TaskPath,Date",
+          "output": "TaskName         TaskPath  Date\n--------         --------  ----\nOneDriveSyncChk  \\         11/10/2026 14:22:05",
+          "comment": "A new task with a name that imitates a real product."
+        },
+        {
+          "cmd": "Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'",
+          "output": "OneDriveSyncChk : C:\\Users\\jsmith\\AppData\\Roaming\\onesync\\chk.exe",
+          "comment": "Run key pointing to a user-writable path."
+        }
+      ],
+      "caption": "Illustrative output. The encoded payload is shown only as a placeholder."
+    },
+    {
+      "id": "accounts",
+      "type": "text",
+      "markdown": "## Review accounts, sessions and network state\n\nAttackers need identities. Review local administrators with `net localgroup administrators`, recently created accounts (event 4720) and additions to privileged groups (4732). Check active sessions with `query user` and `net session`, and list remote desktop history in the `Terminal Server Client` registry key for each user.\n\nThen look at the network. `Get-NetTCPConnection -State Established` joined with the owning process shows who is talking out. An unsigned binary in `AppData` holding a connection to a rarely seen address deserves immediate attention. If the host is a server, also check shares with `net share` and recent SMB access, because stolen data often leaves from file shares first.\n\nFinally, test whether security tooling was tampered with. Look for stopped antivirus services, new exclusion paths in the Defender configuration, and audit policy changes. Disabling defenses is itself an indicator and usually happens early."
+    },
+    {
+      "id": "logging",
+      "type": "callout",
+      "variant": "note",
+      "title": "Logging you wish you had enabled",
+      "markdown": "Command-line auditing for event 4688, PowerShell script block logging and Sysmon are not enabled by default. Enable them across your fleet before an incident, because nothing can be recovered later for events that were never recorded. Also size the Security log generously, since a busy server can overwrite a week of history in a few hours. Forward the logs to a central collector in real time, so that an attacker who clears the local copy cannot erase the record, and test regularly that the forwarding still works after updates and policy changes."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Time zones and clocks",
+      "markdown": "Windows event logs store times in UTC but Event Viewer shows local time. Prefetch and many registry values use UTC too. Convert everything to UTC before you build a timeline, and compare the host clock with a trusted source so you can correct for drift."
+    },
+    {
+      "id": "artifacts",
+      "type": "text",
+      "markdown": "## Prove execution with artifacts\n\nEven if the attacker deletes a program, Windows remembers that it ran. Know what each artifact proves, because they are not equal.\n\n| Artifact | Location | What it tells you |\n|:--|:--|:--|\n| **Prefetch** | `C:\\Windows\\Prefetch\\*.pf` | Program ran; run count and last 8 run times |\n| **Amcache** | `Amcache.hve` | Program existed or ran; SHA-1 of the file |\n| **Shimcache** | `SYSTEM` hive | Program was present; does not always prove execution |\n| **UserAssist** | `NTUSER.DAT` | GUI programs launched by a user |\n| **Jump lists, LNK** | User profile | Files a user opened |\n\nPrefetch is disabled on some server builds and SSDs may vary, so its absence proves little. Combine at least two artifacts before you claim a program ran. Timeline tooling from [Disk and Memory Forensics](/learn/security-operations-dfir/disk-and-memory-forensics) merges these into one view."
+    },
+    {
+      "id": "collect",
+      "type": "text",
+      "markdown": "## Collect at scale with KAPE and Velociraptor\n\nTyping commands by hand does not scale past one host. Two tools solve this for defenders.\n\n**KAPE** (Kroll Artifact Parser and Extractor) copies forensic artifacts quickly using *targets*, then runs parsers using *modules*. It is ideal for a single host you can reach.\n\n**Velociraptor** runs agents across your estate. You write an artifact in VQL (Velociraptor Query Language) and collect it from hundreds of hosts, or hunt for an indicator everywhere. Both write to external storage and preserve timestamps.\n\nUse the least collection that answers the question: triage first, a full image only for the hosts that need it."
+    },
+    {
+      "id": "kape",
+      "type": "code",
+      "language": "powershell",
+      "code": "# Run from external media on an authorized host. Output goes to the same media.\n.\\kape.exe --tsource C: --tdest E:\\case042\\HOST07\\targets `\n  --target !SANS_Triage --vss `\n  --module !EZParser --mdest E:\\case042\\HOST07\\modules\n\n# Hash everything collected for the chain of custody\nGet-ChildItem E:\\case042\\HOST07 -Recurse -File |\n  Get-FileHash -Algorithm SHA256 |\n  Export-Csv E:\\case042\\HOST07\\hashes.csv -NoTypeInformation",
+      "filename": "kape_triage.ps1",
+      "caption": "Collect a triage set of artifacts, parse them and hash the output. Check the target and module names in your KAPE version."
+    },
+    {
+      "id": "warning",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Protect the evidence you are touching",
+      "markdown": "Do not run collection tools from the suspect disk, do not browse the host with a normal user session, and never execute a suspicious file to see what it does. Analyze samples only in an isolated sandbox you control."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a Windows virtual machine you own, enable process creation auditing with command-line logging (Group Policy: Audit Process Creation and Include command line in process creation events). Open Notepad and a PowerShell window, then use Event Viewer or `Get-WinEvent -FilterHashtable @{LogName='Security';Id=4688}` to find them. Write down the parent process for each, then locate `NOTEPAD.EXE-*.pf` in the Prefetch folder and compare its last run time with the event."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Event ID 4688",
+          "definition": "Security event recording that a process was created."
+        },
+        {
+          "term": "Logon type",
+          "definition": "A code showing how a user logged on: interactive, network or remote."
+        },
+        {
+          "term": "Prefetch",
+          "definition": "Files that record program execution to speed up later launches."
+        },
+        {
+          "term": "Amcache",
+          "definition": "A registry hive storing details and hashes of executed programs."
+        },
+        {
+          "term": "Shimcache",
+          "definition": "A compatibility cache that lists programs seen by the system."
+        },
+        {
+          "term": "KAPE",
+          "definition": "A tool that collects and parses forensic artifacts quickly."
+        },
+        {
+          "term": "Velociraptor",
+          "definition": "An endpoint agent for collecting artifacts and hunting with VQL."
+        },
+        {
+          "term": "Sysmon",
+          "definition": "A Microsoft Sysinternals service that logs detailed process and network events."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which event ID indicates that a new service was installed on a Windows host?",
+          "options": [
+            "4624",
+            "7045",
+            "1102",
+            "4104"
+          ],
+          "answer": 1,
+          "explanation": "System event 7045 records service installation, a common persistence method."
+        },
+        {
+          "question": "Which findings are suspicious process relationships? Choose all that apply.",
+          "options": [
+            "winword.exe starting powershell.exe",
+            "explorer.exe starting notepad.exe",
+            "services.exe starting svchost.exe",
+            "excel.exe starting cmd.exe with a long encoded string"
+          ],
+          "answer": [
+            0,
+            3
+          ],
+          "explanation": "Office applications spawning command interpreters is a strong signal. Explorer launching Notepad and services.exe starting svchost.exe are normal."
+        },
+        {
+          "question": "What does Shimcache alone prove?",
+          "options": [
+            "The program definitely ran",
+            "The program was present on the system, but execution is not guaranteed",
+            "The program was signed",
+            "The program was removed by the user"
+          ],
+          "answer": 1,
+          "explanation": "Shimcache can record files that were only browsed or present, so pair it with Prefetch or Amcache."
+        },
+        {
+          "question": "Which are good practices when collecting from a suspect Windows host? Choose all that apply.",
+          "options": [
+            "Run tools from external media",
+            "Write output to external storage and hash it",
+            "Execute the suspicious file to observe it on the host",
+            "Record the time zone and UTC time"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Execution on the host contaminates evidence and risks spread. The others protect integrity."
+        },
+        {
+          "question": "When is Velociraptor a better choice than KAPE?",
+          "options": [
+            "When you need to collect or hunt across many hosts",
+            "When the disk is encrypted",
+            "When you only have one offline image",
+            "When no logs exist"
+          ],
+          "answer": 0,
+          "explanation": "Velociraptor agents let you run the same query on many endpoints, while KAPE targets one host at a time."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nOn Windows, start with event logs and parent-child process relationships, then check services, scheduled tasks and Run keys. Prove execution with several artifacts, not one: Prefetch, Amcache, Shimcache and UserAssist each answer a different question. Use KAPE for one host and Velociraptor for many, always writing to external storage and hashing results. Next, study how attackers move between machines in [Lateral Movement Detection](/learn/security-operations-dfir/lateral-movement-detection)."
+    }
+  ],
+  "ar": {
+    "title": "الاستجابة للحوادث في Windows",
+    "summary": "فرز جهاز Windows مشتبه به: استخدام سجلات الأحداث وفحوص العمليات والاستمرارية وآثار التنفيذ مثل Prefetch وAmcache وأدوات الجمع مثل KAPE وVelociraptor لتحديد نطاق الاختراق.",
+    "objectives": [
+      "جمع أدلة Windows المتطايرة والدائمة بترتيب آمن",
+      "استخدام معرّفات أحداث الأمان والنظام وPowerShell الأساسية لإعادة بناء النشاط",
+      "فحص العمليات والخدمات والمهام المجدولة ومفاتيح Run بحثًا عن الاستمرارية",
+      "شرح ما تثبته Prefetch وAmcache وShimcache عن التنفيذ",
+      "استخدام KAPE وVelociraptor لجمع الآثار على نطاق واسع"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يبلّغ مستخدم عن بطء حاسوبه المحمول ونافذة منبثقة غريبة. يُظهر EDR تشغيل `powershell.exe` من مستند Word يوم الثلاثاء ثم لا شيء بعد ذلك. هل حُجب أم نجح بصمت؟ في Windows تتوزع الإجابة على سجلات الأحداث والسجل (Registry) ونظام الملفات والذاكرة.\n\nيمنح Windows أدلة وفيرة: يكاد كل إجراء يترك أثرًا في مكان ما. والمهارة أن تعرف أين تنظر أولًا وكيف تجمع دون تغيير ما تجده. يقدّم هذا الدرس سير عمل للمدافع على أجهزة مصرّح لك بفحصها، ويرتبط بـ [تحليل العمليات والخدمات المشبوهة](/learn/security-operations-dfir/suspicious-process-and-service-analysis) و[الأدلة الجنائية للأقراص والذاكرة](/learn/security-operations-dfir/disk-and-memory-forensics)."
+      },
+      {
+        "id": "events",
+        "type": "text",
+        "markdown": "## ابدأ بسجلات الأحداث\n\nسجلات الأحداث أسرع مصدر وغالبًا ما تُرسل إلى SIEM، فإن مسحها المهاجم محليًا ترك فجوة يمكنك رؤيتها. احفظ قائمة قصيرة من معرّفات الأحداث.\n\n| السجل | المعرّف | المعنى |\n|:--|:--|:--|\n| الأمان | 4624 / 4625 | تسجيل دخول ناجح / فاشل (لاحظ نوع الدخول) |\n| الأمان | 4688 | إنشاء عملية (مع سطر الأوامر إذا فُعّل) |\n| الأمان | 4720 / 4732 | إنشاء حساب / إضافته إلى مجموعة |\n| الأمان | 1102 | مسح سجل التدقيق |\n| النظام | 7045 | تثبيت خدمة جديدة |\n| الأمان | 4698 | إنشاء مهمة مجدولة |\n| PowerShell | 4104 | تسجيل كتلة نص برمجي |\n| Sysmon | 1 / 3 / 11 | عملية، اتصال شبكي، إنشاء ملف |\n\nأنواع الدخول مهمة: النوع 2 تفاعلي، والنوع 3 شبكي، والنوع 10 سطح المكتب البعيد. وتجد تغطية لسلسلة من دخول النوع 3 من محطة واحدة إلى خوادم كثيرة في [كشف التحرك الجانبي](/learn/security-operations-dfir/lateral-movement-detection)."
+      },
+      {
+        "id": "win-seq",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "مستند Word يبدأ PowerShell",
+        "caption": "العلاقات بين العملية الأب والابن من أقوى الإشارات في الاستجابة على Windows.",
+        "data": {
+          "actors": [
+            {
+              "id": "user",
+              "icon": "user",
+              "label": "المستخدم",
+              "sub": "jsmith"
+            },
+            {
+              "id": "word",
+              "icon": "file",
+              "label": "WINWORD",
+              "sub": "Office"
+            },
+            {
+              "id": "ps",
+              "icon": "cpu",
+              "label": "PowerShell",
+              "sub": "عملية ابن"
+            },
+            {
+              "id": "sys",
+              "icon": "log",
+              "label": "سجلات الأحداث",
+              "sub": "4688 و4104"
+            },
+            {
+              "id": "net",
+              "icon": "globe",
+              "label": "الجهاز البعيد",
+              "sub": "203.0.113.80"
+            }
+          ],
+          "steps": [
+            {
+              "from": "user",
+              "to": "word",
+              "label": "Open invoice.docm",
+              "detail": "Macros enabled",
+              "note": "يفتح المستخدم مرفقًا ويفعّل وحدات الماكرو.",
+              "tone": "warning"
+            },
+            {
+              "from": "word",
+              "to": "ps",
+              "label": "Spawn child",
+              "detail": "powershell.exe -enc ...",
+              "note": "يبدأ Word تشغيل PowerShell بأمر مشفّر، وهذا نادر في المستندات العادية.",
+              "tone": "danger"
+            },
+            {
+              "from": "ps",
+              "to": "sys",
+              "label": "Event 4688",
+              "detail": "ParentImage=WINWORD.EXE",
+              "note": "يسجّل إنشاء العملية الأب غير المعتاد وسطر الأوامر."
+            },
+            {
+              "from": "ps",
+              "to": "sys",
+              "label": "Event 4104",
+              "detail": "Script block",
+              "note": "يخزّن تسجيل كتل النصوص البرمجية النص المفكوك.",
+              "tone": "secure"
+            },
+            {
+              "from": "ps",
+              "to": "net",
+              "label": "HTTPS request",
+              "detail": "Sysmon 3",
+              "note": "يتصل PowerShell بعنوان نادر الظهور.",
+              "tone": "danger"
+            },
+            {
+              "from": "sys",
+              "to": "user",
+              "label": "Analyst pivots",
+              "detail": "EDR + SIEM",
+              "note": "يستخدم المحلل العملية الأب وسطر الأوامر والعنوان لتحديد أجهزة أخرى.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "live",
+        "type": "text",
+        "markdown": "## افحص العمليات والخدمات والاستمرارية\n\nعلى الجهاز الحي ابحث عن عمليات لا معنى لعمليتها الأب (`winword.exe` إلى `powershell.exe`، أو `svchost.exe` لا يبدأها غير `services.exe`)، أو تعمل من مسارات قابلة للكتابة للمستخدم مثل `%TEMP%` و`%APPDATA%`، أو أسماء تقلّد ملفات النظام.\n\nثم افحص نقاط الاستمرارية المعتادة: مفاتيح السجل `Run` و`RunOnce`، والمهام المجدولة، والخدمات الجديدة، ومجلد بدء التشغيل، واشتراكات أحداث WMI. قارن ما تجده بخط أساس سليم إن وُجد. اجمع الأدلة للقراءة فقط واحفظ المخرجات على وسيط خارجي مع تجزئة. الأوامر أدناه بلغة PowerShell تُشغَّل بصلاحية المسؤول على جهاز مصرّح."
+      },
+      {
+        "id": "ps-term",
+        "type": "terminal",
+        "title": "Live checks in PowerShell",
+        "prompt": "PS C:\\>",
+        "lines": [
+          {
+            "cmd": "Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId,Name,CommandLine | Where-Object Name -eq 'powershell.exe' | Format-List",
+            "output": "ProcessId       : 7312\nParentProcessId : 5540\nName            : powershell.exe\nCommandLine     : powershell.exe -nop -w hidden -enc <BASE64-PLACEHOLDER>",
+            "comment": "نافذة مخفية وأمر مشفّر: فُكّه في بيئة معزولة ولا تشغّله أبدًا."
+          },
+          {
+            "cmd": "Get-CimInstance Win32_Process -Filter 'ProcessId=5540' | Select Name,ExecutablePath",
+            "output": "Name        ExecutablePath\n----        --------------\nWINWORD.EXE C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+            "comment": "الأب هو Word، ما يؤكد أن المصدر مستند."
+          },
+          {
+            "cmd": "Get-ScheduledTask | Where-Object {$_.Date -gt (Get-Date).AddDays(-7)} | Select TaskName,TaskPath,Date",
+            "output": "TaskName         TaskPath  Date\n--------         --------  ----\nOneDriveSyncChk  \\         11/10/2026 14:22:05",
+            "comment": "مهمة جديدة باسم يقلّد منتجًا حقيقيًا."
+          },
+          {
+            "cmd": "Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'",
+            "output": "OneDriveSyncChk : C:\\Users\\jsmith\\AppData\\Roaming\\onesync\\chk.exe",
+            "comment": "مفتاح Run يشير إلى مسار قابل للكتابة للمستخدم."
+          }
+        ],
+        "caption": "مخرجات توضيحية. الحمولة المشفّرة معروضة كعنصر نائب فقط."
+      },
+      {
+        "id": "accounts",
+        "type": "text",
+        "markdown": "## راجع الحسابات والجلسات وحالة الشبكة\n\nيحتاج المهاجمون إلى هويات. راجع المسؤولين المحليين بالأمر `net localgroup administrators` والحسابات المنشأة حديثًا (الحدث 4720) والإضافات إلى المجموعات المميزة (4732). افحص الجلسات النشطة بـ `query user` و`net session`، واعرض سجل سطح المكتب البعيد في مفتاح السجل `Terminal Server Client` لكل مستخدم.\n\nثم انظر إلى الشبكة. الأمر `Get-NetTCPConnection -State Established` مربوطًا بالعملية المالكة يُظهر مَن يتصل بالخارج. ملف تنفيذي غير موقّع في `AppData` يحمل اتصالًا بعنوان نادر الظهور يستحق اهتمامًا فوريًا. وإن كان الجهاز خادمًا فافحص المشاركات بـ `net share` والوصول الحديث عبر SMB، لأن البيانات المسروقة تخرج غالبًا من مشاركات الملفات أولًا.\n\nوأخيرًا اختبر هل عُبث بأدوات الحماية. ابحث عن خدمات مكافحة فيروسات متوقفة، ومسارات استثناء جديدة في إعدادات Defender، وتغييرات في سياسة التدقيق. تعطيل الدفاعات مؤشر بحد ذاته ويحدث عادةً مبكرًا."
+      },
+      {
+        "id": "logging",
+        "type": "callout",
+        "variant": "note",
+        "title": "تسجيل تتمنى لو فعّلته",
+        "markdown": "تسجيل سطر الأوامر للحدث 4688 وتسجيل كتل نصوص PowerShell وSysmon ليست مفعّلة افتراضيًا. فعّلها على أجهزتك كلها قبل وقوع الحادثة، لأنه لا يمكن استرجاع شيء لاحقًا لأحداث لم تُسجَّل أصلًا. وخصّص حجمًا كبيرًا لسجل الأمان، فقد يمحو خادم مزدحم تاريخ أسبوع كامل في ساعات قليلة. وأرسل السجلات إلى مجمّع مركزي في الزمن الحقيقي كي لا يستطيع مهاجم مسح النسخة المحلية أن يمحو السجل، واختبر دوريًا أن الإرسال ما زال يعمل بعد التحديثات وتغييرات السياسة."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "المناطق الزمنية والساعات",
+        "markdown": "تخزّن سجلات أحداث Windows الأوقات بالتوقيت العالمي لكن عارض الأحداث يعرض التوقيت المحلي. ويستخدم Prefetch وكثير من قيم السجل التوقيت العالمي أيضًا. حوّل كل شيء إلى التوقيت العالمي قبل بناء الجدول الزمني، وقارن ساعة الجهاز بمصدر موثوق لتصحح الانحراف."
+      },
+      {
+        "id": "artifacts",
+        "type": "text",
+        "markdown": "## أثبت التنفيذ بالآثار\n\nحتى لو حذف المهاجم برنامجًا يتذكّر Windows أنه عمل. اعرف ما يثبته كل أثر لأنها ليست متساوية.\n\n| الأثر | الموضع | ما يخبرك به |\n|:--|:--|:--|\n| **Prefetch** | `C:\\Windows\\Prefetch\\*.pf` | البرنامج عمل؛ عدد مرات التشغيل وآخر 8 أوقات |\n| **Amcache** | `Amcache.hve` | البرنامج وُجد أو عمل؛ تجزئة SHA-1 للملف |\n| **Shimcache** | خلية `SYSTEM` | البرنامج كان موجودًا؛ لا يثبت التنفيذ دائمًا |\n| **UserAssist** | `NTUSER.DAT` | برامج الواجهة التي شغّلها مستخدم |\n| **قوائم القفز وملفات LNK** | ملف المستخدم | الملفات التي فتحها المستخدم |\n\nيُعطَّل Prefetch في بعض إصدارات الخوادم وقد يختلف على أقراص SSD، فغيابه لا يثبت الكثير. اجمع أثرين على الأقل قبل أن تدّعي أن برنامجًا عمل. وتدمج أدوات الجدول الزمني في [الأدلة الجنائية للأقراص والذاكرة](/learn/security-operations-dfir/disk-and-memory-forensics) هذه الآثار في عرض واحد."
+      },
+      {
+        "id": "collect",
+        "type": "text",
+        "markdown": "## اجمع على نطاق واسع بـ KAPE وVelociraptor\n\nكتابة الأوامر يدويًا لا تتسع لأكثر من جهاز واحد. وتحل أداتان هذه المشكلة للمدافعين.\n\nتنسخ **KAPE** (Kroll Artifact Parser and Extractor) الآثار الجنائية بسرعة باستخدام *الأهداف*، ثم تشغّل المحلّلات باستخدام *الوحدات*. وهي مثالية لجهاز واحد يمكنك الوصول إليه.\n\nويعمل **Velociraptor** بوكلاء عبر بيئتك. تكتب أثرًا بلغة VQL (Velociraptor Query Language) وتجمعه من مئات الأجهزة، أو تصطاد مؤشرًا في كل مكان. تكتب الأداتان على وسيط خارجي وتحفظان الأوقات.\n\nاستخدم أقل جمع يجيب عن السؤال: الفرز أولًا، والصورة الكاملة فقط للأجهزة التي تحتاجها."
+      },
+      {
+        "id": "kape",
+        "type": "code",
+        "language": "powershell",
+        "code": "# Run from external media on an authorized host. Output goes to the same media.\n.\\kape.exe --tsource C: --tdest E:\\case042\\HOST07\\targets `\n  --target !SANS_Triage --vss `\n  --module !EZParser --mdest E:\\case042\\HOST07\\modules\n\n# Hash everything collected for the chain of custody\nGet-ChildItem E:\\case042\\HOST07 -Recurse -File |\n  Get-FileHash -Algorithm SHA256 |\n  Export-Csv E:\\case042\\HOST07\\hashes.csv -NoTypeInformation",
+        "filename": "kape_triage.ps1",
+        "caption": "جمع مجموعة فرز من الآثار وتحليلها وتجزئة المخرجات. تحقق من أسماء الأهداف والوحدات في إصدار KAPE لديك."
+      },
+      {
+        "id": "warning",
+        "type": "callout",
+        "variant": "warning",
+        "title": "احمِ الأدلة التي تتعامل معها",
+        "markdown": "لا تشغّل أدوات الجمع من القرص المشتبه به، ولا تتصفح الجهاز بجلسة مستخدم عادية، ولا تنفّذ ملفًا مشبوهًا لترى ماذا يفعل. حلّل العينات فقط في بيئة معزولة تتحكم بها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في آلة Windows افتراضية تملكها، فعّل تدقيق إنشاء العمليات مع تسجيل سطر الأوامر (سياسة المجموعة: Audit Process Creation وInclude command line in process creation events). افتح المفكرة ونافذة PowerShell، ثم استخدم عارض الأحداث أو `Get-WinEvent -FilterHashtable @{LogName='Security';Id=4688}` للعثور عليهما. دوّن العملية الأب لكل منهما، ثم ابحث عن `NOTEPAD.EXE-*.pf` في مجلد Prefetch وقارن وقت آخر تشغيل فيه بالحدث."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسية",
+        "items": [
+          {
+            "term": "المعرّف 4688",
+            "definition": "حدث أمان يسجّل إنشاء عملية."
+          },
+          {
+            "term": "نوع الدخول (Logon type)",
+            "definition": "رمز يبيّن كيف سجّل المستخدم دخوله: تفاعلي أو شبكي أو بعيد."
+          },
+          {
+            "term": "Prefetch",
+            "definition": "ملفات تسجّل تنفيذ البرامج لتسريع التشغيل لاحقًا."
+          },
+          {
+            "term": "Amcache",
+            "definition": "خلية سجل تخزّن تفاصيل البرامج المنفذة وتجزئاتها."
+          },
+          {
+            "term": "Shimcache",
+            "definition": "ذاكرة توافق مؤقتة تسرد البرامج التي رآها النظام."
+          },
+          {
+            "term": "KAPE",
+            "definition": "أداة تجمع الآثار الجنائية وتحللها بسرعة."
+          },
+          {
+            "term": "Velociraptor",
+            "definition": "وكيل للأجهزة الطرفية لجمع الآثار والصيد باستخدام VQL."
+          },
+          {
+            "term": "Sysmon",
+            "definition": "خدمة من Microsoft Sysinternals تسجّل أحداث العمليات والشبكة بالتفصيل."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي معرّف حدث يدل على تثبيت خدمة جديدة على جهاز Windows؟",
+            "options": [
+              "4624",
+              "7045",
+              "1102",
+              "4104"
+            ],
+            "answer": 1,
+            "explanation": "الحدث 7045 في سجل النظام يسجّل تثبيت خدمة، وهي طريقة استمرارية شائعة."
+          },
+          {
+            "question": "أي النتائج علاقات عمليات مشبوهة؟ اختر كل ما ينطبق.",
+            "options": [
+              "winword.exe يبدأ powershell.exe",
+              "explorer.exe يبدأ notepad.exe",
+              "services.exe يبدأ svchost.exe",
+              "excel.exe يبدأ cmd.exe بسلسلة مشفّرة طويلة"
+            ],
+            "answer": [
+              0,
+              3
+            ],
+            "explanation": "تشغيل تطبيقات Office لمفسّرات الأوامر إشارة قوية، أما تشغيل Explorer للمفكرة وservices.exe لـ svchost.exe فطبيعي."
+          },
+          {
+            "question": "ماذا تثبت Shimcache وحدها؟",
+            "options": [
+              "أن البرنامج عمل بالتأكيد",
+              "أن البرنامج كان موجودًا لكن التنفيذ غير مضمون",
+              "أن البرنامج موقّع",
+              "أن المستخدم حذف البرنامج"
+            ],
+            "answer": 1,
+            "explanation": "قد تسجّل Shimcache ملفات تصفّحها النظام أو وُجدت فقط، لذا اجمعها مع Prefetch أو Amcache."
+          },
+          {
+            "question": "ما الممارسات الجيدة عند الجمع من جهاز Windows مشتبه به؟ اختر كل ما ينطبق.",
+            "options": [
+              "تشغيل الأدوات من وسيط خارجي",
+              "كتابة المخرجات على وسيط خارجي وتجزئتها",
+              "تنفيذ الملف المشبوه لمراقبته على الجهاز",
+              "تسجيل المنطقة الزمنية والوقت العالمي"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "التنفيذ على الجهاز يلوّث الأدلة ويخاطر بالانتشار، أما البقية فتحمي السلامة."
+          },
+          {
+            "question": "متى يكون Velociraptor خيارًا أفضل من KAPE؟",
+            "options": [
+              "عندما تحتاج إلى الجمع أو الصيد عبر أجهزة كثيرة",
+              "عندما يكون القرص مشفّرًا",
+              "عندما لا تملك إلا صورة واحدة غير متصلة",
+              "عندما لا توجد سجلات"
+            ],
+            "answer": 0,
+            "explanation": "يتيح وكلاء Velociraptor تشغيل الاستعلام نفسه على أجهزة كثيرة، بينما تستهدف KAPE جهازًا واحدًا في كل مرة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nفي Windows ابدأ بسجلات الأحداث وعلاقات العمليات بين الأب والابن، ثم افحص الخدمات والمهام المجدولة ومفاتيح Run. أثبت التنفيذ بعدة آثار لا بأثر واحد: يجيب كل من Prefetch وAmcache وShimcache وUserAssist عن سؤال مختلف. استخدم KAPE لجهاز واحد وVelociraptor لأجهزة كثيرة، واكتب دائمًا على وسيط خارجي وجزّئ النتائج. وبعد ذلك ادرس كيف ينتقل المهاجمون بين الأجهزة في [كشف التحرك الجانبي](/learn/security-operations-dfir/lateral-movement-detection)."
+      }
+    ]
+  }
+}

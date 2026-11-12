@@ -1,0 +1,658 @@
+{
+  "slug": "linux-incident-response",
+  "title": "Linux Incident Response",
+  "summary": "A practical Linux triage workflow: collect volatile data first, review accounts, processes, connections, persistence and logs, verify package integrity and preserve evidence on servers you are authorized to examine.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Order evidence collection from most to least volatile on a Linux host",
+    "Run live triage commands for users, processes, sockets and scheduled tasks",
+    "Review authentication and system logs with grep and journalctl",
+    "Verify installed files against the package manager",
+    "Build a file timeline and preserve evidence with hashes"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A web server in your production environment raises an alert: an unknown process is listening on a high port. The server is busy, the business wants it back online, and the logs are rotating every night. Every minute of delay overwrites evidence, but every careless command changes it.\n\nLinux incident response is a discipline of order. You collect what disappears first, you record exactly what you ran, and you avoid trusting the system's own tools more than necessary. This lesson gives a repeatable workflow you can adapt for [Server Compromise Investigation](/learn/security-operations-dfir/server-compromise-investigation) and the lifecycle in [Incident Response Fundamentals](/learn/security-operations-dfir/incident-response-fundamentals). Use it only on systems you own or are authorized to examine."
+    },
+    {
+      "id": "order",
+      "type": "text",
+      "markdown": "## Collect in order of volatility\n\nData that lives only in memory or in a running state is lost on reboot, so it comes first.\n\n| Order | Data | Typical command |\n|:--|:--|:--|\n| 1 | Memory contents | Memory acquisition tool (AVML, LiME) |\n| 2 | Network connections and listeners | `ss -tupan` |\n| 3 | Running processes | `ps auxwwf` |\n| 4 | Logged-in users and sessions | `who`, `w`, `last` |\n| 5 | Open files and mounts | `lsof`, `mount` |\n| 6 | Scheduled and startup items | `crontab`, `systemctl` |\n| 7 | Logs and files on disk | `journalctl`, `/var/log` |\n\nDecide before you start whether to image memory. If the host may hold attacker tools that exist only in RAM, acquire memory first and analyze it later, as described in [Disk and Memory Forensics](/learn/security-operations-dfir/disk-and-memory-forensics)."
+    },
+    {
+      "id": "lin-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Linux triage workflow",
+      "caption": "Every step is recorded in a log so the work can be reviewed and repeated.",
+      "data": {
+        "token": "Evidence",
+        "nodes": [
+          {
+            "id": "auth",
+            "icon": "lock",
+            "label": "Authorize",
+            "sub": "Scope and approval"
+          },
+          {
+            "id": "mem",
+            "icon": "cpu",
+            "label": "Memory",
+            "sub": "Acquire first"
+          },
+          {
+            "id": "live",
+            "icon": "server",
+            "label": "Live state",
+            "sub": "Sockets, processes"
+          },
+          {
+            "id": "persist",
+            "icon": "key",
+            "label": "Persistence",
+            "sub": "cron, systemd, keys"
+          },
+          {
+            "id": "logs",
+            "icon": "log",
+            "label": "Logs",
+            "sub": "auth and journal"
+          },
+          {
+            "id": "hash",
+            "icon": "file",
+            "label": "Preserve",
+            "sub": "Hash and store"
+          }
+        ],
+        "steps": [
+          {
+            "at": "auth",
+            "caption": "Confirm written authorization and open a case with the host name and time zone."
+          },
+          {
+            "at": "mem",
+            "caption": "Capture memory to external storage before touching anything else.",
+            "tone": "warning"
+          },
+          {
+            "at": "live",
+            "caption": "Record sockets and the process tree; the unknown listener belongs to PID 4821.",
+            "tone": "danger"
+          },
+          {
+            "at": "persist",
+            "caption": "A new cron entry and an unfamiliar SSH key appear under the web user.",
+            "tone": "danger"
+          },
+          {
+            "at": "logs",
+            "caption": "auth.log shows a successful login from 198.51.100.23 at 01:52.",
+            "tone": "warning"
+          },
+          {
+            "at": "hash",
+            "caption": "Copy outputs to the evidence share and record SHA-256 hashes.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "live",
+      "type": "text",
+      "markdown": "## Run live triage carefully\n\nOn a compromised host, binaries such as `ps` or `ls` may be replaced. Prefer a trusted toolkit mounted read-only from external media, and write all output to external storage, not to the suspect disk.\n\nStart a transcript so every command and its time are recorded, then collect the basics. The terminal below shows a typical sequence. Notice the unexpected listener, and a process whose binary was deleted after it started, which is a strong reason to look closer."
+    },
+    {
+      "id": "live-term",
+      "type": "terminal",
+      "title": "Live triage on web01 (lab host)",
+      "prompt": "root@web01:~#",
+      "lines": [
+        {
+          "cmd": "script -a /mnt/evidence/web01_triage.log",
+          "output": "Script started, file is /mnt/evidence/web01_triage.log",
+          "comment": "Record the whole session to external storage."
+        },
+        {
+          "cmd": "date -u; hostname; uname -r",
+          "output": "Thu Nov 12 03:41:07 UTC 2026\nweb01\n5.15.0-91-generic",
+          "comment": "Always note UTC time and kernel."
+        },
+        {
+          "cmd": "ss -tupan | grep LISTEN",
+          "output": "tcp LISTEN 0 128 0.0.0.0:22   0.0.0.0:* users:((\"sshd\",pid=811))\ntcp LISTEN 0 511 0.0.0.0:443  0.0.0.0:* users:((\"nginx\",pid=902))\ntcp LISTEN 0 5   0.0.0.0:48213 0.0.0.0:* users:((\"kworker-u\",pid=4821))",
+          "comment": "Port 48213 owned by a process named like a kernel thread is suspicious."
+        },
+        {
+          "cmd": "ls -l /proc/4821/exe; cat /proc/4821/cmdline | tr '\\0' ' '",
+          "output": "lrwxrwxrwx 1 www-data www-data 0 Nov 12 03:10 /proc/4821/exe -> /tmp/.cache/kworker-u (deleted)\n/tmp/.cache/kworker-u -p 48213",
+          "comment": "The binary ran from /tmp and was then deleted; the running copy is still recoverable from /proc."
+        },
+        {
+          "cmd": "last -F | head -3",
+          "output": "deploy   pts/0  198.51.100.23  Thu Nov 12 01:52:10 2026   still logged in\ndeploy   pts/0  192.0.2.10     Tue Nov 10 09:14:02 2026 - 09:41:55 2026",
+          "comment": "A login from an unfamiliar address."
+        }
+      ],
+      "caption": "Illustrative output. Run these only on lab hosts or systems you are authorized to examine."
+    },
+    {
+      "id": "persist",
+      "type": "text",
+      "markdown": "## Check persistence and accounts\n\nAn attacker who wants to survive a reboot usually changes one of a small set of places. Check each of them.\n\n- **Accounts:** new entries in `/etc/passwd` with UID 0, or users with a shell that should not have one. Compare `/etc/sudoers` and `/etc/sudoers.d/`.\n- **SSH keys:** `~/.ssh/authorized_keys` for every user, including service accounts.\n- **Scheduled tasks:** `/etc/crontab`, `/etc/cron.*`, user crontabs in `/var/spool/cron` and `systemctl list-timers`.\n- **Services:** recently created units in `/etc/systemd/system`, plus `rc.local`.\n- **Shell and library hooks:** `~/.bashrc`, `/etc/profile.d/` and `/etc/ld.so.preload`, which should normally be empty or absent.\n\nThe broader catalog of techniques is covered in [Persistence Mechanism Detection](/learn/security-operations-dfir/persistence-mechanism-detection). Record file owners and modification times before you change anything."
+    },
+    {
+      "id": "triage-sh",
+      "type": "code",
+      "language": "bash",
+      "code": "#!/bin/bash\n# Read-only persistence sweep. Output goes to external storage.\nOUT=/mnt/evidence/web01_persist\nmkdir -p \"$OUT\"\nawk -F: '$3==0{print}' /etc/passwd            > \"$OUT/uid0.txt\"\nfind /home /root -name authorized_keys -exec ls -l --time-style=full-iso {} + > \"$OUT/ssh_keys.txt\"\nfor u in $(cut -d: -f1 /etc/passwd); do crontab -l -u \"$u\" 2>/dev/null | sed \"s/^/$u: /\"; done > \"$OUT/crontabs.txt\"\nsystemctl list-unit-files --state=enabled > \"$OUT/enabled_units.txt\"\nfind /etc/systemd/system -type f -newermt '2026-11-01' -ls > \"$OUT/new_units.txt\"\ncat /etc/ld.so.preload 2>&1               > \"$OUT/ld_preload.txt\"\nsha256sum \"$OUT\"/* > \"$OUT/SHA256SUMS\"",
+      "filename": "persistence_sweep.sh",
+      "caption": "A small read-only script. It writes only to the evidence share and hashes its own output."
+    },
+    {
+      "id": "scope",
+      "type": "text",
+      "markdown": "## Decide the scope before you decide the cure\n\nA single suspicious process rarely tells you how the attacker arrived. Ask three questions before anyone proposes a fix.\n\n1. **Entry:** how did the actor get in? Look at the web server access log around the first suspicious login, at exposed services, and at stolen or reused credentials.\n2. **Reach:** which accounts, keys and secrets on this host could the actor have read? Application configuration files and environment variables often contain database passwords and API tokens that must be rotated.\n3. **Spread:** did this host connect onward to others? Check `~/.ssh/known_hosts`, shell history and outbound connections for internal addresses.\n\nAnswering these turns one infected server into a defined incident with a list of credentials to reset and neighbors to inspect. Without them, you rebuild the server and the same door stays open."
+    },
+    {
+      "id": "note",
+      "type": "callout",
+      "variant": "note",
+      "title": "Keep your own notes",
+      "markdown": "Write down each finding as you go: what you saw, the command that showed it, the UTC time and the file path. Notes written later from memory are weak evidence and slow down the person who takes over your shift."
+    },
+    {
+      "id": "logs",
+      "type": "text",
+      "markdown": "## Read the logs and verify packages\n\nAuthentication logs live in `/var/log/auth.log` on Debian-based systems and `/var/log/secure` on Red Hat-based ones. On systemd hosts, `journalctl` reads the journal. Search for `Accepted` (successful logins), `Failed password`, `sudo` and `session opened`. A burst of failures followed by a success from the same address is the classic pattern. More authentication techniques follow in [Authentication Log Investigation](/learn/security-operations-dfir/authentication-log-investigation).\n\nThen test whether system files were modified. Package managers store checksums, so you can compare them without knowing what the attacker changed:\n\n- Debian and Ubuntu: `debsums -c`\n- RHEL, Fedora and SUSE: `rpm -Va`\n\nA modified `/usr/bin/ssh` or `/bin/ls` is a serious finding. Remember that a rootkit can also hide from tools on the host, so compare results with an offline view of the disk."
+    },
+    {
+      "id": "log-term",
+      "type": "terminal",
+      "title": "Logs and integrity",
+      "prompt": "root@web01:~#",
+      "lines": [
+        {
+          "cmd": "grep -E 'Failed password|Accepted' /var/log/auth.log | tail -4",
+          "output": "Nov 12 01:49:30 web01 sshd[3102]: Failed password for deploy from 198.51.100.23 port 51022 ssh2\nNov 12 01:49:34 web01 sshd[3104]: Failed password for deploy from 198.51.100.23 port 51030 ssh2\nNov 12 01:52:10 web01 sshd[3188]: Accepted password for deploy from 198.51.100.23 port 51114 ssh2",
+          "comment": "Failures then success: likely a guessed or reused password."
+        },
+        {
+          "cmd": "journalctl -u cron --since '2026-11-12 01:50' --no-pager | tail -2",
+          "output": "Nov 12 02:01:01 web01 CRON[3301]: (deploy) CMD (/tmp/.cache/kworker-u -p 48213 >/dev/null 2>&1)",
+          "comment": "Cron launches the same binary."
+        },
+        {
+          "cmd": "debsums -c 2>/dev/null",
+          "output": "/usr/bin/ssh",
+          "comment": "A packaged file whose checksum no longer matches."
+        }
+      ],
+      "caption": "Illustrative output from a lab host."
+    },
+    {
+      "id": "timeline",
+      "type": "text",
+      "markdown": "## Build a timeline and preserve evidence\n\nOnce you know one malicious file or time, look around it. A quick file timeline uses `find` with `-newermt` to list files changed during the incident window, or `stat` for precise timestamps. Remember that Linux keeps modification, access and inode change times, and an attacker can alter modification times but not easily the inode change time.\n\nFor preservation, copy collected files to read-only external storage, compute a SHA-256 hash of each, and record who handled them and when. If the host will be rebuilt, take a full disk image first. This chain of custody is what makes your findings usable later. Recovery steps are covered in [Incident Recovery and System Rebuilding](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding)."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not reboot or clean up first",
+      "markdown": "Restarting the server or deleting the suspicious file removes the memory image, the process list and the open deleted binary. If you must stop the service for safety, isolate the host from the network and keep it powered on until memory is captured."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a disposable Linux virtual machine you own, create a user named `labuser`, add a cron entry that appends the date to `/tmp/lab.log` every minute, and add a harmless public key to its `authorized_keys`. Then run the persistence sweep script above without looking at your own setup notes. Confirm that the output finds all three changes, and write down the file timestamps you would use to place them on a timeline."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Order of volatility",
+          "definition": "The sequence for collecting evidence, from the data that disappears fastest to the data that lasts."
+        },
+        {
+          "term": "Live triage",
+          "definition": "Quick collection from a running system to decide what to do next."
+        },
+        {
+          "term": "/proc",
+          "definition": "A virtual filesystem exposing running processes and kernel data."
+        },
+        {
+          "term": "authorized_keys",
+          "definition": "The file listing SSH public keys allowed to log in as a user."
+        },
+        {
+          "term": "Rootkit",
+          "definition": "Software that hides an attacker's files, processes or connections."
+        },
+        {
+          "term": "debsums / rpm -V",
+          "definition": "Tools that compare installed files with package checksums."
+        },
+        {
+          "term": "Chain of custody",
+          "definition": "A record of who handled evidence and when."
+        },
+        {
+          "term": "ctime",
+          "definition": "The inode change time, harder for an attacker to forge than mtime."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which item should be collected first on a running Linux host?",
+          "options": [
+            "Files in /var/log",
+            "Memory contents",
+            "Installed package list",
+            "Backup tapes"
+          ],
+          "answer": 1,
+          "explanation": "Memory is the most volatile and is lost at reboot or shutdown, so it is collected first."
+        },
+        {
+          "question": "Which locations are common places for Linux persistence? Choose all that apply.",
+          "options": [
+            "authorized_keys",
+            "Cron entries",
+            "/etc/ld.so.preload",
+            "The /usr/share/doc folder only"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "SSH keys, scheduled tasks and library preloading survive reboots. Documentation folders are not execution points."
+        },
+        {
+          "question": "A process shows `/tmp/.cache/kworker-u (deleted)` in /proc/PID/exe. What does it suggest?",
+          "options": [
+            "A normal kernel thread",
+            "A binary was run then removed from disk, which warrants investigation",
+            "The disk is full",
+            "The process belongs to systemd"
+          ],
+          "answer": 1,
+          "explanation": "Real kernel threads have no executable path. A deleted binary still running is a common sign of concealment."
+        },
+        {
+          "question": "Which are good practices during live triage? Choose all that apply.",
+          "options": [
+            "Write output to external storage",
+            "Use a trusted toolkit from read-only media",
+            "Record every command with timestamps",
+            "Run a system cleanup afterwards on the suspect disk"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "These keep the evidence intact and the work repeatable. Cleanup on the suspect disk changes evidence."
+        },
+        {
+          "question": "Why can `rpm -Va` or `debsums -c` help without knowing the attack in advance?",
+          "options": [
+            "They detect all malware by name",
+            "They compare installed files with package checksums and reveal modified binaries",
+            "They block outbound traffic",
+            "They restore deleted logs"
+          ],
+          "answer": 1,
+          "explanation": "Any packaged file whose checksum changed was modified after installation and deserves a closer look."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nLinux response succeeds through order and restraint. Collect memory and live state first, write everything to external storage, and log your own commands. Review accounts, SSH keys, scheduled tasks, services and preload files for persistence. Read authentication logs, verify packages against their checksums, then build a timeline around the first malicious artifact. Hash and store every item with a chain of custody. Continue with Windows hosts in [Windows Incident Response](/learn/security-operations-dfir/windows-incident-response)."
+    }
+  ],
+  "ar": {
+    "title": "الاستجابة للحوادث في Linux",
+    "summary": "سير عمل عملي للفرز على أنظمة Linux: جمع البيانات المتطايرة أولًا، ثم مراجعة الحسابات والعمليات والاتصالات والاستمرارية والسجلات، والتحقق من سلامة الحزم وحفظ الأدلة على الخوادم المصرّح لك بفحصها.",
+    "objectives": [
+      "ترتيب جمع الأدلة على جهاز Linux من الأكثر تطايرًا إلى الأقل",
+      "تنفيذ أوامر الفرز الحي للمستخدمين والعمليات والمقابس والمهام المجدولة",
+      "مراجعة سجلات المصادقة والنظام بـ grep وjournalctl",
+      "التحقق من الملفات المثبتة مقابل مدير الحزم",
+      "بناء جدول زمني للملفات وحفظ الأدلة بالتجزئات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "ينبّه نظام المراقبة إلى خادم ويب في بيئة الإنتاج: عملية مجهولة تستمع على منفذ مرتفع. الخادم مشغول والعمل يريد عودته للخدمة، والسجلات تُدوَّر كل ليلة. كل دقيقة تأخير تمحو أدلة، لكن كل أمر متسرّع يغيّرها.\n\nالاستجابة للحوادث في Linux انضباط في الترتيب: تجمع ما يزول أولًا، وتسجّل ما نفّذته بدقة، ولا تثق بأدوات النظام نفسه أكثر من اللازم. يقدّم هذا الدرس سير عمل قابلًا للتكرار يمكن تكييفه مع [التحقيق في اختراق الخوادم](/learn/security-operations-dfir/server-compromise-investigation) ودورة الحياة في [أساسيات الاستجابة للحوادث](/learn/security-operations-dfir/incident-response-fundamentals). استخدمه فقط على أنظمة تملكها أو مصرّح لك بفحصها."
+      },
+      {
+        "id": "order",
+        "type": "text",
+        "markdown": "## اجمع بحسب ترتيب التطاير\n\nالبيانات التي توجد في الذاكرة أو في حالة التشغيل فقط تضيع عند إعادة التشغيل، لذا تأتي أولًا.\n\n| الترتيب | البيانات | أمر نموذجي |\n|:--|:--|:--|\n| 1 | محتويات الذاكرة | أداة التقاط الذاكرة (AVML وLiME) |\n| 2 | الاتصالات والمنافذ المستمعة | `ss -tupan` |\n| 3 | العمليات الجارية | `ps auxwwf` |\n| 4 | المستخدمون والجلسات | `who` و`w` و`last` |\n| 5 | الملفات المفتوحة ونقاط التركيب | `lsof` و`mount` |\n| 6 | المهام المجدولة وعناصر الإقلاع | `crontab` و`systemctl` |\n| 7 | السجلات والملفات على القرص | `journalctl` و`/var/log` |\n\nقرّر قبل البدء هل ستلتقط صورة للذاكرة. إن احتمل وجود أدوات للمهاجم في الذاكرة وحدها فالتقطها أولًا وحلّلها لاحقًا كما في [الأدلة الجنائية للأقراص والذاكرة](/learn/security-operations-dfir/disk-and-memory-forensics)."
+      },
+      {
+        "id": "lin-flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "سير عمل الفرز على Linux",
+        "caption": "كل خطوة تُسجَّل في سجل ليمكن مراجعة العمل وتكراره.",
+        "data": {
+          "token": "دليل",
+          "nodes": [
+            {
+              "id": "auth",
+              "icon": "lock",
+              "label": "التفويض",
+              "sub": "النطاق والموافقة"
+            },
+            {
+              "id": "mem",
+              "icon": "cpu",
+              "label": "الذاكرة",
+              "sub": "الالتقاط أولًا"
+            },
+            {
+              "id": "live",
+              "icon": "server",
+              "label": "الحالة الحية",
+              "sub": "المقابس والعمليات"
+            },
+            {
+              "id": "persist",
+              "icon": "key",
+              "label": "الاستمرارية",
+              "sub": "cron وsystemd والمفاتيح"
+            },
+            {
+              "id": "logs",
+              "icon": "log",
+              "label": "السجلات",
+              "sub": "المصادقة والسجل"
+            },
+            {
+              "id": "hash",
+              "icon": "file",
+              "label": "الحفظ",
+              "sub": "التجزئة والتخزين"
+            }
+          ],
+          "steps": [
+            {
+              "at": "auth",
+              "caption": "تأكد من التفويض الكتابي وافتح قضية بها اسم الجهاز والمنطقة الزمنية."
+            },
+            {
+              "at": "mem",
+              "caption": "التقط الذاكرة إلى وسيط خارجي قبل لمس أي شيء آخر.",
+              "tone": "warning"
+            },
+            {
+              "at": "live",
+              "caption": "سجّل المقابس وشجرة العمليات؛ المستمع المجهول يعود للعملية 4821.",
+              "tone": "danger"
+            },
+            {
+              "at": "persist",
+              "caption": "يظهر إدخال cron جديد ومفتاح SSH غير مألوف عند مستخدم الويب.",
+              "tone": "danger"
+            },
+            {
+              "at": "logs",
+              "caption": "يُظهر auth.log تسجيل دخول ناجحًا من 198.51.100.23 عند 01:52.",
+              "tone": "warning"
+            },
+            {
+              "at": "hash",
+              "caption": "انسخ المخرجات إلى مخزن الأدلة وسجّل تجزئات SHA-256.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "live",
+        "type": "text",
+        "markdown": "## نفّذ الفرز الحي بحذر\n\nعلى جهاز مخترق قد تُستبدل ملفات تنفيذية مثل `ps` و`ls`. فضّل مجموعة أدوات موثوقة مركّبة للقراءة فقط من وسيط خارجي، واكتب كل المخرجات على وسيط خارجي لا على القرص المشتبه به.\n\nابدأ تسجيل الجلسة ليُحفظ كل أمر ووقته، ثم اجمع الأساسيات. يعرض الطرفية أدناه تسلسلًا نموذجيًا. لاحظ المستمع غير المتوقع، والعملية التي حُذف ملفها التنفيذي بعد بدء تشغيلها، وهذا سبب قوي للتدقيق أكثر."
+      },
+      {
+        "id": "live-term",
+        "type": "terminal",
+        "title": "Live triage on web01 (lab host)",
+        "prompt": "root@web01:~#",
+        "lines": [
+          {
+            "cmd": "script -a /mnt/evidence/web01_triage.log",
+            "output": "Script started, file is /mnt/evidence/web01_triage.log",
+            "comment": "سجّل الجلسة كاملة على وسيط خارجي."
+          },
+          {
+            "cmd": "date -u; hostname; uname -r",
+            "output": "Thu Nov 12 03:41:07 UTC 2026\nweb01\n5.15.0-91-generic",
+            "comment": "دوّن دائمًا الوقت بالتوقيت العالمي ونسخة النواة."
+          },
+          {
+            "cmd": "ss -tupan | grep LISTEN",
+            "output": "tcp LISTEN 0 128 0.0.0.0:22   0.0.0.0:* users:((\"sshd\",pid=811))\ntcp LISTEN 0 511 0.0.0.0:443  0.0.0.0:* users:((\"nginx\",pid=902))\ntcp LISTEN 0 5   0.0.0.0:48213 0.0.0.0:* users:((\"kworker-u\",pid=4821))",
+            "comment": "المنفذ 48213 لعملية باسم يشبه خيط نواة أمر مريب."
+          },
+          {
+            "cmd": "ls -l /proc/4821/exe; cat /proc/4821/cmdline | tr '\\0' ' '",
+            "output": "lrwxrwxrwx 1 www-data www-data 0 Nov 12 03:10 /proc/4821/exe -> /tmp/.cache/kworker-u (deleted)\n/tmp/.cache/kworker-u -p 48213",
+            "comment": "الملف التنفيذي شُغّل من /tmp ثم حُذف، ونسخته الجارية ما زالت قابلة للاسترجاع من /proc."
+          },
+          {
+            "cmd": "last -F | head -3",
+            "output": "deploy   pts/0  198.51.100.23  Thu Nov 12 01:52:10 2026   still logged in\ndeploy   pts/0  192.0.2.10     Tue Nov 10 09:14:02 2026 - 09:41:55 2026",
+            "comment": "تسجيل دخول من عنوان غير مألوف."
+          }
+        ],
+        "caption": "مخرجات توضيحية. شغّل هذه الأوامر فقط على أجهزة المختبر أو الأنظمة المصرّح لك بفحصها."
+      },
+      {
+        "id": "persist",
+        "type": "text",
+        "markdown": "## افحص الاستمرارية والحسابات\n\nالمهاجم الذي يريد البقاء بعد إعادة التشغيل يغيّر عادةً موضعًا من عدد محدود من المواضع. افحص كلًا منها.\n\n- **الحسابات:** إدخالات جديدة في `/etc/passwd` بمعرّف UID صفر، أو مستخدمون لديهم صدفة وما كان ينبغي أن تكون لهم. قارن `/etc/sudoers` و`/etc/sudoers.d/`.\n- **مفاتيح SSH:** الملف `~/.ssh/authorized_keys` لكل مستخدم بما فيهم حسابات الخدمات.\n- **المهام المجدولة:** `/etc/crontab` و`/etc/cron.*` وجداول المستخدمين في `/var/spool/cron` والأمر `systemctl list-timers`.\n- **الخدمات:** وحدات أُنشئت حديثًا في `/etc/systemd/system` إضافةً إلى `rc.local`.\n- **خطّافات الصدفة والمكتبات:** `~/.bashrc` و`/etc/profile.d/` والملف `/etc/ld.so.preload` الذي ينبغي أن يكون فارغًا أو غائبًا عادةً.\n\nيغطي [كشف آليات الاستمرارية](/learn/security-operations-dfir/persistence-mechanism-detection) الفهرس الأوسع للتقنيات. سجّل مالكي الملفات وأوقات تعديلها قبل أن تغيّر أي شيء."
+      },
+      {
+        "id": "triage-sh",
+        "type": "code",
+        "language": "bash",
+        "code": "#!/bin/bash\n# Read-only persistence sweep. Output goes to external storage.\nOUT=/mnt/evidence/web01_persist\nmkdir -p \"$OUT\"\nawk -F: '$3==0{print}' /etc/passwd            > \"$OUT/uid0.txt\"\nfind /home /root -name authorized_keys -exec ls -l --time-style=full-iso {} + > \"$OUT/ssh_keys.txt\"\nfor u in $(cut -d: -f1 /etc/passwd); do crontab -l -u \"$u\" 2>/dev/null | sed \"s/^/$u: /\"; done > \"$OUT/crontabs.txt\"\nsystemctl list-unit-files --state=enabled > \"$OUT/enabled_units.txt\"\nfind /etc/systemd/system -type f -newermt '2026-11-01' -ls > \"$OUT/new_units.txt\"\ncat /etc/ld.so.preload 2>&1               > \"$OUT/ld_preload.txt\"\nsha256sum \"$OUT\"/* > \"$OUT/SHA256SUMS\"",
+        "filename": "persistence_sweep.sh",
+        "caption": "سكربت صغير للقراءة فقط. يكتب في مخزن الأدلة فقط ويحسب تجزئة مخرجاته."
+      },
+      {
+        "id": "scope",
+        "type": "text",
+        "markdown": "## حدّد النطاق قبل أن تحدد العلاج\n\nنادرًا ما تخبرك عملية مشبوهة واحدة كيف وصل المهاجم. اطرح ثلاثة أسئلة قبل أن يقترح أحد حلًا.\n\n1. **المدخل:** كيف دخل الفاعل؟ انظر إلى سجل وصول خادم الويب حول أول تسجيل دخول مشبوه، وإلى الخدمات المكشوفة، وإلى بيانات الاعتماد المسروقة أو المعاد استخدامها.\n2. **المدى:** أي حسابات ومفاتيح وأسرار على هذا الجهاز كان بوسع الفاعل قراءتها؟ كثيرًا ما تحتوي ملفات إعداد التطبيقات ومتغيرات البيئة على كلمات مرور قواعد البيانات ورموز واجهات البرمجة التي يجب تدويرها.\n3. **الانتشار:** هل اتصل هذا الجهاز بأجهزة أخرى؟ افحص `~/.ssh/known_hosts` وسجل الأوامر والاتصالات الصادرة بحثًا عن عناوين داخلية.\n\nتحوّل هذه الإجابات خادمًا مصابًا واحدًا إلى حادثة محددة بقائمة بيانات اعتماد لإعادة ضبطها وأجهزة مجاورة للفحص. وبدونها تعيد بناء الخادم فيبقى الباب نفسه مفتوحًا."
+      },
+      {
+        "id": "note",
+        "type": "callout",
+        "variant": "note",
+        "title": "احتفظ بملاحظاتك",
+        "markdown": "دوّن كل نتيجة أثناء العمل: ما رأيته والأمر الذي أظهره والوقت بالتوقيت العالمي ومسار الملف. الملاحظات المكتوبة لاحقًا من الذاكرة دليل ضعيف وتبطئ من يستلم ورديتك."
+      },
+      {
+        "id": "logs",
+        "type": "text",
+        "markdown": "## اقرأ السجلات وتحقق من الحزم\n\nتوجد سجلات المصادقة في `/var/log/auth.log` على أنظمة Debian وفي `/var/log/secure` على أنظمة Red Hat. وعلى المضيفات التي تعمل بـ systemd يقرأ الأمر `journalctl` السجل. ابحث عن `Accepted` (تسجيلات الدخول الناجحة) و`Failed password` و`sudo` و`session opened`. سلسلة إخفاقات تعقبها نجاح من العنوان نفسه هي النمط الكلاسيكي. وستجد تقنيات مصادقة أخرى في [التحقيق في سجلات المصادقة](/learn/security-operations-dfir/authentication-log-investigation).\n\nبعد ذلك اختبر هل عُدّلت ملفات النظام. تخزّن مديرات الحزم المجاميع الاختبارية فيمكنك المقارنة دون معرفة ما غيّره المهاجم:\n\n- Debian وUbuntu: `debsums -c`\n- RHEL وFedora وSUSE: `rpm -Va`\n\nتعديل `/usr/bin/ssh` أو `/bin/ls` نتيجة خطيرة. وتذكّر أن حزمة إخفاء (Rootkit) قد تتخفى من أدوات الجهاز نفسه، لذا قارن النتائج بعرض غير متصل للقرص."
+      },
+      {
+        "id": "log-term",
+        "type": "terminal",
+        "title": "Logs and integrity",
+        "prompt": "root@web01:~#",
+        "lines": [
+          {
+            "cmd": "grep -E 'Failed password|Accepted' /var/log/auth.log | tail -4",
+            "output": "Nov 12 01:49:30 web01 sshd[3102]: Failed password for deploy from 198.51.100.23 port 51022 ssh2\nNov 12 01:49:34 web01 sshd[3104]: Failed password for deploy from 198.51.100.23 port 51030 ssh2\nNov 12 01:52:10 web01 sshd[3188]: Accepted password for deploy from 198.51.100.23 port 51114 ssh2",
+            "comment": "إخفاقات ثم نجاح: كلمة مرور مُخمَّنة أو مُعاد استخدامها على الأرجح."
+          },
+          {
+            "cmd": "journalctl -u cron --since '2026-11-12 01:50' --no-pager | tail -2",
+            "output": "Nov 12 02:01:01 web01 CRON[3301]: (deploy) CMD (/tmp/.cache/kworker-u -p 48213 >/dev/null 2>&1)",
+            "comment": "يشغّل cron الملف التنفيذي نفسه."
+          },
+          {
+            "cmd": "debsums -c 2>/dev/null",
+            "output": "/usr/bin/ssh",
+            "comment": "ملف ضمن حزمة لم تعد مجموعته الاختبارية مطابقة."
+          }
+        ],
+        "caption": "مخرجات توضيحية من جهاز مختبر."
+      },
+      {
+        "id": "timeline",
+        "type": "text",
+        "markdown": "## ابنِ جدولًا زمنيًا واحفظ الأدلة\n\nحين تعرف ملفًا خبيثًا أو وقتًا واحدًا فانظر حوله. يستخدم الجدول الزمني السريع للملفات الأمر `find` مع `-newermt` لسرد الملفات التي تغيّرت خلال نافذة الحادثة، أو `stat` لأوقات دقيقة. تذكّر أن Linux يحتفظ بأوقات التعديل والوصول وتغيير العقدة (inode)، وأن المهاجم يستطيع تغيير وقت التعديل لكن يصعب عليه تغيير وقت تغيير العقدة.\n\nوللحفظ انسخ الملفات المجموعة إلى وسيط خارجي للقراءة فقط، واحسب SHA-256 لكل منها، وسجّل مَن تعامل معها ومتى. هذه سلسلة الحيازة (Chain of custody) هي ما يجعل نتائجك صالحة للاستخدام لاحقًا. وتغطي [استعادة الحوادث وإعادة بناء الأنظمة](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding) خطوات التعافي."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تُعد التشغيل ولا تنظّف أولًا",
+        "markdown": "إعادة تشغيل الخادم أو حذف الملف المشبوه تزيل صورة الذاكرة وقائمة العمليات والملف التنفيذي المحذوف المفتوح. إن اضطررت لإيقاف الخدمة للسلامة فاعزل الجهاز عن الشبكة وأبقِه قيد التشغيل حتى تلتقط الذاكرة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في آلة افتراضية Linux مؤقتة تملكها، أنشئ مستخدمًا باسم `labuser` وأضف إدخال cron يُلحق التاريخ بالملف `/tmp/lab.log` كل دقيقة، وأضف مفتاحًا عامًا غير ضار إلى `authorized_keys` الخاص به. ثم شغّل سكربت فحص الاستمرارية أعلاه دون النظر إلى ملاحظات إعدادك. تأكد من أن المخرجات تجد التغييرات الثلاثة، ودوّن أوقات الملفات التي ستستخدمها لوضعها على جدول زمني."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسية",
+        "items": [
+          {
+            "term": "ترتيب التطاير (Order of volatility)",
+            "definition": "تسلسل جمع الأدلة من البيانات الأسرع زوالًا إلى الأطول بقاءً."
+          },
+          {
+            "term": "الفرز الحي (Live triage)",
+            "definition": "جمع سريع من نظام قيد التشغيل لتقرير الخطوة التالية."
+          },
+          {
+            "term": "/proc",
+            "definition": "نظام ملفات افتراضي يعرض العمليات الجارية وبيانات النواة."
+          },
+          {
+            "term": "authorized_keys",
+            "definition": "ملف يسرد مفاتيح SSH العامة المسموح لها بتسجيل الدخول كمستخدم."
+          },
+          {
+            "term": "حزمة الإخفاء (Rootkit)",
+            "definition": "برنامج يُخفي ملفات المهاجم أو عملياته أو اتصالاته."
+          },
+          {
+            "term": "debsums / rpm -V",
+            "definition": "أدوات تقارن الملفات المثبتة بالمجاميع الاختبارية للحزمة."
+          },
+          {
+            "term": "سلسلة الحيازة (Chain of custody)",
+            "definition": "سجل يبيّن مَن تعامل مع الدليل ومتى."
+          },
+          {
+            "term": "ctime",
+            "definition": "وقت تغيير العقدة، ويصعب على المهاجم تزويره أكثر من mtime."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي عنصر ينبغي جمعه أولًا على جهاز Linux قيد التشغيل؟",
+            "options": [
+              "ملفات /var/log",
+              "محتويات الذاكرة",
+              "قائمة الحزم المثبتة",
+              "أشرطة النسخ الاحتياطي"
+            ],
+            "answer": 1,
+            "explanation": "الذاكرة هي الأكثر تطايرًا وتضيع عند إعادة التشغيل أو الإيقاف، لذا تُجمع أولًا."
+          },
+          {
+            "question": "أي المواضع شائعة للاستمرارية في Linux؟ اختر كل ما ينطبق.",
+            "options": [
+              "authorized_keys",
+              "إدخالات cron",
+              "/etc/ld.so.preload",
+              "مجلد /usr/share/doc فقط"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "مفاتيح SSH والمهام المجدولة وتحميل المكتبات المسبق تبقى بعد إعادة التشغيل، أما مجلدات التوثيق فليست نقاط تنفيذ."
+          },
+          {
+            "question": "تُظهر العملية `/tmp/.cache/kworker-u (deleted)` في /proc/PID/exe. ماذا يدل ذلك؟",
+            "options": [
+              "خيط نواة عادي",
+              "ملف تنفيذي شُغّل ثم أُزيل من القرص وهذا يستدعي التحقيق",
+              "القرص ممتلئ",
+              "العملية تتبع systemd"
+            ],
+            "answer": 1,
+            "explanation": "خيوط النواة الحقيقية لا مسار تنفيذيًا لها، وملف محذوف ما زال يعمل علامة شائعة على الإخفاء."
+          },
+          {
+            "question": "ما الممارسات الجيدة أثناء الفرز الحي؟ اختر كل ما ينطبق.",
+            "options": [
+              "كتابة المخرجات على وسيط خارجي",
+              "استخدام أدوات موثوقة من وسيط للقراءة فقط",
+              "تسجيل كل أمر مع الوقت",
+              "تشغيل تنظيف للنظام لاحقًا على القرص المشتبه به"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "هذه الممارسات تحفظ الأدلة وتجعل العمل قابلًا للتكرار، أما التنظيف على القرص المشتبه به فيغيّر الأدلة."
+          },
+          {
+            "question": "لماذا يفيد `rpm -Va` أو `debsums -c` دون معرفة الهجوم مسبقًا؟",
+            "options": [
+              "لأنها تكشف كل البرمجيات الخبيثة بالاسم",
+              "لأنها تقارن الملفات المثبتة بمجاميع الحزمة وتكشف الملفات المعدلة",
+              "لأنها تحجب الحركة الصادرة",
+              "لأنها تستعيد السجلات المحذوفة"
+            ],
+            "answer": 1,
+            "explanation": "أي ملف ضمن حزمة تغيّر مجموعه الاختبارية عُدّل بعد التثبيت ويستحق نظرة أدق."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتنجح الاستجابة في Linux بالترتيب وضبط النفس. اجمع الذاكرة والحالة الحية أولًا، واكتب كل شيء على وسيط خارجي، وسجّل أوامرك أنت. راجع الحسابات ومفاتيح SSH والمهام المجدولة والخدمات وملفات التحميل المسبق بحثًا عن الاستمرارية. اقرأ سجلات المصادقة وتحقق من الحزم بمجاميعها الاختبارية، ثم ابنِ جدولًا زمنيًا حول أول أثر خبيث. جزّئ كل عنصر وخزّنه مع سلسلة حيازة. تابع مع أجهزة Windows في [الاستجابة للحوادث في Windows](/learn/security-operations-dfir/windows-incident-response)."
+      }
+    ]
+  }
+}

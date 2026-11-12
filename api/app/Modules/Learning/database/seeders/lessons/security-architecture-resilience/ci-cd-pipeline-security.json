@@ -1,0 +1,556 @@
+{
+ "slug": "ci-cd-pipeline-security",
+ "title": "CI/CD Pipeline Security",
+ "summary": "Harden build and deploy pipelines: least-privilege tokens, OIDC instead of stored keys, pinned dependencies, secret and dependency scanning, and signed artifacts.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Map the threats along a CI/CD pipeline",
+  "Harden a workflow with scoped tokens and pinned actions",
+  "Replace stored cloud keys with OIDC federation",
+  "Add secret and dependency scanning gates",
+  "Produce SBOMs and sign and verify artifacts"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A CI/CD pipeline is the most trusted system in many companies. It holds the cloud credentials, the signing keys and the right to change production, and it runs code from anyone who can open a pull request. If an attacker controls the pipeline, they do not need to break into production, because production will accept anything the pipeline delivers.\n\nThis is why attackers target build systems, and why incidents involving a poisoned dependency or a leaked token spread so widely. **CI/CD pipeline security** treats the pipeline as a production system in its own right: it has identities, secrets, inputs and outputs, and each needs a control. In this lesson you will map the threats, harden a real workflow and add the gates that stop bad code before release."
+  },
+  {
+   "id": "threats",
+   "type": "text",
+   "markdown": "## Step 1: Map the threats to the pipeline\n\nThink of the pipeline as a path with five exposure points.\n\n| Stage | Threat | Defensive control |\n|:--|:--|:--|\n| Source | Unreviewed or forged commits | Branch protection, signed commits, code owners |\n| Build inputs | Poisoned dependency or action | Lock files, pinned versions, SCA scanning |\n| Build environment | Untrusted pull request runs with secrets | Separate trusted and untrusted workflows |\n| Secrets and identity | Long-lived token leaked in logs | OIDC, short-lived tokens, masking |\n| Artifacts | Tampered image or package | Signing, provenance, SBOM |\n| Deploy | Over-privileged deploy role | Environment approvals, scoped roles |\n\nTwo patterns deserve special attention. In **poisoned pipeline execution**, an attacker changes the workflow file or a script it calls, in a pull request, so that the pipeline runs attacker-controlled commands with the pipeline's privileges. In a **supply chain compromise**, the attacker alters something the build trusts, such as a package or a third-party action. Both are defeated by the same idea: do not give untrusted code access to trusted secrets."
+  },
+  {
+   "id": "yaml",
+   "type": "code",
+   "language": "yaml",
+   "filename": ".github/workflows/build.yml",
+   "code": "name: build\non:\n  pull_request:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read            # default: read-only token\n\njobs:\n  test-and-scan:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@<full-commit-sha>   # pinned, not a movable tag\n        with:\n          persist-credentials: false\n      - name: Secret scan\n        run: gitleaks detect --source . --redact --exit-code 1\n      - name: Dependency scan\n        run: trivy fs --severity HIGH,CRITICAL --exit-code 1 .\n      - name: Unit tests\n        run: make test\n\n  deploy:\n    needs: test-and-scan\n    if: github.ref == 'refs/heads/main'\n    runs-on: ubuntu-24.04\n    environment: production         # requires reviewer approval\n    permissions:\n      id-token: write               # allow OIDC token request\n      contents: read\n    steps:\n      - uses: actions/checkout@<full-commit-sha>\n      - name: Assume deploy role via OIDC\n        run: ./scripts/assume-role.sh arn:aws:iam::123456789012:role/deploy-app\n      - name: Deploy\n        run: ./scripts/deploy.sh",
+   "highlight": [
+    9,
+    10,
+    16,
+    29,
+    31,
+    32
+   ],
+   "caption": "Read-only default token, pinned actions, scans that fail the build, a protected environment and OIDC instead of stored keys."
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Keyless deploy with OpenID Connect",
+   "data": {
+    "actors": [
+     {
+      "id": "job",
+      "label": "Pipeline job",
+      "sub": "main branch",
+      "icon": "cpu"
+     },
+     {
+      "id": "idp",
+      "label": "CI identity provider",
+      "sub": "issues OIDC token",
+      "icon": "key"
+     },
+     {
+      "id": "cloud",
+      "label": "Cloud IAM",
+      "sub": "trust policy",
+      "icon": "cloud"
+     },
+     {
+      "id": "prod",
+      "label": "Production",
+      "sub": "203.0.113.20",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "job",
+      "to": "idp",
+      "label": "Request ID token",
+      "detail": "aud=sts",
+      "note": "The approved deploy job asks for a signed token that names the repository, branch and environment."
+     },
+     {
+      "from": "idp",
+      "to": "job",
+      "label": "Signed JWT",
+      "detail": "sub=repo:acme/app:environment:production",
+      "tone": "secure",
+      "note": "The token lives for minutes and cannot be reused elsewhere."
+     },
+     {
+      "from": "job",
+      "to": "cloud",
+      "label": "Assume role with token",
+      "note": "The job presents the token to the cloud provider."
+     },
+     {
+      "from": "cloud",
+      "to": "cloud",
+      "label": "Check trust policy",
+      "detail": "repo + branch + environment",
+      "tone": "secure",
+      "note": "The role trusts only this repository, this branch and this environment."
+     },
+     {
+      "from": "cloud",
+      "to": "job",
+      "label": "Temporary credentials",
+      "detail": "expires in 15 min",
+      "tone": "success",
+      "note": "No long-lived key was ever stored in the pipeline."
+     },
+     {
+      "from": "job",
+      "to": "prod",
+      "label": "Deploy release",
+      "tone": "success",
+      "note": "Anything outside the trusted branch is refused at the trust-policy step."
+     }
+    ]
+   }
+  },
+  {
+   "id": "secrets",
+   "type": "text",
+   "markdown": "## Step 2: Control secrets and identities\n\nFour rules cover most of the risk.\n\n1. **No long-lived cloud keys in CI variables.** Use OIDC federation, as in the animation, so each run receives a temporary credential tied to a repository, branch and environment.\n2. **Scope each secret.** Store secrets at environment level, not for the whole organization, and require approval to use the production ones.\n3. **Keep untrusted code away from secrets.** Pull requests from forks should run without secrets. Never run `pull_request_target` workflows that check out and execute the pull request's code.\n4. **Never print secrets.** Masking is a safety net that fails when a value is transformed, for example base64-encoded. Review scripts that echo variables.\n\nAssume that a secret will leak eventually. Keep rotation fast, and write a runbook that lists where every secret is used. A leaked token that can be rotated in ten minutes is an inconvenience. One that nobody can find is an incident. For storage patterns, see [Secrets Vaults and Password Managers](/learn/security-architecture-resilience/secrets-vaults-and-password-managers)."
+  },
+  {
+   "id": "term",
+   "type": "terminal",
+   "title": "A secret scan that blocks the build",
+   "lines": [
+    {
+     "cmd": "gitleaks detect --source . --redact --exit-code 1",
+     "prompt": "$",
+     "output": "Finding:     DB_PASSWORD=REDACTED\nSecret:      REDACTED\nRuleID:      generic-api-key\nFile:        config/settings.py\nLine:        14\nCommit:      3f2a9c1\nAuthor:      dev@example.com\n\n1 leaks found",
+     "comment": "The scan found a password committed in settings.py. Exit code 1 fails the job."
+    },
+    {
+     "cmd": "echo $?",
+     "prompt": "$",
+     "output": "1",
+     "comment": "Removing the line is not enough: the secret stays in git history, so rotate it."
+    }
+   ]
+  },
+  {
+   "id": "artifacts",
+   "type": "text",
+   "markdown": "## Step 3: Protect what the pipeline produces\n\nA build that passes tests still has to prove where it came from.\n\n- **Generate an SBOM** (software bill of materials) so you can answer \"which builds contain this vulnerable library?\" within minutes.\n- **Sign artifacts and images** with a tool such as Cosign, and make the deploy step verify the signature. An unsigned image is rejected.\n- **Record provenance**: which commit, which workflow and which runner produced the artifact.\n- **Build once, promote the same artifact** through test, staging and production, instead of rebuilding for each environment.\n- **Harden runners.** Use ephemeral runners that are destroyed after each job. Self-hosted runners that persist between jobs can carry malware from one job to the next.\n\nFinally, log and alert on pipeline events: changes to workflow files, new secrets, new runners and disabled checks. Weakening a gate is itself a security-relevant change. Findings from these scans can also feed the reporting pipeline in [Automated Vulnerability Reporting](/learn/security-architecture-resilience/automated-vulnerability-reporting)."
+  },
+  {
+   "id": "source",
+   "type": "text",
+   "markdown": "## Step 4: Protect the source and the people\n\nThe pipeline trusts whatever reaches the protected branch, so the rules for that branch are the first gate.\n\n| Setting | Why it matters |\n|:--|:--|\n| Require pull requests and one or two approvals | No single person can ship code alone |\n| Dismiss stale approvals on new commits | A reviewer cannot be bypassed by a later change |\n| Require status checks | Scans and tests must pass before merge |\n| Code owners for `.github/workflows/` and deploy scripts | Security approves changes to the pipeline itself |\n| Block force pushes and deletions | History stays trustworthy |\n| Require signed commits for release branches | Authorship is verifiable |\n\nApply the same discipline to accounts. Enforce MFA for everyone with write access, use hardware keys for administrators, and review who holds repository admin rights every quarter. Bots and automation accounts need owners just like service accounts do, and their tokens should expire.\n\nFinally, test the pipeline's defenses. A quarterly exercise in which a trusted engineer, with permission, tries to run an unreviewed workflow change shows whether the gates really hold. If the change goes through, you have found the gap before an attacker did. Record the result and the fix as evidence for audits."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Tags can move",
+   "markdown": "A version tag such as `@v4` can be repointed by whoever controls the action's repository. Pin third-party actions to a full commit hash, and let a dependency bot propose updates that you review. For actions you do not trust, copy the code into an internal repository and use that."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Harden a workflow in a private test repository you own.\n\n1. Create a workflow that runs tests with no `permissions` block, and note the default token scope in the run log.\n2. Add `permissions: contents: read` at the top and rerun.\n3. Replace one `uses:` tag with a pinned commit hash.\n4. Commit a fake token such as `API_KEY=EXAMPLE-NOT-A-REAL-KEY`, run the secret scan and watch the build fail.\n5. Protect the main branch so pull requests require a review and passing checks.\n6. Add a `production` environment that requires a reviewer.\n\nList which threat from the table in Step 1 each change reduced."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "CI/CD",
+     "definition": "Automation that builds, tests and deploys code on every change."
+    },
+    {
+     "term": "OIDC federation",
+     "definition": "Exchanging a signed job token for temporary cloud credentials."
+    },
+    {
+     "term": "Poisoned pipeline execution",
+     "definition": "Abusing workflow definitions to run attacker commands with pipeline privileges."
+    },
+    {
+     "term": "SBOM",
+     "definition": "Inventory of the components inside a build."
+    },
+    {
+     "term": "Provenance",
+     "definition": "Verifiable record of how and where an artifact was built."
+    },
+    {
+     "term": "SCA",
+     "definition": "Software composition analysis: scanning dependencies for known flaws."
+    },
+    {
+     "term": "Ephemeral runner",
+     "definition": "Build machine created for one job and destroyed afterward."
+    },
+    {
+     "term": "Branch protection",
+     "definition": "Rules requiring review and passing checks before merging."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What is the main advantage of OIDC federation over stored cloud keys?",
+     "options": [
+      "It makes builds faster",
+      "Each run gets short-lived credentials bound to repo, branch and environment",
+      "It removes the need for IAM roles",
+      "It disables logging"
+     ],
+     "answer": 1,
+     "explanation": "There is no durable key to steal, and the trust policy limits where the token works."
+    },
+    {
+     "question": "Which practices reduce supply chain risk? (choose all that apply)",
+     "options": [
+      "Pin actions to commit hashes",
+      "Use lock files for dependencies",
+      "Reference actions by floating tags",
+      "Verify signatures before deploy"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Pinning, locking and verification fix what you trust. Floating tags let it change silently."
+    },
+    {
+     "question": "Why should forked pull requests run without secrets?",
+     "options": [
+      "Forks are slower",
+      "The code is untrusted and could read or send the secrets",
+      "Secrets expire on forks",
+      "It is required by git"
+     ],
+     "answer": 1,
+     "explanation": "Untrusted code must never run alongside trusted credentials."
+    },
+    {
+     "question": "A scan finds a committed password. What must you do besides deleting the line?",
+     "options": [
+      "Nothing else",
+      "Rotate the secret, because it remains in history",
+      "Rename the file",
+      "Disable the scanner"
+     ],
+     "answer": 1,
+     "explanation": "Anyone with repository access can read old commits. Treat the secret as compromised."
+    },
+    {
+     "question": "Why use ephemeral runners?",
+     "options": [
+      "They are cheaper in every case",
+      "State and malware cannot persist from one job to the next",
+      "They need no network",
+      "They skip scanning"
+     ],
+     "answer": 1,
+     "explanation": "A fresh machine per job removes a path for cross-job contamination."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- The pipeline holds privileges and runs outside code, so protect it like production.\n- Use read-only default tokens, pinned dependencies and branch protection.\n- Replace stored keys with OIDC and keep untrusted code away from secrets.\n- Scan for secrets and vulnerable dependencies, and fail the build.\n- Produce an SBOM, sign artifacts and verify them before deploy.\n\nNext: [Detection as Code](/learn/security-architecture-resilience/detection-as-code) and [Security Testing and Validation Automation](/learn/security-architecture-resilience/security-testing-and-validation-automation)."
+  }
+ ],
+ "ar": {
+  "title": "أمن خطوط CI/CD",
+  "summary": "حصّن خطوط البناء والنشر بالرموز الأدنى صلاحية وOIDC بدل المفاتيح المخزنة والتبعيات المثبتة وفحص الأسرار والتبعيات والنواتج الموقّعة.",
+  "objectives": [
+   "رسم خريطة التهديدات على امتداد خط CI/CD",
+   "تحصين مسار عمل برموز محدودة وإجراءات مثبتة",
+   "استبدال المفاتيح السحابية المخزنة باتحاد OIDC",
+   "إضافة بوابات فحص الأسرار والتبعيات",
+   "توليد SBOM وتوقيع النواتج والتحقق منها"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "نظام CI/CD هو في كثير من الشركات أكثر الأنظمة ثقةً. ففيه اعتماديات السحابة ومفاتيح التوقيع وحق تغيير الإنتاج، وهو ينفّذ شيفرة أي شخص يستطيع فتح طلب دمج. فإذا سيطر مهاجم على خط المعالجة لم يحتج إلى اختراق الإنتاج، لأن الإنتاج سيقبل كل ما يسلّمه الخط.\n\nلهذا تستهدف الهجمات أنظمة البناء، ولهذا تنتشر الحوادث المرتبطة بتبعية مسمومة أو رمز مسرّب على نطاق واسع. و**أمن خطوط CI/CD (CI/CD Pipeline Security)** يعامل الخط كنظام إنتاج قائم بذاته: له هويات وأسرار ومدخلات ومخرجات، ولكل منها ضابط. في هذا الدرس سترسم خريطة التهديدات، وتحصّن مسار عمل حقيقيًا، وتضيف البوابات التي توقف الشيفرة السيئة قبل الإصدار."
+   },
+   {
+    "id": "threats",
+    "type": "text",
+    "markdown": "## الخطوة 1: ارسم خريطة التهديدات على الخط\n\nتخيّل الخط مسارًا فيه خمس نقاط انكشاف.\n\n| المرحلة | التهديد | الضابط الدفاعي |\n|:--|:--|:--|\n| المصدر | إيداعات بلا مراجعة أو مزوّرة | حماية الفروع، إيداعات موقّعة، ملاك الشيفرة |\n| مدخلات البناء | تبعية أو إجراء مسموم | ملفات القفل، إصدارات مثبتة، فحص SCA |\n| بيئة البناء | طلب دمج غير موثوق يعمل ومعه الأسرار | فصل مسارات العمل الموثوقة عن غير الموثوقة |\n| الأسرار والهوية | رمز طويل العمر مسرّب في السجلات | OIDC، رموز قصيرة العمر، إخفاء القيم |\n| النواتج | صورة أو حزمة معبوث بها | التوقيع، المنشأ، SBOM |\n| النشر | دور نشر مفرط الصلاحيات | موافقات البيئة، أدوار محدودة |\n\nوثمة نمطان يستحقان عناية خاصة. ففي **تنفيذ الخط المسموم (Poisoned Pipeline Execution)** يغيّر المهاجم ملف مسار العمل أو سكربتًا يستدعيه ضمن طلب دمج، فينفّذ الخط أوامر يتحكم بها المهاجم بصلاحيات الخط. وفي **اختراق سلسلة التوريد (Supply Chain Compromise)** يعدّل المهاجم شيئًا يثق به البناء، كحزمة أو إجراء من طرف ثالث. ويهزم الفكرة نفسها كلا النمطين: لا تمنح شيفرة غير موثوقة وصولًا إلى أسرار موثوقة."
+   },
+   {
+    "id": "yaml",
+    "type": "code",
+    "language": "yaml",
+    "filename": ".github/workflows/build.yml",
+    "code": "name: build\non:\n  pull_request:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read            # default: read-only token\n\njobs:\n  test-and-scan:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@<full-commit-sha>   # pinned, not a movable tag\n        with:\n          persist-credentials: false\n      - name: Secret scan\n        run: gitleaks detect --source . --redact --exit-code 1\n      - name: Dependency scan\n        run: trivy fs --severity HIGH,CRITICAL --exit-code 1 .\n      - name: Unit tests\n        run: make test\n\n  deploy:\n    needs: test-and-scan\n    if: github.ref == 'refs/heads/main'\n    runs-on: ubuntu-24.04\n    environment: production         # requires reviewer approval\n    permissions:\n      id-token: write               # allow OIDC token request\n      contents: read\n    steps:\n      - uses: actions/checkout@<full-commit-sha>\n      - name: Assume deploy role via OIDC\n        run: ./scripts/assume-role.sh arn:aws:iam::123456789012:role/deploy-app\n      - name: Deploy\n        run: ./scripts/deploy.sh",
+    "highlight": [
+     9,
+     10,
+     16,
+     29,
+     31,
+     32
+    ],
+    "caption": "رمز افتراضي للقراءة فقط، وإجراءات مثبتة، وفحوص تُفشل البناء، وبيئة محمية، وOIDC بدل المفاتيح المخزنة."
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "نشر بلا مفاتيح عبر OpenID Connect",
+    "data": {
+     "actors": [
+      {
+       "id": "job",
+       "label": "مهمة الخط",
+       "sub": "main branch",
+       "icon": "cpu"
+      },
+      {
+       "id": "idp",
+       "label": "مزوّد هوية CI",
+       "sub": "issues OIDC token",
+       "icon": "key"
+      },
+      {
+       "id": "cloud",
+       "label": "IAM السحابة",
+       "sub": "trust policy",
+       "icon": "cloud"
+      },
+      {
+       "id": "prod",
+       "label": "الإنتاج",
+       "sub": "203.0.113.20",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "job",
+       "to": "idp",
+       "label": "طلب رمز الهوية",
+       "detail": "aud=sts",
+       "note": "تطلب مهمة النشر المعتمدة رمزًا موقّعًا يسمّي المستودع والفرع والبيئة."
+      },
+      {
+       "from": "idp",
+       "to": "job",
+       "label": "JWT موقّع",
+       "detail": "sub=repo:acme/app:environment:production",
+       "tone": "secure",
+       "note": "يعيش الرمز دقائق ولا يمكن إعادة استخدامه في مكان آخر."
+      },
+      {
+       "from": "job",
+       "to": "cloud",
+       "label": "تولّي الدور بالرمز",
+       "note": "تقدّم المهمة الرمز إلى مزود السحابة."
+      },
+      {
+       "from": "cloud",
+       "to": "cloud",
+       "label": "فحص سياسة الثقة",
+       "detail": "repo + branch + environment",
+       "tone": "secure",
+       "note": "يثق الدور بهذا المستودع وهذا الفرع وهذه البيئة فقط."
+      },
+      {
+       "from": "cloud",
+       "to": "job",
+       "label": "اعتماديات مؤقتة",
+       "detail": "expires in 15 min",
+       "tone": "success",
+       "note": "لم يُخزَّن أي مفتاح طويل العمر في الخط."
+      },
+      {
+       "from": "job",
+       "to": "prod",
+       "label": "نشر الإصدار",
+       "tone": "success",
+       "note": "يُرفض أي شيء خارج الفرع الموثوق عند خطوة سياسة الثقة."
+      }
+     ]
+    }
+   },
+   {
+    "id": "secrets",
+    "type": "text",
+    "markdown": "## الخطوة 2: تحكّم في الأسرار والهويات\n\nأربع قواعد تغطي معظم الخطر.\n\n1. **لا مفاتيح سحابية طويلة العمر في متغيرات CI.** استخدم اتحاد OIDC كما في الرسم المتحرك، فتتلقى كل عملية تشغيل اعتمادية مؤقتة مرتبطة بمستودع وفرع وبيئة.\n2. **حدّد نطاق كل سر.** خزّن الأسرار على مستوى البيئة لا المؤسسة كلها، واشترط موافقة لاستخدام أسرار الإنتاج.\n3. **أبعد الشيفرة غير الموثوقة عن الأسرار.** ينبغي أن تعمل طلبات الدمج من النسخ المتفرعة (forks) بلا أسرار. ولا تشغّل أبدًا مسارات `pull_request_target` التي تسحب شيفرة طلب الدمج وتنفذها.\n4. **لا تطبع الأسرار أبدًا.** الإخفاء شبكة أمان تفشل حين تُحوَّل القيمة، كأن تُرمَّز بـ base64. راجع السكربتات التي تطبع المتغيرات.\n\nافترض أن السر سيتسرب يومًا ما. اجعل التدوير سريعًا، واكتب دليل تشغيل يسرد أماكن استخدام كل سر. فالرمز المسرّب الذي يمكن تدويره في عشر دقائق مجرد إزعاج، أما الذي لا يعرف أحد أين هو فحادثة. وللاطلاع على أنماط التخزين راجع [خزائن الأسرار ومديرو كلمات المرور](/learn/security-architecture-resilience/secrets-vaults-and-password-managers)."
+   },
+   {
+    "id": "term",
+    "type": "terminal",
+    "title": "فحص أسرار يوقف البناء",
+    "lines": [
+     {
+      "cmd": "gitleaks detect --source . --redact --exit-code 1",
+      "prompt": "$",
+      "output": "Finding:     DB_PASSWORD=REDACTED\nSecret:      REDACTED\nRuleID:      generic-api-key\nFile:        config/settings.py\nLine:        14\nCommit:      3f2a9c1\nAuthor:      dev@example.com\n\n1 leaks found",
+      "comment": "وجد الفحص كلمة مرور مودَعة في settings.py. رمز الخروج 1 يفشل المهمة."
+     },
+     {
+      "cmd": "echo $?",
+      "prompt": "$",
+      "output": "1",
+      "comment": "حذف السطر لا يكفي، فالسر يبقى في تاريخ git، لذا دوّره."
+     }
+    ]
+   },
+   {
+    "id": "artifacts",
+    "type": "text",
+    "markdown": "## الخطوة 3: احمِ ما ينتجه الخط\n\nالبناء الذي يجتاز الاختبارات يبقى عليه أن يثبت مصدره.\n\n- **ولّد SBOM** (قائمة مكونات البرمجيات) لتجيب في دقائق عن سؤال: أي البُنى تحوي هذه المكتبة الضعيفة؟\n- **وقّع النواتج والصور** بأداة مثل Cosign، واجعل خطوة النشر تتحقق من التوقيع. فالصورة غير الموقّعة تُرفض.\n- **سجّل المنشأ (Provenance)**: أي إيداع وأي مسار عمل وأي مُشغِّل أنتج الناتج.\n- **ابنِ مرة واحدة وروّج الناتج نفسه** عبر الاختبار والتهيئة والإنتاج بدل إعادة البناء لكل بيئة.\n- **حصّن المُشغِّلات.** استخدم مُشغِّلات مؤقتة تُدمَّر بعد كل مهمة. فالمُشغِّلات المستضافة ذاتيًا التي تبقى بين المهام قد تنقل برمجية خبيثة من مهمة إلى أخرى.\n\nوأخيرًا سجّل أحداث الخط ونبّه عليها: تغييرات ملفات مسار العمل، والأسرار الجديدة، والمُشغِّلات الجديدة، والفحوص المعطّلة. فإضعاف بوابة تغيير ذو صلة بالأمن بحد ذاته. ويمكن لنتائج هذه الفحوص أن تغذي خط التقارير في [الإبلاغ الآلي عن الثغرات](/learn/security-architecture-resilience/automated-vulnerability-reporting)."
+   },
+   {
+    "id": "source",
+    "type": "text",
+    "markdown": "## الخطوة 4: احمِ المصدر والأشخاص\n\nيثق الخط بكل ما يصل إلى الفرع المحمي، لذا فإن قواعد ذلك الفرع هي البوابة الأولى.\n\n| الإعداد | أهميته |\n|:--|:--|\n| اشتراط طلبات الدمج وموافقة أو موافقتين | لا يستطيع شخص واحد إصدار شيفرة بمفرده |\n| إسقاط الموافقات القديمة عند إيداعات جديدة | لا يمكن الالتفاف على المراجع بتغيير لاحق |\n| اشتراط نجاح فحوص الحالة | يجب أن تنجح الفحوص والاختبارات قبل الدمج |\n| ملاك الشيفرة لمجلد `.github/workflows/` وسكربتات النشر | يعتمد فريق الأمن تغييرات الخط نفسه |\n| منع الدفع القسري والحذف | يبقى التاريخ موثوقًا |\n| اشتراط إيداعات موقّعة لفروع الإصدار | تصبح هوية الكاتب قابلة للتحقق |\n\nوطبّق الانضباط نفسه على الحسابات. افرض المصادقة متعددة العوامل على كل من لديه صلاحية كتابة، واستخدم مفاتيح عتادية للمسؤولين، وراجع كل ربع سنة من يملك صلاحيات إدارة المستودع. وتحتاج الروبوتات وحسابات الأتمتة إلى مالكين كما تحتاجهم حسابات الخدمة، وينبغي أن تنتهي صلاحية رموزها.\n\nوأخيرًا اختبر دفاعات الخط. تمرين ربع سنوي يحاول فيه مهندس موثوق، بإذن، تشغيل تغيير في مسار العمل دون مراجعة يُظهر هل البوابات صامدة فعلًا. فإن مرّ التغيير فقد وجدت الثغرة قبل المهاجم. سجّل النتيجة والإصلاح دليلًا للتدقيق."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "الوسوم قابلة للتحريك",
+    "markdown": "يستطيع من يتحكم بمستودع الإجراء إعادة توجيه وسم إصدار مثل `@v4`. ثبّت إجراءات الأطراف الثالثة على معرّف إيداع كامل، ودع روبوت تبعيات يقترح التحديثات لتراجعها. وللإجراءات التي لا تثق بها انسخ الشيفرة إلى مستودع داخلي واستخدمه."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "حصّن مسار عمل في مستودع اختبار خاص تملكه.\n\n1. أنشئ مسار عمل يشغّل الاختبارات دون كتلة `permissions`، ولاحظ نطاق الرمز الافتراضي في سجل التشغيل.\n2. أضف `permissions: contents: read` في الأعلى وأعد التشغيل.\n3. استبدل وسم `uses:` واحدًا بمعرّف إيداع مثبّت.\n4. أودِع رمزًا وهميًا مثل `API_KEY=EXAMPLE-NOT-A-REAL-KEY`، وشغّل فحص الأسرار وراقب فشل البناء.\n5. احمِ الفرع الرئيسي بحيث تتطلب طلبات الدمج مراجعة وفحوصًا ناجحة.\n6. أضف بيئة `production` تتطلب مراجعًا.\n\nاذكر أي تهديد من جدول الخطوة 1 خفّضه كل تغيير."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "CI/CD",
+      "definition": "أتمتة تبني الشيفرة وتختبرها وتنشرها عند كل تغيير."
+     },
+     {
+      "term": "OIDC federation",
+      "definition": "استبدال رمز مهمة موقّع باعتماديات سحابية مؤقتة."
+     },
+     {
+      "term": "Poisoned pipeline execution",
+      "definition": "إساءة استخدام تعريفات مسار العمل لتنفيذ أوامر المهاجم بصلاحيات الخط."
+     },
+     {
+      "term": "SBOM",
+      "definition": "جرد للمكونات داخل البناء."
+     },
+     {
+      "term": "Provenance",
+      "definition": "سجل قابل للتحقق عن كيفية بناء الناتج ومكانه."
+     },
+     {
+      "term": "SCA",
+      "definition": "تحليل مكونات البرمجيات: فحص التبعيات بحثًا عن عيوب معروفة."
+     },
+     {
+      "term": "Ephemeral runner",
+      "definition": "جهاز بناء يُنشأ لمهمة واحدة ثم يُدمَّر."
+     },
+     {
+      "term": "Branch protection",
+      "definition": "قواعد تشترط المراجعة والفحوص الناجحة قبل الدمج."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما الميزة الرئيسية لاتحاد OIDC على المفاتيح السحابية المخزنة؟",
+      "options": [
+       "يجعل البناء أسرع",
+       "تحصل كل عملية على اعتماديات قصيرة العمر مرتبطة بالمستودع والفرع والبيئة",
+       "يلغي الحاجة إلى أدوار IAM",
+       "يعطّل التسجيل"
+      ],
+      "answer": 1,
+      "explanation": "لا يوجد مفتاح دائم يمكن سرقته، وسياسة الثقة تحدد أين يعمل الرمز."
+     },
+     {
+      "question": "أي الممارسات تخفض خطر سلسلة التوريد؟ (اختر كل ما ينطبق)",
+      "options": [
+       "تثبيت الإجراءات على معرّفات الإيداع",
+       "استخدام ملفات القفل للتبعيات",
+       "الإشارة إلى الإجراءات بوسوم متحركة",
+       "التحقق من التوقيعات قبل النشر"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "التثبيت والقفل والتحقق تحدد ما تثق به، أما الوسوم المتحركة فتتيح تغييره بصمت."
+     },
+     {
+      "question": "لماذا ينبغي أن تعمل طلبات الدمج من النسخ المتفرعة بلا أسرار؟",
+      "options": [
+       "النسخ المتفرعة أبطأ",
+       "الشيفرة غير موثوقة وقد تقرأ الأسرار أو ترسلها",
+       "تنتهي الأسرار في النسخ المتفرعة",
+       "يتطلبه git"
+      ],
+      "answer": 1,
+      "explanation": "ينبغي ألا تعمل شيفرة غير موثوقة إلى جانب اعتماديات موثوقة."
+     },
+     {
+      "question": "يجد الفحص كلمة مرور مودَعة. ماذا يجب أن تفعل إلى جانب حذف السطر؟",
+      "options": [
+       "لا شيء آخر",
+       "دوّر السر لأنه يبقى في التاريخ",
+       "غيّر اسم الملف",
+       "عطّل الفاحص"
+      ],
+      "answer": 1,
+      "explanation": "يستطيع كل من لديه وصول إلى المستودع قراءة الإيداعات القديمة، فاعتبر السر مخترقًا."
+     },
+     {
+      "question": "لماذا تُستخدم المُشغِّلات المؤقتة؟",
+      "options": [
+       "هي أرخص في كل الحالات",
+       "لا تبقى الحالة والبرمجيات الخبيثة من مهمة إلى التالية",
+       "لا تحتاج إلى شبكة",
+       "تتخطى الفحص"
+      ],
+      "answer": 1,
+      "explanation": "توفر آلة جديدة لكل مهمة مسدًّا أمام التلوث بين المهام."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يملك الخط صلاحيات وينفّذ شيفرة خارجية، فاحمِه كما تحمي الإنتاج.\n- استخدم رموزًا افتراضية للقراءة فقط، وتبعيات مثبتة، وحماية للفروع.\n- استبدل المفاتيح المخزنة بـ OIDC، وأبعد الشيفرة غير الموثوقة عن الأسرار.\n- افحص الأسرار والتبعيات الضعيفة، وأفشل البناء.\n- ولّد SBOM ووقّع النواتج وتحقق منها قبل النشر.\n\nالتالي: [الكشف كشيفرة](/learn/security-architecture-resilience/detection-as-code) و[أتمتة اختبار الأمان والتحقق منه](/learn/security-architecture-resilience/security-testing-and-validation-automation)."
+   }
+  ]
+ }
+}

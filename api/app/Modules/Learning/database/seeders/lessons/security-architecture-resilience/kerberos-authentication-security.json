@@ -1,0 +1,532 @@
+{
+ "slug": "kerberos-authentication-security",
+ "title": "Kerberos Authentication Security",
+ "summary": "Understand how Kerberos tickets prove identity, which weaknesses attackers target, and how to harden, audit and monitor Kerberos in a domain.",
+ "duration_minutes": 35,
+ "objectives": [
+  "Walk through the AS, TGS and AP exchanges and what each ticket proves",
+  "Explain why encryption types, SPNs and delegation shape the attack surface",
+  "Recognize the detection signals for Kerberoasting, AS-REP roasting and ticket forgery",
+  "Apply hardening: AES-only, strong service passwords, gMSA, Protected Users and krbtgt rotation",
+  "Read Kerberos event logs to investigate suspicious activity"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A security analyst notices something odd on a Monday: one ordinary user account requested service tickets for forty different services within two minutes, and every request used the older RC4 encryption type. No alert fired because each request was valid. It was a classic offline-cracking attempt against service account passwords.\n\n**Kerberos** is the default authentication protocol of Active Directory. Instead of sending passwords around, it hands out time-limited **tickets** that prove a user's identity to services. It is secure by design, but its security depends on configuration choices, password strength and monitoring. This lesson explains the protocol first and then how to defend it."
+  },
+  {
+   "id": "flow",
+   "type": "text",
+   "markdown": "## How the protocol works\n\nThree parties take part: the **client**, the **Key Distribution Center (KDC)** running on every domain controller, and the **service** the user wants. The KDC has two roles: the Authentication Service (AS) and the Ticket Granting Service (TGS).\n\n1. **AS exchange (AS-REQ/AS-REP).** The client proves it knows the user's key (derived from the password) and receives a **Ticket Granting Ticket (TGT)**, encrypted with the secret of the special `krbtgt` account.\n2. **TGS exchange (TGS-REQ/TGS-REP).** The client presents the TGT and asks for a **service ticket** for a specific service identified by its **service principal name (SPN)**, such as `HTTP/intranet.example.com`. The ticket is encrypted with the service account's secret.\n3. **AP exchange (AP-REQ).** The client sends the service ticket to the service. The service decrypts it with its own key and trusts the identity inside.\n\nBecause only the KDC and the target service know the keys, no password crosses the network after the first step. The tradeoff: **any authenticated user can request a service ticket for any SPN**, and the ticket is encrypted with the service account's key."
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Kerberos ticket flow",
+   "data": {
+    "actors": [
+     {
+      "id": "c",
+      "label": "Client",
+      "sub": "alice@EXAMPLE.COM",
+      "icon": "laptop"
+     },
+     {
+      "id": "kdc",
+      "label": "KDC",
+      "sub": "dc1.example.com",
+      "icon": "key"
+     },
+     {
+      "id": "s",
+      "label": "File service",
+      "sub": "cifs/files.example.com",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "c",
+      "to": "kdc",
+      "label": "AS-REQ",
+      "detail": "pre-auth timestamp",
+      "note": "The client proves it knows alice's key by encrypting a timestamp (pre-authentication)."
+     },
+     {
+      "from": "kdc",
+      "to": "c",
+      "label": "AS-REP",
+      "detail": "TGT + session key",
+      "note": "The KDC returns a TGT encrypted with the krbtgt key; the client cannot read it.",
+      "tone": "secure"
+     },
+     {
+      "from": "c",
+      "to": "kdc",
+      "label": "TGS-REQ",
+      "detail": "TGT + SPN",
+      "note": "The client asks for a ticket to cifs/files.example.com using its TGT."
+     },
+     {
+      "from": "kdc",
+      "to": "c",
+      "label": "TGS-REP",
+      "detail": "service ticket",
+      "note": "The KDC returns a service ticket encrypted with the file server's key.",
+      "tone": "secure"
+     },
+     {
+      "from": "c",
+      "to": "s",
+      "label": "AP-REQ",
+      "detail": "service ticket + authenticator",
+      "note": "The client presents the ticket plus a fresh authenticator that prevents replay."
+     },
+     {
+      "from": "s",
+      "to": "c",
+      "label": "AP-REP",
+      "detail": "mutual authentication",
+      "note": "The service proves its own identity back to the client.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "surface",
+   "type": "text",
+   "markdown": "## Where the attack surface is\n\nKerberos is not \"broken\", but several behaviors are useful to attackers, so each needs a matching control.\n\n| Technique | Why it works | Detection | Defense |\n|:--|:--|:--|:--|\n| Kerberoasting | Any user can request a ticket for a user-account SPN and crack its password offline | Many 4769 events from one account, encryption type 0x17 | Long random service passwords, gMSA, AES-only |\n| AS-REP roasting | Accounts with pre-authentication disabled return crackable data | 4768 for accounts with pre-auth not required | Never disable pre-authentication |\n| Golden ticket | Stolen `krbtgt` key forges any TGT | TGTs with odd lifetimes, tickets without matching 4768 | Rotate `krbtgt`, protect DCs |\n| Silver ticket | Stolen service key forges tickets for that service | 4624 on a service without a matching 4769 | gMSA, service password hygiene |\n| Delegation abuse | Services impersonate users to other services | Changes to delegation attributes | Constrained delegation, \"Account is sensitive\" flag |\n\nThese are named so you can recognize them in reports and in your own detections. The point of knowing them is to close the gaps, not to exploit them."
+  },
+  {
+   "id": "harden",
+   "type": "code",
+   "language": "powershell",
+   "filename": "kerberos-hardening.ps1",
+   "code": "# Run in a lab or change window, on a domain you administer\n# 1. Create a gMSA so the service password is 120 random chars rotated by AD\nNew-ADServiceAccount -Name 'gmsa-web01' `\n    -DNSHostName 'gmsa-web01.example.com' `\n    -PrincipalsAllowedToRetrieveManagedPassword 'WEB01$' `\n    -KerberosEncryptionType AES128,AES256\n\n# 2. Restrict an existing service account to AES (no RC4/DES)\nSet-ADUser -Identity svc-sql `\n    -KerberosEncryptionType AES128,AES256\n\n# 3. Put administrators in Protected Users (no NTLM, no delegation, 4-hour TGT)\nAdd-ADGroupMember -Identity 'Protected Users' -Members 'adm-alice'\n\n# 4. Find accounts that do not require pre-authentication (should be none)\nGet-ADUser -Filter 'DoesNotRequirePreAuth -eq $true' -Properties DoesNotRequirePreAuth |\n    Select-Object SamAccountName",
+   "caption": "Four hardening steps: a group managed service account, AES-only encryption for a service, Protected Users for admins, and a check for disabled pre-authentication."
+  },
+  {
+   "id": "events",
+   "type": "text",
+   "markdown": "## Reading Kerberos events\n\nDomain controllers log every ticket request, which gives you a timeline for any investigation. Learn the fields that matter:\n\n| Event | Meaning | Fields to read |\n|:--|:--|:--|\n| 4768 | A TGT was requested (AS exchange) | Account name, client address, pre-authentication type, ticket encryption type |\n| 4769 | A service ticket was requested (TGS exchange) | Service name, client address, ticket encryption type, failure code |\n| 4771 | Pre-authentication failed | Failure code `0x18` means a wrong password |\n| 4770 | A ticket was renewed | Useful for long-lived sessions |\n| 4624 | A logon happened on a host | Logon type and authentication package (Kerberos or NTLM) |\n\nThree questions turn raw events into answers. First, who asked, and from which address? Second, what encryption type was used, because RC4 in an AES-only domain is itself a finding? Third, does a service logon have a matching ticket request on a DC? A logon that shows Kerberos but has no corresponding 4769 is worth escalating, since it suggests a forged ticket.\n\nBuild a baseline first. Count normal ticket volume per user and per hour for two weeks, then alert on large departures rather than on single events. A baseline turns noisy logs into a small, trustworthy list of leads."
+  },
+  {
+   "id": "controls",
+   "type": "text",
+   "markdown": "## Hardening checklist\n\n- **Prefer AES.** Set the domain and accounts to AES128/AES256 and plan the retirement of RC4 and DES after measuring who still uses them.\n- **Give service accounts long, random secrets** (25+ characters) or use gMSAs so nobody ever knows the password. A cracked weak password is the whole Kerberoasting risk.\n- **Reduce SPNs on user accounts.** Move services to gMSA or to computer accounts and delete SPNs you do not use.\n- **Rotate `krbtgt`** at least twice a year and after any suspected domain compromise, always twice with a pause of one maximum ticket lifetime in between.\n- **Use Protected Users** for administrators and mark sensitive accounts \"cannot be delegated\".\n- **Keep clocks in sync.** Kerberos tolerates only a few minutes of skew (five by default). Use reliable time sources on the DCs.\n- **Prefer constrained or resource-based delegation** over unconstrained delegation.\n\nRemember that Kerberos relies on DNS. Resolve names consistently and avoid IP-based access, which silently falls back to weaker NTLM."
+  },
+  {
+   "id": "hunt",
+   "type": "terminal",
+   "title": "Hunting for Kerberoasting-like activity",
+   "lines": [
+    {
+     "cmd": "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} -MaxEvents 5000 | Where-Object { $_.Message -match 'Ticket Encryption Type:\\s+0x17' } | Group-Object { ($_.Properties[0].Value) } | Sort-Object Count -Descending | Select-Object -First 3 Count,Name",
+     "prompt": "PS C:\\>",
+     "output": "Count Name\n----- ----\n  41 bob@EXAMPLE.COM\n   3 svc-backup@EXAMPLE.COM\n   1 carol@EXAMPLE.COM",
+     "comment": "bob requested 41 RC4 service tickets in the sample window; the others look normal."
+    },
+    {
+     "cmd": "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} -MaxEvents 5000 | Where-Object { $_.Properties[0].Value -like 'bob@*' } | ForEach-Object { $_.Properties[2].Value } | Sort-Object -Unique | Measure-Object | Select-Object Count",
+     "prompt": "PS C:\\>",
+     "output": "Count\n-----\n   38",
+     "comment": "38 different services in one window is a strong anomaly for a normal user."
+    }
+   ],
+   "caption": "A query on a domain controller you manage: count RC4 service-ticket requests per account, then count distinct services for the noisiest user."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Rotating krbtgt twice, not once",
+   "markdown": "The `krbtgt` account keeps its current and previous password. A single reset leaves the old key valid for forged tickets. Reset twice, waiting at least the maximum TGT lifetime (10 hours by default) between resets, and watch for application failures between the two."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab domain you own, observe Kerberos from the client side.\n\n1. Sign in as a test user and run `klist` to list the TGT and service tickets.\n2. Open a file share, then run `klist` again and find the new `cifs/` ticket and its encryption type.\n3. Run `klist purge`, reconnect, and compare the timestamps.\n4. Set a lab service account to AES-only with the hardening script and request its ticket again.\n5. On the DC, locate events 4768 and 4769 for your actions.\n\nNote the encryption type before and after step 4."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "KDC",
+     "definition": "Key Distribution Center, the AS and TGS running on a domain controller."
+    },
+    {
+     "term": "TGT",
+     "definition": "Ticket Granting Ticket, proof of initial authentication."
+    },
+    {
+     "term": "Service ticket",
+     "definition": "Ticket encrypted with a service's key, presented to that service."
+    },
+    {
+     "term": "SPN",
+     "definition": "Service principal name that identifies a service instance."
+    },
+    {
+     "term": "Pre-authentication",
+     "definition": "Timestamp proof required before the KDC issues a TGT."
+    },
+    {
+     "term": "Kerberoasting",
+     "definition": "Requesting service tickets to crack weak service passwords offline."
+    },
+    {
+     "term": "krbtgt",
+     "definition": "The account whose key signs every TGT."
+    },
+    {
+     "term": "gMSA",
+     "definition": "Managed service account with automatic, very long passwords."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What does a TGT prove to the KDC?",
+     "options": [
+      "The user is a domain admin",
+      "The user already authenticated and can request service tickets",
+      "The service is trusted",
+      "The password has expired"
+     ],
+     "answer": 1,
+     "explanation": "The TGT is issued after the AS exchange and is presented in later TGS requests."
+    },
+    {
+     "question": "Which controls reduce Kerberoasting risk? (choose all that apply)",
+     "options": [
+      "Long random service account passwords",
+      "Group managed service accounts",
+      "Allowing RC4 for compatibility",
+      "Removing unused SPNs from user accounts"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Kerberoasting depends on cracking a weak service secret offline. RC4 makes cracking faster, not safer."
+    },
+    {
+     "question": "Why reset the krbtgt password twice?",
+     "options": [
+      "Kerberos requires two passwords",
+      "The previous password remains valid, so one reset leaves forged tickets working",
+      "To change the domain name",
+      "To clear the event log"
+     ],
+     "answer": 1,
+     "explanation": "The KDC accepts both current and previous keys, so both must be replaced."
+    },
+    {
+     "question": "A user requests 38 service tickets in minutes, all with encryption type 0x17. What do you do first?",
+     "options": [
+      "Ignore it; tickets are valid",
+      "Investigate the account and source host and review the service accounts' passwords",
+      "Reboot the DC",
+      "Disable Kerberos"
+     ],
+     "answer": 1,
+     "explanation": "Valid requests can still be hostile. Treat the pattern as a Kerberoasting signal and strengthen the targeted service secrets."
+    },
+    {
+     "question": "Why can a clock skew break Kerberos logins?",
+     "options": [
+      "Tickets contain timestamps that must match within a small tolerance",
+      "DNS stops working",
+      "The TGT is deleted",
+      "LDAP closes"
+     ],
+     "answer": 0,
+     "explanation": "Authenticators and tickets are time-bound to resist replay, so clocks must be synchronized."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Kerberos issues a TGT after pre-authentication, then service tickets, so passwords stay off the wire.\n- Any user can request service tickets, which makes weak service account passwords the main risk.\n- Use AES, gMSAs, Protected Users, constrained delegation and regular `krbtgt` rotation.\n- Watch events 4768, 4769 and 4624 for anomalies such as bursts of RC4 requests.\n- Synchronize time and keep DNS consistent.\n\nRelated lessons: [Active Directory Security](/learn/security-architecture-resilience/active-directory-security), [Service Account Security](/learn/security-architecture-resilience/service-account-security) and [Authentication Anomaly Detection](/learn/security-architecture-resilience/authentication-anomaly-detection)."
+  }
+ ],
+ "ar": {
+  "title": "أمن مصادقة Kerberos",
+  "summary": "فهم كيف تثبت تذاكر Kerberos الهوية، وما نقاط الضعف التي يستهدفها المهاجمون، وكيف تُقوّى Kerberos وتُدقَّق وتُراقَب في النطاق.",
+  "objectives": [
+   "شرح تبادلات AS وTGS وAP وما تثبته كل تذكرة",
+   "توضيح كيف تحدد أنواع التشفير وSPN والتفويض سطح الهجوم",
+   "التعرف على إشارات كشف Kerberoasting وAS-REP roasting وتزوير التذاكر",
+   "تطبيق التقوية: AES فقط وكلمات مرور خدمة قوية وgMSA وProtected Users وتدوير krbtgt",
+   "قراءة سجلات أحداث Kerberos للتحقيق في النشاط المشبوه"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يلاحظ محلل أمني أمرًا غريبًا صباح الاثنين: حساب مستخدم عادي طلب تذاكر خدمة لأربعين خدمة مختلفة خلال دقيقتين، وكل الطلبات استعملت نوع التشفير الأقدم RC4. لم يُطلق أي تنبيه لأن كل طلب كان صالحًا. كانت تلك محاولة كلاسيكية لكسر كلمات مرور حسابات الخدمة دون اتصال.\n\n**Kerberos** هو بروتوكول المصادقة الافتراضي في Active Directory. فبدل إرسال كلمات المرور يوزّع **تذاكر** محدودة المدة تثبت هوية المستخدم أمام الخدمات. وهو آمن بتصميمه، لكن أمنه يتوقف على خيارات الإعداد وقوة كلمات المرور والمراقبة. يشرح هذا الدرس البروتوكول أولًا ثم كيفية الدفاع عنه."
+   },
+   {
+    "id": "flow",
+    "type": "text",
+    "markdown": "## كيف يعمل البروتوكول\n\nيشارك ثلاثة أطراف: **العميل**، و**مركز توزيع المفاتيح (KDC)** الذي يعمل على كل وحدة تحكم بالنطاق، و**الخدمة** التي يريدها المستخدم. وللـ KDC دوران: خدمة المصادقة (AS) وخدمة منح التذاكر (TGS).\n\n1. **تبادل AS (‏AS-REQ/AS-REP).** يثبت العميل أنه يعرف مفتاح المستخدم (المشتق من كلمة المرور) ويتلقى **تذكرة منح التذاكر (TGT)** مشفّرة بسر الحساب الخاص `krbtgt`.\n2. **تبادل TGS (‏TGS-REQ/TGS-REP).** يقدّم العميل التذكرة TGT ويطلب **تذكرة خدمة** لخدمة محددة باسمها **SPN** مثل `HTTP/intranet.example.com`. تُشفَّر التذكرة بسر حساب الخدمة.\n3. **تبادل AP (‏AP-REQ).** يرسل العميل تذكرة الخدمة إلى الخدمة، فتفك تشفيرها بمفتاحها وتثق بالهوية داخلها.\n\nولأن الـ KDC والخدمة الهدف وحدهما يعرفان المفاتيح، لا تعبر كلمة مرور الشبكة بعد الخطوة الأولى. والمقابل: **يستطيع أي مستخدم موثّق طلب تذكرة خدمة لأي SPN**، وتُشفَّر التذكرة بمفتاح حساب الخدمة."
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "مسار تذاكر Kerberos",
+    "data": {
+     "actors": [
+      {
+       "id": "c",
+       "label": "Client",
+       "sub": "alice@EXAMPLE.COM",
+       "icon": "laptop"
+      },
+      {
+       "id": "kdc",
+       "label": "KDC",
+       "sub": "dc1.example.com",
+       "icon": "key"
+      },
+      {
+       "id": "s",
+       "label": "File service",
+       "sub": "cifs/files.example.com",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "c",
+       "to": "kdc",
+       "label": "AS-REQ",
+       "detail": "pre-auth timestamp",
+       "note": "يثبت العميل معرفته بمفتاح alice بتشفير طابع زمني (المصادقة المسبقة)."
+      },
+      {
+       "from": "kdc",
+       "to": "c",
+       "label": "AS-REP",
+       "detail": "TGT + session key",
+       "note": "يعيد الـ KDC تذكرة TGT مشفّرة بمفتاح krbtgt ولا يستطيع العميل قراءتها.",
+       "tone": "secure"
+      },
+      {
+       "from": "c",
+       "to": "kdc",
+       "label": "TGS-REQ",
+       "detail": "TGT + SPN",
+       "note": "يطلب العميل تذكرة إلى cifs/files.example.com باستعمال TGT."
+      },
+      {
+       "from": "kdc",
+       "to": "c",
+       "label": "TGS-REP",
+       "detail": "service ticket",
+       "note": "يعيد الـ KDC تذكرة خدمة مشفّرة بمفتاح خادم الملفات.",
+       "tone": "secure"
+      },
+      {
+       "from": "c",
+       "to": "s",
+       "label": "AP-REQ",
+       "detail": "service ticket + authenticator",
+       "note": "يقدّم العميل التذكرة مع مُصدِّق جديد يمنع إعادة التشغيل."
+      },
+      {
+       "from": "s",
+       "to": "c",
+       "label": "AP-REP",
+       "detail": "mutual authentication",
+       "note": "تثبت الخدمة هويتها للعميل بالمقابل.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "surface",
+    "type": "text",
+    "markdown": "## أين يقع سطح الهجوم\n\nKerberos ليس «معطوبًا»، لكن عدة سلوكيات تفيد المهاجمين، ولكل منها ضابط مقابل.\n\n| التقنية | سبب نجاحها | الكشف | الدفاع |\n|:--|:--|:--|:--|\n| Kerberoasting | يستطيع أي مستخدم طلب تذكرة لـ SPN حساب مستخدم وكسر كلمة مرورها دون اتصال | أحداث 4769 كثيرة من حساب واحد بنوع تشفير 0x17 | كلمات مرور خدمة طويلة عشوائية وgMSA وAES فقط |\n| AS-REP roasting | الحسابات المعطّلة المصادقة المسبقة تعيد بيانات قابلة للكسر | الحدث 4768 لحسابات لا تتطلب مصادقة مسبقة | لا تعطّل المصادقة المسبقة أبدًا |\n| التذكرة الذهبية | مفتاح `krbtgt` المسروق يزوّر أي TGT | تذاكر TGT بمدد غريبة أو دون 4768 مطابق | دوّر `krbtgt` واحمِ وحدات التحكم |\n| التذكرة الفضية | مفتاح خدمة مسروق يزوّر تذاكر لتلك الخدمة | الحدث 4624 على خدمة دون 4769 مطابق | gMSA ونظافة كلمات مرور الخدمات |\n| إساءة التفويض | تنتحل الخدمات المستخدمين أمام خدمات أخرى | تغييرات في خصائص التفويض | تفويض مقيّد وعلامة «الحساب حسّاس» |\n\nسُمّيت هذه التقنيات لتتعرف عليها في التقارير وفي كشوفاتك. والغاية من معرفتها سدّ الثغرات لا استغلالها."
+   },
+   {
+    "id": "harden",
+    "type": "code",
+    "language": "powershell",
+    "filename": "kerberos-hardening.ps1",
+    "code": "# Run in a lab or change window, on a domain you administer\n# 1. Create a gMSA so the service password is 120 random chars rotated by AD\nNew-ADServiceAccount -Name 'gmsa-web01' `\n    -DNSHostName 'gmsa-web01.example.com' `\n    -PrincipalsAllowedToRetrieveManagedPassword 'WEB01$' `\n    -KerberosEncryptionType AES128,AES256\n\n# 2. Restrict an existing service account to AES (no RC4/DES)\nSet-ADUser -Identity svc-sql `\n    -KerberosEncryptionType AES128,AES256\n\n# 3. Put administrators in Protected Users (no NTLM, no delegation, 4-hour TGT)\nAdd-ADGroupMember -Identity 'Protected Users' -Members 'adm-alice'\n\n# 4. Find accounts that do not require pre-authentication (should be none)\nGet-ADUser -Filter 'DoesNotRequirePreAuth -eq $true' -Properties DoesNotRequirePreAuth |\n    Select-Object SamAccountName",
+    "caption": "أربع خطوات تقوية: حساب خدمة مُدار جماعيًا، وتشفير AES فقط لخدمة، وProtected Users للمسؤولين، وفحص المصادقة المسبقة المعطّلة."
+   },
+   {
+    "id": "events",
+    "type": "text",
+    "markdown": "## قراءة أحداث Kerberos\n\nتسجّل وحدات التحكم كل طلب تذكرة، فتمنحك جدولًا زمنيًا لأي تحقيق. تعلّم الحقول المهمة:\n\n| الحدث | المعنى | الحقول المطلوب قراءتها |\n|:--|:--|:--|\n| 4768 | طُلبت TGT (تبادل AS) | اسم الحساب وعنوان العميل ونوع المصادقة المسبقة ونوع تشفير التذكرة |\n| 4769 | طُلبت تذكرة خدمة (تبادل TGS) | اسم الخدمة وعنوان العميل ونوع التشفير ورمز الفشل |\n| 4771 | فشلت المصادقة المسبقة | الرمز `0x18` يعني كلمة مرور خاطئة |\n| 4770 | جُدّدت تذكرة | مفيد للجلسات الطويلة |\n| 4624 | حدث تسجيل دخول على مضيف | نوع الدخول وحزمة المصادقة (Kerberos أو NTLM) |\n\nثلاثة أسئلة تحوّل الأحداث الخام إلى إجابات. أولًا من طلب ومن أي عنوان؟ ثانيًا ما نوع التشفير المستعمل، فوجود RC4 في نطاق AES فقط نتيجة بحد ذاتها؟ ثالثًا هل لدخول الخدمة طلب تذكرة مطابق على وحدة التحكم؟ الدخول الذي يظهر Kerberos دون حدث 4769 مقابل يستحق التصعيد لأنه يوحي بتذكرة مزوّرة.\n\nابنِ خط أساس أولًا. احسب حجم التذاكر الطبيعي لكل مستخدم ولكل ساعة على مدى أسبوعين، ثم نبّه عند الانحرافات الكبيرة لا عند الأحداث المفردة. فخط الأساس يحوّل سجلات صاخبة إلى قائمة صغيرة موثوقة من الخيوط."
+   },
+   {
+    "id": "controls",
+    "type": "text",
+    "markdown": "## قائمة التقوية\n\n- **فضّل AES.** اضبط النطاق والحسابات على AES128/AES256 وخطّط لإيقاف RC4 وDES بعد قياس من يستعملهما.\n- **امنح حسابات الخدمة أسرارًا طويلة عشوائية** (25 محرفًا فأكثر) أو استعمل gMSA فلا يعرف أحد كلمة المرور. وكلمة مرور ضعيفة مكسورة هي كل خطر Kerberoasting.\n- **قلّل SPN على حسابات المستخدمين.** انقل الخدمات إلى gMSA أو حسابات الحواسيب واحذف SPN غير المستعملة.\n- **دوّر `krbtgt`** مرتين في السنة على الأقل وعند أي اشتباه في اختراق النطاق، مرتين دائمًا بفاصل يعادل أقصى عمر للتذكرة.\n- **استعمل Protected Users** للمسؤولين وعلّم الحسابات الحساسة بـ«لا يمكن تفويضه».\n- **أبقِ الساعات متزامنة.** يتسامح Kerberos بدقائق قليلة فقط من الانحراف (خمس افتراضيًا). استعمل مصادر وقت موثوقة على وحدات التحكم.\n- **فضّل التفويض المقيّد أو القائم على الموارد** على التفويض غير المقيّد.\n\nوتذكّر أن Kerberos يعتمد على DNS. حلّ الأسماء بثبات وتجنّب الوصول بعناوين IP، فهو يرتدّ بصمت إلى NTLM الأضعف."
+   },
+   {
+    "id": "hunt",
+    "type": "terminal",
+    "title": "Hunting for Kerberoasting-like activity",
+    "lines": [
+     {
+      "cmd": "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} -MaxEvents 5000 | Where-Object { $_.Message -match 'Ticket Encryption Type:\\s+0x17' } | Group-Object { ($_.Properties[0].Value) } | Sort-Object Count -Descending | Select-Object -First 3 Count,Name",
+      "prompt": "PS C:\\>",
+      "output": "Count Name\n----- ----\n  41 bob@EXAMPLE.COM\n   3 svc-backup@EXAMPLE.COM\n   1 carol@EXAMPLE.COM",
+      "comment": "bob requested 41 RC4 service tickets in the sample window; the others look normal."
+     },
+     {
+      "cmd": "Get-WinEvent -FilterHashtable @{LogName='Security';Id=4769} -MaxEvents 5000 | Where-Object { $_.Properties[0].Value -like 'bob@*' } | ForEach-Object { $_.Properties[2].Value } | Sort-Object -Unique | Measure-Object | Select-Object Count",
+      "prompt": "PS C:\\>",
+      "output": "Count\n-----\n   38",
+      "comment": "38 different services in one window is a strong anomaly for a normal user."
+     }
+    ],
+    "caption": "استعلام على وحدة تحكم تديرها: عدّ طلبات تذاكر الخدمة بتشفير RC4 لكل حساب، ثم عدّ الخدمات المختلفة لأكثر المستخدمين ضجيجًا."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "تدوير krbtgt مرتين لا مرة",
+    "markdown": "يحتفظ الحساب `krbtgt` بكلمة مروره الحالية والسابقة. تعيين واحد يترك المفتاح القديم صالحًا للتذاكر المزوّرة. أعد التعيين مرتين مع انتظار أقصى عمر لـ TGT (10 ساعات افتراضيًا) بينهما، وراقب أعطال التطبيقات بين المرتين."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في نطاق مخبري تملكه راقب Kerberos من جهة العميل.\n\n1. سجّل الدخول بمستخدم تجريبي ونفّذ `klist` لعرض TGT وتذاكر الخدمة.\n2. افتح مشاركة ملفات ثم نفّذ `klist` مجددًا وابحث عن تذكرة `cifs/` الجديدة ونوع تشفيرها.\n3. نفّذ `klist purge` وأعد الاتصال وقارن الطوابع الزمنية.\n4. اضبط حساب خدمة مخبريًا على AES فقط بسكربت التقوية واطلب تذكرته مجددًا.\n5. على وحدة التحكم ابحث عن الحدثين 4768 و4769 لإجراءاتك.\n\nسجّل نوع التشفير قبل الخطوة 4 وبعدها."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "مركز توزيع المفاتيح (KDC)",
+      "definition": "خدمتا AS وTGS اللتان تعملان على وحدة تحكم بالنطاق."
+     },
+     {
+      "term": "تذكرة منح التذاكر (TGT)",
+      "definition": "دليل المصادقة الأولية."
+     },
+     {
+      "term": "تذكرة الخدمة",
+      "definition": "تذكرة مشفّرة بمفتاح الخدمة تُقدَّم إليها."
+     },
+     {
+      "term": "اسم الخدمة الأساسي (SPN)",
+      "definition": "اسم يعرّف نسخة الخدمة."
+     },
+     {
+      "term": "المصادقة المسبقة",
+      "definition": "إثبات بطابع زمني مطلوب قبل إصدار TGT."
+     },
+     {
+      "term": "Kerberoasting",
+      "definition": "طلب تذاكر خدمة لكسر كلمات مرور الخدمة الضعيفة دون اتصال."
+     },
+     {
+      "term": "krbtgt",
+      "definition": "الحساب الذي يوقّع مفتاحه كل TGT."
+     },
+     {
+      "term": "gMSA",
+      "definition": "حساب خدمة مُدار بكلمات مرور طويلة تتغير تلقائيًا."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ماذا تثبت TGT أمام الـ KDC؟",
+      "options": [
+       "أن المستخدم مسؤول نطاق",
+       "أن المستخدم صادق مسبقًا ويستطيع طلب تذاكر الخدمة",
+       "أن الخدمة موثوقة",
+       "أن كلمة المرور انتهت"
+      ],
+      "answer": 1,
+      "explanation": "تُصدَر TGT بعد تبادل AS وتُقدَّم في طلبات TGS اللاحقة."
+     },
+     {
+      "question": "أي الضوابط تقلل خطر Kerberoasting؟ (اختر كل ما ينطبق)",
+      "options": [
+       "كلمات مرور طويلة عشوائية لحسابات الخدمة",
+       "حسابات الخدمة المُدارة جماعيًا",
+       "السماح بـ RC4 للتوافق",
+       "إزالة SPN غير المستعملة من حسابات المستخدمين"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يعتمد Kerberoasting على كسر سر خدمة ضعيف دون اتصال، و RC4 يجعل الكسر أسرع لا أأمن."
+     },
+     {
+      "question": "لماذا تُعاد كلمة مرور krbtgt مرتين؟",
+      "options": [
+       "لأن Kerberos يتطلب كلمتي مرور",
+       "لأن السابقة تبقى صالحة فيترك تعيين واحد التذاكر المزوّرة عاملة",
+       "لتغيير اسم النطاق",
+       "لمسح سجل الأحداث"
+      ],
+      "answer": 1,
+      "explanation": "يقبل الـ KDC المفتاحين الحالي والسابق، فيجب استبدالهما معًا."
+     },
+     {
+      "question": "يطلب مستخدم 38 تذكرة خدمة خلال دقائق وكلها بنوع التشفير 0x17. ماذا تفعل أولًا؟",
+      "options": [
+       "تتجاهل فالتذاكر صالحة",
+       "تحقق في الحساب ومضيف المصدر وتراجع كلمات مرور حسابات الخدمة",
+       "تعيد تشغيل وحدة التحكم",
+       "تعطّل Kerberos"
+      ],
+      "answer": 1,
+      "explanation": "قد تكون الطلبات الصالحة عدائية. تعامل مع النمط كإشارة Kerberoasting وقوِّ أسرار الخدمات المستهدفة."
+     },
+     {
+      "question": "لماذا يمكن لانحراف الساعة أن يعطل دخول Kerberos؟",
+      "options": [
+       "تحوي التذاكر طوابع زمنية يجب أن تتطابق ضمن تسامح صغير",
+       "يتوقف DNS",
+       "تُحذف TGT",
+       "يُغلق LDAP"
+      ],
+      "answer": 0,
+      "explanation": "تتقيد المُصدِّقات والتذاكر بالزمن لمقاومة إعادة التشغيل، فيجب مزامنة الساعات."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يصدر Kerberos تذكرة TGT بعد المصادقة المسبقة ثم تذاكر الخدمة، فتبقى كلمات المرور خارج الشبكة.\n- يستطيع أي مستخدم طلب تذاكر خدمة، فتصبح كلمات مرور حسابات الخدمة الضعيفة الخطر الرئيس.\n- استعمل AES وgMSA وProtected Users والتفويض المقيّد وتدوير `krbtgt` المنتظم.\n- راقب الأحداث 4768 و4769 و4624 بحثًا عن شذوذ مثل دفعات طلبات RC4.\n- زامن الوقت وأبقِ DNS متسقًا.\n\nدروس ذات صلة: [أمن Active Directory](/learn/security-architecture-resilience/active-directory-security) و[أمن حسابات الخدمة](/learn/security-architecture-resilience/service-account-security) و[كشف شذوذ المصادقة](/learn/security-architecture-resilience/authentication-anomaly-detection)."
+   }
+  ]
+ }
+}

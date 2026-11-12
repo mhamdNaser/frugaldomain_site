@@ -1,0 +1,570 @@
+{
+ "slug": "advanced-network-forensics",
+ "title": "Advanced Network Forensics",
+ "summary": "Reconstruct what happened on the wire: preserve packet evidence, carve sessions and files, rebuild a timeline from PCAP and flow data, and report findings that stand up to review.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Preserve network evidence with hashing and chain of custody",
+  "Filter and slice a PCAP with tshark to isolate a suspect session",
+  "Reconstruct a conversation and recover transferred objects",
+  "Correlate packets, flow records and logs into one timeline",
+  "Write findings that separate observation from inference"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A database server at 10.20.30.15 sent 2 GB to an unknown address overnight. The alert fired at 03:12, the analyst closed it as backup traffic, and two weeks later legal asks one question: what exactly left the building?\n\nNetwork forensics answers questions like this after the fact. Unlike live monitoring, it works on stored evidence, so the evidence must be complete, unaltered and well documented. This lesson extends [Advanced Network Traffic Analysis](/learn/security-operations-dfir/advanced-network-traffic-analysis) from detection to proof. Use these techniques only on captures from networks you own or are authorized to examine."
+  },
+  {
+   "id": "sources",
+   "type": "text",
+   "markdown": "## Know what evidence you have\n\nNetwork evidence comes in layers, and each answers different questions. Always start from the cheapest layer and descend only when needed.\n\n| Source | Contains | Best for | Limit |\n|:--|:--|:--|:--|\n| Full packet capture (PCAP) | Headers and payloads | Proving content, carving files | Huge, short retention |\n| Flow records (NetFlow/IPFIX) | Who talked to whom, how much | Scoping, volume, timing | No content |\n| Protocol logs (Zeek, proxy, DNS) | Parsed transactions | Fast searching | Only what the parser logs |\n| Device logs (firewall, VPN) | Allow/deny decisions | Confirming policy outcome | No packet detail |\n\nRetention decides everything. If full packets are kept for 48 hours and the incident is two weeks old, flows and logs are all you have. Say so in the report instead of guessing."
+  },
+  {
+   "id": "preserve",
+   "type": "text",
+   "markdown": "## Preserve before you analyze\n\nEvidence that can be challenged is worth little. Treat a capture like any other forensic artifact.\n\n1. Copy the PCAP from the sensor to a read-only evidence share.\n2. Compute a SHA-256 hash immediately and record it.\n3. Work only on a copy. Re-hash the original at the end to prove nothing changed.\n4. Log who handled it, when and why (chain of custody).\n\nAlso record the clock. Capture timestamps come from the sensor, and a sensor drifting by 40 seconds from the firewall will break your timeline. Note the NTP source and any known offset."
+  },
+  {
+   "id": "hash",
+   "type": "terminal",
+   "title": "Hash, slice and filter",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "sha256sum case042.pcap | tee case042.sha256",
+     "output": "9f2c1a7e04b5d3c8e61f0a9b72d4c3e18a5f6b0d9c7e24a13b8f05d6c9e1a77  case042.pcap",
+     "comment": "Record the hash before any analysis."
+    },
+    {
+     "cmd": "capinfos -aeuc case042.pcap",
+     "output": "First packet time: 2026-10-28 02:58:41\nLast packet time:  2026-10-28 04:07:19\nCapture duration:  4118 seconds\nNumber of packets: 1873342",
+     "comment": "Confirms the capture covers the 03:12 alert window."
+    },
+    {
+     "cmd": "tshark -r case042.pcap -q -z conv,tcp | sort -k9 -nr | head -3",
+     "output": "10.20.30.15:50712 <-> 203.0.113.77:443   1210 2040 MB ... 4118 s\n10.20.30.15:41876 <-> 10.20.30.8:5432    9120   31 MB ...\n10.20.30.15:39022 <-> 10.20.30.2:53       311    41 kB ...",
+     "comment": "One conversation carries almost all bytes: the pivot."
+    },
+    {
+     "cmd": "editcap -A '2026-10-28 03:10:00' -B '2026-10-28 03:20:00' case042.pcap slice.pcap",
+     "output": "",
+     "comment": "Cut a 10-minute slice; the original stays untouched."
+    }
+   ],
+   "caption": "Run on a lab capture; 203.0.113.77 is a documentation address."
+  },
+  {
+   "id": "reconstruct",
+   "type": "text",
+   "markdown": "## Reconstruct the session\n\nOnce a conversation is isolated, rebuild it. For TCP, follow the stream to see the byte exchange in order. For HTTP, export transferred objects and hash them. For TLS, you cannot read content without keys, but the handshake still tells a story: the SNI name, the certificate subject, the JA3 fingerprint and the sizes and timing of records.\n\nA practical order of questions:\n\n- Who started the connection, and from which process or user if endpoint logs exist?\n- What did the first 10 packets reveal (protocol, name, certificate)?\n- Which direction carried the bytes? A server sending 2 GB out is exfiltration; a server receiving it is a download.\n- Do packet sizes and gaps look like a person, a script or a bulk copy?\n\nRecord each answer with a packet number or stream index so another examiner can repeat it."
+  },
+  {
+   "id": "zeek-q",
+   "type": "code",
+   "language": "bash",
+   "code": "# Pivot from the suspect IP into Zeek logs for the same window\nzeek-cut ts uid id.orig_h id.resp_h id.resp_p service orig_bytes < conn.log \\\n  | awk '$3==\"10.20.30.15\" && $4==\"203.0.113.77\"'\n# 1793000000.12  CxY2a91  10.20.30.15  203.0.113.77  443  ssl  2139095040\n\n# Which name did the client ask for, and what certificate answered?\nzeek-cut ts uid server_name subject ja3 < ssl.log | grep CxY2a91\n# 1793000000.31  CxY2a91  files.example.net  CN=files.example.net  a0e9f5d64349fb13191bc781f81f42e1",
+   "filename": "zeek-pivot.sh",
+   "caption": "The uid links one connection across conn.log, ssl.log and files.log."
+  },
+  {
+   "id": "carve",
+   "type": "text",
+   "markdown": "## Recover transferred files\n\nWhen the protocol is cleartext, such as HTTP, SMB or FTP, the file itself can be recovered from the capture. Wireshark offers File > Export Objects, and Zeek writes extracted files when the extraction script is enabled. Zeek's files.log records a hash for every file it sees, so you can search a threat intelligence feed without opening the file.\n\nTreat every recovered file as potentially hostile. Open it only in an isolated analysis VM with no network, record its SHA-256, and never double-click it. Compare the hash with known-good software and with intelligence sources before you decide what it is.\n\nThree pitfalls appear in almost every first case:\n\n- **Missed packets.** A SPAN port that drops traffic under load produces gaps, so a recovered file may be truncated. Check the capture statistics for dropped packets before trusting a carve.\n- **Offloading.** Checksum offload makes locally captured packets show bad checksums. This is a capture artifact, not an attack.\n- **NAT and proxies.** The internal address you see may be a proxy, not the real user. Pair the packet with the proxy or NAT log to find the true source."
+  },
+  {
+   "id": "timeline",
+   "type": "text",
+   "markdown": "## Build one timeline\n\nNo single source tells the whole story. Merge them on one clock in UTC.\n\n| Time (UTC) | Source | Event |\n|:--|:--|:--|\n| 03:09:50 | Auth log | Service account logs in to 10.20.30.15 |\n| 03:11:58 | DNS log | Lookup of files.example.net |\n| 03:12:04 | Firewall | Allow TCP/443 to 203.0.113.77 |\n| 03:12:05 | PCAP | TLS handshake, JA3 recorded |\n| 03:12-04:06 | Flow | 2,139 MB outbound |\n\nMark each row as observed or inferred. \"2,139 MB left over TCP/443\" is observed. \"Customer data was stolen\" is an inference until you can tie the bytes to a file or table. Link the timeline to your [incident record](/learn/security-operations-dfir/advanced-incident-response) so containment decisions use the same facts."
+  },
+  {
+   "id": "wf",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A network forensic workflow",
+   "caption": "Each stage narrows scope and adds proof.",
+   "data": {
+    "token": "Evidence",
+    "nodes": [
+     {
+      "id": "pres",
+      "label": "Preserve",
+      "sub": "Hash and copy",
+      "icon": "lock"
+     },
+     {
+      "id": "scope",
+      "label": "Scope",
+      "sub": "Flows and logs",
+      "icon": "log"
+     },
+     {
+      "id": "slice",
+      "label": "Slice",
+      "sub": "Isolate the session",
+      "icon": "file"
+     },
+     {
+      "id": "recon",
+      "label": "Reconstruct",
+      "sub": "Streams and objects",
+      "icon": "eye"
+     },
+     {
+      "id": "rep",
+      "label": "Report",
+      "sub": "Facts vs inference",
+      "icon": "shield"
+     }
+    ],
+    "steps": [
+     {
+      "at": "pres",
+      "caption": "The PCAP is hashed and copied to read-only storage.",
+      "tone": "secure"
+     },
+     {
+      "at": "scope",
+      "caption": "Flow data shows one 2 GB conversation from 10.20.30.15.",
+      "tone": "warning"
+     },
+     {
+      "at": "slice",
+      "caption": "tshark and editcap cut the 10-minute window around it.",
+      "tone": "default"
+     },
+     {
+      "at": "recon",
+      "caption": "The TLS handshake names files.example.net; the byte direction is outbound.",
+      "tone": "warning"
+     },
+     {
+      "at": "rep",
+      "caption": "The report lists observed facts, inferences and gaps, with packet references.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Do not decrypt or capture beyond your authority",
+   "markdown": "Packet captures contain passwords, personal data and private messages. Capture and open them only under written authorization, restrict access, and delete working copies when the case closes. If TLS must be decrypted, use keys from systems you own and follow your legal and privacy policy."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Name the gaps",
+   "markdown": "Missing evidence is a finding. Write \"no full packets exist before 02:58 UTC because the sensor ring buffer overwrote them\" rather than leaving readers to assume. Reviewers trust a report that states its own limits."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab VM you own, capture ten minutes of your own browsing with `tcpdump -i eth0 -w lab.pcap`. Then: (1) hash the file, (2) list the top three TCP conversations with `tshark -r lab.pcap -q -z conv,tcp`, (3) pick one and write a three-row timeline marking each row observed or inferred. Finish by re-hashing the original to confirm it did not change."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Chain of custody",
+     "definition": "A record of who held evidence and when."
+    },
+    {
+     "term": "PCAP",
+     "definition": "A file of captured packets with payloads."
+    },
+    {
+     "term": "Flow record",
+     "definition": "A summary of one conversation without content."
+    },
+    {
+     "term": "Follow stream",
+     "definition": "Reassembling one TCP conversation in order."
+    },
+    {
+     "term": "SNI",
+     "definition": "The server name a client sends in the TLS handshake."
+    },
+    {
+     "term": "JA3",
+     "definition": "A fingerprint of a client's TLS handshake."
+    },
+    {
+     "term": "Hash",
+     "definition": "A fixed-length digest proving a file is unchanged."
+    },
+    {
+     "term": "Observation vs inference",
+     "definition": "A fact seen in data versus a conclusion drawn from it."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What should you do first when you receive a PCAP as evidence?",
+     "options": [
+      "Open it in Wireshark and start filtering",
+      "Hash it and work on a copy",
+      "Delete packets that are not relevant",
+      "Convert it to text"
+     ],
+     "answer": 1,
+     "explanation": "Hashing proves later that the evidence is unchanged, and a copy protects the original."
+    },
+    {
+     "question": "Which sources help you scope an incident when full packets have expired? (Choose all that apply)",
+     "options": [
+      "Flow records",
+      "Firewall logs",
+      "Zeek protocol logs",
+      "Payload content"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Flows, firewall logs and parsed protocol logs outlive packets. Payload content needs the packets."
+    },
+    {
+     "question": "Why can a 40-second sensor clock drift ruin an investigation?",
+     "options": [
+      "It corrupts the PCAP file",
+      "Events from different sources no longer line up in the timeline",
+      "It disables TLS",
+      "It changes the hash"
+     ],
+     "answer": 1,
+     "explanation": "Correlation depends on a shared clock; an offset puts cause and effect in the wrong order."
+    },
+    {
+     "question": "A server sent 2 GB over TCP/443 to an external host. Which statement is an observation?",
+     "options": [
+      "Customer records were stolen",
+      "2 GB left the server over TCP/443",
+      "The attacker used a custom tool",
+      "The data was ransomware staging"
+     ],
+     "answer": 1,
+     "explanation": "Only the byte count and port are directly visible. The others are inferences that need more proof."
+    },
+    {
+     "question": "Which fields stay useful even when TLS payloads are encrypted? (Choose all that apply)",
+     "options": [
+      "SNI",
+      "Certificate subject",
+      "JA3 fingerprint",
+      "HTTP request body"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The handshake metadata is visible in cleartext; the HTTP body is inside the encrypted channel."
+    }
+   ]
+  },
+  {
+   "id": "sum",
+   "type": "text",
+   "markdown": "## Summary\n\n- Network forensics proves what happened from stored evidence, so preservation comes first: hash, copy, log custody and note the clock.\n- Use layers: flows and logs to scope, packets to prove. Retention limits what you can claim.\n- Slice the PCAP, reconstruct the stream and use handshake metadata when payloads are encrypted.\n- Merge sources into one UTC timeline and label each row observed or inferred.\n- Continue with [Memory Forensics and Malware Analysis](/learn/security-operations-dfir/memory-forensics-and-malware-analysis) to connect the network story to the host."
+  }
+ ],
+ "ar": {
+  "title": "التحليل الجنائي المتقدم للشبكات",
+  "summary": "أعد بناء ما حدث على الشبكة: احفظ أدلة الحزم، واستخرج الجلسات والملفات، وابنِ خطًا زمنيًا من ملفات PCAP وسجلات التدفق، واكتب نتائج تصمد أمام المراجعة.",
+  "objectives": [
+   "حفظ الأدلة الشبكية باستخدام البصمات وسلسلة الحيازة",
+   "تصفية ملف PCAP وتقطيعه بأداة tshark لعزل جلسة مشبوهة",
+   "إعادة بناء المحادثة واستعادة الكائنات المنقولة",
+   "ربط الحزم وسجلات التدفق والسجلات العادية في خط زمني واحد",
+   "كتابة نتائج تفصل بين الملاحظة والاستنتاج"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "أرسل خادم قاعدة بيانات بالعنوان 10.20.30.15 ما حجمه 2 غيغابايت إلى عنوان مجهول خلال الليل. انطلق التنبيه عند 03:12، وأغلقه المحلل على أنه حركة نسخ احتياطي، وبعد أسبوعين تسأل الإدارة القانونية سؤالًا واحدًا: ما الذي غادر المؤسسة بالضبط؟\n\nيجيب التحليل الجنائي للشبكات (Network Forensics) عن هذه الأسئلة بعد وقوع الحدث. وهو، بخلاف المراقبة الحية، يعمل على أدلة مخزَّنة، ولذلك يجب أن تكون كاملة وغير معدَّلة وموثّقة جيدًا. يوسّع هذا الدرس [تحليل حركة الشبكة المتقدم](/learn/security-operations-dfir/advanced-network-traffic-analysis) من الكشف إلى الإثبات. استخدم هذه التقنيات فقط على لقطات من شبكات تملكها أو مصرّح لك بفحصها."
+   },
+   {
+    "id": "sources",
+    "type": "text",
+    "markdown": "## اعرف الأدلة المتوفرة لديك\n\nتأتي الأدلة الشبكية في طبقات، وتجيب كل طبقة عن أسئلة مختلفة. ابدأ دائمًا بأرخص طبقة ولا تنزل إلى ما بعدها إلا عند الحاجة.\n\n| المصدر | المحتوى | الأفضل لـ | القيد |\n|:--|:--|:--|:--|\n| التقاط الحزم الكامل (PCAP) | الترويسات والحمولات | إثبات المحتوى واستخراج الملفات | حجم ضخم ومدة احتفاظ قصيرة |\n| سجلات التدفق (NetFlow/IPFIX) | من تحدث مع من وبأي حجم | تحديد النطاق والحجم والتوقيت | لا تحتوي المحتوى |\n| سجلات البروتوكولات (Zeek، الوكيل، DNS) | معاملات مفسَّرة | البحث السريع | ما يسجله المحلِّل فقط |\n| سجلات الأجهزة (جدار الحماية، VPN) | قرارات السماح والمنع | تأكيد نتيجة السياسة | لا تفاصيل للحزم |\n\nتحدد مدة الاحتفاظ كل شيء. إذا كانت الحزم الكاملة تُحفظ 48 ساعة والحادثة عمرها أسبوعان، فكل ما لديك هو التدفقات والسجلات. اذكر ذلك في التقرير بدل التخمين."
+   },
+   {
+    "id": "preserve",
+    "type": "text",
+    "markdown": "## احفظ الدليل قبل أن تحلله\n\nالدليل الذي يمكن الطعن فيه قليل القيمة. تعامل مع ملف الالتقاط كما تتعامل مع أي أثر جنائي آخر.\n\n1. انسخ ملف PCAP من المستشعر إلى مشاركة أدلة للقراءة فقط.\n2. احسب بصمة SHA-256 فورًا وسجّلها.\n3. اعمل على نسخة فقط، وأعد حساب بصمة الأصل في النهاية لإثبات أنه لم يتغير.\n4. دوّن من تعامل مع الدليل ومتى ولماذا (سلسلة الحيازة).\n\nسجّل الساعة أيضًا. تأتي الأختام الزمنية للالتقاط من المستشعر، وانحراف المستشعر 40 ثانية عن جدار الحماية يفسد خطك الزمني. دوّن مصدر NTP وأي انحراف معروف."
+   },
+   {
+    "id": "hash",
+    "type": "terminal",
+    "title": "التجزئة والتقطيع والتصفية",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "sha256sum case042.pcap | tee case042.sha256",
+      "output": "9f2c1a7e04b5d3c8e61f0a9b72d4c3e18a5f6b0d9c7e24a13b8f05d6c9e1a77  case042.pcap",
+      "comment": "سجّل البصمة قبل أي تحليل."
+     },
+     {
+      "cmd": "capinfos -aeuc case042.pcap",
+      "output": "First packet time: 2026-10-28 02:58:41\nLast packet time:  2026-10-28 04:07:19\nCapture duration:  4118 seconds\nNumber of packets: 1873342",
+      "comment": "يؤكد أن الالتقاط يغطي نافذة التنبيه عند 03:12."
+     },
+     {
+      "cmd": "tshark -r case042.pcap -q -z conv,tcp | sort -k9 -nr | head -3",
+      "output": "10.20.30.15:50712 <-> 203.0.113.77:443   1210 2040 MB ... 4118 s\n10.20.30.15:41876 <-> 10.20.30.8:5432    9120   31 MB ...\n10.20.30.15:39022 <-> 10.20.30.2:53       311    41 kB ...",
+      "comment": "محادثة واحدة تحمل معظم البايتات، وهي نقطة الارتكاز."
+     },
+     {
+      "cmd": "editcap -A '2026-10-28 03:10:00' -B '2026-10-28 03:20:00' case042.pcap slice.pcap",
+      "output": "",
+      "comment": "قصّ شريحة مدتها 10 دقائق مع بقاء الأصل دون تغيير."
+     }
+    ],
+    "caption": "نُفِّذت على التقاط مخبري، والعنوان 203.0.113.77 عنوان توثيقي."
+   },
+   {
+    "id": "reconstruct",
+    "type": "text",
+    "markdown": "## أعد بناء الجلسة\n\nبعد عزل المحادثة أعد بناءها. في TCP تابع التدفق (Follow Stream) لترى تبادل البايتات بالترتيب. وفي HTTP صدّر الكائنات المنقولة واحسب بصماتها. أما في TLS فلا يمكنك قراءة المحتوى دون المفاتيح، لكن المصافحة تحكي قصة: اسم SNI، وموضوع الشهادة، وبصمة JA3، وأحجام السجلات وتوقيتها.\n\nترتيب عملي للأسئلة:\n\n- من بدأ الاتصال، ومن أي عملية أو مستخدم إن توفرت سجلات الجهاز الطرفي؟\n- ماذا كشفت أول 10 حزم (البروتوكول، الاسم، الشهادة)؟\n- أي اتجاه حمل البايتات؟ خادم يرسل 2 غيغابايت إلى الخارج يعني تسريبًا، أما استقباله لها فيعني تنزيلًا.\n- هل تشبه أحجام الحزم والفواصل سلوك شخص أم سكربت أم نسخًا مجمّعًا؟\n\nسجّل كل إجابة برقم حزمة أو رقم تدفق ليتمكن فاحص آخر من تكرارها."
+   },
+   {
+    "id": "zeek-q",
+    "type": "code",
+    "language": "bash",
+    "code": "# Pivot from the suspect IP into Zeek logs for the same window\nzeek-cut ts uid id.orig_h id.resp_h id.resp_p service orig_bytes < conn.log \\\n  | awk '$3==\"10.20.30.15\" && $4==\"203.0.113.77\"'\n# 1793000000.12  CxY2a91  10.20.30.15  203.0.113.77  443  ssl  2139095040\n\n# Which name did the client ask for, and what certificate answered?\nzeek-cut ts uid server_name subject ja3 < ssl.log | grep CxY2a91\n# 1793000000.31  CxY2a91  files.example.net  CN=files.example.net  a0e9f5d64349fb13191bc781f81f42e1",
+    "filename": "zeek-pivot.sh",
+    "caption": "يربط الحقل uid الاتصال الواحد عبر conn.log وssl.log وfiles.log."
+   },
+   {
+    "id": "carve",
+    "type": "text",
+    "markdown": "## استعد الملفات المنقولة\n\nعندما يكون البروتوكول نصًا واضحًا مثل HTTP أو SMB أو FTP، يمكن استعادة الملف نفسه من الالتقاط. يوفر Wireshark الأمر File > Export Objects، ويكتب Zeek الملفات المستخرجة عند تفعيل سكربت الاستخراج. ويسجل files.log بصمة كل ملف يراه Zeek، فتستطيع البحث في مصادر استخبارات التهديدات دون فتح الملف.\n\nتعامل مع كل ملف مستعاد على أنه قد يكون خبيثًا. افتحه فقط داخل آلة تحليل معزولة بلا شبكة، وسجّل بصمة SHA-256، ولا تنقر عليه نقرًا مزدوجًا أبدًا. قارن البصمة ببرمجيات معروفة موثوقة وبمصادر الاستخبارات قبل أن تحدد ماهيته.\n\nتظهر ثلاثة أخطاء شائعة في كل قضية أولى تقريبًا:\n\n- **الحزم الفائتة.** منفذ SPAN يُسقط الحركة تحت الحمل فيترك فجوات، وقد يكون الملف المستعاد مبتورًا. افحص إحصاءات الالتقاط بحثًا عن الحزم المسقطة قبل الوثوق بالاستخراج.\n- **التفريغ إلى بطاقة الشبكة.** يجعل تفريغ المجموع الاختباري (Checksum offload) الحزم الملتقطة محليًا تبدو بمجاميع خاطئة. هذا أثر من آثار الالتقاط وليس هجومًا.\n- **ترجمة العناوين والوكلاء.** قد يكون العنوان الداخلي الذي تراه وكيلًا لا المستخدم الحقيقي. اربط الحزمة بسجل الوكيل أو سجل NAT لمعرفة المصدر الفعلي."
+   },
+   {
+    "id": "timeline",
+    "type": "text",
+    "markdown": "## ابنِ خطًا زمنيًا واحدًا\n\nلا يحكي مصدر واحد القصة كاملة. ادمج المصادر على ساعة واحدة بتوقيت UTC.\n\n| الوقت (UTC) | المصدر | الحدث |\n|:--|:--|:--|\n| 03:09:50 | سجل المصادقة | حساب خدمة يسجل الدخول إلى 10.20.30.15 |\n| 03:11:58 | سجل DNS | استعلام عن files.example.net |\n| 03:12:04 | جدار الحماية | السماح بـ TCP/443 إلى 203.0.113.77 |\n| 03:12:05 | PCAP | مصافحة TLS وتسجيل JA3 |\n| 03:12-04:06 | التدفق | 2,139 ميغابايت صادرة |\n\nضع على كل صف علامة «مُلاحَظ» أو «مُستنتَج». عبارة «غادر 2,139 ميغابايت عبر TCP/443» ملاحظة. أما «سُرقت بيانات العملاء» فاستنتاج إلى أن تربط البايتات بملف أو جدول. اربط الخط الزمني بـ[سجل الحادثة](/learn/security-operations-dfir/advanced-incident-response) لتعتمد قرارات الاحتواء الحقائق نفسها."
+   },
+   {
+    "id": "wf",
+    "type": "animation",
+    "kind": "flow",
+    "title": "سير عمل التحليل الجنائي للشبكات",
+    "caption": "كل مرحلة تضيّق النطاق وتضيف دليلًا.",
+    "data": {
+     "token": "دليل",
+     "nodes": [
+      {
+       "id": "pres",
+       "label": "احفظ",
+       "sub": "بصمة ونسخ",
+       "icon": "lock"
+      },
+      {
+       "id": "scope",
+       "label": "حدّد النطاق",
+       "sub": "التدفقات والسجلات",
+       "icon": "log"
+      },
+      {
+       "id": "slice",
+       "label": "قطّع",
+       "sub": "اعزل الجلسة",
+       "icon": "file"
+      },
+      {
+       "id": "recon",
+       "label": "أعد البناء",
+       "sub": "التدفقات والكائنات",
+       "icon": "eye"
+      },
+      {
+       "id": "rep",
+       "label": "أبلغ",
+       "sub": "حقائق مقابل استنتاج",
+       "icon": "shield"
+      }
+     ],
+     "steps": [
+      {
+       "at": "pres",
+       "caption": "يُحسب تجزئة ملف PCAP ويُنسخ إلى تخزين للقراءة فقط.",
+       "tone": "secure"
+      },
+      {
+       "at": "scope",
+       "caption": "تُظهر بيانات التدفق محادثة واحدة حجمها 2 غيغابايت من 10.20.30.15.",
+       "tone": "warning"
+      },
+      {
+       "at": "slice",
+       "caption": "تقتطع tshark وeditcap نافذة الدقائق العشر حولها.",
+       "tone": "default"
+      },
+      {
+       "at": "recon",
+       "caption": "تسمّي مصافحة TLS الاسم files.example.net، واتجاه البايتات صادر.",
+       "tone": "warning"
+      },
+      {
+       "at": "rep",
+       "caption": "يسرد التقرير الحقائق الملاحَظة والاستنتاجات والفجوات مع مراجع الحزم.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تفك التشفير ولا تلتقط خارج صلاحيتك",
+    "markdown": "تحتوي لقطات الحزم على كلمات مرور وبيانات شخصية ورسائل خاصة. التقطها وافتحها فقط بتفويض مكتوب، وقيّد الوصول إليها، واحذف النسخ العاملة عند إغلاق القضية. وإذا لزم فك تشفير TLS فاستخدم مفاتيح أنظمة تملكها والتزم بسياساتك القانونية وسياسة الخصوصية."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "سمِّ الفجوات",
+    "markdown": "غياب الدليل نتيجة بحد ذاته. اكتب «لا توجد حزم كاملة قبل 02:58 بتوقيت UTC لأن المخزن الدائري للمستشعر استبدلها» بدل ترك القارئ يفترض. يثق المراجعون بتقرير يذكر حدوده."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في آلة افتراضية مخبرية تملكها، التقط عشر دقائق من تصفحك باستخدام `tcpdump -i eth0 -w lab.pcap`. ثم: (1) احسب بصمة الملف، (2) اسرد أعلى ثلاث محادثات TCP بالأمر `tshark -r lab.pcap -q -z conv,tcp`، (3) اختر واحدة واكتب خطًا زمنيًا من ثلاثة صفوف تضع على كل صف «مُلاحَظ» أو «مُستنتَج». وأنهِ بإعادة حساب بصمة الأصل للتأكد من أنه لم يتغير."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "سلسلة الحيازة (Chain of custody)",
+      "definition": "سجل يبيّن من حاز الدليل ومتى."
+     },
+     {
+      "term": "PCAP",
+      "definition": "ملف حزم ملتقطة مع حمولاتها."
+     },
+     {
+      "term": "سجل التدفق (Flow record)",
+      "definition": "ملخص لمحادثة واحدة دون محتواها."
+     },
+     {
+      "term": "تتبّع التدفق (Follow stream)",
+      "definition": "إعادة تجميع محادثة TCP واحدة بالترتيب."
+     },
+     {
+      "term": "SNI",
+      "definition": "اسم الخادم الذي يرسله العميل في مصافحة TLS."
+     },
+     {
+      "term": "JA3",
+      "definition": "بصمة لمصافحة TLS الخاصة بالعميل."
+     },
+     {
+      "term": "البصمة (Hash)",
+      "definition": "ملخص بطول ثابت يثبت أن الملف لم يتغير."
+     },
+     {
+      "term": "الملاحظة مقابل الاستنتاج",
+      "definition": "حقيقة ظاهرة في البيانات مقابل خلاصة مستنبطة منها."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما أول ما تفعله عند تسلّم ملف PCAP كدليل؟",
+      "options": [
+       "افتحه في Wireshark وابدأ التصفية",
+       "احسب بصمته واعمل على نسخة",
+       "احذف الحزم غير ذات الصلة",
+       "حوّله إلى نص"
+      ],
+      "answer": 1,
+      "explanation": "تثبت البصمة لاحقًا أن الدليل لم يتغير، وتحمي النسخة الأصل."
+     },
+     {
+      "question": "أي المصادر تساعدك على تحديد نطاق حادثة انتهت فيها صلاحية الحزم الكاملة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "سجلات التدفق",
+       "سجلات جدار الحماية",
+       "سجلات Zeek",
+       "محتوى الحمولة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "تعيش التدفقات وسجلات الجدار وسجلات البروتوكول أطول من الحزم، أما المحتوى فيحتاج الحزم."
+     },
+     {
+      "question": "لماذا قد يفسد انحراف ساعة المستشعر 40 ثانية التحقيق؟",
+      "options": [
+       "يتلف ملف PCAP",
+       "لا تتطابق أحداث المصادر المختلفة في الخط الزمني",
+       "يعطل TLS",
+       "يغير البصمة"
+      ],
+      "answer": 1,
+      "explanation": "يعتمد الربط على ساعة مشتركة، والانحراف يضع السبب والنتيجة بترتيب خاطئ."
+     },
+     {
+      "question": "خادم أرسل 2 غيغابايت عبر TCP/443 إلى مضيف خارجي. أي العبارات ملاحظة؟",
+      "options": [
+       "سُرقت سجلات العملاء",
+       "غادر 2 غيغابايت الخادم عبر TCP/443",
+       "استخدم المهاجم أداة مخصصة",
+       "كانت البيانات تجهيزًا لفدية"
+      ],
+      "answer": 1,
+      "explanation": "الظاهر مباشرة هو حجم البايتات والمنفذ فقط، والباقي استنتاجات تحتاج إلى أدلة إضافية."
+     },
+     {
+      "question": "أي الحقول تبقى مفيدة حتى مع تشفير حمولات TLS؟ (اختر كل ما ينطبق)",
+      "options": [
+       "SNI",
+       "موضوع الشهادة",
+       "بصمة JA3",
+       "جسم طلب HTTP"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "بيانات المصافحة الوصفية ظاهرة، أما جسم HTTP فداخل القناة المشفرة."
+     }
+    ]
+   },
+   {
+    "id": "sum",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يثبت التحليل الجنائي للشبكات ما حدث من أدلة مخزَّنة، لذا يأتي الحفظ أولًا: البصمة والنسخ وسلسلة الحيازة وتسجيل الساعة.\n- استخدم الطبقات: التدفقات والسجلات لتحديد النطاق، والحزم للإثبات. وتحدد مدة الاحتفاظ ما يمكنك ادعاؤه.\n- قطّع PCAP وأعد بناء التدفق واستخدم بيانات المصافحة الوصفية عندما تكون الحمولات مشفرة.\n- ادمج المصادر في خط زمني واحد بتوقيت UTC وصنّف كل صف مُلاحَظًا أو مُستنتَجًا.\n- تابع مع [التحليل الجنائي للذاكرة وتحليل البرمجيات الخبيثة](/learn/security-operations-dfir/memory-forensics-and-malware-analysis) لربط قصة الشبكة بالمضيف."
+   }
+  ]
+ }
+}

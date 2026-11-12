@@ -1,0 +1,576 @@
+{
+  "slug": "lateral-movement-detection",
+  "title": "Lateral Movement Detection",
+  "summary": "Detect how attackers move between systems: understand the common remote-execution paths, find them in Windows, Linux and network logs, hunt with fan-out queries and Sigma rules, and prevent movement with segmentation and credential hygiene.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain why attackers move laterally and which remote-execution paths they commonly use",
+    "Map each path to the log evidence it leaves on source and target",
+    "Hunt for fan-out, unusual logon types and remote service creation",
+    "Write a detection for a workstation reaching many servers",
+    "Apply preventive controls that make movement harder and louder"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "The first machine an attacker controls is rarely the one they want. A phished laptop is a doorway; the prize is the file server, the database or the domain controller. Moving from one system to another is called **lateral movement**, and it is the stage where a small incident becomes a breach.\n\nIt is also a stage where attackers are most visible. They must authenticate to new systems, run remote commands and talk across segments they never used before. This lesson shows what that looks like in logs, how to hunt for it, and how to make it harder. It builds on [Authentication Log Investigation](/learn/security-operations-dfir/authentication-log-investigation) and feeds [Advanced Threat Hunting](/learn/security-operations-dfir/advanced-threat-hunting)."
+    },
+    {
+      "id": "paths",
+      "type": "text",
+      "markdown": "## Understand the common paths\n\nAttackers prefer built-in features because they look like administration. Each path leaves different evidence, so knowing the path tells you where to look.\n\n| Path | Port | Evidence on target | Evidence on source |\n|:--|:--|:--|:--|\n| **Remote Desktop** | 3389 | 4624 type 10, 4778/4779 | `mstsc` use, Sysmon 3 |\n| **SMB and admin shares** | 445 | 4624 type 3, 5140/5145 | Network connections to many hosts |\n| **Remote service creation** | 445 | System 7045, 4697 | `sc.exe` or service tools |\n| **Scheduled task creation** | 445/135 | 4698, task file in `System32\\Tasks` | `schtasks` with `/s` |\n| **WMI** | 135 + high | 4624 type 3, `WmiPrvSE.exe` children | `wmic` or WMI scripting |\n| **WinRM / PowerShell remoting** | 5985/5986 | 4624 type 3, `wsmprovhost.exe` | `Enter-PSSession` |\n| **SSH** | 22 | `Accepted` in auth.log | `ssh` in shell history |\n\nMany of these can use stolen password hashes or Kerberos tickets instead of a plaintext password, so the credential type does not always appear in logs. Detect the behavior around it."
+    },
+    {
+      "id": "lat-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "A movement chain from workstation to domain controller",
+      "caption": "Each hop adds a new logon event and a new set of hosts that must be checked.",
+      "data": {
+        "token": "Access",
+        "nodes": [
+          {
+            "id": "ws",
+            "icon": "laptop",
+            "label": "WS-114",
+            "sub": "Phished laptop"
+          },
+          {
+            "id": "app",
+            "icon": "server",
+            "label": "APP-02",
+            "sub": "Application server"
+          },
+          {
+            "id": "file",
+            "icon": "database",
+            "label": "FS-01",
+            "sub": "File server"
+          },
+          {
+            "id": "dc",
+            "icon": "key",
+            "label": "DC-01",
+            "sub": "Domain controller"
+          },
+          {
+            "id": "siem",
+            "icon": "log",
+            "label": "SIEM",
+            "sub": "Detection"
+          }
+        ],
+        "steps": [
+          {
+            "at": "ws",
+            "caption": "The attacker holds a standard user session on WS-114 and discovers local admin credentials.",
+            "tone": "warning"
+          },
+          {
+            "at": "app",
+            "caption": "A network logon (type 3) to APP-02 and a new service appear within two minutes.",
+            "tone": "danger"
+          },
+          {
+            "at": "file",
+            "caption": "The same account reaches FS-01 over SMB and reads many shares in an unusual order.",
+            "tone": "danger"
+          },
+          {
+            "at": "dc",
+            "caption": "A privileged account signs in to DC-01 from APP-02, which it has never done.",
+            "tone": "danger"
+          },
+          {
+            "at": "siem",
+            "caption": "A fan-out rule and a first-seen source-to-target rule both fire.",
+            "tone": "warning"
+          },
+          {
+            "at": "ws",
+            "caption": "Containment isolates WS-114 and APP-02, and the account is disabled.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "hunt",
+      "type": "text",
+      "markdown": "## Hunt for the behaviors\n\nSignatures change but behavior stays. Three hunts find most movement.\n\n1. **Fan-out.** One source authenticating to many distinct hosts in a short time. Normal users touch a handful of systems. Scanners and attackers touch dozens.\n2. **First-seen pairs.** A source and target that have never communicated before, especially over admin protocols such as SMB, RDP or WinRM.\n3. **Logon type mismatches.** Remote interactive or network logons for accounts that normally only sign in locally, and service creation (7045 or 4697) shortly after a network logon.\n\nBuild baselines first. An IT admin account legitimately touches many hosts, so exclude it by role and keep a watch on it separately. Detections that cannot tell administrators apart from attackers will be ignored."
+    },
+    {
+      "id": "fanout-kql",
+      "type": "code",
+      "language": "plain",
+      "code": "SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 4624 and LogonType in (3, 10)\n| where AccountType == \"User\" and TargetUserName !endswith \"$\"\n| summarize Targets = dcount(Computer), TargetList = make_set(Computer, 20) by IpAddress, TargetUserName\n| where Targets >= 8\n| order by Targets desc",
+      "filename": "lateral_fanout.kql",
+      "caption": "KQL for Microsoft Sentinel: one account and source reaching eight or more hosts in an hour with network or remote interactive logons. Tune the threshold to your estate."
+    },
+    {
+      "id": "svc-sigma",
+      "type": "code",
+      "language": "yaml",
+      "code": "title: Service Installed Shortly After Network Logon\nid: 5c1e3a10-0000-4000-8000-00000000a002\nstatus: experimental\nlogsource:\n  product: windows\n  service: system\ndetection:\n  selection:\n    EventID: 7045\n  filter_known:\n    ImagePath|contains:\n      - 'C:\\Program Files\\'\n      - 'C:\\Windows\\System32\\svchost.exe'\n  condition: selection and not filter_known\nfields:\n  - ServiceName\n  - ImagePath\n  - AccountName\nlevel: high\ntags:\n  - attack.lateral_movement\n  - attack.t1021.002",
+      "filename": "service_install_outside_standard_paths.yml",
+      "caption": "A Sigma rule for new services whose binary sits outside standard install paths. Correlate it with a preceding type 3 logon in your SIEM."
+    },
+    {
+      "id": "linux-net",
+      "type": "text",
+      "markdown": "## Use network and Linux evidence too\n\nHost logs can be cleared, so confirm with the network. Flow data and firewall logs show internal east-west connections to ports 445, 3389, 5985 and 22 from sources that never used them. Zeek's `conn` and `smb_mapping` logs show which shares were accessed. Review [Network-Based Incident Investigation](/learn/security-operations-dfir/network-based-incident-investigation) for the queries.\n\nOn Linux, look at `Accepted publickey` lines from internal addresses, new entries in `known_hosts`, SSH agent forwarding, and `sudo` use right after a login. A jump host is a high-value place to log everything, because most legitimate and malicious paths cross it."
+    },
+    {
+      "id": "lat-term",
+      "type": "terminal",
+      "title": "Zeek SMB and Linux checks (lab)",
+      "prompt": "analyst@sensor:~$",
+      "lines": [
+        {
+          "cmd": "zeek-cut ts id.orig_h id.resp_h path < smb_mapping.log | awk '$2==\"10.20.7.114\"' | head -3",
+          "output": "1731402190.4  10.20.7.114  10.20.5.14   \\\\FS-01\\C$\n1731402203.9  10.20.7.114  10.20.5.21   \\\\APP-02\\ADMIN$\n1731402221.1  10.20.7.114  10.20.5.30   \\\\DC-01\\C$",
+          "comment": "One workstation mapping administrative shares on three servers within 30 seconds."
+        },
+        {
+          "cmd": "grep 'Accepted publickey' /var/log/auth.log | awk '{print $9, $11}' | sort | uniq -c | sort -nr | head -3",
+          "output": "  14 deploy 192.0.2.10\n   6 backup 192.0.2.22\n   1 deploy 10.20.7.114",
+          "comment": "A first-seen internal source for the deploy account stands out."
+        }
+      ],
+      "caption": "Illustrative output with documentation and private addresses."
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## Triage a movement alert\n\nWhen a fan-out or service rule fires, work through a short checklist so that your decision is fast and consistent.\n\n1. **Identify both ends.** Which host is the source, which is the target, and which account was used? Confirm the source address with DHCP records.\n2. **Check the role.** Is the account an administrator, a service account or an ordinary user? Is the source a management server expected to do this?\n3. **Read the first event.** Find the earliest logon in the chain. That is usually closest to the original foothold, and it tells you where the investigation really starts.\n4. **Look at what ran.** On the target, review process creation events (4688 or Sysmon 1) just after the logon. A command interpreter spawned by a service or `WmiPrvSE.exe` is a red flag.\n5. **Expand the scope.** Search for the same account, the same source and the same tool name on every other host.\n6. **Decide and act.** If the activity is not explained within your time box, escalate and contain the source host and the account.\n\nThis routine also gives you the timeline you need for the later report."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Record the path, not only the host",
+      "markdown": "Write movement findings as a path: source, account, protocol, target and time. Four lines such as WS-114, svc-backup, SMB, FS-01, 02:14 UTC let the next analyst redraw the whole chain and spot gaps where evidence is missing. A list of hostnames alone cannot do that. Add the evidence source for each hop, such as the event ID or log file, so a reviewer can verify every claim independently and quickly."
+    },
+    {
+      "id": "prevent",
+      "type": "text",
+      "markdown": "## Make movement harder and louder\n\nDetection works best with prevention.\n\n- **Unique local admin passwords** (Windows LAPS) so one stolen password does not unlock every machine.\n- **Tiered administration:** domain admins never sign in to workstations, so their credentials cannot be harvested there.\n- **Segmentation:** block workstation-to-workstation SMB, RDP and WinRM with host firewalls. Workstations rarely need to talk to each other.\n- **Restrict NTLM** and enforce Kerberos where possible; require MFA on remote access and jump hosts.\n- **Remove standing privilege** with just-in-time access.\n- **Log centrally** with 4688 command lines, Sysmon and forwarding to the SIEM.\n\nThese controls also reduce ransomware spread, which is why they appear again in [Ransomware Detection and Response](/learn/security-operations-dfir/ransomware-detection-and-response)."
+    },
+    {
+      "id": "warning",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Administrators look like attackers",
+      "markdown": "Patch tools, backup agents and vulnerability scanners legitimately log in to many hosts and create services. Do not suppress lateral movement alerts globally. Allow-list the specific source, account and time window, record the owner, and review the list every quarter."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a Windows lab domain you own (two member servers and one workstation), sign in from the workstation to both servers using Remote Desktop and `Enter-PSSession`, with a test admin account. On each server, find the matching 4624 events and note the logon type and source address. Write a query that returns one source reaching two or more servers within ten minutes, then raise the count to see how the threshold affects false positives."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Lateral movement",
+          "definition": "Moving from one compromised system to others in the network."
+        },
+        {
+          "term": "East-west traffic",
+          "definition": "Internal traffic between systems inside the network."
+        },
+        {
+          "term": "Fan-out",
+          "definition": "One source contacting many distinct targets in a short time."
+        },
+        {
+          "term": "Admin share",
+          "definition": "Hidden Windows shares such as C$ and ADMIN$ used for administration."
+        },
+        {
+          "term": "WinRM",
+          "definition": "Windows Remote Management, the protocol behind PowerShell remoting."
+        },
+        {
+          "term": "LAPS",
+          "definition": "Windows tool that gives each computer a unique local admin password."
+        },
+        {
+          "term": "Jump host",
+          "definition": "A hardened system used as the controlled path into sensitive networks."
+        },
+        {
+          "term": "Segmentation",
+          "definition": "Splitting a network so that systems cannot freely reach each other."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which logon type indicates a Remote Desktop session?",
+          "options": [
+            "2",
+            "3",
+            "5",
+            "10"
+          ],
+          "answer": 3,
+          "explanation": "Type 10 is RemoteInteractive, used for Remote Desktop. Type 3 is network and type 2 is local interactive."
+        },
+        {
+          "question": "Which behaviors suggest lateral movement? Choose all that apply.",
+          "options": [
+            "A workstation authenticating to 30 servers in ten minutes",
+            "A new service installed right after a network logon",
+            "A user opening a local spreadsheet",
+            "A source reaching a server over SMB for the first time"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Fan-out, remote service creation and first-seen admin-protocol connections are typical. Opening a local file is not lateral movement."
+        },
+        {
+          "question": "Why is a lockout-based rule alone poor at finding lateral movement?",
+          "options": [
+            "Lateral movement uses valid credentials that succeed",
+            "Windows does not log failures",
+            "SMB cannot be logged",
+            "Lockouts only occur on Linux"
+          ],
+          "answer": 0,
+          "explanation": "Movement often uses valid or stolen credentials, so there are few failures to count. Behavior and context matter."
+        },
+        {
+          "question": "Which controls reduce lateral movement? Choose all that apply.",
+          "options": [
+            "Windows LAPS for unique local admin passwords",
+            "Blocking workstation-to-workstation SMB and RDP",
+            "Using one shared local admin password",
+            "Tiered administration"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Unique passwords, segmentation and tiering limit what a stolen credential can reach. One shared password makes movement easy."
+        },
+        {
+          "question": "A patch server shows fan-out to 200 hosts every night. What is the best handling?",
+          "options": [
+            "Disable the detection globally",
+            "Allow-list that specific source, account and time window with an owner and review date",
+            "Ignore all fan-out alerts",
+            "Delete the patch server logs"
+          ],
+          "answer": 1,
+          "explanation": "Targeted exclusions keep the detection useful while removing known legitimate behavior."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nLateral movement turns one compromised system into a breach, but it forces attackers to authenticate, execute remotely and cross network boundaries, all of which leave evidence. Learn the paths and their log signatures, hunt for fan-out, first-seen pairs and logon type mismatches, confirm with network data, and exclude legitimate administration precisely. Prevent with unique local admin passwords, tiering, segmentation and central logging. Next, see how these skills apply to a destructive attack in [Ransomware Detection and Response](/learn/security-operations-dfir/ransomware-detection-and-response)."
+    }
+  ],
+  "ar": {
+    "title": "كشف التحرك الجانبي",
+    "summary": "اكتشف كيف ينتقل المهاجمون بين الأنظمة: افهم مسارات التنفيذ عن بُعد الشائعة، وابحث عنها في سجلات Windows وLinux والشبكة، واصطد باستعلامات الانتشار وقواعد Sigma، وامنع الحركة بالتقسيم ونظافة بيانات الاعتماد.",
+    "objectives": [
+      "شرح سبب تحرك المهاجمين جانبيًا ومسارات التنفيذ عن بُعد التي يستخدمونها عادةً",
+      "ربط كل مسار بالأدلة التي يتركها في السجلات على المصدر والهدف",
+      "الصيد عن الانتشار الواسع وأنواع الدخول غير المعتادة وإنشاء الخدمات عن بُعد",
+      "كتابة كشف لمحطة عمل تصل إلى خوادم كثيرة",
+      "تطبيق ضوابط وقائية تجعل الحركة أصعب وأكثر ضجيجًا"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "أول جهاز يسيطر عليه المهاجم نادرًا ما يكون الجهاز الذي يريده. الحاسوب المحمول المصطاد بالتصيّد مجرد باب؛ أما الجائزة فخادم الملفات أو قاعدة البيانات أو وحدة التحكم بالنطاق. يسمّى الانتقال من نظام إلى آخر **التحرك الجانبي (Lateral movement)**، وهو المرحلة التي تتحول فيها حادثة صغيرة إلى اختراق.\n\nوهي أيضًا مرحلة يكون فيها المهاجمون أكثر ظهورًا. فعليهم أن يصادقوا على أنظمة جديدة وينفذوا أوامر عن بُعد ويتحدثوا عبر مقاطع لم يستخدموها قبل ذلك. يبيّن هذا الدرس شكل ذلك في السجلات وكيف تصطاده وكيف تجعله أصعب. وهو يبني على [التحقيق في سجلات المصادقة](/learn/security-operations-dfir/authentication-log-investigation) ويغذّي [الصيد المتقدم للتهديدات](/learn/security-operations-dfir/advanced-threat-hunting)."
+      },
+      {
+        "id": "paths",
+        "type": "text",
+        "markdown": "## افهم المسارات الشائعة\n\nيفضّل المهاجمون الميزات المضمّنة لأنها تشبه الإدارة. يترك كل مسار أدلة مختلفة، ومعرفة المسار تدلّك أين تنظر.\n\n| المسار | المنفذ | الدليل على الهدف | الدليل على المصدر |\n|:--|:--|:--|:--|\n| **سطح المكتب البعيد** | 3389 | 4624 من النوع 10 و4778/4779 | استخدام `mstsc` وSysmon 3 |\n| **SMB والمشاركات الإدارية** | 445 | 4624 من النوع 3 و5140/5145 | اتصالات شبكية بأجهزة كثيرة |\n| **إنشاء خدمة عن بُعد** | 445 | النظام 7045 و4697 | `sc.exe` أو أدوات الخدمات |\n| **إنشاء مهمة مجدولة** | 445/135 | 4698 وملف المهمة في `System32\\Tasks` | `schtasks` مع `/s` |\n| **WMI** | 135 + منافذ عالية | 4624 من النوع 3 وأبناء `WmiPrvSE.exe` | `wmic` أو سكربتات WMI |\n| **WinRM / PowerShell عن بُعد** | 5985/5986 | 4624 من النوع 3 و`wsmprovhost.exe` | `Enter-PSSession` |\n| **SSH** | 22 | `Accepted` في auth.log | `ssh` في سجل الصدفة |\n\nيمكن لكثير منها استخدام تجزئات كلمات مرور مسروقة أو تذاكر Kerberos بدل كلمة المرور الصريحة، فلا يظهر نوع بيانات الاعتماد دائمًا في السجلات. اكشف السلوك المحيط به."
+      },
+      {
+        "id": "lat-flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "سلسلة تحرك من محطة عمل إلى وحدة تحكم بالنطاق",
+        "caption": "كل قفزة تضيف حدث دخول جديدًا ومجموعة أجهزة جديدة يجب فحصها.",
+        "data": {
+          "token": "وصول",
+          "nodes": [
+            {
+              "id": "ws",
+              "icon": "laptop",
+              "label": "WS-114",
+              "sub": "حاسوب مصاد"
+            },
+            {
+              "id": "app",
+              "icon": "server",
+              "label": "APP-02",
+              "sub": "خادم تطبيقات"
+            },
+            {
+              "id": "file",
+              "icon": "database",
+              "label": "FS-01",
+              "sub": "خادم ملفات"
+            },
+            {
+              "id": "dc",
+              "icon": "key",
+              "label": "DC-01",
+              "sub": "وحدة تحكم بالنطاق"
+            },
+            {
+              "id": "siem",
+              "icon": "log",
+              "label": "SIEM",
+              "sub": "الكشف"
+            }
+          ],
+          "steps": [
+            {
+              "at": "ws",
+              "caption": "يملك المهاجم جلسة مستخدم عادي على WS-114 ويكتشف بيانات اعتماد مسؤول محلي.",
+              "tone": "warning"
+            },
+            {
+              "at": "app",
+              "caption": "يظهر دخول شبكي (النوع 3) إلى APP-02 وخدمة جديدة خلال دقيقتين.",
+              "tone": "danger"
+            },
+            {
+              "at": "file",
+              "caption": "يصل الحساب نفسه إلى FS-01 عبر SMB ويقرأ مشاركات كثيرة بترتيب غير معتاد.",
+              "tone": "danger"
+            },
+            {
+              "at": "dc",
+              "caption": "يسجّل حساب مميز دخوله إلى DC-01 من APP-02 وهو ما لم يفعله قط.",
+              "tone": "danger"
+            },
+            {
+              "at": "siem",
+              "caption": "تُطلق قاعدة الانتشار وقاعدة أول مرة لزوج المصدر والهدف معًا.",
+              "tone": "warning"
+            },
+            {
+              "at": "ws",
+              "caption": "يعزل الاحتواء WS-114 وAPP-02 ويُعطَّل الحساب.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "hunt",
+        "type": "text",
+        "markdown": "## اصطد السلوكيات\n\nتتغير التواقيع ويبقى السلوك. ثلاثة أنواع من الصيد تجد معظم الحركة.\n\n1. **الانتشار الواسع.** مصدر واحد يصادق على أجهزة مختلفة كثيرة في وقت قصير. المستخدمون العاديون يلمسون عددًا قليلًا من الأنظمة، أما الماسحات والمهاجمون فيلمسون عشرات.\n2. **أزواج أول مرة.** مصدر وهدف لم يتواصلا من قبل، خصوصًا عبر بروتوكولات إدارية مثل SMB وRDP وWinRM.\n3. **عدم تطابق نوع الدخول.** دخول تفاعلي بعيد أو شبكي لحسابات تسجّل الدخول محليًا عادةً، وإنشاء خدمة (7045 أو 4697) بعد دخول شبكي بوقت قصير.\n\nابنِ خطوط الأساس أولًا. حساب مسؤول تقنية المعلومات يلمس أجهزة كثيرة بشكل مشروع، فاستثنِه بحسب الدور وراقبه على حدة. الكشوفات التي لا تفرّق بين المسؤولين والمهاجمين سيتجاهلها الفريق."
+      },
+      {
+        "id": "fanout-kql",
+        "type": "code",
+        "language": "plain",
+        "code": "SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 4624 and LogonType in (3, 10)\n| where AccountType == \"User\" and TargetUserName !endswith \"$\"\n| summarize Targets = dcount(Computer), TargetList = make_set(Computer, 20) by IpAddress, TargetUserName\n| where Targets >= 8\n| order by Targets desc",
+        "filename": "lateral_fanout.kql",
+        "caption": "KQL لـ Microsoft Sentinel: حساب ومصدر يصلان إلى ثمانية أجهزة أو أكثر في ساعة بدخول شبكي أو تفاعلي بعيد. اضبط العتبة وفق بيئتك."
+      },
+      {
+        "id": "svc-sigma",
+        "type": "code",
+        "language": "yaml",
+        "code": "title: Service Installed Shortly After Network Logon\nid: 5c1e3a10-0000-4000-8000-00000000a002\nstatus: experimental\nlogsource:\n  product: windows\n  service: system\ndetection:\n  selection:\n    EventID: 7045\n  filter_known:\n    ImagePath|contains:\n      - 'C:\\Program Files\\'\n      - 'C:\\Windows\\System32\\svchost.exe'\n  condition: selection and not filter_known\nfields:\n  - ServiceName\n  - ImagePath\n  - AccountName\nlevel: high\ntags:\n  - attack.lateral_movement\n  - attack.t1021.002",
+        "filename": "service_install_outside_standard_paths.yml",
+        "caption": "قاعدة Sigma للخدمات الجديدة التي يقع ملفها خارج مسارات التثبيت القياسية. اربطها في SIEM بدخول سابق من النوع 3."
+      },
+      {
+        "id": "linux-net",
+        "type": "text",
+        "markdown": "## استخدم أدلة الشبكة وLinux أيضًا\n\nيمكن مسح سجلات الأجهزة، لذا أكّد بالشبكة. تُظهر بيانات التدفق وسجلات جدار الحماية اتصالات داخلية شرق-غرب إلى المنافذ 445 و3389 و5985 و22 من مصادر لم تستخدمها قط. وتبيّن سجلات Zeek مثل `conn` و`smb_mapping` المشاركات التي جرى الوصول إليها. راجع [التحقيق في الحوادث على مستوى الشبكة](/learn/security-operations-dfir/network-based-incident-investigation) للاستعلامات.\n\nوفي Linux ابحث عن أسطر `Accepted publickey` من عناوين داخلية، وإدخالات جديدة في `known_hosts`، وتمرير وكيل SSH، واستخدام `sudo` مباشرة بعد الدخول. وخادم القفز موضع عالي القيمة لتسجيل كل شيء، لأن معظم المسارات المشروعة والخبيثة تعبره."
+      },
+      {
+        "id": "lat-term",
+        "type": "terminal",
+        "title": "Zeek SMB and Linux checks (lab)",
+        "prompt": "analyst@sensor:~$",
+        "lines": [
+          {
+            "cmd": "zeek-cut ts id.orig_h id.resp_h path < smb_mapping.log | awk '$2==\"10.20.7.114\"' | head -3",
+            "output": "1731402190.4  10.20.7.114  10.20.5.14   \\\\FS-01\\C$\n1731402203.9  10.20.7.114  10.20.5.21   \\\\APP-02\\ADMIN$\n1731402221.1  10.20.7.114  10.20.5.30   \\\\DC-01\\C$",
+            "comment": "محطة عمل واحدة تربط مشاركات إدارية على ثلاثة خوادم خلال 30 ثانية."
+          },
+          {
+            "cmd": "grep 'Accepted publickey' /var/log/auth.log | awk '{print $9, $11}' | sort | uniq -c | sort -nr | head -3",
+            "output": "  14 deploy 192.0.2.10\n   6 backup 192.0.2.22\n   1 deploy 10.20.7.114",
+            "comment": "مصدر داخلي يظهر لأول مرة لحساب deploy يبرز بين البقية."
+          }
+        ],
+        "caption": "مخرجات توضيحية بعناوين التوثيق والعناوين الخاصة."
+      },
+      {
+        "id": "triage",
+        "type": "text",
+        "markdown": "## افرز تنبيه الحركة\n\nحين تُطلق قاعدة الانتشار أو الخدمة، اتبع قائمة قصيرة ليكون قرارك سريعًا ومتسقًا.\n\n1. **حدد الطرفين.** أي جهاز هو المصدر، وأيهما الهدف، وأي حساب استُخدم؟ أكّد عنوان المصدر بسجلات DHCP.\n2. **افحص الدور.** هل الحساب مسؤول أم حساب خدمة أم مستخدم عادي؟ وهل المصدر خادم إدارة يُتوقع منه ذلك؟\n3. **اقرأ أول حدث.** ابحث عن أقدم دخول في السلسلة. غالبًا ما يكون الأقرب إلى موطئ القدم الأصلي، ويدلّك على المكان الذي يبدأ منه التحقيق فعلًا.\n4. **انظر إلى ما عمل.** على الهدف راجع أحداث إنشاء العمليات (4688 أو Sysmon 1) بعد الدخول مباشرة. مفسّر أوامر تبدؤه خدمة أو `WmiPrvSE.exe` علامة تحذير.\n5. **وسّع النطاق.** ابحث عن الحساب نفسه والمصدر نفسه واسم الأداة نفسه على كل جهاز آخر.\n6. **قرّر وتصرّف.** إن لم يُفسَّر النشاط ضمن حدك الزمني فصعّد واحتوِ جهاز المصدر والحساب.\n\nويمنحك هذا الروتين أيضًا الجدول الزمني الذي تحتاجه للتقرير لاحقًا."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "سجّل المسار لا الجهاز فقط",
+        "markdown": "اكتب نتائج الحركة كمسار: المصدر والحساب والبروتوكول والهدف والوقت. أسطر مثل WS-114 وsvc-backup وSMB وFS-01 والساعة 02:14 بالتوقيت العالمي تتيح للمحلل التالي إعادة رسم السلسلة كلها واكتشاف الفجوات التي تنقصها الأدلة. قائمة أسماء الأجهزة وحدها لا تفعل ذلك. وأضف مصدر الدليل لكل قفزة، كمعرّف الحدث أو ملف السجل، ليتحقق المراجع من كل ادعاء بنفسه وبسرعة."
+      },
+      {
+        "id": "prevent",
+        "type": "text",
+        "markdown": "## اجعل الحركة أصعب وأعلى صوتًا\n\nيعمل الكشف على أفضل وجه مع الوقاية.\n\n- **كلمات مرور فريدة للمسؤول المحلي** (Windows LAPS) كي لا تفتح كلمة مرور مسروقة كل جهاز.\n- **الإدارة المتدرجة:** مسؤولو النطاق لا يسجلون الدخول إلى محطات العمل، فلا يمكن حصد بيانات اعتمادهم هناك.\n- **التقسيم:** احجب SMB وRDP وWinRM بين محطات العمل عبر جدران الحماية المحلية. نادرًا ما تحتاج محطات العمل إلى التحدث بعضها مع بعض.\n- **قيّد NTLM** وفرض Kerberos حيثما أمكن؛ واشترط MFA على الوصول البعيد وخوادم القفز.\n- **أزل الصلاحيات الدائمة** بالوصول في الوقت المناسب.\n- **سجّل مركزيًا** مع سطور أوامر 4688 وSysmon وإرسالها إلى SIEM.\n\nوتقلل هذه الضوابط أيضًا انتشار برمجيات الفدية، ولذلك تظهر مجددًا في [كشف برمجيات الفدية والاستجابة لها](/learn/security-operations-dfir/ransomware-detection-and-response)."
+      },
+      {
+        "id": "warning",
+        "type": "callout",
+        "variant": "warning",
+        "title": "المسؤولون يشبهون المهاجمين",
+        "markdown": "تسجّل أدوات التحديث ووكلاء النسخ الاحتياطي وماسحات الثغرات الدخول إلى أجهزة كثيرة وتنشئ خدمات بشكل مشروع. لا تُسكت تنبيهات التحرك الجانبي عمومًا. اسمح بمصدر وحساب ونافذة زمنية محددة، وسجّل المالك، وراجع القائمة كل ربع سنة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في نطاق Windows تجريبي تملكه (خادمان عضوان ومحطة عمل واحدة)، سجّل الدخول من المحطة إلى الخادمين باستخدام سطح المكتب البعيد و`Enter-PSSession` بحساب مسؤول اختباري. على كل خادم ابحث عن أحداث 4624 المقابلة ودوّن نوع الدخول وعنوان المصدر. اكتب استعلامًا يعيد مصدرًا يصل إلى خادمين أو أكثر خلال عشر دقائق، ثم ارفع العدد لترى كيف تؤثر العتبة في الإيجابيات الكاذبة."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسية",
+        "items": [
+          {
+            "term": "التحرك الجانبي (Lateral movement)",
+            "definition": "الانتقال من نظام مخترق إلى أنظمة أخرى في الشبكة."
+          },
+          {
+            "term": "حركة شرق-غرب (East-west)",
+            "definition": "حركة داخلية بين أنظمة داخل الشبكة."
+          },
+          {
+            "term": "الانتشار الواسع (Fan-out)",
+            "definition": "مصدر واحد يتصل بأهداف مختلفة كثيرة في وقت قصير."
+          },
+          {
+            "term": "المشاركة الإدارية (Admin share)",
+            "definition": "مشاركات Windows المخفية مثل C$ وADMIN$ المستخدمة للإدارة."
+          },
+          {
+            "term": "WinRM",
+            "definition": "إدارة Windows عن بُعد، البروتوكول خلف PowerShell remoting."
+          },
+          {
+            "term": "LAPS",
+            "definition": "أداة Windows تمنح كل حاسوب كلمة مرور مسؤول محلي فريدة."
+          },
+          {
+            "term": "خادم القفز (Jump host)",
+            "definition": "نظام محصّن يُستخدم مسارًا خاضعًا للرقابة إلى شبكات حساسة."
+          },
+          {
+            "term": "التقسيم (Segmentation)",
+            "definition": "تقسيم الشبكة بحيث لا تصل الأنظمة بعضها إلى بعض بحرية."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي نوع دخول يدل على جلسة سطح مكتب بعيد؟",
+            "options": [
+              "2",
+              "3",
+              "5",
+              "10"
+            ],
+            "answer": 3,
+            "explanation": "النوع 10 هو RemoteInteractive المستخدم لسطح المكتب البعيد، والنوع 3 شبكي، والنوع 2 تفاعلي محلي."
+          },
+          {
+            "question": "أي السلوكيات توحي بتحرك جانبي؟ اختر كل ما ينطبق.",
+            "options": [
+              "محطة عمل تصادق على 30 خادمًا في عشر دقائق",
+              "خدمة جديدة تُثبَّت بعد دخول شبكي مباشرة",
+              "مستخدم يفتح جدول بيانات محليًا",
+              "مصدر يصل إلى خادم عبر SMB لأول مرة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الانتشار الواسع وإنشاء خدمة عن بُعد واتصالات البروتوكولات الإدارية لأول مرة أمور نموذجية، أما فتح ملف محلي فليس تحركًا جانبيًا."
+          },
+          {
+            "question": "لماذا تعدّ قاعدة تعتمد على القفل وحدها ضعيفة في كشف التحرك الجانبي؟",
+            "options": [
+              "لأن التحرك يستخدم بيانات اعتماد صالحة تنجح",
+              "لأن Windows لا يسجّل الإخفاقات",
+              "لأن SMB لا يمكن تسجيله",
+              "لأن القفل يحدث في Linux فقط"
+            ],
+            "answer": 0,
+            "explanation": "كثيرًا ما يستخدم التحرك بيانات اعتماد صالحة أو مسروقة، فلا إخفاقات كثيرة لعدّها. المهم السلوك والسياق."
+          },
+          {
+            "question": "أي الضوابط تقلل التحرك الجانبي؟ اختر كل ما ينطبق.",
+            "options": [
+              "Windows LAPS لكلمات مرور مسؤول محلي فريدة",
+              "حجب SMB وRDP بين محطات العمل",
+              "استخدام كلمة مرور مسؤول محلي مشتركة واحدة",
+              "الإدارة المتدرجة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "كلمات المرور الفريدة والتقسيم والتدرج تحد مما تصل إليه بيانات اعتماد مسروقة، أما كلمة المرور المشتركة فتسهّل التحرك."
+          },
+          {
+            "question": "يُظهر خادم التحديثات انتشارًا إلى 200 جهاز كل ليلة. ما أفضل معالجة؟",
+            "options": [
+              "تعطيل الكشف كليًا",
+              "السماح بذلك المصدر والحساب والنافذة الزمنية مع مالك وتاريخ مراجعة",
+              "تجاهل كل تنبيهات الانتشار",
+              "حذف سجلات خادم التحديثات"
+            ],
+            "answer": 1,
+            "explanation": "الاستثناءات المحددة تُبقي الكشف مفيدًا وتزيل السلوك المشروع المعروف."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nيحوّل التحرك الجانبي نظامًا مخترقًا واحدًا إلى اختراق شامل، لكنه يجبر المهاجمين على المصادقة والتنفيذ عن بُعد وعبور حدود الشبكة، وكلها تترك أدلة. تعلّم المسارات وتواقيعها في السجلات، واصطد الانتشار الواسع وأزواج أول مرة وعدم تطابق نوع الدخول، وأكّد ببيانات الشبكة، واستثنِ الإدارة المشروعة بدقة. وقِ بكلمات مرور مسؤول محلي فريدة والتدرج والتقسيم والتسجيل المركزي. وبعد ذلك شاهد كيف تنطبق هذه المهارات على هجوم تدميري في [كشف برمجيات الفدية والاستجابة لها](/learn/security-operations-dfir/ransomware-detection-and-response)."
+      }
+    ]
+  }
+}

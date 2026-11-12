@@ -1,0 +1,580 @@
+{
+  "slug": "powershell-security-automation",
+  "title": "PowerShell Security Automation",
+  "summary": "Build safe, repeatable PowerShell scripts that audit Windows hosts, detect drift and feed evidence to your security team.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain why scripted checks beat manual console work for security operations",
+    "Write PowerShell that is idempotent, logged and safe to run on many hosts",
+    "Audit privileged groups and security events with structured output",
+    "Detect configuration drift against a baseline",
+    "Run scripts at scale with remoting and least-privilege endpoints"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "An auditor asks a simple question: which accounts are local administrators on your 400 Windows servers? An engineer opens remote consoles one at a time. Three days later the answer is already out of date, and nobody can prove how it was gathered.\n\nPowerShell turns that question into a script you can run in minutes, run again next week and hand to the auditor as evidence. This lesson shows how to write security scripts that are safe, repeatable and observable, and how to run them across a fleet without handing out more privilege than needed."
+    },
+    {
+      "id": "why",
+      "type": "text",
+      "markdown": "## Why script security work\n\nManual checks are slow, inconsistent and impossible to audit. A script is the opposite: the same logic runs every time, its output can be stored, and a reviewer can read exactly what was checked.\n\nPowerShell suits this work for three reasons:\n\n- **Objects, not text.** Cmdlets return typed objects, so you filter with `Where-Object` instead of parsing strings.\n- **Native reach.** It talks to Active Directory, the registry, event logs, Defender and Windows services without extra tools. See [Active Directory security](/learn/security-architecture-resilience/active-directory-security) for what is worth checking.\n- **Remoting built in.** One command can query hundreds of hosts over WinRM.\n\nThe same power makes mistakes expensive, so the rest of this lesson is about discipline."
+    },
+    {
+      "id": "foundations",
+      "type": "text",
+      "markdown": "## Foundations of a safe security script\n\nEvery script you schedule or share should follow a short checklist.\n\n| Practice | What it prevents |\n|:--|:--|\n| `Set-StrictMode -Version Latest` | Silent use of undefined variables |\n| `$ErrorActionPreference = 'Stop'` | Scripts that continue after a failure and report false success |\n| `[CmdletBinding(SupportsShouldProcess)]` | Changes that cannot be previewed with `-WhatIf` |\n| Parameter validation | Bad input reaching a destructive command |\n| Read first, change second | Fixing a host you have not actually inspected |\n| Structured output (CSV or JSON) | Reports nobody can compare over time |\n\n**Idempotent** means running the script twice gives the same result as running it once. Check the current state, change only what differs, and log what you did. Never store credentials in a script; use the SecretManagement module, a vault or a managed identity, as described in [secrets vaults and password managers](/learn/security-architecture-resilience/secrets-vaults-and-password-managers)."
+    },
+    {
+      "id": "audit-script",
+      "type": "code",
+      "language": "powershell",
+      "filename": "Get-AdminAudit.ps1",
+      "caption": "A read-only audit that returns one object per local administrator. `-ErrorAction Continue` on the remote call lets one unreachable host fail without stopping the run.",
+      "code": "[CmdletBinding()]\nparam(\n    [Parameter(Mandatory)][ValidateScript({ Test-Path $_ })][string]$ComputerList,\n    [string]$OutFile = \".\\local-admins-$(Get-Date -Format yyyyMMdd).csv\"\n)\nSet-StrictMode -Version Latest\n$ErrorActionPreference = 'Stop'\n\n$computers = Get-Content $ComputerList\n$rows = Invoke-Command -ComputerName $computers -ErrorAction Continue -ScriptBlock {\n    Get-LocalGroupMember -Group 'Administrators' | ForEach-Object {\n        [pscustomobject]@{\n            Host   = $env:COMPUTERNAME\n            Member = $_.Name\n            Type   = $_.ObjectClass\n            Source = $_.PrincipalSource\n        }\n    }\n}\n$rows | Select-Object Host, Member, Type, Source |\n    Export-Csv -Path $OutFile -NoTypeInformation\nWrite-Host \"Wrote $($rows.Count) rows to $OutFile\"\n",
+      "highlight": [
+        8,
+        10,
+        11
+      ]
+    },
+    {
+      "id": "audit-run",
+      "type": "terminal",
+      "title": "Running the audit",
+      "prompt": "PS C:\\Audit>",
+      "lines": [
+        {
+          "cmd": "./Get-AdminAudit.ps1 -ComputerList .\\servers.txt",
+          "output": "Wrote 9 rows to .\\local-admins-20261112.csv",
+          "comment": "Three servers listed, nine administrator memberships returned."
+        },
+        {
+          "cmd": "Import-Csv .\\local-admins-20261112.csv | Where-Object Source -eq 'Local' | Format-Table",
+          "output": "Host     Member                Type  Source\n----     ------                ----  ------\nSRV-APP1 SRV-APP1\\Administrator User  Local\nSRV-APP1 SRV-APP1\\svc-legacy    User  Local\nSRV-DB1  SRV-DB1\\Administrator  User  Local",
+          "comment": "Local accounts deserve review. `svc-legacy` is an unexpected local administrator on SRV-APP1."
+        }
+      ],
+      "caption": "Output is example data. Store each run so you can diff it against the next one."
+    },
+    {
+      "id": "events",
+      "type": "text",
+      "markdown": "## Querying security events\n\nEvent logs are the second big use case. `Get-WinEvent` with `-FilterHashtable` filters on the server side, which is far faster than pulling every event and filtering locally.\n\nUseful Security log event IDs include:\n\n- **4625** failed logon\n- **4672** special privileges assigned to a new logon\n- **4720** user account created\n- **4732** member added to a security-enabled local group\n\nGroup the results, then decide what is normal. A single failed logon is noise; two hundred from one source in ten minutes is a lead. The related [authentication anomaly detection](/learn/security-architecture-resilience/authentication-anomaly-detection) lesson covers thresholds in depth."
+    },
+    {
+      "id": "events-code",
+      "type": "code",
+      "language": "powershell",
+      "filename": "Get-FailedLogons.ps1",
+      "caption": "Server-side filtering with a hashtable, then a summary by account and source address.",
+      "code": "$since = (Get-Date).AddMinutes(-10)\n$events = Get-WinEvent -FilterHashtable @{\n    LogName = 'Security'; Id = 4625; StartTime = $since\n}\n$events | ForEach-Object {\n    $x = [xml]$_.ToXml()\n    $d = @{}\n    $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }\n    [pscustomobject]@{ Account = $d.TargetUserName; Source = $d.IpAddress }\n} | Group-Object Account, Source |\n    Where-Object Count -ge 20 |\n    Sort-Object Count -Descending |\n    Select-Object Count, Name\n",
+      "highlight": [
+        2,
+        3,
+        9
+      ]
+    },
+    {
+      "id": "drift-anim",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "Drift detection loop",
+      "data": {
+        "center": "Baseline check",
+        "items": [
+          {
+            "label": "Define baseline",
+            "sub": "Store desired settings in version control."
+          },
+          {
+            "label": "Collect state",
+            "sub": "Read the real settings from each host."
+          },
+          {
+            "label": "Compare",
+            "sub": "Diff actual against baseline."
+          },
+          {
+            "label": "Report or remediate",
+            "sub": "Open a ticket, or fix with approval."
+          },
+          {
+            "label": "Record evidence",
+            "sub": "Keep the report for the next audit."
+          }
+        ],
+        "steps": [
+          {
+            "item": 0,
+            "caption": "The baseline lives in Git so every change is reviewed."
+          },
+          {
+            "item": 1,
+            "caption": "A scheduled job reads SMB1, firewall and password-policy settings."
+          },
+          {
+            "item": 2,
+            "caption": "`Compare-Object` finds hosts that differ."
+          },
+          {
+            "item": 3,
+            "caption": "Low-risk drift is fixed; the rest becomes a ticket."
+          },
+          {
+            "item": 4,
+            "caption": "The signed report proves control operation."
+          }
+        ]
+      }
+    },
+    {
+      "id": "drift",
+      "type": "text",
+      "markdown": "## Detecting drift from a baseline\n\nA baseline is a written list of expected settings, such as SMBv1 disabled, Windows Firewall on for all profiles and Defender real-time protection enabled. Drift is any host that no longer matches.\n\nThe pattern is always the same: collect, compare, act. Keep the baseline as data (a JSON file), not as logic buried in the script. Then a policy change is a reviewed commit rather than a code edit. For configuration that must be enforced rather than only reported, pair this with [Group Policy security](/learn/security-architecture-resilience/group-policy-security) or Desired State Configuration.\n\nAuto-remediation is tempting, but fix only changes that are low risk and reversible. Anything that could interrupt a service should open a ticket for a human."
+    },
+    {
+      "id": "drift-code",
+      "type": "code",
+      "language": "powershell",
+      "filename": "Test-Baseline.ps1",
+      "caption": "Compare actual settings with a JSON baseline and emit only the differences.",
+      "code": "$baseline = Get-Content .\\baseline.json | ConvertFrom-Json\n$actual = [pscustomobject]@{\n    SMB1      = (Get-SmbServerConfiguration).EnableSMB1Protocol\n    Firewall  = -not (Get-NetFirewallProfile | Where-Object Enabled -eq 'False')\n    Defender  = -not (Get-MpPreference).DisableRealtimeMonitoring\n}\nforeach ($name in $baseline.PSObject.Properties.Name) {\n    if ($actual.$name -ne $baseline.$name) {\n        [pscustomobject]@{\n            Host = $env:COMPUTERNAME; Setting = $name\n            Expected = $baseline.$name; Actual = $actual.$name\n        }\n    }\n}\n",
+      "highlight": [
+        8,
+        9
+      ]
+    },
+    {
+      "id": "evidence",
+      "type": "text",
+      "markdown": "## Turning output into evidence\n\nA report is only useful if someone can trust it later. Write each result with the host name, a UTC timestamp and the version of the script that produced it. Save the file to a location the scripts cannot overwrite, such as a write-once share or a SIEM index, and keep a hash of the file so tampering is detectable.\n\nSchedule the script with Task Scheduler or your CI system rather than running it by hand. A weekly run produces a trend line: the number of local administrators should fall over time, and a sudden rise is worth an alert. Send only summaries to chat or email, never raw account lists, because those lists are themselves sensitive."
+    },
+    {
+      "id": "scale",
+      "type": "text",
+      "markdown": "## Running at scale, safely\n\nRemoting uses WinRM over HTTPS or Kerberos-protected HTTP. Two rules keep it safe.\n\n1. **Do not run fleet scripts as a domain admin.** Use a dedicated automation account with only the rights the script needs, or a constrained endpoint built with [Just Enough Administration](/learn/security-architecture-resilience/just-enough-administration-jea).\n2. **Log what runs.** Turn on Script Block Logging, Module Logging and transcription through policy. Event ID 4104 then records the content of scripts executed on the host, so your own automation is visible to defenders and an attacker's PowerShell is not.\n\nSet the execution policy to `AllSigned` for production scripts and sign them with a code-signing certificate. Execution policy is a safety net against accidents, not a security boundary, so combine it with application control such as WDAC and Constrained Language Mode on non-admin systems."
+    },
+    {
+      "id": "review",
+      "type": "callout",
+      "variant": "note",
+      "title": "Review scripts like any other code",
+      "markdown": "A security script runs with real privilege, so it deserves the same discipline as production software. Keep it in a repository, require a second person to approve every change, and run PSScriptAnalyzer in the pipeline to catch risky patterns such as `Invoke-Expression` and plain-text passwords. Sign the approved version and let hosts run only signed code. When something goes wrong at 03:00, a reviewed and versioned script is far easier to trust, explain and roll back than a file someone edited on a jump server."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common mistakes",
+      "markdown": "- **Passwords in plain text** inside scripts or scheduled-task arguments.\n- **Changing before reading.** Always inspect and log the current state first.\n- **`-ErrorAction SilentlyContinue` everywhere.** It hides the very failures an auditor needs to see.\n- **Running as Domain Admin** because it is easier.\n- **Trusting downloaded snippets** without reading them line by line."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a Windows 11 or Server lab VM that you own.\n\n1. Save `Get-AdminAudit.ps1` and a `servers.txt` containing `localhost`.\n2. Run it, open the CSV and confirm it lists the local Administrators group.\n3. Add a test user to that group, run it again and compare the two CSV files with `Compare-Object`.\n4. Enable Script Block Logging with Group Policy, run the script once more, then find your script in the `Microsoft-Windows-PowerShell/Operational` log as event 4104.\n5. Remove the test user."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Idempotent",
+          "definition": "A script that gives the same end state however many times it runs."
+        },
+        {
+          "term": "-WhatIf",
+          "definition": "A switch that shows what a command would change without changing it."
+        },
+        {
+          "term": "WinRM",
+          "definition": "Windows Remote Management, the transport behind PowerShell remoting."
+        },
+        {
+          "term": "Script Block Logging",
+          "definition": "Policy that records executed script content as event 4104."
+        },
+        {
+          "term": "Baseline",
+          "definition": "The documented set of expected secure settings."
+        },
+        {
+          "term": "Configuration drift",
+          "definition": "Deviation of a host from its baseline over time."
+        },
+        {
+          "term": "Constrained Language Mode",
+          "definition": "A PowerShell mode that blocks risky language features."
+        },
+        {
+          "term": "Execution policy",
+          "definition": "A safeguard controlling which scripts load; not a security boundary."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What does an idempotent script guarantee?",
+          "options": [
+            "It runs faster each time",
+            "Repeated runs leave the same end state",
+            "It never needs logging",
+            "It only works on one host"
+          ],
+          "answer": 1,
+          "explanation": "Idempotence means checking state first and changing only what differs, so reruns are safe."
+        },
+        {
+          "question": "Why use `-FilterHashtable` with `Get-WinEvent`?",
+          "options": [
+            "It encrypts the log",
+            "Filtering happens at the source, which is much faster",
+            "It deletes old events",
+            "It bypasses permissions"
+          ],
+          "answer": 1,
+          "explanation": "Pulling every event and filtering with `Where-Object` wastes time and bandwidth."
+        },
+        {
+          "question": "Which settings help make your automation visible to defenders? (Choose all that apply.)",
+          "options": [
+            "Script Block Logging",
+            "Module Logging",
+            "Transcription",
+            "Disabling event logs to save space"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "The first three record what ran. Disabling logs removes the evidence you rely on."
+        },
+        {
+          "question": "What is the best account for a fleet-wide audit script?",
+          "options": [
+            "A Domain Admin for convenience",
+            "A dedicated account with only the needed rights",
+            "The built-in local Administrator",
+            "An anonymous session"
+          ],
+          "answer": 1,
+          "explanation": "Least privilege limits the damage if the automation account or script is abused."
+        },
+        {
+          "question": "Is execution policy a security boundary?",
+          "options": [
+            "Yes, it stops all malicious scripts",
+            "No, it is a safeguard against accidents",
+            "Yes, but only on servers",
+            "No, it has no effect at all"
+          ],
+          "answer": 1,
+          "explanation": "Users can bypass it easily, so use WDAC and Constrained Language Mode for real enforcement."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nPowerShell turns repeated security questions into evidence you can produce on demand. Write scripts that read before they change, fail loudly and emit structured output. Keep baselines as data and compare against them on a schedule. Run fleet jobs with a least-privilege account or a JEA endpoint, and log script blocks so your automation stays visible. Next, see [Linux administration automation](/learn/security-architecture-resilience/linux-administration-automation) for the same discipline on Linux."
+    }
+  ],
+  "ar": {
+    "title": "أتمتة الأمن باستخدام PowerShell",
+    "summary": "ابنِ سكربتات PowerShell آمنة وقابلة للتكرار تدقّق مضيفات Windows وتكشف الانحراف وتزوّد فريق الأمن بالأدلة.",
+    "objectives": [
+      "شرح سبب تفوّق الفحوص المبرمجة على العمل اليدوي في عمليات الأمن",
+      "كتابة PowerShell يمكن تكراره دون آثار جانبية، ويُسجَّل، وآمن للتشغيل على مضيفات كثيرة",
+      "تدقيق المجموعات ذات الامتيازات وأحداث الأمن بمخرجات منظّمة",
+      "كشف انحراف الإعدادات عن خط الأساس",
+      "تشغيل السكربتات على نطاق واسع عبر الاتصال عن بُعد ونقاط نهاية بأقل الامتيازات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يسأل المدقّق سؤالًا بسيطًا: ما الحسابات التي تملك صلاحية مسؤول محلي على خوادم Windows الأربعمئة لديكم؟ يفتح المهندس وحدات تحكم بعيدة واحدةً تلو الأخرى. وبعد ثلاثة أيام تكون الإجابة قد أصبحت قديمة، ولا أحد يستطيع إثبات كيفية جمعها.\n\nيحوّل PowerShell هذا السؤال إلى سكربت يُشغَّل في دقائق، ويُعاد تشغيله الأسبوع القادم، ويُسلَّم إلى المدقّق دليلًا. يبيّن هذا الدرس كيف تكتب سكربتات أمنية آمنة وقابلة للتكرار وقابلة للمراقبة، وكيف تشغّلها على أسطول من الأجهزة دون منح امتيازات أكثر من اللازم."
+      },
+      {
+        "id": "why",
+        "type": "text",
+        "markdown": "## لماذا نبرمج العمل الأمني\n\nالفحوص اليدوية بطيئة وغير متسقة ويصعب تدقيقها. أما السكربت فعكس ذلك: المنطق نفسه يعمل في كل مرة، ويمكن حفظ مخرجاته، ويستطيع المراجع أن يقرأ بالضبط ما جرى فحصه.\n\nيناسب PowerShell هذا العمل لثلاثة أسباب:\n\n- **كائنات لا نصوص.** تُعيد الأوامر كائنات مصنّفة، فتُرشِّح بـ `Where-Object` بدل تحليل السلاسل النصية.\n- **وصول أصيل.** يتعامل مع Active Directory والسجل (Registry) وسجلات الأحداث وDefender وخدمات Windows دون أدوات إضافية. راجع [أمن Active Directory](/learn/security-architecture-resilience/active-directory-security) لمعرفة ما يستحق الفحص.\n- **اتصال عن بُعد مدمج.** يستطيع أمر واحد الاستعلام من مئات المضيفات عبر WinRM.\n\nوالقوة نفسها تجعل الأخطاء مكلفة، لذلك يدور باقي الدرس حول الانضباط."
+      },
+      {
+        "id": "foundations",
+        "type": "text",
+        "markdown": "## أسس السكربت الأمني الآمن\n\nينبغي أن يتبع كل سكربت تجدوله أو تشاركونه قائمة قصيرة من الممارسات.\n\n| الممارسة | ما تمنعه |\n|:--|:--|\n| `Set-StrictMode -Version Latest` | استخدام متغيرات غير معرّفة بصمت |\n| `$ErrorActionPreference = 'Stop'` | سكربتات تواصل بعد الفشل وتُبلغ بنجاح كاذب |\n| `[CmdletBinding(SupportsShouldProcess)]` | تغييرات لا يمكن معاينتها بـ `-WhatIf` |\n| التحقق من المعاملات | وصول مدخلات سيئة إلى أمر هدّام |\n| القراءة أولًا ثم التغيير | إصلاح مضيف لم تفحصه فعلًا |\n| مخرجات منظّمة (CSV أو JSON) | تقارير يتعذّر مقارنتها عبر الزمن |\n\nيعني السكربت **القابل للتكرار دون أثر جانبي (Idempotent)** أن تشغيله مرتين يعطي النتيجة نفسها كتشغيله مرة واحدة. افحص الحالة الحالية، وغيّر ما يختلف فقط، وسجّل ما فعلت. لا تخزّن بيانات الاعتماد داخل السكربت أبدًا؛ استخدم وحدة SecretManagement أو خزنة أسرار أو هوية مُدارة كما في درس [خزائن الأسرار ومديرو كلمات المرور](/learn/security-architecture-resilience/secrets-vaults-and-password-managers)."
+      },
+      {
+        "id": "audit-script",
+        "type": "code",
+        "language": "powershell",
+        "filename": "Get-AdminAudit.ps1",
+        "caption": "تدقيق للقراءة فقط يُعيد كائنًا لكل مسؤول محلي. يسمح `-ErrorAction Continue` في الاستدعاء البعيد بفشل مضيف غير متاح دون إيقاف التشغيل.",
+        "code": "[CmdletBinding()]\nparam(\n    [Parameter(Mandatory)][ValidateScript({ Test-Path $_ })][string]$ComputerList,\n    [string]$OutFile = \".\\local-admins-$(Get-Date -Format yyyyMMdd).csv\"\n)\nSet-StrictMode -Version Latest\n$ErrorActionPreference = 'Stop'\n\n$computers = Get-Content $ComputerList\n$rows = Invoke-Command -ComputerName $computers -ErrorAction Continue -ScriptBlock {\n    Get-LocalGroupMember -Group 'Administrators' | ForEach-Object {\n        [pscustomobject]@{\n            Host   = $env:COMPUTERNAME\n            Member = $_.Name\n            Type   = $_.ObjectClass\n            Source = $_.PrincipalSource\n        }\n    }\n}\n$rows | Select-Object Host, Member, Type, Source |\n    Export-Csv -Path $OutFile -NoTypeInformation\nWrite-Host \"Wrote $($rows.Count) rows to $OutFile\"\n",
+        "highlight": [
+          8,
+          10,
+          11
+        ]
+      },
+      {
+        "id": "audit-run",
+        "type": "terminal",
+        "title": "تشغيل التدقيق",
+        "prompt": "PS C:\\Audit>",
+        "lines": [
+          {
+            "cmd": "./Get-AdminAudit.ps1 -ComputerList .\\servers.txt",
+            "output": "Wrote 9 rows to .\\local-admins-20261112.csv",
+            "comment": "ثلاثة خوادم في القائمة، وتسع عضويات مسؤول في النتيجة."
+          },
+          {
+            "cmd": "Import-Csv .\\local-admins-20261112.csv | Where-Object Source -eq 'Local' | Format-Table",
+            "output": "Host     Member                Type  Source\n----     ------                ----  ------\nSRV-APP1 SRV-APP1\\Administrator User  Local\nSRV-APP1 SRV-APP1\\svc-legacy    User  Local\nSRV-DB1  SRV-DB1\\Administrator  User  Local",
+            "comment": "الحسابات المحلية تستحق المراجعة. الحساب `svc-legacy` مسؤول محلي غير متوقع على SRV-APP1."
+          }
+        ],
+        "caption": "المخرجات بيانات توضيحية. احفظ كل تشغيل لتقارنه بالتشغيل التالي."
+      },
+      {
+        "id": "events",
+        "type": "text",
+        "markdown": "## الاستعلام عن أحداث الأمن\n\nسجلات الأحداث هي الاستخدام الكبير الثاني. يرشّح `Get-WinEvent` مع `-FilterHashtable` على جهة الخادم، وهذا أسرع بكثير من سحب كل الأحداث وترشيحها محليًا.\n\nمن معرّفات أحداث سجل Security المفيدة:\n\n- **4625** فشل تسجيل الدخول\n- **4672** منح امتيازات خاصة لجلسة دخول جديدة\n- **4720** إنشاء حساب مستخدم\n- **4732** إضافة عضو إلى مجموعة محلية أمنية\n\nجمّع النتائج ثم قرّر ما هو طبيعي. فشل دخول واحد ضجيج؛ أما مئتا محاولة من مصدر واحد خلال عشر دقائق فخيط يستحق المتابعة. يتناول درس [كشف شذوذ المصادقة](/learn/security-architecture-resilience/authentication-anomaly-detection) العتبات بتوسّع."
+      },
+      {
+        "id": "events-code",
+        "type": "code",
+        "language": "powershell",
+        "filename": "Get-FailedLogons.ps1",
+        "caption": "ترشيح على جهة الخادم بجدول تجزئة، ثم ملخص حسب الحساب وعنوان المصدر.",
+        "code": "$since = (Get-Date).AddMinutes(-10)\n$events = Get-WinEvent -FilterHashtable @{\n    LogName = 'Security'; Id = 4625; StartTime = $since\n}\n$events | ForEach-Object {\n    $x = [xml]$_.ToXml()\n    $d = @{}\n    $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }\n    [pscustomobject]@{ Account = $d.TargetUserName; Source = $d.IpAddress }\n} | Group-Object Account, Source |\n    Where-Object Count -ge 20 |\n    Sort-Object Count -Descending |\n    Select-Object Count, Name\n",
+        "highlight": [
+          2,
+          3,
+          9
+        ]
+      },
+      {
+        "id": "drift-anim",
+        "type": "animation",
+        "kind": "cycle",
+        "title": "حلقة كشف الانحراف",
+        "data": {
+          "center": "فحص خط الأساس",
+          "items": [
+            {
+              "label": "تعريف خط الأساس",
+              "sub": "حفظ الإعدادات المطلوبة في نظام إدارة الإصدارات."
+            },
+            {
+              "label": "جمع الحالة",
+              "sub": "قراءة الإعدادات الفعلية من كل مضيف."
+            },
+            {
+              "label": "المقارنة",
+              "sub": "مقارنة الفعلي بخط الأساس."
+            },
+            {
+              "label": "الإبلاغ أو المعالجة",
+              "sub": "فتح تذكرة، أو الإصلاح بعد الموافقة."
+            },
+            {
+              "label": "تسجيل الدليل",
+              "sub": "حفظ التقرير للتدقيق التالي."
+            }
+          ],
+          "steps": [
+            {
+              "item": 0,
+              "caption": "يعيش خط الأساس في Git فتُراجَع كل تغييراته."
+            },
+            {
+              "item": 1,
+              "caption": "تقرأ مهمة مجدولة إعدادات SMB1 وجدار الحماية وسياسة كلمات المرور."
+            },
+            {
+              "item": 2,
+              "caption": "يجد `Compare-Object` المضيفات المختلفة."
+            },
+            {
+              "item": 3,
+              "caption": "يُصلَح الانحراف منخفض الخطورة، والباقي يصبح تذكرة."
+            },
+            {
+              "item": 4,
+              "caption": "يُثبت التقرير الموقَّع أن الضابط يعمل."
+            }
+          ]
+        }
+      },
+      {
+        "id": "drift",
+        "type": "text",
+        "markdown": "## كشف الانحراف عن خط الأساس\n\nخط الأساس قائمة مكتوبة بالإعدادات المتوقعة، مثل تعطيل SMBv1 وتشغيل جدار حماية Windows لكل الملفات الشخصية وتفعيل الحماية الفورية في Defender. والانحراف هو أي مضيف لم يعد مطابقًا.\n\nالنمط ثابت دائمًا: اجمع ثم قارن ثم تصرّف. احتفظ بخط الأساس بوصفه بيانات (ملف JSON) لا منطقًا مدفونًا في السكربت، فيصبح تغيير السياسة التزامًا (commit) تتم مراجعته لا تعديلًا في الشيفرة. وللإعدادات التي يجب فرضها لا الإبلاغ عنها فقط، اقرنه بـ[أمن سياسة المجموعة](/learn/security-architecture-resilience/group-policy-security) أو Desired State Configuration.\n\nالمعالجة التلقائية مغرية، لكن لا تُصلح تلقائيًا إلا التغييرات منخفضة الخطورة وقابلة التراجع. وأي تغيير قد يقطع خدمة ينبغي أن يفتح تذكرة لإنسان."
+      },
+      {
+        "id": "drift-code",
+        "type": "code",
+        "language": "powershell",
+        "filename": "Test-Baseline.ps1",
+        "caption": "مقارنة الإعدادات الفعلية بخط أساس JSON وإصدار الفروق فقط.",
+        "code": "$baseline = Get-Content .\\baseline.json | ConvertFrom-Json\n$actual = [pscustomobject]@{\n    SMB1      = (Get-SmbServerConfiguration).EnableSMB1Protocol\n    Firewall  = -not (Get-NetFirewallProfile | Where-Object Enabled -eq 'False')\n    Defender  = -not (Get-MpPreference).DisableRealtimeMonitoring\n}\nforeach ($name in $baseline.PSObject.Properties.Name) {\n    if ($actual.$name -ne $baseline.$name) {\n        [pscustomobject]@{\n            Host = $env:COMPUTERNAME; Setting = $name\n            Expected = $baseline.$name; Actual = $actual.$name\n        }\n    }\n}\n",
+        "highlight": [
+          8,
+          9
+        ]
+      },
+      {
+        "id": "evidence",
+        "type": "text",
+        "markdown": "## تحويل المخرجات إلى أدلة\n\nلا يفيد التقرير إلا إذا أمكن الوثوق به لاحقًا. اكتب كل نتيجة مع اسم المضيف وطابع زمني بتوقيت UTC وإصدار السكربت الذي أنتجها. احفظ الملف في موقع لا تستطيع السكربتات الكتابة فوقه، مثل مشاركة للكتابة مرة واحدة أو فهرس في SIEM، واحتفظ بقيمة تجزئة للملف ليُكشف أي تلاعب.\n\nجدول السكربت عبر Task Scheduler أو نظام CI بدل تشغيله يدويًا. ينتج التشغيل الأسبوعي خط اتجاه: ينبغي أن ينخفض عدد المسؤولين المحليين بمرور الوقت، وأي ارتفاع مفاجئ يستحق تنبيهًا. أرسل الملخصات فقط إلى المحادثات أو البريد، ولا ترسل قوائم الحسابات الخام أبدًا لأن هذه القوائم حساسة بذاتها."
+      },
+      {
+        "id": "scale",
+        "type": "text",
+        "markdown": "## التشغيل على نطاق واسع بأمان\n\nيستخدم الاتصال عن بُعد WinRM عبر HTTPS أو HTTP محميًّا بـ Kerberos. وتحفظ قاعدتان سلامته.\n\n1. **لا تشغّل سكربتات الأسطول بصفة مسؤول نطاق.** استخدم حساب أتمتة مخصصًا بالصلاحيات التي يحتاجها السكربت فقط، أو نقطة نهاية مقيَّدة مبنية بـ[Just Enough Administration](/learn/security-architecture-resilience/just-enough-administration-jea).\n2. **سجّل ما يعمل.** فعّل تسجيل كتل السكربت (Script Block Logging) وتسجيل الوحدات والنسخ (transcription) عبر السياسة. عندئذٍ يسجّل الحدث 4104 محتوى السكربتات المنفَّذة على المضيف، فتكون أتمتتك مرئية للمدافعين ولا يكون PowerShell المهاجم كذلك.\n\nاضبط سياسة التنفيذ على `AllSigned` للسكربتات الإنتاجية ووقّعها بشهادة توقيع الشيفرة. وسياسة التنفيذ شبكة أمان ضد الحوادث العرضية لا حدًّا أمنيًا، فاقرنها بالتحكم في التطبيقات مثل WDAC ووضع اللغة المقيَّد على الأنظمة غير الإدارية."
+      },
+      {
+        "id": "review",
+        "type": "callout",
+        "variant": "note",
+        "title": "راجع السكربتات كأي شيفرة أخرى",
+        "markdown": "يعمل السكربت الأمني بامتيازات حقيقية، فيستحق الانضباط نفسه الذي تستحقه برمجيات الإنتاج. احتفظ به في مستودع، واشترط موافقة شخص ثانٍ على كل تغيير، وشغّل PSScriptAnalyzer في خط الإنتاج لالتقاط الأنماط الخطرة مثل `Invoke-Expression` وكلمات المرور بنص صريح. وقّع النسخة المعتمدة واسمح للمضيفات بتشغيل الشيفرة الموقَّعة فقط. وحين يسوء أمر ما عند الثالثة فجرًا، يكون السكربت المراجَع ذو الإصدارات أسهل في الوثوق به وشرحه والتراجع عنه من ملف عدّله أحدهم على خادم قفز."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة",
+        "markdown": "- **كلمات مرور بنص صريح** داخل السكربتات أو معاملات المهام المجدولة.\n- **التغيير قبل القراءة.** افحص الحالة الحالية وسجّلها دائمًا أولًا.\n- **استخدام `-ErrorAction SilentlyContinue` في كل مكان.** فهو يخفي الإخفاقات التي يحتاج المدقّق إلى رؤيتها.\n- **التشغيل بصفة Domain Admin** لأنه أسهل.\n- **الوثوق بمقتطفات منزَّلة** دون قراءتها سطرًا سطرًا."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم جهازًا افتراضيًا تجريبيًا بنظام Windows 11 أو Server تملكه.\n\n1. احفظ `Get-AdminAudit.ps1` وملف `servers.txt` يحتوي على `localhost`.\n2. شغّله وافتح ملف CSV وتأكد أنه يسرد مجموعة Administrators المحلية.\n3. أضف مستخدمًا تجريبيًا إلى المجموعة، وشغّله ثانية، وقارن ملفي CSV بـ `Compare-Object`.\n4. فعّل Script Block Logging عبر سياسة المجموعة، وشغّل السكربت مرة أخرى، ثم ابحث عن سكربتك في سجل `Microsoft-Windows-PowerShell/Operational` بوصفه الحدث 4104.\n5. احذف المستخدم التجريبي."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "قابل للتكرار دون أثر",
+            "definition": "سكربت ينتهي إلى الحالة نفسها مهما تكرر تشغيله."
+          },
+          {
+            "term": "-WhatIf",
+            "definition": "مفتاح يعرض ما سيغيّره الأمر دون تنفيذ التغيير."
+          },
+          {
+            "term": "WinRM",
+            "definition": "إدارة Windows عن بُعد، وهي وسيلة النقل خلف اتصال PowerShell البعيد."
+          },
+          {
+            "term": "تسجيل كتل السكربت",
+            "definition": "سياسة تسجّل محتوى السكربت المنفَّذ بوصفه الحدث 4104."
+          },
+          {
+            "term": "خط الأساس",
+            "definition": "المجموعة الموثّقة من الإعدادات الآمنة المتوقعة."
+          },
+          {
+            "term": "انحراف الإعدادات",
+            "definition": "ابتعاد المضيف عن خط الأساس بمرور الوقت."
+          },
+          {
+            "term": "وضع اللغة المقيَّد",
+            "definition": "وضع في PowerShell يمنع ميزات اللغة الخطرة."
+          },
+          {
+            "term": "سياسة التنفيذ",
+            "definition": "ضمانة تتحكم في السكربتات المسموح تحميلها، وليست حدًّا أمنيًا."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ماذا يضمن السكربت القابل للتكرار دون أثر (Idempotent)؟",
+            "options": [
+              "يعمل أسرع في كل مرة",
+              "التشغيل المتكرر يترك الحالة النهائية نفسها",
+              "لا يحتاج إلى تسجيل أبدًا",
+              "يعمل على مضيف واحد فقط"
+            ],
+            "answer": 1,
+            "explanation": "تعني الخاصية فحص الحالة أولًا وتغيير ما يختلف فقط، فتكون إعادة التشغيل آمنة."
+          },
+          {
+            "question": "لماذا نستخدم `-FilterHashtable` مع `Get-WinEvent`؟",
+            "options": [
+              "يشفّر السجل",
+              "يجري الترشيح عند المصدر وهذا أسرع بكثير",
+              "يحذف الأحداث القديمة",
+              "يتجاوز الصلاحيات"
+            ],
+            "answer": 1,
+            "explanation": "سحب كل الأحداث وترشيحها بـ `Where-Object` يهدر الوقت وعرض النطاق."
+          },
+          {
+            "question": "أي الإعدادات تجعل أتمتتك مرئية للمدافعين؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تسجيل كتل السكربت",
+              "تسجيل الوحدات",
+              "النسخ (Transcription)",
+              "تعطيل سجلات الأحداث لتوفير المساحة"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الثلاثة الأولى تسجّل ما جرى تشغيله، أما تعطيل السجلات فيزيل الدليل الذي تعتمد عليه."
+          },
+          {
+            "question": "ما أفضل حساب لسكربت تدقيق على مستوى الأسطول؟",
+            "options": [
+              "Domain Admin للراحة",
+              "حساب مخصص بالصلاحيات اللازمة فقط",
+              "حساب Administrator المحلي المدمج",
+              "جلسة مجهولة"
+            ],
+            "answer": 1,
+            "explanation": "يحدّ مبدأ أقل الامتيازات من الضرر إذا أُسيء استخدام حساب الأتمتة أو السكربت."
+          },
+          {
+            "question": "هل سياسة التنفيذ حدّ أمني؟",
+            "options": [
+              "نعم، فهي توقف كل السكربتات الخبيثة",
+              "لا، هي ضمانة ضد الحوادث العرضية",
+              "نعم، لكن على الخوادم فقط",
+              "لا، ولا تأثير لها إطلاقًا"
+            ],
+            "answer": 1,
+            "explanation": "يسهل على المستخدمين تجاوزها، لذا استخدم WDAC ووضع اللغة المقيَّد للإنفاذ الحقيقي."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nيحوّل PowerShell الأسئلة الأمنية المتكررة إلى أدلة يمكنك تقديمها عند الطلب. اكتب سكربتات تقرأ قبل أن تغيّر، وتفشل بوضوح، وتُصدر مخرجات منظّمة. احتفظ بخطوط الأساس بوصفها بيانات وقارن بها وفق جدول زمني. شغّل مهام الأسطول بحساب أقل الامتيازات أو نقطة JEA، وسجّل كتل السكربت لتبقى أتمتتك مرئية. انتقل بعد ذلك إلى [أتمتة إدارة Linux](/learn/security-architecture-resilience/linux-administration-automation) لتطبيق الانضباط نفسه على Linux."
+      }
+    ]
+  }
+}

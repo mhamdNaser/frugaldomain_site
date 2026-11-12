@@ -1,0 +1,664 @@
+{
+  "slug": "wazuh-and-suricata-integration-lab",
+  "title": "Wazuh and Suricata Integration Lab",
+  "summary": "Ship Suricata alerts into Wazuh through the agent, verify decoding with wazuh-logtest, write a custom rule, and correlate network alerts with host evidence.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Describe how eve.json reaches the Wazuh manager",
+    "Configure a JSON localfile entry on the agent",
+    "Test decoding and rules with wazuh-logtest",
+    "Write a custom child rule above 100000",
+    "Correlate network alerts with host events"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Suricata sees the network and Wazuh sees the hosts, but on their own each tells half a story. Suricata can report that a web server received a suspicious request. Wazuh can report that the same server then spawned an unexpected process or changed a file. Only when both land in one place can an analyst connect the two events.\n\nIn this lab you connect a Suricata sensor to a Wazuh manager that you own. You will ship `eve.json` through a Wazuh agent, confirm that the built-in Suricata rules fire, add a custom rule, and correlate network and host evidence. It builds on [IDS/IPS Deployment Lab](/learn/hands-on-security-labs/ids-ips-deployment-lab), where the sensor and its test rule were created, and it feeds the wider pipeline in [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab)."
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## Step 1: Understand the architecture\n\nWazuh has three parts. The **agent** runs on a monitored machine and forwards logs. The **manager** decodes events and applies rules. The **indexer and dashboard** store alerts and let you search them. Suricata does not talk to Wazuh directly. It writes JSON lines to `eve.json`, and the Wazuh agent on the sensor reads that file like any other log.\n\n| Component | Role | Where it runs |\n|:--|:--|:--|\n| Suricata | Inspects packets, writes `eve.json` | Sensor VM |\n| Wazuh agent | Reads the file, ships events | Sensor VM |\n| Wazuh manager | Decodes events, matches rules | Manager VM |\n| Indexer and dashboard | Stores and displays alerts | Manager VM or separate |\n\nThe agent installed on the sensor also gives you host monitoring for the sensor itself, such as file integrity and failed logins. That matters because a sensor is a high-value target and should be watched too."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "From eve.json to a Wazuh alert",
+      "caption": "Every hop is a place where the pipeline can silently break, so you will test each one.",
+      "data": {
+        "token": "Event",
+        "nodes": [
+          {
+            "id": "net",
+            "label": "Network traffic",
+            "sub": "203.0.113.40",
+            "icon": "globe"
+          },
+          {
+            "id": "sur",
+            "label": "Suricata",
+            "sub": "Sensor VM",
+            "icon": "eye"
+          },
+          {
+            "id": "eve",
+            "label": "eve.json",
+            "sub": "/var/log/suricata",
+            "icon": "log"
+          },
+          {
+            "id": "ag",
+            "label": "Wazuh agent",
+            "sub": "Sensor VM",
+            "icon": "cpu"
+          },
+          {
+            "id": "mgr",
+            "label": "Wazuh manager",
+            "sub": "Decoders and rules",
+            "icon": "server"
+          },
+          {
+            "id": "dash",
+            "label": "Dashboard",
+            "sub": "Analyst",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "net",
+            "caption": "A request carrying the lab marker crosses the monitored segment."
+          },
+          {
+            "at": "sur",
+            "caption": "Suricata matches rule sid 1000001 and raises an alert.",
+            "tone": "warning"
+          },
+          {
+            "at": "eve",
+            "caption": "The alert is appended as one JSON line."
+          },
+          {
+            "at": "ag",
+            "caption": "The agent notices the new line through its localfile entry and forwards it, encrypted, to the manager."
+          },
+          {
+            "at": "mgr",
+            "caption": "The JSON decoder extracts fields and built-in Suricata rules match."
+          },
+          {
+            "at": "mgr",
+            "caption": "Your custom rule raises the alert level because the signature is on your watch list.",
+            "tone": "warning"
+          },
+          {
+            "at": "dash",
+            "caption": "The analyst sees one searchable alert with network and host context.",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "agent",
+      "type": "text",
+      "markdown": "## Step 2: Point the agent at eve.json\n\nInstall the Wazuh agent on the sensor and register it with your manager. Then add a `localfile` entry to the agent's `ossec.conf`. The key detail is `log_format`: `json` tells the agent to parse each line as structured data instead of free text, so every field becomes searchable.\n\nTwo permission problems cause most failures. The `wazuh` user must be able to read `/var/log/suricata/eve.json`, and the file must not be rotated away without the agent noticing. Suricata's default log rotation handles this, but always verify after a restart.\n\nAlso check the clocks. Suricata, the agent and the manager must agree on time through NTP, otherwise events from the three machines will appear out of order and your correlation will mislead you. A skew of even a minute can make a host event seem to precede the network alert that caused it."
+    },
+    {
+      "id": "conf",
+      "type": "code",
+      "language": "plain",
+      "filename": "/var/ossec/etc/ossec.conf",
+      "caption": "Agent configuration (excerpt). Add inside the ossec_config element.",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "code": "<localfile>\n  <log_format>json</log_format>\n  <location>/var/log/suricata/eve.json</location>\n</localfile>\n"
+    },
+    {
+      "id": "term1",
+      "type": "terminal",
+      "title": "sensor",
+      "prompt": "$",
+      "caption": "Restart the agent, confirm it opened the file, and check the connection to the manager.",
+      "lines": [
+        {
+          "cmd": "sudo systemctl restart wazuh-agent",
+          "output": "",
+          "comment": "Apply the new localfile entry."
+        },
+        {
+          "cmd": "sudo grep -E 'eve.json|Connected' /var/ossec/logs/ossec.log | tail -n 2",
+          "output": "2026/03/10 09:14:02 wazuh-logcollector: INFO: (1950): Analyzing file: '/var/log/suricata/eve.json'.\n2026/03/10 09:14:03 wazuh-agentd: INFO: (4102): Connected to the server ([192.0.2.20]:1514/tcp).",
+          "comment": "Both lines must appear. The first proves the file is monitored, the second proves the channel to the manager works."
+        },
+        {
+          "prompt": "client$",
+          "cmd": "curl -s -o /dev/null -A 'lab-ids-test' http://10.10.20.10/",
+          "output": "",
+          "comment": "Generate the harmless marker request from a lab client you own."
+        }
+      ]
+    },
+    {
+      "id": "rules",
+      "type": "text",
+      "markdown": "## Step 3: Verify decoding and write a custom rule\n\nWazuh ships rules for Suricata alerts, grouped under the `suricata` rule group, so an alert should appear without any custom work. Test this on the manager with `wazuh-logtest`, which runs a pasted log line through the decoders and rules and shows which fired. This is the fastest way to debug a rule, because you do not need live traffic.\n\nThen add your own rule. Custom rules live in `/var/ossec/etc/rules/local_rules.xml` and must use ids from 100000 upward. A child rule uses `if_sid` to build on a parent. Here the parent is the generic Suricata alert rule, and the child fires only for your lab signature, raising the level so it stands out."
+    },
+    {
+      "id": "rule",
+      "type": "code",
+      "language": "plain",
+      "filename": "/var/ossec/etc/rules/local_rules.xml",
+      "caption": "A child rule for the lab signature. Check the parent id in your version's ruleset.",
+      "highlight": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "code": "<group name=\"local,suricata,\">\n  <rule id=\"100100\" level=\"10\">\n    <if_sid>86601</if_sid>\n    <field name=\"alert.signature_id\">^1000001$</field>\n    <description>LAB: Suricata marker signature matched on $(dest_ip)</description>\n    <mitre><id>T1071</id></mitre>\n  </rule>\n</group>\n"
+    },
+    {
+      "id": "term2",
+      "type": "terminal",
+      "title": "manager",
+      "prompt": "$",
+      "caption": "Test with wazuh-logtest, then reload and read the alert from the alerts file.",
+      "lines": [
+        {
+          "cmd": "sudo /var/ossec/bin/wazuh-logtest -q",
+          "output": "Type one log per line\n> {\"event_type\":\"alert\",\"src_ip\":\"10.10.10.15\",\"dest_ip\":\"10.10.20.10\",\"alert\":{\"signature_id\":1000001,\"signature\":\"LAB User-Agent marker seen\"}}\n\n**Phase 2: Completed decoding.\n    name: 'json'\n**Phase 3: Completed filtering (rules).\n    id: '100100'\n    level: '10'\n    description: 'LAB: Suricata marker signature matched on 10.10.20.10'",
+          "comment": "Phase 2 proves the JSON decoder works. Phase 3 shows your rule beat the parent."
+        },
+        {
+          "cmd": "sudo systemctl restart wazuh-manager && sudo jq -c 'select(.rule.id==\"100100\") | {t:.timestamp, agent:.agent.name, lvl:.rule.level, sig:.data.alert.signature}' /var/ossec/logs/alerts/alerts.json | tail -n 1",
+          "output": "{\"t\":\"2026-03-10T09:15:41.220+0000\",\"agent\":\"sensor01\",\"lvl\":10,\"sig\":\"LAB User-Agent marker seen\"}",
+          "comment": "The live alert arrived end to end, carrying the agent name."
+        }
+      ]
+    },
+    {
+      "id": "correlate",
+      "type": "text",
+      "markdown": "## Step 4: Correlate network and host evidence\n\nThe real value appears when one alert leads to the next question. Suppose Suricata flags a request to your web server at 09:15. In the Wazuh dashboard, filter on the server's agent name for the following ten minutes and look for:\n\n- new processes spawned by the web service account;\n- file integrity changes in the web root;\n- failed or unusual authentication events;\n- outbound connections that did not exist before.\n\nA network alert followed by none of these is probably a blocked or irrelevant attempt. A network alert followed by a file change is an incident. Wazuh's own rule groups help here: active response, file integrity monitoring and the Security Configuration Assessment module all add host-side evidence to the same searchable index.\n\nRecord what you find in a small table: time, source, signature, host evidence, verdict. That habit turns raw alerts into a defensible triage record, the same skill used in [Incident Response Simulation Lab](/learn/hands-on-security-labs/incident-response-simulation-lab)."
+    },
+    {
+      "id": "levels",
+      "type": "text",
+      "markdown": "### Choose what deserves attention\n\nSuricata writes more than alerts. `eve.json` also holds `dns`, `http`, `tls` and `flow` events. Shipping all of them gives rich context but costs storage, so decide deliberately. Alerts are small and valuable. Flow and DNS records are bulky but invaluable when you hunt backwards from a single suspicious host.\n\nA practical starting policy for a small lab is shown below. Adjust the levels to your own tolerance for noise.\n\n| Event type | Ship it? | Suggested Wazuh level | Reason |\n|:--|:--|:--|:--|\n| `alert` | Always | 5 to 10 | Direct detection output |\n| `dns` | Yes, short retention | 3 | Shows what hosts tried to resolve |\n| `tls` | Yes | 3 | SNI and certificates survive encryption |\n| `http` | Optional | 3 | Useful but large on busy sites |\n| `flow` | Optional | 0 to 3 | Best for later investigation |\n\nRemember that level 12 and above usually triggers notifications in production setups. Reserve those levels for signatures you would wake someone for, and keep the rest searchable but quiet."
+    },
+    {
+      "id": "tuning",
+      "type": "text",
+      "markdown": "## Step 5: Keep the pipeline healthy\n\nIntegration is not finished when the first alert appears. Plan for three ongoing problems.\n\n1. **Volume.** A community ruleset can produce thousands of alerts a day. Decide which signatures deserve a dashboard alert and which only need to be searchable. Use rule levels to separate them.\n2. **Duplicates.** If both Suricata and a host agent report the same activity, you will see it twice. That is useful for confirmation but needs a naming convention so analysts can group them.\n3. **Silence.** A broken pipeline looks exactly like a quiet network. Alert on the absence of events, for example when the sensor agent has not sent data for fifteen minutes."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Protect the pipeline itself",
+      "markdown": "`eve.json` can contain URLs, hostnames and user-agent strings that came from untrusted clients. Treat it as data, never as commands. Restrict who can read it, keep the agent-to-manager channel on a management network, and never expose the manager ports to the internet."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Debug in order",
+      "markdown": "When no alert appears, test the hops in sequence: does `eve.json` contain the event, does `ossec.log` show the file being analyzed, does `wazuh-logtest` match the line, and does `alerts.json` contain the result? The first hop that fails is your problem."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On VMs **you own**:\n\n1. Install the Wazuh manager on one VM and the agent on your Suricata sensor.\n2. Add the `localfile` entry, restart the agent, and confirm the two log lines.\n3. Send the marker request and find the alert in `alerts.json` and the dashboard.\n4. Add rule 100100, test it with `wazuh-logtest` first, then reload the manager.\n5. Create a rule or dashboard filter that shows both Suricata alerts and file integrity events for the web server.\n6. Stop the agent for twenty minutes and write down how you would detect that silence."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Wazuh agent",
+          "definition": "Software on a monitored host that collects logs and events and sends them to the manager."
+        },
+        {
+          "term": "Wazuh manager",
+          "definition": "The server that decodes events, applies rules and generates alerts."
+        },
+        {
+          "term": "localfile",
+          "definition": "An agent configuration entry that names a log file to read and its format."
+        },
+        {
+          "term": "Decoder",
+          "definition": "A parser that turns a raw log line into named fields."
+        },
+        {
+          "term": "Rule id",
+          "definition": "A number identifying a rule; custom rules use 100000 and above."
+        },
+        {
+          "term": "wazuh-logtest",
+          "definition": "A manager tool that shows which decoders and rules a pasted log line triggers."
+        },
+        {
+          "term": "File integrity monitoring",
+          "definition": "Detection of changes to watched files and directories."
+        },
+        {
+          "term": "Correlation",
+          "definition": "Linking events from different sources into one story."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "How do Suricata alerts reach the Wazuh manager?",
+          "options": [
+            "The agent reads eve.json and forwards the events",
+            "Suricata logs in to the manager over SSH",
+            "The manager scans the sensor",
+            "Through email"
+          ],
+          "answer": 0,
+          "explanation": "Suricata only writes a file. The Wazuh agent on the sensor collects it through a localfile entry."
+        },
+        {
+          "question": "Why set log_format to json?",
+          "options": [
+            "So each field becomes searchable",
+            "To compress the file",
+            "To encrypt the log",
+            "To disable rules"
+          ],
+          "answer": 0,
+          "explanation": "The JSON format lets decoders extract structured fields such as signature id and destination IP."
+        },
+        {
+          "question": "Which are valid first checks when no alert appears? (Choose all that apply.)",
+          "options": [
+            "Check that eve.json contains the event",
+            "Check ossec.log for the file being analyzed",
+            "Run wazuh-logtest with the log line",
+            "Reinstall the operating system"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Test each hop in order. Reinstalling is never a first step."
+        },
+        {
+          "question": "What id range should custom Wazuh rules use?",
+          "options": [
+            "1 to 999",
+            "100000 and above",
+            "Any, since they overwrite defaults",
+            "Exactly 86601"
+          ],
+          "answer": 1,
+          "explanation": "Ids from 100000 upward are reserved for local rules and avoid clashing with shipped rules."
+        },
+        {
+          "question": "Why alert on missing events from the sensor?",
+          "options": [
+            "A broken pipeline looks like a quiet network",
+            "Silence is always an attack",
+            "It saves disk space",
+            "Agents require it"
+          ],
+          "answer": 0,
+          "explanation": "Without a heartbeat check you cannot tell no traffic from no visibility."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou connected a Suricata sensor to Wazuh by reading `eve.json` with a JSON `localfile` entry, verified decoding with `wazuh-logtest`, and wrote a custom rule on top of the built-in Suricata rules. You practiced correlating a network alert with host evidence and planned for volume, duplicates and silence. Next, look at the packets behind those alerts in [Network Traffic Analysis Lab](/learn/hands-on-security-labs/network-traffic-analysis-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر دمج Wazuh وSuricata",
+    "summary": "أرسل تنبيهات Suricata إلى Wazuh عبر الوكيل، وتحقق من فك الترميز بـ wazuh-logtest، واكتب قاعدة مخصصة، واربط التنبيهات الشبكية بأدلة المضيف.",
+    "objectives": [
+      "وصف كيف يصل eve.json إلى مدير Wazuh",
+      "ضبط مدخل localfile بصيغة JSON على الوكيل",
+      "اختبار فك الترميز والقواعد بـ wazuh-logtest",
+      "كتابة قاعدة فرعية مخصصة بمعرّف فوق 100000",
+      "ربط التنبيهات الشبكية بأحداث المضيف"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تبصر Suricata الشبكة وتبصر Wazuh المضيفات، لكن كلًّا منهما وحدها تروي نصف القصة. فقد تبلّغ Suricata بأن خادم ويب تلقى طلبًا مشبوهًا، وقد تبلّغ Wazuh بأن الخادم نفسه أنشأ بعدها عملية غير متوقعة أو غيّر ملفًا. ولا يستطيع المحلل الربط بين الحدثين إلا إذا اجتمعا في مكان واحد.\n\nفي هذا المختبر تربط مستشعر Suricata بمدير Wazuh **تملكه**. سترسل `eve.json` عبر وكيل Wazuh (Agent) وتتأكد من أن القواعد المدمجة الخاصة بـ Suricata تعمل، ثم تضيف قاعدة مخصصة وتربط الأدلة الشبكية بأدلة المضيف. يبني المختبر على [مختبر نشر IDS/IPS](/learn/hands-on-security-labs/ids-ips-deployment-lab) الذي أُنشئ فيه المستشعر وقاعدة اختباره، ويغذّي المسار الأوسع في [مختبر SIEM المركزي](/learn/hands-on-security-labs/centralized-siem-lab)."
+      },
+      {
+        "id": "arch",
+        "type": "text",
+        "markdown": "## الخطوة 1: افهم المعمارية\n\nيتكون Wazuh من ثلاثة أجزاء. **الوكيل (Agent)** يعمل على الجهاز المراقَب ويمرّر السجلات. و**المدير (Manager)** يفك ترميز الأحداث ويطبّق القواعد. و**المفهرس ولوحة المعلومات** يخزّنان التنبيهات ويتيحان البحث فيها. لا تتحدث Suricata مع Wazuh مباشرة؛ فهي تكتب أسطر JSON في `eve.json` ويقرأ وكيل Wazuh على المستشعر ذلك الملف كأي سجل آخر.\n\n| المكوّن | الدور | مكان التشغيل |\n|:--|:--|:--|\n| Suricata | تفحص الحزم وتكتب `eve.json` | آلة المستشعر |\n| وكيل Wazuh | يقرأ الملف ويمرّر الأحداث | آلة المستشعر |\n| مدير Wazuh | يفك الترميز ويطابق القواعد | آلة المدير |\n| المفهرس ولوحة المعلومات | يخزّنان التنبيهات ويعرضانها | آلة المدير أو آلة منفصلة |\n\nكذلك يمنحك الوكيل المثبَّت على المستشعر مراقبة للمستشعر نفسه، مثل سلامة الملفات وفشل تسجيل الدخول. وهذا مهم لأن المستشعر هدف عالي القيمة ويجب مراقبته أيضًا."
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "من eve.json إلى تنبيه في Wazuh",
+        "caption": "كل قفزة موضع قد ينكسر فيه المسار بصمت، لذلك ستختبر كلًّا منها.",
+        "data": {
+          "token": "حدث",
+          "nodes": [
+            {
+              "id": "net",
+              "label": "حركة الشبكة",
+              "sub": "203.0.113.40",
+              "icon": "globe"
+            },
+            {
+              "id": "sur",
+              "label": "Suricata",
+              "sub": "Sensor VM",
+              "icon": "eye"
+            },
+            {
+              "id": "eve",
+              "label": "eve.json",
+              "sub": "/var/log/suricata",
+              "icon": "log"
+            },
+            {
+              "id": "ag",
+              "label": "وكيل Wazuh",
+              "sub": "Sensor VM",
+              "icon": "cpu"
+            },
+            {
+              "id": "mgr",
+              "label": "مدير Wazuh",
+              "sub": "Decoders and rules",
+              "icon": "server"
+            },
+            {
+              "id": "dash",
+              "label": "لوحة المعلومات",
+              "sub": "Analyst",
+              "icon": "user"
+            }
+          ],
+          "steps": [
+            {
+              "at": "net",
+              "caption": "يعبر طلب يحمل علامة المختبر الشريحة المراقَبة."
+            },
+            {
+              "at": "sur",
+              "caption": "تطابق Suricata القاعدة sid 1000001 وتطلق تنبيهًا.",
+              "tone": "warning"
+            },
+            {
+              "at": "eve",
+              "caption": "يُلحق التنبيه كسطر JSON واحد."
+            },
+            {
+              "at": "ag",
+              "caption": "يلاحظ الوكيل السطر الجديد عبر مدخل localfile ويمرره مشفّرًا إلى المدير."
+            },
+            {
+              "at": "mgr",
+              "caption": "يستخرج مفكّك JSON الحقول وتطابق القواعد المدمجة الخاصة بـ Suricata."
+            },
+            {
+              "at": "mgr",
+              "caption": "ترفع قاعدتك المخصصة مستوى التنبيه لأن التوقيع في قائمة مراقبتك.",
+              "tone": "warning"
+            },
+            {
+              "at": "dash",
+              "caption": "يرى المحلل تنبيهًا واحدًا قابلًا للبحث مع سياق الشبكة والمضيف.",
+              "tone": "secure"
+            }
+          ]
+        }
+      },
+      {
+        "id": "agent",
+        "type": "text",
+        "markdown": "## الخطوة 2: وجّه الوكيل إلى eve.json\n\nثبّت وكيل Wazuh على المستشعر وسجّله لدى المدير، ثم أضف مدخل `localfile` إلى ملف `ossec.conf` الخاص بالوكيل. التفصيل الجوهري هو `log_format`: القيمة `json` تخبر الوكيل بتحليل كل سطر كبيانات منظمة لا كنص حر، فيصبح كل حقل قابلًا للبحث.\n\nتسبّب مشكلتا صلاحيات معظم الإخفاقات. يجب أن يستطيع المستخدم `wazuh` قراءة `/var/log/suricata/eve.json`، ويجب ألا يُدوَّر الملف بعيدًا دون أن يلاحظ الوكيل. يتولى تدوير السجلات الافتراضي في Suricata ذلك، لكن تحقق دائمًا بعد إعادة التشغيل.\n\nوتحقق كذلك من الساعات. يجب أن تتفق Suricata والوكيل والمدير على الوقت عبر NTP، وإلا ظهرت أحداث الآلات الثلاث بترتيب خاطئ وضلّلك الربط بينها. فانحراف دقيقة واحدة قد يجعل حدث المضيف يبدو سابقًا للتنبيه الشبكي الذي تسبب فيه."
+      },
+      {
+        "id": "conf",
+        "type": "code",
+        "language": "plain",
+        "filename": "/var/ossec/etc/ossec.conf",
+        "caption": "إعدادات الوكيل (مقتطف). أضفه داخل عنصر ossec_config.",
+        "highlight": [
+          1,
+          2,
+          3
+        ],
+        "code": "<localfile>\n  <log_format>json</log_format>\n  <location>/var/log/suricata/eve.json</location>\n</localfile>\n"
+      },
+      {
+        "id": "term1",
+        "type": "terminal",
+        "title": "sensor",
+        "prompt": "$",
+        "caption": "أعد تشغيل الوكيل وتأكد من أنه فتح الملف وافحص الاتصال بالمدير.",
+        "lines": [
+          {
+            "cmd": "sudo systemctl restart wazuh-agent",
+            "output": "",
+            "comment": "طبّق مدخل localfile الجديد."
+          },
+          {
+            "cmd": "sudo grep -E 'eve.json|Connected' /var/ossec/logs/ossec.log | tail -n 2",
+            "output": "2026/03/10 09:14:02 wazuh-logcollector: INFO: (1950): Analyzing file: '/var/log/suricata/eve.json'.\n2026/03/10 09:14:03 wazuh-agentd: INFO: (4102): Connected to the server ([192.0.2.20]:1514/tcp).",
+            "comment": "يجب أن يظهر السطران. الأول يثبت مراقبة الملف والثاني يثبت عمل القناة إلى المدير."
+          },
+          {
+            "prompt": "client$",
+            "cmd": "curl -s -o /dev/null -A 'lab-ids-test' http://10.10.20.10/",
+            "output": "",
+            "comment": "ولّد طلب العلامة غير الضار من عميل في مختبرك."
+          }
+        ]
+      },
+      {
+        "id": "rules",
+        "type": "text",
+        "markdown": "## الخطوة 3: تحقق من فك الترميز واكتب قاعدة مخصصة\n\nيأتي Wazuh بقواعد لتنبيهات Suricata ضمن مجموعة القواعد `suricata`، فيجب أن يظهر التنبيه دون أي عمل مخصص. اختبر ذلك على المدير بالأداة `wazuh-logtest` التي تمرّر سطر سجل ملصوقًا عبر المفكّكات والقواعد وتُظهر ما أُطلق منها. وهي أسرع طريقة لتصحيح قاعدة لأنك لا تحتاج إلى حركة حية.\n\nثم أضف قاعدتك. تقع القواعد المخصصة في `/var/ossec/etc/rules/local_rules.xml` ويجب أن تستخدم معرّفات من 100000 فما فوق. وتبني القاعدة الفرعية على أبيها عبر `if_sid`. الأب هنا هو قاعدة تنبيه Suricata العامة، والفرع يُطلق لتوقيع مختبرك فقط ويرفع المستوى كي يبرز."
+      },
+      {
+        "id": "rule",
+        "type": "code",
+        "language": "plain",
+        "filename": "/var/ossec/etc/rules/local_rules.xml",
+        "caption": "قاعدة فرعية لتوقيع المختبر. تحقق من معرّف الأب في مجموعة قواعد إصدارك.",
+        "highlight": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "code": "<group name=\"local,suricata,\">\n  <rule id=\"100100\" level=\"10\">\n    <if_sid>86601</if_sid>\n    <field name=\"alert.signature_id\">^1000001$</field>\n    <description>LAB: Suricata marker signature matched on $(dest_ip)</description>\n    <mitre><id>T1071</id></mitre>\n  </rule>\n</group>\n"
+      },
+      {
+        "id": "term2",
+        "type": "terminal",
+        "title": "manager",
+        "prompt": "$",
+        "caption": "اختبر بـ wazuh-logtest ثم أعد التحميل واقرأ التنبيه من ملف التنبيهات.",
+        "lines": [
+          {
+            "cmd": "sudo /var/ossec/bin/wazuh-logtest -q",
+            "output": "Type one log per line\n> {\"event_type\":\"alert\",\"src_ip\":\"10.10.10.15\",\"dest_ip\":\"10.10.20.10\",\"alert\":{\"signature_id\":1000001,\"signature\":\"LAB User-Agent marker seen\"}}\n\n**Phase 2: Completed decoding.\n    name: 'json'\n**Phase 3: Completed filtering (rules).\n    id: '100100'\n    level: '10'\n    description: 'LAB: Suricata marker signature matched on 10.10.20.10'",
+            "comment": "تثبت المرحلة 2 أن مفكّك JSON يعمل وتُظهر المرحلة 3 أن قاعدتك سبقت الأب."
+          },
+          {
+            "cmd": "sudo systemctl restart wazuh-manager && sudo jq -c 'select(.rule.id==\"100100\") | {t:.timestamp, agent:.agent.name, lvl:.rule.level, sig:.data.alert.signature}' /var/ossec/logs/alerts/alerts.json | tail -n 1",
+            "output": "{\"t\":\"2026-03-10T09:15:41.220+0000\",\"agent\":\"sensor01\",\"lvl\":10,\"sig\":\"LAB User-Agent marker seen\"}",
+            "comment": "وصل التنبيه الحي من البداية إلى النهاية ويحمل اسم الوكيل."
+          }
+        ]
+      },
+      {
+        "id": "correlate",
+        "type": "text",
+        "markdown": "## الخطوة 4: اربط الأدلة الشبكية بأدلة المضيف\n\nتظهر القيمة الحقيقية حين يقود تنبيه واحد إلى السؤال التالي. افترض أن Suricata أبلغت عن طلب إلى خادم الويب عند 09:15. في لوحة معلومات Wazuh صفِّ بحسب اسم وكيل الخادم للدقائق العشر التالية وابحث عن:\n\n- عمليات جديدة أنشأها حساب خدمة الويب؛\n- تغييرات في سلامة الملفات داخل جذر الويب؛\n- أحداث مصادقة فاشلة أو غير معتادة؛\n- اتصالات صادرة لم تكن موجودة من قبل.\n\nالتنبيه الشبكي الذي لا يتبعه شيء من هذا غالبًا محاولة محجوبة أو غير ذات أثر. أما التنبيه الشبكي الذي يتبعه تغيير في ملف فهو حادث. وتساعد مجموعات قواعد Wazuh هنا: فالاستجابة النشطة ومراقبة سلامة الملفات ووحدة تقييم إعدادات الأمان تضيف جميعها أدلة من جهة المضيف إلى الفهرس القابل للبحث نفسه.\n\nدوّن ما تجده في جدول صغير: الوقت والمصدر والتوقيع ودليل المضيف والحكم. هذه العادة تحوّل التنبيهات الخام إلى سجل فرز يمكن الدفاع عنه، وهي المهارة نفسها في [مختبر محاكاة الاستجابة للحوادث](/learn/hands-on-security-labs/incident-response-simulation-lab)."
+      },
+      {
+        "id": "levels",
+        "type": "text",
+        "markdown": "### قرر ما يستحق الانتباه\n\nتكتب Suricata أكثر من التنبيهات؛ فيحتوي `eve.json` أيضًا أحداث `dns` و`http` و`tls` و`flow`. إرسالها كلها يمنح سياقًا غنيًا لكنه يكلّف تخزينًا، فقرر عن قصد. التنبيهات صغيرة وثمينة. أما سجلات التدفق وDNS فضخمة لكنها لا تُقدَّر بثمن حين تتعقب الأحداث رجوعًا من مضيف مشبوه واحد.\n\nفيما يلي سياسة بداية عملية لمختبر صغير. عدّل المستويات بحسب تحملك للضجيج.\n\n| نوع الحدث | هل يُرسل؟ | مستوى Wazuh المقترح | السبب |\n|:--|:--|:--|:--|\n| `alert` | دائمًا | من 5 إلى 10 | ناتج الكشف المباشر |\n| `dns` | نعم مع احتفاظ قصير | 3 | يبيّن ما حاولت المضيفات حله |\n| `tls` | نعم | 3 | يبقى SNI والشهادات ظاهرين رغم التشفير |\n| `http` | اختياري | 3 | مفيد لكنه ضخم في المواقع المزدحمة |\n| `flow` | اختياري | من 0 إلى 3 | الأفضل للتحقيق لاحقًا |\n\nتذكّر أن المستوى 12 وما فوقه يطلق عادةً الإشعارات في البيئات الإنتاجية. احجز تلك المستويات للتواقيع التي توقظ من أجلها شخصًا، وأبقِ الباقي قابلًا للبحث لكن هادئًا."
+      },
+      {
+        "id": "tuning",
+        "type": "text",
+        "markdown": "## الخطوة 5: أبقِ المسار سليمًا\n\nلا ينتهي التكامل بظهور أول تنبيه. خطّط لثلاث مشكلات مستمرة.\n\n1. **الحجم.** قد تنتج مجموعة قواعد مجتمعية آلاف التنبيهات يوميًا. قرر أي التواقيع يستحق تنبيهًا في لوحة المعلومات وأيها يكفي أن يكون قابلًا للبحث. استخدم مستويات القواعد للفصل بينها.\n2. **التكرار.** إن أبلغ Suricata ووكيل المضيف كلاهما عن النشاط نفسه فسترى الحدث مرتين. هذا مفيد للتأكيد لكنه يحتاج إلى اصطلاح تسمية ليجمعهما المحللون.\n3. **الصمت.** المسار المعطّل يشبه تمامًا الشبكة الهادئة. نبّه على غياب الأحداث، مثلًا حين لا يرسل وكيل المستشعر بيانات لمدة خمس عشرة دقيقة."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "احمِ المسار نفسه",
+        "markdown": "قد يحوي `eve.json` عناوين URL وأسماء مضيفات وسلاسل user-agent قادمة من عملاء غير موثوقين. تعامل معه كبيانات لا كأوامر. قيّد من يستطيع قراءته، وأبقِ قناة الوكيل إلى المدير على شبكة إدارة، ولا تعرّض منافذ المدير للإنترنت أبدًا."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "صحّح الأخطاء بالترتيب",
+        "markdown": "إن لم يظهر تنبيه فاختبر القفزات بالتسلسل: هل يحتوي `eve.json` على الحدث، وهل يظهر `ossec.log` أن الملف قيد التحليل، وهل يطابق `wazuh-logtest` السطر، وهل يحتوي `alerts.json` على النتيجة؟ أول قفزة تفشل هي مشكلتك."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلات افتراضية **تملكها**:\n\n1. ثبّت مدير Wazuh على آلة والوكيل على مستشعر Suricata.\n2. أضف مدخل `localfile` وأعد تشغيل الوكيل وتأكد من سطري السجل.\n3. أرسل طلب العلامة وابحث عن التنبيه في `alerts.json` وفي لوحة المعلومات.\n4. أضف القاعدة 100100 واختبرها بـ `wazuh-logtest` أولًا ثم أعد تحميل المدير.\n5. أنشئ قاعدة أو مرشحًا في اللوحة يعرض تنبيهات Suricata وأحداث سلامة الملفات لخادم الويب.\n6. أوقف الوكيل عشرين دقيقة ودوّن كيف ستكتشف هذا الصمت."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "وكيل Wazuh",
+            "definition": "برنامج على المضيف المراقَب يجمع السجلات والأحداث ويرسلها إلى المدير."
+          },
+          {
+            "term": "مدير Wazuh",
+            "definition": "الخادم الذي يفك ترميز الأحداث ويطبق القواعد ويولّد التنبيهات."
+          },
+          {
+            "term": "localfile",
+            "definition": "مدخل في إعدادات الوكيل يسمّي ملف سجل ليقرأه وصيغته."
+          },
+          {
+            "term": "المفكّك (Decoder)",
+            "definition": "محلل يحوّل سطر سجل خامًا إلى حقول مسمّاة."
+          },
+          {
+            "term": "معرّف القاعدة",
+            "definition": "رقم يعرّف القاعدة؛ وتستخدم القواعد المخصصة 100000 فما فوق."
+          },
+          {
+            "term": "wazuh-logtest",
+            "definition": "أداة في المدير تُظهر المفكّكات والقواعد التي يطلقها سطر سجل ملصوق."
+          },
+          {
+            "term": "مراقبة سلامة الملفات",
+            "definition": "كشف التغييرات في الملفات والمجلدات المراقَبة."
+          },
+          {
+            "term": "الربط (Correlation)",
+            "definition": "وصل أحداث من مصادر مختلفة في قصة واحدة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "كيف تصل تنبيهات Suricata إلى مدير Wazuh؟",
+            "options": [
+              "يقرأ الوكيل eve.json ويمرر الأحداث",
+              "تسجّل Suricata الدخول إلى المدير عبر SSH",
+              "يفحص المدير المستشعر",
+              "عبر البريد الإلكتروني"
+            ],
+            "answer": 0,
+            "explanation": "تكتب Suricata ملفًا فقط، ويجمعه وكيل Wazuh على المستشعر عبر مدخل localfile."
+          },
+          {
+            "question": "لماذا نضبط log_format على json؟",
+            "options": [
+              "لتصبح كل الحقول قابلة للبحث",
+              "لضغط الملف",
+              "لتشفير السجل",
+              "لتعطيل القواعد"
+            ],
+            "answer": 0,
+            "explanation": "يتيح تنسيق JSON للمفكّكات استخراج حقول منظمة مثل معرّف التوقيع وعنوان الوجهة."
+          },
+          {
+            "question": "أي مما يلي فحوص أولى صحيحة حين لا يظهر تنبيه؟ (اختر كل ما ينطبق)",
+            "options": [
+              "التأكد من أن eve.json يحتوي الحدث",
+              "فحص ossec.log لرؤية الملف قيد التحليل",
+              "تشغيل wazuh-logtest بسطر السجل",
+              "إعادة تثبيت نظام التشغيل"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "اختبر كل قفزة بالترتيب. إعادة التثبيت ليست خطوة أولى أبدًا."
+          },
+          {
+            "question": "أي نطاق معرّفات تستخدمه قواعد Wazuh المخصصة؟",
+            "options": [
+              "من 1 إلى 999",
+              "من 100000 فما فوق",
+              "أي نطاق لأنها تستبدل الافتراضية",
+              "86601 تحديدًا"
+            ],
+            "answer": 1,
+            "explanation": "المعرّفات من 100000 فما فوق محجوزة للقواعد المحلية وتتجنب التعارض مع القواعد المشحونة."
+          },
+          {
+            "question": "لماذا ننبّه على غياب الأحداث من المستشعر؟",
+            "options": [
+              "المسار المعطّل يشبه شبكة هادئة",
+              "الصمت دائمًا هجوم",
+              "يوفّر مساحة القرص",
+              "الوكلاء يتطلبون ذلك"
+            ],
+            "answer": 0,
+            "explanation": "دون فحص نبض لا تستطيع التمييز بين غياب الحركة وغياب الرؤية."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nربطت مستشعر Suricata بـ Wazuh بقراءة `eve.json` عبر مدخل `localfile` بصيغة JSON، وتحققت من فك الترميز بـ `wazuh-logtest`، وكتبت قاعدة مخصصة فوق القواعد المدمجة الخاصة بـ Suricata. وتدرّبت على ربط تنبيه شبكي بأدلة المضيف وخططت للحجم والتكرار والصمت. وفي الخطوة التالية انظر إلى الحزم خلف تلك التنبيهات في [مختبر تحليل حركة مرور الشبكة](/learn/hands-on-security-labs/network-traffic-analysis-lab)."
+      }
+    ]
+  }
+}

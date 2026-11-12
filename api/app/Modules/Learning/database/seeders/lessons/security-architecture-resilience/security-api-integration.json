@@ -1,0 +1,586 @@
+{
+ "slug": "security-api-integration",
+ "title": "Security API Integration",
+ "summary": "Connect security tools through APIs with strong authentication, resilient error handling and guardrails for automated actions.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Choose appropriate authentication for an integration",
+  "Handle rate limits, retries, pagination and timeouts",
+  "Prevent duplicate actions with idempotency",
+  "Add guardrails to automated response actions",
+  "Treat API data as untrusted input"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A phishing alert fires in the email gateway. An analyst opens the console, copies the sender address, pastes it into a threat intelligence site, checks the endpoint tool for recipients who clicked, then opens a ticket and types the findings by hand. The whole routine takes twenty minutes and is identical for every phishing alert. A script could do it in four seconds.\n\nSecurity tools expose **application programming interfaces (APIs)** so that other systems can read data and trigger actions. Connecting them is the core of SOAR (security orchestration, automation and response). But an integration is also a new trust relationship: it holds a credential, it can change security controls, and it fails in unusual ways. This lesson teaches how to connect security tools reliably and safely."
+  },
+  {
+   "id": "auth",
+   "type": "text",
+   "markdown": "## Step 1: Choose the right authentication\n\nEvery integration needs an identity. Choose the strongest method the product supports, and give the integration its own account.\n\n| Method | How it works | Strengths | Weaknesses |\n|:--|:--|:--|:--|\n| Static API key | One long string in a header | Simple | Long-lived, easy to leak |\n| Basic authentication | Username and password per request | Universal | Weak, avoid for new work |\n| OAuth 2.0 client credentials | Exchange client ID and secret for a short-lived token | Expiring, scoped | Needs token refresh logic |\n| Mutual TLS | Client certificate proves identity | Strong, no shared secret | Certificate lifecycle to manage |\n| Cloud workload identity | Platform issues temporary credentials | No stored secret | Only inside that cloud |\n\nWhatever you choose, apply four rules. Create a **dedicated service account** per integration, never a person's account. Grant **least privilege**: a ticketing integration needs permission to create tickets, not to administer the platform. Store secrets in a vault, never in the script, and read them at run time. Finally, give each secret an owner and a rotation date, as described in [Service Account Security](/learn/security-architecture-resilience/service-account-security)."
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "An integration that handles tokens and rate limits",
+   "data": {
+    "actors": [
+     {
+      "id": "bot",
+      "label": "Automation",
+      "sub": "soar.example.com",
+      "icon": "cpu"
+     },
+     {
+      "id": "auth",
+      "label": "Auth server",
+      "sub": "idp.example.com",
+      "icon": "key"
+     },
+     {
+      "id": "api",
+      "label": "Security API",
+      "sub": "edr.example.com",
+      "icon": "shield"
+     },
+     {
+      "id": "tk",
+      "label": "Ticketing",
+      "sub": "tickets.example.com",
+      "icon": "file"
+     }
+    ],
+    "steps": [
+     {
+      "from": "bot",
+      "to": "auth",
+      "label": "Client credentials",
+      "detail": "grant_type=client_credentials",
+      "note": "The secret is read from the vault and sent over TLS."
+     },
+     {
+      "from": "auth",
+      "to": "bot",
+      "label": "Access token",
+      "detail": "expires_in=900",
+      "tone": "secure",
+      "note": "A scoped token valid for 15 minutes."
+     },
+     {
+      "from": "bot",
+      "to": "api",
+      "label": "GET /alerts?severity=high",
+      "detail": "Authorization: Bearer ***",
+      "note": "The script asks for new high-severity alerts."
+     },
+     {
+      "from": "api",
+      "to": "bot",
+      "label": "429 Too Many Requests",
+      "detail": "Retry-After: 5",
+      "tone": "warning",
+      "note": "The API is rate limiting. The script must slow down, not retry instantly."
+     },
+     {
+      "from": "bot",
+      "to": "bot",
+      "label": "Wait, then retry",
+      "detail": "backoff + jitter",
+      "tone": "secure",
+      "note": "Exponential backoff with random jitter avoids retry storms."
+     },
+     {
+      "from": "api",
+      "to": "bot",
+      "label": "200 OK",
+      "detail": "page 1 of 3",
+      "tone": "success",
+      "note": "Results arrive in pages; the script follows the next cursor."
+     },
+     {
+      "from": "bot",
+      "to": "tk",
+      "label": "POST /tickets",
+      "detail": "Idempotency-Key: alert-4411",
+      "tone": "success",
+      "note": "A key per alert prevents duplicate tickets if the call is retried."
+     }
+    ]
+   }
+  },
+  {
+   "id": "code",
+   "type": "code",
+   "language": "python",
+   "filename": "alert_to_ticket.py",
+   "code": "import os, time, random, requests\n\nAPI = 'https://edr.example.com/api/v1'\nTICKETS = 'https://tickets.example.com/api/v2'\nsession = requests.Session()\nsession.headers['Authorization'] = 'Bearer ' + os.environ['EDR_TOKEN']   # injected by the vault, never hard-coded\n\ndef call(method, url, **kw):\n    for attempt in range(5):\n        r = session.request(method, url, timeout=(3, 15), **kw)    # always set timeouts\n        if r.status_code == 429:\n            wait = int(r.headers.get('Retry-After', 2 ** attempt))\n            time.sleep(wait + random.random())                     # backoff with jitter\n            continue\n        if r.status_code >= 500:\n            time.sleep(2 ** attempt); continue                     # transient server error\n        r.raise_for_status()                                       # 4xx is our bug: fail loudly\n        return r.json()\n    raise RuntimeError(f'giving up on {url}')\n\ndef alerts():\n    url = f'{API}/alerts?severity=high&limit=50'\n    while url:\n        page = call('GET', url)\n        yield from page['items']\n        url = page.get('next')                                     # follow pagination\n\nfor a in alerts():\n    call('POST', f'{TICKETS}/tickets',\n         headers={'Idempotency-Key': f\"alert-{a['id']}\"},\n         json={'title': f\"EDR: {a['name']} on {a['host']}\", 'priority': 'P2'})",
+   "highlight": [
+    6,
+    9,
+    11,
+    14,
+    17,
+    22,
+    28
+   ],
+   "caption": "Timeouts, backoff on 429 and 5xx, pagination and an idempotency key. The endpoints are fictional examples."
+  },
+  {
+   "id": "term",
+   "type": "terminal",
+   "title": "Testing an endpoint by hand first",
+   "lines": [
+    {
+     "cmd": "curl -sS -D - -o /dev/null -H \"Authorization: Bearer $EDR_TOKEN\" 'https://edr.example.com/api/v1/alerts?limit=1'",
+     "prompt": "$",
+     "output": "HTTP/2 200\ncontent-type: application/json\nx-ratelimit-limit: 60\nx-ratelimit-remaining: 57\nx-ratelimit-reset: 38",
+     "comment": "Read the rate limit headers: 57 calls remain for the next 38 seconds. Design the schedule around them."
+    },
+    {
+     "cmd": "curl -sS -H \"Authorization: Bearer $EDR_TOKEN\" 'https://edr.example.com/api/v1/hosts/nonexistent'",
+     "prompt": "$",
+     "output": "{\"error\":\"not_found\",\"message\":\"host not found\",\"request_id\":\"b81f-77\"}",
+     "comment": "Keep the request_id in your logs; the vendor needs it for support."
+    }
+   ]
+  },
+  {
+   "id": "reliability",
+   "type": "text",
+   "markdown": "## Step 2: Build for failure\n\nAPIs time out, return errors, change fields and go offline. An integration that assumes success will eventually do something wrong, silently. Design for these cases.\n\n- **Timeouts.** Always set a connect and a read timeout. Without one, a hung connection blocks your whole workflow.\n- **Retries.** Retry only safe cases: 429 and 5xx responses, and network errors. Do not retry 400 or 403, because the request itself is wrong.\n- **Idempotency.** An action like \"create ticket\" or \"isolate host\" may run twice after a retry. Use idempotency keys, or check whether the object already exists.\n- **Pagination.** Never assume one page holds everything. A script that reads only the first 50 alerts silently ignores the rest.\n- **Schema changes.** Validate the fields you need and alert when they are missing, rather than defaulting to empty values.\n- **Dead-letter queue.** Save failed items for review instead of dropping them.\n\nLog every call with a request ID, a status and a duration, but never the token or full sensitive payloads."
+  },
+  {
+   "id": "safe",
+   "type": "text",
+   "markdown": "## Step 3: Automate actions with guardrails\n\nReading data is low risk. Writing is not. A mistaken rule that blocks an IP address, disables an account or isolates a host can cause an outage larger than the attack it was meant to stop.\n\n| Action | Risk | Guardrail |\n|:--|:--|:--|\n| Enrich an indicator | Very low | Run automatically |\n| Create or update a ticket | Low | Run automatically, with idempotency |\n| Block an IP on a firewall | Medium | Allowlist of protected addresses, automatic expiry |\n| Disable a user account | High | Skip executives and service accounts, or require approval |\n| Isolate a host | High | Approval for servers, automatic for laptops |\n\nUse a **dry-run mode** that logs what would happen, and run it for a week before enabling real actions. Add a **kill switch**, a single flag that halts all automated changes. Record who or what triggered every action and keep the log. Combine these patterns with the enrichment steps in [Automated Incident Enrichment](/learn/security-architecture-resilience/automated-incident-enrichment)."
+  },
+  {
+   "id": "operate",
+   "type": "text",
+   "markdown": "## Step 4: Operate the integration over time\n\nAn integration is not finished when it first works. It becomes part of your security operations, and it needs the care of any production service.\n\n**Monitor it.** Track the number of calls, the error rate, the latency and the age of the newest item processed. A script that silently stops reading alerts looks exactly like a quiet day. Alert when no data arrives for longer than the expected interval, and test that alert by pausing the job.\n\n**Version it.** Vendors change APIs. Pin the API version in the URL or a header when the product supports it, subscribe to the vendor's deprecation notices, and keep tests that run against a sandbox or a recorded response.\n\n**Document it.** For each integration, record the owner, the credential and its rotation date, the permissions it holds, the systems it touches and how to disable it quickly. During an incident, the team must be able to answer \"what can this automation do?\" in a minute.\n\n**Review it.** Every quarter, check that the permissions are still the minimum, that unused integrations are removed, and that the guardrails behaved as intended. Treat an integration account like any privileged identity, and include it in access reviews."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Treat API data as untrusted input",
+   "markdown": "Alert fields such as a hostname, subject line or file name can contain text chosen by an attacker. Never pass them into a shell command or a database query without validation. Use library calls with argument lists, not string concatenation, so that an alert cannot become a way to run commands in your automation."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Practice with an API you own, such as a local Wazuh or a mock server.\n\n1. Run a small mock API (for example with Python `http.server` or a Postman mock) that returns three pages of alerts and occasionally returns 429.\n2. Adapt `alert_to_ticket.py` to read the token from an environment variable, never from the file.\n3. Confirm that pagination reaches all three pages.\n4. Force a 429 and watch the backoff.\n5. Run the script twice and verify no duplicate tickets are created.\n6. Add a `DRY_RUN=1` mode that prints actions instead of sending them.\n\nWrite down which failure mode each step protects against."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "API",
+     "definition": "Defined interface that lets programs exchange data and trigger actions."
+    },
+    {
+     "term": "SOAR",
+     "definition": "Platforms that orchestrate tools and automate response playbooks."
+    },
+    {
+     "term": "OAuth 2.0",
+     "definition": "Authorization framework that issues scoped, expiring access tokens."
+    },
+    {
+     "term": "Rate limit",
+     "definition": "Maximum number of requests allowed in a period."
+    },
+    {
+     "term": "Idempotency",
+     "definition": "Property that repeating a request has the same effect as sending it once."
+    },
+    {
+     "term": "Backoff",
+     "definition": "Increasing waits between retries, usually with random jitter."
+    },
+    {
+     "term": "Pagination",
+     "definition": "Returning large result sets in pages."
+    },
+    {
+     "term": "Kill switch",
+     "definition": "Single control that halts all automated actions."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "An API returns 429 with Retry-After: 5. What should the script do?",
+     "options": [
+      "Retry immediately in a loop",
+      "Wait at least 5 seconds, add jitter and retry",
+      "Delete the token",
+      "Stop forever"
+     ],
+     "answer": 1,
+     "explanation": "Respect the server's instruction. Immediate retries make the overload worse."
+    },
+    {
+     "question": "Which errors should normally be retried? (choose all that apply)",
+     "options": [
+      "429 Too Many Requests",
+      "503 Service Unavailable",
+      "Connection timeout",
+      "403 Forbidden"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Transient problems may clear. A 403 means the credential lacks permission, and retrying will not fix it."
+    },
+    {
+     "question": "Why use an idempotency key when creating tickets?",
+     "options": [
+      "To encrypt the ticket",
+      "To prevent duplicates when a call is retried",
+      "To speed up the API",
+      "To hide the title"
+     ],
+     "answer": 1,
+     "explanation": "If the first call succeeded but the response was lost, the retry would otherwise create a second ticket."
+    },
+    {
+     "question": "Which guardrails suit an automated account-disable action? (choose all that apply)",
+     "options": [
+      "Exclude service accounts and executives or require approval",
+      "Dry-run mode before enabling",
+      "A kill switch",
+      "No logging, for speed"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "High-impact actions need limits, a safe rollout and a way to stop. Logging is always required."
+    },
+    {
+     "question": "Where should the integration's token be kept?",
+     "options": [
+      "In the script",
+      "In a vault or secure variable, read at run time",
+      "In the ticket description",
+      "In the alert name"
+     ],
+     "answer": 1,
+     "explanation": "Embedded tokens leak through repositories and logs."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Security APIs connect tools and remove repetitive manual work.\n- Use a dedicated account, least privilege and short-lived tokens, with secrets in a vault.\n- Handle timeouts, 429 and 5xx responses, pagination and duplicates.\n- Treat data from APIs as untrusted input.\n- Add dry-run mode, allowlists, approvals and a kill switch before automating high-impact actions.\n\nNext: [Automated Incident Enrichment](/learn/security-architecture-resilience/automated-incident-enrichment) and [Automated Vulnerability Reporting](/learn/security-architecture-resilience/automated-vulnerability-reporting)."
+  }
+ ],
+ "ar": {
+  "title": "تكامل واجهات البرمجة الأمنية (APIs)",
+  "summary": "اربط الأدوات الأمنية عبر واجهات البرمجة بمصادقة قوية ومعالجة متينة للأخطاء وضوابط حماية للإجراءات الآلية.",
+  "objectives": [
+   "اختيار المصادقة المناسبة للتكامل",
+   "التعامل مع حدود المعدل وإعادة المحاولة وترقيم الصفحات والمهلات",
+   "منع تكرار الإجراءات بعدم التكرار",
+   "إضافة ضوابط حماية لإجراءات الاستجابة الآلية",
+   "معاملة بيانات الواجهات كمدخلات غير موثوقة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يُطلق جدار بوابة البريد تنبيه تصيّد. يفتح المحلل وحدة التحكم، وينسخ عنوان المرسل، ويلصقه في موقع استخبارات التهديدات، ويفحص أداة الأجهزة الطرفية لمعرفة من نقر من المستلمين، ثم يفتح تذكرة ويكتب النتائج يدويًا. تستغرق الروتين كله عشرين دقيقة ويتكرر بالطريقة نفسها مع كل تنبيه تصيّد. وسكربت يستطيع إنجازه في أربع ثوانٍ.\n\nتتيح الأدوات الأمنية **واجهات برمجة التطبيقات (APIs)** كي تقرأ الأنظمة الأخرى البيانات وتطلق الإجراءات. وربط هذه الأدوات هو لب SOAR (التنسيق والأتمتة والاستجابة الأمنية). لكن التكامل علاقة ثقة جديدة أيضًا: يحمل اعتمادية، ويستطيع تغيير ضوابط أمنية، ويفشل بطرق غير مألوفة. يعلّمك هذا الدرس كيف تربط الأدوات الأمنية بموثوقية وأمان."
+   },
+   {
+    "id": "auth",
+    "type": "text",
+    "markdown": "## الخطوة 1: اختر المصادقة المناسبة\n\nيحتاج كل تكامل إلى هوية. اختر أقوى طريقة يدعمها المنتج، وأعطِ التكامل حسابه الخاص.\n\n| الطريقة | آلية العمل | نقاط القوة | نقاط الضعف |\n|:--|:--|:--|:--|\n| مفتاح API ثابت | سلسلة طويلة واحدة في ترويسة | بسيط | طويل العمر وسهل التسرب |\n| المصادقة الأساسية | اسم مستخدم وكلمة مرور مع كل طلب | شاملة | ضعيفة، تجنبها في الأعمال الجديدة |\n| OAuth 2.0 (اعتمادية العميل) | استبدال معرّف العميل وسره برمز قصير العمر | منتهي الصلاحية ومحدود النطاق | يحتاج منطق تجديد الرمز |\n| TLS المتبادل | شهادة العميل تثبت الهوية | قوي بلا سر مشترك | إدارة دورة حياة الشهادات |\n| هوية حمل العمل السحابية | تصدر المنصة اعتماديات مؤقتة | بلا سر مخزَّن | داخل تلك السحابة فقط |\n\nوأيًّا كانت الطريقة طبّق أربع قواعد. أنشئ **حساب خدمة مخصصًا** لكل تكامل لا حساب شخص. وامنح **أدنى صلاحية**: فتكامل التذاكر يحتاج إذن إنشاء التذاكر لا إدارة المنصة. وخزّن الأسرار في خزنة لا في السكربت، واقرأها وقت التشغيل. وأخيرًا أعطِ كل سر مالكًا وتاريخ تدوير كما في [أمن حسابات الخدمة](/learn/security-architecture-resilience/service-account-security)."
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "تكامل يتعامل مع الرموز وحدود المعدل",
+    "data": {
+     "actors": [
+      {
+       "id": "bot",
+       "label": "الأتمتة",
+       "sub": "soar.example.com",
+       "icon": "cpu"
+      },
+      {
+       "id": "auth",
+       "label": "خادم المصادقة",
+       "sub": "idp.example.com",
+       "icon": "key"
+      },
+      {
+       "id": "api",
+       "label": "واجهة الأمان",
+       "sub": "edr.example.com",
+       "icon": "shield"
+      },
+      {
+       "id": "tk",
+       "label": "نظام التذاكر",
+       "sub": "tickets.example.com",
+       "icon": "file"
+      }
+     ],
+     "steps": [
+      {
+       "from": "bot",
+       "to": "auth",
+       "label": "اعتمادية العميل",
+       "detail": "grant_type=client_credentials",
+       "note": "يُقرأ السر من الخزنة ويُرسل عبر TLS."
+      },
+      {
+       "from": "auth",
+       "to": "bot",
+       "label": "رمز الوصول",
+       "detail": "expires_in=900",
+       "tone": "secure",
+       "note": "رمز محدود النطاق صالح 15 دقيقة."
+      },
+      {
+       "from": "bot",
+       "to": "api",
+       "label": "GET /alerts?severity=high",
+       "detail": "Authorization: Bearer ***",
+       "note": "يطلب السكربت التنبيهات الجديدة عالية الخطورة."
+      },
+      {
+       "from": "api",
+       "to": "bot",
+       "label": "429 Too Many Requests",
+       "detail": "Retry-After: 5",
+       "tone": "warning",
+       "note": "الواجهة تحدّ من المعدل، وعلى السكربت أن يبطئ لا أن يعيد المحاولة فورًا."
+      },
+      {
+       "from": "bot",
+       "to": "bot",
+       "label": "انتظر ثم أعد المحاولة",
+       "detail": "backoff + jitter",
+       "tone": "secure",
+       "note": "التراجع الأسي مع عشوائية يتجنب عواصف إعادة المحاولة."
+      },
+      {
+       "from": "api",
+       "to": "bot",
+       "label": "200 OK",
+       "detail": "page 1 of 3",
+       "tone": "success",
+       "note": "تصل النتائج على صفحات، ويتتبع السكربت مؤشر الصفحة التالية."
+      },
+      {
+       "from": "bot",
+       "to": "tk",
+       "label": "POST /tickets",
+       "detail": "Idempotency-Key: alert-4411",
+       "tone": "success",
+       "note": "يمنع مفتاح لكل تنبيه تكرار التذاكر إن أُعيد الاستدعاء."
+      }
+     ]
+    }
+   },
+   {
+    "id": "code",
+    "type": "code",
+    "language": "python",
+    "filename": "alert_to_ticket.py",
+    "code": "import os, time, random, requests\n\nAPI = 'https://edr.example.com/api/v1'\nTICKETS = 'https://tickets.example.com/api/v2'\nsession = requests.Session()\nsession.headers['Authorization'] = 'Bearer ' + os.environ['EDR_TOKEN']   # injected by the vault, never hard-coded\n\ndef call(method, url, **kw):\n    for attempt in range(5):\n        r = session.request(method, url, timeout=(3, 15), **kw)    # always set timeouts\n        if r.status_code == 429:\n            wait = int(r.headers.get('Retry-After', 2 ** attempt))\n            time.sleep(wait + random.random())                     # backoff with jitter\n            continue\n        if r.status_code >= 500:\n            time.sleep(2 ** attempt); continue                     # transient server error\n        r.raise_for_status()                                       # 4xx is our bug: fail loudly\n        return r.json()\n    raise RuntimeError(f'giving up on {url}')\n\ndef alerts():\n    url = f'{API}/alerts?severity=high&limit=50'\n    while url:\n        page = call('GET', url)\n        yield from page['items']\n        url = page.get('next')                                     # follow pagination\n\nfor a in alerts():\n    call('POST', f'{TICKETS}/tickets',\n         headers={'Idempotency-Key': f\"alert-{a['id']}\"},\n         json={'title': f\"EDR: {a['name']} on {a['host']}\", 'priority': 'P2'})",
+    "highlight": [
+     6,
+     9,
+     11,
+     14,
+     17,
+     22,
+     28
+    ],
+    "caption": "مهلات زمنية وتراجع عند 429 و5xx وترقيم صفحات ومفتاح لعدم التكرار. نقاط النهاية أمثلة وهمية."
+   },
+   {
+    "id": "term",
+    "type": "terminal",
+    "title": "اختبار نقطة نهاية يدويًا أولًا",
+    "lines": [
+     {
+      "cmd": "curl -sS -D - -o /dev/null -H \"Authorization: Bearer $EDR_TOKEN\" 'https://edr.example.com/api/v1/alerts?limit=1'",
+      "prompt": "$",
+      "output": "HTTP/2 200\ncontent-type: application/json\nx-ratelimit-limit: 60\nx-ratelimit-remaining: 57\nx-ratelimit-reset: 38",
+      "comment": "اقرأ ترويسات حد المعدل: بقي 57 استدعاءً خلال 38 ثانية القادمة. صمّم الجدولة وفقها."
+     },
+     {
+      "cmd": "curl -sS -H \"Authorization: Bearer $EDR_TOKEN\" 'https://edr.example.com/api/v1/hosts/nonexistent'",
+      "prompt": "$",
+      "output": "{\"error\":\"not_found\",\"message\":\"host not found\",\"request_id\":\"b81f-77\"}",
+      "comment": "احتفظ بـ request_id في سجلاتك، فالمورد يحتاجه للدعم."
+     }
+    ]
+   },
+   {
+    "id": "reliability",
+    "type": "text",
+    "markdown": "## الخطوة 2: ابنِ التكامل للفشل\n\nتنتهي مهلة واجهات البرمجة وتعيد أخطاء وتغيّر الحقول وتتوقف عن العمل. والتكامل الذي يفترض النجاح سيفعل شيئًا خاطئًا في النهاية، وبصمت. صمّم لهذه الحالات.\n\n- **المهلات الزمنية.** اضبط دائمًا مهلة اتصال ومهلة قراءة. وبدونها يعطّل اتصال معلّق مسار العمل كله.\n- **إعادة المحاولة.** أعد المحاولة في الحالات الآمنة فقط: استجابات 429 و5xx وأخطاء الشبكة. ولا تعد عند 400 أو 403 لأن الطلب نفسه خاطئ.\n- **عدم التكرار (Idempotency).** قد ينفَّذ إجراء مثل «أنشئ تذكرة» أو «اعزل المضيف» مرتين بعد إعادة المحاولة. استخدم مفاتيح عدم التكرار أو تحقق من وجود الكائن مسبقًا.\n- **ترقيم الصفحات.** لا تفترض أن صفحة واحدة تحوي كل شيء. فالسكربت الذي يقرأ أول 50 تنبيهًا فقط يتجاهل الباقي بصمت.\n- **تغيّر المخطط.** تحقق من الحقول التي تحتاجها ونبّه عند غيابها بدل الاكتفاء بقيم فارغة افتراضية.\n- **طابور الرسائل الفاشلة.** احفظ العناصر الفاشلة للمراجعة بدل إسقاطها.\n\nسجّل كل استدعاء بمعرّف الطلب والحالة والمدة، ولا تسجّل الرمز ولا الحمولات الحساسة كاملة."
+   },
+   {
+    "id": "safe",
+    "type": "text",
+    "markdown": "## الخطوة 3: أتمت الإجراءات مع ضوابط حماية\n\nقراءة البيانات منخفضة الخطر، أما الكتابة فلا. فقاعدة خاطئة تحجب عنوان IP أو تعطّل حسابًا أو تعزل مضيفًا قد تسبب انقطاعًا أكبر من الهجوم الذي أُريد إيقافه.\n\n| الإجراء | الخطر | ضابط الحماية |\n|:--|:--|:--|\n| إثراء مؤشر | منخفض جدًا | يعمل تلقائيًا |\n| إنشاء تذكرة أو تحديثها | منخفض | تلقائي مع عدم التكرار |\n| حجب IP على جدار الحماية | متوسط | قائمة سماح بالعناوين المحمية وانتهاء تلقائي |\n| تعطيل حساب مستخدم | عالٍ | تخطّي التنفيذيين وحسابات الخدمة أو اشتراط موافقة |\n| عزل مضيف | عالٍ | موافقة للخوادم وتلقائي للحواسيب المحمولة |\n\nاستخدم **وضع التجربة (dry-run)** الذي يسجّل ما سيحدث، وشغّله أسبوعًا قبل تفعيل الإجراءات الفعلية. وأضف **مفتاح إيقاف (kill switch)**، أي علمًا واحدًا يوقف كل التغييرات الآلية. وسجّل من أو ما الذي أطلق كل إجراء واحتفظ بالسجل. واجمع هذه الأنماط مع خطوات الإثراء في [الإثراء الآلي للحوادث](/learn/security-architecture-resilience/automated-incident-enrichment)."
+   },
+   {
+    "id": "operate",
+    "type": "text",
+    "markdown": "## الخطوة 4: شغّل التكامل عبر الزمن\n\nلا ينتهي العمل حين ينجح التكامل أول مرة. فهو يصبح جزءًا من عملياتك الأمنية ويحتاج عناية أي خدمة إنتاجية.\n\n**راقبه.** تتبّع عدد الاستدعاءات ومعدل الأخطاء والزمن المستغرق وعمر أحدث عنصر عولج. فالسكربت الذي يتوقف عن قراءة التنبيهات بصمت يبدو تمامًا كيوم هادئ. نبّه حين لا تصل بيانات لمدة أطول من الفاصل المتوقع، واختبر هذا التنبيه بإيقاف المهمة مؤقتًا.\n\n**أصدِر نسخه.** يغيّر الموردون واجهاتهم البرمجية. ثبّت إصدار الواجهة في العنوان أو الترويسة إن دعم المنتج ذلك، واشترك في إشعارات الإيقاف عند المورد، واحتفظ باختبارات تعمل على بيئة تجريبية أو استجابات مسجَّلة.\n\n**وثّقه.** سجّل لكل تكامل المالك والاعتمادية وتاريخ تدويرها والصلاحيات التي يحملها والأنظمة التي يمسها وطريقة تعطيله سريعًا. ففي أثناء الحادثة ينبغي أن يجيب الفريق عن سؤال «ماذا تستطيع هذه الأتمتة أن تفعل؟» في دقيقة.\n\n**راجعه.** تحقق كل ربع سنة أن الصلاحيات ما زالت في حدها الأدنى، وأن التكاملات غير المستخدمة أُزيلت، وأن ضوابط الحماية تصرفت كما أُريد. وعامل حساب التكامل كأي هوية ذات امتياز، وأدرجه في مراجعات الوصول."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "عامِل بيانات واجهة البرمجة كمدخلات غير موثوقة",
+    "markdown": "قد تحوي حقول التنبيه مثل اسم المضيف أو سطر الموضوع أو اسم الملف نصًا اختاره المهاجم. لا تمررها أبدًا إلى أمر في الصدفة أو استعلام قاعدة بيانات دون تحقق. استخدم استدعاءات المكتبات بقوائم معاملات لا ربط السلاسل، كي لا يصير التنبيه وسيلة لتشغيل أوامر داخل أتمتتك."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "تدرّب على واجهة تملكها، مثل Wazuh محلي أو خادم محاكاة.\n\n1. شغّل واجهة محاكاة صغيرة (مثلًا بـ `http.server` في بايثون أو محاكاة Postman) تعيد ثلاث صفحات من التنبيهات وتعيد 429 أحيانًا.\n2. عدّل `alert_to_ticket.py` ليقرأ الرمز من متغير بيئة لا من الملف.\n3. تأكد أن ترقيم الصفحات يبلغ الصفحات الثلاث.\n4. افرض استجابة 429 وراقب التراجع.\n5. شغّل السكربت مرتين وتحقق أنه لم تُنشأ تذاكر مكررة.\n6. أضف وضع `DRY_RUN=1` يطبع الإجراءات بدل إرسالها.\n\nدوّن أي نمط فشل يحميك منه كل خطوة."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "API",
+      "definition": "واجهة محددة تتيح للبرامج تبادل البيانات وإطلاق الإجراءات."
+     },
+     {
+      "term": "SOAR",
+      "definition": "منصات تنسق الأدوات وتؤتمت أدلة الاستجابة."
+     },
+     {
+      "term": "OAuth 2.0",
+      "definition": "إطار تفويض يصدر رموز وصول محدودة النطاق ومنتهية الصلاحية."
+     },
+     {
+      "term": "Rate limit",
+      "definition": "الحد الأقصى للطلبات المسموح بها في فترة معينة."
+     },
+     {
+      "term": "Idempotency",
+      "definition": "خاصية أن تكرار الطلب له الأثر نفسه كإرساله مرة واحدة."
+     },
+     {
+      "term": "Backoff",
+      "definition": "أزمنة انتظار متزايدة بين المحاولات، عادةً مع عشوائية."
+     },
+     {
+      "term": "Pagination",
+      "definition": "إعادة مجموعات النتائج الكبيرة على صفحات."
+     },
+     {
+      "term": "Kill switch",
+      "definition": "ضابط واحد يوقف كل الإجراءات الآلية."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "تعيد واجهة 429 مع Retry-After: 5. ماذا يفعل السكربت؟",
+      "options": [
+       "يعيد فورًا في حلقة",
+       "ينتظر 5 ثوانٍ على الأقل ويضيف عشوائية ثم يعيد",
+       "يحذف الرمز",
+       "يتوقف نهائيًا"
+      ],
+      "answer": 1,
+      "explanation": "احترم تعليمة الخادم، فإعادة المحاولة الفورية تزيد الحمل سوءًا."
+     },
+     {
+      "question": "أي الأخطاء ينبغي عادةً إعادة محاولتها؟ (اختر كل ما ينطبق)",
+      "options": [
+       "429 طلبات كثيرة جدًا",
+       "503 الخدمة غير متاحة",
+       "انتهاء مهلة الاتصال",
+       "403 ممنوع"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "المشكلات العابرة قد تزول، أما 403 فتعني أن الاعتمادية تفتقر إلى الصلاحية ولن تصلحها إعادة المحاولة."
+     },
+     {
+      "question": "لماذا يُستخدم مفتاح عدم التكرار عند إنشاء التذاكر؟",
+      "options": [
+       "لتشفير التذكرة",
+       "لمنع التكرار حين يُعاد الاستدعاء",
+       "لتسريع الواجهة",
+       "لإخفاء العنوان"
+      ],
+      "answer": 1,
+      "explanation": "إن نجح الاستدعاء الأول وضاعت الاستجابة فستنشئ إعادة المحاولة تذكرة ثانية."
+     },
+     {
+      "question": "أي ضوابط الحماية تناسب إجراء تعطيل الحساب الآلي؟ (اختر كل ما ينطبق)",
+      "options": [
+       "استثناء حسابات الخدمة والتنفيذيين أو اشتراط موافقة",
+       "وضع تجربة قبل التفعيل",
+       "مفتاح إيقاف",
+       "بلا تسجيل لأجل السرعة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "الإجراءات عالية الأثر تحتاج حدودًا وطرح آمنًا ووسيلة إيقاف، والتسجيل مطلوب دائمًا."
+     },
+     {
+      "question": "أين ينبغي حفظ رمز التكامل؟",
+      "options": [
+       "في السكربت",
+       "في خزنة أو متغير آمن يُقرأ وقت التشغيل",
+       "في وصف التذكرة",
+       "في اسم التنبيه"
+      ],
+      "answer": 1,
+      "explanation": "تتسرب الرموز المضمّنة عبر المستودعات والسجلات."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تربط واجهات البرمجة الأمنية الأدوات وتزيل العمل اليدوي المتكرر.\n- استخدم حسابًا مخصصًا وأدنى صلاحية ورموزًا قصيرة العمر مع أسرار في خزنة.\n- عالج المهلات واستجابات 429 و5xx وترقيم الصفحات والتكرار.\n- عامل البيانات القادمة من الواجهات كمدخلات غير موثوقة.\n- أضف وضع التجربة وقوائم السماح والموافقات ومفتاح الإيقاف قبل أتمتة الإجراءات عالية الأثر.\n\nالتالي: [الإثراء الآلي للحوادث](/learn/security-architecture-resilience/automated-incident-enrichment) و[الإبلاغ الآلي عن الثغرات](/learn/security-architecture-resilience/automated-vulnerability-reporting)."
+   }
+  ]
+ }
+}

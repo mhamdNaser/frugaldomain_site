@@ -1,0 +1,610 @@
+{
+  "slug": "security-monitoring-architecture",
+  "title": "Security Monitoring Architecture",
+  "summary": "Design the pipeline behind a SOC: choose telemetry sources, collect and normalize them reliably, tier storage by value, protect the pipeline itself, and monitor the monitors.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Select telemetry sources by the detections and investigations they enable",
+    "Describe the stages of a collection pipeline: agent, forwarder, parser, normalizer and index",
+    "Design hot, warm and cold storage tiers around retention and cost",
+    "Secure the monitoring pipeline against tampering and data loss",
+    "Monitor ingestion health to detect silent log sources"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "During an investigation, an analyst asks a simple question: which hosts connected to the suspicious server last Tuesday? The answer should take one query. Instead the proxy logs were kept only seven days, the firewall logs arrive in a format nobody parsed, and the domain controllers were never forwarding authentication events at all. The SIEM is excellent; the architecture feeding it is not.\n\n**Security monitoring architecture** is the design of everything between the thing that happened and the analyst who sees it. Good architecture answers four questions in advance: what do we collect, how does it arrive intact, where does it live and for how long, and how do we know when any of that breaks. Detection rules, covered in [Advanced Detection Engineering](/learn/security-operations-dfir/advanced-detection-engineering), are only as good as this foundation."
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## Choose sources by the questions they answer\n\nCollecting everything is expensive and noisy; collecting too little leaves blind spots. Start from the detections and investigations you need, then work backward to the data.\n\n| Source | Answers | Typical volume | Priority |\n|:--|:--|:--|:--|\n| Identity provider and domain controllers | Who signed in, from where, with what result | Medium | Very high |\n| EDR and process telemetry | What ran, with what parent and command line | High | Very high |\n| DNS resolver logs | Which names each host resolved | High | High |\n| Firewall and proxy logs | Which connections left the network | Very high | High |\n| Cloud audit logs | Who changed which cloud resource | Medium | Very high |\n| Email gateway | Who received which message | Medium | High |\n| Application and database audit | Who touched sensitive data | Variable | Medium to high |\n\nFor each source, write down its **owner**, its **format**, the **fields** you depend on and the **detections** that would break without it. This inventory becomes your coverage map and your change-management checklist: when the network team upgrades a firewall, you know which rules to retest."
+    },
+    {
+      "id": "pipeline",
+      "type": "text",
+      "markdown": "## The collection pipeline\n\nEvery log travels through the same logical stages, even when one product performs several of them.\n\n1. **Source** generates the event.\n2. **Agent or collector** reads it near the source, buffers it on disk and ships it over an encrypted channel.\n3. **Forwarder or aggregator** receives from many agents, applies load balancing and can drop or route events.\n4. **Parser** splits the raw line into fields.\n5. **Normalizer** maps vendor field names to a common schema such as the Elastic Common Schema (ECS) or the Splunk Common Information Model (CIM).\n6. **Index or data lake** stores the result for search.\n7. **Detection and case management** consume it.\n\nNormalization is what makes cross-source detections possible: a rule on `source.ip` works for every firewall only if each one maps its own field to that name. Keep the **raw original** event alongside the normalized fields; analysts and auditors sometimes need exactly what the device emitted. The animation follows one authentication failure through the pipeline."
+    },
+    {
+      "id": "pipeline-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "One failed logon through the pipeline",
+      "caption": "Each stage can lose, delay or corrupt the event; each is a place to measure.",
+      "data": {
+        "token": "Event",
+        "nodes": [
+          {
+            "id": "dc",
+            "label": "Domain controller",
+            "sub": "Event ID 4625",
+            "icon": "server"
+          },
+          {
+            "id": "agent",
+            "label": "Agent",
+            "sub": "Disk buffer, TLS",
+            "icon": "cpu"
+          },
+          {
+            "id": "fwd",
+            "label": "Forwarder",
+            "sub": "Load balance, route",
+            "icon": "router"
+          },
+          {
+            "id": "parse",
+            "label": "Parser",
+            "sub": "Fields extracted",
+            "icon": "file"
+          },
+          {
+            "id": "norm",
+            "label": "Normalizer",
+            "sub": "Common schema",
+            "icon": "shield"
+          },
+          {
+            "id": "index",
+            "label": "Hot index",
+            "sub": "Searchable",
+            "icon": "database"
+          },
+          {
+            "id": "rule",
+            "label": "Detection",
+            "sub": "Failed-logon burst",
+            "icon": "eye"
+          },
+          {
+            "id": "soc",
+            "label": "SOC queue",
+            "sub": "Alert ticket",
+            "icon": "alert"
+          }
+        ],
+        "steps": [
+          {
+            "at": "dc",
+            "caption": "A failed sign-in for user jdoe is written to the Security log (Event ID 4625)."
+          },
+          {
+            "at": "agent",
+            "caption": "The agent reads the event, stores it in a local disk buffer and ships it over TLS."
+          },
+          {
+            "at": "fwd",
+            "caption": "The forwarder receives it with thousands of others and routes authentication events to the security index.",
+            "tone": "secure"
+          },
+          {
+            "at": "parse",
+            "caption": "The parser extracts user, workstation, source address and failure reason from the raw text."
+          },
+          {
+            "at": "norm",
+            "caption": "Fields are renamed to the common schema: user.name, source.ip, event.outcome=failure.",
+            "tone": "secure"
+          },
+          {
+            "at": "index",
+            "caption": "The event lands in the hot tier, searchable within seconds, with the raw original attached."
+          },
+          {
+            "at": "rule",
+            "caption": "A rule sees 40 failures for one account in five minutes and fires.",
+            "tone": "warning"
+          },
+          {
+            "at": "soc",
+            "token": "Alert",
+            "caption": "A ticket reaches the queue with enrichment, about 90 seconds after the original event.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tiers",
+      "type": "text",
+      "markdown": "## Storage tiers: pay for the speed you need\n\nSearch speed and storage cost pull in opposite directions, so tier the data by how often it is queried.\n\n| Tier | Typical age | Storage | Use |\n|:--|:--|:--|:--|\n| **Hot** | 0 to 30 days | Fast local disks or SSD | Detection, triage, daily hunting |\n| **Warm** | 30 to 90 days | Cheaper disks, fewer replicas | Investigations, scoping |\n| **Cold** | 90 days to 1 year | Object storage, searchable snapshots | Long investigations, audits |\n| **Archive** | 1 to 7 years | Compressed, immutable storage | Legal and compliance retention |\n\nSet retention per source, not globally. Authentication and cloud audit logs deserve long retention because intrusions are often discovered months late; verbose debug logs do not. Some regulations fix minimum periods, so confirm them with your compliance team rather than guessing."
+    },
+    {
+      "id": "agent-config",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/fluent-bit/fluent-bit.conf",
+      "caption": "A collection agent that buffers to disk and forwards over verified TLS. The shared key is a placeholder; real keys belong in a secrets store.",
+      "code": "[SERVICE]\n    Flush            5\n    storage.path     /var/lib/fluent-bit/buffer\n    storage.sync     normal\n    storage.max_chunks_up 128\n\n[INPUT]\n    Name             tail\n    Path             /var/log/auth.log\n    Tag              host.auth\n    storage.type     filesystem\n    Mem_Buf_Limit    16MB\n\n[FILTER]\n    Name             record_modifier\n    Match            host.*\n    Record           environment production\n    Record           sensor_owner soc-platform@example.com\n\n[OUTPUT]\n    Name             forward\n    Match            host.*\n    Host             collector.example.net\n    Port             24224\n    tls              on\n    tls.verify       on\n    tls.ca_file      /etc/ssl/certs/soc-ca.pem\n    Shared_Key       <PLACEHOLDER-SHARED-KEY>\n    Retry_Limit      False\n",
+      "highlight": [
+        3,
+        4,
+        10,
+        11,
+        25,
+        26,
+        27,
+        28
+      ]
+    },
+    {
+      "id": "secure",
+      "type": "text",
+      "markdown": "## Protect and monitor the pipeline\n\nAttackers who reach a host often try to blind the defenders: stop the agent, clear the log or tamper with the collector. Treat the pipeline as critical infrastructure.\n\n- **Integrity.** Use TLS with certificate verification between every hop, and write-once or immutable storage for the archive tier.\n- **Availability.** Buffer on disk at the agent, run at least two aggregators and size queues for a multi-hour outage. A forwarder that drops events when the SIEM is slow creates a gap exactly when something is happening.\n- **Access.** Limit who can edit parsers, drop rules and retention. Log administrator actions on the SIEM itself and review them.\n- **Separation.** Forward logs off the host in near real time so that clearing a local log does not erase the evidence.\n\nThen monitor the monitors. For every source, track the last-event time and the events per minute against a baseline. A source that goes quiet is a finding, not a relief. The terminal below shows a query that lists silent sources."
+    },
+    {
+      "id": "silent",
+      "type": "terminal",
+      "title": "Finding silent log sources",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -u analyst:<PLACEHOLDER-PASSWORD> -H 'Content-Type: application/json' https://siem.example.net:9200/logs-*/_search -d @silent_sources.json | jq '.aggregations.hosts.buckets[] | {host: .key, last_seen: .last.value_as_string}'",
+          "output": "{ \"host\": \"fw-edge-01\",  \"last_seen\": \"2026-11-12T09:58:41Z\" }\n{ \"host\": \"dc-02\",       \"last_seen\": \"2026-11-12T09:58:39Z\" }\n{ \"host\": \"proxy-03\",    \"last_seen\": \"2026-11-09T22:14:07Z\" }",
+          "comment": "proxy-03 stopped sending three days ago"
+        }
+      ],
+      "caption": "The query returns the last event per host; a stale timestamp exposes a broken source before an investigation needs it."
+    },
+    {
+      "id": "warn-drop",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Never filter before you understand the cost of losing the event",
+      "markdown": "Dropping noisy events at the forwarder saves license money, but a dropped event can never be searched again. Prefer routing low-value logs to cheap storage rather than deleting them, and ask the detection and investigation owners before removing any field or event type."
+    },
+    {
+      "id": "tip-time",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Fix time first",
+      "markdown": "Correlation fails when clocks disagree. Synchronize every source with NTP, store timestamps in UTC, and keep both the event time and the ingest time. The gap between them is a free measurement of pipeline latency."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "1. In a lab VM you own, install Fluent Bit and configure a `tail` input on `/var/log/auth.log` with a `file` or `stdout` output.\n2. Run it, trigger a few failed `sudo` attempts on your own account, and confirm the events appear.\n3. Stop the output target, generate more events, restart it and confirm the disk buffer delivers the backlog without loss.\n4. Write a table of five log sources in your environment with owner, format, retention and one detection that depends on each.\n5. Decide which tier each source belongs in and justify the retention period in one sentence."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Telemetry",
+          "definition": "Data emitted by systems about their activity, such as logs, metrics and events."
+        },
+        {
+          "term": "Collector / agent",
+          "definition": "Software near the source that reads, buffers and ships logs."
+        },
+        {
+          "term": "Normalization",
+          "definition": "Mapping vendor-specific fields to a common schema so rules work across sources."
+        },
+        {
+          "term": "ECS / CIM",
+          "definition": "Common schemas from Elastic and Splunk that define standard field names."
+        },
+        {
+          "term": "Hot / warm / cold tier",
+          "definition": "Storage levels that trade search speed for lower cost as data ages."
+        },
+        {
+          "term": "Backpressure",
+          "definition": "Slowdown that propagates upstream when a downstream stage cannot keep up."
+        },
+        {
+          "term": "Disk buffer",
+          "definition": "Local on-disk queue that holds events while the destination is unavailable."
+        },
+        {
+          "term": "Silent source",
+          "definition": "A log source that has stopped sending events without raising an error."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main benefit of normalizing logs to a common schema?",
+          "options": [
+            "It reduces storage to zero",
+            "One detection rule can work across many vendors' logs",
+            "It encrypts the logs",
+            "It removes the need for parsing"
+          ],
+          "answer": 1,
+          "explanation": "Normalization maps different field names to shared ones, so a rule on source.ip works for every firewall that maps to it."
+        },
+        {
+          "question": "Which design choices help prevent log loss during a SIEM outage? (Choose all that apply.)",
+          "options": [
+            "Disk buffering at the agent",
+            "At least two aggregators",
+            "Dropping events when the queue is full",
+            "Queue sizing for a multi-hour outage"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Buffers, redundancy and sized queues absorb outages. Silently dropping events creates gaps exactly when data matters."
+        },
+        {
+          "question": "Why should retention be set per log source?",
+          "options": [
+            "Because the SIEM requires it",
+            "Because sources differ in investigative value and compliance needs",
+            "Because shorter retention is always safer",
+            "Because all logs have equal value"
+          ],
+          "answer": 1,
+          "explanation": "Authentication and cloud audit logs are valuable for months; verbose debug logs are not. Per-source retention balances cost and usefulness."
+        },
+        {
+          "question": "Which actions harden the monitoring pipeline against tampering? (Choose all that apply.)",
+          "options": [
+            "TLS with certificate verification between hops",
+            "Forwarding logs off the host in near real time",
+            "Letting every analyst edit parsers",
+            "Immutable storage for archived logs"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Encrypted verified channels, off-host copies and immutable archives protect integrity. Broad edit rights on parsers expand the attack surface."
+        },
+        {
+          "question": "A firewall that normally sends 50,000 events per hour suddenly sends none, with no errors. What is the best interpretation?",
+          "options": [
+            "Nothing to worry about; the network is quiet",
+            "A potential monitoring failure or evasion that must be investigated",
+            "The SIEM license has expired",
+            "The rules are tuned correctly"
+          ],
+          "answer": 1,
+          "explanation": "A source going silent is a finding. It may be a misconfiguration, an outage or deliberate tampering, and it leaves a detection blind spot."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Choose **telemetry sources** from the detections and investigations you need, and record owner, format, fields and dependent rules for each.\n- A pipeline has source, agent, forwarder, parser, normalizer, index and consumers; **normalization** is what enables cross-source detection.\n- **Tier** storage into hot, warm, cold and archive, and set retention per source.\n- **Protect** the pipeline with verified TLS, disk buffers, redundancy, restricted edit rights and off-host copies.\n- **Monitor the monitors:** a silent source is a finding, and event time versus ingest time measures latency.\n\nContinue with [SIEM Engineering and Optimization](/learn/security-operations-dfir/siem-engineering-and-optimization) to tune the platform that sits at the end of this pipeline."
+    }
+  ],
+  "ar": {
+    "title": "بنية المراقبة الأمنية",
+    "summary": "صمّم المسار الذي يقوم عليه مركز العمليات الأمنية: اختر مصادر القياس عن بُعد، واجمعها ووحّد صيغتها بموثوقية، ووزّع التخزين حسب القيمة، واحمِ المسار نفسه، وراقب أدوات المراقبة.",
+    "objectives": [
+      "اختيار مصادر القياس عن بُعد بحسب ما تتيحه من عمليات كشف وتحقيق",
+      "وصف مراحل مسار الجمع: الوكيل والمُحوِّل والمحلّل والموحِّد والفهرس",
+      "تصميم طبقات تخزين ساخنة ودافئة وباردة بحسب مدة الاحتفاظ والكلفة",
+      "حماية مسار المراقبة من العبث وفقدان البيانات",
+      "مراقبة سلامة الاستيعاب لاكتشاف مصادر السجلات الصامتة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "أثناء تحقيق، يطرح محلّل سؤالًا بسيطًا: أيّ الأجهزة اتصلت بالخادم المشبوه الثلاثاء الماضي؟ ينبغي أن يستغرق الجواب استعلامًا واحدًا. لكن سجلات الوكيل (Proxy) لم تُحفظ إلا سبعة أيام، وسجلات جدار الحماية تصل بصيغة لم يحلّلها أحد، وأجهزة وحدات التحكم بالنطاق لم تكن ترسل أحداث المصادقة أصلًا. نظام SIEM ممتاز، أما البنية التي تغذّيه فليست كذلك.\n\n**بنية المراقبة الأمنية (Security Monitoring Architecture)** هي تصميم كل ما بين الحدث ذاته والمحلّل الذي يراه. وتجيب البنية الجيدة سلفًا عن أربعة أسئلة: ماذا نجمع، وكيف يصل سليمًا، وأين يُخزَّن ولكم من الوقت، وكيف نعلم بتعطل أي من ذلك. أما قواعد الكشف، التي يتناولها درس [هندسة الكشف المتقدمة](/learn/security-operations-dfir/advanced-detection-engineering)، فجودتها من جودة هذا الأساس."
+      },
+      {
+        "id": "sources",
+        "type": "text",
+        "markdown": "## اختر المصادر بحسب الأسئلة التي تجيب عنها\n\nجمع كل شيء مكلف وصاخب، وجمع القليل جدًا يترك نقاطًا عمياء. ابدأ من عمليات الكشف والتحقيق التي تحتاجها، ثم ارجع إلى البيانات.\n\n| المصدر | يجيب عن | الحجم المعتاد | الأولوية |\n|:--|:--|:--|:--|\n| مزوّد الهوية ووحدات التحكم بالنطاق | من سجّل الدخول ومن أين وبأي نتيجة | متوسط | عالية جدًا |\n| EDR وقياسات العمليات | ما الذي شُغّل وبأي عملية أم وسطر أوامر | مرتفع | عالية جدًا |\n| سجلات مُحلّل DNS | الأسماء التي حلّها كل جهاز | مرتفع | عالية |\n| سجلات جدار الحماية والوكيل | الاتصالات التي غادرت الشبكة | مرتفع جدًا | عالية |\n| سجلات التدقيق السحابية | من غيّر أيّ مورد سحابي | متوسط | عالية جدًا |\n| بوابة البريد | من تلقى أي رسالة | متوسط | عالية |\n| تدقيق التطبيقات وقواعد البيانات | من لمس البيانات الحساسة | متغير | متوسطة إلى عالية |\n\nسجّل لكل مصدر **مالكه** و**صيغته** و**الحقول** التي تعتمد عليها و**عمليات الكشف** التي ستتعطل بدونه. يصبح هذا الجرد خريطة تغطيتك وقائمة إدارة التغيير: فحين تحدّث فرقة الشبكات جدار حماية، تعرف أيّ القواعد يجب إعادة اختبارها."
+      },
+      {
+        "id": "pipeline",
+        "type": "text",
+        "markdown": "## مسار الجمع\n\nيمر كل سجل عبر المراحل المنطقية نفسها، حتى لو نفّذ منتج واحد عدة مراحل منها.\n\n1. **المصدر**: يولّد الحدث.\n2. **الوكيل أو المُجمِّع (Agent/Collector)**: يقرؤه قرب المصدر ويخزّنه مؤقتًا على القرص ويرسله عبر قناة مشفّرة.\n3. **المُحوِّل أو المُجمِّع المركزي (Forwarder/Aggregator)**: يستقبل من وكلاء كثيرين، ويوزّع الحمل، ويمكنه إسقاط الأحداث أو توجيهها.\n4. **المحلّل (Parser)**: يقسّم السطر الخام إلى حقول.\n5. **الموحِّد (Normalizer)**: يربط أسماء حقول المورّدين بمخطط مشترك مثل Elastic Common Schema (ECS) أو Splunk Common Information Model (CIM).\n6. **الفهرس أو بحيرة البيانات**: يخزّن الناتج للبحث.\n7. **الكشف وإدارة الحالات**: تستهلكه.\n\nالتوحيد هو ما يجعل الكشف العابر للمصادر ممكنًا: فالقاعدة المبنية على `source.ip` تعمل مع كل جدار حماية فقط إذا ربط كل منها حقله الخاص بهذا الاسم. واحتفظ **بالحدث الخام الأصلي** إلى جانب الحقول الموحّدة، فالمحللون والمدققون يحتاجون أحيانًا إلى ما أصدره الجهاز بالضبط. وتتبع الحركة التالية فشل مصادقة واحدًا عبر المسار."
+      },
+      {
+        "id": "pipeline-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "إخفاق دخول واحد عبر المسار",
+        "caption": "يمكن لكل مرحلة أن تفقد الحدث أو تؤخره أو تفسده؛ وكل مرحلة موضع للقياس.",
+        "data": {
+          "token": "حدث",
+          "nodes": [
+            {
+              "id": "dc",
+              "label": "وحدة التحكم بالنطاق",
+              "sub": "الحدث 4625",
+              "icon": "server"
+            },
+            {
+              "id": "agent",
+              "label": "الوكيل",
+              "sub": "ذاكرة مؤقتة على القرص وTLS",
+              "icon": "cpu"
+            },
+            {
+              "id": "fwd",
+              "label": "المُحوِّل",
+              "sub": "توزيع الحمل والتوجيه",
+              "icon": "router"
+            },
+            {
+              "id": "parse",
+              "label": "المحلّل",
+              "sub": "استخراج الحقول",
+              "icon": "file"
+            },
+            {
+              "id": "norm",
+              "label": "الموحِّد",
+              "sub": "مخطط مشترك",
+              "icon": "shield"
+            },
+            {
+              "id": "index",
+              "label": "الفهرس الساخن",
+              "sub": "قابل للبحث",
+              "icon": "database"
+            },
+            {
+              "id": "rule",
+              "label": "الكشف",
+              "sub": "دفعة من إخفاقات الدخول",
+              "icon": "eye"
+            },
+            {
+              "id": "soc",
+              "label": "قائمة المركز",
+              "sub": "تذكرة تنبيه",
+              "icon": "alert"
+            }
+          ],
+          "steps": [
+            {
+              "at": "dc",
+              "caption": "يُكتب إخفاق تسجيل دخول للمستخدم jdoe في سجل الأمان (الحدث 4625)."
+            },
+            {
+              "at": "agent",
+              "caption": "يقرأ الوكيل الحدث ويخزّنه في ذاكرة مؤقتة محلية على القرص ويرسله عبر TLS."
+            },
+            {
+              "at": "fwd",
+              "caption": "يستقبله المُحوِّل مع آلاف غيره ويوجّه أحداث المصادقة إلى فهرس الأمان.",
+              "tone": "secure"
+            },
+            {
+              "at": "parse",
+              "caption": "يستخرج المحلّل المستخدم ومحطة العمل وعنوان المصدر وسبب الإخفاق من النص الخام."
+            },
+            {
+              "at": "norm",
+              "caption": "تُعاد تسمية الحقول وفق المخطط المشترك: user.name وsource.ip وevent.outcome=failure.",
+              "tone": "secure"
+            },
+            {
+              "at": "index",
+              "caption": "يصل الحدث إلى الطبقة الساخنة وقابلًا للبحث خلال ثوانٍ، مع الأصل الخام مرفقًا."
+            },
+            {
+              "at": "rule",
+              "caption": "ترى قاعدة 40 إخفاقًا لحساب واحد خلال خمس دقائق فتنطلق.",
+              "tone": "warning"
+            },
+            {
+              "at": "soc",
+              "token": "تنبيه",
+              "caption": "تصل تذكرة إلى القائمة مع الإثراء بعد نحو 90 ثانية من الحدث الأصلي.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "tiers",
+        "type": "text",
+        "markdown": "## طبقات التخزين: ادفع ثمن السرعة التي تحتاجها\n\nتتعارض سرعة البحث مع كلفة التخزين، لذا وزّع البيانات على طبقات بحسب كثرة الاستعلام عنها.\n\n| الطبقة | العمر المعتاد | التخزين | الاستخدام |\n|:--|:--|:--|:--|\n| **الساخنة (Hot)** | 0 إلى 30 يومًا | أقراص محلية سريعة أو SSD | الكشف والفرز والصيد اليومي |\n| **الدافئة (Warm)** | 30 إلى 90 يومًا | أقراص أرخص ونسخ متماثلة أقل | التحقيقات وتحديد النطاق |\n| **الباردة (Cold)** | 90 يومًا إلى سنة | تخزين كائنات ولقطات قابلة للبحث | التحقيقات الطويلة والتدقيق |\n| **الأرشيف (Archive)** | 1 إلى 7 سنوات | تخزين مضغوط غير قابل للتعديل | الاحتفاظ القانوني وللامتثال |\n\nحدّد مدة الاحتفاظ لكل مصدر لا بصورة عامة. تستحق سجلات المصادقة والتدقيق السحابي احتفاظًا طويلًا لأن الاختراقات كثيرًا ما تُكتشف بعد شهور، أما سجلات التتبع المطوّلة فلا. وبعض اللوائح تفرض حدودًا دنيا للمدة، فتأكد منها مع فريق الامتثال بدلًا من التخمين."
+      },
+      {
+        "id": "agent-config",
+        "type": "code",
+        "language": "ini",
+        "filename": "/etc/fluent-bit/fluent-bit.conf",
+        "caption": "وكيل جمع يخزّن مؤقتًا على القرص ويرسل عبر TLS موثّق. المفتاح المشترك نائب فقط؛ أما المفاتيح الحقيقية فمكانها مخزن الأسرار.",
+        "code": "[SERVICE]\n    Flush            5\n    storage.path     /var/lib/fluent-bit/buffer\n    storage.sync     normal\n    storage.max_chunks_up 128\n\n[INPUT]\n    Name             tail\n    Path             /var/log/auth.log\n    Tag              host.auth\n    storage.type     filesystem\n    Mem_Buf_Limit    16MB\n\n[FILTER]\n    Name             record_modifier\n    Match            host.*\n    Record           environment production\n    Record           sensor_owner soc-platform@example.com\n\n[OUTPUT]\n    Name             forward\n    Match            host.*\n    Host             collector.example.net\n    Port             24224\n    tls              on\n    tls.verify       on\n    tls.ca_file      /etc/ssl/certs/soc-ca.pem\n    Shared_Key       <PLACEHOLDER-SHARED-KEY>\n    Retry_Limit      False\n",
+        "highlight": [
+          3,
+          4,
+          10,
+          11,
+          25,
+          26,
+          27,
+          28
+        ]
+      },
+      {
+        "id": "secure",
+        "type": "text",
+        "markdown": "## احمِ المسار وراقبه\n\nكثيرًا ما يحاول المهاجمون الذين يصلون إلى جهاز أن يُعموا المدافعين: بإيقاف الوكيل أو مسح السجل أو العبث بالمُجمِّع. عامِل المسار بوصفه بنية تحتية حرجة.\n\n- **السلامة**: استخدم TLS مع التحقق من الشهادات بين كل قفزتين، وتخزينًا غير قابل للتعديل لطبقة الأرشيف.\n- **التوافر**: خزّن مؤقتًا على القرص عند الوكيل، وشغّل مُجمِّعَين مركزيين على الأقل، وحدّد أحجام الطوابير لانقطاع يمتد ساعات. فالمُحوِّل الذي يُسقط الأحداث حين يبطؤ SIEM يخلق فجوة في اللحظة التي يحدث فيها شيء ما.\n- **الوصول**: قيّد من يستطيع تعديل المحلّلات وقواعد الإسقاط والاحتفاظ. وسجّل إجراءات المديرين على SIEM نفسه وراجعها.\n- **الفصل**: أرسل السجلات خارج الجهاز في زمن شبه فوري حتى لا يمحو مسح السجل المحلي الدليل.\n\nثم راقب المراقِبين. تتبّع لكل مصدر وقت آخر حدث وعدد الأحداث في الدقيقة مقابل خط الأساس. المصدر الذي يصمت نتيجة تستحق التحقيق لا راحة. ويعرض الطرف التالي استعلامًا يسرد المصادر الصامتة."
+      },
+      {
+        "id": "silent",
+        "type": "terminal",
+        "title": "Finding silent log sources",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "curl -s -u analyst:<PLACEHOLDER-PASSWORD> -H 'Content-Type: application/json' https://siem.example.net:9200/logs-*/_search -d @silent_sources.json | jq '.aggregations.hosts.buckets[] | {host: .key, last_seen: .last.value_as_string}'",
+            "output": "{ \"host\": \"fw-edge-01\",  \"last_seen\": \"2026-11-12T09:58:41Z\" }\n{ \"host\": \"dc-02\",       \"last_seen\": \"2026-11-12T09:58:39Z\" }\n{ \"host\": \"proxy-03\",    \"last_seen\": \"2026-11-09T22:14:07Z\" }",
+            "comment": "توقف proxy-03 عن الإرسال منذ ثلاثة أيام"
+          }
+        ],
+        "caption": "يعيد الاستعلام آخر حدث لكل جهاز؛ ويكشف الطابع الزمني القديم مصدرًا معطلًا قبل أن يحتاجه تحقيق ما."
+      },
+      {
+        "id": "warn-drop",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تُرشِّح قبل أن تفهم كلفة فقدان الحدث",
+        "markdown": "إسقاط الأحداث الصاخبة عند المُحوِّل يوفر كلفة الترخيص، لكن الحدث المُسقَط لا يمكن البحث عنه مرة أخرى. فضّل توجيه السجلات قليلة القيمة إلى تخزين رخيص بدلًا من حذفها، واسأل مالكي الكشف والتحقيق قبل إزالة أي حقل أو نوع حدث."
+      },
+      {
+        "id": "tip-time",
+        "type": "callout",
+        "variant": "tip",
+        "title": "أصلح الوقت أولًا",
+        "markdown": "يفشل الربط حين تختلف الساعات. زامن كل مصدر عبر NTP، وخزّن الطوابع الزمنية بالتوقيت العالمي المنسّق UTC، واحتفظ بوقت الحدث ووقت الاستيعاب معًا. والفارق بينهما قياس مجاني لزمن تأخر المسار."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "1. في جهاز افتراضي مخبري تملكه، ثبّت Fluent Bit واضبط مدخل `tail` على `/var/log/auth.log` مع مخرج `file` أو `stdout`.\n2. شغّله، وأحدث بضع محاولات `sudo` فاشلة على حسابك أنت، وتأكد من ظهور الأحداث.\n3. أوقف هدف المخرجات، وولّد أحداثًا أخرى، ثم أعد تشغيله وتأكد من أن الذاكرة المؤقتة على القرص تسلّم المتراكم دون فقد.\n4. اكتب جدولًا بخمسة مصادر سجلات في بيئتك مع المالك والصيغة ومدة الاحتفاظ وقاعدة كشف واحدة تعتمد على كل منها.\n5. حدّد الطبقة التي ينتمي إليها كل مصدر وبرّر مدة الاحتفاظ في جملة واحدة."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "القياس عن بُعد (Telemetry)",
+            "definition": "بيانات تصدرها الأنظمة عن نشاطها، كالسجلات والمقاييس والأحداث."
+          },
+          {
+            "term": "الوكيل أو المُجمِّع (Agent)",
+            "definition": "برنامج قرب المصدر يقرأ السجلات ويخزّنها مؤقتًا ويرسلها."
+          },
+          {
+            "term": "التوحيد (Normalization)",
+            "definition": "ربط حقول كل مورّد بمخطط مشترك لتعمل القواعد عبر المصادر."
+          },
+          {
+            "term": "ECS وCIM",
+            "definition": "مخططان مشتركان من Elastic وSplunk يحددان أسماء الحقول القياسية."
+          },
+          {
+            "term": "الطبقات الساخنة والدافئة والباردة",
+            "definition": "مستويات تخزين تقايض سرعة البحث بكلفة أقل كلما تقادمت البيانات."
+          },
+          {
+            "term": "الضغط العكسي (Backpressure)",
+            "definition": "بطء ينتقل إلى المراحل السابقة حين تعجز المرحلة اللاحقة عن المواكبة."
+          },
+          {
+            "term": "الذاكرة المؤقتة على القرص",
+            "definition": "طابور محلي على القرص يحتفظ بالأحداث ما دامت الوجهة غير متاحة."
+          },
+          {
+            "term": "المصدر الصامت",
+            "definition": "مصدر سجلات توقف عن إرسال الأحداث دون إطلاق أي خطأ."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما الفائدة الرئيسة من توحيد السجلات إلى مخطط مشترك؟",
+            "options": [
+              "يخفض التخزين إلى الصفر",
+              "تعمل قاعدة كشف واحدة عبر سجلات موردين كثيرين",
+              "يشفّر السجلات",
+              "يلغي الحاجة إلى التحليل"
+            ],
+            "answer": 1,
+            "explanation": "يربط التوحيد أسماء الحقول المختلفة بأسماء مشتركة، فتعمل القاعدة المبنية على source.ip مع كل جدار حماية يربط حقله بها."
+          },
+          {
+            "question": "أيّ خيارات التصميم التالية تمنع فقد السجلات أثناء انقطاع SIEM؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "التخزين المؤقت على القرص عند الوكيل",
+              "مُجمِّعان مركزيان على الأقل",
+              "إسقاط الأحداث حين يمتلئ الطابور",
+              "تحديد حجم الطوابير لانقطاع يمتد ساعات"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تمتص الذاكرة المؤقتة والتكرار والطوابير المحسوبة الانقطاعات، أما الإسقاط الصامت فيخلق فجوات في أحرج الأوقات."
+          },
+          {
+            "question": "لماذا ينبغي ضبط مدة الاحتفاظ لكل مصدر سجلات؟",
+            "options": [
+              "لأن SIEM يشترط ذلك",
+              "لأن المصادر تختلف في قيمتها التحقيقية واحتياجات الامتثال",
+              "لأن الاحتفاظ الأقصر أكثر أمانًا دائمًا",
+              "لأن جميع السجلات متساوية القيمة"
+            ],
+            "answer": 1,
+            "explanation": "سجلات المصادقة والتدقيق السحابي قيّمة لشهور، أما سجلات التتبع المطوّلة فلا؛ والاحتفاظ لكل مصدر يوازن بين الكلفة والفائدة."
+          },
+          {
+            "question": "أيّ الإجراءات التالية تحصّن مسار المراقبة ضد العبث؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "TLS مع التحقق من الشهادات بين القفزات",
+              "إرسال السجلات خارج الجهاز في زمن شبه فوري",
+              "السماح لكل محلّل بتعديل المحلّلات",
+              "تخزين غير قابل للتعديل للسجلات المؤرشفة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "القنوات المشفّرة الموثّقة والنسخ خارج الجهاز والأرشيف غير القابل للتعديل تحمي السلامة، أما صلاحيات التعديل الواسعة على المحلّلات فتوسّع سطح الهجوم."
+          },
+          {
+            "question": "جدار حماية يرسل عادة 50,000 حدث في الساعة توقف فجأة عن الإرسال دون أخطاء. ما أفضل تفسير؟",
+            "options": [
+              "لا داعي للقلق؛ فالشبكة هادئة",
+              "فشل محتمل في المراقبة أو محاولة تهرب تستوجب التحقيق",
+              "انتهى ترخيص SIEM",
+              "القواعد مضبوطة بشكل صحيح"
+            ],
+            "answer": 1,
+            "explanation": "صمت المصدر نتيجة تستحق التحقيق؛ فقد يكون خطأ إعداد أو انقطاعًا أو عبثًا متعمدًا، ويترك نقطة عمياء في الكشف."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- اختر **مصادر القياس عن بُعد** من عمليات الكشف والتحقيق التي تحتاجها، وسجّل لكل مصدر المالك والصيغة والحقول والقواعد المعتمدة عليه.\n- يتكوّن المسار من مصدر ووكيل ومُحوِّل ومحلّل وموحِّد وفهرس وجهات مستهلكة؛ و**التوحيد** هو ما يتيح الكشف العابر للمصادر.\n- **وزّع** التخزين على طبقات ساخنة ودافئة وباردة وأرشيف، وحدّد الاحتفاظ لكل مصدر.\n- **احمِ** المسار بـ TLS موثّق وذاكرة مؤقتة على القرص وتكرار وصلاحيات تعديل مقيّدة ونسخ خارج الجهاز.\n- **راقب المراقِبين**: المصدر الصامت نتيجة تستحق التحقيق، والفارق بين وقت الحدث ووقت الاستيعاب يقيس التأخر.\n\nتابع مع درس [هندسة SIEM وتحسينها](/learn/security-operations-dfir/siem-engineering-and-optimization) لضبط المنصة التي تقع في نهاية هذا المسار."
+      }
+    ]
+  }
+}

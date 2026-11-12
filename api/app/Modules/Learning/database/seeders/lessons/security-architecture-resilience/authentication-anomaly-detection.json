@@ -1,0 +1,590 @@
+{
+ "slug": "authentication-anomaly-detection",
+ "title": "Authentication Anomaly Detection",
+ "summary": "Learn which sign-in signals reveal spray, stuffing, impossible travel and MFA fatigue, and how to write, tune and test detections in KQL and Python.",
+ "objectives": [
+  "List the sign-in fields and log sources used for detection",
+  "Distinguish brute force, spray, stuffing and MFA fatigue in logs",
+  "Write KQL detections for spray and fatigue patterns",
+  "Combine weak signals into a risk-based decision",
+  "Tune detections to reduce false positives"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 02:10 the identity provider logs 4,800 failed sign-ins from one address, each against a different employee, each with the same password guess. Two hours earlier, a finance manager approved a push notification she did not start, after receiving eleven of them in a row. Neither event looks like a broken system, and neither is blocked by a password policy.\n\n**Authentication anomaly detection** finds these cases by comparing each sign-in with what is normal for the user, the network and the application. It sits between preventive controls such as [multi-factor authentication](/learn/security-architecture-resilience/centralized-authentication) and the response work in [identity threat detection and response](/learn/security-architecture-resilience/identity-threat-detection-and-response). Prevention reduces attacks; detection tells you which ones still got through."
+  },
+  {
+   "id": "signals",
+   "type": "text",
+   "markdown": "## The signals worth collecting\n\nEvery sign-in record contains evidence. The fields that matter most are:\n\n- **Who:** user, account type (human, service), privileged or not.\n- **Where from:** source IP, ASN, country, and whether it is a known corporate or VPN range.\n- **What with:** device ID and compliance state, browser or client application, user agent.\n- **How:** protocol (modern or legacy authentication), MFA method and result, conditional access outcome.\n- **Result:** success, failure code and reason, such as bad password versus locked account.\n\nSources include Entra ID and Okta sign-in logs, Windows events 4624, 4625 and 4768/4769 from domain controllers, VPN and SSO gateway logs, and application logs. Send them all to one place, such as a SIEM, and normalize the user name so the same person is one identity across systems. Without that, correlation breaks. See [centralized authentication](/learn/security-architecture-resilience/centralized-authentication) for how a single identity source makes this practical."
+  },
+  {
+   "id": "patterns",
+   "type": "text",
+   "markdown": "## Anomaly patterns and how they look in logs\n\n| Pattern | What the logs show | Typical response |\n|:--|:--|:--|\n| **Brute force** | Many failures against one account from one or few sources | Lock or throttle the account, block the source |\n| **Password spray** | One source, many accounts, few attempts per account, often one password | Block the source, force resets for any account that then succeeded |\n| **Credential stuffing** | Many accounts, leaked passwords, spread across many IPs | Require MFA, check breached-password lists |\n| **Impossible travel** | Two successes from places too far apart for the elapsed time | Require re-authentication, review session |\n| **MFA fatigue** | Many push prompts, then one approval, often at night | Disable the push method for the user, reset credentials |\n| **Legacy authentication** | Protocols that cannot do MFA, such as IMAP or SMTP AUTH | Block legacy protocols with conditional access |\n| **New device and client** | First-seen device ID, rare user agent, new country | Step-up authentication, risk score increase |\n\nNote the difference between brute force and spray. Per-account lockout catches the first and misses the second, because each account sees only one or two failures. Detection must therefore count failures **per source**, and count **distinct accounts** per source."
+  },
+  {
+   "id": "score-flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "A sign-in being scored for risk",
+   "caption": "Risk-based detection combines several weak signals into one decision.",
+   "data": {
+    "token": "Sign-in",
+    "nodes": [
+     {
+      "id": "idp",
+      "label": "Identity provider",
+      "sub": "SSO",
+      "icon": "key"
+     },
+     {
+      "id": "enrich",
+      "label": "Enrichment",
+      "sub": "Geo, ASN, device",
+      "icon": "globe"
+     },
+     {
+      "id": "base",
+      "label": "Baseline",
+      "sub": "Usual hours and places",
+      "icon": "database"
+     },
+     {
+      "id": "score",
+      "label": "Risk score",
+      "sub": "Rules + model",
+      "icon": "cpu"
+     },
+     {
+      "id": "ca",
+      "label": "Policy",
+      "sub": "Allow / MFA / block",
+      "icon": "shield"
+     },
+     {
+      "id": "soc",
+      "label": "SOC alert",
+      "sub": "SIEM",
+      "icon": "alert"
+     }
+    ],
+    "steps": [
+     {
+      "at": "idp",
+      "caption": "Layla signs in from 203.0.113.50 using an unfamiliar browser at 02:14 local time."
+     },
+     {
+      "at": "enrich",
+      "caption": "The address resolves to a hosting provider in another country; the device ID is new.",
+      "tone": "warning"
+     },
+     {
+      "at": "base",
+      "caption": "Her baseline: office hours, two known devices, always the home country."
+     },
+     {
+      "at": "score",
+      "caption": "Three deviations add up to a high score. A single one would have been medium.",
+      "tone": "danger"
+     },
+     {
+      "at": "ca",
+      "caption": "Policy requires phishing-resistant MFA; the attacker cannot satisfy it.",
+      "tone": "blocked"
+     },
+     {
+      "at": "soc",
+      "caption": "The failed high-risk attempt opens an alert so analysts can reset her credentials proactively.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "queries",
+   "type": "text",
+   "markdown": "## Writing the detections\n\nStart with simple, explainable rules before adding machine learning. Below, the first query finds password spray: one IP failing against many users. The second finds MFA fatigue: repeated prompts followed by a success. Both use Microsoft Sentinel KQL on Entra ID sign-in logs, but the logic ports to any SIEM.\n\nChoose thresholds from your own data. Run the query over 30 days, look at the distribution, then set the alert just above normal noise."
+  },
+  {
+   "id": "kql-spray",
+   "type": "code",
+   "language": "sql",
+   "code": "// Password spray: one source IP, many distinct users, few tries each\nSigninLogs\n| where TimeGenerated > ago(1h)\n| where ResultType in (50126, 50053)        // bad password, locked account\n| summarize Failures = count(), Users = dcount(UserPrincipalName),\n            Sample = make_set(UserPrincipalName, 5) by IPAddress\n| where Users >= 20 and Failures / Users < 5\n| order by Users desc",
+   "filename": "password-spray.kql",
+   "caption": "A high Users count with a low Failures/Users ratio is the spray signature."
+  },
+  {
+   "id": "kql-fatigue",
+   "type": "code",
+   "language": "sql",
+   "code": "// MFA fatigue: many MFA denials/timeouts followed by a success within 30 minutes\nlet window = 30m;\nSigninLogs\n| where TimeGenerated > ago(24h)\n| where ResultType in (500121, 50074, 0)    // MFA failed, MFA required, success\n| sort by UserPrincipalName asc, TimeGenerated asc\n| serialize\n| extend Fails = row_cumsum(iff(ResultType != 0, 1, 0), UserPrincipalName != prev(UserPrincipalName))\n| where ResultType == 0 and Fails >= 5\n| project TimeGenerated, UserPrincipalName, IPAddress, Fails",
+   "filename": "mfa-fatigue.kql",
+   "caption": "Illustrative logic: adapt result codes to your tenant and test on historical data."
+  },
+  {
+   "id": "python",
+   "type": "text",
+   "markdown": "## A portable check in Python\n\nNot every environment has a SIEM. The script below reads exported sign-in events as JSON lines and flags sources that touch many accounts. It teaches the core idea, **group by source and count distinct users**, in a few lines. Use it on logs you own, as a prototype before building the real rule."
+  },
+  {
+   "id": "py-spray",
+   "type": "code",
+   "language": "python",
+   "code": "import json, sys\nfrom collections import defaultdict\n\nusers_by_ip = defaultdict(set)\nfails_by_ip = defaultdict(int)\n\nfor line in open(sys.argv[1], encoding=\"utf-8\"):\n    e = json.loads(line)\n    if e[\"result\"] == \"failure\":\n        users_by_ip[e[\"ip\"]].add(e[\"user\"])\n        fails_by_ip[e[\"ip\"]] += 1\n\nfor ip, users in sorted(users_by_ip.items(), key=lambda kv: -len(kv[1])):\n    if len(users) >= 20:\n        print(f\"{ip}: {len(users)} users, {fails_by_ip[ip]} failures\")",
+   "filename": "spray_check.py",
+   "caption": "Input example: {\"ip\": \"198.51.100.23\", \"user\": \"a.karim@example.com\", \"result\": \"failure\"}"
+  },
+  {
+   "id": "py-out",
+   "type": "terminal",
+   "prompt": "$",
+   "lines": [
+    {
+     "prompt": "$",
+     "cmd": "python spray_check.py signins-2026-11-11.jsonl",
+     "output": "198.51.100.23: 412 users, 436 failures\n203.0.113.77: 31 users, 52 failures",
+     "comment": "The first source touched 412 accounts with barely more than one failure each: classic spray."
+    }
+   ],
+   "title": "Annotated output (example data)"
+  },
+  {
+   "id": "tuning",
+   "type": "text",
+   "markdown": "## Tuning: false positives decide whether anyone trusts the alert\n\nA detection that fires fifty times a day teaches analysts to ignore it. Reduce noise without blinding yourself:\n\n- **Allow-list known egress.** Corporate NAT, VPN gateways and cloud proxies make many users appear to come from one address. Tag them rather than deleting the alert.\n- **Handle travel properly.** Impossible travel fires for mobile carriers and VPN exits. Compare against the device ID and the previous session before alerting.\n- **Weight by privilege.** The same anomaly on a global administrator should page someone, while for a standard user it may only raise a risk score.\n- **Combine signals.** New country alone is weak. New country plus new device plus legacy protocol is strong.\n- **Measure.** Track alerts per week, the share that are true positives, and time to triage. Review the numbers monthly.\n\nAlways keep a path from alert to action. Each detection should name its playbook, such as revoking sessions and resetting credentials, described in [identity threat detection and response](/learn/security-architecture-resilience/identity-threat-detection-and-response)."
+  },
+  {
+   "id": "prevent",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Detection works best next to prevention",
+   "markdown": "Every pattern above gets harder when the sign-in method is strong. Passkeys and FIDO2 security keys cannot be sprayed or fatigued, number matching makes blind push approval much less likely, and blocking legacy protocols removes a whole class of MFA bypass. Treat each detection you write as a measurement of how far those controls have been rolled out: the alerts that still fire show where weak methods remain."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Do not rely on lockout alone",
+   "markdown": "Aggressive lockout lets an attacker lock out every employee by spraying known usernames, which is a denial of service. Prefer smart lockout that separates known-good locations from unfamiliar ones, add throttling, and detect sprays by source rather than by account."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a **test** tenant or log file that you own:\n\n1. Create a JSON-lines file with 40 fake failure events for 30 different `@example.com` users from `198.51.100.23`, plus 20 events from other addresses against single users.\n2. Run the Python check above and confirm that only the spray source is reported.\n3. Change the threshold to 40 and then 10. Describe what happens to false negatives and false positives.\n4. Write down, for impossible travel, three legitimate reasons it could fire (for example, a VPN exit) and the field you would compare to rule each out.\n5. Draft the response steps for an account that succeeded after a spray: which sessions to revoke and which credentials to reset."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Baseline",
+     "definition": "Profile of normal behavior for a user, device or application used to judge new events."
+    },
+    {
+     "term": "Password spray",
+     "definition": "Trying a few common passwords against many accounts to avoid per-account lockout."
+    },
+    {
+     "term": "Credential stuffing",
+     "definition": "Replaying username and password pairs leaked from other breaches."
+    },
+    {
+     "term": "Impossible travel",
+     "definition": "Two sign-ins from locations too far apart to reach in the time between them."
+    },
+    {
+     "term": "MFA fatigue",
+     "definition": "Flooding a user with push prompts until they approve one."
+    },
+    {
+     "term": "Legacy authentication",
+     "definition": "Older protocols such as IMAP or POP that cannot enforce MFA."
+    },
+    {
+     "term": "Risk score",
+     "definition": "Combined rating of how suspicious a sign-in is, used to allow, challenge or block."
+    },
+    {
+     "term": "Smart lockout",
+     "definition": "Lockout that treats familiar locations differently from unfamiliar ones to limit denial of service."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why does per-account lockout fail to stop a password spray?",
+     "options": [
+      "Spray uses encryption",
+      "Each account sees only one or two failures",
+      "Lockout does not exist in the cloud",
+      "Spray only targets service accounts"
+     ],
+     "answer": 1,
+     "explanation": "The attack spreads attempts across many accounts, so no single account reaches its lockout threshold. Count distinct users per source instead."
+    },
+    {
+     "question": "Which signals strengthen an impossible-travel alert? Choose all that apply.",
+     "options": [
+      "A device ID never seen before",
+      "A known corporate VPN egress address",
+      "A legacy protocol that bypasses MFA",
+      "A user agent rare for this account"
+     ],
+     "answer": [
+      0,
+      2,
+      3
+     ],
+     "explanation": "A known VPN egress is a common benign cause. New device, legacy protocol and rare client all point towards compromise."
+    },
+    {
+     "question": "An attacker triggers many push prompts and the user finally approves one. What is this called?",
+     "options": [
+      "Credential stuffing",
+      "MFA fatigue",
+      "Kerberoasting",
+      "Session replay"
+     ],
+     "answer": 1,
+     "explanation": "MFA fatigue (push bombing) exploits human tolerance. Number matching and phishing-resistant methods reduce it."
+    },
+    {
+     "question": "What is a sensible first step to cut false positives for a spray alert?",
+     "options": [
+      "Disable the alert",
+      "Tag known NAT and VPN egress addresses",
+      "Raise the threshold to 10,000",
+      "Delete old logs"
+     ],
+     "answer": 1,
+     "explanation": "Shared egress addresses make many users look like one source. Tagging them preserves the detection while reducing noise."
+    },
+    {
+     "question": "Which data should be forwarded to the SIEM for authentication detection? Choose all that apply.",
+     "options": [
+      "Identity provider sign-in logs",
+      "Domain controller events 4624, 4625, 4768 and 4769",
+      "VPN gateway logs",
+      "The employee holiday calendar only"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Authentication evidence comes from identity providers, domain controllers and gateways. A holiday calendar is context, not a log source on its own."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- **Authentication anomaly detection** compares each sign-in with a baseline of user, device, place and time.\n- Collect identity provider, domain controller and gateway logs in one SIEM with a normalized user name.\n- Know the patterns: **brute force, spray, stuffing, impossible travel, MFA fatigue** and **legacy authentication**.\n- Count **distinct users per source** to catch a spray, and combine weak signals into a risk score.\n- Tune with allow-lists and privilege weighting, measure true-positive rates, and attach a response playbook to each alert."
+  }
+ ],
+ "duration_minutes": 30,
+ "ar": {
+  "title": "كشف الشذوذ في المصادقة",
+  "summary": "تعرّف أي إشارات تسجيل الدخول تكشف الرش والحشو والسفر المستحيل وإرهاق MFA، وكيف تكتب عمليات الكشف وتضبطها وتختبرها بـKQL وPython.",
+  "objectives": [
+   "اذكر حقول تسجيل الدخول ومصادر السجلات المستخدمة في الكشف",
+   "ميّز القوة الغاشمة والرش والحشو وإرهاق MFA في السجلات",
+   "اكتب عمليات كشف KQL لأنماط الرش والإرهاق",
+   "ادمج الإشارات الضعيفة في قرار قائم على الخطر",
+   "اضبط عمليات الكشف لتقليل الإيجابيات الكاذبة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في الساعة 02:10 يسجّل مزوّد الهوية 4800 محاولة دخول فاشلة من عنوان واحد، كلٌّ منها ضد موظف مختلف وبتخمين كلمة المرور نفسها. وقبل ساعتين وافقت مديرة مالية على إشعار دفع لم تبدأه، بعد أن تلقّت أحد عشر إشعارًا متتاليًا. لا يبدو أيٌّ من الحدثين عطلًا في النظام، ولا تحجبهما سياسة كلمات المرور.\n\nيكتشف **كشف الشذوذ في المصادقة (Authentication anomaly detection)** هذه الحالات بمقارنة كل تسجيل دخول بما هو معتاد للمستخدم والشبكة والتطبيق. وهو يقع بين الضوابط الوقائية مثل [المصادقة متعددة العوامل](/learn/security-architecture-resilience/centralized-authentication) وأعمال الاستجابة في [كشف تهديدات الهوية والاستجابة لها](/learn/security-architecture-resilience/identity-threat-detection-and-response). الوقاية تقلل الهجمات، والكشف يخبرك أيها نفذ رغم ذلك."
+   },
+   {
+    "id": "signals",
+    "type": "text",
+    "markdown": "## الإشارات التي تستحق الجمع\n\nيحتوي كل سجل تسجيل دخول على أدلة. وأهم الحقول:\n\n- **من:** المستخدم ونوع الحساب (بشري أو خدمة) ومميز أم لا.\n- **من أين:** عنوان IP المصدر وASN والدولة، وهل هو نطاق مؤسسي أو VPN معروف.\n- **بماذا:** معرّف الجهاز وحالة امتثاله، والمتصفح أو التطبيق العميل وUser agent.\n- **كيف:** البروتوكول (مصادقة حديثة أو قديمة)، وطريقة MFA ونتيجتها، ونتيجة الوصول المشروط.\n- **النتيجة:** نجاح أو فشل وسبب الفشل، كخطأ كلمة المرور مقابل الحساب المقفل.\n\nتشمل المصادر سجلات الدخول في Entra ID وOkta، وأحداث Windows رقم 4624 و4625 و4768/4769 من وحدات التحكم بالنطاق، وسجلات VPN وبوابات SSO، وسجلات التطبيقات. أرسلها جميعًا إلى مكان واحد كنظام SIEM، ووحّد اسم المستخدم ليكون الشخص نفسه هوية واحدة عبر الأنظمة. وبدون ذلك يتعطل الربط. راجع [المصادقة المركزية](/learn/security-architecture-resilience/centralized-authentication) لترى كيف يجعل مصدر الهوية الواحد ذلك عمليًا."
+   },
+   {
+    "id": "patterns",
+    "type": "text",
+    "markdown": "## أنماط الشذوذ وكيف تظهر في السجلات\n\n| النمط | ما تُظهره السجلات | الاستجابة المعتادة |\n|:--|:--|:--|\n| **القوة الغاشمة** | إخفاقات كثيرة ضد حساب واحد من مصدر أو مصادر قليلة | قفل الحساب أو إبطاؤه وحجب المصدر |\n| **رش كلمات المرور (Password spray)** | مصدر واحد وحسابات كثيرة ومحاولات قليلة لكل حساب، غالبًا بكلمة مرور واحدة | حجب المصدر وفرض إعادة تعيين لأي حساب نجح بعد ذلك |\n| **حشو بيانات الاعتماد (Credential stuffing)** | حسابات كثيرة وكلمات مرور مسرّبة وعناوين IP متعددة | اشتراط MFA وفحص قوائم كلمات المرور المخترقة |\n| **السفر المستحيل (Impossible travel)** | نجاحان من مكانين متباعدين أكثر مما يسمح به الزمن | طلب مصادقة جديدة ومراجعة الجلسة |\n| **إرهاق MFA** | إشعارات دفع كثيرة ثم موافقة واحدة، غالبًا ليلًا | تعطيل طريقة الدفع للمستخدم وإعادة تعيين بيانات الاعتماد |\n| **المصادقة القديمة (Legacy authentication)** | بروتوكولات لا تدعم MFA مثل IMAP أو SMTP AUTH | حجب البروتوكولات القديمة بالوصول المشروط |\n| **جهاز وعميل جديدان** | معرّف جهاز لأول مرة وUser agent نادر ودولة جديدة | مصادقة معززة ورفع درجة الخطر |\n\nلاحظ الفرق بين القوة الغاشمة والرش. القفل لكل حساب يلتقط الأولى ويفوّت الثانية، لأن كل حساب يرى إخفاقًا أو اثنين فقط. لذا يجب أن يعدّ الكشف الإخفاقات **لكل مصدر**، ويعدّ **الحسابات المتمايزة** لكل مصدر."
+   },
+   {
+    "id": "score-flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "تقييم تسجيل دخول بحثًا عن الخطر",
+    "caption": "يجمع الكشف القائم على الخطر عدة إشارات ضعيفة في قرار واحد.",
+    "data": {
+     "token": "تسجيل دخول",
+     "nodes": [
+      {
+       "id": "idp",
+       "label": "مزوّد الهوية",
+       "sub": "SSO",
+       "icon": "key"
+      },
+      {
+       "id": "enrich",
+       "label": "الإثراء",
+       "sub": "الموقع وASN والجهاز",
+       "icon": "globe"
+      },
+      {
+       "id": "base",
+       "label": "خط الأساس",
+       "sub": "الأوقات والأماكن المعتادة",
+       "icon": "database"
+      },
+      {
+       "id": "score",
+       "label": "درجة الخطر",
+       "sub": "القواعد + النموذج",
+       "icon": "cpu"
+      },
+      {
+       "id": "ca",
+       "label": "السياسة",
+       "sub": "سماح / MFA / حجب",
+       "icon": "shield"
+      },
+      {
+       "id": "soc",
+       "label": "تنبيه SOC",
+       "sub": "SIEM",
+       "icon": "alert"
+      }
+     ],
+     "steps": [
+      {
+       "at": "idp",
+       "caption": "تسجّل ليلى الدخول من 203.0.113.50 بمتصفح غير مألوف عند الثانية والربع ليلًا."
+      },
+      {
+       "at": "enrich",
+       "caption": "يعود العنوان إلى مزوّد استضافة في دولة أخرى، ومعرّف الجهاز جديد.",
+       "tone": "warning"
+      },
+      {
+       "at": "base",
+       "caption": "خط أساس ليلى: ساعات العمل وجهازان معروفان ودائمًا في بلدها."
+      },
+      {
+       "at": "score",
+       "caption": "تتجمع ثلاثة انحرافات في درجة مرتفعة. ولو كان واحدًا لكانت متوسطة.",
+       "tone": "danger"
+      },
+      {
+       "at": "ca",
+       "caption": "تشترط السياسة MFA مقاومة للتصيّد ولا يستطيع المهاجم استيفاءها.",
+       "tone": "blocked"
+      },
+      {
+       "at": "soc",
+       "caption": "تفتح المحاولةُ الفاشلة عالية الخطر تنبيهًا ليعيد المحللون تعيين بيانات اعتمادها استباقيًا.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "queries",
+    "type": "text",
+    "markdown": "## كتابة عمليات الكشف\n\nابدأ بقواعد بسيطة قابلة للتفسير قبل إضافة التعلم الآلي. في الاستعلامين أدناه، يجد الأول رش كلمات المرور: عنوان IP واحد يفشل ضد مستخدمين كثيرين. ويجد الثاني إرهاق MFA: مطالبات متكررة تعقبها موافقة. كلاهما بـKQL في Microsoft Sentinel على سجلات دخول Entra ID، لكن المنطق ينتقل إلى أي SIEM.\n\nاختر العتبات من بياناتك أنت. شغّل الاستعلام على 30 يومًا، وافحص التوزيع، ثم اضبط التنبيه فوق ضوضاء الوضع الطبيعي مباشرة."
+   },
+   {
+    "id": "kql-spray",
+    "type": "code",
+    "language": "sql",
+    "code": "// Password spray: one source IP, many distinct users, few tries each\nSigninLogs\n| where TimeGenerated > ago(1h)\n| where ResultType in (50126, 50053)        // bad password, locked account\n| summarize Failures = count(), Users = dcount(UserPrincipalName),\n            Sample = make_set(UserPrincipalName, 5) by IPAddress\n| where Users >= 20 and Failures / Users < 5\n| order by Users desc",
+    "filename": "password-spray.kql",
+    "caption": "عدد مستخدمين مرتفع مع نسبة إخفاقات/مستخدمين منخفضة هو توقيع الرش."
+   },
+   {
+    "id": "kql-fatigue",
+    "type": "code",
+    "language": "sql",
+    "code": "// MFA fatigue: many MFA denials/timeouts followed by a success within 30 minutes\nlet window = 30m;\nSigninLogs\n| where TimeGenerated > ago(24h)\n| where ResultType in (500121, 50074, 0)    // MFA failed, MFA required, success\n| sort by UserPrincipalName asc, TimeGenerated asc\n| serialize\n| extend Fails = row_cumsum(iff(ResultType != 0, 1, 0), UserPrincipalName != prev(UserPrincipalName))\n| where ResultType == 0 and Fails >= 5\n| project TimeGenerated, UserPrincipalName, IPAddress, Fails",
+    "filename": "mfa-fatigue.kql",
+    "caption": "منطق توضيحي: عدّل رموز النتائج حسب مستأجرك واختبره على بيانات تاريخية."
+   },
+   {
+    "id": "python",
+    "type": "text",
+    "markdown": "## فحص قابل للنقل بلغة Python\n\nلا تملك كل بيئة نظام SIEM. يقرأ السكربت أدناه أحداث دخول مصدّرة بصيغة JSON lines ويعلّم المصادر التي تلمس حسابات كثيرة. وهو يعلّم الفكرة الجوهرية، **التجميع حسب المصدر وعدّ المستخدمين المتمايزين**، في أسطر قليلة. استخدمه على سجلات تملكها، نموذجًا أوليًا قبل بناء القاعدة الفعلية."
+   },
+   {
+    "id": "py-spray",
+    "type": "code",
+    "language": "python",
+    "code": "import json, sys\nfrom collections import defaultdict\n\nusers_by_ip = defaultdict(set)\nfails_by_ip = defaultdict(int)\n\nfor line in open(sys.argv[1], encoding=\"utf-8\"):\n    e = json.loads(line)\n    if e[\"result\"] == \"failure\":\n        users_by_ip[e[\"ip\"]].add(e[\"user\"])\n        fails_by_ip[e[\"ip\"]] += 1\n\nfor ip, users in sorted(users_by_ip.items(), key=lambda kv: -len(kv[1])):\n    if len(users) >= 20:\n        print(f\"{ip}: {len(users)} users, {fails_by_ip[ip]} failures\")",
+    "filename": "spray_check.py",
+    "caption": "مثال للمدخل: {\"ip\": \"198.51.100.23\", \"user\": \"a.karim@example.com\", \"result\": \"failure\"}"
+   },
+   {
+    "id": "py-out",
+    "type": "terminal",
+    "prompt": "$",
+    "lines": [
+     {
+      "prompt": "$",
+      "cmd": "python spray_check.py signins-2026-11-11.jsonl",
+      "output": "198.51.100.23: 412 users, 436 failures\n203.0.113.77: 31 users, 52 failures",
+      "comment": "لمس المصدر الأول 412 حسابًا بإخفاق واحد تقريبًا لكل منها: رش كلاسيكي."
+     }
+    ],
+    "title": "مخرجات موضّحة (بيانات مثال)"
+   },
+   {
+    "id": "tuning",
+    "type": "text",
+    "markdown": "## الضبط: الإيجابيات الكاذبة هي التي تحدد هل يثق أحد بالتنبيه\n\nالكشف الذي يُطلق خمسين مرة يوميًا يعلّم المحللين تجاهله. قلّل الضوضاء دون أن تُعمي نفسك:\n\n- **ضع المخارج المعروفة في قائمة سماح.** شبكات NAT المؤسسية وبوابات VPN ووكلاء السحابة تجعل مستخدمين كثيرين يبدون قادمين من عنوان واحد. ضع عليها وسمًا بدل حذف التنبيه.\n- **تعامل مع السفر بشكل صحيح.** يُطلق السفر المستحيل بسبب مشغّلي الجوال ومخارج VPN. قارن بمعرّف الجهاز والجلسة السابقة قبل التنبيه.\n- **رجّح حسب الصلاحية.** الشذوذ نفسه على مسؤول عام ينبغي أن يستدعي شخصًا، بينما قد يرفع درجة الخطر فقط لمستخدم عادي.\n- **ادمج الإشارات.** دولة جديدة وحدها إشارة ضعيفة. دولة جديدة مع جهاز جديد وبروتوكول قديم إشارة قوية.\n- **قِس.** تتبّع التنبيهات أسبوعيًا ونسبة الإيجابيات الحقيقية وزمن الفرز. راجع الأرقام شهريًا.\n\nأبقِ دائمًا طريقًا من التنبيه إلى الإجراء. ينبغي أن يسمّي كل كشف دليل التشغيل الخاص به، كسحب الجلسات وإعادة تعيين بيانات الاعتماد، كما يرد في [كشف تهديدات الهوية والاستجابة لها](/learn/security-architecture-resilience/identity-threat-detection-and-response)."
+   },
+   {
+    "id": "prevent",
+    "type": "callout",
+    "variant": "tip",
+    "title": "الكشف أفضل بجانب الوقاية",
+    "markdown": "يصبح كل نمط مما سبق أصعب حين تكون طريقة الدخول قوية. فمفاتيح المرور ومفاتيح أمان FIDO2 لا يمكن رشها أو إرهاقها، ومطابقة الأرقام تقلل كثيرًا احتمال الموافقة العمياء على الإشعار، وحجب البروتوكولات القديمة يزيل صنفًا كاملًا من تجاوزات MFA. وعامل كل كشف تكتبه بوصفه مقياسًا لمدى انتشار هذه الضوابط: التنبيهات التي ما تزال تُطلق تدل على مواضع بقاء الطرق الضعيفة."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تعتمد على القفل وحده",
+    "markdown": "القفل الصارم يتيح للمهاجم قفل كل الموظفين برش أسماء مستخدمين معروفة، وهذا حجب للخدمة. فضّل القفل الذكي الذي يفصل المواقع الموثوقة عن المواقع غير المألوفة، وأضف التبطئة، واكشف الرش حسب المصدر لا حسب الحساب."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم مستأجرًا **تجريبيًا** أو ملف سجل تملكه:\n\n1. أنشئ ملف JSON lines فيه 40 حدث إخفاق وهميًا لثلاثين مستخدمًا مختلفًا بنطاق `@example.com` من `198.51.100.23`، إضافةً إلى 20 حدثًا من عناوين أخرى ضد مستخدمين منفردين.\n2. شغّل فحص Python أعلاه وتأكد أن مصدر الرش وحده يظهر.\n3. غيّر العتبة إلى 40 ثم إلى 10. صف ما يحدث للسلبيات الكاذبة والإيجابيات الكاذبة.\n4. اكتب ثلاثة أسباب مشروعة قد تُطلق السفر المستحيل (مثل مخرج VPN) والحقل الذي ستقارنه لاستبعاد كل منها.\n5. صُغ خطوات الاستجابة لحساب نجح بعد الرش: أي الجلسات تُسحب وأي بيانات اعتماد تُعاد تعيينها."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "المصطلحات الرئيسة",
+    "items": [
+     {
+      "term": "خط الأساس",
+      "definition": "وصف للسلوك الطبيعي لمستخدم أو جهاز أو تطبيق يُقاس عليه الجديد من الأحداث."
+     },
+     {
+      "term": "رش كلمات المرور",
+      "definition": "تجربة عدد قليل من كلمات المرور الشائعة على حسابات كثيرة لتفادي القفل لكل حساب."
+     },
+     {
+      "term": "حشو بيانات الاعتماد",
+      "definition": "إعادة استخدام أزواج اسم المستخدم وكلمة المرور المسرّبة من اختراقات أخرى."
+     },
+     {
+      "term": "السفر المستحيل",
+      "definition": "تسجيلا دخول من موقعين متباعدين أكثر مما يمكن قطعه في الزمن الفاصل."
+     },
+     {
+      "term": "إرهاق MFA",
+      "definition": "إغراق المستخدم بإشعارات الدفع حتى يوافق على أحدها."
+     },
+     {
+      "term": "المصادقة القديمة",
+      "definition": "بروتوكولات أقدم مثل IMAP وPOP لا تستطيع فرض MFA."
+     },
+     {
+      "term": "درجة الخطر",
+      "definition": "تقدير مجمّع لمدى ريبة تسجيل الدخول، يُستخدم للسماح أو التحدي أو الحجب."
+     },
+     {
+      "term": "القفل الذكي",
+      "definition": "قفل يعامل المواقع المألوفة على نحو مختلف عن غير المألوفة للحد من حجب الخدمة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يفشل القفل لكل حساب في إيقاف رش كلمات المرور؟",
+      "options": [
+       "الرش يستخدم التشفير",
+       "كل حساب يرى إخفاقًا أو اثنين فقط",
+       "القفل غير موجود في السحابة",
+       "الرش يستهدف حسابات الخدمة فقط"
+      ],
+      "answer": 1,
+      "explanation": "ينشر الهجوم المحاولات على حسابات كثيرة فلا يبلغ أي حساب عتبة القفل. عدّ المستخدمين المتمايزين لكل مصدر بدلًا من ذلك."
+     },
+     {
+      "question": "أي الإشارات تقوّي تنبيه السفر المستحيل؟ اختر كل ما ينطبق.",
+      "options": [
+       "معرّف جهاز لم يُرَ من قبل",
+       "عنوان مخرج VPN مؤسسي معروف",
+       "بروتوكول قديم يتجاوز MFA",
+       "User agent نادر لهذا الحساب"
+      ],
+      "answer": [
+       0,
+       2,
+       3
+      ],
+      "explanation": "مخرج VPN المعروف سبب بريء شائع. أما الجهاز الجديد والبروتوكول القديم والعميل النادر فكلها تشير إلى الاختراق."
+     },
+     {
+      "question": "يُطلق مهاجم مطالبات دفع كثيرة ويوافق المستخدم أخيرًا على إحداها. ماذا يُسمّى ذلك؟",
+      "options": [
+       "حشو بيانات الاعتماد",
+       "إرهاق MFA",
+       "Kerberoasting",
+       "إعادة تشغيل الجلسة"
+      ],
+      "answer": 1,
+      "explanation": "يستغل إرهاق MFA (قصف الإشعارات) تحمّل الإنسان. وتقلله مطابقة الأرقام والطرق المقاومة للتصيّد."
+     },
+     {
+      "question": "ما الخطوة الأولى المعقولة لتقليل الإيجابيات الكاذبة في تنبيه الرش؟",
+      "options": [
+       "تعطيل التنبيه",
+       "وسم عناوين NAT وVPN المعروفة",
+       "رفع العتبة إلى 10000",
+       "حذف السجلات القديمة"
+      ],
+      "answer": 1,
+      "explanation": "عناوين الخروج المشتركة تجعل مستخدمين كثيرين يبدون مصدرًا واحدًا. ويحافظ وسمها على الكشف مع تقليل الضوضاء."
+     },
+     {
+      "question": "أي البيانات ينبغي إرسالها إلى SIEM لأغراض كشف المصادقة؟ اختر كل ما ينطبق.",
+      "options": [
+       "سجلات دخول مزوّد الهوية",
+       "أحداث وحدة التحكم بالنطاق 4624 و4625 و4768 و4769",
+       "سجلات بوابة VPN",
+       "تقويم إجازات الموظفين فقط"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "تأتي أدلة المصادقة من مزوّدي الهوية ووحدات التحكم والبوابات. تقويم الإجازات سياق لا مصدر سجلات بذاته."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يقارن **كشف الشذوذ في المصادقة** كل تسجيل دخول بخط أساس للمستخدم والجهاز والمكان والزمان.\n- اجمع سجلات مزوّد الهوية ووحدات التحكم والبوابات في SIEM واحد باسم مستخدم موحّد.\n- تعرّف الأنماط: **القوة الغاشمة والرش والحشو والسفر المستحيل وإرهاق MFA** و**المصادقة القديمة**.\n- عُدّ **المستخدمين المتمايزين لكل مصدر** لالتقاط الرش، وادمج الإشارات الضعيفة في درجة خطر.\n- اضبط بقوائم السماح وترجيح الصلاحية، وقِس معدل الإيجابيات الحقيقية، وأرفق دليل استجابة بكل تنبيه."
+   }
+  ]
+ }
+}

@@ -1,0 +1,654 @@
+{
+  "slug": "nginx-and-laravel-security-lab",
+  "title": "Nginx and Laravel Security Lab",
+  "summary": "Harden an Nginx and Laravel stack you own: TLS, security headers, dot-file and rate-limit rules, production Laravel settings and file permissions, then verify from outside with curl.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain the layers of a hardened web stack",
+    "Configure Nginx with TLS, headers, dot-file denial and rate limits",
+    "Apply production-safe Laravel settings and file permissions",
+    "Verify controls from the outside with curl",
+    "Roll out headers such as CSP safely"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A Laravel application runs behind Nginx on a small VPS. It works, but a scan of the server shows the Nginx version in every response, `.env` reachable by a typo in the web root, debug mode left on, and no security headers. Each issue alone looks minor. Together they give an attacker a map of your stack and sometimes your database password.\n\nIn this lab you harden an Nginx and Laravel stack that **you own**, in your own test VM from [Isolated Virtual Security Lab](/learn/hands-on-security-labs/isolated-virtual-security-lab). You will fix the web server layer, the framework layer and the file permissions, and then verify the result from the outside with `curl`."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## Step 1: Know what you are protecting\n\nA request passes through several components. Each one can enforce a different control, so treat them as layers.\n\n| Layer | Main risk | Control |\n|:--|:--|:--|\n| TLS | Eavesdropping, downgrade | TLS 1.2+, HSTS |\n| Nginx | Information leaks, abuse | Hidden version, rate limits, headers |\n| PHP-FPM | Code execution from uploads | Only allow `index.php` |\n| Laravel | Debug leaks, weak sessions | `APP_DEBUG=false`, secure cookies |\n| Filesystem | Secret exposure | Web root is `public/` only, strict ownership |\n\nThe animation shows what happens to hostile and normal requests in a hardened stack."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Requests meeting a hardened web stack",
+      "caption": "Normal requests reach Laravel; probes for secrets or abusive rates are stopped earlier.",
+      "data": {
+        "token": "Request",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "Client",
+            "sub": "203.0.113.40",
+            "icon": "laptop"
+          },
+          {
+            "id": "tls",
+            "label": "TLS",
+            "sub": "443",
+            "icon": "lock"
+          },
+          {
+            "id": "nginx",
+            "label": "Nginx",
+            "sub": "Rules and limits",
+            "icon": "firewall"
+          },
+          {
+            "id": "fpm",
+            "label": "PHP-FPM",
+            "sub": "index.php",
+            "icon": "cpu"
+          },
+          {
+            "id": "app",
+            "label": "Laravel",
+            "sub": "Middleware",
+            "icon": "shield"
+          },
+          {
+            "id": "db",
+            "label": "Database",
+            "sub": "10.20.0.5",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "client",
+            "token": "GET /",
+            "caption": "A visitor requests the home page over HTTPS."
+          },
+          {
+            "at": "tls",
+            "token": "GET /",
+            "caption": "The session negotiates TLS 1.3; HTTP port 80 only redirects.",
+            "tone": "secure"
+          },
+          {
+            "at": "nginx",
+            "token": "GET /",
+            "caption": "Nginx adds security headers and passes the request to PHP-FPM.",
+            "tone": "success"
+          },
+          {
+            "at": "fpm",
+            "token": "GET /",
+            "caption": "Only index.php is executed; the front controller starts Laravel."
+          },
+          {
+            "at": "app",
+            "token": "GET /",
+            "caption": "Middleware checks CSRF, session and authorization, then queries the database."
+          },
+          {
+            "at": "nginx",
+            "token": "GET /.env",
+            "caption": "A probe for /.env matches a deny rule and receives 404 without touching PHP.",
+            "tone": "blocked"
+          },
+          {
+            "at": "nginx",
+            "token": "60 req/s",
+            "caption": "A burst on /login exceeds the rate limit and receives 429.",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "nginx",
+      "type": "text",
+      "markdown": "## Step 2: Harden Nginx\n\nStart with what the server reveals and what it accepts. Hide the version, force HTTPS, set security headers and rate limit the login route. Serve only the `public/` directory of Laravel, never the project root.\n\nTwo details are easy to miss. First, `add_header` directives are not inherited into a block that defines its own `add_header`, so repeat them or use one include file. Second, deny every dot file except `/.well-known/`, which certificate renewal needs."
+    },
+    {
+      "id": "nginxconf",
+      "type": "code",
+      "language": "nginx",
+      "filename": "/etc/nginx/sites-available/app.example.com",
+      "caption": "A hardened server block. Certificate paths are placeholders for your own.",
+      "highlight": [
+        1,
+        2,
+        15,
+        19,
+        23,
+        26
+      ],
+      "code": "limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;\n\nserver {\n    listen 80;\n    server_name app.example.com;\n    return 301 https://$host$request_uri;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name app.example.com;\n    root /var/www/app/public;\n    index index.php;\n    server_tokens off;\n\n    ssl_certificate     /etc/ssl/example/fullchain.pem;\n    ssl_certificate_key /etc/ssl/example/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header X-Frame-Options \"SAMEORIGIN\" always;\n    add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n    add_header Content-Security-Policy \"default-src 'self'\" always;\n\n    location ~ /\\.(?!well-known) { deny all; return 404; }\n\n    location = /login {\n        limit_req zone=login burst=5 nodelay;\n        try_files $uri /index.php?$query_string;\n    }\n\n    location / { try_files $uri $uri/ /index.php?$query_string; }\n\n    location ~ \\.php$ {\n        include fastcgi_params;\n        fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        # Only the front controller may execute\n        fastcgi_split_path_info ^(.+\\.php)(/.+)$;\n    }\n}\n"
+    },
+    {
+      "id": "laravel",
+      "type": "text",
+      "markdown": "## Step 3: Harden Laravel\n\nThe framework has strong defaults, but production settings are your job. Most Laravel incidents come from configuration, not from framework bugs.\n\n- Set `APP_ENV=production` and `APP_DEBUG=false`. Debug pages print environment values and stack traces.\n- Generate `APP_KEY` once with `php artisan key:generate`, keep it secret, and never commit `.env`.\n- Use `SESSION_SECURE_COOKIE=true` and `SESSION_SAME_SITE=lax` so cookies travel over HTTPS only.\n- Use Eloquent or the query builder with bindings. Never concatenate user input into SQL.\n- Keep `composer.lock` committed, and run `composer audit` regularly to check for vulnerable packages.\n- Cache configuration with `php artisan config:cache`, which also stops stray `env()` reads.\n\nFinally, file permissions. Only `storage/` and `bootstrap/cache/` need to be writable by the PHP user."
+    },
+    {
+      "id": "perms",
+      "type": "code",
+      "language": "bash",
+      "filename": "permissions.sh",
+      "caption": "Code owned by a deploy user, writable paths owned by the web user.",
+      "highlight": [
+        2,
+        4,
+        6
+      ],
+      "code": "# Code is read-only for the web server\nsudo chown -R deploy:www-data /var/www/app\nsudo find /var/www/app -type f -exec chmod 640 {} \\;\nsudo find /var/www/app -type d -exec chmod 750 {} \\;\n# Only these two need writes\nsudo chmod -R ug+rwX /var/www/app/storage /var/www/app/bootstrap/cache\nsudo chmod 600 /var/www/app/.env\nphp artisan config:cache && php artisan route:cache\ncomposer audit\n"
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Step 4: Verify from the outside\n\nHardening is only done when an outside observer sees the result. Use `curl` from another machine in your lab, because it shows exactly what an attacker or a scanner sees. Test the headers, the dot-file rule, the HTTP redirect and the login rate limit."
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "lab-client",
+      "prompt": "$",
+      "caption": "Verification against a test VM at app.example.com (resolved through your hosts file).",
+      "lines": [
+        {
+          "cmd": "curl -sI http://app.example.com/ | head -n 3",
+          "output": "HTTP/1.1 301 Moved Permanently\nServer: nginx\nLocation: https://app.example.com/",
+          "comment": "Redirect works and no version number is shown."
+        },
+        {
+          "cmd": "curl -sI https://app.example.com/ | grep -Ei 'strict|nosniff|frame|referrer|content-security'",
+          "output": "strict-transport-security: max-age=31536000\nx-content-type-options: nosniff\nx-frame-options: SAMEORIGIN\nreferrer-policy: strict-origin-when-cross-origin\ncontent-security-policy: default-src 'self'",
+          "comment": "All five headers are present."
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://app.example.com/.env",
+          "output": "404",
+          "comment": "The secret file is not served, and the answer does not reveal that it exists."
+        },
+        {
+          "cmd": "for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' https://app.example.com/login; done; echo",
+          "output": "200 200 200 200 200 200 503 503 503 503 503 503",
+          "comment": "After the burst is used up, Nginx rejects requests. Use limit_req_status 429 if you prefer 429."
+        }
+      ]
+    },
+    {
+      "id": "monitor",
+      "type": "text",
+      "markdown": "## Step 5: Watch the logs\n\nControls fail quietly, so check that you can see attacks. The Nginx access log records every probe, including the ones you blocked. Count the blocked probes by path to see what scanners look for, and ship the log to your SIEM for correlation, as in [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab).\n\nFor active protection, a tool such as Fail2ban can read repeated 404 or 401 responses and add a temporary firewall rule. Test it first with your own address excluded, because a rule that blocks you is a fast way to learn about lockouts.\n\nFinally, test the firewall layer in front of the server using [Firewall Rule Testing Lab](/learn/hands-on-security-labs/firewall-rule-testing-lab). Only ports 80 and 443 should be reachable from outside."
+    },
+    {
+      "id": "headers",
+      "type": "text",
+      "markdown": "## What each header actually does\n\nHeaders are cheap, but only if you understand what each one protects. Copying a list without understanding it leads to broken pages and false confidence.\n\n| Header | Protects against | Typical mistake |\n|:--|:--|:--|\n| `Strict-Transport-Security` | Downgrade to plain HTTP | Long `max-age` before HTTPS works everywhere |\n| `X-Content-Type-Options` | Browsers guessing a file type and running it | Forgetting it on uploaded files |\n| `X-Frame-Options` | Clickjacking by framing your pages | Blocking your own legitimate embeds |\n| `Referrer-Policy` | Leaking full URLs to other sites | Leaving the default for sensitive paths |\n| `Content-Security-Policy` | Cross-site scripting impact | Allowing `unsafe-inline` everywhere |\n\nA header is a layer, not a fix. If your application has a cross-site scripting bug, a good policy reduces the damage, but you still repair the bug. Likewise, rate limiting slows password guessing, but it does not replace strong passwords and multi-factor authentication. Think of Nginx as the guard at the door and Laravel as the lock on each room: you want both, and you want to know when either one is tested."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Never test a header policy only in production",
+      "markdown": "A strict `Content-Security-Policy` can silently break scripts, fonts and payment widgets. Start with `Content-Security-Policy-Report-Only`, read the browser console, adjust the policy, and only then enforce it. HSTS is sticky: browsers remember it for the full `max-age`, so begin with a short value."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Use a single include file for headers",
+      "markdown": "Put the `add_header` lines in `/etc/nginx/snippets/security-headers.conf` and add `include` in each `location` that sets its own headers. This avoids the inheritance trap and keeps one place to audit. Always run `sudo nginx -t` before `sudo systemctl reload nginx`."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "In a test VM **you own** running Nginx, PHP-FPM and a fresh Laravel app:\n\n1. Run the four `curl` checks from Step 4 and save the output as your baseline.\n2. Apply the Nginx server block, then set `APP_DEBUG=false` and run the permission commands.\n3. Run `sudo nginx -t`, reload, and repeat the checks. Compare the before and after output.\n4. Temporarily set `APP_DEBUG=true`, trigger an error page, and note which values the page reveals. Turn it off again.\n5. Run `composer audit` and write down any advisory it reports.\n6. Add `Content-Security-Policy-Report-Only` first, then decide what you would change before enforcing it."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "HSTS",
+          "definition": "A header telling browsers to use HTTPS only for a domain for a set time."
+        },
+        {
+          "term": "Content-Security-Policy",
+          "definition": "A header that limits where scripts, styles and other resources may load from, reducing the impact of XSS."
+        },
+        {
+          "term": "server_tokens",
+          "definition": "The Nginx setting that controls whether the version number appears in responses and error pages."
+        },
+        {
+          "term": "Rate limiting",
+          "definition": "Restricting how many requests a client may send in a period, which slows password guessing and abuse."
+        },
+        {
+          "term": "Front controller",
+          "definition": "The single entry script, public/index.php in Laravel, through which all dynamic requests pass."
+        },
+        {
+          "term": "APP_DEBUG",
+          "definition": "The Laravel setting that shows detailed error pages; it must be false in production."
+        },
+        {
+          "term": "APP_KEY",
+          "definition": "The secret used to encrypt cookies and signed data in Laravel; leaking it can allow forged sessions."
+        },
+        {
+          "term": "composer audit",
+          "definition": "A command that checks installed PHP packages against known security advisories."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which directory should be the Nginx document root for a Laravel application?",
+          "options": [
+            "The project root",
+            "public/",
+            "storage/",
+            "vendor/"
+          ],
+          "answer": 1,
+          "explanation": "Only public/ is meant to be served. Serving the project root can expose .env, source code and vendor files."
+        },
+        {
+          "question": "What is the main reason to set APP_DEBUG=false in production?",
+          "options": [
+            "It makes pages load faster",
+            "Debug pages can reveal environment values and stack traces",
+            "It encrypts the database",
+            "It enables HTTPS"
+          ],
+          "answer": 1,
+          "explanation": "Detailed error pages can leak configuration, paths and sometimes credentials to anyone who triggers an error."
+        },
+        {
+          "question": "Which of these are hardening steps from this lab? (Choose all that apply.)",
+          "options": [
+            "server_tokens off",
+            "Deny requests for dot files except .well-known",
+            "chmod 777 on the whole project",
+            "Rate limit the login route"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Hiding the version, denying dot files and limiting login attempts reduce exposure. chmod 777 lets any local user change code and is never appropriate."
+        },
+        {
+          "question": "A location block defines its own add_header lines. What happens to the headers from the server block?",
+          "options": [
+            "They are merged",
+            "They are not inherited into that location",
+            "Nginx refuses to start",
+            "They are doubled"
+          ],
+          "answer": 1,
+          "explanation": "Nginx inherits add_header only when the lower level defines none, so repeat the headers or use an include file."
+        },
+        {
+          "question": "Why start a new Content-Security-Policy in report-only mode?",
+          "options": [
+            "It is more secure",
+            "To see what would break before blocking anything",
+            "Browsers require it",
+            "It disables scripts"
+          ],
+          "answer": 1,
+          "explanation": "Report-only mode logs violations without blocking, so you can fix legitimate resources first."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou hardened the web tier in three layers: Nginx hides its version, redirects to HTTPS, sets security headers, blocks dot files and limits login attempts; Laravel runs in production mode with secure cookies and audited packages; the filesystem exposes only `public/` and keeps secrets at mode 600. You then verified every claim with `curl` from outside. Keep the Nginx file, the `.env.example` and the permission script in version control. Next, stand a firewall in front of the stack: [Firewall Rule Testing Lab](/learn/hands-on-security-labs/firewall-rule-testing-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر أمن Nginx وLaravel",
+    "summary": "حصّن حزمة Nginx وLaravel تملكها: TLS والترويسات الأمنية وقواعد الملفات المخفية وتحديد المعدل وإعدادات Laravel للإنتاج وأذونات الملفات، ثم تحقق من الخارج بـ curl.",
+    "objectives": [
+      "شرح طبقات حزمة ويب محصّنة",
+      "ضبط Nginx مع TLS والترويسات ومنع الملفات المخفية وتحديد المعدل",
+      "تطبيق إعدادات Laravel الآمنة للإنتاج وأذونات الملفات",
+      "التحقق من الضوابط من الخارج بـ curl",
+      "نشر ترويسات مثل CSP بأمان"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يعمل تطبيق Laravel خلف Nginx على خادم افتراضي صغير. هو يعمل، لكنّ فحص الخادم يُظهر إصدار Nginx في كل استجابة، وملف `.env` قابلًا للوصول بسبب خطأ في جذر الويب، ووضع التصحيح (debug) مفعّلًا، ولا ترويسات أمنية. كل مشكلة وحدها تبدو بسيطة، لكنها معًا تعطي المهاجم خريطة لبنيتك وأحيانًا كلمة مرور قاعدة بياناتك.\n\nستحصّن في هذا المختبر حزمة Nginx وLaravel **تملكها**، داخل آلتك الافتراضية التجريبية من [مختبر الأمن الافتراضي المعزول](/learn/hands-on-security-labs/isolated-virtual-security-lab). ستعالج طبقة خادم الويب وطبقة إطار العمل وأذونات الملفات، ثم تتحقق من النتيجة من الخارج باستخدام `curl`."
+      },
+      {
+        "id": "model",
+        "type": "text",
+        "markdown": "## الخطوة 1: اعرف ما الذي تحميه\n\nيمر الطلب عبر عدة مكونات، ويستطيع كل منها فرض ضابط مختلف، لذا تعامل معها كطبقات.\n\n| الطبقة | الخطر الرئيسي | الضابط |\n|:--|:--|:--|\n| TLS | التنصت والتخفيض | TLS 1.2 فأعلى وHSTS |\n| Nginx | تسرّب المعلومات وسوء الاستخدام | إخفاء الإصدار وتحديد المعدل والترويسات |\n| PHP-FPM | تنفيذ الشيفرة من الملفات المرفوعة | السماح بـ `index.php` فقط |\n| Laravel | تسرّب التصحيح وضعف الجلسات | `APP_DEBUG=false` وملفات تعريف ارتباط آمنة |\n| نظام الملفات | كشف الأسرار | جذر الويب هو `public/` فقط وملكية صارمة |\n\nيوضّح الرسم المتحرك ما يحدث للطلبات العدائية والعادية في حزمة محصّنة."
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "طلبات تواجه حزمة ويب محصّنة",
+        "caption": "تصل الطلبات العادية إلى Laravel، أما محاولات الوصول إلى الأسرار أو المعدلات المسيئة فتُوقف مبكرًا.",
+        "data": {
+          "token": "طلب",
+          "nodes": [
+            {
+              "id": "client",
+              "label": "العميل",
+              "sub": "203.0.113.40",
+              "icon": "laptop"
+            },
+            {
+              "id": "tls",
+              "label": "TLS",
+              "sub": "443",
+              "icon": "lock"
+            },
+            {
+              "id": "nginx",
+              "label": "Nginx",
+              "sub": "قواعد وحدود",
+              "icon": "firewall"
+            },
+            {
+              "id": "fpm",
+              "label": "PHP-FPM",
+              "sub": "index.php",
+              "icon": "cpu"
+            },
+            {
+              "id": "app",
+              "label": "Laravel",
+              "sub": "البرمجيات الوسيطة",
+              "icon": "shield"
+            },
+            {
+              "id": "db",
+              "label": "قاعدة البيانات",
+              "sub": "10.20.0.5",
+              "icon": "database"
+            }
+          ],
+          "steps": [
+            {
+              "at": "client",
+              "token": "GET /",
+              "caption": "يطلب زائر الصفحة الرئيسية عبر HTTPS."
+            },
+            {
+              "at": "tls",
+              "token": "GET /",
+              "caption": "تتفاوض الجلسة على TLS 1.3، ويقتصر المنفذ 80 على إعادة التوجيه.",
+              "tone": "secure"
+            },
+            {
+              "at": "nginx",
+              "token": "GET /",
+              "caption": "يضيف Nginx الترويسات الأمنية ويمرر الطلب إلى PHP-FPM.",
+              "tone": "success"
+            },
+            {
+              "at": "fpm",
+              "token": "GET /",
+              "caption": "يُنفَّذ index.php وحده؛ ويشغّل المتحكم الأمامي Laravel."
+            },
+            {
+              "at": "app",
+              "token": "GET /",
+              "caption": "تفحص البرمجيات الوسيطة CSRF والجلسة والتفويض ثم تستعلم عن قاعدة البيانات."
+            },
+            {
+              "at": "nginx",
+              "token": "GET /.env",
+              "caption": "يطابق طلب /.env قاعدة منع فيتلقى 404 دون الوصول إلى PHP.",
+              "tone": "blocked"
+            },
+            {
+              "at": "nginx",
+              "token": "60 طلبًا/ث",
+              "caption": "تتجاوز موجة طلبات على /login حد المعدل فتتلقى 429.",
+              "tone": "danger"
+            }
+          ]
+        }
+      },
+      {
+        "id": "nginx",
+        "type": "text",
+        "markdown": "## الخطوة 2: تحصين Nginx\n\nابدأ بما يكشفه الخادم وما يقبله. أخفِ الإصدار، وأجبر استخدام HTTPS، وعيّن الترويسات الأمنية، وحدّد معدل مسار تسجيل الدخول. وقدّم المجلد `public/` الخاص بـ Laravel فقط، لا جذر المشروع أبدًا.\n\nهناك تفصيلان يُغفلان بسهولة. الأول أن توجيهات `add_header` لا تُورَّث إلى كتلة تعرّف `add_header` خاصة بها، فكرّرها أو استخدم ملف تضمين واحدًا. والثاني امنع كل الملفات التي تبدأ بنقطة عدا `/.well-known/` الذي يحتاجه تجديد الشهادات."
+      },
+      {
+        "id": "nginxconf",
+        "type": "code",
+        "language": "nginx",
+        "filename": "/etc/nginx/sites-available/app.example.com",
+        "caption": "كتلة خادم محصّنة. مسارات الشهادات بدائل عن مسارات شهاداتك.",
+        "highlight": [
+          1,
+          2,
+          15,
+          19,
+          23,
+          26
+        ],
+        "code": "limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;\n\nserver {\n    listen 80;\n    server_name app.example.com;\n    return 301 https://$host$request_uri;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name app.example.com;\n    root /var/www/app/public;\n    index index.php;\n    server_tokens off;\n\n    ssl_certificate     /etc/ssl/example/fullchain.pem;\n    ssl_certificate_key /etc/ssl/example/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header X-Frame-Options \"SAMEORIGIN\" always;\n    add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n    add_header Content-Security-Policy \"default-src 'self'\" always;\n\n    location ~ /\\.(?!well-known) { deny all; return 404; }\n\n    location = /login {\n        limit_req zone=login burst=5 nodelay;\n        try_files $uri /index.php?$query_string;\n    }\n\n    location / { try_files $uri $uri/ /index.php?$query_string; }\n\n    location ~ \\.php$ {\n        include fastcgi_params;\n        fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        # Only the front controller may execute\n        fastcgi_split_path_info ^(.+\\.php)(/.+)$;\n    }\n}\n"
+      },
+      {
+        "id": "laravel",
+        "type": "text",
+        "markdown": "## الخطوة 3: تحصين Laravel\n\nلدى الإطار إعدادات افتراضية قوية، لكنّ إعدادات الإنتاج مسؤوليتك. تأتي معظم حوادث Laravel من الإعدادات لا من أخطاء الإطار.\n\n- اضبط `APP_ENV=production` و`APP_DEBUG=false`. فصفحات التصحيح تطبع قيم البيئة وآثار الاستدعاء.\n- ولّد `APP_KEY` مرة واحدة بالأمر `php artisan key:generate` واحفظه سرًّا ولا ترفع `.env` إلى المستودع أبدًا.\n- استخدم `SESSION_SECURE_COOKIE=true` و`SESSION_SAME_SITE=lax` كي تنتقل ملفات تعريف الارتباط عبر HTTPS فقط.\n- استخدم Eloquent أو باني الاستعلامات مع الربط. ولا تدمج مدخلات المستخدم في SQL أبدًا.\n- أبقِ `composer.lock` مرفوعًا ونفّذ `composer audit` دوريًا للتحقق من الحزم الضعيفة.\n- خزّن الإعدادات مؤقتًا بالأمر `php artisan config:cache` وهو يمنع قراءات `env()` العشوائية أيضًا.\n\nأخيرًا أذونات الملفات. لا يحتاج إلى قابلية الكتابة من مستخدم PHP سوى `storage/` و`bootstrap/cache/`."
+      },
+      {
+        "id": "perms",
+        "type": "code",
+        "language": "bash",
+        "filename": "permissions.sh",
+        "caption": "الشيفرة يملكها مستخدم النشر، والمسارات القابلة للكتابة يملكها مستخدم الويب.",
+        "highlight": [
+          2,
+          4,
+          6
+        ],
+        "code": "# Code is read-only for the web server\nsudo chown -R deploy:www-data /var/www/app\nsudo find /var/www/app -type f -exec chmod 640 {} \\;\nsudo find /var/www/app -type d -exec chmod 750 {} \\;\n# Only these two need writes\nsudo chmod -R ug+rwX /var/www/app/storage /var/www/app/bootstrap/cache\nsudo chmod 600 /var/www/app/.env\nphp artisan config:cache && php artisan route:cache\ncomposer audit\n"
+      },
+      {
+        "id": "verify",
+        "type": "text",
+        "markdown": "## الخطوة 4: التحقق من الخارج\n\nلا يكتمل التحصين إلا حين يرى مراقب خارجي النتيجة. استخدم `curl` من جهاز آخر في مختبرك، فهو يُظهر بالضبط ما يراه المهاجم أو الماسح. اختبر الترويسات وقاعدة الملفات المخفية وإعادة التوجيه من HTTP وحد معدل تسجيل الدخول."
+      },
+      {
+        "id": "term",
+        "type": "terminal",
+        "title": "lab-client",
+        "prompt": "$",
+        "caption": "تحقق من آلة تجريبية على app.example.com (تُحلّ عبر ملف hosts لديك).",
+        "lines": [
+          {
+            "cmd": "curl -sI http://app.example.com/ | head -n 3",
+            "output": "HTTP/1.1 301 Moved Permanently\nServer: nginx\nLocation: https://app.example.com/",
+            "comment": "تعمل إعادة التوجيه ولا يظهر رقم إصدار."
+          },
+          {
+            "cmd": "curl -sI https://app.example.com/ | grep -Ei 'strict|nosniff|frame|referrer|content-security'",
+            "output": "strict-transport-security: max-age=31536000\nx-content-type-options: nosniff\nx-frame-options: SAMEORIGIN\nreferrer-policy: strict-origin-when-cross-origin\ncontent-security-policy: default-src 'self'",
+            "comment": "الترويسات الخمس كلها موجودة."
+          },
+          {
+            "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://app.example.com/.env",
+            "output": "404",
+            "comment": "لا يُقدَّم الملف السري، ولا يكشف الرد أنه موجود."
+          },
+          {
+            "cmd": "for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' https://app.example.com/login; done; echo",
+            "output": "200 200 200 200 200 200 503 503 503 503 503 503",
+            "comment": "بعد استنفاد الاندفاع يرفض Nginx الطلبات. استخدم limit_req_status 429 إن فضّلت 429."
+          }
+        ]
+      },
+      {
+        "id": "monitor",
+        "type": "text",
+        "markdown": "## الخطوة 5: راقب السجلات\n\nتفشل الضوابط بصمت، فتأكد أنك تستطيع رؤية الهجمات. يسجل سجل الوصول في Nginx كل محاولة فحص، ومنها ما حجبته. عُدّ المحاولات المحجوبة حسب المسار لتعرف ما الذي تبحث عنه الماسحات، وأرسل السجل إلى نظام SIEM للربط كما في [مختبر SIEM المركزي](/learn/hands-on-security-labs/centralized-siem-lab).\n\nوللحماية الفعالة يستطيع أداة مثل Fail2ban قراءة تكرار الاستجابات 404 أو 401 وإضافة قاعدة جدار ناري مؤقتة. اختبرها أولًا مع استثناء عنوانك، فالقاعدة التي تحجبك طريقة سريعة لتتعلم عن حالات القفل.\n\nوأخيرًا اختبر طبقة الجدار الناري أمام الخادم باستخدام [مختبر اختبار قواعد الجدار الناري](/learn/hands-on-security-labs/firewall-rule-testing-lab). يجب ألا يكون قابلًا للوصول من الخارج سوى المنفذين 80 و443."
+      },
+      {
+        "id": "headers",
+        "type": "text",
+        "markdown": "## ماذا تفعل كل ترويسة فعلًا\n\nالترويسات رخيصة، لكن بشرط أن تفهم ما تحميه كل واحدة. ونسخ قائمة دون فهم يؤدي إلى صفحات معطّلة وثقة زائفة.\n\n| الترويسة | تحمي من | الخطأ المعتاد |\n|:--|:--|:--|\n| `Strict-Transport-Security` | التخفيض إلى HTTP العادي | `max-age` طويل قبل أن يعمل HTTPS في كل مكان |\n| `X-Content-Type-Options` | تخمين المتصفح نوع الملف وتشغيله | نسيانها للملفات المرفوعة |\n| `X-Frame-Options` | الاختطاف بالنقر عبر تضمين صفحاتك | حجب التضمينات المشروعة الخاصة بك |\n| `Referrer-Policy` | تسريب العناوين الكاملة لمواقع أخرى | ترك الافتراضي للمسارات الحساسة |\n| `Content-Security-Policy` | أثر البرمجة عبر المواقع (XSS) | السماح بـ `unsafe-inline` في كل مكان |\n\nالترويسة طبقة وليست إصلاحًا. فإن كان في تطبيقك ثغرة XSS فالسياسة الجيدة تخفف الضرر لكنك تظل تصلح الثغرة. وكذلك يبطئ تحديد المعدل تخمين كلمات المرور لكنه لا يغني عن كلمات المرور القوية والمصادقة متعددة العوامل. فكّر في Nginx كحارس الباب وفي Laravel كقفل كل غرفة: تريدهما معًا، وتريد أن تعرف حين يُختبر أيٌّ منهما."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تختبر سياسة الترويسات في الإنتاج فقط",
+        "markdown": "قد تُعطّل سياسة `Content-Security-Policy` الصارمة النصوص البرمجية والخطوط وأدوات الدفع بصمت. ابدأ بـ `Content-Security-Policy-Report-Only` واقرأ وحدة تحكم المتصفح وعدّل السياسة ثم فعّلها. وHSTS لاصق: تتذكره المتصفحات طوال `max-age`، فابدأ بقيمة قصيرة."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "استخدم ملف تضمين واحدًا للترويسات",
+        "markdown": "ضع أسطر `add_header` في `/etc/nginx/snippets/security-headers.conf` وأضف `include` في كل `location` يعرّف ترويسات خاصة به. هذا يتجنب فخ الوراثة ويبقي مكانًا واحدًا للتدقيق. نفّذ دائمًا `sudo nginx -t` قبل `sudo systemctl reload nginx`."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "في آلة تجريبية **تملكها** تشغّل Nginx وPHP-FPM وتطبيق Laravel جديدًا:\n\n1. نفّذ فحوص `curl` الأربعة من الخطوة 4 واحفظ المخرجات خط أساس.\n2. طبّق كتلة خادم Nginx ثم اضبط `APP_DEBUG=false` ونفّذ أوامر الأذونات.\n3. نفّذ `sudo nginx -t` وأعد التحميل وكرّر الفحوص وقارن المخرجات قبل التغيير وبعده.\n4. فعّل `APP_DEBUG=true` مؤقتًا وأثِر صفحة خطأ ولاحظ القيم التي تكشفها الصفحة، ثم أوقفه من جديد.\n5. نفّذ `composer audit` ودوّن أي تنبيه يعرضه.\n6. أضف `Content-Security-Policy-Report-Only` أولًا ثم قرر ما ستغيّره قبل فرضها."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "HSTS",
+            "definition": "ترويسة تخبر المتصفحات بأن تستخدم HTTPS فقط لنطاق ما خلال مدة محددة."
+          },
+          {
+            "term": "Content-Security-Policy",
+            "definition": "ترويسة تقيّد المواضع التي يمكن تحميل النصوص والأنماط والموارد منها، فتخفف أثر XSS."
+          },
+          {
+            "term": "server_tokens",
+            "definition": "إعداد في Nginx يتحكم بظهور رقم الإصدار في الاستجابات وصفحات الأخطاء."
+          },
+          {
+            "term": "تحديد المعدل",
+            "definition": "تقييد عدد الطلبات التي يرسلها العميل في فترة، مما يبطئ تخمين كلمات المرور والإساءة."
+          },
+          {
+            "term": "المتحكم الأمامي",
+            "definition": "سكربت الدخول الوحيد، وهو public/index.php في Laravel، وتمر عبره كل الطلبات الديناميكية."
+          },
+          {
+            "term": "APP_DEBUG",
+            "definition": "إعداد في Laravel يعرض صفحات أخطاء مفصلة؛ ويجب أن يكون false في الإنتاج."
+          },
+          {
+            "term": "APP_KEY",
+            "definition": "السر المستخدم لتشفير ملفات تعريف الارتباط والبيانات الموقّعة في Laravel؛ وتسريبه قد يتيح تزوير الجلسات."
+          },
+          {
+            "term": "composer audit",
+            "definition": "أمر يفحص حزم PHP المثبتة مقابل التنبيهات الأمنية المعروفة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي مجلد ينبغي أن يكون جذر المستند في Nginx لتطبيق Laravel؟",
+            "options": [
+              "جذر المشروع",
+              "public/",
+              "storage/",
+              "vendor/"
+            ],
+            "answer": 1,
+            "explanation": "المقصود تقديم public/ فقط. أما تقديم جذر المشروع فقد يكشف .env والشيفرة المصدرية وملفات vendor."
+          },
+          {
+            "question": "ما السبب الرئيسي لضبط APP_DEBUG=false في الإنتاج؟",
+            "options": [
+              "يجعل الصفحات أسرع تحميلًا",
+              "قد تكشف صفحات التصحيح قيم البيئة وآثار الاستدعاء",
+              "يشفّر قاعدة البيانات",
+              "يفعّل HTTPS"
+            ],
+            "answer": 1,
+            "explanation": "قد تسرّب صفحات الأخطاء المفصلة الإعدادات والمسارات وأحيانًا بيانات الاعتماد لكل من يثير خطأً."
+          },
+          {
+            "question": "أي مما يلي من خطوات التحصين في هذا المختبر؟ (اختر كل ما ينطبق)",
+            "options": [
+              "server_tokens off",
+              "منع طلبات الملفات المخفية عدا .well-known",
+              "chmod 777 على المشروع كله",
+              "تحديد معدل مسار تسجيل الدخول"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "إخفاء الإصدار ومنع الملفات المخفية وتحديد محاولات الدخول تقلّل التعرّض. أما chmod 777 فيسمح لأي مستخدم محلي بتعديل الشيفرة ولا يصح أبدًا."
+          },
+          {
+            "question": "تعرّف كتلة location أسطر add_header خاصة بها. ماذا يحدث للترويسات المعرّفة في كتلة server؟",
+            "options": [
+              "تُدمج",
+              "لا تُورَّث إلى ذلك الموقع",
+              "يرفض Nginx البدء",
+              "تتضاعف"
+            ],
+            "answer": 1,
+            "explanation": "يورّث Nginx الترويسات فقط حين لا يعرّف المستوى الأدنى أيًّا منها، لذا كرّر الترويسات أو استخدم ملف تضمين."
+          },
+          {
+            "question": "لماذا تبدأ سياسة Content-Security-Policy جديدة بوضع التقارير فقط؟",
+            "options": [
+              "لأنه أكثر أمانًا",
+              "لترى ما سينكسر قبل أن تحجب أي شيء",
+              "لأن المتصفحات تشترطه",
+              "لأنه يعطّل النصوص البرمجية"
+            ],
+            "answer": 1,
+            "explanation": "يسجل وضع التقارير المخالفات دون حجب، فتصلح الموارد المشروعة أولًا."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nحصّنت طبقة الويب على ثلاث مستويات: يخفي Nginx إصداره ويعيد التوجيه إلى HTTPS ويضبط الترويسات الأمنية ويحجب الملفات المخفية ويحدّ محاولات الدخول؛ ويعمل Laravel بوضع الإنتاج مع ملفات تعريف ارتباط آمنة وحزم مدقَّقة؛ ولا يكشف نظام الملفات سوى `public/` ويحفظ الأسرار بالإذن 600. ثم تحققت من كل ادعاء بـ `curl` من الخارج. احتفظ بملف Nginx و`.env.example` وسكربت الأذونات في نظام تحكم بالإصدارات. والخطوة التالية وضع جدار ناري أمام الحزمة: [مختبر اختبار قواعد الجدار الناري](/learn/hands-on-security-labs/firewall-rule-testing-lab)."
+      }
+    ]
+  }
+}

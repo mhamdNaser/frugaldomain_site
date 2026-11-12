@@ -1,0 +1,634 @@
+{
+  "slug": "security-automation-engineering",
+  "title": "Security Automation Engineering",
+  "summary": "Learn which security tasks to automate, how to build guardrails into playbooks and scripts, and where humans must stay in the loop.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Score security tasks for automation suitability",
+    "Compare SOAR platforms with scripted automation",
+    "Build guardrails: dry run, idempotency, rate limits and audit logs",
+    "Design a workflow with a human approval gate",
+    "Identify and mitigate common automation failure modes"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Your SOC closes 600 alerts a day. Forty percent are the same three benign patterns, and each takes an analyst four minutes: look up the host owner, check recent alerts, find the user's last sign-in, close the ticket. That is 16 analyst-hours of repetitive work, and the one real attack in the pile gets the same tired attention as the rest.\n\n**Security automation engineering** treats this work as software. You design workflows that gather context, make low-risk decisions on their own, and hand the hard decisions to people with the evidence already attached. This lesson builds on [Enterprise Security Engineering](/learn/security-operations-dfir/enterprise-security-engineering) and leads into [Continuous Security Improvement](/learn/security-operations-dfir/continuous-security-improvement)."
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## Step 1: Decide what deserves automation\n\nNot every task should be automated. Score each candidate on three questions: how often does it happen, how predictable is the right answer, and how bad is a wrong action?\n\n| Task | Frequency | Predictable? | Cost of error | Verdict |\n|:--|:--|:--|:--|:--|\n| Look up host owner and criticality | Very high | Yes | None | Automate fully |\n| Check URL and hash reputation | Very high | Mostly | Low | Automate fully |\n| Close known-benign scanner alerts | High | Yes | Low, reversible | Automate with logging |\n| Disable a user account | Medium | Depends | High | Automate with human approval |\n| Isolate a production server | Low | No | Very high | Recommend only |\n\nStart at the top of the table. Enrichment is the safest first target because it only reads data. Move down only after the earlier steps have run reliably for weeks."
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## Step 2: Choose the right tool\n\nA **SOAR** platform (Security Orchestration, Automation and Response) gives you connectors, a visual designer, case management and audit trails. Plain scripts give you flexibility and easy version control. Many teams use both: SOAR for the workflow and approvals, and small tested functions for custom logic.\n\nWhatever you choose, apply software engineering rules: keep workflows in Git, review changes, write tests with recorded sample alerts, and pin the versions of integrations. The same pipeline that ships detections, as described in [Advanced Detection Engineering](/learn/security-operations-dfir/advanced-detection-engineering), should ship automation."
+    },
+    {
+      "id": "code-intro",
+      "type": "text",
+      "markdown": "## Step 3: Build guardrails into the code\n\nThe script below enriches an alert and then chooses between three outcomes. Look at what makes it safe, not only what makes it useful: it runs in dry-run mode by default, reads its token from the environment, skips alerts it has already handled, escalates anything touching critical assets, and logs every decision as structured JSON."
+    },
+    {
+      "id": "triage-code",
+      "type": "code",
+      "language": "python",
+      "code": "#!/usr/bin/env python3\n\"\"\"Enrich a SIEM alert, then decide: auto-close, ask a human, or contain.\"\"\"\nimport json, os, sys, time, requests\n\nSIEM = \"https://siem.example.com/api\"\nTOKEN = os.environ[\"SIEM_API_TOKEN\"]          # never hard-code secrets\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"1\") == \"1\"  # safe by default\nMAX_ISOLATIONS_PER_HOUR = 3                   # guardrail against runaway loops\n\ndef api(method, path, **kw):\n    r = requests.request(method, f\"{SIEM}{path}\", timeout=10,\n                         headers={\"Authorization\": f\"Bearer {TOKEN}\"}, **kw)\n    r.raise_for_status()\n    return r.json()\n\ndef audit(alert_id, action, detail):\n    # every decision is written down, including \"did nothing\"\n    print(json.dumps({\"ts\": int(time.time()), \"alert\": alert_id,\n                      \"action\": action, \"detail\": detail}))\n\ndef handle(alert_id):\n    a = api(\"GET\", f\"/alerts/{alert_id}\")\n    if a.get(\"handled_by\"):                    # idempotent: skip repeated runs\n        return audit(alert_id, \"skip\", \"already handled\")\n    host = a[\"host\"]\n    ctx = api(\"GET\", f\"/assets/{host}\")        # owner, criticality, tags\n    seen = api(\"GET\", f\"/alerts?host={host}&window=24h\")[\"count\"]\n\n    if ctx[\"criticality\"] == \"high\" or ctx[\"tags\"].count(\"server\"):\n        return audit(alert_id, \"escalate\", f\"{host} is critical, human decides\")\n    if seen >= 3 and a[\"severity\"] >= 7:\n        if DRY_RUN:\n            return audit(alert_id, \"would-isolate\", host)\n        api(\"POST\", f\"/hosts/{host}/isolate\", json={\"reason\": alert_id})\n        return audit(alert_id, \"isolated\", host)\n    api(\"POST\", f\"/alerts/{alert_id}/close\", json={\"verdict\": \"benign-known\"})\n    audit(alert_id, \"closed\", \"low severity, no repeats\")\n\nif __name__ == \"__main__\":\n    handle(sys.argv[1])",
+      "filename": "triage.py",
+      "caption": "An alert triage script with dry-run, idempotency, escalation and audit logging."
+    },
+    {
+      "id": "run",
+      "type": "text",
+      "markdown": "## Step 4: Test in dry-run first\n\nRun the script against real alerts with `DRY_RUN=1` and read the audit log. The first run shows the script would isolate a workstation, the second shows it escalates a production database instead of touching it, and the third shows that a duplicate trigger does nothing. These three properties (safe preview, critical-asset exclusion, idempotency) are what you check before enabling real actions."
+    },
+    {
+      "id": "run-term",
+      "type": "terminal",
+      "title": "Dry-run results",
+      "lines": [
+        {
+          "cmd": "DRY_RUN=1 python triage.py ALRT-5521"
+        },
+        {
+          "output": "{\"ts\": 1767225600, \"alert\": \"ALRT-5521\", \"action\": \"would-isolate\", \"detail\": \"ws-0412.example.com\"}",
+          "comment": "dry run: nothing changed, decision logged"
+        },
+        {
+          "cmd": "DRY_RUN=1 python triage.py ALRT-5522"
+        },
+        {
+          "output": "{\"ts\": 1767225604, \"alert\": \"ALRT-5522\", \"action\": \"escalate\", \"detail\": \"db-prod-01.example.com is critical, human decides\"}"
+        },
+        {
+          "cmd": "python triage.py ALRT-5521"
+        },
+        {
+          "output": "{\"ts\": 1767225610, \"alert\": \"ALRT-5521\", \"action\": \"skip\", \"detail\": \"already handled\"}",
+          "comment": "idempotency: a duplicate trigger is harmless"
+        }
+      ],
+      "caption": "Three runs: a preview, an escalation and a duplicate trigger."
+    },
+    {
+      "id": "flow",
+      "type": "text",
+      "markdown": "## Step 5: Put humans where judgment is needed\n\nGood workflows pause for approval instead of guessing. The sequence shows an automated response in which the system does the legwork and a person approves the one risky action."
+    },
+    {
+      "id": "auto-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Automated response with a human approval gate",
+      "caption": "The system does the legwork; a person approves the risky step.",
+      "data": {
+        "actors": [
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "Alert source",
+            "icon": "log"
+          },
+          {
+            "id": "soar",
+            "label": "SOAR",
+            "sub": "Playbook runner",
+            "icon": "cpu"
+          },
+          {
+            "id": "ti",
+            "label": "Intel + CMDB",
+            "sub": "Context",
+            "icon": "database"
+          },
+          {
+            "id": "an",
+            "label": "Analyst",
+            "sub": "Approver",
+            "icon": "user"
+          },
+          {
+            "id": "edr",
+            "label": "EDR",
+            "sub": "Containment",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "from": "siem",
+            "to": "soar",
+            "label": "Alert ALRT-5521",
+            "detail": "Webhook",
+            "note": "SIEM sends a high-severity alert and the playbook starts."
+          },
+          {
+            "from": "soar",
+            "to": "ti",
+            "label": "Enrich",
+            "detail": "host, user, hash",
+            "note": "The playbook gathers owner, criticality and reputation."
+          },
+          {
+            "from": "ti",
+            "to": "soar",
+            "label": "Context returned",
+            "detail": "workstation, finance",
+            "note": "Read-only steps finished with no side effects.",
+            "tone": "secure"
+          },
+          {
+            "from": "soar",
+            "to": "an",
+            "label": "Approval request",
+            "detail": "summary + evidence",
+            "note": "A chat message shows the evidence and asks for approval to isolate.",
+            "tone": "warning"
+          },
+          {
+            "from": "an",
+            "to": "soar",
+            "label": "Approved",
+            "detail": "by analyst",
+            "note": "A person accepts responsibility for the risky action.",
+            "tone": "success"
+          },
+          {
+            "from": "soar",
+            "to": "edr",
+            "label": "Isolate host",
+            "detail": "ws-0412",
+            "note": "The EDR API call runs with the ticket ID as the reason.",
+            "tone": "blocked"
+          },
+          {
+            "from": "soar",
+            "to": "soar",
+            "label": "Audit entry written",
+            "detail": "who, what, when",
+            "note": "The case records the decision trail and a rollback command.",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "fail",
+      "type": "text",
+      "markdown": "## Failure modes to design against\n\nAutomation fails in ways manual work does not, because it fails fast and at scale.\n\n- **Runaway loops.** An isolation playbook triggered by an alert that its own action creates. Add rate limits, such as three isolations per hour, and a global pause switch.\n- **Stale credentials.** A service account token expires and the playbook silently stops. Alert on playbook failures and run a daily heartbeat test.\n- **Unreviewed exclusions.** An allow-list added during a noisy week lives forever. Give every exclusion an owner and an expiry date.\n- **Over-trust.** Analysts stop checking automated verdicts. Sample 5% of auto-closed alerts for human review each week.\n- **Hidden dependencies.** A third-party API changes its response format. Pin versions and test integrations on a schedule."
+    },
+    {
+      "id": "warn-auto",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Automated containment is a weapon pointed at your own network",
+      "markdown": "A bug, a spoofed alert or a bad allow-list can make your playbook isolate the wrong machines at scale. Require approval for anything hard to undo, exclude critical assets by default, and keep a tested rollback for every action."
+    },
+    {
+      "id": "tip-measure",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Measure the time you give back",
+      "markdown": "Track minutes saved per alert type, the share of alerts fully handled by automation, and the false action rate. If you cannot show a number to the SOC manager, the next automation project will not get funded."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "1. In a lab, copy the script and replace the SIEM calls with a local JSON file of three fake alerts and assets.\n2. Run it with `DRY_RUN=1` and confirm each alert gets the expected action.\n3. Add a guardrail: refuse to act on any host whose name starts with `dc-`.\n4. Write one test that runs the same alert twice and asserts the second run logs `skip`.\n5. Add a rate limit and prove it works by feeding in ten alerts for ten hosts."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "SOAR",
+          "definition": "A platform that orchestrates tools and automates response steps with case management and audit trails."
+        },
+        {
+          "term": "Enrichment",
+          "definition": "Adding context such as owner, criticality and reputation to an alert."
+        },
+        {
+          "term": "Idempotency",
+          "definition": "The property that running an action twice has the same effect as running it once."
+        },
+        {
+          "term": "Dry run",
+          "definition": "Executing a workflow so it reports decisions without making changes."
+        },
+        {
+          "term": "Guardrail",
+          "definition": "A built-in limit that prevents automation from causing harm, such as a rate limit or an exclusion list."
+        },
+        {
+          "term": "Human in the loop",
+          "definition": "A workflow step that requires a person's approval before a risky action."
+        },
+        {
+          "term": "Audit trail",
+          "definition": "A tamper-resistant record of what was decided, by whom and when."
+        },
+        {
+          "term": "Rollback",
+          "definition": "A tested procedure that reverses an automated action."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which task is the safest first candidate for full automation?",
+          "options": [
+            "Isolating production servers",
+            "Looking up host owner and criticality",
+            "Deleting user accounts",
+            "Changing firewall rules"
+          ],
+          "answer": 1,
+          "explanation": "Enrichment is read-only, frequent and predictable, so errors cost almost nothing."
+        },
+        {
+          "question": "What does idempotency protect against?",
+          "options": [
+            "Slow API calls",
+            "Duplicate triggers causing repeated actions",
+            "Weak passwords",
+            "Missing logs"
+          ],
+          "answer": 1,
+          "explanation": "If the same alert fires twice, an idempotent workflow recognizes it and does not act again."
+        },
+        {
+          "question": "Which are good guardrails for an isolation playbook? (Choose all that apply.)",
+          "options": [
+            "A rate limit per hour",
+            "Excluding domain controllers by default",
+            "Hard-coding the API token in the script",
+            "A global pause switch"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Rate limits, exclusions and a kill switch limit damage. Hard-coded secrets are a vulnerability, not a guardrail."
+        },
+        {
+          "question": "Why should every allow-list entry have an owner and an expiry date?",
+          "options": [
+            "To make the list longer",
+            "So exclusions are reviewed instead of living forever",
+            "Because SOAR requires it",
+            "To reduce licensing costs"
+          ],
+          "answer": 1,
+          "explanation": "Unreviewed exclusions silently become blind spots."
+        },
+        {
+          "question": "Which practices keep analysts from over-trusting automation? (Choose all that apply.)",
+          "options": [
+            "Sampling auto-closed alerts for review",
+            "Logging every automated decision",
+            "Hiding automated verdicts from the ticket",
+            "Tracking the false action rate"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Sampling, logging and measuring errors keep automation accountable. Hiding verdicts removes the evidence reviewers need."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Choose automation targets by frequency, predictability and cost of error; start with read-only enrichment.\n- Use SOAR for workflow and approvals and keep logic in version control with tests.\n- Build guardrails: dry run, idempotency, rate limits, exclusions, audit logging and rollback.\n- Keep humans in the loop for hard-to-reverse actions.\n- Measure time saved and error rates, and sample automated decisions for review.\n\nThe measurements from this lesson feed directly into [Continuous Security Improvement](/learn/security-operations-dfir/continuous-security-improvement)."
+    }
+  ],
+  "ar": {
+    "title": "هندسة الأتمتة الأمنية",
+    "summary": "تعلّم أيّ المهام الأمنية تُؤتمت، وكيف تبني الضوابط الواقية في أدلة الإجراءات والسكربتات، وأين يجب أن يبقى الإنسان في الحلقة.",
+    "objectives": [
+      "تقييم مدى ملاءمة المهام الأمنية للأتمتة",
+      "المقارنة بين منصّات SOAR والأتمتة بالسكربتات",
+      "بناء ضوابط واقية: تجربة جافة وعدم تأثّر بالتكرار وحدود معدّل وسجلّات تدقيق",
+      "تصميم مسار عمل ببوابة موافقة بشرية",
+      "تحديد أنماط فشل الأتمتة الشائعة والحدّ منها"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يغلق مركز العمليات الأمنية لديك 600 تنبيه يوميًا. أربعون بالمئة منها ثلاثة أنماط حميدة متكرّرة، ويستغرق كلٌّ منها أربع دقائق من المحلّل: البحث عن مالك المضيف، وفحص التنبيهات الأخيرة، ومعرفة آخر تسجيل دخول للمستخدم، ثم إغلاق التذكرة. هذه 16 ساعة عمل متكرّر، ويحظى الهجوم الحقيقي الوحيد وسط الكومة بالانتباه المتعب نفسه.\n\nتعامل **هندسة الأتمتة الأمنية (Security Automation Engineering)** هذا العمل بوصفه برمجيات. فأنت تصمّم مسارات عمل تجمع السياق، وتتخذ بنفسها القرارات منخفضة المخاطر، وتسلّم القرارات الصعبة إلى البشر والأدلة مرفقة. يبني هذا الدرس على [Enterprise Security Engineering](/learn/security-operations-dfir/enterprise-security-engineering) ويمهّد لـ[Continuous Security Improvement](/learn/security-operations-dfir/continuous-security-improvement)."
+      },
+      {
+        "id": "what",
+        "type": "text",
+        "markdown": "## الخطوة 1: قرّر ما يستحق الأتمتة\n\nليست كلّ مهمة صالحة للأتمتة. قيِّم كلَّ مرشّحة بثلاثة أسئلة: كم مرة تحدث؟ وما مدى قابلية الجواب الصحيح للتنبؤ؟ وما مدى سوء الإجراء الخاطئ؟\n\n| المهمة | التكرار | قابلة للتنبؤ؟ | كلفة الخطأ | الحكم |\n|:--|:--|:--|:--|:--|\n| البحث عن مالك المضيف وأهميته | مرتفع جدًا | نعم | لا شيء | أتمتة كاملة |\n| فحص سمعة الروابط والبصمات | مرتفع جدًا | في الغالب | منخفضة | أتمتة كاملة |\n| إغلاق تنبيهات الماسحات الحميدة المعروفة | مرتفع | نعم | منخفضة وقابلة للتراجع | أتمتة مع تسجيل |\n| تعطيل حساب مستخدم | متوسط | تعتمد | مرتفعة | أتمتة بموافقة بشرية |\n| عزل خادم إنتاج | منخفض | لا | مرتفعة جدًا | توصية فقط |\n\nابدأ من أعلى الجدول. الإثراء (Enrichment) أأمن هدف أول لأنه يقرأ البيانات فقط. ولا تنزل إلى ما تحته إلا بعد أن تعمل الخطوات السابقة بموثوقية أسابيع."
+      },
+      {
+        "id": "arch",
+        "type": "text",
+        "markdown": "## الخطوة 2: اختر الأداة المناسبة\n\nتمنحك منصّة **SOAR** (التنسيق والأتمتة والاستجابة الأمنية) موصّلات ومصمّمًا مرئيًا وإدارة قضايا وسجلّات تدقيق. وتمنحك السكربتات البسيطة المرونة وسهولة ضبط الإصدارات. وكثير من الفرق تستعمل الاثنين: SOAR لمسار العمل والموافقات، ودوالّ صغيرة مختبَرة للمنطق المخصّص.\n\nوأيًّا كان اختيارك فطبّق قواعد هندسة البرمجيات: احفظ المسارات في Git، وراجع التغييرات، واكتب اختبارات بتنبيهات عيّنة مسجّلة، وثبّت إصدارات التكاملات. وينبغي أن يوصل خطُّ الإنتاج نفسه الذي يوصل قواعد الكشف، كما في [Advanced Detection Engineering](/learn/security-operations-dfir/advanced-detection-engineering)، الأتمتةَ أيضًا."
+      },
+      {
+        "id": "code-intro",
+        "type": "text",
+        "markdown": "## الخطوة 3: ابنِ الضوابط الواقية داخل الشيفرة\n\nيثري السكربت أدناه التنبيه ثم يختار من ثلاث نتائج. انظر إلى ما يجعله آمنًا لا إلى ما يجعله مفيدًا فقط: فهو يعمل افتراضيًا في وضع التجربة الجافة، ويقرأ الرمز من البيئة، ويتخطى التنبيهات التي عالجها من قبل، ويصعّد كلّ ما يمسّ الأصول الحرجة، ويسجّل كلّ قرار بصيغة JSON منظّمة."
+      },
+      {
+        "id": "triage-code",
+        "type": "code",
+        "language": "python",
+        "code": "#!/usr/bin/env python3\n\"\"\"Enrich a SIEM alert, then decide: auto-close, ask a human, or contain.\"\"\"\nimport json, os, sys, time, requests\n\nSIEM = \"https://siem.example.com/api\"\nTOKEN = os.environ[\"SIEM_API_TOKEN\"]          # never hard-code secrets\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"1\") == \"1\"  # safe by default\nMAX_ISOLATIONS_PER_HOUR = 3                   # guardrail against runaway loops\n\ndef api(method, path, **kw):\n    r = requests.request(method, f\"{SIEM}{path}\", timeout=10,\n                         headers={\"Authorization\": f\"Bearer {TOKEN}\"}, **kw)\n    r.raise_for_status()\n    return r.json()\n\ndef audit(alert_id, action, detail):\n    # every decision is written down, including \"did nothing\"\n    print(json.dumps({\"ts\": int(time.time()), \"alert\": alert_id,\n                      \"action\": action, \"detail\": detail}))\n\ndef handle(alert_id):\n    a = api(\"GET\", f\"/alerts/{alert_id}\")\n    if a.get(\"handled_by\"):                    # idempotent: skip repeated runs\n        return audit(alert_id, \"skip\", \"already handled\")\n    host = a[\"host\"]\n    ctx = api(\"GET\", f\"/assets/{host}\")        # owner, criticality, tags\n    seen = api(\"GET\", f\"/alerts?host={host}&window=24h\")[\"count\"]\n\n    if ctx[\"criticality\"] == \"high\" or ctx[\"tags\"].count(\"server\"):\n        return audit(alert_id, \"escalate\", f\"{host} is critical, human decides\")\n    if seen >= 3 and a[\"severity\"] >= 7:\n        if DRY_RUN:\n            return audit(alert_id, \"would-isolate\", host)\n        api(\"POST\", f\"/hosts/{host}/isolate\", json={\"reason\": alert_id})\n        return audit(alert_id, \"isolated\", host)\n    api(\"POST\", f\"/alerts/{alert_id}/close\", json={\"verdict\": \"benign-known\"})\n    audit(alert_id, \"closed\", \"low severity, no repeats\")\n\nif __name__ == \"__main__\":\n    handle(sys.argv[1])",
+        "filename": "triage.py",
+        "caption": "سكربت فرز تنبيهات مع تجربة جافة وعدم تأثّر بالتكرار وتصعيد وتسجيل تدقيق."
+      },
+      {
+        "id": "run",
+        "type": "text",
+        "markdown": "## الخطوة 4: اختبر أولًا بالتجربة الجافة\n\nشغّل السكربت على تنبيهات حقيقية مع `DRY_RUN=1` واقرأ سجلّ التدقيق. يُظهر التشغيل الأول أنّ السكربت كان سيعزل محطّة عمل، ويُظهر الثاني أنّه يصعّد قاعدة بيانات إنتاج بدل أن يمسّها، ويُظهر الثالث أنّ التشغيل المكرّر لا يفعل شيئًا. هذه الخصائص الثلاث (معاينة آمنة، واستثناء الأصول الحرجة، وعدم التأثّر بالتكرار) هي ما تتحقّق منه قبل تفعيل الإجراءات الفعلية."
+      },
+      {
+        "id": "run-term",
+        "type": "terminal",
+        "title": "Dry-run results",
+        "lines": [
+          {
+            "cmd": "DRY_RUN=1 python triage.py ALRT-5521"
+          },
+          {
+            "output": "{\"ts\": 1767225600, \"alert\": \"ALRT-5521\", \"action\": \"would-isolate\", \"detail\": \"ws-0412.example.com\"}",
+            "comment": "dry run: nothing changed, decision logged"
+          },
+          {
+            "cmd": "DRY_RUN=1 python triage.py ALRT-5522"
+          },
+          {
+            "output": "{\"ts\": 1767225604, \"alert\": \"ALRT-5522\", \"action\": \"escalate\", \"detail\": \"db-prod-01.example.com is critical, human decides\"}"
+          },
+          {
+            "cmd": "python triage.py ALRT-5521"
+          },
+          {
+            "output": "{\"ts\": 1767225610, \"alert\": \"ALRT-5521\", \"action\": \"skip\", \"detail\": \"already handled\"}",
+            "comment": "idempotency: a duplicate trigger is harmless"
+          }
+        ],
+        "caption": "ثلاث تشغيلات: معاينة وتصعيد وتشغيل مكرّر."
+      },
+      {
+        "id": "flow",
+        "type": "text",
+        "markdown": "## الخطوة 5: ضع البشر حيث يلزم الحكم\n\nتتوقف مسارات العمل الجيدة لطلب الموافقة بدل التخمين. يعرض التسلسل استجابة آلية يؤدي فيها النظام الجهد المتكرّر ويوافق إنسان على الإجراء الخطِر الوحيد."
+      },
+      {
+        "id": "auto-seq",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "استجابة آلية ببوابة موافقة بشرية",
+        "caption": "يؤدي النظام الجهد المتكرّر ويوافق إنسان على الخطوة الخطِرة.",
+        "data": {
+          "actors": [
+            {
+              "id": "siem",
+              "label": "SIEM",
+              "sub": "مصدر التنبيه",
+              "icon": "log"
+            },
+            {
+              "id": "soar",
+              "label": "SOAR",
+              "sub": "منفّذ دليل الإجراءات",
+              "icon": "cpu"
+            },
+            {
+              "id": "ti",
+              "label": "الاستخبارات وCMDB",
+              "sub": "السياق",
+              "icon": "database"
+            },
+            {
+              "id": "an",
+              "label": "المحلّل",
+              "sub": "جهة الموافقة",
+              "icon": "user"
+            },
+            {
+              "id": "edr",
+              "label": "EDR",
+              "sub": "الاحتواء",
+              "icon": "shield"
+            }
+          ],
+          "steps": [
+            {
+              "from": "siem",
+              "to": "soar",
+              "label": "التنبيه ALRT-5521",
+              "detail": "Webhook",
+              "note": "ينطلق خطّ العمل عند وصول تنبيه عالي الخطورة من SIEM."
+            },
+            {
+              "from": "soar",
+              "to": "ti",
+              "label": "إثراء",
+              "detail": "host, user, hash",
+              "note": "يجمع دليل الإجراءات المالك والأهمية والسمعة."
+            },
+            {
+              "from": "ti",
+              "to": "soar",
+              "label": "عاد السياق",
+              "detail": "workstation, finance",
+              "note": "اكتملت الخطوات القرائية دون أيّ أثر جانبي.",
+              "tone": "secure"
+            },
+            {
+              "from": "soar",
+              "to": "an",
+              "label": "طلب موافقة",
+              "detail": "summary + evidence",
+              "note": "تعرض رسالة محادثة الأدلّة وتطلب الموافقة على العزل.",
+              "tone": "warning"
+            },
+            {
+              "from": "an",
+              "to": "soar",
+              "label": "تمت الموافقة",
+              "detail": "by analyst",
+              "note": "يتحمّل إنسان مسؤولية الإجراء الخطِر.",
+              "tone": "success"
+            },
+            {
+              "from": "soar",
+              "to": "edr",
+              "label": "عزل المضيف",
+              "detail": "ws-0412",
+              "note": "يُنفَّذ استدعاء واجهة EDR ومعرّف التذكرة هو السبب.",
+              "tone": "blocked"
+            },
+            {
+              "from": "soar",
+              "to": "soar",
+              "label": "كُتب إدخال التدقيق",
+              "detail": "who, what, when",
+              "note": "تسجّل القضية مسار القرار وأمر التراجع.",
+              "tone": "secure"
+            }
+          ]
+        }
+      },
+      {
+        "id": "fail",
+        "type": "text",
+        "markdown": "## أنماط الفشل التي يجب التصميم ضدّها\n\nتفشل الأتمتة بطرق لا يفشل بها العمل اليدوي، لأنها تفشل بسرعة وعلى نطاق واسع.\n\n- **الحلقات المنفلتة.** دليل عزل ينطلق بتنبيه ينتجه إجراؤه نفسه. أضف حدودًا للمعدّل، مثل ثلاث عمليات عزل في الساعة، ومفتاح إيقاف شاملًا.\n- **بيانات اعتماد منتهية.** ينتهي رمز حساب الخدمة فيتوقف الدليل بصمت. نبّه عند فشل الأدلّة وشغّل اختبار نبض يوميًا.\n- **استثناءات غير مراجَعة.** قائمة سماح أُضيفت في أسبوع صاخب تبقى للأبد. أعطِ كلّ استثناء مالكًا وتاريخ انتهاء.\n- **الثقة الزائدة.** يتوقف المحلّلون عن فحص الأحكام الآلية. خذ عيّنة 5% من التنبيهات المغلقة آليًا للمراجعة البشرية كلَّ أسبوع.\n- **اعتماديات خفية.** تغيّر واجهة طرف ثالث صيغة استجابتها. ثبّت الإصدارات واختبر التكاملات وفق جدول."
+      },
+      {
+        "id": "warn-auto",
+        "type": "callout",
+        "variant": "warning",
+        "title": "الاحتواء الآلي سلاح موجَّه إلى شبكتك أنت",
+        "markdown": "قد يجعل خطأ برمجي أو تنبيه مزوَّر أو قائمة سماح سيئة دليلَك يعزل الأجهزة الخاطئة على نطاق واسع. اشترط الموافقة لكلّ ما يصعب التراجع عنه، واستثنِ الأصول الحرجة افتراضيًا، واحتفظ بتراجع مختبَر لكلّ إجراء."
+      },
+      {
+        "id": "tip-measure",
+        "type": "callout",
+        "variant": "tip",
+        "title": "قِس الوقت الذي أعدته",
+        "markdown": "تتبّع الدقائق الموفَّرة لكلّ نوع تنبيه، ونسبة التنبيهات المعالَجة آليًا بالكامل، ومعدّل الإجراءات الخاطئة. إذا عجزت عن عرض رقم على مدير المركز فلن يُموَّل مشروع الأتمتة التالي."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "1. في مختبر، انسخ السكربت واستبدل استدعاءات SIEM بملف JSON محلي فيه ثلاثة تنبيهات وأصول وهمية.\n2. شغّله مع `DRY_RUN=1` وتأكّد أنّ كلّ تنبيه ينال الإجراء المتوقع.\n3. أضف ضابطًا واقيًا: ارفض التصرف في أيّ مضيف يبدأ اسمه بـ `dc-`.\n4. اكتب اختبارًا يشغّل التنبيه نفسه مرتين ويؤكّد أنّ التشغيل الثاني يسجّل `skip`.\n5. أضف حدًّا للمعدّل وأثبت عمله بتغذيته بعشرة تنبيهات لعشرة مضيفين."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "SOAR",
+            "definition": "منصّة تنسّق الأدوات وتؤتمت خطوات الاستجابة مع إدارة القضايا وسجلّات التدقيق."
+          },
+          {
+            "term": "الإثراء (Enrichment)",
+            "definition": "إضافة سياق مثل المالك والأهمية والسمعة إلى التنبيه."
+          },
+          {
+            "term": "عدم التأثّر بالتكرار (Idempotency)",
+            "definition": "خاصية أن يكون لتنفيذ الإجراء مرتين الأثر نفسه كتنفيذه مرة واحدة."
+          },
+          {
+            "term": "التجربة الجافة (Dry Run)",
+            "definition": "تنفيذ مسار العمل بحيث يعلن قراراته دون إجراء أيّ تغيير."
+          },
+          {
+            "term": "الضابط الواقي (Guardrail)",
+            "definition": "حدّ مدمج يمنع الأتمتة من إحداث ضرر، مثل حدّ المعدّل أو قائمة الاستثناء."
+          },
+          {
+            "term": "الإنسان في الحلقة (Human in the Loop)",
+            "definition": "خطوة في مسار العمل تتطلّب موافقة شخص قبل إجراء خطِر."
+          },
+          {
+            "term": "سجلّ التدقيق (Audit Trail)",
+            "definition": "سجلّ يصعب العبث به لما تقرّر ومن قرّره ومتى."
+          },
+          {
+            "term": "التراجع (Rollback)",
+            "definition": "إجراء مختبَر يعكس إجراءً آليًا."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أيّ المهام أأمن مرشّح أول للأتمتة الكاملة؟",
+            "options": [
+              "عزل خوادم الإنتاج",
+              "البحث عن مالك المضيف وأهميته",
+              "حذف حسابات المستخدمين",
+              "تغيير قواعد جدار الحماية"
+            ],
+            "answer": 1,
+            "explanation": "الإثراء قرائي وكثير التكرار وقابل للتنبؤ، فكلفة أخطائه شبه معدومة."
+          },
+          {
+            "question": "مِمَّ تحمي خاصية عدم التأثّر بالتكرار؟",
+            "options": [
+              "بطء استدعاءات الواجهة",
+              "تكرار التشغيل الذي يسبّب إجراءات متكررة",
+              "كلمات المرور الضعيفة",
+              "السجلّات المفقودة"
+            ],
+            "answer": 1,
+            "explanation": "إذا انطلق التنبيه نفسه مرتين فإنّ المسار غير المتأثّر بالتكرار يتعرّف عليه ولا يتصرّف ثانية."
+          },
+          {
+            "question": "أيّ مما يلي ضوابط واقية جيدة لدليل العزل؟ (اختر كلّ ما ينطبق)",
+            "options": [
+              "حدّ للمعدّل في الساعة",
+              "استثناء وحدات تحكّم النطاق افتراضيًا",
+              "كتابة رمز الواجهة داخل السكربت",
+              "مفتاح إيقاف شامل"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "حدود المعدّل والاستثناءات ومفتاح الإيقاف تحدّ الضرر، أمّا الأسرار المكتوبة في الشيفرة فثغرة لا ضابط."
+          },
+          {
+            "question": "لماذا يجب أن يكون لكلّ استثناء مالك وتاريخ انتهاء؟",
+            "options": [
+              "لإطالة القائمة",
+              "لتُراجَع الاستثناءات بدل أن تبقى للأبد",
+              "لأنّ SOAR تشترط ذلك",
+              "لتخفيض كلفة التراخيص"
+            ],
+            "answer": 1,
+            "explanation": "الاستثناءات غير المراجَعة تتحوّل بصمت إلى نقاط عمياء."
+          },
+          {
+            "question": "أيّ الممارسات تمنع المحلّلين من الثقة الزائدة بالأتمتة؟ (اختر كلّ ما ينطبق)",
+            "options": [
+              "أخذ عيّنات من التنبيهات المغلقة آليًا للمراجعة",
+              "تسجيل كلّ قرار آلي",
+              "إخفاء الأحكام الآلية عن التذكرة",
+              "تتبّع معدّل الإجراءات الخاطئة"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تبقي العيّنات والتسجيل وقياس الأخطاء الأتمتةَ خاضعة للمساءلة، أمّا إخفاء الأحكام فيزيل الأدلّة التي يحتاجها المراجعون."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- اختر أهداف الأتمتة بحسب التكرار وقابلية التنبؤ وكلفة الخطأ، وابدأ بالإثراء القرائي.\n- استخدم SOAR لمسار العمل والموافقات، وأبقِ المنطق في نظام ضبط الإصدارات مع اختبارات.\n- ابنِ الضوابط الواقية: التجربة الجافة وعدم التأثّر بالتكرار وحدود المعدّل والاستثناءات وتسجيل التدقيق والتراجع.\n- أبقِ الإنسان في الحلقة للإجراءات التي يصعب التراجع عنها.\n- قِس الوقت الموفَّر ومعدّلات الخطأ، وخذ عيّنات من القرارات الآلية للمراجعة.\n\nوتغذّي قياسات هذا الدرس مباشرةً [Continuous Security Improvement](/learn/security-operations-dfir/continuous-security-improvement)."
+      }
+    ]
+  }
+}

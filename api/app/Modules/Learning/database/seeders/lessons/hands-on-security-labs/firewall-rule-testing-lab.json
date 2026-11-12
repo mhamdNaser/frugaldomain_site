@@ -1,0 +1,604 @@
+{
+  "slug": "firewall-rule-testing-lab",
+  "title": "Firewall Rule Testing Lab",
+  "summary": "Write a firewall policy as a table, implement it in nftables on a gateway you own, and verify it with a test matrix of positive and negative tests, nmap and log review.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Express a segmentation policy as a zone table and ruleset",
+    "Explain first-match evaluation and connection tracking",
+    "Build and run a positive and negative test matrix",
+    "Diagnose rules that allow more than intended",
+    "Use firewall logs as evidence and for detection"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A firewall ruleset is a promise: \"only these flows are allowed.\" Most teams write the rules, see the application still works and stop there. They never check the second half of the promise, which is that everything else is blocked. Months later an old temporary rule, a wrong CIDR mask or a rule in the wrong order quietly lets traffic through.\n\nThis lab teaches you to **test** a firewall like an engineer. You write a policy on a Linux gateway you own, turn it into a test matrix of expected results, run the tests from two lab VMs and compare the outcome with your expectation. The method works for nftables, pfSense, OPNsense and Cisco firewalls alike. If you have not built your segments yet, start with [Multi-VLAN Network Security Lab](/learn/hands-on-security-labs/multi-vlan-network-security-lab)."
+    },
+    {
+      "id": "method",
+      "type": "text",
+      "markdown": "## Step 1: Write the policy as a table first\n\nBefore you touch the firewall, write down what each zone may do. Our lab has three zones behind one gateway:\n\n| Zone | Subnet | Role |\n|:--|:--|:--|\n| LAN | `10.10.10.0/24` | Staff clients |\n| DMZ | `10.10.20.0/24` | Web server `10.10.20.10` |\n| Lab (untrusted) | `10.10.30.0/24` | Test attacker VM, you own it |\n\nThe policy is: LAN may reach the DMZ on TCP/443 and the internet on TCP/80 and 443. The untrusted zone may reach the DMZ on TCP/443 only. The DMZ may not start any connection into the LAN. Everything else is denied and logged.\n\nNow turn each sentence into **positive and negative tests**. A positive test proves an allowed flow works. A negative test proves a forbidden flow fails. Negative tests find the real mistakes."
+    },
+    {
+      "id": "nft",
+      "type": "code",
+      "language": "bash",
+      "filename": "/etc/nftables.conf",
+      "caption": "A forward-chain ruleset for the lab gateway. Interface names are examples.",
+      "highlight": [
+        5,
+        6,
+        8,
+        9,
+        10,
+        12
+      ],
+      "code": "table inet filter {\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related accept\n    iifname \"eth1\" ip daddr 10.10.20.10 tcp dport 443 accept   # LAN -> DMZ web\n    iifname \"eth1\" oifname \"eth0\" tcp dport { 80, 443 } accept # LAN -> internet\n    iifname \"eth3\" ip daddr 10.10.20.10 tcp dport 443 accept   # Lab -> DMZ web\n    iifname \"eth2\" ip daddr 10.10.10.0/24 log prefix \"DMZ-TO-LAN \" drop\n    log prefix \"FW-DENY \" limit rate 10/second\n  }\n}\n"
+    },
+    {
+      "id": "anim-intro",
+      "type": "text",
+      "markdown": "## Step 2: See how a packet is judged\n\nA stateful firewall evaluates the **first** packet of a flow against the rules from top to bottom. The first match decides. Later packets of an allowed flow are matched by the connection tracking table, which is why `ct state established,related accept` appears first.\n\nThe animation follows three packets from the untrusted lab VM. Watch where each one is decided."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Three packets from the untrusted lab VM",
+      "caption": "Only the packet that matches an explicit allow rule is forwarded; the rest meet the default drop.",
+      "data": {
+        "token": "TCP/443",
+        "nodes": [
+          {
+            "id": "src",
+            "label": "Lab VM",
+            "sub": "10.10.30.50",
+            "icon": "attacker"
+          },
+          {
+            "id": "fw",
+            "label": "Gateway",
+            "sub": "nftables",
+            "icon": "firewall"
+          },
+          {
+            "id": "dmz",
+            "label": "DMZ web",
+            "sub": "10.10.20.10",
+            "icon": "server"
+          },
+          {
+            "id": "lan",
+            "label": "LAN",
+            "sub": "10.10.10.0/24",
+            "icon": "desktop"
+          },
+          {
+            "id": "log",
+            "label": "Log",
+            "sub": "FW-DENY",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "src",
+            "caption": "The lab VM sends a SYN to 10.10.20.10 on TCP/443."
+          },
+          {
+            "at": "fw",
+            "caption": "The rule for the Lab zone to the DMZ web server matches.",
+            "tone": "success"
+          },
+          {
+            "at": "dmz",
+            "caption": "The packet is forwarded and the web server answers; conntrack stores the flow.",
+            "tone": "success"
+          },
+          {
+            "at": "src",
+            "token": "TCP/22",
+            "caption": "Next the lab VM tries SSH to the same server."
+          },
+          {
+            "at": "fw",
+            "token": "TCP/22",
+            "caption": "No allow rule matches port 22, so the chain policy drops it.",
+            "tone": "blocked"
+          },
+          {
+            "at": "log",
+            "token": "TCP/22",
+            "caption": "The drop is logged with the FW-DENY prefix for later review.",
+            "tone": "warning"
+          },
+          {
+            "at": "src",
+            "token": "TCP/445",
+            "caption": "Finally it tries SMB to a LAN host at 10.10.10.20."
+          },
+          {
+            "at": "fw",
+            "token": "TCP/445",
+            "caption": "The default drop applies; there is no path from Lab to LAN.",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "matrix",
+      "type": "text",
+      "markdown": "## Step 3: Build and run the test matrix\n\nA test matrix lists the source, destination, port and the **expected** result. Run each line and record the **actual** result. Any difference is a finding.\n\n| # | Source | Destination | Port | Expected |\n|:--|:--|:--|:--|:--|\n| 1 | LAN | DMZ web | 443 | open |\n| 2 | LAN | DMZ web | 22 | blocked |\n| 3 | Lab | DMZ web | 443 | open |\n| 4 | Lab | DMZ web | 22 | blocked |\n| 5 | Lab | LAN host | 445 | blocked |\n| 6 | DMZ | LAN host | any | blocked |\n\nUse `nmap` only against hosts **in your own lab**. A TCP connect scan with `-Pn` skips host discovery, so a filtered result is not confused with a dead host. Use `-p` to test exact ports, and `--reason` to learn why nmap decided what it did."
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "lab-vm 10.10.30.50",
+      "prompt": "$",
+      "caption": "Tests 3, 4 and 5 from the untrusted lab VM, with annotations.",
+      "lines": [
+        {
+          "cmd": "nmap -Pn -sT -p 443,22 --reason 10.10.20.10",
+          "output": "PORT    STATE    SERVICE REASON\n22/tcp  filtered ssh     no-response\n443/tcp open     https   syn-ack",
+          "comment": "443 is open; 22 is filtered because the drop gives no reply, which matches the expected result."
+        },
+        {
+          "cmd": "nc -zv -w 3 10.10.10.20 445",
+          "output": "nc: connect to 10.10.10.20 port 445 (tcp) timed out: Operation now in progress",
+          "comment": "Test 5 passes: no route from Lab to LAN."
+        },
+        {
+          "prompt": "gw$",
+          "cmd": "sudo journalctl -k --since '5 min ago' | grep FW-DENY | head -n 2",
+          "output": "Nov 12 10:02:11 gw kernel: FW-DENY IN=eth3 OUT=eth2 SRC=10.10.30.50 DST=10.10.20.10 PROTO=TCP SPT=51544 DPT=22\nNov 12 10:02:19 gw kernel: FW-DENY IN=eth3 OUT=eth1 SRC=10.10.30.50 DST=10.10.10.20 PROTO=TCP SPT=51602 DPT=445",
+          "comment": "Every denied test also appears in the gateway log with source, destination and port."
+        }
+      ]
+    },
+    {
+      "id": "findings",
+      "type": "text",
+      "markdown": "## Step 4: Read the results honestly\n\nSuppose test 6 had returned `open`. You would compare the rule list to the source address and look for the usual causes:\n\n- **Rule order**: a broad accept sits above a specific drop.\n- **Mask error**: `10.10.0.0/16` was typed instead of `/24`.\n- **Unscoped rule**: the rule lacks an interface, so it matches traffic from every zone.\n- **Forgotten temporary rule**: someone opened a port \"for an hour\" months ago.\n- **IPv6**: the IPv4 ruleset is strict, but the host also has IPv6 and no filter for it. The `inet` table in nftables covers both families, which is why this lab uses it.\n\nAlso check **egress** and **logging**. A firewall that blocks inbound but allows every outbound flow lets malware call home. A firewall without logs gives you no evidence during an incident. Feed the `FW-DENY` lines into the SIEM from [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab), and use them to detect scans.\n\nFinally, save the matrix and results as evidence. Re-run the same matrix after every rule change. That is regression testing for your network."
+    },
+    {
+      "id": "platforms",
+      "type": "text",
+      "markdown": "## Applying the method on other platforms\n\nThe matrix does not depend on nftables. On **pfSense** or **OPNsense**, the same six lines become interface rules plus a floating deny, and the log view replaces `journalctl`. On a Cisco ASA or Secure Firewall, you would read hit counts with `show access-list` and trace a synthetic packet with `packet-tracer`. The tool changes; the habit stays the same: state the expected result first, measure second, and investigate every difference.\n\nA useful rule is to keep one owner for the matrix. When several people edit rules but nobody owns the tests, the tests rot, and a firewall nobody can verify is a firewall you only hope is working."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Only scan what you own",
+      "markdown": "Run scans only against systems in your own lab or with written authorization. Scanning other networks can be illegal and can trigger real incident response. Keep the lab VMs on an isolated virtual network so test traffic cannot leave it."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Test before you apply",
+      "markdown": "Check a new ruleset with `sudo nft -c -f /etc/nftables.conf`, which validates syntax without loading it. Keep a console session open, and schedule a rollback such as `sleep 120 && nft -f /root/last-good.nft` so a mistake cannot lock you out of the gateway."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "With three VMs **you own** on an isolated virtual network (LAN client, DMZ web server, Lab VM) and a Linux gateway:\n\n1. Load the nftables example with your own interface names and run `sudo nft -c -f` first.\n2. Fill the six-line matrix with your actual addresses and run each test, recording expected and actual results.\n3. Break the ruleset on purpose: move a broad accept above the DMZ-to-LAN drop. Re-run test 6 and note which line changed.\n4. Fix it, then add IPv6 tests with `nmap -6` and confirm the `inet` table covers them.\n5. Count `FW-DENY` lines per source address with `grep` and `sort | uniq -c`.\n6. Save the matrix as `fw-tests.md` and re-run it after each change."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Stateful firewall",
+          "definition": "A firewall that tracks connections and automatically allows return traffic for allowed flows."
+        },
+        {
+          "term": "Default deny",
+          "definition": "A policy where anything not explicitly allowed is dropped."
+        },
+        {
+          "term": "Negative test",
+          "definition": "A test that proves a forbidden flow fails."
+        },
+        {
+          "term": "Test matrix",
+          "definition": "A table of sources, destinations, ports and expected results used to verify a ruleset."
+        },
+        {
+          "term": "Connection tracking",
+          "definition": "The kernel table that remembers active flows so replies match without extra rules."
+        },
+        {
+          "term": "Filtered port",
+          "definition": "An nmap state meaning probes got no answer or an error, usually because a firewall dropped them."
+        },
+        {
+          "term": "Egress filtering",
+          "definition": "Restricting outbound traffic to limit data theft and malware command channels."
+        },
+        {
+          "term": "Regression test",
+          "definition": "Re-running the same tests after a change to confirm nothing else broke."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why are negative tests essential when verifying a firewall?",
+          "options": [
+            "They are faster",
+            "They prove forbidden flows are actually blocked",
+            "They improve throughput",
+            "They replace logging"
+          ],
+          "answer": 1,
+          "explanation": "An application can work perfectly while a rule still allows far too much. Only negative tests reveal over-permissive rules."
+        },
+        {
+          "question": "nmap reports port 22 as filtered with reason no-response. What is the most likely cause?",
+          "options": [
+            "The service is open",
+            "A firewall silently dropped the probes",
+            "The host is powered off for sure",
+            "DNS failed"
+          ],
+          "answer": 1,
+          "explanation": "A drop gives no reply, so nmap cannot tell open from closed and reports filtered. A reject would give an immediate refusal instead."
+        },
+        {
+          "question": "Which are typical causes of a rule letting traffic through that should be blocked? (Choose all that apply.)",
+          "options": [
+            "A broad accept above a specific drop",
+            "A wrong subnet mask",
+            "Logging enabled on the drop rule",
+            "A forgotten temporary rule"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Rule order, mask mistakes and leftover temporary rules are classic causes. Logging a drop does not change its verdict."
+        },
+        {
+          "question": "Why does the lab use an inet table in nftables?",
+          "options": [
+            "It covers IPv4 and IPv6 in one ruleset",
+            "It is required for logging",
+            "It disables NAT",
+            "It speeds up nmap"
+          ],
+          "answer": 0,
+          "explanation": "A single inet table applies the same policy to both families, which avoids an unfiltered IPv6 path."
+        },
+        {
+          "question": "What should you do after every firewall rule change?",
+          "options": [
+            "Nothing if the app still works",
+            "Re-run the saved test matrix and compare with expected results",
+            "Delete the logs",
+            "Disable the default drop"
+          ],
+          "answer": 1,
+          "explanation": "Re-running the same matrix is regression testing: it catches new gaps introduced by an otherwise correct change."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou wrote the policy as a table, expressed it in nftables, derived positive and negative tests, ran them from the right zones and compared actual results with expected ones. Rule order, masks, scope, IPv6 and forgotten rules are the usual culprits when results differ. Logging turns each test into evidence you can feed to a SIEM. Keep the matrix with the ruleset and re-run it on every change. The same discipline applies to detection systems: continue with [IDS/IPS Deployment Lab](/learn/hands-on-security-labs/ids-ips-deployment-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر اختبار قواعد الجدار الناري",
+    "summary": "اكتب سياسة جدار ناري في جدول ونفّذها في nftables على بوابة تملكها ثم تحقق منها بمصفوفة اختبارات إيجابية وسلبية وnmap ومراجعة السجلات.",
+    "objectives": [
+      "التعبير عن سياسة تقسيم الشبكة بجدول مناطق ومجموعة قواعد",
+      "شرح التقييم بأول تطابق وتتبع الاتصالات",
+      "بناء مصفوفة اختبار إيجابية وسلبية وتنفيذها",
+      "تشخيص القواعد التي تسمح بأكثر من المقصود",
+      "استخدام سجلات الجدار الناري دليلًا وللكشف"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "قاعدة جدار الحماية وعد: \"هذه التدفقات فقط مسموحة\". يكتب معظم الفرق القواعد ويرون أن التطبيق ما زال يعمل ثم يتوقفون. لا يتحققون من النصف الثاني من الوعد، وهو أن كل ما عداها محجوب. وبعد أشهر تسمح قاعدة مؤقتة قديمة أو قناع CIDR خاطئ أو قاعدة في ترتيب خاطئ بمرور حركة المرور بصمت.\n\nيعلّمك هذا المختبر **اختبار** الجدار الناري كمهندس. تكتب سياسة على بوابة Linux **تملكها**، وتحوّلها إلى مصفوفة اختبار بنتائج متوقعة، وتنفّذ الاختبارات من آلتين افتراضيتين في المختبر، ثم تقارن النتيجة بتوقعك. تصلح الطريقة لـ nftables وpfSense وOPNsense وجدران Cisco على حد سواء. وإن لم تبنِ شرائح الشبكة بعدُ فابدأ بـ [مختبر أمان الشبكة متعددة VLAN](/learn/hands-on-security-labs/multi-vlan-network-security-lab)."
+      },
+      {
+        "id": "method",
+        "type": "text",
+        "markdown": "## الخطوة 1: اكتب السياسة في جدول أولًا\n\nقبل أن تلمس الجدار الناري، دوّن ما يحق لكل منطقة فعله. في مختبرنا ثلاث مناطق خلف بوابة واحدة:\n\n| المنطقة | الشبكة الفرعية | الدور |\n|:--|:--|:--|\n| LAN | `10.10.10.0/24` | أجهزة الموظفين |\n| DMZ | `10.10.20.0/24` | خادم الويب `10.10.20.10` |\n| المختبر (غير موثوقة) | `10.10.30.0/24` | آلة المهاجم التجريبية التي تملكها |\n\nالسياسة: تصل LAN إلى DMZ عبر TCP/443 وإلى الإنترنت عبر TCP/80 و443. وتصل المنطقة غير الموثوقة إلى DMZ عبر TCP/443 فقط. ولا تبدأ DMZ أي اتصال نحو LAN. وكل ما عدا ذلك مرفوض ومسجَّل.\n\nثم حوّل كل جملة إلى **اختبارات إيجابية وسلبية**. يثبت الاختبار الإيجابي أن التدفق المسموح يعمل، ويثبت الاختبار السلبي أن التدفق الممنوع يفشل. والاختبارات السلبية هي التي تكشف الأخطاء الحقيقية."
+      },
+      {
+        "id": "nft",
+        "type": "code",
+        "language": "bash",
+        "filename": "/etc/nftables.conf",
+        "caption": "مجموعة قواعد لسلسلة forward في بوابة المختبر. أسماء الواجهات أمثلة.",
+        "highlight": [
+          5,
+          6,
+          8,
+          9,
+          10,
+          12
+        ],
+        "code": "table inet filter {\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related accept\n    iifname \"eth1\" ip daddr 10.10.20.10 tcp dport 443 accept   # LAN -> DMZ web\n    iifname \"eth1\" oifname \"eth0\" tcp dport { 80, 443 } accept # LAN -> internet\n    iifname \"eth3\" ip daddr 10.10.20.10 tcp dport 443 accept   # Lab -> DMZ web\n    iifname \"eth2\" ip daddr 10.10.10.0/24 log prefix \"DMZ-TO-LAN \" drop\n    log prefix \"FW-DENY \" limit rate 10/second\n  }\n}\n"
+      },
+      {
+        "id": "anim-intro",
+        "type": "text",
+        "markdown": "## الخطوة 2: كيف يُحكم على الحزمة\n\nيقيّم الجدار الناري ذو الحالة **أول** حزمة في التدفق مقابل القواعد من الأعلى إلى الأسفل. ويقرر أول تطابق. أما الحزم اللاحقة في تدفق مسموح فتطابقها جدول تتبع الاتصالات، ولهذا يظهر `ct state established,related accept` أولًا.\n\nيتتبّع الرسم المتحرك ثلاث حزم من آلة المختبر غير الموثوقة. لاحظ أين يُحسم كل منها."
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "ثلاث حزم من آلة المختبر غير الموثوقة",
+        "caption": "تُمرَّر الحزمة المطابقة لقاعدة سماح صريحة فقط، وتصطدم البقية بالحجب الافتراضي.",
+        "data": {
+          "token": "TCP/443",
+          "nodes": [
+            {
+              "id": "src",
+              "label": "آلة المختبر",
+              "sub": "10.10.30.50",
+              "icon": "attacker"
+            },
+            {
+              "id": "fw",
+              "label": "البوابة",
+              "sub": "nftables",
+              "icon": "firewall"
+            },
+            {
+              "id": "dmz",
+              "label": "خادم DMZ",
+              "sub": "10.10.20.10",
+              "icon": "server"
+            },
+            {
+              "id": "lan",
+              "label": "LAN",
+              "sub": "10.10.10.0/24",
+              "icon": "desktop"
+            },
+            {
+              "id": "log",
+              "label": "السجل",
+              "sub": "FW-DENY",
+              "icon": "log"
+            }
+          ],
+          "steps": [
+            {
+              "at": "src",
+              "caption": "ترسل آلة المختبر SYN إلى 10.10.20.10 على TCP/443."
+            },
+            {
+              "at": "fw",
+              "caption": "تطابق قاعدة منطقة المختبر إلى خادم DMZ.",
+              "tone": "success"
+            },
+            {
+              "at": "dmz",
+              "caption": "تُمرَّر الحزمة ويرد خادم الويب، ويخزّن conntrack التدفق.",
+              "tone": "success"
+            },
+            {
+              "at": "src",
+              "token": "TCP/22",
+              "caption": "بعد ذلك تجرّب آلة المختبر SSH إلى الخادم نفسه."
+            },
+            {
+              "at": "fw",
+              "token": "TCP/22",
+              "caption": "لا تطابق أي قاعدة سماح المنفذ 22 فتحجبه سياسة السلسلة.",
+              "tone": "blocked"
+            },
+            {
+              "at": "log",
+              "token": "TCP/22",
+              "caption": "يُسجَّل الحجب بالبادئة FW-DENY للمراجعة لاحقًا.",
+              "tone": "warning"
+            },
+            {
+              "at": "src",
+              "token": "TCP/445",
+              "caption": "وأخيرًا تجرّب SMB إلى مضيف في LAN عند 10.10.10.20."
+            },
+            {
+              "at": "fw",
+              "token": "TCP/445",
+              "caption": "يُطبَّق الحجب الافتراضي؛ فلا مسار من المختبر إلى LAN.",
+              "tone": "danger"
+            }
+          ]
+        }
+      },
+      {
+        "id": "matrix",
+        "type": "text",
+        "markdown": "## الخطوة 3: ابنِ مصفوفة الاختبار ونفّذها\n\nتسرد مصفوفة الاختبار المصدر والوجهة والمنفذ والنتيجة **المتوقعة**. نفّذ كل سطر وسجّل النتيجة **الفعلية**. وأي اختلاف هو نتيجة تدقيق.\n\n| # | المصدر | الوجهة | المنفذ | المتوقع |\n|:--|:--|:--|:--|:--|\n| 1 | LAN | خادم DMZ | 443 | مفتوح |\n| 2 | LAN | خادم DMZ | 22 | محجوب |\n| 3 | المختبر | خادم DMZ | 443 | مفتوح |\n| 4 | المختبر | خادم DMZ | 22 | محجوب |\n| 5 | المختبر | مضيف LAN | 445 | محجوب |\n| 6 | DMZ | مضيف LAN | أي | محجوب |\n\nاستخدم `nmap` ضد مضيفات **في مختبرك** فقط. يتخطى فحص اتصال TCP مع `-Pn` اكتشاف المضيف، فلا تُخلط نتيجة \"مفلتر\" مع مضيف ميت. واستخدم `-p` لاختبار منافذ محددة و`--reason` لتعرف سبب قرار nmap."
+      },
+      {
+        "id": "term",
+        "type": "terminal",
+        "title": "lab-vm 10.10.30.50",
+        "prompt": "$",
+        "caption": "الاختباران 3 و4 و5 من آلة المختبر غير الموثوقة مع شروح.",
+        "lines": [
+          {
+            "cmd": "nmap -Pn -sT -p 443,22 --reason 10.10.20.10",
+            "output": "PORT    STATE    SERVICE REASON\n22/tcp  filtered ssh     no-response\n443/tcp open     https   syn-ack",
+            "comment": "المنفذ 443 مفتوح و22 مفلتر لأن الحجب لا يعطي ردًا، وهذا يطابق المتوقع."
+          },
+          {
+            "cmd": "nc -zv -w 3 10.10.10.20 445",
+            "output": "nc: connect to 10.10.10.20 port 445 (tcp) timed out: Operation now in progress",
+            "comment": "ينجح الاختبار 5: لا مسار من المختبر إلى LAN."
+          },
+          {
+            "prompt": "gw$",
+            "cmd": "sudo journalctl -k --since '5 min ago' | grep FW-DENY | head -n 2",
+            "output": "Nov 12 10:02:11 gw kernel: FW-DENY IN=eth3 OUT=eth2 SRC=10.10.30.50 DST=10.10.20.10 PROTO=TCP SPT=51544 DPT=22\nNov 12 10:02:19 gw kernel: FW-DENY IN=eth3 OUT=eth1 SRC=10.10.30.50 DST=10.10.10.20 PROTO=TCP SPT=51602 DPT=445",
+            "comment": "كل اختبار مرفوض يظهر أيضًا في سجل البوابة مع المصدر والوجهة والمنفذ."
+          }
+        ]
+      },
+      {
+        "id": "findings",
+        "type": "text",
+        "markdown": "## الخطوة 4: اقرأ النتائج بأمانة\n\nلنفترض أن الاختبار 6 أعاد `open`. عندها تقارن قائمة القواعد بعنوان المصدر وتبحث عن الأسباب المعتادة:\n\n- **ترتيب القواعد**: قاعدة سماح واسعة تقع فوق قاعدة حجب محددة.\n- **خطأ القناع**: كُتب `10.10.0.0/16` بدلًا من `/24`.\n- **قاعدة غير محددة النطاق**: تفتقر القاعدة إلى واجهة فتطابق حركة المرور من كل المناطق.\n- **قاعدة مؤقتة منسية**: فتح أحدهم منفذًا \"لساعة\" قبل أشهر.\n- **IPv6**: مجموعة قواعد IPv4 صارمة، لكن المضيف يملك IPv6 أيضًا ولا مرشّح له. يغطي الجدول `inet` في nftables العائلتين معًا، ولهذا يستخدمه هذا المختبر.\n\nافحص أيضًا **الحركة الصادرة** و**التسجيل**. فالجدار الذي يحجب الوارد ويسمح بكل صادر يترك البرمجيات الخبيثة تتصل بمشغّلها. والجدار بلا سجلات لا يعطيك دليلًا أثناء الحادثة. أرسل أسطر `FW-DENY` إلى نظام SIEM من [مختبر SIEM المركزي](/learn/hands-on-security-labs/centralized-siem-lab) واستخدمها لكشف عمليات الفحص.\n\nوأخيرًا احفظ المصفوفة والنتائج دليلًا، وأعد تنفيذ المصفوفة نفسها بعد كل تغيير في القواعد. هذا هو اختبار الانحدار لشبكتك."
+      },
+      {
+        "id": "platforms",
+        "type": "text",
+        "markdown": "## تطبيق الطريقة على منصات أخرى\n\nلا تعتمد المصفوفة على nftables. ففي **pfSense** أو **OPNsense** تصبح الأسطر الستة نفسها قواعد على الواجهات مع قاعدة منع عائمة، ويحل عرض السجلات محل `journalctl`. وفي Cisco ASA أو Secure Firewall تقرأ عدّادات الإصابات بالأمر `show access-list` وتتتبع حزمة اصطناعية بالأمر `packet-tracer`. تتغير الأداة وتبقى العادة: اذكر النتيجة المتوقعة أولًا ثم قِس ثم تحرَّ كل اختلاف.\n\nمن القواعد المفيدة أن يكون للمصفوفة مالك واحد. فحين يعدّل عدة أشخاص القواعد ولا يملك أحد الاختبارات تتعفن الاختبارات، والجدار الناري الذي لا يستطيع أحد التحقق منه جدار تأمل فقط أن يعمل."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "افحص ما تملكه فقط",
+        "markdown": "نفّذ الفحص على الأنظمة الموجودة في مختبرك أو بإذن كتابي فقط. فقد يكون فحص شبكات الآخرين مخالفًا للقانون وقد يطلق استجابة حقيقية للحوادث. أبقِ آلات المختبر على شبكة افتراضية معزولة كي لا تغادرها حركة الاختبار."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "اختبر قبل أن تطبّق",
+        "markdown": "افحص مجموعة القواعد الجديدة بالأمر `sudo nft -c -f /etc/nftables.conf` الذي يتحقق من الصياغة دون تحميلها. أبقِ جلسة وحدة تحكم مفتوحة وجدول تراجعًا مثل `sleep 120 && nft -f /root/last-good.nft` كي لا يقفلك خطأ عن البوابة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "بثلاث آلات افتراضية **تملكها** على شبكة افتراضية معزولة (عميل LAN وخادم ويب DMZ وآلة المختبر) وبوابة Linux:\n\n1. حمّل مثال nftables بأسماء واجهاتك ونفّذ `sudo nft -c -f` أولًا.\n2. املأ المصفوفة ذات الأسطر الستة بعناوينك الفعلية ونفّذ كل اختبار وسجّل المتوقع والفعلي.\n3. اكسر القواعد عمدًا: انقل قاعدة سماح واسعة فوق حجب DMZ نحو LAN. أعد الاختبار 6 ولاحظ أي سطر تغيّر.\n4. أصلحها ثم أضف اختبارات IPv6 بـ `nmap -6` وتأكد أن الجدول `inet` يغطيها.\n5. عُدّ أسطر `FW-DENY` لكل عنوان مصدر بـ `grep` و`sort | uniq -c`.\n6. احفظ المصفوفة في `fw-tests.md` وأعد تنفيذها بعد كل تغيير."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "جدار ناري ذو حالة",
+            "definition": "جدار ناري يتتبع الاتصالات ويسمح تلقائيًا بحركة الرد للتدفقات المسموحة."
+          },
+          {
+            "term": "الحجب الافتراضي",
+            "definition": "سياسة يُحجب فيها كل ما لم يُسمح به صراحةً."
+          },
+          {
+            "term": "اختبار سلبي",
+            "definition": "اختبار يثبت أن التدفق الممنوع يفشل."
+          },
+          {
+            "term": "مصفوفة الاختبار",
+            "definition": "جدول مصادر ووجهات ومنافذ ونتائج متوقعة يُستخدم للتحقق من مجموعة القواعد."
+          },
+          {
+            "term": "تتبع الاتصالات",
+            "definition": "جدول النواة الذي يتذكر التدفقات النشطة فتطابق الردود دون قواعد إضافية."
+          },
+          {
+            "term": "منفذ مفلتر",
+            "definition": "حالة في nmap تعني أن الفحوص لم تتلقَّ ردًا أو تلقت خطأ، وغالبًا لأن جدارًا ناريًا أسقطها."
+          },
+          {
+            "term": "ترشيح الحركة الصادرة",
+            "definition": "تقييد الحركة الصادرة للحد من سرقة البيانات وقنوات أوامر البرمجيات الخبيثة."
+          },
+          {
+            "term": "اختبار الانحدار",
+            "definition": "إعادة تنفيذ الاختبارات نفسها بعد تغيير للتأكد من أن شيئًا آخر لم ينكسر."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا تعد الاختبارات السلبية ضرورية عند التحقق من جدار ناري؟",
+            "options": [
+              "لأنها أسرع",
+              "لأنها تثبت أن التدفقات الممنوعة محجوبة فعلًا",
+              "لأنها تحسّن الإنتاجية",
+              "لأنها تغني عن التسجيل"
+            ],
+            "answer": 1,
+            "explanation": "قد يعمل التطبيق بإتقان بينما قاعدة ما تسمح بأكثر مما يجب. الاختبارات السلبية وحدها تكشف القواعد المفرطة في السماح."
+          },
+          {
+            "question": "يبلّغ nmap عن المنفذ 22 بأنه مفلتر مع السبب no-response. ما السبب الأرجح؟",
+            "options": [
+              "الخدمة مفتوحة",
+              "جدار ناري أسقط الفحوص بصمت",
+              "المضيف مطفأ بالتأكيد",
+              "فشل DNS"
+            ],
+            "answer": 1,
+            "explanation": "الإسقاط لا يعطي ردًا، فلا يميز nmap بين المفتوح والمغلق ويبلّغ مفلترًا. أما الرفض (reject) فيعطي رفضًا فوريًا."
+          },
+          {
+            "question": "أي مما يلي من الأسباب المعتادة لقاعدة تسمح بمرور حركة يفترض حجبها؟ (اختر كل ما ينطبق)",
+            "options": [
+              "قاعدة سماح واسعة فوق حجب محدد",
+              "قناع شبكة فرعية خاطئ",
+              "تفعيل التسجيل على قاعدة الحجب",
+              "قاعدة مؤقتة منسية"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "ترتيب القواعد وأخطاء القناع والقواعد المؤقتة المتبقية أسباب كلاسيكية. أما تسجيل الحجب فلا يغيّر حكمه."
+          },
+          {
+            "question": "لماذا يستخدم المختبر الجدول inet في nftables؟",
+            "options": [
+              "يغطي IPv4 وIPv6 في مجموعة قواعد واحدة",
+              "هو مطلوب للتسجيل",
+              "يعطّل NAT",
+              "يسرّع nmap"
+            ],
+            "answer": 0,
+            "explanation": "يطبّق جدول inet الواحد السياسة نفسها على العائلتين، فيتجنب مسار IPv6 غير مرشّح."
+          },
+          {
+            "question": "ماذا ينبغي أن تفعل بعد كل تغيير في قواعد الجدار الناري؟",
+            "options": [
+              "لا شيء إذا ظل التطبيق يعمل",
+              "إعادة تنفيذ مصفوفة الاختبار المحفوظة ومقارنتها بالمتوقع",
+              "حذف السجلات",
+              "تعطيل الحجب الافتراضي"
+            ],
+            "answer": 1,
+            "explanation": "إعادة تنفيذ المصفوفة نفسها اختبار انحدار: يلتقط الثغرات الجديدة التي يسببها تغيير صحيح في ذاته."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nكتبت السياسة في جدول وعبّرت عنها في nftables واشتققت اختبارات إيجابية وسلبية ونفّذتها من المناطق الصحيحة وقارنت النتائج الفعلية بالمتوقعة. ترتيب القواعد والأقنعة والنطاق وIPv6 والقواعد المنسية هي المشتبه بهم المعتادون عند اختلاف النتائج. ويحوّل التسجيل كل اختبار إلى دليل يمكن تغذية SIEM به. احتفظ بالمصفوفة مع القواعد وأعد تنفيذها عند كل تغيير. وينطبق الانضباط نفسه على أنظمة الكشف: تابع مع [مختبر نشر IDS/IPS](/learn/hands-on-security-labs/ids-ips-deployment-lab)."
+      }
+    ]
+  }
+}

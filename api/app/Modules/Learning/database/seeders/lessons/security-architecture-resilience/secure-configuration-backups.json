@@ -1,0 +1,544 @@
+{
+ "slug": "secure-configuration-backups",
+ "title": "Secure Configuration Backups",
+ "summary": "Collect network, firewall and server configurations automatically, strip or encrypt secrets, store them versioned and tamper-evident, and prove you can restore from them.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Decide which configurations to back up and how often",
+  "Collect configurations automatically with a least-privilege account",
+  "Keep secrets out of config repositories using redaction and encryption",
+  "Detect unauthorized change with version history and diffs",
+  "Test restores from configuration backups"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A firewall fails at 2 a.m. The spare arrives by courier, but the last configuration backup is eight months old, was saved to the administrator's laptop, and contains the VPN pre-shared keys in plain text. Rebuilding by memory takes a day and breaks three site-to-site tunnels.\n\nDevice and server configurations are the blueprint of your environment. Losing them slows recovery; leaking them hands an attacker your topology, rules and often your credentials. A secure configuration backup program must therefore be automatic, versioned, protected and tested."
+  },
+  {
+   "id": "scope",
+   "type": "text",
+   "markdown": "## Step 1: Decide what to back up\n\nStart with an inventory. Anything whose loss would slow a rebuild belongs in scope.\n\n| Asset | What to capture | Frequency | Sensitivity |\n|:--|:--|:--|:--|\n| Routers and switches | Running config, VLAN database, license info | On change, plus daily | Medium to high |\n| Firewalls (ASA, FTD, others) | Full policy, NAT, VPN, certificates | On change, plus daily | High |\n| Identity systems | Realm, client and policy exports | Daily | High |\n| Servers | Package list, service config, `/etc` | Daily | Medium |\n| Infrastructure as code | The repository itself | Every commit | Medium |\n| Cloud accounts | IAM policies, network rules, resource templates | Daily | High |\n\nCapture the **running** configuration, not only the startup file, and record the software version next to it. A configuration restored onto a different firmware release can behave differently. Treat private keys and certificates as a separate class that belongs in a vault with its own backup, not in the same repository."
+  },
+  {
+   "id": "flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Journey of a configuration backup",
+   "data": {
+    "token": "Config",
+    "nodes": [
+     {
+      "id": "dev",
+      "label": "Network device",
+      "sub": "198.51.100.10",
+      "icon": "router"
+     },
+     {
+      "id": "col",
+      "label": "Collector",
+      "sub": "read-only account",
+      "icon": "server"
+     },
+     {
+      "id": "red",
+      "label": "Redaction",
+      "sub": "secrets removed",
+      "icon": "eye"
+     },
+     {
+      "id": "git",
+      "label": "Versioned repo",
+      "sub": "encrypted at rest",
+      "icon": "database"
+     },
+     {
+      "id": "off",
+      "label": "Offline copy",
+      "sub": "immutable",
+      "icon": "lock"
+     }
+    ],
+    "steps": [
+     {
+      "at": "dev",
+      "caption": "A change is committed on the device, and a syslog message announces it."
+     },
+     {
+      "at": "col",
+      "caption": "The collector connects over SSH with a read-only account and runs show running-config."
+     },
+     {
+      "at": "red",
+      "caption": "Passwords, community strings and keys are replaced with placeholders.",
+      "tone": "warning"
+     },
+     {
+      "at": "git",
+      "caption": "The file is committed. The diff shows exactly who or what changed.",
+      "tone": "secure"
+     },
+     {
+      "at": "off",
+      "caption": "A nightly copy goes to storage that the collector cannot modify or delete.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "collect",
+   "type": "text",
+   "markdown": "## Step 2: Collect automatically with least privilege\n\nManual saves are forgotten. Use a collector such as Oxidized, RANCID or a scheduled Ansible job. Give it its own account with only the commands it needs, and restrict that account to the collector's source address.\n\nOn Cisco IOS XE, create a limited role:\n\n```\nR1(config)# username svc-cfgbackup privilege 5 secret <placeholder>\nR1(config)# privilege exec all level 5 show running-config\nR1(config)# privilege exec level 5 show version\n```\n\nThen point the collector at an inventory. The example below uses Oxidized."
+  },
+  {
+   "id": "oxi",
+   "type": "code",
+   "language": "yaml",
+   "filename": "oxidized/config",
+   "caption": "Oxidized collector configuration. The credential comes from the environment, not from the file.",
+   "code": "---\nusername: svc-cfgbackup\npassword: <from-env-OXIDIZED_PASS>\ninterval: 3600\nuse_syslog: true\nmodel: ios\nresolve_dns: false\ninput:\n  default: ssh\n  ssh:\n    secure: true        # verify host keys\noutput:\n  default: git\n  git:\n    user: cfgbackup\n    email: cfgbackup@example.com\n    repo: /var/lib/oxidized/configs.git\nsource:\n  default: csv\n  csv:\n    file: /etc/oxidized/router.db\n    delimiter: !ruby/regexp /:/\n    map:\n      name: 0\n      ip: 1\n      model: 2\nhooks:\n  notify_on_change:\n    type: exec\n    events: [post_store]\n    cmd: '/usr/local/bin/notify-soc.sh'"
+  },
+  {
+   "id": "secrets",
+   "type": "text",
+   "markdown": "## Step 3: Keep secrets out of the repository\n\nA configuration file is full of secrets: enable passwords, SNMP communities, VPN keys, RADIUS shared secrets and API tokens. Even hashed values help an offline attack. Use two layers.\n\n1. **Redact at collection.** Replace secret values with a placeholder before the file is stored. Most collectors have a scrubbing option, for example `vars: remove_secret: true` in Oxidized.\n2. **Encrypt what must remain.** If you need the secrets to rebuild, keep them in a secrets vault or encrypt the repository with a tool such as `age` or `sops`, with the key held by two people and stored offline.\n\nAlso protect the repository itself. Allow only the collector to push, require signed commits for human edits, and enable branch protection so history cannot be rewritten. Compare this with the identity guidance in [Backup access control](/learn/security-architecture-resilience/backup-access-control)."
+  },
+  {
+   "id": "diff",
+   "type": "terminal",
+   "title": "Detect an unauthorized change",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "git -C /var/lib/oxidized/configs.git log --oneline -3 -- fw-edge-1",
+     "prompt": "cfg01$",
+     "output": "a41c9e2 fw-edge-1 config changed 2026-11-11 02:14\n7be03d8 fw-edge-1 config changed 2026-11-04 10:02\n1f9a6c0 fw-edge-1 config changed 2026-10-28 09:47",
+     "comment": "A 02:14 commit is outside the change window, so inspect it."
+    },
+    {
+     "cmd": "git -C /var/lib/oxidized/configs.git diff 7be03d8 a41c9e2 -- fw-edge-1",
+     "prompt": "cfg01$",
+     "output": "-access-list OUTSIDE_IN extended deny ip any any log\n+access-list OUTSIDE_IN extended permit tcp any host 192.0.2.50 eq 3389\n+access-list OUTSIDE_IN extended deny ip any any log",
+     "comment": "RDP from anywhere was opened to 192.0.2.50. No ticket matches, so escalate to the SOC."
+    }
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Backups of drift are still backups of drift",
+   "markdown": "A backup that records a bad change faithfully is not protection. Pair the diffs with change tickets and alerts, and keep a known-good \"golden\" baseline that is reviewed and signed, so you can tell whether to restore the latest version or an older one."
+  },
+  {
+   "id": "servers",
+   "type": "text",
+   "markdown": "## Servers and cloud accounts\n\nNot every asset speaks a network-device protocol. For Linux servers, back up the configuration directories and the package state rather than the whole disk, so a rebuild starts from a clean image and applies your settings on top. For cloud accounts, export policies and network rules with the provider's command line tool on a schedule and commit the output the same way.\n\n- **Servers:** `/etc`, systemd units, firewall rules, the package list (`dpkg --get-selections` or `rpm -qa`) and the cron tables.\n- **Cloud:** identity policies, security groups, route tables and logging settings, exported as JSON.\n- **Directories:** a documented export of groups, policies and the schema version.\n\nWhere you already use infrastructure as code, the repository is the backup, and the live state is only compared against it. That comparison is called drift detection, and it turns a backup program into a continuous check. The next lessons on [Infrastructure recovery automation](/learn/security-architecture-resilience/infrastructure-recovery-automation) build on this idea.\n\nWhatever the source, keep the same rules: automated, least privilege, no secrets in the clear, versioned, and tested."
+  },
+  {
+   "id": "tip",
+   "type": "callout",
+   "variant": "tip",
+   "title": "Store the version with the config",
+   "markdown": "Record the model, serial number and firmware version in a header comment or a sidecar file for each device. During a rebuild you will need to flash the same release first, and finding that number in a dead device's records is much harder than reading it from the repository."
+  },
+  {
+   "id": "restore",
+   "type": "text",
+   "markdown": "## Step 4: Protect the copies and test the restore\n\nThe collector and repository are attractive targets, because whoever controls them can read or alter every device's blueprint. Apply the isolation ideas from [Backup server isolation](/learn/security-architecture-resilience/backup-server-isolation): management VLAN only, no internet access, host firewall, and MFA for human logins.\n\nSend a nightly copy to storage with write-once retention, as described in [Immutable and offline backups](/learn/security-architecture-resilience/immutable-and-offline-backups). Then test.\n\n- **Monthly:** pick a device at random and build it from the stored config on a spare or a virtual image in a lab.\n- **Check:** are interfaces, routing, NAT and VPN identical? Which secrets did you have to re-enter?\n- **Time it** and record the result against the RTO of the service the device supports.\n- **Record the gaps** (missing certificate, missing license file) and fix the process.\n\nAn untested configuration backup is only a guess about what will work."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a lab device or a virtual machine you own.\n\n1. Install Oxidized or write a script that runs `show running-config` over SSH for two lab devices.\n2. Create a read-only account for the collector and confirm it cannot enter configuration mode.\n3. Initialize a git repository for the output and commit the first configs.\n4. Enable secret scrubbing and `grep` the repository for `password`, `secret` and `community` to confirm no real values appear.\n5. Change a lab ACL, wait for the next run, and read the diff.\n6. Rebuild a device from the saved file and list everything you had to add by hand."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Running configuration",
+     "definition": "The configuration currently active in a device's memory."
+    },
+    {
+     "term": "Configuration drift",
+     "definition": "Unplanned divergence from the approved baseline."
+    },
+    {
+     "term": "Golden baseline",
+     "definition": "A reviewed, known-good configuration used as the reference."
+    },
+    {
+     "term": "Redaction",
+     "definition": "Replacing secret values with placeholders before storage."
+    },
+    {
+     "term": "Oxidized",
+     "definition": "An open-source tool that collects device configurations into git."
+    },
+    {
+     "term": "Diff",
+     "definition": "A line-by-line comparison of two versions."
+    },
+    {
+     "term": "age / sops",
+     "definition": "Tools for encrypting files that hold secrets."
+    },
+    {
+     "term": "Out-of-band",
+     "definition": "A channel that does not depend on the production network."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why should a collector use a read-only account?",
+     "options": [
+      "If it is compromised it cannot change device configurations",
+      "Read-only accounts are faster",
+      "Devices refuse write accounts",
+      "It removes the need for SSH"
+     ],
+     "answer": 0,
+     "explanation": "Least privilege limits the damage if the collector is attacked."
+    },
+    {
+     "question": "Which actions keep secrets out of a config repository? (Choose all that apply.)",
+     "options": [
+      "Redact values at collection",
+      "Encrypt remaining secrets with a key held offline",
+      "Commit the files to a public repository",
+      "Email the configs to the team"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "Redaction and encryption reduce exposure. Public repositories and email spread secrets."
+    },
+    {
+     "question": "A commit at 02:14 adds a permit rule with no ticket. What is the best next step?",
+     "options": [
+      "Ignore it because it is backed up",
+      "Escalate to the SOC and compare with the baseline",
+      "Delete the repository",
+      "Disable logging"
+     ],
+     "answer": 1,
+     "explanation": "An unapproved change may be an attack, so investigate and restore the baseline if needed."
+    },
+    {
+     "question": "What should every restore test record? (Choose all that apply.)",
+     "options": [
+      "Time taken compared with RTO",
+      "Secrets or files that had to be added by hand",
+      "Only whether the device powered on",
+      "Software version used"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Time, manual additions and version reveal real gaps. Powering on proves little."
+    },
+    {
+     "question": "Which backup target best protects configurations from a compromised collector?",
+     "options": [
+      "A folder on the collector",
+      "A write-once copy the collector cannot delete",
+      "The administrator's laptop",
+      "A shared drive open to everyone"
+     ],
+     "answer": 1,
+     "explanation": "Immutable storage outside the collector's control survives its compromise."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Back up running configurations and software versions on change and daily.\n- Collect with an automated, read-only, address-restricted account.\n- Redact secrets, encrypt what remains and protect the repository.\n- Use diffs and baselines to detect unauthorized change.\n- Keep an immutable copy and test restores monthly.\n\nNext, protect the data layer in [Database point-in-time recovery](/learn/security-architecture-resilience/database-point-in-time-recovery)."
+  }
+ ],
+ "ar": {
+  "title": "النسخ الاحتياطي الآمن للإعدادات",
+  "summary": "اجمع إعدادات الشبكة وجدار الحماية والخوادم تلقائيًا، وأزل الأسرار أو شفّرها، وخزّنها بإصدارات يظهر فيها العبث، وأثبت قدرتك على الاستعادة منها.",
+  "objectives": [
+   "تحديد الإعدادات التي تُنسخ احتياطيًا وتكرار ذلك",
+   "جمع الإعدادات تلقائيًا بحساب بأقل الصلاحيات",
+   "إبقاء الأسرار خارج مستودعات الإعدادات بالحجب والتشفير",
+   "كشف التغيير غير المصرّح به عبر سجل الإصدارات والفروقات",
+   "اختبار الاستعادة من نسخ الإعدادات"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يتعطل جدار حماية في الثانية فجرًا. يصل الجهاز البديل بالشحن، لكن آخر نسخة احتياطية للإعدادات عمرها ثمانية أشهر، وحُفظت على حاسوب المسؤول المحمول، وتحتوي مفاتيح VPN المشتركة مسبقًا بنص صريح. تستغرق إعادة البناء من الذاكرة يومًا كاملًا وتكسر ثلاثة أنفاق بين المواقع.\n\nإعدادات الأجهزة والخوادم هي مخطط بيئتك. فقدانها يبطئ الاستعادة، وتسريبها يمنح المهاجم طوبولوجيا الشبكة وقواعدها وغالبًا بيانات اعتمادها. لذا يجب أن يكون برنامج النسخ الاحتياطي للإعدادات آليًا ومُصدَّرًا ومحميًا ومختبرًا."
+   },
+   {
+    "id": "scope",
+    "type": "text",
+    "markdown": "## الخطوة الأولى: حدّد ما يُنسخ\n\nابدأ بالجرد. كل ما يبطئ فقدانُه عملية إعادة البناء يدخل في النطاق.\n\n| الأصل | ما يُلتقط | التكرار | الحساسية |\n|:--|:--|:--|:--|\n| الموجّهات والمبدّلات | الإعداد الجاري وقاعدة VLAN ومعلومات الترخيص | عند التغيير ويوميًا | متوسطة إلى عالية |\n| جدران الحماية (ASA وFTD وغيرها) | السياسة كاملة وNAT وVPN والشهادات | عند التغيير ويوميًا | عالية |\n| أنظمة الهوية | تصدير النطاقات والعملاء والسياسات | يوميًا | عالية |\n| الخوادم | قائمة الحزم وإعدادات الخدمات و`/etc` | يوميًا | متوسطة |\n| البنية كشيفرة | المستودع نفسه | عند كل إيداع | متوسطة |\n| الحسابات السحابية | سياسات IAM وقواعد الشبكة وقوالب الموارد | يوميًا | عالية |\n\nالتقط الإعداد **الجاري** (running) لا ملف الإقلاع فقط، وسجّل إصدار البرمجيات بجانبه، فقد يتصرف إعداد مُستعاد على إصدار مختلف تصرفًا مختلفًا. وعامل المفاتيح الخاصة والشهادات فئةً مستقلة تُحفظ في خزنة لها نسخها الاحتياطي، لا في المستودع نفسه."
+   },
+   {
+    "id": "flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "رحلة نسخة احتياطية للإعدادات",
+    "data": {
+     "token": "إعداد",
+     "nodes": [
+      {
+       "id": "dev",
+       "label": "جهاز الشبكة",
+       "sub": "198.51.100.10",
+       "icon": "router"
+      },
+      {
+       "id": "col",
+       "label": "المُجمِّع",
+       "sub": "حساب قراءة فقط",
+       "icon": "server"
+      },
+      {
+       "id": "red",
+       "label": "الحجب",
+       "sub": "إزالة الأسرار",
+       "icon": "eye"
+      },
+      {
+       "id": "git",
+       "label": "مستودع بإصدارات",
+       "sub": "مشفّر أثناء التخزين",
+       "icon": "database"
+      },
+      {
+       "id": "off",
+       "label": "نسخة دون اتصال",
+       "sub": "غير قابلة للتعديل",
+       "icon": "lock"
+      }
+     ],
+     "steps": [
+      {
+       "at": "dev",
+       "caption": "يُنفَّذ تغيير على الجهاز وتعلن رسالة syslog عنه."
+      },
+      {
+       "at": "col",
+       "caption": "يتصل المُجمِّع عبر SSH بحساب قراءة فقط وينفّذ show running-config."
+      },
+      {
+       "at": "red",
+       "caption": "تُستبدل كلمات المرور وسلاسل المجتمع والمفاتيح بعناصر نائبة.",
+       "tone": "warning"
+      },
+      {
+       "at": "git",
+       "caption": "يُودَع الملف، ويُظهر الفرق ما تغيّر وبواسطة من.",
+       "tone": "secure"
+      },
+      {
+       "at": "off",
+       "caption": "تُنسخ ليليًا نسخة إلى تخزين لا يستطيع المُجمِّع تعديله أو حذفه.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "collect",
+    "type": "text",
+    "markdown": "## الخطوة الثانية: اجمع تلقائيًا بأقل الصلاحيات\n\nالحفظ اليدوي يُنسى. استخدم مُجمِّعًا مثل Oxidized أو RANCID أو مهمة Ansible مجدولة. امنحه حسابًا خاصًا بالأوامر التي يحتاجها فقط، وقيّد الحساب بعنوان المصدر الخاص بالمُجمِّع.\n\nعلى Cisco IOS XE أنشئ دورًا محدودًا:\n\n```\nR1(config)# username svc-cfgbackup privilege 5 secret <placeholder>\nR1(config)# privilege exec all level 5 show running-config\nR1(config)# privilege exec level 5 show version\n```\n\nثم وجّه المُجمِّع إلى قائمة جرد. يستخدم المثال أدناه Oxidized."
+   },
+   {
+    "id": "oxi",
+    "type": "code",
+    "language": "yaml",
+    "filename": "oxidized/config",
+    "caption": "إعداد المُجمِّع Oxidized. تأتي بيانات الاعتماد من متغيرات البيئة لا من الملف.",
+    "code": "---\nusername: svc-cfgbackup\npassword: <from-env-OXIDIZED_PASS>\ninterval: 3600\nuse_syslog: true\nmodel: ios\nresolve_dns: false\ninput:\n  default: ssh\n  ssh:\n    secure: true        # verify host keys\noutput:\n  default: git\n  git:\n    user: cfgbackup\n    email: cfgbackup@example.com\n    repo: /var/lib/oxidized/configs.git\nsource:\n  default: csv\n  csv:\n    file: /etc/oxidized/router.db\n    delimiter: !ruby/regexp /:/\n    map:\n      name: 0\n      ip: 1\n      model: 2\nhooks:\n  notify_on_change:\n    type: exec\n    events: [post_store]\n    cmd: '/usr/local/bin/notify-soc.sh'"
+   },
+   {
+    "id": "secrets",
+    "type": "text",
+    "markdown": "## الخطوة الثالثة: أبقِ الأسرار خارج المستودع\n\nيمتلئ ملف الإعدادات بالأسرار: كلمات مرور enable وسلاسل مجتمع SNMP ومفاتيح VPN والأسرار المشتركة لـ RADIUS ورموز API. حتى القيم المجزّأة تساعد في الهجوم دون اتصال. استخدم طبقتين.\n\n1. **احجب عند الجمع.** استبدل قيم الأسرار بعنصر نائب قبل حفظ الملف. لدى معظم المُجمِّعات خيار تنقية، مثل `vars: remove_secret: true` في Oxidized.\n2. **شفّر ما يجب أن يبقى.** إن احتجت الأسرار لإعادة البناء فاحفظها في خزنة أسرار، أو شفّر المستودع بأداة مثل `age` أو `sops` على أن يحتفظ شخصان بالمفتاح ويُخزَّن دون اتصال.\n\nوامنح المستودع نفسه حماية: اسمح للمُجمِّع وحده بالدفع، واشترط إيداعات موقّعة للتعديلات البشرية، وفعّل حماية الفروع حتى لا يُعاد كتابة السجل. قارن ذلك بإرشادات الهوية في [التحكم في الوصول إلى النسخ الاحتياطية](/learn/security-architecture-resilience/backup-access-control)."
+   },
+   {
+    "id": "diff",
+    "type": "terminal",
+    "title": "كشف تغيير غير مصرّح به",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "git -C /var/lib/oxidized/configs.git log --oneline -3 -- fw-edge-1",
+      "prompt": "cfg01$",
+      "output": "a41c9e2 fw-edge-1 config changed 2026-11-11 02:14\n7be03d8 fw-edge-1 config changed 2026-11-04 10:02\n1f9a6c0 fw-edge-1 config changed 2026-10-28 09:47",
+      "comment": "إيداع في 02:14 خارج نافذة التغيير، لذا افحصه."
+     },
+     {
+      "cmd": "git -C /var/lib/oxidized/configs.git diff 7be03d8 a41c9e2 -- fw-edge-1",
+      "prompt": "cfg01$",
+      "output": "-access-list OUTSIDE_IN extended deny ip any any log\n+access-list OUTSIDE_IN extended permit tcp any host 192.0.2.50 eq 3389\n+access-list OUTSIDE_IN extended deny ip any any log",
+      "comment": "فُتح RDP من أي مكان إلى 192.0.2.50 دون تذكرة مطابقة، فصعّد الأمر إلى مركز العمليات الأمنية."
+     }
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "نسخ الانحراف تبقى نسخًا للانحراف",
+    "markdown": "النسخة التي تسجّل تغييرًا سيئًا بأمانة ليست حماية. اقرن الفروقات بتذاكر التغيير والتنبيهات، واحتفظ بخط أساس «ذهبي» معروف السلامة ومراجَع وموقَّع، لتعرف هل تستعيد أحدث إصدار أم إصدارًا أقدم."
+   },
+   {
+    "id": "servers",
+    "type": "text",
+    "markdown": "## الخوادم والحسابات السحابية\n\nليست كل الأصول تتحدث ببروتوكول أجهزة الشبكة. انسخ في خوادم Linux مجلدات الإعدادات وحالة الحزم بدل القرص كاملًا، فتبدأ إعادة البناء من صورة نظيفة ثم تُطبَّق إعداداتك فوقها. وفي الحسابات السحابية صدّر السياسات وقواعد الشبكة بأداة سطر الأوامر الخاصة بالمزوّد وفق جدول، وأودِع المخرجات بالطريقة نفسها.\n\n- **الخوادم:** `/etc` ووحدات systemd وقواعد جدار الحماية وقائمة الحزم (`dpkg --get-selections` أو `rpm -qa`) وجداول cron.\n- **السحابة:** سياسات الهوية ومجموعات الأمان وجداول التوجيه وإعدادات التسجيل، مُصدَّرة بصيغة JSON.\n- **الأدلة (Directories):** تصدير موثّق للمجموعات والسياسات وإصدار المخطط.\n\nوحيث تستخدم البنية كشيفرة (Infrastructure as Code) فالمستودع هو النسخة الاحتياطية، ويُقارَن به الوضع الحي فقط. وتسمى هذه المقارنة كشف الانحراف (Drift detection)، وهي تحوّل برنامج النسخ إلى فحص مستمر. وتبني الدروس التالية على هذه الفكرة، ومنها [أتمتة استعادة البنية التحتية](/learn/security-architecture-resilience/infrastructure-recovery-automation).\n\nومهما كان المصدر فالقواعد نفسها: آلي، وأقل صلاحيات، ولا أسرار بنص صريح، ومُصدَّر، ومُختبَر."
+   },
+   {
+    "id": "tip",
+    "type": "callout",
+    "variant": "tip",
+    "title": "احفظ الإصدار مع الإعداد",
+    "markdown": "سجّل الطراز والرقم التسلسلي وإصدار البرمجيات الثابتة في تعليق ترويسة أو ملف مرافق لكل جهاز. ستحتاج أثناء إعادة البناء إلى تثبيت الإصدار نفسه أولًا، وإيجاد هذا الرقم في سجلات جهاز معطّل أصعب بكثير من قراءته من المستودع."
+   },
+   {
+    "id": "restore",
+    "type": "text",
+    "markdown": "## الخطوة الرابعة: احمِ النسخ واختبر الاستعادة\n\nيُعدّ المُجمِّع والمستودع هدفين مغريين، لأن من يتحكم بهما يستطيع قراءة مخطط كل جهاز أو تعديله. طبّق أفكار العزل من [عزل خادم النسخ الاحتياطي](/learn/security-architecture-resilience/backup-server-isolation): شبكة إدارة فقط، ولا وصول إلى الإنترنت، وجدار حماية على المضيف، وMFA لدخول البشر.\n\nأرسل نسخة ليلية إلى تخزين بحفظ لمرة واحدة كما في [النسخ الاحتياطية غير القابلة للتعديل ودون اتصال](/learn/security-architecture-resilience/immutable-and-offline-backups). ثم اختبر.\n\n- **شهريًا:** اختر جهازًا عشوائيًا وابنِه من الإعداد المحفوظ على جهاز احتياطي أو صورة افتراضية في مختبر.\n- **تحقق:** هل الواجهات والتوجيه وNAT وVPN متطابقة؟ وما الأسرار التي اضطُررت إلى إدخالها من جديد؟\n- **قِس الزمن** وقارنه بـ RTO للخدمة التي يدعمها الجهاز.\n- **دوّن الثغرات** (شهادة ناقصة أو ملف ترخيص مفقود) وأصلح العملية.\n\nالنسخة الاحتياطية للإعدادات غير المختبرة مجرد تخمين لما سينجح."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم جهازًا مخبريًا أو آلة افتراضية تملكها.\n\n1. ثبّت Oxidized أو اكتب سكربتًا ينفّذ `show running-config` عبر SSH لجهازين مخبريين.\n2. أنشئ حساب قراءة فقط للمُجمِّع وتأكد أنه لا يستطيع دخول وضع الإعداد.\n3. هيّئ مستودع git للمخرجات وأودِع الإعدادات الأولى.\n4. فعّل تنقية الأسرار ونفّذ `grep` في المستودع بحثًا عن `password` و`secret` و`community` للتأكد من غياب القيم الحقيقية.\n5. غيّر قائمة ACL مخبرية، وانتظر التشغيل التالي، واقرأ الفرق.\n6. أعد بناء جهاز من الملف المحفوظ وسجّل كل ما أضفته يدويًا."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "الإعداد الجاري",
+      "definition": "الإعداد النشط حاليًا في ذاكرة الجهاز."
+     },
+     {
+      "term": "انحراف الإعدادات",
+      "definition": "ابتعاد غير مخطط له عن خط الأساس المعتمد."
+     },
+     {
+      "term": "خط الأساس الذهبي",
+      "definition": "إعداد مراجَع ومعروف السلامة يُستخدم مرجعًا."
+     },
+     {
+      "term": "الحجب",
+      "definition": "استبدال قيم الأسرار بعناصر نائبة قبل التخزين."
+     },
+     {
+      "term": "Oxidized",
+      "definition": "أداة مفتوحة المصدر تجمع إعدادات الأجهزة في git."
+     },
+     {
+      "term": "الفرق (Diff)",
+      "definition": "مقارنة سطرًا بسطر بين إصدارين."
+     },
+     {
+      "term": "age / sops",
+      "definition": "أدوات لتشفير الملفات التي تحتوي أسرارًا."
+     },
+     {
+      "term": "خارج النطاق",
+      "definition": "قناة لا تعتمد على شبكة الإنتاج."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا ينبغي أن يستخدم المُجمِّع حساب قراءة فقط؟",
+      "options": [
+       "إذا اختُرق فلن يستطيع تغيير إعدادات الأجهزة",
+       "حسابات القراءة أسرع",
+       "ترفض الأجهزة حسابات الكتابة",
+       "يلغي الحاجة إلى SSH"
+      ],
+      "answer": 0,
+      "explanation": "تحدّ أقل الصلاحيات من الضرر إذا هوجم المُجمِّع."
+     },
+     {
+      "question": "أي الإجراءات تُبقي الأسرار خارج مستودع الإعدادات؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "حجب القيم عند الجمع",
+       "تشفير الأسرار المتبقية بمفتاح محفوظ دون اتصال",
+       "إيداع الملفات في مستودع عام",
+       "إرسال الإعدادات بالبريد إلى الفريق"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "يقلّل الحجب والتشفير التعرض، أما المستودعات العامة والبريد فينشران الأسرار."
+     },
+     {
+      "question": "إيداع في 02:14 يضيف قاعدة سماح دون تذكرة. ما أفضل خطوة تالية؟",
+      "options": [
+       "تجاهله لأنه منسوخ احتياطيًا",
+       "التصعيد إلى مركز العمليات الأمنية والمقارنة بخط الأساس",
+       "حذف المستودع",
+       "تعطيل التسجيل"
+      ],
+      "answer": 1,
+      "explanation": "قد يكون التغيير غير المعتمد هجومًا، فحقّق واستعد خط الأساس عند الحاجة."
+     },
+     {
+      "question": "ماذا ينبغي أن يسجّل كل اختبار استعادة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "الزمن المستغرَق مقارنة بـ RTO",
+       "الأسرار أو الملفات التي أُضيفت يدويًا",
+       "هل أُشغّل الجهاز فقط",
+       "إصدار البرمجيات المستخدم"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "يكشف الزمن والإضافات اليدوية والإصدار الثغرات الحقيقية، أما التشغيل فلا يثبت الكثير."
+     },
+     {
+      "question": "أي وجهة نسخ تحمي الإعدادات أفضل من مُجمِّع مخترق؟",
+      "options": [
+       "مجلد على المُجمِّع",
+       "نسخة بحفظ لمرة واحدة لا يستطيع المُجمِّع حذفها",
+       "حاسوب المسؤول المحمول",
+       "قرص مشترك مفتوح للجميع"
+      ],
+      "answer": 1,
+      "explanation": "يصمد التخزين غير القابل للتعديل خارج سيطرة المُجمِّع أمام اختراقه."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- انسخ الإعدادات الجارية وإصدارات البرمجيات عند التغيير ويوميًا.\n- اجمعها بحساب آلي للقراءة فقط ومقيّد بالعنوان.\n- احجب الأسرار وشفّر ما يتبقى واحمِ المستودع.\n- استخدم الفروقات وخطوط الأساس لكشف التغيير غير المصرّح به.\n- احتفظ بنسخة غير قابلة للتعديل واختبر الاستعادة شهريًا.\n\nثم احمِ طبقة البيانات في [استعادة قواعد البيانات إلى نقطة زمنية محددة](/learn/security-architecture-resilience/database-point-in-time-recovery)."
+   }
+  ]
+ }
+}

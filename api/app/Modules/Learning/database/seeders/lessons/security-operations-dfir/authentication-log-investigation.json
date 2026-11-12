@@ -1,0 +1,614 @@
+{
+  "slug": "authentication-log-investigation",
+  "title": "Authentication Log Investigation",
+  "summary": "Read authentication logs like an investigator: separate brute force, password spraying and credential stuffing, spot impossible travel and MFA fatigue, review Kerberos signals, and write KQL, SPL and Sigma detections.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Identify the main authentication log sources across Windows, Linux and cloud identity",
+    "Tell brute force, password spraying and credential stuffing apart by their log patterns",
+    "Recognize impossible travel, MFA fatigue and anomalous Kerberos activity",
+    "Write KQL and Sigma detections for failed-then-successful logons",
+    "Decide what to do when a valid-looking login is actually an attacker"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Most intrusions today do not break in. They log in. Stolen passwords, reused credentials and approved push notifications give attackers the same access as the employee, and the only record is an ordinary-looking line in an authentication log.\n\nInvestigating those lines is a core SOC skill. The questions are always the same: who authenticated, from where, how, and what happened next? This lesson shows how to answer them across Windows, Linux and cloud identity, and how to turn what you learn into detections. It supports [Privilege Escalation Investigation](/learn/security-operations-dfir/privilege-escalation-investigation) and [Lateral Movement Detection](/learn/security-operations-dfir/lateral-movement-detection)."
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## Know your authentication sources\n\nEach platform records logins in a different place and with different fields. Learn the main ones.\n\n| Platform | Source | Key events and fields |\n|:--|:--|:--|\n| Windows endpoint / server | Security log | 4624 success, 4625 failure, 4648 explicit credentials, logon type, source address |\n| Active Directory | Domain controller Security log | 4768 TGT request, 4769 service ticket, 4771 pre-auth failure, 4776 NTLM |\n| Linux | `/var/log/auth.log`, `/var/log/secure`, `journalctl` | `Accepted`, `Failed password`, `sudo`, `session opened` |\n| Cloud identity | Entra ID sign-in logs, other IdPs | User, IP, app, result code, MFA result, device |\n| Remote access | VPN, RDP gateway, bastion | User, public IP, session start and end |\n\nAlways record the **result** and the **reason**. A failure because of a wrong password is very different from a failure because the account is locked or disabled."
+    },
+    {
+      "id": "patterns",
+      "type": "text",
+      "markdown": "## Separate the attack patterns\n\nThree password attacks look similar in a dashboard but differ in the logs. Counting failures per account and per source address is the key.\n\n| Pattern | Accounts | Source addresses | Typical log shape |\n|:--|:--|:--|:--|\n| **Brute force** | One | One or few | Hundreds of failures on one account |\n| **Password spraying** | Many | One or few | One or two failures on each of many accounts |\n| **Credential stuffing** | Many | Many | Single attempts with leaked pairs, spread widely |\n\nSpraying stays below account lockout thresholds on purpose, so a lockout alert will miss it. Detect it by counting distinct accounts targeted by one source in a window. The pivotal moment in any of these is the **first success after failures**. That event turns noise into an incident, and you should check what the account did in the following hour."
+    },
+    {
+      "id": "spray-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Password spray ending in a valid login",
+      "caption": "The attacker tries one common password across many accounts and stays under the lockout threshold.",
+      "data": {
+        "actors": [
+          {
+            "id": "src",
+            "icon": "attacker",
+            "label": "Source",
+            "sub": "198.51.100.23"
+          },
+          {
+            "id": "idp",
+            "icon": "key",
+            "label": "Identity provider",
+            "sub": "Sign-in service"
+          },
+          {
+            "id": "siem",
+            "icon": "log",
+            "label": "SIEM",
+            "sub": "Detection"
+          },
+          {
+            "id": "soc",
+            "icon": "user",
+            "label": "Analyst",
+            "sub": "Response"
+          }
+        ],
+        "steps": [
+          {
+            "from": "src",
+            "to": "idp",
+            "label": "Try Summer2026!",
+            "detail": "User 1 of 400",
+            "note": "The source tries one password on the first account; it fails.",
+            "tone": "warning"
+          },
+          {
+            "from": "src",
+            "to": "idp",
+            "label": "Try again",
+            "detail": "Users 2 to 399",
+            "note": "The same password is tried on hundreds of accounts, one attempt each, below the lockout limit.",
+            "tone": "warning"
+          },
+          {
+            "from": "idp",
+            "to": "src",
+            "label": "Success",
+            "detail": "User 400",
+            "note": "One account used the weak password and the login succeeds.",
+            "tone": "danger"
+          },
+          {
+            "from": "idp",
+            "to": "siem",
+            "label": "Send logs",
+            "detail": "4625 x 399, 4624 x 1",
+            "note": "Sign-in events are forwarded with source, result and time."
+          },
+          {
+            "from": "siem",
+            "to": "soc",
+            "label": "Alert",
+            "detail": "399 accounts, 1 source",
+            "note": "A rule fires: one source failed against many accounts, then succeeded once.",
+            "tone": "danger"
+          },
+          {
+            "from": "soc",
+            "to": "idp",
+            "label": "Contain",
+            "detail": "Reset and revoke",
+            "note": "The analyst resets the password, revokes sessions and blocks the source.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "kql",
+      "type": "text",
+      "markdown": "## Hunt with queries\n\nA detection is a question you ask the data repeatedly. The query below, in KQL for Microsoft Sentinel, finds a source that failed against many accounts and then succeeded. Adapt the field names to your own tables, and tune the thresholds to your normal traffic."
+    },
+    {
+      "id": "kql-code",
+      "type": "code",
+      "language": "plain",
+      "code": "let window = 1h;\nlet failures = SigninLogs\n| where TimeGenerated > ago(window) and ResultType in (50126, 50053)   // bad password, locked\n| summarize FailedAccounts = dcount(UserPrincipalName), Attempts = count() by IPAddress;\nlet successes = SigninLogs\n| where TimeGenerated > ago(window) and ResultType == 0\n| project IPAddress, UserPrincipalName, SuccessTime = TimeGenerated;\nfailures\n| where FailedAccounts >= 20\n| join kind=inner successes on IPAddress\n| project IPAddress, FailedAccounts, Attempts, UserPrincipalName, SuccessTime\n| order by FailedAccounts desc",
+      "filename": "spray_then_success.kql",
+      "caption": "Sources with 20 or more failed accounts in an hour that also had a successful sign-in. Result codes shown are for Entra ID sign-in logs."
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "code": "title: Many Failed Logons From One Source\nid: 5c1e3a10-0000-4000-8000-00000000a001\nstatus: experimental\nlogsource:\n  product: windows\n  service: security\ndetection:\n  selection:\n    EventID: 4625\n  condition: selection | count(TargetUserName) by IpAddress > 20\n  timeframe: 15m\nfields:\n  - IpAddress\n  - TargetUserName\nlevel: medium\ntags:\n  - attack.credential_access\n  - attack.t1110.003",
+      "filename": "failed_logons_spray.yml",
+      "caption": "A Sigma rule for password spraying that you convert to your SIEM's language. Tune the threshold and exclude known scanners."
+    },
+    {
+      "id": "modern",
+      "type": "text",
+      "markdown": "## Spot modern abuse patterns\n\n**Impossible travel.** The same user signs in from two distant locations in less time than travel allows. Treat it as a lead because VPNs and mobile networks create false positives. Check device identifiers and the user agent.\n\n**MFA fatigue.** An attacker who has the password sends repeated push prompts hoping the user taps Approve. Look for many MFA denials or timeouts followed by one approval, often at night. Number matching and phishing-resistant factors reduce this risk.\n\n**Kerberos signals.** On domain controllers, a burst of event 4769 requests for service tickets using RC4 encryption (`0x17`) from one user can indicate service ticket cracking. An event 4768 with unusual encryption, or a pre-authentication failure (4771) spike, deserves review. Confirm with baselines, since legacy systems may still use RC4.\n\n**Logon type.** A type 10 (Remote Desktop) logon for an account that has never used RDP, or type 3 logons from a workstation to dozens of servers, point toward movement rather than normal work."
+    },
+    {
+      "id": "lin-term",
+      "type": "terminal",
+      "title": "Linux SSH spray check (lab host)",
+      "prompt": "root@web01:~#",
+      "lines": [
+        {
+          "cmd": "grep 'Failed password' /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -nr | head -3",
+          "output": " 612 198.51.100.23\n  41 203.0.113.9\n   6 192.0.2.44",
+          "comment": "Count failures per source address."
+        },
+        {
+          "cmd": "grep 'Failed password' /var/log/auth.log | grep 198.51.100.23 | awk '{print $9}' | sort -u | wc -l",
+          "output": "58",
+          "comment": "58 different usernames from one source indicates spraying, not a single-account brute force."
+        },
+        {
+          "cmd": "grep 'Accepted' /var/log/auth.log | grep 198.51.100.23",
+          "output": "Nov 12 01:52:10 web01 sshd[3188]: Accepted password for deploy from 198.51.100.23 port 51114 ssh2",
+          "comment": "The success is the moment to start a compromise investigation."
+        }
+      ],
+      "caption": "Illustrative output. Field positions in awk depend on your syslog format."
+    },
+    {
+      "id": "context",
+      "type": "text",
+      "markdown": "## Add context before you decide\n\nA raw login line says little. Enrich it before you judge it, and compare it against what is normal for that user.\n\n- **Who is the account?** A service account that suddenly logs in interactively is more serious than a student account doing the same.\n- **What is normal?** Build a baseline of usual hours, countries, devices and applications for important users, and flag deviations rather than single events.\n- **What came before and after?** Look at the hour before the login for password reset requests or phishing reports, and the hour after for new devices, inbox rules, privilege changes and large downloads.\n- **Is the source known?** Check whether the address belongs to a hosting provider, an anonymizing service or your own VPN range. A cloud hosting address signing in as an employee is unusual.\n\nWrite your reasoning into the ticket as a short chain: signal, context, verdict. That habit makes your decisions reviewable and helps you tune the detection later."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Keep detections explainable",
+      "markdown": "A rule that says \"20 accounts failed from one source in an hour\" is easy for the next analyst to understand and tune. A complex score nobody can explain gets disabled the first time it is noisy. Start simple, record the false positives you see, and add exclusions with a reason and an owner."
+    },
+    {
+      "id": "respond",
+      "type": "text",
+      "markdown": "## When the login is valid\n\nThe hardest case is a successful, correctly authenticated login by an attacker. Your response should assume the account is compromised until proven otherwise:\n\n1. Reset the password and revoke active sessions and refresh tokens.\n2. Review what the session did: mailbox rules, new MFA devices, OAuth consents, file downloads and new sign-in locations.\n3. Check privileged use of the account and any lateral movement.\n4. Classify the incident using [Security Incident Classification and Prioritization](/learn/security-operations-dfir/security-incident-classification-and-prioritization).\n\nDo not lock out accounts blindly during an active attack: attackers use lockouts to disrupt users. Prefer targeted blocks at the source and conditional access."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "A failed login is not always an attack",
+      "markdown": "Expired passwords, a service account with an old secret and a phone with a saved password all create floods of failures. Check whether the same host and application repeat the failures every few minutes before you escalate, and ask the account owner first."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a Linux lab VM you own, use a few wrong passwords for a test user over SSH from a second lab machine, then log in correctly. Run the three `grep` commands above to count failures per source, count distinct users and find the success. Then write the Sigma or KQL logic you would use to alert on \"more than five failures followed by a success within ten minutes\", and note one legitimate cause of false positives."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Password spraying",
+          "definition": "Trying a few common passwords across many accounts to avoid lockout."
+        },
+        {
+          "term": "Credential stuffing",
+          "definition": "Using leaked username and password pairs against other services."
+        },
+        {
+          "term": "Logon type",
+          "definition": "A code that tells how a Windows logon happened."
+        },
+        {
+          "term": "Impossible travel",
+          "definition": "Sign-ins from distant places within an unrealistic time."
+        },
+        {
+          "term": "MFA fatigue",
+          "definition": "Repeated prompts meant to wear a user down into approving."
+        },
+        {
+          "term": "Kerberos ticket",
+          "definition": "A credential issued by a domain controller to access a service."
+        },
+        {
+          "term": "Sigma",
+          "definition": "A vendor-neutral format for describing log detections."
+        },
+        {
+          "term": "Conditional access",
+          "definition": "Policy that allows or blocks sign-ins based on context."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Fifty usernames each fail once from one IP address within five minutes. What is the most likely pattern?",
+          "options": [
+            "Brute force on one account",
+            "Password spraying",
+            "Normal user mistakes",
+            "Kerberos ticket abuse"
+          ],
+          "answer": 1,
+          "explanation": "Few attempts on many accounts from one source is the signature of spraying."
+        },
+        {
+          "question": "Which signals suggest MFA fatigue? Choose all that apply.",
+          "options": [
+            "Many push prompts denied or ignored in a short time",
+            "One approval after the repeated prompts",
+            "A user entering a number match code correctly the first time",
+            "A single successful sign-in during office hours"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "Repeated prompts followed by an approval are the pattern. Normal use shows a single prompt approved by the user."
+        },
+        {
+          "question": "Why can a lockout alert miss password spraying?",
+          "options": [
+            "Spraying uses encrypted traffic",
+            "The attacker stays below the lockout threshold on each account",
+            "Lockouts only apply to Linux",
+            "Spraying never succeeds"
+          ],
+          "answer": 1,
+          "explanation": "Only one or two attempts are made per account, so lockouts rarely trigger."
+        },
+        {
+          "question": "After a successful login from an attacker, which actions belong in the response? Choose all that apply.",
+          "options": [
+            "Reset the password and revoke sessions",
+            "Review mailbox rules and new MFA devices",
+            "Wait to see whether more failures appear",
+            "Check for lateral movement from the account"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Waiting gives the attacker time. The other steps remove access and scope the damage."
+        },
+        {
+          "question": "Which log shows Kerberos service ticket requests on a domain controller?",
+          "options": [
+            "Event 4769",
+            "Event 4720",
+            "Event 1102",
+            "Event 7045"
+          ],
+          "answer": 0,
+          "explanation": "4769 records a service ticket request; 4720 is account creation, 1102 a cleared log and 7045 a new service."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nAuthentication logs hold the story of most modern intrusions. Know where each platform writes them, and always record the result and the reason. Separate brute force, spraying and stuffing by counting accounts and sources. Treat the first success after failures as the pivot, then check what the session did. Add impossible travel, MFA fatigue and Kerberos signals to your hunting list, and encode what you learn in KQL and Sigma. Continue with [Lateral Movement Detection](/learn/security-operations-dfir/lateral-movement-detection)."
+    }
+  ],
+  "ar": {
+    "title": "التحقيق في سجلات المصادقة",
+    "summary": "اقرأ سجلات المصادقة كمحقق: ميّز بين القوة الغاشمة ورش كلمات المرور وحشو بيانات الاعتماد، واكتشف السفر المستحيل وإرهاق المصادقة متعددة العوامل، وراجع إشارات Kerberos، واكتب كشوفات بـ KQL وSPL وSigma.",
+    "objectives": [
+      "تحديد مصادر سجلات المصادقة الرئيسية في Windows وLinux والهوية السحابية",
+      "التمييز بين القوة الغاشمة ورش كلمات المرور وحشو بيانات الاعتماد من أنماط السجلات",
+      "التعرف على السفر المستحيل وإرهاق المصادقة متعددة العوامل ونشاط Kerberos الشاذ",
+      "كتابة كشوفات KQL وSigma لتسجيلات الدخول الفاشلة ثم الناجحة",
+      "تقرير ما يُفعل حين يكون دخول يبدو سليمًا في الحقيقة مهاجمًا"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "معظم عمليات الاختراق اليوم لا تقتحم، بل تسجّل الدخول. كلمات المرور المسروقة وبيانات الاعتماد المعاد استخدامها وإشعارات الموافقة المقبولة تمنح المهاجم صلاحيات الموظف نفسها، والسجل الوحيد سطر عادي المظهر في سجل مصادقة.\n\nوالتحقيق في هذه الأسطر مهارة أساسية في مركز العمليات الأمنية. الأسئلة ثابتة: مَن صادق، ومن أين، وكيف، وماذا حدث بعد ذلك؟ يبيّن هذا الدرس كيف تجيب عنها في Windows وLinux والهوية السحابية، وكيف تحوّل ما تتعلمه إلى كشوفات. وهو يدعم [التحقيق في تصعيد الصلاحيات](/learn/security-operations-dfir/privilege-escalation-investigation) و[كشف التحرك الجانبي](/learn/security-operations-dfir/lateral-movement-detection)."
+      },
+      {
+        "id": "sources",
+        "type": "text",
+        "markdown": "## اعرف مصادر المصادقة\n\nيسجّل كل نظام تسجيلات الدخول في مكان مختلف وبحقول مختلفة. تعلّم المصادر الرئيسية.\n\n| النظام | المصدر | الأحداث والحقول الأساسية |\n|:--|:--|:--|\n| محطة/خادم Windows | سجل الأمان | 4624 نجاح، 4625 فشل، 4648 بيانات اعتماد صريحة، نوع الدخول، عنوان المصدر |\n| Active Directory | سجل الأمان في وحدة التحكم بالنطاق | 4768 طلب TGT، 4769 تذكرة خدمة، 4771 فشل المصادقة المسبقة، 4776 NTLM |\n| Linux | `/var/log/auth.log` و`/var/log/secure` و`journalctl` | `Accepted` و`Failed password` و`sudo` و`session opened` |\n| الهوية السحابية | سجلات الدخول في Entra ID وموفّرات هوية أخرى | المستخدم والعنوان والتطبيق ورمز النتيجة ونتيجة MFA والجهاز |\n| الوصول البعيد | VPN وبوابة RDP وخادم القفز | المستخدم والعنوان العام وبدء الجلسة ونهايتها |\n\nسجّل دائمًا **النتيجة** و**السبب**. الفشل بسبب كلمة مرور خاطئة يختلف كثيرًا عن الفشل بسبب حساب مقفل أو معطّل."
+      },
+      {
+        "id": "patterns",
+        "type": "text",
+        "markdown": "## ميّز أنماط الهجوم\n\nتبدو ثلاثة هجمات على كلمات المرور متشابهة في لوحة المراقبة لكنها تختلف في السجلات. المفتاح هو عدّ الإخفاقات لكل حساب ولكل عنوان مصدر.\n\n| النمط | الحسابات | عناوين المصدر | شكل السجل النموذجي |\n|:--|:--|:--|:--|\n| **القوة الغاشمة** | حساب واحد | واحد أو قليل | مئات الإخفاقات على حساب واحد |\n| **رش كلمات المرور** | كثيرة | واحد أو قليل | إخفاق أو اثنان على كل حساب من حسابات كثيرة |\n| **حشو بيانات الاعتماد** | كثيرة | كثيرة | محاولات مفردة بأزواج مسرّبة موزعة على نطاق واسع |\n\nيبقى الرش دون عتبات القفل عمدًا، فيفوت تنبيه القفل. اكشفه بعدّ الحسابات المختلفة المستهدفة من مصدر واحد في نافذة زمنية. واللحظة الحاسمة في أي منها هي **أول نجاح بعد الإخفاقات**، فهي تحوّل الضجيج إلى حادثة، ويجب أن تفحص ما فعله الحساب في الساعة التالية."
+      },
+      {
+        "id": "spray-seq",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "رش كلمات المرور وينتهي بدخول صحيح",
+        "caption": "يجرّب المهاجم كلمة مرور شائعة واحدة على حسابات كثيرة ويبقى دون عتبة القفل.",
+        "data": {
+          "actors": [
+            {
+              "id": "src",
+              "icon": "attacker",
+              "label": "المصدر",
+              "sub": "198.51.100.23"
+            },
+            {
+              "id": "idp",
+              "icon": "key",
+              "label": "موفّر الهوية",
+              "sub": "خدمة الدخول"
+            },
+            {
+              "id": "siem",
+              "icon": "log",
+              "label": "SIEM",
+              "sub": "الكشف"
+            },
+            {
+              "id": "soc",
+              "icon": "user",
+              "label": "المحلل",
+              "sub": "الاستجابة"
+            }
+          ],
+          "steps": [
+            {
+              "from": "src",
+              "to": "idp",
+              "label": "Try Summer2026!",
+              "detail": "User 1 of 400",
+              "note": "يجرّب المصدر كلمة مرور واحدة على أول حساب فيفشل.",
+              "tone": "warning"
+            },
+            {
+              "from": "src",
+              "to": "idp",
+              "label": "Try again",
+              "detail": "Users 2 to 399",
+              "note": "تُجرَّب الكلمة نفسها على مئات الحسابات بمحاولة لكل حساب دون حد القفل.",
+              "tone": "warning"
+            },
+            {
+              "from": "idp",
+              "to": "src",
+              "label": "Success",
+              "detail": "User 400",
+              "note": "يستخدم أحد الحسابات كلمة المرور الضعيفة فينجح الدخول.",
+              "tone": "danger"
+            },
+            {
+              "from": "idp",
+              "to": "siem",
+              "label": "Send logs",
+              "detail": "4625 x 399, 4624 x 1",
+              "note": "تُرسل أحداث الدخول مع المصدر والنتيجة والوقت."
+            },
+            {
+              "from": "siem",
+              "to": "soc",
+              "label": "Alert",
+              "detail": "399 accounts, 1 source",
+              "note": "تُطلق قاعدة: مصدر واحد فشل أمام حسابات كثيرة ثم نجح مرة.",
+              "tone": "danger"
+            },
+            {
+              "from": "soc",
+              "to": "idp",
+              "label": "Contain",
+              "detail": "Reset and revoke",
+              "note": "يعيد المحلل ضبط كلمة المرور ويلغي الجلسات ويحجب المصدر.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "kql",
+        "type": "text",
+        "markdown": "## اصطد بالاستعلامات\n\nالكشف سؤال تطرحه على البيانات مرارًا. يجد الاستعلام أدناه، بلغة KQL في Microsoft Sentinel، مصدرًا فشل أمام حسابات كثيرة ثم نجح. كيّف أسماء الحقول مع جداولك، واضبط العتبات وفق حركتك الطبيعية."
+      },
+      {
+        "id": "kql-code",
+        "type": "code",
+        "language": "plain",
+        "code": "let window = 1h;\nlet failures = SigninLogs\n| where TimeGenerated > ago(window) and ResultType in (50126, 50053)   // bad password, locked\n| summarize FailedAccounts = dcount(UserPrincipalName), Attempts = count() by IPAddress;\nlet successes = SigninLogs\n| where TimeGenerated > ago(window) and ResultType == 0\n| project IPAddress, UserPrincipalName, SuccessTime = TimeGenerated;\nfailures\n| where FailedAccounts >= 20\n| join kind=inner successes on IPAddress\n| project IPAddress, FailedAccounts, Attempts, UserPrincipalName, SuccessTime\n| order by FailedAccounts desc",
+        "filename": "spray_then_success.kql",
+        "caption": "مصادر لديها 20 حسابًا فاشلًا أو أكثر خلال ساعة ولديها أيضًا دخول ناجح. رموز النتائج المعروضة لسجلات الدخول في Entra ID."
+      },
+      {
+        "id": "sigma",
+        "type": "code",
+        "language": "yaml",
+        "code": "title: Many Failed Logons From One Source\nid: 5c1e3a10-0000-4000-8000-00000000a001\nstatus: experimental\nlogsource:\n  product: windows\n  service: security\ndetection:\n  selection:\n    EventID: 4625\n  condition: selection | count(TargetUserName) by IpAddress > 20\n  timeframe: 15m\nfields:\n  - IpAddress\n  - TargetUserName\nlevel: medium\ntags:\n  - attack.credential_access\n  - attack.t1110.003",
+        "filename": "failed_logons_spray.yml",
+        "caption": "قاعدة Sigma لرش كلمات المرور تحوّلها إلى لغة SIEM لديك. اضبط العتبة واستثنِ الماسحات المعروفة."
+      },
+      {
+        "id": "modern",
+        "type": "text",
+        "markdown": "## اكتشف أنماط الإساءة الحديثة\n\n**السفر المستحيل.** يسجّل المستخدم نفسه دخوله من موقعين بعيدين في وقت أقصر مما يسمح به السفر. اعتبره خيطًا للتحقيق لأن VPN وشبكات الجوال تُنتج إيجابيات كاذبة. افحص معرّفات الجهاز ووكيل المستخدم.\n\n**إرهاق المصادقة متعددة العوامل.** مهاجم يملك كلمة المرور يرسل إشعارات دفع متكررة آملًا أن يضغط المستخدم موافقة. ابحث عن رفض أو انتهاء مهلة متعدد لـ MFA يعقبه قبول واحد، وغالبًا ليلًا. وتقلل مطابقة الأرقام والعوامل المقاومة للتصيّد هذا الخطر.\n\n**إشارات Kerberos.** على وحدات التحكم بالنطاق قد يدل سيل من طلبات تذاكر الخدمة (الحدث 4769) بتشفير RC4 (`0x17`) من مستخدم واحد على كسر تذاكر الخدمة. ويستحق المراجعة حدث 4768 بتشفير غير معتاد أو ارتفاع في إخفاقات المصادقة المسبقة (4771). تأكد بخطوط الأساس لأن أنظمة قديمة قد تستخدم RC4 ما زالت.\n\n**نوع الدخول.** دخول من النوع 10 (سطح المكتب البعيد) لحساب لم يستخدم RDP قط، أو دخول من النوع 3 من محطة عمل إلى عشرات الخوادم، يشير إلى تحرك لا إلى عمل طبيعي."
+      },
+      {
+        "id": "lin-term",
+        "type": "terminal",
+        "title": "Linux SSH spray check (lab host)",
+        "prompt": "root@web01:~#",
+        "lines": [
+          {
+            "cmd": "grep 'Failed password' /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -nr | head -3",
+            "output": " 612 198.51.100.23\n  41 203.0.113.9\n   6 192.0.2.44",
+            "comment": "عدّ الإخفاقات لكل عنوان مصدر."
+          },
+          {
+            "cmd": "grep 'Failed password' /var/log/auth.log | grep 198.51.100.23 | awk '{print $9}' | sort -u | wc -l",
+            "output": "58",
+            "comment": "58 اسم مستخدم مختلفًا من مصدر واحد يدل على الرش لا على قوة غاشمة لحساب واحد."
+          },
+          {
+            "cmd": "grep 'Accepted' /var/log/auth.log | grep 198.51.100.23",
+            "output": "Nov 12 01:52:10 web01 sshd[3188]: Accepted password for deploy from 198.51.100.23 port 51114 ssh2",
+            "comment": "النجاح هو اللحظة التي تبدأ فيها التحقيق في الاختراق."
+          }
+        ],
+        "caption": "مخرجات توضيحية. تعتمد مواضع الحقول في awk على تنسيق syslog لديك."
+      },
+      {
+        "id": "context",
+        "type": "text",
+        "markdown": "## أضف السياق قبل أن تقرر\n\nسطر دخول خام لا يقول الكثير. أثرِه قبل أن تحكم عليه، وقارنه بما هو طبيعي لذلك المستخدم.\n\n- **مَن صاحب الحساب؟** حساب خدمة يسجّل الدخول فجأة بشكل تفاعلي أخطر من حساب طالب يفعل الشيء نفسه.\n- **ما الطبيعي؟** ابنِ خط أساس للساعات والدول والأجهزة والتطبيقات المعتادة للمستخدمين المهمين، وأشِر إلى الانحرافات لا إلى الأحداث المفردة.\n- **ما قبل الدخول وما بعده؟** انظر في الساعة السابقة إلى طلبات إعادة ضبط كلمة المرور أو بلاغات التصيّد، وفي الساعة اللاحقة إلى الأجهزة الجديدة وقواعد البريد وتغييرات الصلاحيات والتنزيلات الكبيرة.\n- **هل المصدر معروف؟** تحقق هل يعود العنوان إلى مزوّد استضافة أو خدمة إخفاء هوية أو نطاق VPN الخاص بك. دخول موظف من عنوان استضافة سحابية أمر غير معتاد.\n\nاكتب استدلالك في التذكرة كسلسلة قصيرة: الإشارة، السياق، الحكم. هذه العادة تجعل قراراتك قابلة للمراجعة وتساعدك على ضبط الكشف لاحقًا."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "اجعل الكشوفات قابلة للتفسير",
+        "markdown": "قاعدة تقول «فشل 20 حسابًا من مصدر واحد خلال ساعة» يسهل على المحلل التالي فهمها وضبطها. أما درجة معقدة لا يفسّرها أحد فتُعطَّل عند أول ضجيج. ابدأ ببساطة، وسجّل الإيجابيات الكاذبة التي تراها، وأضف الاستثناءات بسبب ومالك."
+      },
+      {
+        "id": "respond",
+        "type": "text",
+        "markdown": "## حين يكون الدخول صحيحًا\n\nأصعب الحالات دخول ناجح ومصادَق عليه بشكل صحيح من مهاجم. ينبغي أن تفترض استجابتك أن الحساب مخترق حتى يثبت العكس:\n\n1. أعد ضبط كلمة المرور وألغِ الجلسات النشطة ورموز التحديث.\n2. راجع ما فعلته الجلسة: قواعد صندوق البريد وأجهزة MFA الجديدة وموافقات OAuth وتنزيلات الملفات ومواقع الدخول الجديدة.\n3. افحص الاستخدام المميز للحساب وأي تحرك جانبي.\n4. صنّف الحادثة باستخدام [تصنيف حوادث الأمن وترتيب أولوياتها](/learn/security-operations-dfir/security-incident-classification-and-prioritization).\n\nلا تقفل الحسابات عشوائيًا أثناء هجوم نشط، فالمهاجمون يستخدمون القفل لتعطيل المستخدمين. فضّل الحجب المستهدف عند المصدر والوصول المشروط."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "الدخول الفاشل ليس هجومًا دائمًا",
+        "markdown": "كلمات المرور المنتهية وحساب خدمة بسرّ قديم وهاتف بكلمة مرور محفوظة كلها تُنتج سيلًا من الإخفاقات. تحقق هل يكرر الجهاز والتطبيق نفسه الإخفاقات كل بضع دقائق قبل التصعيد، واسأل صاحب الحساب أولًا."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة Linux افتراضية للمختبر تملكها، استخدم بضع كلمات مرور خاطئة لمستخدم اختبار عبر SSH من جهاز مختبر ثانٍ، ثم سجّل الدخول بشكل صحيح. شغّل أوامر `grep` الثلاثة أعلاه لعدّ الإخفاقات لكل مصدر وعدّ المستخدمين المختلفين وإيجاد النجاح. ثم اكتب منطق Sigma أو KQL الذي ستستخدمه للتنبيه على «أكثر من خمسة إخفاقات يعقبها نجاح خلال عشر دقائق»، ودوّن سببًا مشروعًا واحدًا للإيجابيات الكاذبة."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسية",
+        "items": [
+          {
+            "term": "رش كلمات المرور (Password spraying)",
+            "definition": "تجربة كلمات مرور شائعة قليلة على حسابات كثيرة لتجنب القفل."
+          },
+          {
+            "term": "حشو بيانات الاعتماد (Credential stuffing)",
+            "definition": "استخدام أزواج اسم مستخدم وكلمة مرور مسرّبة ضد خدمات أخرى."
+          },
+          {
+            "term": "نوع الدخول (Logon type)",
+            "definition": "رمز يبيّن كيف تم الدخول في Windows."
+          },
+          {
+            "term": "السفر المستحيل (Impossible travel)",
+            "definition": "تسجيلات دخول من أماكن بعيدة في زمن غير واقعي."
+          },
+          {
+            "term": "إرهاق المصادقة متعددة العوامل (MFA fatigue)",
+            "definition": "إشعارات متكررة تهدف إلى إرهاق المستخدم ليوافق."
+          },
+          {
+            "term": "تذكرة Kerberos",
+            "definition": "بيانات اعتماد تصدرها وحدة التحكم بالنطاق للوصول إلى خدمة."
+          },
+          {
+            "term": "Sigma",
+            "definition": "صيغة محايدة للمورّدين لوصف كشوفات السجلات."
+          },
+          {
+            "term": "الوصول المشروط (Conditional access)",
+            "definition": "سياسة تسمح بالدخول أو تحجبه بحسب السياق."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "فشل خمسون اسم مستخدم مرة واحدة لكل منها من عنوان IP واحد خلال خمس دقائق. ما النمط الأرجح؟",
+            "options": [
+              "قوة غاشمة على حساب واحد",
+              "رش كلمات المرور",
+              "أخطاء مستخدمين عادية",
+              "إساءة استخدام تذاكر Kerberos"
+            ],
+            "answer": 1,
+            "explanation": "محاولات قليلة على حسابات كثيرة من مصدر واحد هي بصمة الرش."
+          },
+          {
+            "question": "أي الإشارات توحي بإرهاق المصادقة متعددة العوامل؟ اختر كل ما ينطبق.",
+            "options": [
+              "إشعارات دفع كثيرة مرفوضة أو متجاهلة في وقت قصير",
+              "موافقة واحدة بعد الإشعارات المتكررة",
+              "إدخال المستخدم رمز مطابقة الأرقام بشكل صحيح من أول مرة",
+              "دخول ناجح واحد في ساعات العمل"
+            ],
+            "answer": [
+              0,
+              1
+            ],
+            "explanation": "الإشعارات المتكررة التي تعقبها موافقة هي النمط، أما الاستخدام الطبيعي فيُظهر إشعارًا واحدًا يوافق عليه المستخدم."
+          },
+          {
+            "question": "لماذا قد يفوت تنبيه القفل رش كلمات المرور؟",
+            "options": [
+              "لأن الرش يستخدم حركة مشفّرة",
+              "لأن المهاجم يبقى دون عتبة القفل لكل حساب",
+              "لأن القفل ينطبق على Linux فقط",
+              "لأن الرش لا ينجح أبدًا"
+            ],
+            "answer": 1,
+            "explanation": "تتم محاولة أو محاولتان فقط لكل حساب، فنادرًا ما يُفعَّل القفل."
+          },
+          {
+            "question": "بعد دخول ناجح من مهاجم، أي الإجراءات تنتمي إلى الاستجابة؟ اختر كل ما ينطبق.",
+            "options": [
+              "إعادة ضبط كلمة المرور وإلغاء الجلسات",
+              "مراجعة قواعد صندوق البريد وأجهزة MFA الجديدة",
+              "الانتظار لمعرفة هل تظهر إخفاقات أخرى",
+              "فحص التحرك الجانبي من الحساب"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الانتظار يمنح المهاجم وقتًا، أما الخطوات الأخرى فتزيل الوصول وتحدد حجم الضرر."
+          },
+          {
+            "question": "أي سجل يُظهر طلبات تذاكر خدمة Kerberos على وحدة التحكم بالنطاق؟",
+            "options": [
+              "الحدث 4769",
+              "الحدث 4720",
+              "الحدث 1102",
+              "الحدث 7045"
+            ],
+            "answer": 0,
+            "explanation": "الحدث 4769 يسجّل طلب تذكرة خدمة، بينما 4720 إنشاء حساب و1102 مسح سجل و7045 خدمة جديدة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nتحمل سجلات المصادقة قصة معظم الاختراقات الحديثة. اعرف أين يكتبها كل نظام، وسجّل دائمًا النتيجة والسبب. ميّز بين القوة الغاشمة والرش والحشو بعدّ الحسابات والمصادر. اعتبر أول نجاح بعد الإخفاقات نقطة الارتكاز، ثم افحص ما فعلته الجلسة. أضف السفر المستحيل وإرهاق MFA وإشارات Kerberos إلى قائمة صيدك، وضمّن ما تتعلمه في KQL وSigma. تابع مع [كشف التحرك الجانبي](/learn/security-operations-dfir/lateral-movement-detection)."
+      }
+    ]
+  }
+}

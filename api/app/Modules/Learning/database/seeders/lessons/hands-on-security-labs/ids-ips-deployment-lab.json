@@ -1,0 +1,624 @@
+{
+  "slug": "ids-ips-deployment-lab",
+  "title": "IDS/IPS Deployment Lab",
+  "summary": "Deploy Suricata on a sensor you own: choose IDS or IPS mode, configure capture and eve.json, write and test a local rule with harmless traffic, and tune before blocking.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Compare IDS, inline IPS and mirror-port deployments",
+    "Configure Suricata capture, HOME_NET and eve.json",
+    "Write and verify a local detection rule safely",
+    "Tune noisy signatures using disable and suppress entries",
+    "Plan a safe move from detection to prevention"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Your firewall allows TCP/443 to the web server, so it cannot tell a normal request from a malicious one hidden inside that allowed flow. A network **intrusion detection system (IDS)** watches traffic and raises alerts. An **intrusion prevention system (IPS)** sits in the path and can also drop packets. Both inspect packet contents with signatures and protocol analysis.\n\nThis lab deploys **Suricata**, an open-source engine, on a Linux sensor you own. You will place it, run it first as a passive IDS, write and test a local rule with harmless traffic, tune out noise, and only then consider IPS mode. For the integration with an agent-based platform, continue later with [Wazuh and Suricata Integration Lab](/learn/hands-on-security-labs/wazuh-and-suricata-integration-lab)."
+    },
+    {
+      "id": "modes",
+      "type": "text",
+      "markdown": "## Step 1: Choose the deployment mode\n\nThe mode decides how traffic reaches the sensor, and therefore what the sensor can do.\n\n| Mode | How it sees traffic | Can block? | Risk |\n|:--|:--|:--|:--|\n| **IDS with SPAN or TAP** | A copy of traffic from a mirror port | No | Missed packets if the mirror is oversubscribed |\n| **IPS inline (NFQUEUE)** | Traffic is queued to Suricata by the kernel | Yes | A false positive or a crash can break production |\n| **Inline bridge** | The sensor bridges two interfaces | Yes | Sensor failure cuts the link without fail-open |\n\nStart in IDS mode on a mirror port or a virtual switch with promiscuous mode enabled. Visibility first, blocking later. In a Proxmox lab, mirror the DMZ bridge to the sensor's second interface, as covered in [Proxmox Security Lab](/learn/hands-on-security-labs/proxmox-security-lab)."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "From packet to alert in passive IDS mode",
+      "caption": "The sensor works on a copy, so inspection never delays real traffic.",
+      "data": {
+        "token": "Packet",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "Client",
+            "sub": "203.0.113.40",
+            "icon": "laptop"
+          },
+          {
+            "id": "sw",
+            "label": "Mirror port",
+            "sub": "SPAN",
+            "icon": "switch"
+          },
+          {
+            "id": "web",
+            "label": "Web server",
+            "sub": "10.10.20.10",
+            "icon": "server"
+          },
+          {
+            "id": "sur",
+            "label": "Suricata",
+            "sub": "eth1 AF_PACKET",
+            "icon": "eye"
+          },
+          {
+            "id": "eve",
+            "label": "eve.json",
+            "sub": "Alert and flow logs",
+            "icon": "log"
+          },
+          {
+            "id": "soc",
+            "label": "Analyst",
+            "sub": "SIEM",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "client",
+            "caption": "A client sends an HTTP request with a suspicious User-Agent to the web server."
+          },
+          {
+            "at": "sw",
+            "caption": "The switch forwards the packet and mirrors a copy to the sensor."
+          },
+          {
+            "at": "web",
+            "caption": "The original packet reaches the web server unchanged.",
+            "tone": "success"
+          },
+          {
+            "at": "sur",
+            "caption": "Suricata reassembles the stream, decodes HTTP and compares it to the rules."
+          },
+          {
+            "at": "sur",
+            "caption": "Rule sid 1000001 matches the lab test string.",
+            "tone": "warning"
+          },
+          {
+            "at": "eve",
+            "caption": "An alert record is written to eve.json with the flow, rule and signature."
+          },
+          {
+            "at": "soc",
+            "caption": "The SIEM ingests the alert; an analyst triages it.",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "install",
+      "type": "text",
+      "markdown": "## Step 2: Install and configure the sensor\n\nInstall Suricata from your distribution or the project repository, then edit `suricata.yaml`. Only a few settings matter at the start.\n\n- `HOME_NET` must list your internal ranges. Wrong values make many rules silently never match.\n- `af-packet` names the capture interface.\n- `eve-log` should be enabled so alerts, DNS, HTTP, TLS and flow events are written as JSON.\n- Turn off hardware offloading on the capture interface, since a checksum or segmentation offload hides real packets from the sensor."
+    },
+    {
+      "id": "yaml",
+      "type": "code",
+      "language": "yaml",
+      "filename": "/etc/suricata/suricata.yaml",
+      "caption": "Key settings (excerpt). Addresses are lab ranges.",
+      "highlight": [
+        2,
+        3,
+        8,
+        12
+      ],
+      "code": "vars:\n  address-groups:\n    HOME_NET: \"[10.10.10.0/24,10.10.20.0/24]\"\n    EXTERNAL_NET: \"!$HOME_NET\"\n\naf-packet:\n  - interface: eth1\n    cluster-id: 99\n    cluster-type: cluster_flow\n\noutputs:\n  - eve-log:\n      enabled: yes\n      filename: eve.json\n      types: [alert, http, dns, tls, flow]\n\ndefault-rule-path: /var/lib/suricata/rules\nrule-files:\n  - suricata.rules\n  - local.rules\n"
+    },
+    {
+      "id": "rules",
+      "type": "text",
+      "markdown": "## Step 3: Write and test a local rule\n\nA rule has an **action**, a **header** (protocol, addresses, ports) and **options** in parentheses. Keep your own rules in `local.rules` and give them a `sid` of 1,000,000 or higher so they never clash with a community set.\n\nWe will detect a harmless marker string in a `User-Agent` header so you can test without any attack code. Replace the marker with real indicators of your own later.\n\nAfter saving, run `suricata -T` to test the configuration, update the managed rules with `suricata-update`, and restart the service."
+    },
+    {
+      "id": "rule",
+      "type": "code",
+      "language": "plain",
+      "filename": "/var/lib/suricata/rules/local.rules",
+      "caption": "A lab-only rule. The marker string is made up for this exercise.",
+      "highlight": [
+        1
+      ],
+      "code": "alert http $EXTERNAL_NET any -> $HOME_NET any (msg:\"LAB User-Agent marker seen\"; flow:established,to_server; http.user_agent; content:\"lab-ids-test\"; nocase; classtype:policy-violation; sid:1000001; rev:1;)\n"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "sensor",
+      "prompt": "$",
+      "caption": "Validate, generate harmless test traffic from your own client, and read the alert.",
+      "lines": [
+        {
+          "cmd": "sudo suricata -T -c /etc/suricata/suricata.yaml",
+          "output": "i: suricata: This is Suricata version 7.0.5 RELEASE running in SYSTEM mode\ni: suricata: Configuration provided was successfully loaded. Exiting.",
+          "comment": "Always test the config before a restart."
+        },
+        {
+          "cmd": "sudo systemctl restart suricata && sudo suricata-update list-sources | head -n 3",
+          "output": "Name: et/open\n  Vendor: Proofpoint\n  Summary: Emerging Threats Open Ruleset",
+          "comment": "A community ruleset gives broad coverage."
+        },
+        {
+          "prompt": "client$",
+          "cmd": "curl -s -o /dev/null -A 'lab-ids-test' http://10.10.20.10/",
+          "output": "",
+          "comment": "Harmless request from a client in your lab that carries the marker."
+        },
+        {
+          "prompt": "sensor$",
+          "cmd": "jq -c 'select(.event_type==\"alert\") | {src:.src_ip, dst:.dest_ip, sig:.alert.signature, sid:.alert.signature_id}' /var/log/suricata/eve.json | tail -n 1",
+          "output": "{\"src\":\"10.10.10.15\",\"dst\":\"10.10.20.10\",\"sig\":\"LAB User-Agent marker seen\",\"sid\":1000001}",
+          "comment": "The rule fired. Note the source: EXTERNAL_NET is !HOME_NET, so adjust it if the client is inside your lab ranges."
+        }
+      ]
+    },
+    {
+      "id": "tune",
+      "type": "text",
+      "markdown": "## Step 4: Tune before you block\n\nA fresh sensor with a full community ruleset is noisy. Noise trains analysts to ignore alerts, which is worse than having none. Tune in a loop: review the top alerting signatures, decide whether each is true activity, a false positive or low value, and act.\n\n- **Disable** a rule that is irrelevant to your environment, through `disable.conf`.\n- **Suppress** a rule for one known-good host with a `threshold.config` entry, rather than disabling it for everyone.\n- **Modify** a threshold to alert once per source per hour for chatty scans.\n- **Keep** high-value rules for services you actually run, such as web and DNS.\n\nOnly after several quiet, tuned weeks should you test IPS mode. Convert a small number of high-confidence rules from `alert` to `drop`, run Suricata with the NFQUEUE option, and test with a rollback plan ready. If the queue process dies, decide in advance whether traffic should fail open or closed."
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## Step 5: Triage an alert like an analyst\n\nAn alert is a question, not an answer. When one fires, ask four things in order.\n\n1. **Is the rule trustworthy?** Read the signature and its classification. Does it describe a pattern that really indicates harm?\n2. **Was the target vulnerable?** An alert about an exploit for software you do not run is informational.\n3. **What did the target do next?** Look at the same flow in `eve.json`, then at the web server log and the host. A successful response or a new outbound connection raises the priority.\n4. **Is it part of a pattern?** One source touching many hosts or many rules is a scan or a campaign.\n\nWrite the outcome down: true positive, benign or false positive. Those labels are the raw material for your next tuning round, and they show a hiring manager that you can reason about evidence, not only install tools."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Detection is not prevention",
+      "markdown": "An IDS only reports. Encrypted traffic (TLS 1.3) hides payloads from signature rules unless you inspect metadata such as the TLS SNI and certificate fields or terminate TLS at a proxy you control. Treat IDS coverage as partial, and pair it with endpoint logs and the firewall tests from [Firewall Rule Testing Lab](/learn/hands-on-security-labs/firewall-rule-testing-lab)."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Measure packet loss",
+      "markdown": "Check `stats.log` or the `stats` events for `capture.kernel_drops`. A rising value means the sensor cannot keep up, and every drop is traffic you never inspected. Give it more CPU, tune `cluster_flow`, or reduce the mirrored traffic."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a sensor VM **you own**, attached to a mirror of your lab bridge:\n\n1. Install Suricata, set `HOME_NET` and `af-packet`, then run `sudo suricata -T`.\n2. Add the local rule, restart, and generate the marker request from a lab client.\n3. Confirm the alert in `eve.json` with the `jq` filter and record the fields.\n4. Run `suricata-update`, browse for a day, then list the top five signatures with `jq` and `sort | uniq -c`.\n5. Choose one noisy rule and suppress it for a single host. Document your reasoning.\n6. Write a short plan for moving one rule to `drop`: what test proves it is safe, and how you would roll back?"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "IDS",
+          "definition": "A system that inspects traffic or logs and raises alerts without blocking."
+        },
+        {
+          "term": "IPS",
+          "definition": "An inline system that can drop or reset malicious traffic as well as alert."
+        },
+        {
+          "term": "SPAN / TAP",
+          "definition": "Ways to copy network traffic to a sensor, by a switch mirror port or a physical tap."
+        },
+        {
+          "term": "Signature",
+          "definition": "A rule describing a pattern of known bad or policy-violating traffic."
+        },
+        {
+          "term": "HOME_NET",
+          "definition": "The Suricata variable listing the networks you defend; many rules depend on it."
+        },
+        {
+          "term": "eve.json",
+          "definition": "Suricata's JSON event log containing alerts and protocol metadata."
+        },
+        {
+          "term": "False positive",
+          "definition": "An alert for activity that is actually harmless."
+        },
+        {
+          "term": "NFQUEUE",
+          "definition": "A Linux mechanism that hands packets from the kernel firewall to a user-space program for a verdict."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main difference between an IDS and an IPS?",
+          "options": [
+            "An IPS can drop traffic inline; an IDS only alerts",
+            "An IDS is always faster",
+            "An IPS cannot read payloads",
+            "They are the same product"
+          ],
+          "answer": 0,
+          "explanation": "Both inspect traffic, but only an inline IPS sits in the path and can block. An IDS works on a copy and reports."
+        },
+        {
+          "question": "Why start with IDS mode on a mirror port?",
+          "options": [
+            "It cannot break production traffic while you tune",
+            "It encrypts traffic",
+            "It is required by law",
+            "It uses no CPU"
+          ],
+          "answer": 0,
+          "explanation": "A passive sensor works on a copy, so mistakes and false positives cannot block real users."
+        },
+        {
+          "question": "Which actions are valid tuning steps? (Choose all that apply.)",
+          "options": [
+            "Suppress a rule for one known-good host",
+            "Disable rules irrelevant to your services",
+            "Set HOME_NET to any",
+            "Review the top alerting signatures regularly"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Targeted suppression, disabling irrelevant rules and regular review reduce noise. Setting HOME_NET to any breaks the logic of directional rules."
+        },
+        {
+          "question": "A rising capture.kernel_drops counter means what?",
+          "options": [
+            "The rules are very good",
+            "The sensor is missing packets and not inspecting them",
+            "TLS is disabled",
+            "The log is encrypted"
+          ],
+          "answer": 1,
+          "explanation": "Kernel drops are packets the sensor never saw, which are blind spots in detection."
+        },
+        {
+          "question": "Why can TLS 1.3 limit signature-based detection?",
+          "options": [
+            "Payloads are encrypted, leaving mostly metadata",
+            "It blocks Suricata",
+            "It removes IP headers",
+            "It slows the network"
+          ],
+          "answer": 0,
+          "explanation": "Signatures that match HTTP content cannot see inside encrypted sessions, so you rely on SNI, certificates and flow behavior."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou placed a Suricata sensor on a mirrored segment, configured `HOME_NET`, capture and `eve.json`, wrote a lab rule, and proved it by generating harmless traffic and finding the alert. You learned to tune with disable and suppress entries before ever blocking, to watch kernel drops, and to plan IPS conversion with a rollback. Alerts are only useful if someone sees them, so the next lab collects them centrally: [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر نشر IDS/IPS",
+    "summary": "انشر Suricata على مستشعر تملكه: اختر وضع IDS أو IPS واضبط الالتقاط وeve.json واكتب قاعدة محلية واختبرها بحركة غير ضارة واضبط قبل الحجب.",
+    "objectives": [
+      "المقارنة بين نشر IDS وIPS المضمَّن ومنفذ المرآة",
+      "ضبط التقاط Suricata وHOME_NET وeve.json",
+      "كتابة قاعدة كشف محلية والتحقق منها بأمان",
+      "ضبط التواقيع كثيرة الضجيج بإدخالات التعطيل والكتم",
+      "التخطيط لانتقال آمن من الكشف إلى المنع"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يسمح جدارك الناري بـ TCP/443 إلى خادم الويب، فلا يستطيع التمييز بين طلب عادي وطلب خبيث مخبّأ داخل ذلك التدفق المسموح. يراقب **نظام كشف التسلل (IDS)** حركة المرور ويطلق تنبيهات. ويقع **نظام منع التسلل (IPS)** في مسار الحركة ويستطيع أيضًا إسقاط الحزم. ويفحص كلاهما محتوى الحزم بالتواقيع وتحليل البروتوكولات.\n\nينشر هذا المختبر **Suricata** وهو محرك مفتوح المصدر على مستشعر Linux **تملكه**. ستحدد موضعه، وتشغّله أولًا كنظام IDS سلبي، وتكتب قاعدة محلية وتختبرها بحركة غير ضارة، وتخفّض الضجيج، ثم تفكر في وضع IPS فقط. وللتكامل مع منصة تعتمد على الوكلاء تابع لاحقًا مع [مختبر تكامل Wazuh وSuricata](/learn/hands-on-security-labs/wazuh-and-suricata-integration-lab)."
+      },
+      {
+        "id": "modes",
+        "type": "text",
+        "markdown": "## الخطوة 1: اختر وضع النشر\n\nيحدد الوضع كيف تصل الحركة إلى المستشعر وبالتالي ما يستطيع المستشعر فعله.\n\n| الوضع | كيف يرى الحركة | هل يحجب؟ | الخطر |\n|:--|:--|:--|:--|\n| **IDS مع SPAN أو TAP** | نسخة من الحركة من منفذ مرآة | لا | فقدان حزم إذا أُفرط في تحميل المرآة |\n| **IPS مضمَّن (NFQUEUE)** | تضع النواة الحركة في طابور إلى Suricata | نعم | قد يعطّل إيجابي كاذب أو تعطل الإنتاج |\n| **جسر مضمَّن** | يجسر المستشعر بين واجهتين | نعم | فشل المستشعر يقطع الوصلة دون فتح عند الفشل |\n\nابدأ بوضع IDS على منفذ مرآة أو مفتاح افتراضي مفعّل فيه الوضع المختلط. الرؤية أولًا والحجب لاحقًا. وفي مختبر Proxmox اعكس جسر DMZ إلى الواجهة الثانية للمستشعر كما في [مختبر Proxmox الأمني](/learn/hands-on-security-labs/proxmox-security-lab)."
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "من الحزمة إلى التنبيه في وضع IDS السلبي",
+        "caption": "يعمل المستشعر على نسخة، فلا يؤخر الفحص الحركة الحقيقية.",
+        "data": {
+          "token": "حزمة",
+          "nodes": [
+            {
+              "id": "client",
+              "label": "العميل",
+              "sub": "203.0.113.40",
+              "icon": "laptop"
+            },
+            {
+              "id": "sw",
+              "label": "منفذ المرآة",
+              "sub": "SPAN",
+              "icon": "switch"
+            },
+            {
+              "id": "web",
+              "label": "خادم الويب",
+              "sub": "10.10.20.10",
+              "icon": "server"
+            },
+            {
+              "id": "sur",
+              "label": "Suricata",
+              "sub": "eth1 AF_PACKET",
+              "icon": "eye"
+            },
+            {
+              "id": "eve",
+              "label": "eve.json",
+              "sub": "سجلات التنبيه والتدفق",
+              "icon": "log"
+            },
+            {
+              "id": "soc",
+              "label": "المحلل",
+              "sub": "SIEM",
+              "icon": "user"
+            }
+          ],
+          "steps": [
+            {
+              "at": "client",
+              "caption": "يرسل عميل طلب HTTP بقيمة User-Agent مشبوهة إلى خادم الويب."
+            },
+            {
+              "at": "sw",
+              "caption": "يمرر المفتاح الحزمة ويعكس نسخة منها إلى المستشعر."
+            },
+            {
+              "at": "web",
+              "caption": "تصل الحزمة الأصلية إلى خادم الويب دون تغيير.",
+              "tone": "success"
+            },
+            {
+              "at": "sur",
+              "caption": "يعيد Suricata تجميع التدفق ويفك HTTP ويقارنه بالقواعد."
+            },
+            {
+              "at": "sur",
+              "caption": "تطابق القاعدة sid 1000001 سلسلة الاختبار في المختبر.",
+              "tone": "warning"
+            },
+            {
+              "at": "eve",
+              "caption": "يُكتب سجل تنبيه في eve.json مع التدفق والقاعدة والتوقيع."
+            },
+            {
+              "at": "soc",
+              "caption": "يستوعب SIEM التنبيه ويفرزه المحلل.",
+              "tone": "secure"
+            }
+          ]
+        }
+      },
+      {
+        "id": "install",
+        "type": "text",
+        "markdown": "## الخطوة 2: ثبّت المستشعر واضبطه\n\nثبّت Suricata من توزيعتك أو من مستودع المشروع ثم عدّل `suricata.yaml`. لا يهم في البداية سوى بضعة إعدادات.\n\n- يجب أن يسرد `HOME_NET` نطاقاتك الداخلية. القيم الخاطئة تجعل كثيرًا من القواعد لا تطابق أبدًا وبصمت.\n- يسمّي `af-packet` واجهة الالتقاط.\n- فعّل `eve-log` ليكتب أحداث التنبيه وDNS وHTTP وTLS والتدفق بصيغة JSON.\n- عطّل تفريغ الأجهزة (offloading) على واجهة الالتقاط لأن تفريغ المجاميع الاختبارية أو التجزئة يخفي الحزم الحقيقية عن المستشعر."
+      },
+      {
+        "id": "yaml",
+        "type": "code",
+        "language": "yaml",
+        "filename": "/etc/suricata/suricata.yaml",
+        "caption": "الإعدادات الأساسية (مقتطف). العناوين نطاقات مختبر.",
+        "highlight": [
+          2,
+          3,
+          8,
+          12
+        ],
+        "code": "vars:\n  address-groups:\n    HOME_NET: \"[10.10.10.0/24,10.10.20.0/24]\"\n    EXTERNAL_NET: \"!$HOME_NET\"\n\naf-packet:\n  - interface: eth1\n    cluster-id: 99\n    cluster-type: cluster_flow\n\noutputs:\n  - eve-log:\n      enabled: yes\n      filename: eve.json\n      types: [alert, http, dns, tls, flow]\n\ndefault-rule-path: /var/lib/suricata/rules\nrule-files:\n  - suricata.rules\n  - local.rules\n"
+      },
+      {
+        "id": "rules",
+        "type": "text",
+        "markdown": "## الخطوة 3: اكتب قاعدة محلية واختبرها\n\nتتكون القاعدة من **إجراء** و**ترويسة** (البروتوكول والعناوين والمنافذ) و**خيارات** بين قوسين. احتفظ بقواعدك في `local.rules` وأعطها `sid` يساوي 1000000 أو أكبر كي لا تتعارض مع مجموعة مجتمعية.\n\nسنكشف سلسلة علامة غير ضارة في ترويسة `User-Agent` لتختبر دون أي شيفرة هجوم. وبدّل العلامة لاحقًا بمؤشرات حقيقية خاصة بك.\n\nبعد الحفظ نفّذ `suricata -T` لاختبار الإعدادات، وحدّث القواعد المُدارة بـ `suricata-update`، وأعد تشغيل الخدمة."
+      },
+      {
+        "id": "rule",
+        "type": "code",
+        "language": "plain",
+        "filename": "/var/lib/suricata/rules/local.rules",
+        "caption": "قاعدة للمختبر فقط. سلسلة العلامة مختلقة لهذا التمرين.",
+        "highlight": [
+          1
+        ],
+        "code": "alert http $EXTERNAL_NET any -> $HOME_NET any (msg:\"LAB User-Agent marker seen\"; flow:established,to_server; http.user_agent; content:\"lab-ids-test\"; nocase; classtype:policy-violation; sid:1000001; rev:1;)\n"
+      },
+      {
+        "id": "term",
+        "type": "terminal",
+        "title": "sensor",
+        "prompt": "$",
+        "caption": "تحقق وولّد حركة اختبار غير ضارة من عميلك ثم اقرأ التنبيه.",
+        "lines": [
+          {
+            "cmd": "sudo suricata -T -c /etc/suricata/suricata.yaml",
+            "output": "i: suricata: This is Suricata version 7.0.5 RELEASE running in SYSTEM mode\ni: suricata: Configuration provided was successfully loaded. Exiting.",
+            "comment": "اختبر الإعدادات دائمًا قبل إعادة التشغيل."
+          },
+          {
+            "cmd": "sudo systemctl restart suricata && sudo suricata-update list-sources | head -n 3",
+            "output": "Name: et/open\n  Vendor: Proofpoint\n  Summary: Emerging Threats Open Ruleset",
+            "comment": "توفر مجموعة قواعد مجتمعية تغطية واسعة."
+          },
+          {
+            "prompt": "client$",
+            "cmd": "curl -s -o /dev/null -A 'lab-ids-test' http://10.10.20.10/",
+            "output": "",
+            "comment": "طلب غير ضار من عميل في مختبرك يحمل العلامة."
+          },
+          {
+            "prompt": "sensor$",
+            "cmd": "jq -c 'select(.event_type==\"alert\") | {src:.src_ip, dst:.dest_ip, sig:.alert.signature, sid:.alert.signature_id}' /var/log/suricata/eve.json | tail -n 1",
+            "output": "{\"src\":\"10.10.10.15\",\"dst\":\"10.10.20.10\",\"sig\":\"LAB User-Agent marker seen\",\"sid\":1000001}",
+            "comment": "أطلقت القاعدة تنبيهًا. لاحظ المصدر: EXTERNAL_NET هو !HOME_NET فعدّله إن كان العميل داخل نطاقات مختبرك."
+          }
+        ]
+      },
+      {
+        "id": "tune",
+        "type": "text",
+        "markdown": "## الخطوة 4: اضبط قبل أن تحجب\n\nالمستشعر الجديد مع مجموعة قواعد مجتمعية كاملة كثير الضجيج. والضجيج يعوّد المحللين على تجاهل التنبيهات، وهذا أسوأ من انعدامها. اضبط في حلقة: راجع أكثر التواقيع تنبيهًا وقرر هل هي نشاط حقيقي أم إيجابي كاذب أم قليلة القيمة ثم تصرّف.\n\n- **عطّل** القاعدة غير ذات الصلة ببيئتك عبر `disable.conf`.\n- **اكتم** القاعدة لمضيف واحد موثوق بسطر في `threshold.config` بدل تعطيلها للجميع.\n- **عدّل** العتبة لتنبّه مرة لكل مصدر في الساعة للفحوص كثيرة الثرثرة.\n- **أبقِ** القواعد عالية القيمة للخدمات التي تشغّلها فعلًا مثل الويب وDNS.\n\nلا تجرّب وضع IPS إلا بعد أسابيع هادئة مضبوطة. حوّل عددًا قليلًا من القواعد عالية الثقة من `alert` إلى `drop` وشغّل Suricata بخيار NFQUEUE واختبر مع خطة تراجع جاهزة. وإن توقفت عملية الطابور فقرر مسبقًا هل تفشل الحركة مفتوحة أم مغلقة."
+      },
+      {
+        "id": "triage",
+        "type": "text",
+        "markdown": "## الخطوة 5: افرز التنبيه كمحلل\n\nالتنبيه سؤال وليس جوابًا. عندما يُطلق أحدها اسأل أربعة أسئلة بالترتيب.\n\n1. **هل القاعدة موثوقة؟** اقرأ التوقيع وتصنيفه. هل يصف نمطًا يدل فعلًا على ضرر؟\n2. **هل كان الهدف ضعيفًا؟** التنبيه عن استغلال لبرنامج لا تشغّله معلوماتي فقط.\n3. **ماذا فعل الهدف بعد ذلك؟** انظر إلى التدفق نفسه في `eve.json` ثم إلى سجل خادم الويب والمضيف. فالاستجابة الناجحة أو اتصال صادر جديد يرفع الأولوية.\n4. **هل هو جزء من نمط؟** مصدر واحد يلامس مضيفات كثيرة أو قواعد كثيرة فحص أو حملة.\n\nدوّن النتيجة: إيجابي حقيقي أو حميد أو إيجابي كاذب. هذه التصنيفات مادة جولة الضبط التالية، وهي تُري مدير التوظيف أنك تستدل بالأدلة ولا تكتفي بتثبيت الأدوات."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "الكشف ليس منعًا",
+        "markdown": "لا يفعل IDS سوى التبليغ. وتخفي الحركة المشفّرة (TLS 1.3) الحمولات عن قواعد التواقيع ما لم تفحص البيانات الوصفية مثل SNI وحقول الشهادة أو تنهِ TLS عند وكيل تتحكم به. اعتبر تغطية IDS جزئية وادمجها مع سجلات الأجهزة الطرفية واختبارات الجدار الناري من [مختبر اختبار قواعد الجدار الناري](/learn/hands-on-security-labs/firewall-rule-testing-lab)."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "قِس فقدان الحزم",
+        "markdown": "افحص `stats.log` أو أحداث `stats` بحثًا عن `capture.kernel_drops`. القيمة المتصاعدة تعني أن المستشعر لا يواكب، وكل حزمة مفقودة حركة لم تُفحص. أعطه مزيدًا من المعالج أو اضبط `cluster_flow` أو قلّل الحركة المعكوسة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة مستشعر افتراضية **تملكها** ومتصلة بمرآة لجسر مختبرك:\n\n1. ثبّت Suricata واضبط `HOME_NET` و`af-packet` ثم نفّذ `sudo suricata -T`.\n2. أضف القاعدة المحلية وأعد التشغيل وولّد طلب العلامة من عميل في المختبر.\n3. أكّد التنبيه في `eve.json` بمرشح `jq` وسجّل الحقول.\n4. نفّذ `suricata-update` وتصفّح يومًا ثم اسرد أكثر خمسة تواقيع بـ `jq` و`sort | uniq -c`.\n5. اختر قاعدة كثيرة الضجيج واكتمها لمضيف واحد ودوّن مبررك.\n6. اكتب خطة قصيرة لتحويل قاعدة واحدة إلى `drop`: ما الاختبار الذي يثبت أمانها وكيف ستتراجع؟"
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "نظام كشف التسلل (IDS)",
+            "definition": "نظام يفحص الحركة أو السجلات ويطلق تنبيهات دون حجب."
+          },
+          {
+            "term": "نظام منع التسلل (IPS)",
+            "definition": "نظام مضمَّن يستطيع إسقاط الحركة الخبيثة أو إعادة ضبطها إضافة إلى التنبيه."
+          },
+          {
+            "term": "SPAN / TAP",
+            "definition": "طرق لنسخ حركة الشبكة إلى مستشعر، عبر منفذ مرآة في المفتاح أو وصلة TAP فيزيائية."
+          },
+          {
+            "term": "التوقيع",
+            "definition": "قاعدة تصف نمط حركة معروفة بأنها سيئة أو مخالفة للسياسة."
+          },
+          {
+            "term": "HOME_NET",
+            "definition": "متغير في Suricata يسرد الشبكات التي تدافع عنها؛ وتعتمد عليه قواعد كثيرة."
+          },
+          {
+            "term": "eve.json",
+            "definition": "سجل أحداث Suricata بصيغة JSON ويحوي التنبيهات والبيانات الوصفية للبروتوكولات."
+          },
+          {
+            "term": "إيجابي كاذب",
+            "definition": "تنبيه عن نشاط غير ضار في الحقيقة."
+          },
+          {
+            "term": "NFQUEUE",
+            "definition": "آلية في Linux تسلّم الحزم من جدار النواة إلى برنامج في فضاء المستخدم لإصدار حكم."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما الفرق الرئيسي بين IDS وIPS؟",
+            "options": [
+              "يستطيع IPS إسقاط الحركة وهو مضمَّن، أما IDS فينبّه فقط",
+              "IDS أسرع دائمًا",
+              "IPS لا يقرأ الحمولات",
+              "هما المنتج نفسه"
+            ],
+            "answer": 0,
+            "explanation": "كلاهما يفحص الحركة، لكن IPS المضمَّن وحده يقع في المسار ويحجب. أما IDS فيعمل على نسخة ويبلّغ."
+          },
+          {
+            "question": "لماذا نبدأ بوضع IDS على منفذ مرآة؟",
+            "options": [
+              "لأنه لا يستطيع تعطيل حركة الإنتاج أثناء الضبط",
+              "لأنه يشفّر الحركة",
+              "لأنه مطلوب قانونًا",
+              "لأنه لا يستهلك معالجًا"
+            ],
+            "answer": 0,
+            "explanation": "يعمل المستشعر السلبي على نسخة، فلا تحجب الأخطاء والإيجابيات الكاذبة المستخدمين الحقيقيين."
+          },
+          {
+            "question": "أي الإجراءات خطوات ضبط صحيحة؟ (اختر كل ما ينطبق)",
+            "options": [
+              "كتم قاعدة لمضيف واحد موثوق",
+              "تعطيل القواعد غير ذات الصلة بخدماتك",
+              "ضبط HOME_NET على any",
+              "مراجعة أكثر التواقيع تنبيهًا بانتظام"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "الكتم المحدد وتعطيل غير ذات الصلة والمراجعة المنتظمة تقلل الضجيج. أما ضبط HOME_NET على any فيكسر منطق القواعد الاتجاهية."
+          },
+          {
+            "question": "ماذا يعني تصاعد عدّاد capture.kernel_drops؟",
+            "options": [
+              "القواعد ممتازة",
+              "المستشعر يفوّت الحزم دون فحصها",
+              "TLS معطّل",
+              "السجل مشفّر"
+            ],
+            "answer": 1,
+            "explanation": "الحزم المسقطة في النواة حزم لم يرها المستشعر، وهي نقاط عمياء في الكشف."
+          },
+          {
+            "question": "لماذا قد يحدّ TLS 1.3 من الكشف المعتمد على التواقيع؟",
+            "options": [
+              "لأن الحمولات مشفّرة ولا يبقى سوى البيانات الوصفية غالبًا",
+              "لأنه يحجب Suricata",
+              "لأنه يزيل ترويسات IP",
+              "لأنه يبطئ الشبكة"
+            ],
+            "answer": 0,
+            "explanation": "لا تستطيع التواقيع المطابقة لمحتوى HTTP رؤية ما داخل الجلسات المشفّرة، فيُعتمد على SNI والشهادات وسلوك التدفق."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nوضعت مستشعر Suricata على شريحة معكوسة وضبطت `HOME_NET` والالتقاط و`eve.json`، وكتبت قاعدة مختبر، وأثبتّها بتوليد حركة غير ضارة وإيجاد التنبيه. وتعلمت الضبط بإدخالات التعطيل والكتم قبل أي حجب، ومراقبة الحزم المسقطة في النواة، والتخطيط لتحويل IPS مع خطة تراجع. التنبيهات لا تنفع إلا إن رآها أحد، لذلك يجمعها المختبر التالي مركزيًا: [مختبر SIEM المركزي](/learn/hands-on-security-labs/centralized-siem-lab)."
+      }
+    ]
+  }
+}

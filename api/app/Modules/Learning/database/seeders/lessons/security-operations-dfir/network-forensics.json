@@ -1,0 +1,740 @@
+{
+  "slug": "network-forensics",
+  "title": "Network Forensics",
+  "summary": "Learn to collect and preserve network evidence, turn packets into Zeek logs, spot beaconing and DNS tunneling from metadata, and tie network findings to hosts, times and users.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Compare PCAP, protocol logs, flow records and IDS alerts as evidence sources",
+    "Collect a capture with a ring buffer and record its hash",
+    "Use Zeek and zeek-cut to find beaconing and DNS tunneling",
+    "Apply tshark display filters to answer investigative questions",
+    "Tie network findings to hosts and users and state confidence"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 09:12 a firewall log shows that file server FS01 (192.0.2.10) made 4,000 DNS queries in an hour, many to a domain nobody recognizes. The host agent was disabled weeks ago, so the server cannot tell you what it did. The network can. Packets and logs kept outside the compromised machine are evidence the attacker cannot easily edit.\n\n**Network forensics** is the collection, preservation and analysis of network traffic and its metadata to reconstruct what happened. It complements the live work in [Network-Based Incident Investigation](/learn/security-operations-dfir/network-based-incident-investigation) and builds on [Advanced Network Traffic Analysis](/learn/security-operations-dfir/advanced-network-traffic-analysis)."
+    },
+    {
+      "id": "evidence",
+      "type": "text",
+      "markdown": "## Choose the right evidence type\n\nNo organization stores every packet forever. Each source trades detail against storage and retention:\n\n| Source | Detail | Typical retention | Best for |\n|:--|:--|:--|:--|\n| **Full packet capture (PCAP)** | Every byte, including payloads | Hours to days | Reconstructing files and exact protocol behavior |\n| **Protocol logs (Zeek, proxy, DNS)** | Per-connection and per-request fields | Months | Hunting, timelines, scoping |\n| **Flow records (NetFlow, IPFIX)** | Addresses, ports, bytes, times | Months to a year | Volume, direction and who-talked-to-whom |\n| **IDS alerts (Suricata, Snort)** | Rule matches with context | Months | Known-bad indicators |\n| **Firewall and VPN logs** | Allow or deny and NAT mappings | Months | Boundary crossings and address translation |\n\nMost investigations begin with logs and flows, then pull PCAP for the few conversations that matter. Encryption reduces payload value, but metadata (who, when, how often, how much, which name) still tells most of the story."
+    },
+    {
+      "id": "collect",
+      "type": "text",
+      "markdown": "## Collect and preserve a capture\n\nCapture only on networks you are authorized to monitor, and treat the file as evidence from the first byte.\n\n1. **Place the sensor** on a SPAN port or network TAP so that capturing does not change traffic. A TAP is passive; a SPAN port can drop packets under load.\n2. **Filter narrowly** when you can, for example one host, because broad captures collect personal data you do not need.\n3. **Use a ring buffer** so the disk cannot fill up and stop the capture.\n4. **Hash immediately** and record who captured, when, where and with which command.\n5. **Work on copies.** Never analyze the original file.\n\nThe terminal shows an hourly ring buffer for the suspect server and the first integrity steps."
+    },
+    {
+      "id": "term-cap",
+      "type": "terminal",
+      "title": "Capture and integrity check",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "sudo tcpdump -i eth1 -nn -s 0 -G 3600 -W 24 -w /evidence/cap-%Y%m%d-%H%M.pcap host 192.0.2.10",
+          "comment": "Capture the suspect host only: 24 hourly files, full packet length, no name resolution"
+        },
+        {
+          "output": "tcpdump: listening on eth1, link-type EN10MB (Ethernet), snapshot length 262144 bytes",
+          "comment": "tcpdump confirms the interface; a silent failure here would lose evidence"
+        },
+        {
+          "cmd": "sha256sum /evidence/cap-*.pcap | tee /evidence/SHA256SUMS",
+          "comment": "Record a hash of every closed file straight away"
+        },
+        {
+          "output": "9b1f0c4e7a2d...e41  /evidence/cap-20261112-0900.pcap",
+          "comment": "Store the hash list separately from the captures"
+        },
+        {
+          "cmd": "capinfos -c -u -a -e /evidence/cap-20261112-0900.pcap",
+          "comment": "Check packet count and time range against what you expected"
+        },
+        {
+          "output": "Number of packets:   1482733\nCapture duration:    3600 seconds\nFirst packet time:   2026-11-12 09:00:00\nLast packet time:    2026-11-12 09:59:59",
+          "comment": "A gap in the time range would mean the capture dropped data"
+        }
+      ],
+      "caption": "Run on a sensor you administer, with written authorization."
+    },
+    {
+      "id": "zeek",
+      "type": "text",
+      "markdown": "## Turn packets into searchable logs\n\n**Zeek** reads a capture and writes structured logs: `conn.log` (every connection), `dns.log`, `http.log`, `ssl.log` and `files.log`. Each log carries a shared `uid`, so you can follow one conversation across logs. Searching text is far faster than scrolling packets.\n\nThree patterns repay the effort:\n\n- **Beaconing.** Malware that checks in on a timer produces connections at a nearly constant interval and a nearly constant size. Humans do not.\n- **DNS abuse.** Very long labels, high-entropy names, many unique subdomains under one parent and heavy use of TXT records suggest tunneling.\n- **Unusual volume.** A server that sends far more bytes out than it receives may be staging or exfiltrating data.\n\nThe next terminal finds the first two patterns in the capture."
+    },
+    {
+      "id": "term-zeek",
+      "type": "terminal",
+      "title": "Zeek and zeek-cut",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "zeek -C -r /evidence/cap-20261112-0900.pcap && ls *.log",
+          "comment": "Process the capture offline; -C ignores bad checksums from offload"
+        },
+        {
+          "output": "conn.log  dns.log  files.log  http.log  ssl.log  weird.log",
+          "comment": "These logs are your new working data"
+        },
+        {
+          "cmd": "zeek-cut ts < conn.log > /dev/null; zeek-cut ts id.resp_h < conn.log | awk '$2==\"203.0.113.50\"{print $1}' | awk 'NR>1{printf \"%d\\n\", $1-p} {p=$1}' | sort -n | uniq -c",
+          "comment": "Compute the gap in seconds between each connection to the suspect address"
+        },
+        {
+          "output": "     46 60\n      2 61\n      1 59",
+          "comment": "46 of 49 gaps are 60 seconds: a timer, not a person"
+        },
+        {
+          "cmd": "zeek-cut query qtype_name < dns.log | awk 'length($1) > 50' | head -3",
+          "comment": "Find DNS names with labels longer than 50 characters"
+        },
+        {
+          "output": "a8f3k2m9q1x7zb4c0d5e6h8j2l4n7p1r3t5v9w0y2.t.example.net TXT\nb9g4l3n0r2y8ac5d1e7f9i3k5m8o2q4s6u0w1x3z5.t.example.net TXT\nc0h5m4o1s3z9bd6e2f8g0j4l6n9p3r5t7v1x2y4a6.t.example.net TXT",
+          "comment": "Random-looking TXT queries under one parent domain: strong tunneling indicator"
+        }
+      ],
+      "caption": "Annotated output from a lab capture. Domains and addresses are documentation values."
+    },
+    {
+      "id": "flow-intro",
+      "type": "text",
+      "markdown": "## Reading the story\n\nThe animation shows what the sensor sees when a server uses DNS first and HTTPS second. Follow the steps, then notice that the analyst never decrypted anything."
+    },
+    {
+      "id": "net-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "DNS tunneling followed by an HTTPS beacon",
+      "caption": "Metadata alone reveals a command channel, the host involved and the time window.",
+      "data": {
+        "actors": [
+          {
+            "id": "fs",
+            "label": "File server",
+            "sub": "192.0.2.10",
+            "icon": "server"
+          },
+          {
+            "id": "dns",
+            "label": "Resolver",
+            "sub": "192.0.2.53",
+            "icon": "globe"
+          },
+          {
+            "id": "c2",
+            "label": "Remote host",
+            "sub": "t.example.net / 203.0.113.50",
+            "icon": "attacker"
+          },
+          {
+            "id": "zk",
+            "label": "Zeek sensor",
+            "sub": "SPAN port",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "from": "fs",
+            "to": "dns",
+            "label": "DNS TXT query",
+            "detail": "a8f3k2...t.example.net",
+            "note": "The server asks for a very long, random-looking name under an unusual domain.",
+            "tone": "warning"
+          },
+          {
+            "from": "dns",
+            "to": "c2",
+            "label": "Recursive lookup",
+            "detail": "TXT t.example.net",
+            "note": "The resolver forwards the query to the authoritative server, which the attacker controls.",
+            "tone": "attack"
+          },
+          {
+            "from": "c2",
+            "to": "fs",
+            "label": "TXT answer",
+            "detail": "encoded instruction",
+            "note": "The answer carries data in the record text. DNS is allowed out, so the firewall does not object.",
+            "tone": "danger"
+          },
+          {
+            "from": "fs",
+            "to": "c2",
+            "label": "HTTPS beacon",
+            "detail": "TCP/443, 60 s interval",
+            "note": "The server then beacons every 60 seconds with a nearly constant request size.",
+            "tone": "danger"
+          },
+          {
+            "from": "zk",
+            "to": "zk",
+            "label": "conn.log, dns.log, ssl.log",
+            "detail": "Metadata written",
+            "note": "The sensor records every connection and query even though the HTTPS payload is encrypted.",
+            "tone": "secure"
+          },
+          {
+            "from": "zk",
+            "to": "zk",
+            "label": "Interval analysis",
+            "detail": "46 of 49 gaps = 60 s",
+            "note": "Grouping the gaps shows machine-like regularity, which people never produce.",
+            "tone": "warning"
+          },
+          {
+            "from": "zk",
+            "to": "zk",
+            "label": "Host and time pivot",
+            "detail": "Hand off to host forensics",
+            "note": "The analyst now knows which host and which window to examine on disk and in memory.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tools",
+      "type": "text",
+      "markdown": "## Wireshark, tshark and Suricata\n\n**Wireshark** is best for inspecting one conversation: *Follow TCP Stream*, protocol hierarchy and the Statistics menu. **tshark** gives the same engine on the command line, which suits scripts and large files. **Suricata** adds signatures and writes `eve.json` for your SIEM, as covered in [Security Onion Architecture](/learn/security-operations-dfir/security-onion-architecture).\n\nUse display filters that answer a question. Start broad (`dns`), then narrow (`dns.qry.name contains \"t.example.net\"`) and export only the packets that matter to your report."
+    },
+    {
+      "id": "tshark",
+      "type": "code",
+      "language": "bash",
+      "filename": "tshark-recipes.sh",
+      "caption": "Four tshark recipes: DNS names, largest TCP conversations, TLS server names and a per-minute traffic profile.",
+      "code": "# Run on a copy of the capture, never on the original evidence file.\ntshark -r suspect.pcap -Y 'dns.qry.name contains \"t.example.net\"' -T fields -e frame.time -e ip.src -e dns.qry.name -e dns.qry.type\ntshark -r suspect.pcap -q -z conv,tcp | sort -k9 -n -r | head\ntshark -r suspect.pcap -Y 'tls.handshake.type==1' -T fields -e ip.dst -e tls.handshake.extensions_server_name\ntshark -r suspect.pcap -q -z io,stat,60,\"ip.dst==203.0.113.50\"\n"
+    },
+    {
+      "id": "suricata",
+      "type": "code",
+      "language": "plain",
+      "filename": "local.rules",
+      "caption": "A lab Suricata rule that flags long DNS labels. It will need tuning against your normal traffic.",
+      "code": "alert dns $HOME_NET any -> any 53 (msg:\"LAB DNS long query label\"; dns.query; content:\".\"; pcre:\"/^[a-z0-9]{40,}\\./\"; threshold:type limit, track by_src, count 1, seconds 60; classtype:bad-unknown; sid:9000001; rev:1;)\n"
+    },
+    {
+      "id": "report",
+      "type": "text",
+      "markdown": "## From packets to a conclusion\n\nA network finding becomes useful when it is tied to a host, a time and a user:\n\n1. **Pivot** from the address to the asset inventory and DHCP or VPN logs to find the real device at that moment. NAT and DHCP change the answer over time.\n2. **Correlate** with host and authentication evidence, such as [Authentication Log Investigation](/learn/security-operations-dfir/authentication-log-investigation).\n3. **State confidence.** \"The server contacted the domain every 60 seconds\" is a fact. \"The server is controlled by an attacker\" is a conclusion that needs host evidence.\n4. **Record every step** so another examiner can repeat your result from the same files.\n\nThen examine the machine itself with [Disk and Memory Forensics](/learn/security-operations-dfir/disk-and-memory-forensics)."
+    },
+    {
+      "id": "warn-privacy",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Capture only what you are authorized to capture",
+      "markdown": "Packet captures can contain passwords, personal messages and health or payment data. Get written authority, scope the capture to the hosts under investigation, restrict access to the files, and delete them when the retention rule says so. Capturing outside your authority can be unlawful even on your own employer's network."
+    },
+    {
+      "id": "tip-encrypted",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Encrypted does not mean invisible",
+      "markdown": "With TLS you still see the destination, the server name (SNI), certificate details, byte counts, timing and TLS client fingerprints such as JA3 or JA4. Many beacons are found with exactly this data and no decryption at all."
+    },
+    {
+      "id": "note-time",
+      "type": "callout",
+      "variant": "note",
+      "title": "Check clocks before you correlate",
+      "markdown": "Network sensors, servers and firewalls rarely agree to the second. Before you join a Zeek record to a host log, compare each system's clock against a trusted time source and write down the offset. A skew of two minutes can make a harmless event look like the cause of an alert, or hide the real one. Record the time zone of every source too, because Zeek stores epoch time while many other tools show local time."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use **your own computer or a lab VM** only.\n\n1. Start a capture of your own traffic: `tcpdump -i any -nn -w mine.pcap` (or use Wireshark), then browse a few sites for two minutes and stop it.\n2. Hash it with `sha256sum mine.pcap` and write the value in a notebook with the time and your name.\n3. Run `zeek -C -r mine.pcap` and open `dns.log` with `zeek-cut query < dns.log | sort | uniq -c | sort -nr | head`.\n4. Find your longest DNS name and your largest connection in `conn.log` by `orig_bytes`.\n5. Write two sentences stating what you can prove from the metadata and what you cannot."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "PCAP",
+          "definition": "A file containing captured packets, used as full-fidelity network evidence."
+        },
+        {
+          "term": "SPAN port",
+          "definition": "A switch port that mirrors other ports' traffic to a monitoring device."
+        },
+        {
+          "term": "Network TAP",
+          "definition": "A passive hardware device that copies traffic to a sensor without affecting it."
+        },
+        {
+          "term": "Zeek",
+          "definition": "A network analysis framework that turns traffic into structured, searchable logs."
+        },
+        {
+          "term": "NetFlow / IPFIX",
+          "definition": "Flow records summarizing who talked to whom, on which ports, for how long and how much."
+        },
+        {
+          "term": "Beaconing",
+          "definition": "Regular, timer-based check-in traffic from malware to its controller."
+        },
+        {
+          "term": "DNS tunneling",
+          "definition": "Hiding data inside DNS queries and answers to cross a network boundary."
+        },
+        {
+          "term": "JA3 / JA4",
+          "definition": "Fingerprints of a TLS client's handshake that help identify software without decryption."
+        },
+        {
+          "term": "Chain of custody",
+          "definition": "A record of who handled evidence, when and why, proving it was not altered."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which source keeps the most detail but is usually retained for the shortest time?",
+          "options": [
+            "Flow records",
+            "Full packet capture",
+            "Firewall logs",
+            "Zeek dns.log"
+          ],
+          "answer": 1,
+          "explanation": "Full packet capture stores every byte, so storage cost forces short retention. Flows and logs summarize and last far longer."
+        },
+        {
+          "question": "A host connects to one address with intervals of 60, 60, 61, 60 and 59 seconds. What does this most suggest?",
+          "options": [
+            "A user browsing",
+            "Timer-based beaconing",
+            "Packet loss",
+            "A DHCP renewal storm"
+          ],
+          "answer": 1,
+          "explanation": "Near-constant intervals indicate software on a timer. Human activity is irregular."
+        },
+        {
+          "question": "Which are signs of possible DNS tunneling? (Choose all that apply.)",
+          "options": [
+            "Very long, random-looking labels",
+            "Many unique subdomains under one parent domain",
+            "Frequent TXT queries to that domain",
+            "A single A record lookup for a popular site"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Tunneling encodes data in names and records, giving long labels, many unique subdomains and unusual record types. A single normal lookup is not suspicious."
+        },
+        {
+          "question": "Why should you hash a capture file immediately after collection?",
+          "options": [
+            "To make the file smaller",
+            "To prove later that it has not been altered",
+            "To decrypt TLS traffic",
+            "To speed up Wireshark"
+          ],
+          "answer": 1,
+          "explanation": "A recorded hash lets anyone verify that the file analyzed is the file collected, which supports chain of custody."
+        },
+        {
+          "question": "What can you still learn from encrypted HTTPS traffic? (Choose all that apply.)",
+          "options": [
+            "Destination address and server name",
+            "Connection timing and byte counts",
+            "The exact page content",
+            "TLS client fingerprint"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Metadata remains visible. The page content is protected unless you can legitimately decrypt it."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- **Network evidence** lives outside the compromised host: PCAP for detail, Zeek and proxy logs for search, flows for volume, IDS alerts for known-bad.\n- **Collect carefully**: authorized scope, TAP or SPAN, ring buffer, immediate hashing, copies for analysis.\n- **Zeek** converts packets into logs; look for regular intervals, long or random DNS names and lopsided outbound volume.\n- Encrypted traffic still exposes **metadata**, which is often enough to find a command channel.\n- Tie each finding to a host, time and user, state your confidence, and hand the machine to host forensics.\n\nContinue with [Disk and Memory Forensics](/learn/security-operations-dfir/disk-and-memory-forensics)."
+    }
+  ],
+  "ar": {
+    "title": "التحليل الجنائي للشبكات",
+    "summary": "تعلّم كيف تجمع الأدلة الشبكية وتحفظها، وتحوّل الحزم إلى سجلات Zeek، وتكتشف الإشارات الدورية ونفق DNS من البيانات الوصفية، وتربط النتائج الشبكية بالأجهزة والأوقات والمستخدمين.",
+    "objectives": [
+      "المقارنة بين PCAP وسجلات البروتوكولات وسجلات التدفق وتنبيهات IDS بوصفها مصادر أدلة",
+      "جمع التقاط بمخزن دوّار وتسجيل بصمته",
+      "استخدام Zeek وzeek-cut لاكتشاف الإشارات الدورية ونفق DNS",
+      "تطبيق مرشّحات عرض tshark للإجابة عن أسئلة التحقيق",
+      "ربط النتائج الشبكية بالأجهزة والمستخدمين وذكر درجة الثقة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الساعة 09:12 يُظهر سجل جدار الحماية أن خادم الملفات FS01 (192.0.2.10) أجرى 4000 استعلام DNS في ساعة واحدة، كثير منها إلى نطاق لا يعرفه أحد. وقد عُطّل وكيل الجهاز قبل أسابيع، فلا يستطيع الخادم إخبارك بما فعل. أما الشبكة فتستطيع. فالحزم والسجلات المحفوظة خارج الجهاز المخترق أدلة لا يسهل على المهاجم تعديلها.\n\n**التحليل الجنائي للشبكات (Network Forensics)** هو جمع حركة الشبكة وبياناتها الوصفية وحفظها وتحليلها لإعادة بناء ما حدث. وهو يكمّل العمل المباشر في درس [التحقيق في الحوادث المستند إلى الشبكة](/learn/security-operations-dfir/network-based-incident-investigation) ويبني على درس [التحليل المتقدم لحركة الشبكة](/learn/security-operations-dfir/advanced-network-traffic-analysis)."
+      },
+      {
+        "id": "evidence",
+        "type": "text",
+        "markdown": "## اختر نوع الدليل المناسب\n\nلا تخزّن أي مؤسسة كل الحزم إلى الأبد. يوازن كل مصدر بين التفصيل والتخزين ومدة الاحتفاظ:\n\n| المصدر | التفصيل | مدة الاحتفاظ المعتادة | الأنسب لـ |\n|:--|:--|:--|:--|\n| **التقاط الحزم الكامل (PCAP)** | كل بايت بما فيه الحمولات | ساعات إلى أيام | إعادة بناء الملفات وسلوك البروتوكول بدقة |\n| **سجلات البروتوكولات (Zeek والوكيل وDNS)** | حقول لكل اتصال وطلب | أشهر | الصيد والخطوط الزمنية وتحديد النطاق |\n| **سجلات التدفق (NetFlow وIPFIX)** | العناوين والمنافذ والحجم والأوقات | أشهر إلى سنة | الحجم والاتجاه ومن تحدّث مع من |\n| **تنبيهات IDS (Suricata وSnort)** | تطابقات القواعد مع السياق | أشهر | المؤشرات الخبيثة المعروفة |\n| **سجلات جدار الحماية وVPN** | السماح أو المنع وتحويلات NAT | أشهر | عبور الحدود وترجمة العناوين |\n\nتبدأ معظم التحقيقات بالسجلات والتدفقات، ثم تُسحب حزم PCAP للمحادثات القليلة المهمة. يقلّل التشفير قيمة الحمولة، لكن البيانات الوصفية (من، ومتى، وكم مرة، وكم حجمًا، وأي اسم) لا تزال تروي معظم القصة."
+      },
+      {
+        "id": "collect",
+        "type": "text",
+        "markdown": "## جمع الالتقاط وحفظه\n\nالتقط فقط على الشبكات المصرَّح لك بمراقبتها، وعامل الملف بوصفه دليلًا منذ أول بايت.\n\n1. **ضع الحساس** على منفذ SPAN أو جهاز TAP كي لا يغيّر الالتقاط الحركة. جهاز TAP سلبي، أما منفذ SPAN فقد يُسقط حزمًا تحت الحمل.\n2. **ضيّق المرشّح** متى أمكن، كأن يقتصر على جهاز واحد، لأن الالتقاطات الواسعة تجمع بيانات شخصية لا تحتاج إليها.\n3. **استخدم مخزنًا دوّارًا (Ring buffer)** حتى لا يمتلئ القرص فيتوقف الالتقاط.\n4. **احسب البصمة فورًا** وسجّل من التقط ومتى وأين وبأي أمر.\n5. **اعمل على نسخ.** لا تحلل الملف الأصلي أبدًا.\n\nتعرض الطرفية مخزنًا دوّارًا بالساعة للخادم المشتبه فيه وأولى خطوات التحقق من السلامة."
+      },
+      {
+        "id": "term-cap",
+        "type": "terminal",
+        "title": "الالتقاط والتحقق من السلامة",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "sudo tcpdump -i eth1 -nn -s 0 -G 3600 -W 24 -w /evidence/cap-%Y%m%d-%H%M.pcap host 192.0.2.10",
+            "comment": "التقط الجهاز المشتبه فيه فقط: 24 ملفًا بالساعة وبطول الحزمة الكامل ودون تحليل أسماء"
+          },
+          {
+            "output": "tcpdump: listening on eth1, link-type EN10MB (Ethernet), snapshot length 262144 bytes",
+            "comment": "يؤكد tcpdump الواجهة؛ والفشل الصامت هنا يضيّع الدليل"
+          },
+          {
+            "cmd": "sha256sum /evidence/cap-*.pcap | tee /evidence/SHA256SUMS",
+            "comment": "سجّل بصمة كل ملف مغلق فورًا"
+          },
+          {
+            "output": "9b1f0c4e7a2d...e41  /evidence/cap-20261112-0900.pcap",
+            "comment": "احفظ قائمة البصمات بعيدًا عن ملفات الالتقاط"
+          },
+          {
+            "cmd": "capinfos -c -u -a -e /evidence/cap-20261112-0900.pcap",
+            "comment": "قارن عدد الحزم والنطاق الزمني بما تتوقعه"
+          },
+          {
+            "output": "Number of packets:   1482733\nCapture duration:    3600 seconds\nFirst packet time:   2026-11-12 09:00:00\nLast packet time:    2026-11-12 09:59:59",
+            "comment": "الفجوة في النطاق الزمني تعني أن الالتقاط أسقط بيانات"
+          }
+        ],
+        "caption": "شغّل هذا على حساس تديره وبتصريح مكتوب."
+      },
+      {
+        "id": "zeek",
+        "type": "text",
+        "markdown": "## حوّل الحزم إلى سجلات قابلة للبحث\n\nيقرأ **Zeek** الالتقاط ويكتب سجلات منظّمة: `conn.log` (كل اتصال)، و`dns.log`، و`http.log`، و`ssl.log`، و`files.log`. يحمل كل سجل معرّفًا مشتركًا `uid` فتتتبع محادثة واحدة عبر السجلات. والبحث في النص أسرع بكثير من تصفح الحزم.\n\nثلاثة أنماط تستحق الجهد:\n\n- **الإشارات الدورية (Beaconing).** البرمجيات الخبيثة التي تتصل بمؤقّت تنتج اتصالات بفاصل شبه ثابت وحجم شبه ثابت. والبشر لا يفعلون ذلك.\n- **إساءة استخدام DNS.** التسميات الطويلة جدًا، والأسماء عالية العشوائية، وكثرة النطاقات الفرعية الفريدة تحت أصل واحد، وكثرة سجلات TXT، كلها تشير إلى النفق.\n- **الحجم غير المعتاد.** الخادم الذي يرسل بايتات أكثر بكثير مما يستقبل قد يكون يجهّز بيانات أو يسرّبها.\n\nتكشف الطرفية التالية النمطين الأولين في الالتقاط."
+      },
+      {
+        "id": "term-zeek",
+        "type": "terminal",
+        "title": "Zeek وzeek-cut",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "zeek -C -r /evidence/cap-20261112-0900.pcap && ls *.log",
+            "comment": "عالج الالتقاط دون اتصال؛ يتجاهل الخيار -C المجاميع الاختبارية الخاطئة الناتجة عن التفريغ"
+          },
+          {
+            "output": "conn.log  dns.log  files.log  http.log  ssl.log  weird.log",
+            "comment": "هذه السجلات هي بياناتك العاملة الجديدة"
+          },
+          {
+            "cmd": "zeek-cut ts < conn.log > /dev/null; zeek-cut ts id.resp_h < conn.log | awk '$2==\"203.0.113.50\"{print $1}' | awk 'NR>1{printf \"%d\\n\", $1-p} {p=$1}' | sort -n | uniq -c",
+            "comment": "احسب الفاصل بالثواني بين كل اتصال بالعنوان المشتبه فيه"
+          },
+          {
+            "output": "     46 60\n      2 61\n      1 59",
+            "comment": "46 من 49 فاصلًا تساوي 60 ثانية: مؤقّت لا إنسان"
+          },
+          {
+            "cmd": "zeek-cut query qtype_name < dns.log | awk 'length($1) > 50' | head -3",
+            "comment": "ابحث عن أسماء DNS ذات تسميات أطول من 50 حرفًا"
+          },
+          {
+            "output": "a8f3k2m9q1x7zb4c0d5e6h8j2l4n7p1r3t5v9w0y2.t.example.net TXT\nb9g4l3n0r2y8ac5d1e7f9i3k5m8o2q4s6u0w1x3z5.t.example.net TXT\nc0h5m4o1s3z9bd6e2f8g0j4l6n9p3r5t7v1x2y4a6.t.example.net TXT",
+            "comment": "استعلامات TXT عشوائية المظهر تحت نطاق أصل واحد: مؤشر قوي على النفق"
+          }
+        ],
+        "caption": "مخرجات موضَّحة من التقاط مخبري. النطاقات والعناوين قيم مخصصة للتوثيق."
+      },
+      {
+        "id": "flow-intro",
+        "type": "text",
+        "markdown": "## قراءة القصة\n\nتُظهر الحركة التوضيحية ما يراه الحساس حين يستخدم خادم DNS أولًا ثم HTTPS. تابع الخطوات، ثم لاحظ أن المحلّل لم يفكّ تشفير شيء."
+      },
+      {
+        "id": "net-seq",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "نفق DNS تتبعه إشارة HTTPS دورية",
+        "caption": "تكشف البيانات الوصفية وحدها قناة تحكم والجهاز المعني والنافذة الزمنية.",
+        "data": {
+          "actors": [
+            {
+              "id": "fs",
+              "label": "خادم الملفات",
+              "sub": "192.0.2.10",
+              "icon": "server"
+            },
+            {
+              "id": "dns",
+              "label": "المحلّل",
+              "sub": "192.0.2.53",
+              "icon": "globe"
+            },
+            {
+              "id": "c2",
+              "label": "المضيف البعيد",
+              "sub": "t.example.net / 203.0.113.50",
+              "icon": "attacker"
+            },
+            {
+              "id": "zk",
+              "label": "حساس Zeek",
+              "sub": "منفذ SPAN",
+              "icon": "eye"
+            }
+          ],
+          "steps": [
+            {
+              "from": "fs",
+              "to": "dns",
+              "label": "استعلام DNS من نوع TXT",
+              "detail": "a8f3k2...t.example.net",
+              "note": "يطلب الخادم اسمًا طويلًا جدًا يبدو عشوائيًا تحت نطاق غير معتاد.",
+              "tone": "warning"
+            },
+            {
+              "from": "dns",
+              "to": "c2",
+              "label": "بحث تكراري",
+              "detail": "TXT t.example.net",
+              "note": "يحوّل المحلّل الاستعلام إلى الخادم المخوَّل الذي يتحكم به المهاجم.",
+              "tone": "attack"
+            },
+            {
+              "from": "c2",
+              "to": "fs",
+              "label": "إجابة TXT",
+              "detail": "تعليمات مرمَّزة",
+              "note": "تحمل الإجابة بيانات في نص السجل. وDNS مسموح خروجه، فلا يعترض جدار الحماية.",
+              "tone": "danger"
+            },
+            {
+              "from": "fs",
+              "to": "c2",
+              "label": "إشارة HTTPS دورية",
+              "detail": "TCP/443 كل 60 ثانية",
+              "note": "ثم يرسل الخادم إشارة كل 60 ثانية بحجم طلب شبه ثابت.",
+              "tone": "danger"
+            },
+            {
+              "from": "zk",
+              "to": "zk",
+              "label": "conn.log وdns.log وssl.log",
+              "detail": "كتابة البيانات الوصفية",
+              "note": "يسجّل الحساس كل اتصال واستعلام مع أن حمولة HTTPS مشفّرة.",
+              "tone": "secure"
+            },
+            {
+              "from": "zk",
+              "to": "zk",
+              "label": "تحليل الفواصل الزمنية",
+              "detail": "46 من 49 فاصلًا = 60 ثانية",
+              "note": "يُظهر تجميع الفواصل انتظامًا آليًا لا يصدر عن البشر.",
+              "tone": "warning"
+            },
+            {
+              "from": "zk",
+              "to": "zk",
+              "label": "المحور بحسب الجهاز والوقت",
+              "detail": "التسليم للتحليل الجنائي للجهاز",
+              "note": "صار المحلّل يعرف أي جهاز وأي نافذة زمنية يفحص على القرص وفي الذاكرة.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "tools",
+        "type": "text",
+        "markdown": "## Wireshark وtshark وSuricata\n\n**Wireshark** الأفضل لفحص محادثة واحدة: *Follow TCP Stream* وتسلسل البروتوكولات وقائمة الإحصاءات. و**tshark** يقدّم المحرّك نفسه في سطر الأوامر، وهو مناسب للسكربتات والملفات الكبيرة. و**Suricata** يضيف التواقيع ويكتب `eve.json` لنظام SIEM كما في درس [بنية Security Onion](/learn/security-operations-dfir/security-onion-architecture).\n\nاستخدم مرشّحات عرض تجيب عن سؤال. ابدأ واسعًا (`dns`) ثم ضيّق (`dns.qry.name contains \"t.example.net\"`) وصدّر الحزم المهمة لتقريرك فقط."
+      },
+      {
+        "id": "tshark",
+        "type": "code",
+        "language": "bash",
+        "filename": "tshark-recipes.sh",
+        "caption": "أربع وصفات tshark: أسماء DNS، وأكبر محادثات TCP، وأسماء خوادم TLS، وملف حركة لكل دقيقة.",
+        "code": "# Run on a copy of the capture, never on the original evidence file.\ntshark -r suspect.pcap -Y 'dns.qry.name contains \"t.example.net\"' -T fields -e frame.time -e ip.src -e dns.qry.name -e dns.qry.type\ntshark -r suspect.pcap -q -z conv,tcp | sort -k9 -n -r | head\ntshark -r suspect.pcap -Y 'tls.handshake.type==1' -T fields -e ip.dst -e tls.handshake.extensions_server_name\ntshark -r suspect.pcap -q -z io,stat,60,\"ip.dst==203.0.113.50\"\n"
+      },
+      {
+        "id": "suricata",
+        "type": "code",
+        "language": "plain",
+        "filename": "local.rules",
+        "caption": "قاعدة Suricata مخبرية تُبلغ عن تسميات DNS الطويلة. وستحتاج إلى ضبط بحسب حركتك الطبيعية.",
+        "code": "alert dns $HOME_NET any -> any 53 (msg:\"LAB DNS long query label\"; dns.query; content:\".\"; pcre:\"/^[a-z0-9]{40,}\\./\"; threshold:type limit, track by_src, count 1, seconds 60; classtype:bad-unknown; sid:9000001; rev:1;)\n"
+      },
+      {
+        "id": "report",
+        "type": "text",
+        "markdown": "## من الحزم إلى الاستنتاج\n\nيصبح الاستنتاج الشبكي مفيدًا حين يُربط بجهاز ووقت ومستخدم:\n\n1. **انتقل** من العنوان إلى قائمة الأصول وسجلات DHCP أو VPN لتعرف الجهاز الحقيقي في تلك اللحظة. فـ NAT وDHCP يغيّران الإجابة بمرور الوقت.\n2. **اربط** بأدلة الجهاز والمصادقة، كما في درس [التحقيق في سجلات المصادقة](/learn/security-operations-dfir/authentication-log-investigation).\n3. **اذكر درجة الثقة.** «اتصل الخادم بالنطاق كل 60 ثانية» حقيقة. و«الخادم يتحكم به مهاجم» استنتاج يحتاج إلى أدلة من الجهاز.\n4. **سجّل كل خطوة** ليتمكن فاحص آخر من تكرار نتيجتك من الملفات نفسها.\n\nثم افحص الجهاز نفسه بدرس [التحليل الجنائي للأقراص والذاكرة](/learn/security-operations-dfir/disk-and-memory-forensics)."
+      },
+      {
+        "id": "warn-privacy",
+        "type": "callout",
+        "variant": "warning",
+        "title": "التقط فقط ما أنت مخوَّل بالتقاطه",
+        "markdown": "قد تحتوي التقاطات الحزم على كلمات مرور ورسائل شخصية وبيانات صحية أو مالية. احصل على تفويض مكتوب، وقصر الالتقاط على الأجهزة قيد التحقيق، وقيّد الوصول إلى الملفات، واحذفها حين تقضي قاعدة الاحتفاظ بذلك. وقد يكون الالتقاط خارج صلاحيتك مخالفًا للقانون حتى على شبكة جهة عملك."
+      },
+      {
+        "id": "tip-encrypted",
+        "type": "callout",
+        "variant": "tip",
+        "title": "المشفّر ليس خفيًا",
+        "markdown": "مع TLS ما زلت ترى الوجهة واسم الخادم (SNI) وتفاصيل الشهادة وعدد البايتات والتوقيت وبصمات عميل TLS مثل JA3 أو JA4. وكثير من الإشارات الدورية تُكتشف بهذه البيانات وحدها دون فك تشفير."
+      },
+      {
+        "id": "note-time",
+        "type": "callout",
+        "variant": "note",
+        "title": "افحص الساعات قبل أن تربط",
+        "markdown": "نادرًا ما تتفق ساعات حساسات الشبكة والخوادم وجدران الحماية إلى الثانية. قبل أن تربط سجل Zeek بسجل جهاز، قارن ساعة كل نظام بمصدر وقت موثوق ودوّن الفارق. فانحراف دقيقتين قد يجعل حدثًا بريئًا يبدو سبب التنبيه أو يخفي السبب الحقيقي. دوّن أيضًا المنطقة الزمنية لكل مصدر، لأن Zeek يخزّن الوقت بصيغة epoch بينما تعرض أدوات كثيرة التوقيت المحلي."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم **حاسوبك أو آلة افتراضية مخبرية** فقط.\n\n1. ابدأ التقاط حركتك: `tcpdump -i any -nn -w mine.pcap` (أو استخدم Wireshark)، ثم تصفّح بعض المواقع دقيقتين وأوقفه.\n2. احسب بصمته بالأمر `sha256sum mine.pcap` ودوّن القيمة في دفتر مع الوقت واسمك.\n3. شغّل `zeek -C -r mine.pcap` وافتح `dns.log` بالأمر `zeek-cut query < dns.log | sort | uniq -c | sort -nr | head`.\n4. ابحث عن أطول اسم DNS وأكبر اتصال في `conn.log` بحسب `orig_bytes`.\n5. اكتب جملتين تذكران ما تستطيع إثباته من البيانات الوصفية وما لا تستطيع."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "PCAP",
+            "definition": "ملف يحتوي حزمًا ملتقطة، يُستخدم دليلًا شبكيًا كامل التفصيل."
+          },
+          {
+            "term": "منفذ SPAN",
+            "definition": "منفذ في المبدّل (Switch) يعكس حركة منافذ أخرى إلى جهاز مراقبة."
+          },
+          {
+            "term": "جهاز TAP للشبكة",
+            "definition": "جهاز عتادي سلبي ينسخ الحركة إلى حساس دون التأثير فيها."
+          },
+          {
+            "term": "Zeek",
+            "definition": "إطار تحليل شبكي يحوّل الحركة إلى سجلات منظّمة قابلة للبحث."
+          },
+          {
+            "term": "NetFlow / IPFIX",
+            "definition": "سجلات تدفق تلخّص من تحدّث مع من وعلى أي منافذ ولكم من الوقت وبأي حجم."
+          },
+          {
+            "term": "الإشارة الدورية (Beaconing)",
+            "definition": "حركة اتصال منتظمة بمؤقّت من البرمجية الخبيثة إلى متحكّمها."
+          },
+          {
+            "term": "نفق DNS (DNS tunneling)",
+            "definition": "إخفاء البيانات داخل استعلامات DNS وإجاباتها لعبور حدود الشبكة."
+          },
+          {
+            "term": "JA3 / JA4",
+            "definition": "بصمات لمصافحة عميل TLS تساعد على تحديد البرمجية دون فك التشفير."
+          },
+          {
+            "term": "سلسلة الحيازة (Chain of custody)",
+            "definition": "سجل يبيّن من تعامل مع الدليل ومتى ولماذا، ويثبت عدم تغييره."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أيّ مصدر يحتفظ بأكبر قدر من التفصيل لكنه يُحفظ عادةً أقصر مدة؟",
+            "options": [
+              "سجلات التدفق",
+              "التقاط الحزم الكامل",
+              "سجلات جدار الحماية",
+              "السجل dns.log في Zeek"
+            ],
+            "answer": 1,
+            "explanation": "يخزّن الالتقاط الكامل كل بايت، فتفرض كلفة التخزين مدة احتفاظ قصيرة، أما التدفقات والسجلات فتلخّص وتبقى أطول."
+          },
+          {
+            "question": "يتصل جهاز بعنوان واحد بفواصل 60 و60 و61 و60 و59 ثانية. ما الأرجح؟",
+            "options": [
+              "مستخدم يتصفح",
+              "إشارة دورية بمؤقّت",
+              "فقدان حزم",
+              "عاصفة تجديد DHCP"
+            ],
+            "answer": 1,
+            "explanation": "الفواصل شبه الثابتة تدل على برمجية تعمل بمؤقّت، أما نشاط البشر فغير منتظم."
+          },
+          {
+            "question": "أيّ مما يلي علامات محتملة على نفق DNS؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تسميات طويلة جدًا عشوائية المظهر",
+              "نطاقات فرعية فريدة كثيرة تحت نطاق أصل واحد",
+              "استعلامات TXT متكررة إلى ذلك النطاق",
+              "بحث واحد عن سجل A لموقع شهير"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "يرمّز النفق البيانات في الأسماء والسجلات، فينتج تسميات طويلة ونطاقات فرعية فريدة كثيرة وأنواع سجلات غير معتادة. أما البحث الطبيعي الواحد فليس مشبوهًا."
+          },
+          {
+            "question": "لماذا يجب حساب بصمة ملف الالتقاط فور جمعه؟",
+            "options": [
+              "لتصغير حجم الملف",
+              "لإثبات عدم تغييره لاحقًا",
+              "لفك تشفير TLS",
+              "لتسريع Wireshark"
+            ],
+            "answer": 1,
+            "explanation": "تتيح البصمة المسجّلة لأي شخص التحقق من أن الملف المحلَّل هو الملف المجموع، ما يدعم سلسلة الحيازة."
+          },
+          {
+            "question": "ما الذي يمكنك معرفته من حركة HTTPS المشفّرة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "عنوان الوجهة واسم الخادم",
+              "توقيت الاتصال وعدد البايتات",
+              "محتوى الصفحة بالضبط",
+              "بصمة عميل TLS"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تبقى البيانات الوصفية مرئية. أما محتوى الصفحة فمحمي ما لم تستطع فك تشفيره بصورة مشروعة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- **الأدلة الشبكية** توجد خارج الجهاز المخترق: PCAP للتفصيل، وسجلات Zeek والوكيل للبحث، والتدفقات للحجم، وتنبيهات IDS للمعروف الخبيث.\n- **اجمع بعناية**: نطاق مصرَّح به، وTAP أو SPAN، ومخزن دوّار، وبصمة فورية، ونسخ للتحليل.\n- يحوّل **Zeek** الحزم إلى سجلات؛ ابحث عن الفواصل المنتظمة وأسماء DNS الطويلة أو العشوائية والحجم الخارج غير المتوازن.\n- ما زالت الحركة المشفّرة تكشف **البيانات الوصفية**، وهي كثيرًا ما تكفي لإيجاد قناة تحكم.\n- اربط كل نتيجة بجهاز ووقت ومستخدم، واذكر درجة ثقتك، وسلّم الجهاز للتحليل الجنائي للأجهزة.\n\nتابع بدرس [التحليل الجنائي للأقراص والذاكرة](/learn/security-operations-dfir/disk-and-memory-forensics)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,576 @@
+{
+  "slug": "advanced-persistent-threat-apt-detection",
+  "title": "Advanced Persistent Threat (APT) Detection",
+  "summary": "Learn how to detect patient, well-resourced adversaries by modeling them in MITRE ATT&CK, hunting for beaconing, catching persistence and credential theft, and scoring weak signals together.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain why APT activity evades signature-based detection",
+    "Build an ATT&CK coverage map from adversary techniques and log sources",
+    "Write a beaconing hunt and a Sigma rule for LSASS access",
+    "Combine weak signals into a per-entity risk score"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A 40-person engineering firm notices nothing unusual for months. Then a routine review of DNS logs shows one workstation contacting a rarely seen domain every 55 to 65 minutes, always at a similar size, day and night. No alert fired, because every single event looked harmless. This is the shape of an **advanced persistent threat (APT)**: a well-resourced adversary that wants long-term access, moves slowly, and blends in with normal activity.\n\nAPT detection is not about finding one smoking gun. It is about combining many weak signals, over weeks, against a model of how such actors behave. This lesson shows how to build that model and turn it into queries you can run on logs you own. It builds on [Advanced Threat Hunting](/learn/security-operations-dfir/advanced-threat-hunting) and [Advanced Detection Engineering](/learn/security-operations-dfir/advanced-detection-engineering)."
+    },
+    {
+      "id": "what-makes",
+      "type": "text",
+      "markdown": "## What makes a threat \"persistent\"\n\nCommodity attackers want fast money, so they are noisy. APT actors want access, so they are patient. Four traits matter to defenders:\n\n- **Targeted objectives.** Data theft, espionage or pre-positioning in a specific sector.\n- **Low and slow.** Small transfers, long sleep intervals, working hours that match the victim.\n- **Living off the land.** Built-in tools such as `powershell.exe`, `wmic.exe`, `schtasks.exe` and `certutil.exe` instead of custom binaries.\n- **Layered persistence.** Several footholds, so removing one does not end the intrusion.\n\n| Trait | Why signature detection fails | What still works |\n|:--|:--|:--|\n| Low and slow | No threshold is crossed | Long-window statistics, beaconing analysis |\n| Living off the land | Binaries are legitimate | Parent-child process and command-line context |\n| Valid accounts | Logins succeed | Behavior baselines per user and host |\n| Custom tooling | No known hash | Behavior, not indicators |\n\nDetection therefore shifts from \"is this file bad?\" to \"is this behavior unusual for this asset, and does it fit a known adversary technique?\"."
+    },
+    {
+      "id": "attack-model",
+      "type": "text",
+      "markdown": "## Step 1: Model the adversary with MITRE ATT&CK\n\nYou cannot detect everything, so start with who is likely to target you. Pick two or three relevant groups from threat intelligence, list their techniques in the **MITRE ATT&CK** matrix, and mark which ones you can already see.\n\n1. Export the techniques for each group from the ATT&CK Navigator.\n2. Map each technique to a log source you collect: Sysmon, Windows Security, DNS, proxy, EDR.\n3. Color the matrix: covered, partly covered, blind.\n4. Rank the blind spots by how many of your priority groups use them.\n\nThe result is a **coverage map**. It tells you where to invest in logging before you write a single rule. For example, if credential dumping (T1003) appears in every priority group but you do not log process access to `lsass.exe`, that is your first gap."
+    },
+    {
+      "id": "kill-chain",
+      "type": "animation",
+      "kind": "flow",
+      "title": "An APT intrusion across months",
+      "caption": "Each stage leaves a different, small trace. Detection needs several of them.",
+      "data": {
+        "token": "Intruder",
+        "nodes": [
+          {
+            "id": "mail",
+            "label": "Initial access",
+            "sub": "Spearphishing",
+            "icon": "mail"
+          },
+          {
+            "id": "ws",
+            "label": "Workstation",
+            "sub": "Foothold",
+            "icon": "laptop"
+          },
+          {
+            "id": "dc",
+            "label": "Domain controller",
+            "sub": "Credential access",
+            "icon": "server"
+          },
+          {
+            "id": "fs",
+            "label": "File server",
+            "sub": "Collection",
+            "icon": "database"
+          },
+          {
+            "id": "c2",
+            "label": "External host",
+            "sub": "203.0.113.50",
+            "icon": "cloud"
+          }
+        ],
+        "steps": [
+          {
+            "at": "mail",
+            "caption": "Week 1: a targeted email delivers a first-stage tool. Trace: mail gateway log, one rare child process of Office.",
+            "tone": "attack"
+          },
+          {
+            "at": "ws",
+            "caption": "Week 1: persistence through a scheduled task. Trace: Event ID 4698 and Sysmon process creation.",
+            "tone": "warning"
+          },
+          {
+            "at": "c2",
+            "caption": "Weeks 1-6: beaconing every hour. Trace: regular intervals in DNS and proxy logs.",
+            "tone": "warning"
+          },
+          {
+            "at": "dc",
+            "caption": "Week 3: the intruder uses a valid admin account. Trace: logon type 3 from a workstation that never did that.",
+            "tone": "danger"
+          },
+          {
+            "at": "fs",
+            "caption": "Week 5: archives are staged on the file server. Trace: large reads outside business hours.",
+            "tone": "danger"
+          },
+          {
+            "at": "c2",
+            "caption": "Week 6: slow exfiltration in small chunks. Trace: outbound byte counts per day per host.",
+            "tone": "attack"
+          }
+        ]
+      }
+    },
+    {
+      "id": "beacon",
+      "type": "text",
+      "markdown": "## Step 2: Hunt for beaconing\n\nMalware that calls home on a timer produces connections with a regular rhythm. People browse irregularly, so low variation is suspicious. Modern implants add **jitter** (random variation), so you look for a low coefficient of variation rather than exact equality.\n\nThe query below, in Splunk SPL, groups proxy events by source and destination, then measures how regular the gaps are. Run it against 14 days of your own data."
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "beacon-hunt.spl",
+      "code": "index=proxy earliest=-14d\n| sort 0 src_ip dest_host _time\n| streamstats current=f last(_time) AS prev BY src_ip dest_host\n| eval gap=_time-prev\n| stats count AS conns avg(gap) AS avg_gap stdev(gap) AS sd_gap\n        dc(date_mday) AS days BY src_ip dest_host\n| eval cv=round(sd_gap/avg_gap,2)\n| where conns>100 AND days>=7 AND cv<0.3 AND avg_gap>30\n| lookup top_domains.csv dest_host OUTPUT rank\n| where isnull(rank)\n| sort cv",
+      "highlight": [
+        7,
+        8,
+        9
+      ],
+      "caption": "A beaconing hunt. Low cv (coefficient of variation) over many days, to a host that is not in your popular-domain allowlist, deserves review."
+    },
+    {
+      "id": "beacon-out",
+      "type": "terminal",
+      "title": "Sample result",
+      "prompt": "$",
+      "lines": [
+        {
+          "output": "src_ip=192.0.2.44  dest_host=cdn-sync.example.net  conns=312  avg_gap=3584  sd_gap=412  days=13  cv=0.11",
+          "comment": "Strong candidate: about one connection per hour, very regular."
+        },
+        {
+          "output": "src_ip=192.0.2.71  dest_host=updates.example.org  conns=1440  avg_gap=60  sd_gap=2  days=14  cv=0.03",
+          "comment": "Very regular, but likely a software updater. Check the owner before escalating."
+        }
+      ],
+      "caption": "Output is a lead, not a verdict. Validate each row against asset ownership and the process that opened the connection."
+    },
+    {
+      "id": "persist",
+      "type": "text",
+      "markdown": "## Step 3: Detect persistence and credential theft\n\nPersistence and credential access are where APT actors cannot fully hide, because they must change the system. Focus on a few high-value events:\n\n- **Scheduled tasks and services** created by non-admin tools: Security 4698, System 7045.\n- **Registry run keys** and WMI event subscriptions: Sysmon events 12, 13 and 19-21.\n- **Access to LSASS memory** by unusual processes: Sysmon event 10 with `TargetImage` ending in `lsass.exe`.\n- **New logon patterns:** a service account logging on interactively, or an admin logging on to a server it never touched.\n\nWrite these as Sigma rules so they are portable between Splunk, Sentinel and Elastic. The rule below flags suspicious access to LSASS memory."
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "lsass-access.yml",
+      "code": "title: Suspicious Process Access to LSASS\nid: 7c1d9a52-0000-4000-8000-000000000001\nstatus: experimental\ndescription: Non-system process opens LSASS with memory-read rights\nlogsource:\n  product: windows\n  category: process_access\ndetection:\n  selection:\n    TargetImage|endswith: '\\lsass.exe'\n    GrantedAccess|contains:\n      - '0x1010'\n      - '0x1410'\n      - '0x1fffff'\n  filter_known:\n    SourceImage|startswith:\n      - 'C:\\Windows\\System32\\'\n      - 'C:\\Program Files\\Windows Defender\\'\n  condition: selection and not filter_known\nlevel: high\ntags:\n  - attack.credential_access\n  - attack.t1003.001",
+      "highlight": [
+        10,
+        11,
+        12,
+        13
+      ],
+      "caption": "A Sigma rule for T1003.001. Tune filter_known to your EDR and backup agents before enabling alerts."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not alert on every weak signal",
+      "markdown": "Beaconing and rare-process hunts produce many false positives. Send them to a **hunting queue** with a risk score, not straight to the alert queue. Raise an incident only when several independent signals land on the same host or account within a window, for example beaconing plus a new scheduled task plus an LSASS access."
+    },
+    {
+      "id": "correlate",
+      "type": "text",
+      "markdown": "## Step 4: Correlate into a risk score\n\nRisk-based alerting assigns points to each weak signal and alerts when the sum crosses a threshold. Give each signal a score based on how rare it is and which ATT&CK tactic it matches, and add them per entity (host or user) over seven days. A host with a beaconing score of 30, a new service of 20 and an unusual admin logon of 40 reaches 90 and opens a case, while any one alone would not.\n\nReview the scores monthly. If analysts close most cases as benign, lower the weight of the noisy signal or add an exclusion with an owner and an expiry date. If you find an incident that no score caught, add the missing signal."
+    },
+    {
+      "id": "tip-baseline",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Baseline before you hunt",
+      "markdown": "A hunt is only as good as your idea of normal. Spend the first week of any new data source building baselines: which hosts talk to which domains, which accounts log on to which servers, and what a typical day of outbound bytes looks like per department. Store the baselines as lookup tables and refresh them monthly. Without them, every rare event looks suspicious and analysts quickly stop trusting the hunt results."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "1. In a lab or on logs you own, export 14 days of DNS or proxy logs.\n2. Adapt the SPL (or a Python script using `statistics.stdev`) to compute the gap, mean and coefficient of variation per source and destination.\n3. List the top five lowest-`cv` pairs, and explain for each whether it is a known update service or needs investigation.\n4. Import the Sigma rule into your SIEM test instance, trigger it safely with an approved security tool on a lab machine, and note which false positives you must filter."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "APT",
+          "definition": "An adversary with resources and patience that seeks long-term access to specific targets."
+        },
+        {
+          "term": "Beaconing",
+          "definition": "Periodic outbound connections from an implant to its controller."
+        },
+        {
+          "term": "Jitter",
+          "definition": "Random variation added to a beacon interval to avoid exact regularity."
+        },
+        {
+          "term": "Living off the land",
+          "definition": "Abusing built-in operating system tools instead of custom malware."
+        },
+        {
+          "term": "Coverage map",
+          "definition": "A matrix showing which ATT&CK techniques your logs and detections can see."
+        },
+        {
+          "term": "Risk-based alerting",
+          "definition": "Scoring weak signals per entity and alerting when the total crosses a threshold."
+        },
+        {
+          "term": "Sigma",
+          "definition": "A vendor-neutral YAML format for describing log detections."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why do signature-based tools often miss APT activity?",
+          "options": [
+            "The actors use only zero-day exploits",
+            "Techniques use legitimate tools and valid accounts, so no known-bad indicator exists",
+            "APT traffic is always encrypted",
+            "SIEMs cannot store logs for more than a day"
+          ],
+          "answer": 1,
+          "explanation": "Living off the land and valid accounts leave no bad hash or domain to match, so behavior-based detection is needed."
+        },
+        {
+          "question": "Which are good beaconing indicators? (Choose all that apply)",
+          "options": [
+            "Low coefficient of variation in connection gaps",
+            "Connections continuing outside working hours",
+            "A destination that is rare in your environment",
+            "One large download from a software vendor"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Regular timing, activity at night and rare destinations together suggest automation; a single vendor download is ordinary."
+        },
+        {
+          "question": "What is the first output of modeling the adversary with ATT&CK?",
+          "options": [
+            "A list of IP blocks",
+            "A coverage map showing blind spots",
+            "A malware sample",
+            "A firewall rule set"
+          ],
+          "answer": 1,
+          "explanation": "Mapping techniques to your log sources shows where you can and cannot detect, guiding logging investment."
+        },
+        {
+          "question": "Which Sysmon event records one process opening another, used to spot LSASS access?",
+          "options": [
+            "Event ID 1",
+            "Event ID 3",
+            "Event ID 10",
+            "Event ID 22"
+          ],
+          "answer": 2,
+          "explanation": "Event 10 is ProcessAccess. Event 1 is process creation, 3 is network connection and 22 is DNS query."
+        },
+        {
+          "question": "Why send beaconing hits to a hunting queue first?",
+          "options": [
+            "They are always malicious",
+            "They have high false-positive rates and need corroboration",
+            "Analysts are not allowed to see them",
+            "They cannot be scored"
+          ],
+          "answer": 1,
+          "explanation": "Regular traffic is common (updaters, monitoring agents), so the signal needs other evidence before becoming an incident."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nAPT detection means finding behavior, not files. Start by modeling likely adversaries in ATT&CK and mapping coverage to your log sources. Hunt for beaconing with statistics over long windows, detect persistence and credential access with portable Sigma rules, and combine weak signals into risk scores per host and user. Treat every hunt result as a lead, validate it against asset ownership, and feed what you learn back into your detections. Continue with [Ransomware Defense Engineering](/learn/security-operations-dfir/ransomware-defense-engineering)."
+    }
+  ],
+  "ar": {
+    "title": "كشف التهديدات المتقدمة المستمرة (APT)",
+    "summary": "تعرّف كيف تكشف خصومًا صبورين يملكون موارد كبيرة بنمذجتهم في MITRE ATT&CK، وصيد الاتصال الدوري، وكشف الثبات وسرقة بيانات الاعتماد، وتجميع الإشارات الضعيفة في درجات مخاطر.",
+    "objectives": [
+      "تفسير سبب إفلات نشاط APT من الكشف بالتواقيع",
+      "بناء خريطة تغطية ATT&CK من تقنيات الخصم ومصادر السجلات",
+      "كتابة صيد للاتصال الدوري وقاعدة Sigma للوصول إلى LSASS",
+      "دمج الإشارات الضعيفة في درجة مخاطر لكل كيان"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تلاحظ شركة هندسية من 40 موظفًا أن كل شيء طبيعي لأشهر. ثم تكشف مراجعة روتينية لسجلات DNS أن محطة عمل واحدة تتصل بنطاق نادر كل 55 إلى 65 دقيقة، بحجم متقارب ليلًا ونهارًا. لم يُطلق أي تنبيه، لأن كل حدث على حدة يبدو بريئًا. هذه هي صورة **التهديد المتقدم المستمر (APT)**: خصم يملك موارد كبيرة، ويريد وصولًا طويل الأمد، ويتحرك ببطء، ويمتزج مع النشاط الاعتيادي.\n\nلا يقوم كشف APT على العثور على دليل واحد حاسم، بل على جمع إشارات ضعيفة كثيرة عبر أسابيع ومقارنتها بنموذج لسلوك هذه الجهات. يبيّن هذا الدرس كيف تبني هذا النموذج وتحوّله إلى استعلامات تشغّلها على سجلات تملكها. وهو يبني على [Advanced Threat Hunting](/learn/security-operations-dfir/advanced-threat-hunting) و[Advanced Detection Engineering](/learn/security-operations-dfir/advanced-detection-engineering)."
+      },
+      {
+        "id": "what-makes",
+        "type": "text",
+        "markdown": "## ما الذي يجعل التهديد «مستمرًا»\n\nيريد المهاجمون العاديون ربحًا سريعًا، لذلك يصدرون ضجيجًا. أما جهات APT فتريد الوصول، لذلك تصبر. وتهم المدافعَ أربع سمات:\n\n- **أهداف محددة.** سرقة بيانات أو تجسس أو التمركز المسبق في قطاع معين.\n- **بطء وهدوء.** نقل قليل الحجم، وفترات سكون طويلة، وساعات عمل تطابق الضحية.\n- **استغلال ما هو موجود (Living off the land).** أدوات مدمجة مثل `powershell.exe` و`wmic.exe` و`schtasks.exe` و`certutil.exe` بدل ملفات مخصصة.\n- **ثبات متعدد الطبقات.** مواطئ قدم عدة، فلا تنتهي العملية بإزالة واحد منها.\n\n| السمة | سبب فشل الكشف بالتواقيع | ما ينفع |\n|:--|:--|:--|\n| بطء وهدوء | لا يُتجاوز أي حد | إحصاءات النوافذ الطويلة وتحليل الاتصال الدوري |\n| استغلال الأدوات المدمجة | الملفات سليمة | سياق العملية الأب والابن وسطر الأوامر |\n| حسابات صالحة | تنجح عمليات الدخول | خطوط أساس سلوكية لكل مستخدم وجهاز |\n| أدوات مخصصة | لا بصمة معروفة | السلوك لا المؤشرات |\n\nلذلك ينتقل الكشف من سؤال «هل هذا الملف خبيث؟» إلى سؤال «هل هذا السلوك غير معتاد لهذا الأصل، وهل يطابق تقنية خصم معروفة؟»."
+      },
+      {
+        "id": "attack-model",
+        "type": "text",
+        "markdown": "## الخطوة 1: نمذجة الخصم باستخدام MITRE ATT&CK\n\nلا يمكنك كشف كل شيء، فابدأ بمن يُرجَّح أن يستهدفك. اختر مجموعتين أو ثلاثًا ذات صلة من استخبارات التهديد، وسجّل تقنياتها في مصفوفة **MITRE ATT&CK**، وحدّد ما تستطيع رؤيته حاليًا.\n\n1. صدّر تقنيات كل مجموعة من ATT&CK Navigator.\n2. اربط كل تقنية بمصدر سجلات تجمعه: Sysmon وWindows Security وDNS والوكيل (Proxy) وEDR.\n3. لوّن المصفوفة: مغطّاة، مغطّاة جزئيًا، عمياء.\n4. رتّب الفجوات بحسب عدد المجموعات ذات الأولوية التي تستخدمها.\n\nالناتج هو **خريطة تغطية (Coverage map)**. تدلّك على أين تستثمر في التسجيل قبل أن تكتب قاعدة واحدة. فمثلًا إن ظهر تفريغ بيانات الاعتماد (T1003) لدى كل المجموعات ذات الأولوية ولا تسجّل الوصول إلى عملية `lsass.exe`، فهذه فجوتك الأولى."
+      },
+      {
+        "id": "kill-chain",
+        "type": "animation",
+        "kind": "flow",
+        "title": "اختراق APT عبر أشهر",
+        "caption": "كل مرحلة تترك أثرًا صغيرًا مختلفًا، والكشف يحتاج إلى عدة آثار.",
+        "data": {
+          "token": "المتسلل",
+          "nodes": [
+            {
+              "id": "mail",
+              "label": "الوصول الأولي",
+              "sub": "تصيّد موجّه",
+              "icon": "mail"
+            },
+            {
+              "id": "ws",
+              "label": "محطة العمل",
+              "sub": "موطئ قدم",
+              "icon": "laptop"
+            },
+            {
+              "id": "dc",
+              "label": "وحدة تحكم النطاق",
+              "sub": "الوصول إلى بيانات الاعتماد",
+              "icon": "server"
+            },
+            {
+              "id": "fs",
+              "label": "خادم الملفات",
+              "sub": "الجمع",
+              "icon": "database"
+            },
+            {
+              "id": "c2",
+              "label": "مضيف خارجي",
+              "sub": "203.0.113.50",
+              "icon": "cloud"
+            }
+          ],
+          "steps": [
+            {
+              "at": "mail",
+              "caption": "الأسبوع 1: بريد موجّه يسلّم أداة المرحلة الأولى. الأثر: سجل بوابة البريد وعملية ابنة نادرة لبرنامج Office.",
+              "tone": "attack"
+            },
+            {
+              "at": "ws",
+              "caption": "الأسبوع 1: ثبات عبر مهمة مجدولة. الأثر: الحدث 4698 وإنشاء العمليات في Sysmon.",
+              "tone": "warning"
+            },
+            {
+              "at": "c2",
+              "caption": "الأسابيع 1 إلى 6: اتصال دوري كل ساعة. الأثر: فواصل منتظمة في سجلات DNS والوكيل.",
+              "tone": "warning"
+            },
+            {
+              "at": "dc",
+              "caption": "الأسبوع 3: يستخدم المتسلل حساب مسؤول صالحًا. الأثر: دخول من النوع 3 من محطة لم تفعل ذلك قط.",
+              "tone": "danger"
+            },
+            {
+              "at": "fs",
+              "caption": "الأسبوع 5: تُجهَّز أرشيفات على خادم الملفات. الأثر: قراءات كبيرة خارج ساعات العمل.",
+              "tone": "danger"
+            },
+            {
+              "at": "c2",
+              "caption": "الأسبوع 6: تسريب بطيء بقطع صغيرة. الأثر: حجم البيانات الصادرة يوميًا لكل جهاز.",
+              "tone": "attack"
+            }
+          ]
+        }
+      },
+      {
+        "id": "beacon",
+        "type": "text",
+        "markdown": "## الخطوة 2: صيد الاتصال الدوري (Beaconing)\n\nتُنتج البرمجيات التي تتصل بمصدرها على مؤقت اتصالات ذات إيقاع منتظم. أما البشر فيتصفحون بلا انتظام، لذا فالتباين المنخفض مريب. وتضيف الزرعات الحديثة **تذبذبًا (Jitter)** عشوائيًا، فنبحث عن معامل اختلاف منخفض لا عن تساوٍ تام.\n\nيجمع الاستعلام التالي، بلغة Splunk SPL، أحداث الوكيل بحسب المصدر والوجهة، ثم يقيس انتظام الفواصل. شغّله على بياناتك أنت لمدة 14 يومًا."
+      },
+      {
+        "id": "spl",
+        "type": "code",
+        "language": "plain",
+        "filename": "beacon-hunt.spl",
+        "code": "index=proxy earliest=-14d\n| sort 0 src_ip dest_host _time\n| streamstats current=f last(_time) AS prev BY src_ip dest_host\n| eval gap=_time-prev\n| stats count AS conns avg(gap) AS avg_gap stdev(gap) AS sd_gap\n        dc(date_mday) AS days BY src_ip dest_host\n| eval cv=round(sd_gap/avg_gap,2)\n| where conns>100 AND days>=7 AND cv<0.3 AND avg_gap>30\n| lookup top_domains.csv dest_host OUTPUT rank\n| where isnull(rank)\n| sort cv",
+        "highlight": [
+          7,
+          8,
+          9
+        ],
+        "caption": "صيد للاتصال الدوري. معامل اختلاف (cv) منخفض عبر أيام كثيرة نحو مضيف ليس في قائمة النطاقات الشائعة المسموحة يستحق المراجعة."
+      },
+      {
+        "id": "beacon-out",
+        "type": "terminal",
+        "title": "Sample result",
+        "prompt": "$",
+        "lines": [
+          {
+            "output": "src_ip=192.0.2.44  dest_host=cdn-sync.example.net  conns=312  avg_gap=3584  sd_gap=412  days=13  cv=0.11",
+            "comment": "مرشح قوي: اتصال واحد تقريبًا كل ساعة وبانتظام عالٍ."
+          },
+          {
+            "output": "src_ip=192.0.2.71  dest_host=updates.example.org  conns=1440  avg_gap=60  sd_gap=2  days=14  cv=0.03",
+            "comment": "منتظم جدًا، لكنه على الأرجح محدّث برمجيات. تحقق من المالك قبل التصعيد."
+          }
+        ],
+        "caption": "الناتج خيط تحقيق لا حكم نهائي. تحقق من كل صف مقابل ملكية الأصل والعملية التي فتحت الاتصال."
+      },
+      {
+        "id": "persist",
+        "type": "text",
+        "markdown": "## الخطوة 3: كشف الثبات وسرقة بيانات الاعتماد\n\nالثبات والوصول إلى بيانات الاعتماد هما موضع لا تستطيع جهات APT الاختفاء فيه كليًا، لأنها يجب أن تغيّر النظام. ركّز على بضعة أحداث عالية القيمة:\n\n- **المهام المجدولة والخدمات** التي تُنشأ بأدوات غير إدارية: الحدث 4698 في Security و7045 في System.\n- **مفاتيح التشغيل في السجل (Registry)** واشتراكات WMI: أحداث Sysmon رقم 12 و13 و19 إلى 21.\n- **الوصول إلى ذاكرة LSASS** من عمليات غير معتادة: حدث Sysmon رقم 10 حيث ينتهي `TargetImage` بـ `lsass.exe`.\n- **أنماط دخول جديدة:** حساب خدمة يسجّل دخولًا تفاعليًا، أو مسؤول يدخل خادمًا لم يلمسه من قبل.\n\nاكتب هذه كقواعد Sigma لتنتقل بين Splunk وSentinel وElastic. تضع القاعدة التالية علامة على الوصول المريب إلى ذاكرة LSASS."
+      },
+      {
+        "id": "sigma",
+        "type": "code",
+        "language": "yaml",
+        "filename": "lsass-access.yml",
+        "code": "title: Suspicious Process Access to LSASS\nid: 7c1d9a52-0000-4000-8000-000000000001\nstatus: experimental\ndescription: Non-system process opens LSASS with memory-read rights\nlogsource:\n  product: windows\n  category: process_access\ndetection:\n  selection:\n    TargetImage|endswith: '\\lsass.exe'\n    GrantedAccess|contains:\n      - '0x1010'\n      - '0x1410'\n      - '0x1fffff'\n  filter_known:\n    SourceImage|startswith:\n      - 'C:\\Windows\\System32\\'\n      - 'C:\\Program Files\\Windows Defender\\'\n  condition: selection and not filter_known\nlevel: high\ntags:\n  - attack.credential_access\n  - attack.t1003.001",
+        "highlight": [
+          10,
+          11,
+          12,
+          13
+        ],
+        "caption": "قاعدة Sigma للتقنية T1003.001. اضبط filter_known بحسب وكيل EDR وأدوات النسخ الاحتياطي لديك قبل تفعيل التنبيهات."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تُنبّه على كل إشارة ضعيفة",
+        "markdown": "تُنتج عمليات صيد الاتصال الدوري والعمليات النادرة إيجابيات كاذبة كثيرة. أرسلها إلى **قائمة صيد** مع درجة خطورة، لا إلى قائمة التنبيهات مباشرة. ارفع حادثة فقط حين تتجمع عدة إشارات مستقلة على المضيف أو الحساب نفسه ضمن نافذة زمنية، مثل اتصال دوري مع مهمة مجدولة جديدة ووصول إلى LSASS."
+      },
+      {
+        "id": "correlate",
+        "type": "text",
+        "markdown": "## الخطوة 4: الربط في درجة مخاطر\n\nيعطي التنبيه المبني على المخاطر نقاطًا لكل إشارة ضعيفة، ويُنبّه حين يتجاوز المجموع حدًا معينًا. أعطِ كل إشارة درجة بحسب ندرتها والتكتيك الذي تطابقه في ATT&CK، ثم اجمعها لكل كيان (جهاز أو مستخدم) على مدى سبعة أيام. جهاز بدرجة 30 للاتصال الدوري و20 لخدمة جديدة و40 لدخول إداري غير معتاد يصل إلى 90 ويفتح حالة، بينما لا تكفي أي إشارة منها وحدها.\n\nراجع الدرجات شهريًا. إن أغلق المحللون معظم الحالات على أنها سليمة، فخفّض وزن الإشارة المزعجة أو أضف استثناءً له مالك وتاريخ انتهاء. وإن وجدت حادثة لم تلتقطها أي درجة، فأضف الإشارة الناقصة."
+      },
+      {
+        "id": "tip-baseline",
+        "type": "callout",
+        "variant": "tip",
+        "title": "ابنِ خط الأساس قبل الصيد",
+        "markdown": "جودة الصيد من جودة تصوّرك للوضع الطبيعي. اقضِ الأسبوع الأول من أي مصدر بيانات جديد في بناء خطوط أساس: أي الأجهزة تتصل بأي النطاقات، وأي الحسابات تدخل أي الخوادم، وكيف يبدو يوم اعتيادي من البيانات الصادرة لكل قسم. خزّن خطوط الأساس في جداول بحث (Lookup) وحدّثها شهريًا. من دونها يبدو كل حدث نادر مريبًا، ويفقد المحللون ثقتهم بنتائج الصيد سريعًا."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "1. في مختبر أو على سجلات تملكها، صدّر 14 يومًا من سجلات DNS أو الوكيل.\n2. عدّل استعلام SPL (أو سكربت Python يستخدم `statistics.stdev`) لحساب الفاصل والمتوسط ومعامل الاختلاف لكل مصدر ووجهة.\n3. اذكر أقل خمسة أزواج في `cv`، ووضّح لكل منها هل هو خدمة تحديث معروفة أم يحتاج إلى تحقيق.\n4. استورد قاعدة Sigma في نسخة اختبار من SIEM، وأطلقها بأمان بأداة أمنية معتمدة على جهاز مختبر، ودوّن الإيجابيات الكاذبة التي يجب تصفيتها."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "APT",
+            "definition": "خصم يملك الموارد والصبر ويسعى إلى وصول طويل الأمد لأهداف محددة."
+          },
+          {
+            "term": "الاتصال الدوري (Beaconing)",
+            "definition": "اتصالات صادرة دورية من زرعة إلى جهة التحكم بها."
+          },
+          {
+            "term": "التذبذب (Jitter)",
+            "definition": "تغيير عشوائي يُضاف إلى فاصل الاتصال لتفادي الانتظام التام."
+          },
+          {
+            "term": "استغلال الأدوات المدمجة",
+            "definition": "إساءة استخدام أدوات نظام التشغيل المدمجة بدل البرمجيات الخبيثة المخصصة."
+          },
+          {
+            "term": "خريطة التغطية",
+            "definition": "مصفوفة تبيّن أي تقنيات ATT&CK تستطيع سجلاتك وقواعدك رؤيتها."
+          },
+          {
+            "term": "التنبيه المبني على المخاطر",
+            "definition": "إعطاء درجات للإشارات الضعيفة لكل كيان والتنبيه عند تجاوز المجموع حدًا معينًا."
+          },
+          {
+            "term": "Sigma",
+            "definition": "صيغة YAML محايدة للمورّدين لوصف قواعد الكشف في السجلات."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا تفوّت أدوات التواقيع كثيرًا من نشاط APT؟",
+            "options": [
+              "لأن الجهات تستخدم ثغرات اليوم الصفري فقط",
+              "لأن التقنيات تستخدم أدوات سليمة وحسابات صالحة فلا يوجد مؤشر خبيث معروف",
+              "لأن حركة APT مشفّرة دائمًا",
+              "لأن SIEM لا يخزّن السجلات أكثر من يوم"
+            ],
+            "answer": 1,
+            "explanation": "لا يترك استغلال الأدوات المدمجة والحسابات الصالحة بصمة أو نطاقًا خبيثًا للمطابقة، لذا يلزم الكشف المبني على السلوك."
+          },
+          {
+            "question": "ما المؤشرات الجيدة على الاتصال الدوري؟ (اختر كل ما ينطبق)",
+            "options": [
+              "معامل اختلاف منخفض في فواصل الاتصال",
+              "استمرار الاتصالات خارج ساعات العمل",
+              "وجهة نادرة في بيئتك",
+              "تنزيل واحد كبير من مورّد برمجيات"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "يدل الانتظام الزمني والنشاط الليلي والوجهة النادرة معًا على الأتمتة، أما تنزيل واحد من مورّد فأمر عادي."
+          },
+          {
+            "question": "ما أول ناتج لنمذجة الخصم باستخدام ATT&CK؟",
+            "options": [
+              "قائمة بعناوين IP للحظر",
+              "خريطة تغطية تبيّن النقاط العمياء",
+              "عيّنة برمجية خبيثة",
+              "مجموعة قواعد جدار حماية"
+            ],
+            "answer": 1,
+            "explanation": "ربط التقنيات بمصادر السجلات يبيّن أين تستطيع الكشف وأين لا تستطيع، فيوجّه الاستثمار في التسجيل."
+          },
+          {
+            "question": "أي حدث في Sysmon يسجّل فتح عملية لعملية أخرى ويُستخدم لكشف الوصول إلى LSASS؟",
+            "options": [
+              "الحدث 1",
+              "الحدث 3",
+              "الحدث 10",
+              "الحدث 22"
+            ],
+            "answer": 2,
+            "explanation": "الحدث 10 هو ProcessAccess. أما 1 فهو إنشاء عملية، و3 اتصال شبكي، و22 استعلام DNS."
+          },
+          {
+            "question": "لماذا ترسل نتائج الاتصال الدوري إلى قائمة صيد أولًا؟",
+            "options": [
+              "لأنها خبيثة دائمًا",
+              "لأن إيجابياتها الكاذبة عالية وتحتاج إلى تعزيز",
+              "لأن المحللين ممنوعون من رؤيتها",
+              "لأنه لا يمكن تسجيل درجات لها"
+            ],
+            "answer": 1,
+            "explanation": "الحركة المنتظمة شائعة (محدّثات ووكلاء مراقبة)، فتحتاج الإشارة إلى أدلة أخرى قبل أن تصبح حادثة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nكشف APT يعني العثور على السلوك لا على الملفات. ابدأ بنمذجة الخصوم المرجّحين في ATT&CK وربط التغطية بمصادر سجلاتك. اصطد الاتصال الدوري بإحصاءات على نوافذ طويلة، واكشف الثبات والوصول إلى بيانات الاعتماد بقواعد Sigma قابلة للنقل، واجمع الإشارات الضعيفة في درجات مخاطر لكل جهاز ومستخدم. عامل كل نتيجة صيد على أنها خيط تحقيق، وتحقق منها مقابل ملكية الأصل، وأعد ما تتعلمه إلى قواعد الكشف. تابع مع [Ransomware Defense Engineering](/learn/security-operations-dfir/ransomware-defense-engineering)."
+      }
+    ]
+  }
+}

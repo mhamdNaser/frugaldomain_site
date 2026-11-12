@@ -1,0 +1,542 @@
+{
+ "slug": "elastic-security-and-siem",
+ "title": "Elastic Security and SIEM",
+ "summary": "Learn how Elastic Security turns the Elastic Stack into a SIEM: how data is collected and normalized with ECS, which detection rule types to use, and how an alert is investigated and tuned.",
+ "duration_minutes": 28,
+ "objectives": [
+  "Describe the components of an Elastic SIEM deployment",
+  "Explain why ECS field names make cross-source detection possible",
+  "Choose the right detection rule type for a scenario",
+  "Investigate and tune an alert using Timeline, cases and exceptions"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A small company already collects Windows logs, firewall logs and cloud audit trails, but they sit in separate tools. When an analyst hears about a suspicious sign-in, she has to open four consoles and compare timestamps by hand. The company already runs the Elastic Stack for application search, so the question is whether it can also serve as a **SIEM** (Security Information and Event Management).\n\nIt can. **Elastic Security** adds detection rules, alerts, cases, a timeline investigation view and prebuilt content on top of Elasticsearch and Kibana. This lesson shows how the pieces fit, how data becomes searchable and comparable, and how a detection rule produces an alert that an analyst can work. If you have not yet met the idea of central collection, read [Centralized Log Management](/learn/security-operations-dfir/centralized-log-management) first."
+  },
+  {
+   "id": "arch",
+   "type": "text",
+   "markdown": "## The building blocks\n\nElastic Security is not a separate product install. It is a solution inside Kibana that runs on the same cluster as your other data.\n\n| Component | Role in the SIEM |\n|:--|:--|\n| **Elastic Agent** | One agent that collects logs and metrics, and can also run endpoint protection |\n| **Fleet** | Central management of agents and their policies from Kibana |\n| **Integrations** | Packaged inputs (Windows, Linux auditd, firewalls, AWS CloudTrail) that parse data into a standard shape |\n| **Logstash** (optional) | Heavy pipeline for transformation, buffering or routing before indexing |\n| **Elasticsearch** | Stores and searches events in indexes and data streams |\n| **Kibana** | Detection rules, alerts, dashboards, cases and the investigation timeline |\n\nData is stored in **data streams** such as `logs-system.security-default`. Each stream rolls over to new backing indexes, and an **index lifecycle policy** moves older data through hot, warm, cold and delete phases. That is how you keep 7 days on fast disks and 90 days on cheaper ones without manual work.\n\nOlder deployments use Beats (Winlogbeat, Filebeat, Auditbeat) instead of Elastic Agent. They still work, but new designs should start with Agent and Fleet because policy changes then reach every host from one place."
+  },
+  {
+   "id": "ecs",
+   "type": "text",
+   "markdown": "## Why ECS matters\n\nA SIEM is only useful if one query can search many sources. Windows calls the account `TargetUserName`, a Linux log says `user`, and a firewall says `src_user`. The **Elastic Common Schema (ECS)** gives every one of these the same field name, `user.name`. Integrations map raw fields into ECS during ingestion.\n\nA handful of fields do most of the work:\n\n- `event.category`, `event.type`, `event.outcome`: what kind of thing happened and whether it succeeded.\n- `host.name`, `source.ip`, `destination.ip`: where it happened.\n- `user.name`, `process.name`, `process.command_line`: who and what did it.\n- `@timestamp`: the event time, always stored in UTC.\n\nBecause of ECS, one rule such as \"many failed logons from one source\" works for Windows, SSH and a VPN gateway at the same time. When you write custom parsers, map into ECS fields rather than inventing names. Otherwise every prebuilt rule and dashboard will ignore your data."
+  },
+  {
+   "id": "kql",
+   "type": "terminal",
+   "title": "Checking data and searching in ECS",
+   "lines": [
+    {
+     "cmd": "curl -s -u analyst:<PASSWORD> 'https://es01.example.com:9200/_cat/indices/.ds-logs-system.security*?v&h=index,docs.count,store.size'",
+     "output": "index                                              docs.count store.size\n.ds-logs-system.security-default-2026.11.10-000012     481203    312mb\n.ds-logs-system.security-default-2026.11.11-000013      90412     58mb",
+     "comment": "Confirms that Windows Security events are arriving, and how large each backing index is."
+    },
+    {
+     "cmd": "curl -s -u analyst:<PASSWORD> -H 'Content-Type: application/json' 'https://es01.example.com:9200/logs-system.security-*/_count' -d '{\"query\":{\"bool\":{\"filter\":[{\"term\":{\"event.code\":\"4625\"}},{\"range\":{\"@timestamp\":{\"gte\":\"now-15m\"}}}]}}}'",
+     "output": "{\"count\":214,\"_shards\":{\"total\":2,\"successful\":2,\"skipped\":0,\"failed\":0}}",
+     "comment": "214 failed logons (event 4625) in 15 minutes. Is that normal for this environment? A baseline answers it."
+    }
+   ],
+   "caption": "Verifying ingestion and counting failed logons through the REST API. The same filter in the Kibana search bar (KQL) is event.code: 4625."
+  },
+  {
+   "id": "rules",
+   "type": "text",
+   "markdown": "## Detection rules\n\nA **detection rule** is a scheduled search that creates an alert when it matches. Elastic ships hundreds of prebuilt rules, mapped to MITRE ATT&CK, that you enable per integration. You can also write your own. Choose the rule type by the question you are asking:\n\n| Rule type | Use it when | Example |\n|:--|:--|:--|\n| **Custom query** | One event is suspicious | A new local administrator is created |\n| **Threshold** | A count over time matters | 20 failed logons from one IP in 5 minutes |\n| **Event correlation (EQL)** | A *sequence* of events matters | Failed logons followed by a success for the same user |\n| **Indicator match** | You hold a threat intelligence list | Any `destination.ip` found in an IOC index |\n| **New terms** | First-time behavior matters | A user signs in from a country never seen before |\n| **Machine learning** | You want anomaly scoring | Unusual process activity for a host |\n\nEvery rule runs on an interval with a look-back window. Set the look-back longer than the interval, for example run every 5 minutes and look back 6, so events that arrive late are not missed. Each rule also carries a **severity**, a **risk score** and ATT&CK tags that help triage."
+  },
+  {
+   "id": "eql",
+   "type": "code",
+   "language": "plain",
+   "filename": "brute-force-then-success.eql",
+   "caption": "An EQL sequence rule: five failed Windows logons followed by a success for the same user and source, within 10 minutes. Highlighted lines carry the correlation logic.",
+   "highlight": [
+    1,
+    2,
+    3,
+    5
+   ],
+   "code": "sequence by user.name, source.ip with maxspan=10m\n  [authentication where event.outcome == \"failure\" and\n   event.code == \"4625\"] with runs=5\n  [authentication where event.outcome == \"success\" and\n   event.code == \"4624\" and winlog.logon.type == \"Network\"]"
+  },
+  {
+   "id": "flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "From log line to alert in Elastic Security",
+   "caption": "One failed-logon event travels from a Windows host to a case.",
+   "data": {
+    "token": "Event",
+    "nodes": [
+     {
+      "id": "host",
+      "label": "Windows host",
+      "sub": "srv-fin-01",
+      "icon": "server"
+     },
+     {
+      "id": "agent",
+      "label": "Elastic Agent",
+      "sub": "Fleet policy",
+      "icon": "cpu"
+     },
+     {
+      "id": "es",
+      "label": "Elasticsearch",
+      "sub": "Data stream",
+      "icon": "database"
+     },
+     {
+      "id": "rule",
+      "label": "Detection rule",
+      "sub": "EQL sequence",
+      "icon": "eye"
+     },
+     {
+      "id": "alert",
+      "label": "Alert",
+      "sub": "Risk 73",
+      "icon": "alert"
+     },
+     {
+      "id": "case",
+      "label": "Case",
+      "sub": "Analyst triage",
+      "icon": "user"
+     }
+    ],
+    "steps": [
+     {
+      "at": "host",
+      "caption": "Event 4625 is written to the Security log: a failed network logon for user svc-backup."
+     },
+     {
+      "at": "agent",
+      "caption": "The agent reads the event and the integration maps it to ECS fields such as user.name and event.outcome."
+     },
+     {
+      "at": "es",
+      "caption": "The event is indexed into the logs-system.security data stream within seconds."
+     },
+     {
+      "at": "rule",
+      "caption": "The scheduled rule finds 5 failures then a success from 198.51.100.23 within 10 minutes.",
+      "tone": "warning"
+     },
+     {
+      "at": "alert",
+      "caption": "An alert is created with severity high and a link to the matching events.",
+      "tone": "danger"
+     },
+     {
+      "at": "case",
+      "caption": "The analyst opens the alert in Timeline, confirms the pattern and attaches it to a case.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "ops",
+   "type": "text",
+   "markdown": "## Working an alert\n\nAn alert is a document written to a hidden `.alerts-security.alerts-default` index. It copies the matching event fields and adds rule metadata, so you can filter alerts by `kibana.alert.severity` or `kibana.alert.workflow_status`.\n\nA practical workflow looks like this:\n\n1. **Open the alert details** and read the rule description and the fields that triggered it.\n2. **Investigate in Timeline.** Drag fields such as `source.ip` and `user.name` into a timeline and widen the time range to see what else the same entity did.\n3. **Check context.** Is the host a server or a laptop? Is the account a service account? Did the same IP touch other hosts?\n4. **Decide.** Mark the alert acknowledged, closed (with a reason) or attach it to a **case**.\n5. **Tune.** If it is a false positive, add a rule **exception** for the narrow condition, such as a known vulnerability scanner at `192.0.2.50`, instead of disabling the rule. The next lesson, [Security Alert Triage](/learn/security-operations-dfir/security-alert-triage), goes deeper on this step.\n\nCases collect alerts, notes and observables, and can be pushed to ticketing tools such as ServiceNow or Jira. For endpoint-focused detection that complements this approach, compare it with [Wazuh](/learn/security-operations-dfir/wazuh-security-monitoring)."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Plan for volume before you enable everything",
+   "markdown": "Enabling every prebuilt rule on day one floods the queue with alerts nobody can read. Start with rules for your highest-risk assets, review the alert volume for a week, then add more. Also watch ingestion: unparsed or duplicated logs inflate storage and slow searches, and a rule can only match data that actually arrived."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a lab cluster you own, such as a single-node Elastic Stack in a virtual machine.\n\n1. Add the **System** integration to an Elastic Agent policy in Fleet and enroll one lab VM.\n2. In Discover, search `event.category: authentication` and find the field list for a login event. Note which fields are ECS names.\n3. Create a **threshold** rule that fires when one `source.ip` has 5 failed logons in 5 minutes. Set the look-back to 6 minutes.\n4. Fail a login on your own VM six times, wait for the rule to run, and open the alert in Timeline.\n5. Add the alert to a case and write two sentences describing your verdict."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "SIEM",
+     "definition": "A platform that collects, normalizes and correlates security events and raises alerts."
+    },
+    {
+     "term": "Elastic Agent",
+     "definition": "A single agent, managed by Fleet, that ships logs and metrics and can run endpoint protection."
+    },
+    {
+     "term": "ECS",
+     "definition": "Elastic Common Schema: a standard set of field names such as user.name and source.ip."
+    },
+    {
+     "term": "Data stream",
+     "definition": "An append-only, time-based series of backing indexes that is searched as one name."
+    },
+    {
+     "term": "EQL",
+     "definition": "Event Query Language: a query language that matches ordered sequences of events."
+    },
+    {
+     "term": "Threshold rule",
+     "definition": "A rule that alerts when a count of matching events over time crosses a limit."
+    },
+    {
+     "term": "Timeline",
+     "definition": "The Kibana investigation workspace for pivoting across events and entities."
+    },
+    {
+     "term": "Rule exception",
+     "definition": "A narrow condition that stops a rule from alerting on known benign activity."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why does a SIEM rely on a common schema such as ECS?",
+     "options": [
+      "It encrypts logs at rest",
+      "It lets one query and one rule work across different log sources",
+      "It removes the need for time synchronization",
+      "It compresses indexes"
+     ],
+     "answer": 1,
+     "explanation": "ECS gives equivalent data the same field name, so a rule on user.name covers Windows, Linux and network sources alike."
+    },
+    {
+     "question": "Which rule type best detects failed logons followed by a success for the same account?",
+     "options": [
+      "Threshold",
+      "Indicator match",
+      "Event correlation (EQL sequence)",
+      "New terms"
+     ],
+     "answer": 2,
+     "explanation": "The order of events matters, and EQL sequences express ordered events with a shared key and a time span."
+    },
+    {
+     "question": "Which statements about rule scheduling are correct? (Choose all that apply.)",
+     "options": [
+      "The look-back window should be longer than the run interval",
+      "A longer look-back helps catch late-arriving events",
+      "Rules only run when an analyst opens Kibana",
+      "Rules run on a schedule in the background"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Rules run on their own schedule. Overlapping windows prevent gaps caused by ingestion delay."
+    },
+    {
+     "question": "A vulnerability scanner at 192.0.2.50 keeps triggering a port scan rule. What is the best fix?",
+     "options": [
+      "Disable the rule",
+      "Delete the alerts every morning",
+      "Add a narrow exception for that source address",
+      "Lower the risk score of every rule"
+     ],
+     "answer": 2,
+     "explanation": "An exception removes the known benign case while the rule still detects real scans from other sources."
+    },
+    {
+     "question": "What does Fleet provide?",
+     "options": [
+      "Central management of Elastic Agents and their policies",
+      "Long-term cold storage",
+      "A threat intelligence feed",
+      "Email delivery of alerts"
+     ],
+     "answer": 0,
+     "explanation": "Fleet in Kibana enrolls agents and pushes policy and integration changes to them."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Elastic Security turns the Elastic Stack into a SIEM with rules, alerts, Timeline and cases.\n- Elastic Agent and Fleet collect and manage data; integrations map it to ECS.\n- ECS field names let one rule cover many sources.\n- Choose the rule type by the question: query, threshold, EQL, indicator match, new terms or machine learning.\n- Work alerts in Timeline, tune with narrow exceptions and start with a small, high-value rule set.\n\nNext, see how the same collection ideas apply to infrastructure health in [Grafana and Prometheus Infrastructure Monitoring](/learn/security-operations-dfir/grafana-and-prometheus-infrastructure-monitoring)."
+  }
+ ],
+ "ar": {
+  "title": "Elastic Security وSIEM",
+  "summary": "تعرّف كيف يحوّل Elastic Security حزمة Elastic Stack إلى نظام SIEM: كيف تُجمع البيانات وتُوحَّد بـ ECS، وأي أنواع قواعد الكشف تستخدم، وكيف يُحقَّق في التنبيه ويُضبط.",
+  "objectives": [
+   "وصف مكوّنات نشر Elastic SIEM",
+   "شرح لماذا تتيح أسماء حقول ECS الكشف عبر المصادر",
+   "اختيار نوع قاعدة الكشف المناسب لسيناريو",
+   "التحقيق في تنبيه وضبطه باستخدام Timeline والحالات والاستثناءات"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "تجمع شركة صغيرة سجلات ويندوز وجدار الحماية والتدقيق السحابي، لكنها موزّعة على أدوات منفصلة. وعندما تسمع المحلّلة عن عملية دخول مشبوهة، عليها أن تفتح أربع لوحات تحكم وتقارن الأوقات يدوياً. والشركة تشغّل أصلاً حزمة Elastic Stack للبحث في التطبيقات، فيُطرح السؤال: هل تصلح أيضاً كنظام SIEM (إدارة المعلومات والأحداث الأمنية)؟\n\nنعم تصلح. يضيف **Elastic Security** قواعد كشف وتنبيهات وحالات (Cases) وواجهة تحقيق زمنية (Timeline) ومحتوى جاهزاً فوق Elasticsearch وKibana. يوضّح هذا الدرس كيف تتكامل المكوّنات، وكيف تصبح البيانات قابلة للبحث والمقارنة، وكيف تنتج قاعدة الكشف تنبيهاً يعمل عليه المحلّل. وإن لم تطّلع بعد على فكرة التجميع المركزي فاقرأ أولاً [إدارة السجلات المركزية](/learn/security-operations-dfir/centralized-log-management)."
+   },
+   {
+    "id": "arch",
+    "type": "text",
+    "markdown": "## اللبنات الأساسية\n\nلا يُثبَّت Elastic Security كمنتج منفصل، بل هو حلّ داخل Kibana يعمل على العنقود (Cluster) نفسه الذي تُخزَّن فيه بياناتك الأخرى.\n\n| المكوّن | دوره في نظام SIEM |\n|:--|:--|\n| **Elastic Agent** | وكيل واحد يجمع السجلات والمقاييس، ويمكنه أيضاً تشغيل حماية الجهاز الطرفي |\n| **Fleet** | إدارة مركزية للوكلاء وسياساتهم من Kibana |\n| **التكاملات (Integrations)** | مدخلات جاهزة (Windows وLinux auditd وجدران الحماية وAWS CloudTrail) تحلّل البيانات إلى شكل قياسي |\n| **Logstash** (اختياري) | خط معالجة ثقيل للتحويل أو التخزين المؤقت أو التوجيه قبل الفهرسة |\n| **Elasticsearch** | يخزّن الأحداث ويبحث فيها ضمن فهارس وتدفقات بيانات |\n| **Kibana** | قواعد الكشف والتنبيهات ولوحات المعلومات والحالات وواجهة التحقيق الزمنية |\n\nتُخزَّن البيانات في **تدفقات بيانات (Data streams)** مثل `logs-system.security-default`. ينتقل كل تدفق إلى فهارس جديدة عند بلوغ حدّ معيّن، وتنقل **سياسة دورة حياة الفهرس** البيانات القديمة عبر مراحل hot وwarm وcold وdelete. وبذلك تحتفظ بسبعة أيام على أقراص سريعة وبتسعين يوماً على أقراص أرخص دون عمل يدوي.\n\nتستخدم النشرات الأقدم وكلاء Beats (Winlogbeat وFilebeat وAuditbeat) بدل Elastic Agent. ما زالت تعمل، لكن التصاميم الجديدة يجب أن تبدأ بـ Agent وFleet لأن تغيير السياسة يصل حينئذٍ إلى كل الأجهزة من مكان واحد."
+   },
+   {
+    "id": "ecs",
+    "type": "text",
+    "markdown": "## لماذا يهمّ ECS\n\nلا يفيد نظام SIEM إلا إذا استطاع استعلام واحد أن يبحث في مصادر كثيرة. يسمّي ويندوز الحساب `TargetUserName`، ويكتب سجل لينكس `user`، ويكتب جدار الحماية `src_user`. يعطي **مخطط Elastic المشترك (ECS)** هذه الحقول كلها اسماً واحداً هو `user.name`، وتحوّل التكاملات الحقول الخام إلى ECS أثناء الاستيعاب.\n\nتقوم حفنة من الحقول بمعظم العمل:\n\n- `event.category` و`event.type` و`event.outcome`: نوع ما حدث ونجاحه.\n- `host.name` و`source.ip` و`destination.ip`: مكان الحدث.\n- `user.name` و`process.name` و`process.command_line`: من فعله وبماذا.\n- `@timestamp`: وقت الحدث، ويُخزَّن دائماً بتوقيت UTC.\n\nبفضل ECS تعمل قاعدة واحدة مثل «فشل دخول كثير من مصدر واحد» على ويندوز وSSH وبوابة VPN في الوقت نفسه. وعند كتابة محلّلات مخصصة ضع البيانات في حقول ECS ولا تخترع أسماء، وإلا تجاهلت كل القواعد ولوحات المعلومات الجاهزة بياناتك."
+   },
+   {
+    "id": "kql",
+    "type": "terminal",
+    "title": "التحقق من البيانات والبحث بحقول ECS",
+    "lines": [
+     {
+      "cmd": "curl -s -u analyst:<PASSWORD> 'https://es01.example.com:9200/_cat/indices/.ds-logs-system.security*?v&h=index,docs.count,store.size'",
+      "output": "index                                              docs.count store.size\n.ds-logs-system.security-default-2026.11.10-000012     481203    312mb\n.ds-logs-system.security-default-2026.11.11-000013      90412     58mb",
+      "comment": "يتأكد من وصول أحداث أمان ويندوز ومن حجم كل فهرس."
+     },
+     {
+      "cmd": "curl -s -u analyst:<PASSWORD> -H 'Content-Type: application/json' 'https://es01.example.com:9200/logs-system.security-*/_count' -d '{\"query\":{\"bool\":{\"filter\":[{\"term\":{\"event.code\":\"4625\"}},{\"range\":{\"@timestamp\":{\"gte\":\"now-15m\"}}}]}}}'",
+      "output": "{\"count\":214,\"_shards\":{\"total\":2,\"successful\":2,\"skipped\":0,\"failed\":0}}",
+      "comment": "214 عملية دخول فاشلة (الحدث 4625) في 15 دقيقة. هل هذا طبيعي؟ يجيب الأساس المرجعي عن ذلك."
+     }
+    ],
+    "caption": "التحقق من الاستيعاب وعدّ عمليات الدخول الفاشلة عبر واجهة REST. المرشّح نفسه في شريط بحث Kibana (KQL) هو event.code: 4625."
+   },
+   {
+    "id": "rules",
+    "type": "text",
+    "markdown": "## قواعد الكشف\n\n**قاعدة الكشف (Detection rule)** بحث مجدول ينشئ تنبيهاً عند تطابقه. يأتي Elastic بمئات القواعد الجاهزة المرتبطة بإطار MITRE ATT&CK وتفعّلها لكل تكامل، ويمكنك كتابة قواعدك. اختر نوع القاعدة بحسب السؤال الذي تطرحه:\n\n| نوع القاعدة | متى تستخدمها | مثال |\n|:--|:--|:--|\n| **استعلام مخصص** | حدث واحد مشبوه | إنشاء مسؤول محلي جديد |\n| **عتبة (Threshold)** | يهمّ العدد خلال زمن | 20 فشل دخول من عنوان واحد خلال 5 دقائق |\n| **ربط أحداث (EQL)** | يهمّ **تسلسل** الأحداث | فشل دخول متكرر يتبعه نجاح للمستخدم نفسه |\n| **مطابقة المؤشرات** | لديك قائمة استخبارات تهديد | أي `destination.ip` موجود في فهرس IOC |\n| **مصطلحات جديدة** | يهمّ أول ظهور لسلوك | مستخدم يدخل من بلد لم يُرَ من قبل |\n| **تعلّم آلي** | تريد تقييم الشذوذ | نشاط عمليات غير معتاد لجهاز |\n\nتعمل كل قاعدة بفاصل زمني ونافذة رجوع. اجعل نافذة الرجوع أطول من الفاصل، كأن تعمل كل 5 دقائق وترجع 6، كي لا تضيع الأحداث المتأخرة. وتحمل كل قاعدة أيضاً **درجة خطورة (Severity)** و**درجة مخاطرة (Risk score)** ووسوم ATT&CK تساعد في الفرز."
+   },
+   {
+    "id": "eql",
+    "type": "code",
+    "language": "plain",
+    "filename": "brute-force-then-success.eql",
+    "caption": "قاعدة تسلسل EQL: خمس عمليات دخول فاشلة على ويندوز يتبعها نجاح للمستخدم والمصدر نفسيهما خلال 10 دقائق. الأسطر المظلّلة تحمل منطق الربط.",
+    "highlight": [
+     1,
+     2,
+     3,
+     5
+    ],
+    "code": "sequence by user.name, source.ip with maxspan=10m\n  [authentication where event.outcome == \"failure\" and\n   event.code == \"4625\"] with runs=5\n  [authentication where event.outcome == \"success\" and\n   event.code == \"4624\" and winlog.logon.type == \"Network\"]"
+   },
+   {
+    "id": "flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "من سطر السجل إلى التنبيه في Elastic Security",
+    "caption": "حدث فشل دخول واحد ينتقل من جهاز ويندوز إلى حالة.",
+    "data": {
+     "token": "حدث",
+     "nodes": [
+      {
+       "id": "host",
+       "label": "جهاز ويندوز",
+       "sub": "srv-fin-01",
+       "icon": "server"
+      },
+      {
+       "id": "agent",
+       "label": "Elastic Agent",
+       "sub": "Fleet policy",
+       "icon": "cpu"
+      },
+      {
+       "id": "es",
+       "label": "Elasticsearch",
+       "sub": "Data stream",
+       "icon": "database"
+      },
+      {
+       "id": "rule",
+       "label": "قاعدة الكشف",
+       "sub": "EQL sequence",
+       "icon": "eye"
+      },
+      {
+       "id": "alert",
+       "label": "تنبيه",
+       "sub": "Risk 73",
+       "icon": "alert"
+      },
+      {
+       "id": "case",
+       "label": "حالة",
+       "sub": "فرز المحلّل",
+       "icon": "user"
+      }
+     ],
+     "steps": [
+      {
+       "at": "host",
+       "caption": "يُكتب الحدث 4625 في سجل Security: فشل دخول شبكي للمستخدم svc-backup."
+      },
+      {
+       "at": "agent",
+       "caption": "يقرأ الوكيل الحدث وتحوّله التكاملات إلى حقول ECS مثل user.name وevent.outcome."
+      },
+      {
+       "at": "es",
+       "caption": "يُفهرَس الحدث في تدفق logs-system.security خلال ثوانٍ."
+      },
+      {
+       "at": "rule",
+       "caption": "تجد القاعدة المجدولة 5 إخفاقات ثم نجاحاً من 198.51.100.23 خلال 10 دقائق.",
+       "tone": "warning"
+      },
+      {
+       "at": "alert",
+       "caption": "يُنشأ تنبيه بخطورة عالية مع رابط للأحداث المطابقة.",
+       "tone": "danger"
+      },
+      {
+       "at": "case",
+       "caption": "يفتح المحلّل التنبيه في Timeline ويؤكد النمط ويرفقه بحالة.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "ops",
+    "type": "text",
+    "markdown": "## العمل على تنبيه\n\nالتنبيه وثيقة تُكتب في فهرس مخفي هو `.alerts-security.alerts-default`. تنسخ حقول الحدث المطابق وتضيف بيانات القاعدة، فيمكنك ترشيح التنبيهات بحسب `kibana.alert.severity` أو `kibana.alert.workflow_status`.\n\nيبدو سير العمل العملي هكذا:\n\n1. **افتح تفاصيل التنبيه** واقرأ وصف القاعدة والحقول التي أطلقتها.\n2. **حقّق في Timeline.** اسحب حقولاً مثل `source.ip` و`user.name` إلى خط زمني ووسّع المدى الزمني لترى ما فعله الكيان نفسه.\n3. **افحص السياق.** هل الجهاز خادم أم حاسوب محمول؟ هل الحساب حساب خدمة؟ هل لمس العنوان نفسه أجهزة أخرى؟\n4. **قرّر.** اجعل التنبيه مُقَرّاً أو مغلقاً (مع سبب) أو أرفقه بـ**حالة (Case)**.\n5. **اضبط.** إن كان إيجابياً كاذباً فأضف **استثناءً** للقاعدة بشرط ضيّق، مثل ماسح ثغرات معروف على `192.0.2.50`، بدل تعطيل القاعدة. يتعمّق الدرس التالي [فرز التنبيهات الأمنية](/learn/security-operations-dfir/security-alert-triage) في هذه الخطوة.\n\nتجمع الحالات التنبيهات والملاحظات والمرصودات، ويمكن دفعها إلى أدوات التذاكر مثل ServiceNow وJira. وللكشف المرتكز على الأجهزة الطرفية قارن هذا النهج مع [Wazuh](/learn/security-operations-dfir/wazuh-security-monitoring)."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "خطّط للحجم قبل تفعيل كل شيء",
+    "markdown": "تفعيل كل القواعد الجاهزة في اليوم الأول يغرق الطابور بتنبيهات لا يستطيع أحد قراءتها. ابدأ بقواعد الأصول الأعلى خطورة، وراجع حجم التنبيهات أسبوعاً، ثم أضف المزيد. وراقب الاستيعاب أيضاً: السجلات غير المحلَّلة أو المكرّرة تضخّم التخزين وتبطئ البحث، ولا تطابق القاعدة إلا بيانات وصلت فعلاً."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم عنقوداً تجريبياً تملكه، مثل Elastic Stack بعقدة واحدة داخل جهاز افتراضي.\n\n1. أضف تكامل **System** إلى سياسة Elastic Agent في Fleet وسجّل جهازاً افتراضياً واحداً.\n2. في Discover ابحث عن `event.category: authentication` وراجع قائمة حقول حدث دخول. لاحظ أي الحقول بأسماء ECS.\n3. أنشئ قاعدة **عتبة** تُطلق عند 5 عمليات دخول فاشلة من `source.ip` واحد خلال 5 دقائق، واجعل نافذة الرجوع 6 دقائق.\n4. أفشل الدخول إلى جهازك ست مرات، وانتظر تشغيل القاعدة، ثم افتح التنبيه في Timeline.\n5. أضف التنبيه إلى حالة واكتب جملتين تصفان حكمك."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "SIEM",
+      "definition": "منصة تجمع الأحداث الأمنية وتوحّد شكلها وتربط بينها وتطلق التنبيهات."
+     },
+     {
+      "term": "Elastic Agent",
+      "definition": "وكيل واحد تديره Fleet يرسل السجلات والمقاييس ويمكنه تشغيل حماية الجهاز الطرفي."
+     },
+     {
+      "term": "ECS",
+      "definition": "مخطط Elastic المشترك: مجموعة قياسية من أسماء الحقول مثل user.name وsource.ip."
+     },
+     {
+      "term": "Data stream",
+      "definition": "سلسلة زمنية للإلحاق فقط من الفهارس الداعمة يُبحث فيها باسم واحد."
+     },
+     {
+      "term": "EQL",
+      "definition": "لغة استعلام الأحداث: تطابق تسلسلات مرتبة من الأحداث."
+     },
+     {
+      "term": "Threshold rule",
+      "definition": "قاعدة تنبّه عندما يتجاوز عدد الأحداث المطابقة خلال زمن حدّاً معيّناً."
+     },
+     {
+      "term": "Timeline",
+      "definition": "مساحة التحقيق في Kibana للتنقل بين الأحداث والكيانات."
+     },
+     {
+      "term": "Rule exception",
+      "definition": "شرط ضيّق يمنع القاعدة من التنبيه على نشاط سليم معروف."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا يعتمد نظام SIEM على مخطط مشترك مثل ECS؟",
+      "options": [
+       "يشفّر السجلات المخزّنة",
+       "يتيح لاستعلام وقاعدة واحدة العمل على مصادر سجلات مختلفة",
+       "يلغي الحاجة إلى مزامنة الوقت",
+       "يضغط الفهارس"
+      ],
+      "answer": 1,
+      "explanation": "يمنح ECS البيانات المتكافئة اسم الحقل نفسه، فتغطي قاعدة على user.name مصادر ويندوز ولينكس والشبكة."
+     },
+     {
+      "question": "أي نوع قاعدة يكشف بأفضل شكل فشل دخول يتبعه نجاح للحساب نفسه؟",
+      "options": [
+       "عتبة",
+       "مطابقة المؤشرات",
+       "ربط أحداث (تسلسل EQL)",
+       "مصطلحات جديدة"
+      ],
+      "answer": 2,
+      "explanation": "يهمّ ترتيب الأحداث، وتعبّر تسلسلات EQL عن أحداث مرتبة بمفتاح مشترك ومدى زمني."
+     },
+     {
+      "question": "أي العبارات عن جدولة القواعد صحيحة؟ (اختر كل ما ينطبق)",
+      "options": [
+       "يجب أن تكون نافذة الرجوع أطول من فاصل التشغيل",
+       "نافذة رجوع أطول تساعد في التقاط الأحداث المتأخرة",
+       "تعمل القواعد فقط عندما يفتح محلّل Kibana",
+       "تعمل القواعد بجدول في الخلفية"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "تعمل القواعد بجدولها الخاص، وتمنع النوافذ المتداخلة الفجوات الناتجة عن تأخر الاستيعاب."
+     },
+     {
+      "question": "ماسح ثغرات على 192.0.2.50 يطلق قاعدة مسح المنافذ باستمرار. ما أفضل حلّ؟",
+      "options": [
+       "تعطيل القاعدة",
+       "حذف التنبيهات كل صباح",
+       "إضافة استثناء ضيّق لذلك العنوان المصدر",
+       "خفض درجة المخاطرة لكل القواعد"
+      ],
+      "answer": 2,
+      "explanation": "يزيل الاستثناء الحالة السليمة المعروفة بينما تظل القاعدة تكشف المسح الحقيقي من مصادر أخرى."
+     },
+     {
+      "question": "ماذا توفّر Fleet؟",
+      "options": [
+       "إدارة مركزية لوكلاء Elastic وسياساتهم",
+       "تخزيناً بارداً طويل الأمد",
+       "مصدر استخبارات تهديد",
+       "إرسال التنبيهات بالبريد"
+      ],
+      "answer": 0,
+      "explanation": "تسجّل Fleet في Kibana الوكلاء وتدفع إليهم تغييرات السياسة والتكاملات."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يحوّل Elastic Security حزمة Elastic Stack إلى نظام SIEM بقواعد وتنبيهات وTimeline وحالات.\n- يجمع Elastic Agent وFleet البيانات ويديرانها، وتحوّلها التكاملات إلى ECS.\n- تتيح أسماء حقول ECS لقاعدة واحدة تغطية مصادر كثيرة.\n- اختر نوع القاعدة بحسب السؤال: استعلام أو عتبة أو EQL أو مطابقة مؤشرات أو مصطلحات جديدة أو تعلّم آلي.\n- اعمل على التنبيهات في Timeline، واضبطها باستثناءات ضيّقة، وابدأ بمجموعة قواعد صغيرة عالية القيمة.\n\nبعد ذلك انظر كيف تنطبق أفكار الجمع نفسها على صحة البنية التحتية في [مراقبة البنية التحتية باستخدام Grafana وPrometheus](/learn/security-operations-dfir/grafana-and-prometheus-infrastructure-monitoring)."
+   }
+  ]
+ }
+}

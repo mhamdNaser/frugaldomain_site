@@ -15,9 +15,9 @@
 | | العدد |
 |:--|--:|
 | دروس المنهج | **655** |
-| دروس مكتوبة باللغتين | **448** |
+| دروس مكتوبة باللغتين | **590** |
 | دروس مراجعة (تُولَّد تلقائياً وتحيل إلى الدرس الأصلي) | **65** |
-| **دروس متبقية للكتابة** | **142** |
+| **دروس متبقية للكتابة** | **0** |
 
 > **ملاحظة:** درس المراجعة لا يُكتب له محتوى. يُنشر تلقائياً عند كتابة الدرس
 > الأصلي الذي يحيل إليه وإعادة تشغيل الـ seeder. لذلك ترتيب الدفعات أدناه
@@ -54,18 +54,18 @@
 | 3 | Cisco Security Track | Cisco CCNP Security (SCOR 350-701) | 27 | أمن الشبكات، الهوية، الويب | [x] |
 | 4 | Cisco Security Track | Cisco CCNP Cybersecurity (CBRCOR 350-201) | 27 | المراقبة، الاستجابة للحوادث | [x] |
 | 5 | Offensive Security / OT | Ethical Hacking (15) + OT Security (12) | 27 | اكتشاف الثغرات، الاختبار الهجومي | [x] |
-| 6 | Systems & Infrastructure | Secure Systems Administration (19) + Professional Network Security (8) | 27 | المراقبة، الأتمتة | [ ] |
-| 7 | Systems & Infrastructure | Proxmox & Virtualization Security | 23 | النسخ الاحتياطي | [ ] |
-| 8 | Systems & Infrastructure | Database Security | 21 | — | [ ] |
-| 9 | Systems & Infrastructure | Web Server & Application Security | 20 | الحاويات | [ ] |
-| 10 | Systems / Offensive | Container Security (15) + Vulnerability Discovery (12) | 27 | الاختبار الهجومي المتقدم | [ ] |
-| 11 | Security Operations & DFIR | Security Monitoring & Defensive Architecture | 17 | — | [ ] |
-| 12 | DFIR / Offensive | Incident Response & Forensics (15) + Advanced Offensive Testing (11) | 26 | التخصص المتقدم | [ ] |
-| 13 | Identity & Architecture | Identity & Access Security | 19 | — | [ ] |
-| 14 | Identity & Architecture | Backup & Continuity (14) + Automation & Security Engineering (12) | 26 | — | [ ] |
-| 15 | Architecture / Labs | Security Engineering & Design (15) + Career Paths (12) | 27 | — | [ ] |
-| 16 | Security Operations & DFIR | Advanced Professional Specialization | 18 | — | [ ] |
-| 17 | Hands-On Labs | Hands-On Labs & Building Experience | 20 | — | [ ] |
+| 6 | Systems & Infrastructure | Secure Systems Administration (19) + Professional Network Security (8) | 27 | المراقبة، الأتمتة | [x] |
+| 7 | Systems & Infrastructure | Proxmox & Virtualization Security | 23 | النسخ الاحتياطي | [x] |
+| 8 | Systems & Infrastructure | Database Security | 21 | — | [x] |
+| 9 | Systems & Infrastructure | Web Server & Application Security | 20 | الحاويات | [x] |
+| 10 | Systems / Offensive | Container Security (15) + Vulnerability Discovery (12) | 27 | الاختبار الهجومي المتقدم | [x] |
+| 11 | Security Operations & DFIR | Security Monitoring & Defensive Architecture | 17 | — | [x] |
+| 12 | DFIR / Offensive | Incident Response & Forensics (15) + Advanced Offensive Testing (11) | 26 | التخصص المتقدم | [x] |
+| 13 | Identity & Architecture | Identity & Access Security | 19 | — | [x] |
+| 14 | Identity & Architecture | Backup & Continuity (14) + Automation & Security Engineering (12) | 26 | — | [x] |
+| 15 | Architecture / Labs | Security Engineering & Design (15) + Career Paths (12) | 27 | — | [x] |
+| 16 | Security Operations & DFIR | Advanced Professional Specialization | 18 | — | [x] |
+| 17 | Hands-On Labs | Hands-On Labs & Building Experience | 20 | — | [x] |
 | 18 | Network Automation & DevOps | Cisco CCNP Automation (350-901) | 23 | — | [x] |
 | 19 | Enterprise & Data Center | Cisco CCNP Enterprise (ENCOR + ENARSI) | 25 | — | [x] |
 | 20 | Enterprise & Data Center | Cisco CCNP Data Center (DCCOR 350-601) | 23 | — | [x] |

@@ -1,0 +1,636 @@
+{
+  "slug": "linux-administration-automation",
+  "title": "Linux Administration Automation",
+  "summary": "Automate Linux auditing and hardening with safe shell scripts, systemd timers and Ansible, and prove the result with check mode and reports.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Write defensive Bash for audit and maintenance tasks",
+    "Schedule jobs with systemd timers instead of unmanaged cron entries",
+    "Use Ansible to enforce a hardening baseline idempotently",
+    "Preview and verify changes with check mode and diffs",
+    "Collect audit evidence from many hosts without sharing root credentials"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Three months after a hardening project, a scan shows that 30 of 200 Linux servers have password login enabled again. Someone fixed a lockout by hand, a rebuilt image used the old template, and nobody noticed because nobody was checking.\n\nHardening that is done once decays. Hardening that is expressed as code and re-applied on a schedule stays true. This lesson covers the three layers of Linux automation: defensive shell scripts for quick checks, systemd timers for scheduling, and Ansible for enforcing a baseline across the fleet."
+    },
+    {
+      "id": "bash",
+      "type": "text",
+      "markdown": "## Defensive shell scripting\n\nBash is the right tool for small, local checks. It is also easy to get dangerously wrong, so start every script with a strict header.\n\n- `set -euo pipefail` stops on errors, undefined variables and failed pipes.\n- Quote every variable: `\"$file\"`, never `$file`.\n- Use `mktemp` for temporary files and `trap` to clean them up.\n- Prefer `[[ ... ]]` tests and `readonly` constants.\n- Run `shellcheck` in CI; it catches most quoting bugs.\n\nKeep scripts read-only wherever possible. An audit script that only reports can run on every host safely; a script that edits files needs a dry-run mode and a change log. When logic grows beyond about a hundred lines or needs data structures, move it to Python."
+    },
+    {
+      "id": "audit-sh",
+      "type": "code",
+      "language": "bash",
+      "filename": "ssh-audit.sh",
+      "caption": "A read-only check that prints one PASS or FAIL line per control. `sshd -T` reports the effective configuration, including defaults and `Match` blocks.",
+      "code": "#!/usr/bin/env bash\nset -euo pipefail\n\ncheck() {  # check <name> <expected> <actual>\n  if [[ \"$2\" == \"$3\" ]]; then\n    echo \"PASS $(hostname -s) $1=$3\"\n  else\n    echo \"FAIL $(hostname -s) $1 expected=$2 actual=$3\"\n  fi\n}\n\ncfg=$(sudo sshd -T)\nget() { awk -v k=\"$1\" '$1 == k { print $2 }' <<<\"$cfg\"; }\n\ncheck passwordauthentication no \"$(get passwordauthentication)\"\ncheck permitrootlogin        no \"$(get permitrootlogin)\"\ncheck maxauthtries           3  \"$(get maxauthtries)\"\n",
+      "highlight": [
+        2,
+        6,
+        13
+      ]
+    },
+    {
+      "id": "audit-run",
+      "type": "terminal",
+      "title": "Running the audit on one host",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "bash ssh-audit.sh",
+          "output": "PASS web01 passwordauthentication=no\nPASS web01 permitrootlogin=no\nFAIL web01 maxauthtries expected=3 actual=6",
+          "comment": "Two controls pass. `maxauthtries` is still at the OpenSSH default of 6."
+        }
+      ],
+      "caption": "Output is example data. The `FAIL` line is the item Ansible will fix in the next section."
+    },
+    {
+      "id": "timers",
+      "type": "text",
+      "markdown": "## Scheduling with systemd timers\n\nA crontab entry is invisible: it has no dependencies, no log by default and no owner. A **systemd timer** gives you a unit file you can version, `journalctl` output, resource limits and sandboxing.\n\n| Feature | cron | systemd timer |\n|:--|:--|:--|\n| Logs | Mail or custom file | Journal, queryable |\n| Missed runs after downtime | Skipped | `Persistent=true` catches up |\n| Sandboxing | None | `ProtectSystem`, `NoNewPrivileges` and more |\n| Visibility | Per-user crontabs | `systemctl list-timers` |\n\nRun audit jobs under a dedicated service user with `NoNewPrivileges=yes` and `ProtectSystem=strict`. If a job needs one privileged command, grant exactly that in `sudoers` rather than running the whole script as root. This is the same least-privilege idea from [least privilege implementation](/learn/security-architecture-resilience/least-privilege-implementation)."
+    },
+    {
+      "id": "timer",
+      "type": "code",
+      "language": "ini",
+      "filename": "ssh-audit.timer",
+      "caption": "The timer fires daily and catches up after downtime. The paired service unit would set `User=audit` and the sandboxing options above.",
+      "code": "[Unit]\nDescription=Daily SSH configuration audit\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=30m\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
+      "highlight": [
+        6,
+        7
+      ]
+    },
+    {
+      "id": "ansible",
+      "type": "text",
+      "markdown": "## Enforcing a baseline with Ansible\n\nAnsible connects over SSH, needs no agent and describes the **desired state**, not the steps. Modules such as `lineinfile`, `service` and `sysctl` check first and change only when needed, which makes playbooks idempotent.\n\nThree habits make Ansible safe for security work:\n\n1. **Check mode first.** `--check --diff` shows exactly what would change without changing it.\n2. **Validate before reload.** For `sshd_config`, use `validate: /usr/sbin/sshd -t -f %s` so a typo cannot lock you out.\n3. **Keep secrets in Ansible Vault** or an external vault, never in the inventory. See [SSH key management](/learn/security-architecture-resilience/ssh-key-management) for how to handle the keys the control node uses."
+    },
+    {
+      "id": "playbook",
+      "type": "code",
+      "language": "yaml",
+      "filename": "harden-ssh.yml",
+      "caption": "`validate` runs `sshd -t` on a temporary copy. The handler reloads the service only when a line actually changed.",
+      "code": "---\n- name: SSH hardening baseline\n  hosts: linux_servers\n  become: true\n  tasks:\n    - name: Apply sshd settings\n      ansible.builtin.lineinfile:\n        path: /etc/ssh/sshd_config\n        regexp: \"^#?{{ item.key }}\\\\b\"\n        line: \"{{ item.key }} {{ item.value }}\"\n        validate: /usr/sbin/sshd -t -f %s\n      loop:\n        - { key: PasswordAuthentication, value: \"no\" }\n        - { key: PermitRootLogin, value: \"no\" }\n        - { key: MaxAuthTries, value: \"3\" }\n      notify: Reload sshd\n\n  handlers:\n    - name: Reload sshd\n      ansible.builtin.service:\n        name: sshd\n        state: reloaded\n",
+      "highlight": [
+        10,
+        15,
+        16
+      ]
+    },
+    {
+      "id": "ansible-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Safe rollout with check mode",
+      "data": {
+        "actors": [
+          {
+            "id": "c",
+            "label": "Control node",
+            "sub": "ansible",
+            "icon": "laptop"
+          },
+          {
+            "id": "h",
+            "label": "Managed host",
+            "sub": "web01",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "c",
+            "to": "h",
+            "label": "Gather facts",
+            "detail": "SSH, key auth",
+            "note": "The control node connects with a key, not a password.",
+            "tone": "secure"
+          },
+          {
+            "from": "c",
+            "to": "h",
+            "label": "Run --check --diff",
+            "detail": "no changes",
+            "note": "Modules report what would change; the host stays untouched."
+          },
+          {
+            "from": "h",
+            "to": "c",
+            "label": "Diff: MaxAuthTries 6 to 3",
+            "detail": "changed=1",
+            "note": "The engineer reviews the diff and approves.",
+            "tone": "warning"
+          },
+          {
+            "from": "c",
+            "to": "h",
+            "label": "Apply with validate",
+            "detail": "sshd -t",
+            "note": "The new file is syntax-checked before it replaces the old one."
+          },
+          {
+            "from": "h",
+            "to": "h",
+            "label": "Reload sshd",
+            "detail": "handler",
+            "note": "The handler fires because a line changed.",
+            "tone": "success"
+          },
+          {
+            "from": "c",
+            "to": "h",
+            "label": "Re-run",
+            "detail": "changed=0",
+            "note": "A second run changes nothing, which proves idempotence.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "check-run",
+      "type": "terminal",
+      "title": "Check mode output",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "ansible-playbook -i inventory.ini harden-ssh.yml --check --diff",
+          "output": "TASK [Apply sshd settings] *****************************\n--- before: /etc/ssh/sshd_config\n+++ after: /etc/ssh/sshd_config\n@@ -62 +62 @@\n-MaxAuthTries 6\n+MaxAuthTries 3\nchanged: [web01] => (item={'key': 'MaxAuthTries', 'value': '3'})\nok: [web02] => (item={'key': 'MaxAuthTries', 'value': '3'})\n\nPLAY RECAP *********************************************\nweb01 : ok=2 changed=1 unreachable=0 failed=0\nweb02 : ok=2 changed=0 unreachable=0 failed=0",
+          "comment": "`web01` has drifted; `web02` already complies. Nothing was written because of `--check`."
+        }
+      ],
+      "caption": "Annotated example output. Review every `changed` line before running without `--check`."
+    },
+    {
+      "id": "accounts",
+      "type": "text",
+      "markdown": "## What to audit on every host\n\nA baseline is only as good as the questions it asks. A practical Linux audit covers five areas.\n\n| Area | Check | Command |\n|:--|:--|:--|\n| Accounts | UID 0 accounts other than root | `awk -F: '$3==0' /etc/passwd` |\n| Privilege | Members of `sudo` or `wheel` | `getent group sudo` |\n| Network | Listening services | `ss -tlnp` |\n| Patching | Pending security updates | `apt list --upgradable` or `dnf updateinfo` |\n| Integrity | Changed packaged files | `debsums -c` or `rpm -Va` |\n\nEach command is read-only, fast and produces text you can diff. Store the output per host and per day. When a new UID 0 account or a new listening port appears, the diff is your alert. Pair these checks with the logging configuration covered in [log parsing and security analytics](/learn/security-architecture-resilience/log-parsing-and-security-analytics) so that anything your scripts miss still leaves a trail.\n\nStart small. Five reliable checks that run every night are worth more than fifty fragile ones that nobody maintains. When a check fails, decide in advance who owns the fix and how quickly it must happen, for example seven days for a medium finding and 24 hours for a new administrator account. A failing check without an owner and a deadline is only a report, and reports that nobody acts on slowly stop being read."
+    },
+    {
+      "id": "evidence",
+      "type": "text",
+      "markdown": "## Collecting evidence at scale\n\nAnsible can also be your audit tool. Use `ansible.builtin.setup` or `command` tasks with `changed_when: false` to gather facts: kernel version, listening ports from `ss -tlnp`, members of the `sudo` group, and the age of the last package update. Write results to a central directory with `fetch`, then diff them week to week.\n\nTwo cautions apply. First, gathering is not remediating: keep audit playbooks separate from enforcement playbooks so a reviewer can approve each on its own. Second, the control node holds the keys to everything. Harden it, restrict who can log in, and send its logs to your central store, as discussed in [centralized authentication](/learn/security-architecture-resilience/centralized-authentication)."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Roll out in rings",
+      "markdown": "Never apply a new baseline to the whole fleet at once. Use an inventory group for a canary ring of two or three non-critical hosts, run the playbook there, wait a day and watch your monitoring. Then widen to ten percent, then everything. Use `--limit` to select each ring and keep a tested rollback, such as the previous Git tag of the playbook. This turns a risky change into a routine one."
+    },
+    {
+      "id": "review",
+      "type": "callout",
+      "variant": "note",
+      "title": "Keep automation reviewable",
+      "markdown": "Store playbooks and scripts in Git, protect the main branch and require a pull request for every change to a security baseline. A reviewer reads the diff, a pipeline runs `ansible-lint` and `shellcheck`, and only then does the change reach the control node. This gives you an audit trail that answers who changed a control, when and why, which is exactly what auditors ask. It also means a compromised laptop cannot silently push a weaker configuration to the whole fleet."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Common mistakes",
+      "markdown": "- **Editing `sshd_config` without `validate`.** One typo and every host is unreachable.\n- **Running Ansible as root over a shared key.** You lose attribution; use per-engineer accounts with `sudo`.\n- **Skipping check mode** on the first production run.\n- **Using `shell:` for everything.** It is never idempotent; prefer purpose-built modules.\n- **Secrets in plain-text vars files** committed to Git."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use two Linux VMs you own, or one VM and `localhost`.\n\n1. Install Ansible on one machine and create an `inventory.ini` listing the other.\n2. Save `harden-ssh.yml` and run it with `--check --diff`; read the diff.\n3. Run it for real, then run it again and confirm `changed=0`.\n4. Edit `sshd_config` by hand to set `MaxAuthTries 6`, re-run the playbook and watch it repair the drift.\n5. Run `bash ssh-audit.sh` and confirm three PASS lines. Keep a console session open in case you need to revert."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Idempotence",
+          "definition": "Running a task repeatedly produces the same end state."
+        },
+        {
+          "term": "Playbook",
+          "definition": "An Ansible YAML file describing desired state for a group of hosts."
+        },
+        {
+          "term": "Check mode",
+          "definition": "A dry run (`--check`) that reports changes without applying them."
+        },
+        {
+          "term": "Handler",
+          "definition": "A task that runs only when another task reports a change."
+        },
+        {
+          "term": "systemd timer",
+          "definition": "A unit that triggers a service on a schedule, with journal logging."
+        },
+        {
+          "term": "shellcheck",
+          "definition": "A static analyzer that finds quoting and logic bugs in shell scripts."
+        },
+        {
+          "term": "Control node",
+          "definition": "The machine that runs Ansible and holds credentials to managed hosts."
+        },
+        {
+          "term": "Ansible Vault",
+          "definition": "Built-in encryption for secret variables and files."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What does `set -euo pipefail` do at the top of a Bash script?",
+          "options": [
+            "Encrypts the script",
+            "Stops on errors, unset variables and failed pipes",
+            "Runs the script as root",
+            "Disables logging"
+          ],
+          "answer": 1,
+          "explanation": "Strict mode stops a script that would otherwise continue after a failure and report false success."
+        },
+        {
+          "question": "Which are advantages of systemd timers over cron? (Choose all that apply.)",
+          "options": [
+            "Logs go to the journal",
+            "`Persistent=true` catches up missed runs",
+            "Services can be sandboxed",
+            "They need no unit file"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Timers pair with service units, so they inherit logging and sandboxing. They do need unit files."
+        },
+        {
+          "question": "Why run `ansible-playbook --check --diff` first?",
+          "options": [
+            "It makes the playbook faster",
+            "It shows what would change without changing it",
+            "It skips validation",
+            "It deletes the inventory"
+          ],
+          "answer": 1,
+          "explanation": "You review the exact diff and catch mistakes before they reach production."
+        },
+        {
+          "question": "What does the `validate` option protect against in the SSH playbook?",
+          "options": [
+            "Weak passwords",
+            "Installing an `sshd_config` with a syntax error",
+            "Expired certificates",
+            "Network latency"
+          ],
+          "answer": 1,
+          "explanation": "`sshd -t` tests the candidate file first, so a typo never replaces a working config."
+        },
+        {
+          "question": "Why is the Ansible control node a high-value target?",
+          "options": [
+            "It stores the whole inventory only",
+            "It holds credentials that reach every managed host",
+            "It runs the kernel for all hosts",
+            "It has no network access"
+          ],
+          "answer": 1,
+          "explanation": "Whoever controls it can reach everything it manages, so harden, restrict and log it."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nLinux security automation has three layers: strict, read-only shell checks; systemd timers that run them visibly; and Ansible playbooks that enforce the baseline idempotently. Always preview with check mode, validate configuration before reload, and treat the control node as a crown jewel. Next, see [network monitoring automation](/learn/security-architecture-resilience/network-monitoring-automation) to apply the same ideas to devices and telemetry."
+    }
+  ],
+  "ar": {
+    "title": "أتمتة إدارة Linux",
+    "summary": "أتمتة تدقيق Linux وتحصينه بسكربتات شل آمنة ومؤقّتات systemd وAnsible، وإثبات النتيجة بوضع الفحص والتقارير.",
+    "objectives": [
+      "كتابة Bash دفاعي لمهام التدقيق والصيانة",
+      "جدولة المهام بمؤقّتات systemd بدل مدخلات cron غير المُدارة",
+      "استخدام Ansible لفرض خط أساس تحصين بصورة قابلة للتكرار دون أثر جانبي",
+      "معاينة التغييرات والتحقق منها بوضع الفحص والفروق",
+      "جمع أدلة التدقيق من مضيفات كثيرة دون مشاركة بيانات اعتماد root"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "بعد ثلاثة أشهر من مشروع تحصين، يُظهر الفحص أن 30 خادمًا من أصل 200 خادم Linux عاد فيها تسجيل الدخول بكلمة المرور. أصلح أحدهم قفلًا يدويًا، واستخدمت صورة أُعيد بناؤها القالب القديم، ولم ينتبه أحد لأن أحدًا لا يفحص.\n\nالتحصين الذي يُنجَز مرة واحدة يتآكل، أما التحصين المكتوب شيفرةً والمُعاد تطبيقه وفق جدول فيبقى صحيحًا. يغطي هذا الدرس ثلاث طبقات لأتمتة Linux: سكربتات شل دفاعية للفحوص السريعة، ومؤقّتات systemd للجدولة، وAnsible لفرض خط الأساس على الأسطول."
+      },
+      {
+        "id": "bash",
+        "type": "text",
+        "markdown": "## كتابة شل دفاعية\n\nBash هو الأداة المناسبة للفحوص المحلية الصغيرة، ومن السهل أيضًا أن يخطئ المرء فيه خطأً خطيرًا، لذا ابدأ كل سكربت برأس صارم.\n\n- يوقف `set -euo pipefail` التنفيذ عند الأخطاء والمتغيرات غير المعرّفة وفشل الأنابيب.\n- ضع كل متغير بين علامتي اقتباس: `\"$file\"` وليس `$file`.\n- استخدم `mktemp` للملفات المؤقتة و`trap` لتنظيفها.\n- فضّل اختبارات `[[ ... ]]` والثوابت `readonly`.\n- شغّل `shellcheck` في CI فهو يلتقط معظم أخطاء الاقتباس.\n\nأبقِ السكربتات للقراءة فقط كلما أمكن. سكربت التدقيق الذي يُبلغ فقط يمكن تشغيله بأمان على كل مضيف، أما السكربت الذي يعدّل الملفات فيحتاج إلى وضع تجربة وسجل تغييرات. وعندما يتجاوز المنطق نحو مئة سطر أو يحتاج إلى بنى بيانات فانقله إلى لغة أغنى مثل Python."
+      },
+      {
+        "id": "audit-sh",
+        "type": "code",
+        "language": "bash",
+        "filename": "ssh-audit.sh",
+        "caption": "فحص للقراءة فقط يطبع سطر PASS أو FAIL لكل ضابط. يعرض `sshd -T` الإعدادات الفعلية بما فيها القيم الافتراضية وكتل `Match`.",
+        "code": "#!/usr/bin/env bash\nset -euo pipefail\n\ncheck() {  # check <name> <expected> <actual>\n  if [[ \"$2\" == \"$3\" ]]; then\n    echo \"PASS $(hostname -s) $1=$3\"\n  else\n    echo \"FAIL $(hostname -s) $1 expected=$2 actual=$3\"\n  fi\n}\n\ncfg=$(sudo sshd -T)\nget() { awk -v k=\"$1\" '$1 == k { print $2 }' <<<\"$cfg\"; }\n\ncheck passwordauthentication no \"$(get passwordauthentication)\"\ncheck permitrootlogin        no \"$(get permitrootlogin)\"\ncheck maxauthtries           3  \"$(get maxauthtries)\"\n",
+        "highlight": [
+          2,
+          6,
+          13
+        ]
+      },
+      {
+        "id": "audit-run",
+        "type": "terminal",
+        "title": "تشغيل التدقيق على مضيف واحد",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "bash ssh-audit.sh",
+            "output": "PASS web01 passwordauthentication=no\nPASS web01 permitrootlogin=no\nFAIL web01 maxauthtries expected=3 actual=6",
+            "comment": "ضابطان ناجحان، لكن `maxauthtries` ما زال عند القيمة الافتراضية 6 في OpenSSH."
+          }
+        ],
+        "caption": "المخرجات بيانات توضيحية. سطر `FAIL` هو البند الذي سيصلحه Ansible في القسم التالي."
+      },
+      {
+        "id": "timers",
+        "type": "text",
+        "markdown": "## الجدولة بمؤقّتات systemd\n\nمدخل crontab غير مرئي: لا اعتماديات له ولا سجل افتراضيًا ولا مالك. أما **مؤقّت systemd (Timer)** فيمنحك ملف وحدة يمكن إدارة إصداراته، ومخرجات `journalctl`، وحدودًا للموارد، وعزلًا.\n\n| الميزة | cron | مؤقّت systemd |\n|:--|:--|:--|\n| السجلات | بريد أو ملف مخصص | Journal قابل للاستعلام |\n| التشغيلات الفائتة بعد التوقف | تُتخطى | `Persistent=true` يعوّضها |\n| العزل | لا يوجد | `ProtectSystem` و`NoNewPrivileges` وغيرها |\n| الرؤية | ملفات crontab لكل مستخدم | `systemctl list-timers` |\n\nشغّل مهام التدقيق بمستخدم خدمة مخصص مع `NoNewPrivileges=yes` و`ProtectSystem=strict`. وإذا احتاجت المهمة إلى أمر واحد بامتياز فامنح هذا الأمر بالتحديد في `sudoers` بدل تشغيل السكربت كله بصفة root. وهذه هي فكرة أقل الامتيازات نفسها في درس [تطبيق أقل الامتيازات](/learn/security-architecture-resilience/least-privilege-implementation)."
+      },
+      {
+        "id": "timer",
+        "type": "code",
+        "language": "ini",
+        "filename": "ssh-audit.timer",
+        "caption": "يعمل المؤقّت يوميًا ويعوّض ما فاته بعد التوقف. وتضبط وحدة الخدمة المقترنة `User=audit` وخيارات العزل أعلاه.",
+        "code": "[Unit]\nDescription=Daily SSH configuration audit\n\n[Timer]\nOnCalendar=daily\nRandomizedDelaySec=30m\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
+        "highlight": [
+          6,
+          7
+        ]
+      },
+      {
+        "id": "ansible",
+        "type": "text",
+        "markdown": "## فرض خط الأساس بـ Ansible\n\nيتصل Ansible عبر SSH ولا يحتاج إلى عميل، ويصف **الحالة المطلوبة** لا الخطوات. وتفحص وحدات مثل `lineinfile` و`service` و`sysctl` الحالة أولًا ولا تغيّر إلا عند الحاجة، وهذا ما يجعل الـ playbooks قابلة للتكرار دون أثر جانبي.\n\nثلاث عادات تجعل Ansible آمنًا للعمل الأمني:\n\n1. **وضع الفحص أولًا.** يعرض `--check --diff` بدقة ما سيتغيّر دون تغييره.\n2. **التحقق قبل إعادة التحميل.** في `sshd_config` استخدم `validate: /usr/sbin/sshd -t -f %s` كي لا يقفلك خطأ مطبعي خارج الخادم.\n3. **احفظ الأسرار في Ansible Vault** أو خزنة خارجية، لا في ملف الجرد (inventory). راجع [إدارة مفاتيح SSH](/learn/security-architecture-resilience/ssh-key-management) لمعرفة كيفية التعامل مع المفاتيح التي تستخدمها عقدة التحكم."
+      },
+      {
+        "id": "playbook",
+        "type": "code",
+        "language": "yaml",
+        "filename": "harden-ssh.yml",
+        "caption": "يشغّل `validate` الأمر `sshd -t` على نسخة مؤقتة. ولا يعيد المعالج تحميل الخدمة إلا إذا تغيّر سطر فعلًا.",
+        "code": "---\n- name: SSH hardening baseline\n  hosts: linux_servers\n  become: true\n  tasks:\n    - name: Apply sshd settings\n      ansible.builtin.lineinfile:\n        path: /etc/ssh/sshd_config\n        regexp: \"^#?{{ item.key }}\\\\b\"\n        line: \"{{ item.key }} {{ item.value }}\"\n        validate: /usr/sbin/sshd -t -f %s\n      loop:\n        - { key: PasswordAuthentication, value: \"no\" }\n        - { key: PermitRootLogin, value: \"no\" }\n        - { key: MaxAuthTries, value: \"3\" }\n      notify: Reload sshd\n\n  handlers:\n    - name: Reload sshd\n      ansible.builtin.service:\n        name: sshd\n        state: reloaded\n",
+        "highlight": [
+          10,
+          15,
+          16
+        ]
+      },
+      {
+        "id": "ansible-seq",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "طرح آمن بوضع الفحص",
+        "data": {
+          "actors": [
+            {
+              "id": "c",
+              "label": "عقدة التحكم",
+              "sub": "ansible",
+              "icon": "laptop"
+            },
+            {
+              "id": "h",
+              "label": "المضيف المُدار",
+              "sub": "web01",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "from": "c",
+              "to": "h",
+              "label": "Gather facts",
+              "detail": "SSH, key auth",
+              "note": "تتصل عقدة التحكم بمفتاح لا بكلمة مرور.",
+              "tone": "secure"
+            },
+            {
+              "from": "c",
+              "to": "h",
+              "label": "Run --check --diff",
+              "detail": "no changes",
+              "note": "تُبلغ الوحدات بما سيتغيّر ويبقى المضيف دون مساس."
+            },
+            {
+              "from": "h",
+              "to": "c",
+              "label": "Diff: MaxAuthTries 6 to 3",
+              "detail": "changed=1",
+              "note": "يراجع المهندس الفروق ويوافق.",
+              "tone": "warning"
+            },
+            {
+              "from": "c",
+              "to": "h",
+              "label": "Apply with validate",
+              "detail": "sshd -t",
+              "note": "يُفحَص تركيب الملف الجديد قبل أن يحلّ محل القديم."
+            },
+            {
+              "from": "h",
+              "to": "h",
+              "label": "Reload sshd",
+              "detail": "handler",
+              "note": "يعمل المعالج لأن سطرًا تغيّر.",
+              "tone": "success"
+            },
+            {
+              "from": "c",
+              "to": "h",
+              "label": "Re-run",
+              "detail": "changed=0",
+              "note": "لا يغيّر التشغيل الثاني شيئًا، وهذا يثبت القابلية للتكرار.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "check-run",
+        "type": "terminal",
+        "title": "مخرجات وضع الفحص",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "ansible-playbook -i inventory.ini harden-ssh.yml --check --diff",
+            "output": "TASK [Apply sshd settings] *****************************\n--- before: /etc/ssh/sshd_config\n+++ after: /etc/ssh/sshd_config\n@@ -62 +62 @@\n-MaxAuthTries 6\n+MaxAuthTries 3\nchanged: [web01] => (item={'key': 'MaxAuthTries', 'value': '3'})\nok: [web02] => (item={'key': 'MaxAuthTries', 'value': '3'})\n\nPLAY RECAP *********************************************\nweb01 : ok=2 changed=1 unreachable=0 failed=0\nweb02 : ok=2 changed=0 unreachable=0 failed=0",
+            "comment": "المضيف `web01` منحرف و`web02` مطابق. لم يُكتب شيء بسبب `--check`."
+          }
+        ],
+        "caption": "مخرجات توضيحية. راجع كل سطر `changed` قبل التشغيل دون `--check`."
+      },
+      {
+        "id": "accounts",
+        "type": "text",
+        "markdown": "## ما الذي يُدقَّق على كل مضيف\n\nقيمة خط الأساس بقدر جودة الأسئلة التي يطرحها. يغطي تدقيق Linux العملي خمسة مجالات.\n\n| المجال | الفحص | الأمر |\n|:--|:--|:--|\n| الحسابات | حسابات UID 0 غير root | `awk -F: '$3==0' /etc/passwd` |\n| الامتيازات | أعضاء `sudo` أو `wheel` | `getent group sudo` |\n| الشبكة | الخدمات المستمعة | `ss -tlnp` |\n| التحديثات | تحديثات الأمن المعلّقة | `apt list --upgradable` أو `dnf updateinfo` |\n| السلامة | ملفات الحزم المتغيّرة | `debsums -c` أو `rpm -Va` |\n\nكل أمر للقراءة فقط وسريع وينتج نصًا يمكن مقارنته. احفظ المخرجات لكل مضيف ولكل يوم. وعند ظهور حساب UID 0 جديد أو منفذ مستمع جديد تكون المقارنة هي تنبيهك. واقرن هذه الفحوص بإعدادات التسجيل في درس [تحليل السجلات والتحليلات الأمنية](/learn/security-architecture-resilience/log-parsing-and-security-analytics) لتترك أي ثغرة في سكربتاتك أثرًا.\n\nابدأ صغيرًا. خمسة فحوص موثوقة تعمل كل ليلة أفضل من خمسين فحصًا هشًّا لا يصونها أحد. وعندما يفشل فحص، قرّر مسبقًا من يملك الإصلاح وبأي سرعة يجب أن يتم، كسبعة أيام لنتيجة متوسطة و24 ساعة لحساب مسؤول جديد. الفحص الفاشل بلا مالك وموعد نهائي مجرد تقرير، والتقارير التي لا يتصرف أحد بناءً عليها يتوقف الناس تدريجيًا عن قراءتها."
+      },
+      {
+        "id": "evidence",
+        "type": "text",
+        "markdown": "## جمع الأدلة على نطاق واسع\n\nيمكن أن يكون Ansible أداة التدقيق أيضًا. استخدم `ansible.builtin.setup` أو مهام `command` مع `changed_when: false` لجمع الحقائق: إصدار النواة، والمنافذ المستمعة من `ss -tlnp`، وأعضاء مجموعة `sudo`، وعمر آخر تحديث للحزم. اكتب النتائج في دليل مركزي بـ `fetch` ثم قارنها أسبوعًا بأسبوع.\n\nوهناك تنبيهان. الأول أن الجمع ليس معالجة: افصل playbooks التدقيق عن playbooks الإنفاذ ليوافق المراجع على كل منهما على حدة. والثاني أن عقدة التحكم تحمل مفاتيح كل شيء، فحصّنها وقيّد من يسجّل الدخول إليها وأرسل سجلاتها إلى مخزنك المركزي كما في درس [المصادقة المركزية](/learn/security-architecture-resilience/centralized-authentication)."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "الطرح على حلقات",
+        "markdown": "لا تطبّق خط أساس جديدًا على الأسطول كله دفعة واحدة. استخدم مجموعة في ملف الجرد لحلقة تجريبية من مضيفين أو ثلاثة غير حرجة، وشغّل الـ playbook عليها، وانتظر يومًا وراقب أنظمة المراقبة. ثم وسّع إلى عشرة بالمئة، ثم إلى الجميع. استخدم `--limit` لاختيار كل حلقة، واحتفظ بتراجع مجرَّب، مثل وسم Git السابق للـ playbook. بذلك يتحول التغيير الخطر إلى تغيير روتيني."
+      },
+      {
+        "id": "review",
+        "type": "callout",
+        "variant": "note",
+        "title": "أبقِ الأتمتة قابلة للمراجعة",
+        "markdown": "خزّن الـ playbooks والسكربتات في Git، واحمِ الفرع الرئيسي، واشترط طلب دمج (pull request) لكل تغيير في خط أساس أمني. يقرأ المراجع الفروق، ويشغّل خط الإنتاج `ansible-lint` و`shellcheck`، وعندها فقط يصل التغيير إلى عقدة التحكم. يمنحك ذلك سجل تدقيق يجيب عمّن غيّر ضابطًا ومتى ولماذا، وهو بالضبط ما يسأل عنه المدقّقون. ويعني أيضًا أن حاسوبًا محمولًا مخترَقًا لا يستطيع دفع إعداد أضعف إلى الأسطول كله بصمت."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أخطاء شائعة",
+        "markdown": "- **تعديل `sshd_config` دون `validate`.** خطأ مطبعي واحد يجعل كل المضيفات غير قابلة للوصول.\n- **تشغيل Ansible بصفة root عبر مفتاح مشترك.** تفقد نسبة الفعل إلى فاعله؛ استخدم حسابات لكل مهندس مع `sudo`.\n- **تخطي وضع الفحص** في أول تشغيل إنتاجي.\n- **استخدام `shell:` لكل شيء.** فهو لا يكون قابلًا للتكرار أبدًا؛ فضّل الوحدات المخصصة.\n- **أسرار في ملفات متغيرات نصية صريحة** مودعة في Git."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم جهازين افتراضيين لينكس تملكهما، أو جهازًا واحدًا و`localhost`.\n\n1. ثبّت Ansible على أحد الجهازين وأنشئ `inventory.ini` يسرد الآخر.\n2. احفظ `harden-ssh.yml` وشغّله بـ `--check --diff` واقرأ الفروق.\n3. شغّله فعليًا ثم أعد تشغيله وتأكد أن النتيجة `changed=0`.\n4. عدّل `sshd_config` يدويًا إلى `MaxAuthTries 6`، وأعد تشغيل الـ playbook وراقبه وهو يصلح الانحراف.\n5. شغّل `bash ssh-audit.sh` وتأكد من ظهور ثلاثة أسطر PASS. أبقِ جلسة وحدة تحكم مفتوحة تحسبًا لحاجتك إلى التراجع."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "القابلية للتكرار دون أثر",
+            "definition": "تشغيل المهمة مرارًا ينتج الحالة النهائية نفسها."
+          },
+          {
+            "term": "Playbook",
+            "definition": "ملف YAML في Ansible يصف الحالة المطلوبة لمجموعة مضيفات."
+          },
+          {
+            "term": "وضع الفحص",
+            "definition": "تشغيل تجريبي (`--check`) يُبلغ بالتغييرات دون تطبيقها."
+          },
+          {
+            "term": "المعالج",
+            "definition": "مهمة لا تعمل إلا عندما تُبلغ مهمة أخرى بحدوث تغيير."
+          },
+          {
+            "term": "مؤقّت systemd",
+            "definition": "وحدة تشغّل خدمة وفق جدول مع تسجيل في journal."
+          },
+          {
+            "term": "shellcheck",
+            "definition": "محلّل ساكن يجد أخطاء الاقتباس والمنطق في سكربتات الشل."
+          },
+          {
+            "term": "عقدة التحكم",
+            "definition": "الجهاز الذي يشغّل Ansible ويحمل بيانات الاعتماد للمضيفات المُدارة."
+          },
+          {
+            "term": "Ansible Vault",
+            "definition": "تشفير مدمج للمتغيرات والملفات السرية."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ماذا يفعل `set -euo pipefail` في أول سكربت Bash؟",
+            "options": [
+              "يشفّر السكربت",
+              "يوقف التنفيذ عند الأخطاء والمتغيرات غير المعرّفة وفشل الأنابيب",
+              "يشغّل السكربت بصفة root",
+              "يعطّل التسجيل"
+            ],
+            "answer": 1,
+            "explanation": "الوضع الصارم يوقف سكربتًا كان سيواصل بعد الفشل ويُبلغ بنجاح كاذب."
+          },
+          {
+            "question": "أي مما يلي من مزايا مؤقّتات systemd على cron؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تذهب السجلات إلى journal",
+              "يعوّض `Persistent=true` التشغيلات الفائتة",
+              "يمكن عزل الخدمات",
+              "لا تحتاج إلى ملف وحدة"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "ترتبط المؤقّتات بوحدات الخدمة فترث التسجيل والعزل، وهي تحتاج إلى ملفات وحدات."
+          },
+          {
+            "question": "لماذا نشغّل `ansible-playbook --check --diff` أولًا؟",
+            "options": [
+              "يجعل الـ playbook أسرع",
+              "يعرض ما سيتغيّر دون تغييره",
+              "يتخطى التحقق",
+              "يحذف ملف الجرد"
+            ],
+            "answer": 1,
+            "explanation": "تراجع الفروق الدقيقة وتلتقط الأخطاء قبل وصولها إلى الإنتاج."
+          },
+          {
+            "question": "مما يحمي الخيار `validate` في playbook‏ SSH؟",
+            "options": [
+              "كلمات المرور الضعيفة",
+              "تثبيت `sshd_config` فيه خطأ في التركيب",
+              "الشهادات المنتهية",
+              "تأخر الشبكة"
+            ],
+            "answer": 1,
+            "explanation": "يختبر `sshd -t` الملف المرشح أولًا، فلا يحلّ خطأ مطبعي محل إعداد يعمل."
+          },
+          {
+            "question": "لماذا تُعدّ عقدة التحكم في Ansible هدفًا عالي القيمة؟",
+            "options": [
+              "تخزّن ملف الجرد فقط",
+              "تحمل بيانات اعتماد تصل إلى كل مضيف مُدار",
+              "تشغّل النواة لكل المضيفات",
+              "ليس لها وصول شبكي"
+            ],
+            "answer": 1,
+            "explanation": "من يتحكم بها يصل إلى كل ما تديره، فحصّنها وقيّد الوصول إليها وسجّله."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nلأتمتة أمن Linux ثلاث طبقات: فحوص شل صارمة للقراءة فقط، ومؤقّتات systemd تشغّلها بصورة مرئية، وplaybooks في Ansible تفرض خط الأساس دون أثر جانبي. عاين دائمًا بوضع الفحص، وتحقق من الإعدادات قبل إعادة التحميل، وعامل عقدة التحكم بوصفها جوهرة التاج. انتقل بعد ذلك إلى [أتمتة مراقبة الشبكات](/learn/security-architecture-resilience/network-monitoring-automation) لتطبيق الأفكار نفسها على الأجهزة والقياسات."
+      }
+    ]
+  }
+}

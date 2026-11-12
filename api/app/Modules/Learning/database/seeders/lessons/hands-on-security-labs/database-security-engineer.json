@@ -1,0 +1,666 @@
+{
+  "slug": "database-security-engineer",
+  "title": "Database Security Engineer",
+  "summary": "Learn what a database security engineer does, how to enforce least privilege and network restrictions in PostgreSQL, how to verify them, and how to build an honest career path from a home lab.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Describe the responsibilities of a database security engineer",
+    "Build least-privilege roles and row-level security in PostgreSQL",
+    "Restrict and verify database connections",
+    "Explain how layered controls and audit logs work together",
+    "Plan a realistic skills and certification path"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A small online shop keeps every customer record in one PostgreSQL database. The web application is well written, but a reporting password was pasted into a chat months ago. Anyone who finds it can connect from a laptop and read the whole `customers` table, and nothing in the logs says who did it.\n\nThis is the daily concern of a **database security engineer**: the database is where the valuable data finally lands, so it needs its own controls. In this lesson you will learn what the role covers, which controls matter most, how to prove them with real queries, and how to build the skills on a lab you own."
+    },
+    {
+      "id": "role",
+      "type": "text",
+      "markdown": "## What the role does\n\nA database security engineer sits between the database administrator (DBA), the application developers and the security team. The DBA keeps the database fast and available. You keep it **confidential, intact and accountable**.\n\nTypical work includes:\n\n- Designing roles and permissions so each account can do only what it needs.\n- Hardening the server: patching, disabling unused features, restricting network access.\n- Encrypting data in transit and at rest, and managing the keys.\n- Turning on auditing and sending the logs to the SIEM.\n- Reviewing backups, replication and disaster recovery for exposure.\n- Finding sensitive data (card numbers, national IDs, health data) and masking it where possible.\n- Supporting audits and compliance work.\n\nThe role is usually reached after experience as a DBA, sysadmin, developer or SOC analyst. Few organizations hire it as an entry-level job, so treat it as a specialization to grow toward."
+    },
+    {
+      "id": "controls",
+      "type": "text",
+      "markdown": "## The controls that matter most\n\nEvery database product has its own syntax, but the control families are the same.\n\n| Control | What it prevents | Example |\n|:--|:--|:--|\n| Strong authentication | Stolen or guessed passwords | SCRAM-SHA-256, certificates, SSO or IAM tokens |\n| Least privilege | One leaked account reading everything | Separate read-only and read-write roles |\n| Network restriction | Direct access from anywhere | Firewall plus `pg_hba.conf` allow-list |\n| Encryption in transit | Sniffing on the network | TLS required for every client |\n| Encryption at rest | Stolen disks and backups | Disk or tablespace encryption, encrypted backups |\n| Auditing | Silent misuse | Log connections, DDL and privileged reads |\n| Patching | Known server vulnerabilities | Monthly minor-version updates |\n\nStart with the cheapest controls: remove default accounts, close the network path, and give applications their own limited roles. Most real incidents involve an over-privileged account or an exposed port, not a clever attack on the engine."
+    },
+    {
+      "id": "sql-intro",
+      "type": "text",
+      "markdown": "## Step 1: Build least privilege in SQL\n\nLeast privilege means each account gets only the permissions its job needs. In PostgreSQL you do this with **roles**. A group role holds the permissions, and login roles inherit from it.\n\nThe script below revokes the default rights of the `PUBLIC` pseudo-role, creates a read-only reporting role, and adds row-level security so the role sees only European orders. Notice that the reporting job cannot read `customers` at all."
+    },
+    {
+      "id": "sql-roles",
+      "type": "code",
+      "language": "sql",
+      "code": "-- Run as a superuser on a lab server you own (PostgreSQL 16)\n-- 1. Stop the PUBLIC pseudo-role from connecting or creating objects\nREVOKE ALL ON DATABASE shopdb FROM PUBLIC;\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\n-- 2. A group role that holds permissions; people and apps inherit it\nCREATE ROLE reporting_ro NOLOGIN;\nGRANT CONNECT ON DATABASE shopdb TO reporting_ro;\nGRANT USAGE ON SCHEMA public TO reporting_ro;\nGRANT SELECT ON orders, products TO reporting_ro;   -- no customers table\n\n-- 3. A login role for the reporting job (secret is a placeholder)\nCREATE ROLE report_job LOGIN PASSWORD '<generated-secret>' CONNECTION LIMIT 5;\nGRANT reporting_ro TO report_job;\n\n-- 4. Hide rows from a role that must see only its own region\nALTER TABLE orders ENABLE ROW LEVEL SECURITY;\nCREATE POLICY eu_only ON orders FOR SELECT TO reporting_ro\n    USING (region = 'EU');\n",
+      "filename": "least-privilege.sql",
+      "highlight": [
+        4,
+        11,
+        12,
+        16,
+        17
+      ],
+      "caption": "Least-privilege roles for a lab database (`shopdb` is a placeholder). The password is a placeholder: generate and store the real one in a secrets manager."
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Step 2: Restrict access and verify it\n\nA permission you have not tested is only a hope. First restrict *who can connect from where* in `pg_hba.conf`. The file is read top to bottom and the first matching line wins, so the final `reject` line acts as a safety net."
+    },
+    {
+      "id": "hba",
+      "type": "code",
+      "language": "plain",
+      "code": "# TYPE  DATABASE  USER        ADDRESS            METHOD\nlocal   all       postgres                       peer\nhostssl shopdb    app_rw      10.20.0.0/24       scram-sha-256\nhostssl shopdb    report_job  10.20.5.10/32      scram-sha-256\nhost    all       all         0.0.0.0/0          reject\n",
+      "filename": "pg_hba.conf",
+      "highlight": [
+        2,
+        3,
+        4
+      ],
+      "caption": "A restrictive host-based authentication file. Only two application hosts on documentation-style private ranges can connect, and only over TLS."
+    },
+    {
+      "id": "verify2",
+      "type": "text",
+      "markdown": "Then ask the server what it believes. The session below runs as an administrator on the lab server and checks roles, the connection method and what the reporting account can actually do."
+    },
+    {
+      "id": "psql",
+      "type": "terminal",
+      "title": "Verify roles and access",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "psql -h db1.example.internal -U postgres -d shopdb -c \"\\du report_job\"",
+          "output": " Role name |        Attributes\n-----------+---------------------------\n report_job | 5 connections\n",
+          "comment": "Only a connection limit; no superuser, no createdb."
+        },
+        {
+          "cmd": "PGPASSWORD='<report-secret>' psql -h db1.example.internal -U report_job -d shopdb -c \"SELECT count(*) FROM customers;\"",
+          "output": "ERROR:  permission denied for table customers\n",
+          "comment": "The control works: the reporting account cannot read customer data."
+        },
+        {
+          "cmd": "PGPASSWORD='<report-secret>' psql -h db1.example.internal -U report_job -d shopdb -c \"SELECT region, count(*) FROM orders GROUP BY 1;\"",
+          "output": " region | count\n--------+-------\n EU     |  1204\n",
+          "comment": "Row-level security returns EU rows only."
+        },
+        {
+          "cmd": "psql -h db1.example.internal -U postgres -d shopdb -c \"SELECT usename, ssl, client_addr FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) WHERE usename IS NOT NULL;\"",
+          "output": " usename    | ssl | client_addr\n------------+-----+-------------\n app_rw     | t   | 10.20.0.14\n report_job | t   | 10.20.5.10\n",
+          "comment": "Every session uses TLS and comes from an allowed address."
+        }
+      ],
+      "caption": "Never paste real passwords into a terminal history. Use an environment variable, a `.pgpass` file with strict permissions, or a secrets manager."
+    },
+    {
+      "id": "flow",
+      "type": "text",
+      "markdown": "## Step 3: Follow a request through the layers\n\nControls work together. A single query passes several checkpoints, and a good design means that failure of one layer does not expose the data. Watch a legitimate request and a stolen-password attempt travel through the same stack."
+    },
+    {
+      "id": "flow-anim",
+      "type": "animation",
+      "title": "Two connections reach the database",
+      "caption": "Each layer is a separate chance to stop misuse and to leave evidence.",
+      "data": {
+        "token": "Query",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "Application",
+            "sub": "10.20.0.14",
+            "icon": "server"
+          },
+          {
+            "id": "fw",
+            "label": "Firewall",
+            "sub": "TCP/5432 allow-list",
+            "icon": "firewall"
+          },
+          {
+            "id": "hba",
+            "label": "pg_hba + TLS",
+            "sub": "Authentication",
+            "icon": "lock"
+          },
+          {
+            "id": "role",
+            "label": "Roles + RLS",
+            "sub": "Authorization",
+            "icon": "key"
+          },
+          {
+            "id": "db",
+            "label": "Database",
+            "sub": "shopdb",
+            "icon": "database"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "Audit logs",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "The application sends a SELECT for one customer order."
+          },
+          {
+            "at": "fw",
+            "caption": "The source address is on the allow-list, so TCP/5432 is permitted.",
+            "tone": "success"
+          },
+          {
+            "at": "hba",
+            "caption": "The client uses TLS and SCRAM authentication; the matching rule accepts it.",
+            "tone": "secure"
+          },
+          {
+            "at": "role",
+            "caption": "The role may read orders, and row-level security limits the rows returned."
+          },
+          {
+            "at": "db",
+            "caption": "The query runs and the result goes back to the application.",
+            "tone": "success"
+          },
+          {
+            "at": "siem",
+            "caption": "The connection and the statement count are logged for later review."
+          },
+          {
+            "at": "fw",
+            "token": "Stolen login",
+            "caption": "An attacker on a laptop at 203.0.113.50 uses the leaked reporting password. The firewall drops the traffic.",
+            "tone": "blocked"
+          },
+          {
+            "at": "siem",
+            "token": "Alert",
+            "caption": "The firewall and failed-connection logs raise an alert, so the leak is discovered before data is read.",
+            "tone": "warning"
+          }
+        ]
+      },
+      "kind": "flow"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not test on systems you do not own",
+      "markdown": "Run every command in this lesson only against a database you built yourself. Probing a colleague's or employer's production database, even \"just to check\", can break policy and law. Get written permission first."
+    },
+    {
+      "id": "pitfalls",
+      "type": "text",
+      "markdown": "## Common mistakes to look for\n\nWhen you review an existing database, check the same handful of problems first. They appear in almost every environment.\n\n| Finding | Why it is risky | Fix |\n|:--|:--|:--|\n| Application connects as the owner or superuser | A single SQL injection can drop tables or read the operating system | Use a limited application role and a separate migration role |\n| Shared passwords in code or chat | Anyone with the text has full access | Store secrets in a manager and rotate them |\n| Database port open to the whole network | Password guessing from any host | Allow-list the application hosts only |\n| Test data copied from production | Real personal data in a weaker environment | Mask or generate synthetic data |\n| Audit logs kept only on the database host | An intruder can erase them | Ship logs off the host in near real time |\n\nWrite each finding with evidence, a risk rating and a specific fix. A clear, calm report builds more trust with developers than a long list of warnings."
+    },
+    {
+      "id": "career",
+      "type": "text",
+      "markdown": "## Building the career path honestly\n\nThere is no single road, and certification alone does not get you hired. Employers look for evidence that you can do the work.\n\n| Stage | Focus | Evidence you can show |\n|:--|:--|:--|\n| Foundation | Linux, networking, SQL, one database engine | A lab that runs PostgreSQL or MySQL with documented hardening |\n| Practice | Roles, TLS, auditing, backups, log shipping | A write-up with before and after configuration |\n| Specialization | Cloud databases (IAM, key management), data masking | A small project that rotates secrets automatically |\n| Recognition | Vendor database certificates, plus general ones such as Security+ or later CISSP | Optional; choose by the job ads you target |\n\nRead job descriptions in your region before choosing a certificate, because requirements differ. Ignore salary claims you cannot verify. Related roles to explore are [System Security Engineer](/learn/hands-on-security-labs/system-security-engineer) and [Security Architect](/learn/hands-on-security-labs/security-architect)."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "1. In a VM you own, install PostgreSQL and create a database called `shopdb` with an `orders` and a `customers` table of fake data.\n2. Run the `least-privilege.sql` script, replacing the password placeholder with a generated one.\n3. Edit `pg_hba.conf` as shown, reload the server, and confirm that `report_job` is denied on `customers` but allowed on `orders`.\n4. Turn on `log_connections` and `log_statement = 'ddl'`, then find your test connections in the log.\n5. Write five lines describing which control would have stopped the leaked-password story from the start of this lesson."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Least privilege",
+          "definition": "Giving an account only the permissions its job requires."
+        },
+        {
+          "term": "Role",
+          "definition": "A named set of permissions that can be granted to users or other roles."
+        },
+        {
+          "term": "Row-level security",
+          "definition": "A policy that filters which rows a role can see or change."
+        },
+        {
+          "term": "pg_hba.conf",
+          "definition": "The PostgreSQL file that decides which clients may connect, from where and how."
+        },
+        {
+          "term": "Database audit log",
+          "definition": "A record of connections, statements and privilege changes."
+        },
+        {
+          "term": "Encryption at rest",
+          "definition": "Protecting stored data and backups so a stolen disk is unreadable."
+        },
+        {
+          "term": "Data masking",
+          "definition": "Replacing sensitive values with realistic but fake ones for non-production use."
+        },
+        {
+          "term": "DBA",
+          "definition": "Database administrator, responsible for performance, availability and maintenance."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which approach best limits the damage when a reporting password leaks?",
+          "options": [
+            "Give the reporting job the superuser role so it never fails",
+            "Give it a login role that can read only the tables it needs",
+            "Share one account between all applications",
+            "Rely on the application to filter results"
+          ],
+          "answer": 1,
+          "explanation": "A narrowly scoped role limits what a stolen credential can read. Superuser or shared accounts do the opposite, and application-level filtering is bypassed once someone connects directly."
+        },
+        {
+          "question": "In `pg_hba.conf`, what decides which rule applies to a connection?",
+          "options": [
+            "The longest rule",
+            "The last matching rule",
+            "The first matching rule from the top",
+            "The rule with the most permissive method"
+          ],
+          "answer": 2,
+          "explanation": "PostgreSQL reads the file in order and uses the first line that matches, which is why a final reject line works as a safety net."
+        },
+        {
+          "question": "Which controls reduce the risk of a stolen database backup being useful? (Choose all that apply.)",
+          "options": [
+            "Encrypting backups",
+            "Keeping the keys separate from the backup storage",
+            "Naming the file backup.sql",
+            "Restricting who can read the backup location"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Encrypted backups with separately held keys and restricted access make theft far less useful. A file name has no security value."
+        },
+        {
+          "question": "A candidate has a database certificate but no hands-on work. What most improves their chances?",
+          "options": [
+            "A second certificate",
+            "A documented lab showing hardening with before and after evidence",
+            "A higher salary request",
+            "Removing the certificate"
+          ],
+          "answer": 1,
+          "explanation": "Employers want proof of skill. A documented, reproducible lab shows how you think and work."
+        },
+        {
+          "question": "Which are sound reasons to enable database auditing? (Choose all that apply.)",
+          "options": [
+            "Detecting unusual privileged access",
+            "Supporting incident investigations",
+            "Replacing the need for permissions",
+            "Providing evidence for compliance reviews"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Audit logs detect, investigate and prove. They never replace access control, which prevents the misuse in the first place."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A database security engineer protects the data store itself: access, encryption, auditing, patching and recovery.\n- Least privilege with roles, a restrictive `pg_hba.conf` and TLS stop most realistic incidents.\n- Verify every control by connecting as the account you restricted, and send audit logs to your SIEM.\n- Build the career with a documented lab first, then choose certifications based on real job requirements.\n- Continue with [Security Architect](/learn/hands-on-security-labs/security-architect) to see how these controls fit a whole design."
+    }
+  ],
+  "ar": {
+    "title": "مهندس أمن قواعد البيانات",
+    "summary": "تعرّف على عمل مهندس أمن قواعد البيانات، وكيف تطبّق أقل الصلاحيات وقيود الشبكة في PostgreSQL، وكيف تتحقق منها، وكيف تبني مسارًا مهنيًا صادقًا انطلاقًا من مختبر منزلي.",
+    "objectives": [
+      "وصف مسؤوليات مهندس أمن قواعد البيانات",
+      "بناء أدوار بأقل الصلاحيات وأمان مستوى الصف في PostgreSQL",
+      "تقييد اتصالات القاعدة والتحقق منها",
+      "شرح كيف تعمل الضوابط المتعددة وسجلات التدقيق معًا",
+      "التخطيط لمسار واقعي للمهارات والشهادات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يحتفظ متجر إلكتروني صغير بسجلات جميع عملائه في قاعدة بيانات PostgreSQL واحدة. تطبيق الويب مكتوب بإتقان، لكن كلمة مرور خاصة بالتقارير لُصقت في محادثة قبل أشهر. وأي شخص يعثر عليها يستطيع الاتصال من حاسوب محمول وقراءة جدول `customers` كاملًا، دون أن يخبرنا السجل بمن فعل ذلك.\n\nهذا هو الهمّ اليومي لـ**مهندس أمن قواعد البيانات (Database Security Engineer)**: فالقاعدة هي المكان الذي تستقر فيه البيانات الثمينة في النهاية، ولذلك تحتاج إلى ضوابط خاصة بها. في هذا الدرس ستتعرف على نطاق الدور، وأهم الضوابط، وكيف تثبتها باستعلامات حقيقية، وكيف تبني المهارات في مختبر تملكه."
+      },
+      {
+        "id": "role",
+        "type": "text",
+        "markdown": "## ماذا يفعل هذا الدور\n\nيقف مهندس أمن قواعد البيانات بين مدير قواعد البيانات (DBA) ومطوّري التطبيقات وفريق الأمن. يحافظ مدير القاعدة على سرعتها وتوافرها، وتحافظ أنت على **سريتها وسلامتها وإمكان محاسبة المتعاملين معها**.\n\nتشمل المهام المعتادة ما يلي:\n\n- تصميم الأدوار والصلاحيات بحيث لا يفعل كل حساب إلا ما يحتاج إليه.\n- تحصين الخادم: التحديثات، وتعطيل الميزات غير المستخدمة، وتقييد الوصول عبر الشبكة.\n- تشفير البيانات أثناء النقل وفي حالة السكون، وإدارة المفاتيح.\n- تفعيل التدقيق (Auditing) وإرسال السجلات إلى نظام SIEM.\n- مراجعة النسخ الاحتياطية والمزامنة والتعافي من الكوارث بحثًا عن أي انكشاف.\n- اكتشاف البيانات الحساسة (أرقام البطاقات، والهويات الوطنية، والبيانات الصحية) وإخفائها متى أمكن.\n- دعم عمليات التدقيق والامتثال.\n\nيُبلَغ هذا الدور عادةً بعد خبرة في إدارة القواعد أو النظم أو التطوير أو العمل محلّلًا في مركز العمليات الأمنية. ونادرًا ما تعلن المؤسسات عنه وظيفةً مبتدئة، فاعدّه تخصصًا تنمو نحوه."
+      },
+      {
+        "id": "controls",
+        "type": "text",
+        "markdown": "## الضوابط الأهم\n\nلكل منتج قواعد بيانات صياغته الخاصة، لكن عائلات الضوابط واحدة.\n\n| الضابط | ما يمنعه | مثال |\n|:--|:--|:--|\n| المصادقة القوية | كلمات المرور المسروقة أو المخمَّنة | SCRAM-SHA-256 أو الشهادات أو SSO أو رموز IAM |\n| أقل الصلاحيات | قراءة حساب مسرَّب لكل شيء | أدوار منفصلة للقراءة فقط وللقراءة والكتابة |\n| تقييد الشبكة | الوصول المباشر من أي مكان | جدار حماية مع قائمة سماح في `pg_hba.conf` |\n| التشفير أثناء النقل | التنصت على الشبكة | فرض TLS على كل العملاء |\n| التشفير في حالة السكون | سرقة الأقراص والنسخ الاحتياطية | تشفير القرص أو مساحة الجداول ونسخ احتياطية مشفرة |\n| التدقيق | سوء الاستخدام الصامت | تسجيل الاتصالات وأوامر DDL والقراءات المميزة |\n| التحديث | ثغرات الخادم المعروفة | تحديثات شهرية للإصدارات الفرعية |\n\nابدأ بأرخص الضوابط: أزل الحسابات الافتراضية، وأغلق مسار الشبكة، وامنح التطبيقات أدوارًا محدودة خاصة بها. فأغلب الحوادث الحقيقية تتعلق بحساب مفرط الصلاحيات أو منفذ مكشوف، لا بهجوم بارع على المحرك نفسه."
+      },
+      {
+        "id": "sql-intro",
+        "type": "text",
+        "markdown": "## الخطوة 1: ابنِ أقل الصلاحيات بلغة SQL\n\nيعني مبدأ أقل الصلاحيات أن يحصل كل حساب على ما تتطلبه مهمته فقط. وفي PostgreSQL يتحقق ذلك بـ**الأدوار (Roles)**: يحمل دور المجموعة الصلاحيات، وترثها أدوار تسجيل الدخول.\n\nيسحب النص أدناه الحقوق الافتراضية من الدور الوهمي `PUBLIC`، وينشئ دور تقارير للقراءة فقط، ويضيف أمان مستوى الصف (Row-Level Security) ليرى الدور طلبات أوروبا وحدها. لاحظ أن مهمة التقارير لا تستطيع قراءة `customers` إطلاقًا."
+      },
+      {
+        "id": "sql-roles",
+        "type": "code",
+        "language": "sql",
+        "code": "-- Run as a superuser on a lab server you own (PostgreSQL 16)\n-- 1. Stop the PUBLIC pseudo-role from connecting or creating objects\nREVOKE ALL ON DATABASE shopdb FROM PUBLIC;\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\n-- 2. A group role that holds permissions; people and apps inherit it\nCREATE ROLE reporting_ro NOLOGIN;\nGRANT CONNECT ON DATABASE shopdb TO reporting_ro;\nGRANT USAGE ON SCHEMA public TO reporting_ro;\nGRANT SELECT ON orders, products TO reporting_ro;   -- no customers table\n\n-- 3. A login role for the reporting job (secret is a placeholder)\nCREATE ROLE report_job LOGIN PASSWORD '<generated-secret>' CONNECTION LIMIT 5;\nGRANT reporting_ro TO report_job;\n\n-- 4. Hide rows from a role that must see only its own region\nALTER TABLE orders ENABLE ROW LEVEL SECURITY;\nCREATE POLICY eu_only ON orders FOR SELECT TO reporting_ro\n    USING (region = 'EU');\n",
+        "filename": "least-privilege.sql",
+        "highlight": [
+          4,
+          11,
+          12,
+          16,
+          17
+        ],
+        "caption": "أدوار بأقل الصلاحيات لقاعدة بيانات مختبرية (`shopdb` اسم افتراضي). كلمة المرور مجرد عنصر نائب: ولّد الحقيقية واحفظها في مدير أسرار."
+      },
+      {
+        "id": "verify",
+        "type": "text",
+        "markdown": "## الخطوة 2: قيّد الوصول وتحقق منه\n\nالصلاحية التي لم تختبرها مجرد أمل. ابدأ بتقييد *من يستطيع الاتصال ومن أين* في الملف `pg_hba.conf`. يُقرأ الملف من الأعلى إلى الأسفل ويُعتمد أول سطر مطابق، ولذلك يعمل السطر الأخير `reject` شبكةَ أمان."
+      },
+      {
+        "id": "hba",
+        "type": "code",
+        "language": "plain",
+        "code": "# TYPE  DATABASE  USER        ADDRESS            METHOD\nlocal   all       postgres                       peer\nhostssl shopdb    app_rw      10.20.0.0/24       scram-sha-256\nhostssl shopdb    report_job  10.20.5.10/32      scram-sha-256\nhost    all       all         0.0.0.0/0          reject\n",
+        "filename": "pg_hba.conf",
+        "highlight": [
+          2,
+          3,
+          4
+        ],
+        "caption": "ملف مصادقة مقيِّد للمضيفين. لا يتصل سوى مضيفين اثنين للتطبيقات ضمن نطاقات خاصة، وعبر TLS فقط."
+      },
+      {
+        "id": "verify2",
+        "type": "text",
+        "markdown": "ثم اسأل الخادم عمّا يعتقده. تعمل الجلسة أدناه مديرًا على خادم المختبر، وتفحص الأدوار وطريقة الاتصال وما يستطيع حساب التقارير فعله فعلًا."
+      },
+      {
+        "id": "psql",
+        "type": "terminal",
+        "title": "التحقق من الأدوار والوصول",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "psql -h db1.example.internal -U postgres -d shopdb -c \"\\du report_job\"",
+            "output": " Role name |        Attributes\n-----------+---------------------------\n report_job | 5 connections\n",
+            "comment": "لا يملك سوى حد للاتصالات، وليس مديرًا فائقًا ولا يستطيع إنشاء قواعد."
+          },
+          {
+            "cmd": "PGPASSWORD='<report-secret>' psql -h db1.example.internal -U report_job -d shopdb -c \"SELECT count(*) FROM customers;\"",
+            "output": "ERROR:  permission denied for table customers\n",
+            "comment": "الضابط يعمل: حساب التقارير لا يستطيع قراءة بيانات العملاء."
+          },
+          {
+            "cmd": "PGPASSWORD='<report-secret>' psql -h db1.example.internal -U report_job -d shopdb -c \"SELECT region, count(*) FROM orders GROUP BY 1;\"",
+            "output": " region | count\n--------+-------\n EU     |  1204\n",
+            "comment": "يعيد أمان مستوى الصف صفوف أوروبا فقط."
+          },
+          {
+            "cmd": "psql -h db1.example.internal -U postgres -d shopdb -c \"SELECT usename, ssl, client_addr FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) WHERE usename IS NOT NULL;\"",
+            "output": " usename    | ssl | client_addr\n------------+-----+-------------\n app_rw     | t   | 10.20.0.14\n report_job | t   | 10.20.5.10\n",
+            "comment": "كل جلسة تستخدم TLS وتأتي من عنوان مسموح."
+          }
+        ],
+        "caption": "لا تلصق كلمات مرور حقيقية في سجل الطرفية. استخدم متغير بيئة، أو ملف `.pgpass` بصلاحيات صارمة، أو مدير أسرار."
+      },
+      {
+        "id": "flow",
+        "type": "text",
+        "markdown": "## الخطوة 3: تتبّع طلبًا عبر الطبقات\n\nتعمل الضوابط معًا. يمر الاستعلام الواحد بعدة نقاط تفتيش، والتصميم الجيد يعني أن فشل طبقة واحدة لا يكشف البيانات. شاهد طلبًا مشروعًا ومحاولة بكلمة مرور مسروقة تعبران المكدّس نفسه."
+      },
+      {
+        "id": "flow-anim",
+        "type": "animation",
+        "title": "اتصالان يصلان إلى قاعدة البيانات",
+        "caption": "كل طبقة فرصة مستقلة لإيقاف إساءة الاستخدام وترك الأدلة.",
+        "data": {
+          "token": "استعلام",
+          "nodes": [
+            {
+              "id": "app",
+              "label": "التطبيق",
+              "sub": "10.20.0.14",
+              "icon": "server"
+            },
+            {
+              "id": "fw",
+              "label": "جدار الحماية",
+              "sub": "قائمة سماح TCP/5432",
+              "icon": "firewall"
+            },
+            {
+              "id": "hba",
+              "label": "pg_hba + TLS",
+              "sub": "المصادقة",
+              "icon": "lock"
+            },
+            {
+              "id": "role",
+              "label": "الأدوار + RLS",
+              "sub": "التفويض",
+              "icon": "key"
+            },
+            {
+              "id": "db",
+              "label": "قاعدة البيانات",
+              "sub": "shopdb",
+              "icon": "database"
+            },
+            {
+              "id": "siem",
+              "label": "SIEM",
+              "sub": "سجلات التدقيق",
+              "icon": "log"
+            }
+          ],
+          "steps": [
+            {
+              "at": "app",
+              "caption": "يرسل التطبيق استعلام SELECT عن طلب عميل واحد."
+            },
+            {
+              "at": "fw",
+              "caption": "عنوان المصدر ضمن قائمة السماح، فيُسمح بالمنفذ TCP/5432.",
+              "tone": "success"
+            },
+            {
+              "at": "hba",
+              "caption": "يستخدم العميل TLS ومصادقة SCRAM، ويقبله السطر المطابق.",
+              "tone": "secure"
+            },
+            {
+              "at": "role",
+              "caption": "يحق للدور قراءة orders، ويحدّ أمان مستوى الصف من الصفوف المُعادة."
+            },
+            {
+              "at": "db",
+              "caption": "ينفَّذ الاستعلام وتعود النتيجة إلى التطبيق.",
+              "tone": "success"
+            },
+            {
+              "at": "siem",
+              "caption": "يُسجَّل الاتصال وعدد العبارات للمراجعة لاحقًا."
+            },
+            {
+              "at": "fw",
+              "token": "دخول مسروق",
+              "caption": "يستخدم مهاجم على حاسوب محمول بالعنوان 203.0.113.50 كلمة مرور التقارير المسرّبة، فيُسقط جدار الحماية الحزم.",
+              "tone": "blocked"
+            },
+            {
+              "at": "siem",
+              "token": "تنبيه",
+              "caption": "تثير سجلات جدار الحماية والاتصالات الفاشلة تنبيهًا، فيُكتشف التسرّب قبل قراءة أي بيانات.",
+              "tone": "warning"
+            }
+          ]
+        },
+        "kind": "flow"
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "تحذير: لا تختبر على أنظمة لا تملكها",
+        "markdown": "نفّذ كل أمر في هذا الدرس على قاعدة بيانات بنيتها بنفسك فقط. فاستكشاف قاعدة بيانات زميل أو جهة عمل، ولو \"للتأكد فقط\"، قد يخالف السياسات والقانون. احصل على إذن كتابي أولًا."
+      },
+      {
+        "id": "pitfalls",
+        "type": "text",
+        "markdown": "## أخطاء شائعة ابحث عنها\n\nعند مراجعة قاعدة بيانات قائمة، افحص المشكلات القليلة نفسها أولًا، فهي تظهر في معظم البيئات تقريبًا.\n\n| الملاحظة | سبب الخطورة | المعالجة |\n|:--|:--|:--|\n| يتصل التطبيق بصفته المالك أو المدير الفائق | حقن SQL واحد قد يحذف الجداول أو يقرأ نظام التشغيل | استخدم دور تطبيق محدودًا ودورًا منفصلًا للترحيلات |\n| كلمات مرور مشتركة في الشيفرة أو المحادثات | كل من يملك النص يملك وصولًا كاملًا | احفظ الأسرار في مدير أسرار ودوّرها |\n| منفذ القاعدة مفتوح لكل الشبكة | تخمين كلمات المرور من أي مضيف | اسمح لمضيفات التطبيق وحدها |\n| بيانات اختبار منسوخة من الإنتاج | بيانات شخصية حقيقية في بيئة أضعف | أخفِ البيانات أو ولّد بيانات اصطناعية |\n| سجلات التدقيق محفوظة على مضيف القاعدة فقط | يستطيع المتسلل محوها | أرسل السجلات خارج المضيف في وقت قريب من الحقيقي |\n\nاكتب كل ملاحظة مع دليلها وتقدير خطورتها ومعالجة محددة. فالتقرير الواضح الهادئ يكسب ثقة المطورين أكثر من قائمة طويلة من التحذيرات."
+      },
+      {
+        "id": "career",
+        "type": "text",
+        "markdown": "## بناء المسار المهني بصدق\n\nلا يوجد طريق واحد، والشهادة وحدها لا تمنحك الوظيفة. يبحث أصحاب العمل عن دليل على قدرتك على أداء العمل.\n\n| المرحلة | التركيز | الدليل الذي تعرضه |\n|:--|:--|:--|\n| الأساس | لينكس والشبكات وSQL ومحرك قواعد بيانات واحد | مختبر يشغّل PostgreSQL أو MySQL مع تحصين موثّق |\n| الممارسة | الأدوار وTLS والتدقيق والنسخ الاحتياطية وشحن السجلات | تقرير يعرض الإعدادات قبل التحصين وبعده |\n| التخصص | قواعد البيانات السحابية (IAM وإدارة المفاتيح)، وإخفاء البيانات | مشروع صغير يدوّر الأسرار آليًا |\n| الاعتراف | شهادات الموردين لقواعد البيانات، مع شهادات عامة مثل Security+ ثم CISSP لاحقًا | اختيارية؛ اخترها بحسب إعلانات الوظائف التي تستهدفها |\n\nاقرأ أوصاف الوظائف في منطقتك قبل اختيار الشهادة، فالمتطلبات تختلف. وتجاهل ادعاءات الرواتب التي لا يمكنك التحقق منها. ومن الأدوار القريبة التي يحسن استكشافها [مهندس أمن الأنظمة](/learn/hands-on-security-labs/system-security-engineer) و[مهندس الأمن المعماري](/learn/hands-on-security-labs/security-architect)."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "1. في جهاز افتراضي تملكه، ثبّت PostgreSQL وأنشئ قاعدة باسم `shopdb` فيها جدولا `orders` و`customers` ببيانات وهمية.\n2. نفّذ النص `least-privilege.sql` بعد استبدال كلمة المرور النائبة بأخرى مولَّدة.\n3. عدّل `pg_hba.conf` كما هو مبيَّن، وأعد تحميل الخادم، وتأكد أن `report_job` ممنوع من `customers` ومسموح له بـ`orders`.\n4. فعّل `log_connections` و`log_statement = 'ddl'`، ثم ابحث عن اتصالاتك التجريبية في السجل.\n5. اكتب خمسة أسطر تبيّن أي ضابط كان سيمنع قصة كلمة المرور المسرّبة منذ البداية."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الرئيسة",
+        "items": [
+          {
+            "term": "أقل الصلاحيات (Least privilege)",
+            "definition": "منح الحساب الصلاحيات التي تتطلبها مهمته فقط."
+          },
+          {
+            "term": "الدور (Role)",
+            "definition": "مجموعة مسماة من الصلاحيات يمكن منحها للمستخدمين أو لأدوار أخرى."
+          },
+          {
+            "term": "أمان مستوى الصف (RLS)",
+            "definition": "سياسة تحدد الصفوف التي يستطيع الدور رؤيتها أو تعديلها."
+          },
+          {
+            "term": "pg_hba.conf",
+            "definition": "ملف PostgreSQL الذي يحدد العملاء المسموح لهم بالاتصال ومن أين وكيف."
+          },
+          {
+            "term": "سجل تدقيق القاعدة (Audit log)",
+            "definition": "سجل بالاتصالات والعبارات وتغييرات الصلاحيات."
+          },
+          {
+            "term": "التشفير في حالة السكون",
+            "definition": "حماية البيانات المخزنة والنسخ الاحتياطية بحيث يتعذر قراءة قرص مسروق."
+          },
+          {
+            "term": "إخفاء البيانات (Masking)",
+            "definition": "استبدال القيم الحساسة بقيم مقنعة لكنها وهمية في بيئات غير الإنتاج."
+          },
+          {
+            "term": "مدير قواعد البيانات (DBA)",
+            "definition": "المسؤول عن أداء القاعدة وتوافرها وصيانتها."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما أفضل طريقة للحد من الضرر عند تسرّب كلمة مرور التقارير؟",
+            "options": [
+              "منح مهمة التقارير دور المدير الفائق كي لا تفشل أبدًا",
+              "منحها دور دخول يقرأ الجداول التي تحتاج إليها فقط",
+              "مشاركة حساب واحد بين كل التطبيقات",
+              "الاعتماد على التطبيق لتصفية النتائج"
+            ],
+            "answer": 1,
+            "explanation": "الدور المحدود النطاق يقلّل ما تستطيع بيانات الاعتماد المسروقة قراءته. أما الحساب الفائق أو المشترك فيفعل العكس، ويُتجاوز التصفية في التطبيق متى اتصل أحدهم مباشرة."
+          },
+          {
+            "question": "في `pg_hba.conf`، ما الذي يحدد القاعدة المطبَّقة على الاتصال؟",
+            "options": [
+              "القاعدة الأطول",
+              "آخر قاعدة مطابقة",
+              "أول قاعدة مطابقة من الأعلى",
+              "القاعدة ذات الطريقة الأكثر تساهلًا"
+            ],
+            "answer": 2,
+            "explanation": "يقرأ PostgreSQL الملف بالترتيب ويستخدم أول سطر مطابق، ولهذا يعمل سطر الرفض الأخير شبكةَ أمان."
+          },
+          {
+            "question": "أي الضوابط تقلل فائدة نسخة احتياطية مسروقة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "تشفير النسخ الاحتياطية",
+              "حفظ المفاتيح بمعزل عن مخزن النسخ",
+              "تسمية الملف backup.sql",
+              "تقييد من يقرأ موقع النسخ"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "النسخ المشفرة مع مفاتيح محفوظة منفصلة ووصول مقيّد تجعل السرقة أقل نفعًا بكثير. أما اسم الملف فلا قيمة أمنية له."
+          },
+          {
+            "question": "مرشح يحمل شهادة في قواعد البيانات لكن بلا عمل عملي. ما الذي يحسّن فرصه أكثر؟",
+            "options": [
+              "شهادة ثانية",
+              "مختبر موثّق يعرض التحصين مع أدلة قبل وبعد",
+              "طلب راتب أعلى",
+              "حذف الشهادة"
+            ],
+            "answer": 1,
+            "explanation": "يريد أصحاب العمل دليلًا على المهارة. والمختبر الموثّق القابل للإعادة يُظهر طريقة تفكيرك وعملك."
+          },
+          {
+            "question": "أي مما يلي أسباب وجيهة لتفعيل تدقيق قاعدة البيانات؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "كشف الوصول المميز غير المعتاد",
+              "دعم التحقيق في الحوادث",
+              "الاستغناء عن الصلاحيات",
+              "توفير أدلة لمراجعات الامتثال"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "تُستخدم سجلات التدقيق للكشف والتحقيق والإثبات، ولا تغني أبدًا عن التحكم في الوصول الذي يمنع إساءة الاستخدام أصلًا."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يحمي مهندس أمن قواعد البيانات مخزن البيانات نفسه: الوصول، والتشفير، والتدقيق، والتحديث، والتعافي.\n- أقل الصلاحيات عبر الأدوار، و`pg_hba.conf` مقيِّد، وTLS، تمنع معظم الحوادث الواقعية.\n- تحقق من كل ضابط بالاتصال بالحساب الذي قيّدته، وأرسل سجلات التدقيق إلى نظام SIEM.\n- ابنِ مسارك المهني بمختبر موثّق أولًا، ثم اختر الشهادات بحسب متطلبات الوظائف الفعلية.\n- تابع مع درس [مهندس الأمن المعماري](/learn/hands-on-security-labs/security-architect) لترى كيف تنسجم هذه الضوابط في تصميم متكامل."
+      }
+    ]
+  }
+}

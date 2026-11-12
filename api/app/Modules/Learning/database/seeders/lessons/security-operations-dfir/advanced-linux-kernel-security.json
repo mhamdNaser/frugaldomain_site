@@ -1,0 +1,600 @@
+{
+  "slug": "advanced-linux-kernel-security",
+  "title": "Advanced Linux Kernel Security",
+  "summary": "Learn the Linux kernel's built-in protections, how to harden and audit them, and how to verify a suspect host for kernel-level tampering.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Describe the main Linux kernel protections and what each prevents",
+    "Apply a sysctl and boot-parameter hardening baseline",
+    "Configure auditd rules for kernel-level events",
+    "Verify a suspect host using taint flags, module views and eBPF listings"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A responder is called to a web server that \"feels slow.\" The EDR shows nothing, `ps` looks normal, and the application logs are clean. Yet outbound traffic to a rare destination continues every few minutes. When the process list cannot be trusted, the question moves one layer down: **what is the kernel doing?**\n\nThe Linux kernel is the most privileged code on the host. Everything else, including your logging agent, trusts it to report the truth. That is why kernel security matters twice for a defender: you must **harden** the kernel so an attacker cannot easily tamper with it, and you must know how to **verify** it when a host is suspect. This lesson stays defensive. You will learn the protections the kernel offers, how to configure and audit them, and how to spot signs of kernel-level tampering on systems you own. It builds on [Hypervisor and Virtualization Internals](/learn/security-operations-dfir/hypervisor-and-virtualization-internals) and feeds into [Memory Forensics and Malware Analysis](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)."
+    },
+    {
+      "id": "protections",
+      "type": "text",
+      "markdown": "## The kernel's built-in protections\n\nModern kernels ship many layers. Know what each one stops, because a missing layer shapes how you investigate.\n\n| Protection | What it does | Where to check |\n|:--|:--|:--|\n| **KASLR** | Randomizes the kernel's load address so fixed addresses cannot be assumed | `dmesg`, `/proc/kallsyms` (zeros for non-root) |\n| **SMEP / SMAP** | CPU features that block the kernel from executing or reading user-space memory by mistake | `grep -o 'smep' /proc/cpuinfo` |\n| **Module signing** | Refuses unsigned kernel modules | `/proc/sys/kernel/modules_disabled`, kernel config |\n| **Lockdown mode** | Blocks root from modifying the running kernel (`/dev/mem`, unsigned modules, kexec) | `/sys/kernel/security/lockdown` |\n| **Seccomp** | Filters which system calls a process may use | `grep Seccomp /proc/<pid>/status` |\n| **LSMs** (SELinux, AppArmor) | Mandatory access control on top of file permissions | `getenforce`, `aa-status` |\n| **Secure Boot** | Verifies the bootloader and kernel signature at startup | `mokutil --sb-state` |\n\nNo single control is enough. Secure Boot protects the boot chain, lockdown protects the running kernel from root, and an LSM limits what a compromised service can reach in the first place. Together they turn \"root on the box\" from \"game over\" into a much harder position for the attacker."
+    },
+    {
+      "id": "syscall-anim",
+      "type": "animation",
+      "kind": "layers",
+      "title": "Layers a system call passes through",
+      "caption": "Each layer can stop the request; logging at several layers gives you evidence.",
+      "data": {
+        "layers": [
+          {
+            "label": "Process",
+            "sub": "user space"
+          },
+          {
+            "label": "Seccomp filter",
+            "sub": "syscall allow-list"
+          },
+          {
+            "label": "LSM hook",
+            "sub": "SELinux / AppArmor"
+          },
+          {
+            "label": "Audit subsystem",
+            "sub": "auditd rules"
+          },
+          {
+            "label": "Kernel",
+            "sub": "ring 0"
+          }
+        ],
+        "steps": [
+          {
+            "layer": 0,
+            "packet": [
+              "open()"
+            ],
+            "caption": "A web service calls open() on a file."
+          },
+          {
+            "layer": 1,
+            "packet": [
+              "open()",
+              "seccomp"
+            ],
+            "caption": "The seccomp profile allows open(), so the call continues. A forbidden call would be killed here."
+          },
+          {
+            "layer": 2,
+            "packet": [
+              "open()",
+              "label"
+            ],
+            "caption": "The LSM compares the process label with the file label and denies access to /etc/shadow."
+          },
+          {
+            "layer": 3,
+            "packet": [
+              "open()",
+              "denied"
+            ],
+            "caption": "The denial is written as an AVC record, which your SIEM can alert on."
+          },
+          {
+            "layer": 4,
+            "packet": [
+              "EACCES"
+            ],
+            "caption": "The kernel returns an error to the process; the file was never read."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sysctl",
+      "type": "text",
+      "markdown": "## Hardening with sysctl and boot parameters\n\nMany kernel defenses are tunables. Place them in a drop-in file so they survive reboots and can be reviewed in version control."
+    },
+    {
+      "id": "sysctl-code",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/sysctl.d/90-hardening.conf",
+      "caption": "Kernel hardening baseline",
+      "highlight": [
+        2,
+        5,
+        8
+      ],
+      "code": "# Hide kernel pointers and dmesg from unprivileged users\nkernel.kptr_restrict = 2\nkernel.dmesg_restrict = 1\n# Block unprivileged eBPF and restrict ptrace to parent processes\nkernel.unprivileged_bpf_disabled = 1\nkernel.yama.ptrace_scope = 1\n# Do not allow core dumps from setuid programs; limit perf use\nfs.suid_dumpable = 0\nkernel.perf_event_paranoid = 3\n# Network hygiene frequently checked in audits\nnet.ipv4.conf.all.rp_filter = 1\nnet.ipv4.conf.all.accept_redirects = 0"
+    },
+    {
+      "id": "sysctl-explain",
+      "type": "text",
+      "markdown": "`kptr_restrict = 2` hides kernel addresses from everyone, which weakens address-leak techniques. `unprivileged_bpf_disabled = 1` closes a well-known attack surface, since eBPF runs code inside the kernel. `ptrace_scope = 1` stops one process from reading the memory of an unrelated process, which blunts credential theft from memory.\n\nBoot parameters add more. `lockdown=integrity` enables lockdown, `module.sig_enforce=1` forces signed modules, and `init_on_alloc=1` zeroes memory on allocation. After setting them, confirm with `cat /proc/cmdline`. For production, test each change on a staging host first, since some drivers and monitoring tools need eBPF or ptrace."
+    },
+    {
+      "id": "audit",
+      "type": "text",
+      "markdown": "## Auditing kernel-level events\n\nYou cannot investigate what was never recorded. `auditd` hooks the kernel and records security-relevant events. Focus on actions that change the kernel itself: loading modules, changing time, using `ptrace`, and altering the audit rules."
+    },
+    {
+      "id": "audit-term",
+      "type": "terminal",
+      "title": "auditd rules and a module-load event",
+      "prompt": "root@host:~#",
+      "lines": [
+        {
+          "cmd": "cat /etc/audit/rules.d/kernel.rules",
+          "output": "-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k kmod\n-a always,exit -F arch=b64 -S ptrace -k ptrace_use\n-w /etc/audit/ -p wa -k audit_config\n-e 2",
+          "comment": "The final -e 2 locks the rules until reboot"
+        },
+        {
+          "cmd": "augenrules --load && auditctl -s | head -3",
+          "output": "enabled 2\nfailure 1\npid 812"
+        },
+        {
+          "cmd": "ausearch -k kmod -i --start today",
+          "output": "type=SYSCALL msg=audit(11/11/2026 09:14:02.113:5521) : arch=x86_64 syscall=finit_module success=yes exit=0 auid=admin uid=root exe=/usr/sbin/modprobe comm=modprobe key=kmod\ntype=PATH ... name=/lib/modules/6.8.0/extra/diag_helper.ko",
+          "comment": "An unexpected module from an 'extra' folder: investigate who loaded it"
+        }
+      ]
+    },
+    {
+      "id": "rootkit",
+      "type": "text",
+      "markdown": "## Verifying a suspect host\n\nWhen a kernel-level compromise is suspected, work from the outside in and trust nothing the host tells you without a second source.\n\n1. **Check the taint flags.** `cat /proc/sys/kernel/tainted` returns a bitmask. A non-zero value shows that an out-of-tree, unsigned or forced module was loaded.\n2. **Compare views.** List modules with `lsmod`, then compare against `/sys/module/` and the kernel log. A module that appears in one view but not another is a strong lead.\n3. **Inspect eBPF.** Run `bpftool prog show` and `bpftool net` to see loaded programs. Unknown programs attached to network or tracing hooks deserve attention.\n4. **Verify packages.** On RPM systems use `rpm -Va`; on Debian use `debsums -c`. Altered system binaries show up here.\n5. **Capture memory and disk, then analyze offline.** Acquire memory with a trusted tool and examine it later with Volatility, as covered in [Memory Forensics and Malware Analysis](/learn/security-operations-dfir/memory-forensics-and-malware-analysis).\n\nIf the host is production, coordinate the response through your [Advanced Incident Response](/learn/security-operations-dfir/advanced-incident-response) process before powering off, because shutting down destroys volatile evidence."
+    },
+    {
+      "id": "verify-term",
+      "type": "terminal",
+      "title": "Quick integrity checks",
+      "prompt": "root@host:~#",
+      "lines": [
+        {
+          "cmd": "cat /proc/sys/kernel/tainted",
+          "output": "12288",
+          "comment": "12288 = bits 12 and 13: out-of-tree and unsigned module"
+        },
+        {
+          "cmd": "cat /sys/kernel/security/lockdown",
+          "output": "none [integrity] confidentiality"
+        },
+        {
+          "cmd": "bpftool prog show | head -4",
+          "output": "41: kprobe  name trace_exec  tag 6b1c...  gpl\n        loaded_at 2026-11-10T22:01:44+0000  uid 0\n        xlated 312B  jited 201B  memlock 4096B",
+          "comment": "Is this program part of your approved monitoring stack?"
+        }
+      ]
+    },
+    {
+      "id": "mistakes",
+      "type": "text",
+      "markdown": "## Common mistakes and trade-offs\n\nHardening is a balance between safety and operability. Teams most often go wrong in four ways:\n\n- **Setting values without persistence.** A value changed with `sysctl -w` disappears at reboot, so the audit passes today and fails after the next patch window.\n- **Locking auditing too early.** With `-e 2`, any rule change needs a reboot. Test the rules thoroughly first, then lock them.\n- **Ignoring containers.** Containers share the host kernel, so one kernel flaw affects every container. Apply seccomp and an LSM profile to containers as well, and keep the kernel patched.\n- **Treating patching as optional.** Most kernel defenses reduce the impact of a flaw; they do not remove it. Track kernel advisories and use live patching where reboots are hard to schedule.\n\nRecord every deviation from the baseline with an owner and an expiry date. That list becomes a useful input for [Security Control Effectiveness Testing](/learn/security-operations-dfir/security-control-effectiveness-testing)."
+    },
+    {
+      "id": "tips",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Do not trust a compromised host's own tools",
+      "markdown": "If the kernel itself is tampered with, `ps`, `ls` and `lsmod` can all be made to lie. Use known-good binaries from read-only media, compare against a second view such as memory or disk analysis, and treat a clean result from the host as inconclusive, not as proof."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a Linux virtual machine you own, create `/etc/sysctl.d/90-hardening.conf` with the baseline above and run `sudo sysctl --system`. Then:\n\n1. Confirm each value with `sysctl kernel.kptr_restrict kernel.yama.ptrace_scope`.\n2. Add the three audit rules from the terminal example, load them, then run `sudo modprobe dummy` and find the event with `ausearch -k kmod -i`.\n3. Record `/proc/sys/kernel/tainted` and `/sys/kernel/security/lockdown`, and write one sentence on what each result tells you.\n4. Remove the module with `sudo modprobe -r dummy` and note the second audit event."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "KASLR",
+          "definition": "Randomizes the kernel's memory layout at boot."
+        },
+        {
+          "term": "Lockdown",
+          "definition": "A kernel mode that stops root from modifying the running kernel."
+        },
+        {
+          "term": "Seccomp",
+          "definition": "A filter limiting the system calls a process can make."
+        },
+        {
+          "term": "LSM",
+          "definition": "Linux Security Module, the framework behind SELinux and AppArmor."
+        },
+        {
+          "term": "Taint flag",
+          "definition": "A bitmask showing the kernel loaded unusual or unsupported code."
+        },
+        {
+          "term": "eBPF",
+          "definition": "A mechanism to run sandboxed programs inside the kernel."
+        },
+        {
+          "term": "auditd",
+          "definition": "The Linux audit daemon that records kernel events."
+        },
+        {
+          "term": "Secure Boot",
+          "definition": "Firmware verification of the bootloader and kernel signatures."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which setting stops a process from reading the memory of an unrelated process?",
+          "options": [
+            "kernel.yama.ptrace_scope = 1",
+            "kernel.dmesg_restrict = 1",
+            "fs.suid_dumpable = 0",
+            "net.ipv4.conf.all.rp_filter = 1"
+          ],
+          "answer": 0,
+          "explanation": "Yama ptrace_scope limits ptrace to parent-child relationships."
+        },
+        {
+          "question": "Which are kernel-level protections? Choose all that apply.",
+          "options": [
+            "Module signing",
+            "Lockdown mode",
+            "Seccomp",
+            "Browser pop-up blocker"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "The first three are kernel features; a pop-up blocker is unrelated."
+        },
+        {
+          "question": "A non-zero /proc/sys/kernel/tainted most likely means:",
+          "options": [
+            "The disk is full",
+            "An unusual or unsigned module was loaded",
+            "The firewall is off",
+            "Time is out of sync"
+          ],
+          "answer": 1,
+          "explanation": "Taint bits record loads of out-of-tree, unsigned or forced modules."
+        },
+        {
+          "question": "Why compare lsmod with /sys/module and memory analysis?",
+          "options": [
+            "Tampered tools can hide data in one view",
+            "It is faster",
+            "It is required by auditd",
+            "It encrypts the output"
+          ],
+          "answer": 0,
+          "explanation": "A discrepancy between independent views reveals hiding."
+        },
+        {
+          "question": "What does the audit rule option -e 2 do?",
+          "options": [
+            "Disables auditing",
+            "Locks the rules until reboot",
+            "Deletes old logs",
+            "Doubles log size"
+          ],
+          "answer": 1,
+          "explanation": "Immutable mode prevents an attacker from silently removing rules."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- The kernel is the foundation of trust, so harden it and verify it.\n- Layer controls: Secure Boot, lockdown, module signing, seccomp and an LSM.\n- Use `sysctl` and boot parameters for a reviewed, repeatable baseline.\n- Audit module loads, `ptrace` and rule changes with `auditd`, and lock the rules.\n- On a suspect host, compare independent views and analyze memory offline.\n- Related reading: [Advanced Threat Hunting](/learn/security-operations-dfir/advanced-threat-hunting)."
+    }
+  ],
+  "ar": {
+    "title": "أمن نواة Linux المتقدم",
+    "summary": "تعرّف على حمايات نواة Linux المدمجة، وكيف تحصّنها وتدقّقها، وكيف تتحقق من جهاز مشتبه به بحثاً عن عبث على مستوى النواة.",
+    "objectives": [
+      "وصف حمايات نواة Linux الرئيسية وما تمنعه كل منها",
+      "تطبيق خط أساس للتحصين عبر sysctl ومعاملات الإقلاع",
+      "ضبط قواعد auditd لأحداث مستوى النواة",
+      "التحقق من جهاز مشتبه به عبر أعلام التلوث ومنظورات الوحدات وقوائم eBPF"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يُستدعى مستجيب إلى خادم ويب «يبدو بطيئاً». لا يُظهر نظام حماية الأجهزة الطرفية (EDR) شيئاً، وتبدو نتيجة `ps` طبيعية، وسجلات التطبيق نظيفة، ومع ذلك تستمر حركة صادرة نحو وجهة نادرة كل بضع دقائق. حين لا يمكن الوثوق بقائمة العمليات ينتقل السؤال طبقةً أعمق: **ماذا تفعل النواة (Kernel)؟**\n\nنواة Linux هي الشيفرة الأعلى امتيازاً على الجهاز، وكل ما عداها، ومنه وكيل التسجيل لديك، يثق بها لتخبره الحقيقة. لذلك يهمّ أمن النواة المدافع مرتين: عليك **تحصين** النواة كي يصعب على المهاجم العبث بها، وعليك معرفة كيف **تتحقق** منها حين يُشتبه بجهاز. يبقى هذا الدرس دفاعياً: ستتعلم الحمايات التي توفرها النواة، وكيف تضبطها وتدقّقها، وكيف تكتشف علامات العبث على مستوى النواة في أنظمة تملكها. وهو يبني على [البنية الداخلية للمشرفات الافتراضية والمحاكاة الافتراضية](/learn/security-operations-dfir/hypervisor-and-virtualization-internals) ويمهّد لـ [التحليل الجنائي للذاكرة وتحليل البرمجيات الخبيثة](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)."
+      },
+      {
+        "id": "protections",
+        "type": "text",
+        "markdown": "## الحمايات المدمجة في النواة\n\nتأتي النواة الحديثة بطبقات كثيرة. اعرف ما تمنعه كل طبقة، لأن غياب طبقة يحدّد طريقة تحقيقك.\n\n| الحماية | وظيفتها | أين تتحقق منها |\n|:--|:--|:--|\n| **KASLR** | تعشّي عنوان تحميل النواة فلا يمكن افتراض عناوين ثابتة | `dmesg` و`/proc/kallsyms` (أصفار لغير الجذر) |\n| **SMEP / SMAP** | ميزتان في المعالج تمنعان النواة من تنفيذ ذاكرة المستخدم أو قراءتها خطأً | `grep -o 'smep' /proc/cpuinfo` |\n| **توقيع الوحدات (Module signing)** | يرفض وحدات النواة غير الموقّعة | `/proc/sys/kernel/modules_disabled` وإعدادات النواة |\n| **وضع القفل (Lockdown)** | يمنع الجذر من تعديل النواة العاملة (`/dev/mem` والوحدات غير الموقّعة وkexec) | `/sys/kernel/security/lockdown` |\n| **Seccomp** | يرشّح استدعاءات النظام المسموحة للعملية | `grep Seccomp /proc/<pid>/status` |\n| **وحدات الأمان (SELinux وAppArmor)** | تحكّم وصول إلزامي فوق صلاحيات الملفات | `getenforce` و`aa-status` |\n| **الإقلاع الآمن (Secure Boot)** | يتحقق من توقيع المحمّل والنواة عند التشغيل | `mokutil --sb-state` |\n\nلا يكفي ضابط واحد. يحمي Secure Boot سلسلة الإقلاع، ويحمي القفل النواةَ العاملة من الجذر، وتحدّ وحدة الأمان مما تصل إليه خدمة مخترَقة أصلاً. معاً تحوّل عبارة «حصل المهاجم على الجذر» من نهاية اللعبة إلى موقف أصعب بكثير عليه."
+      },
+      {
+        "id": "syscall-anim",
+        "type": "animation",
+        "kind": "layers",
+        "title": "الطبقات التي يمر بها استدعاء النظام",
+        "caption": "يمكن لكل طبقة أن توقف الطلب، والتسجيل في عدة طبقات يمنحك أدلة.",
+        "data": {
+          "layers": [
+            {
+              "label": "العملية",
+              "sub": "user space"
+            },
+            {
+              "label": "مرشّح Seccomp",
+              "sub": "syscall allow-list"
+            },
+            {
+              "label": "خطّاف LSM",
+              "sub": "SELinux / AppArmor"
+            },
+            {
+              "label": "نظام التدقيق",
+              "sub": "auditd rules"
+            },
+            {
+              "label": "النواة",
+              "sub": "ring 0"
+            }
+          ],
+          "steps": [
+            {
+              "layer": 0,
+              "packet": [
+                "open()"
+              ],
+              "caption": "تستدعي خدمة ويب الدالة open() على ملف."
+            },
+            {
+              "layer": 1,
+              "packet": [
+                "open()",
+                "seccomp"
+              ],
+              "caption": "يسمح ملف seccomp بـ open() فيستمر الاستدعاء، وأي استدعاء محظور يُقتل هنا."
+            },
+            {
+              "layer": 2,
+              "packet": [
+                "open()",
+                "label"
+              ],
+              "caption": "تقارن وحدة الأمان وسم العملية بوسم الملف وترفض الوصول إلى /etc/shadow."
+            },
+            {
+              "layer": 3,
+              "packet": [
+                "open()",
+                "denied"
+              ],
+              "caption": "يُكتب الرفض بسجل AVC يمكن لنظام SIEM التنبيه عليه."
+            },
+            {
+              "layer": 4,
+              "packet": [
+                "EACCES"
+              ],
+              "caption": "تعيد النواة خطأً للعملية، ولم يُقرأ الملف أبداً."
+            }
+          ]
+        }
+      },
+      {
+        "id": "sysctl",
+        "type": "text",
+        "markdown": "## التحصين عبر sysctl ومعاملات الإقلاع\n\nكثير من دفاعات النواة قابل للضبط. ضعها في ملف مستقل كي تبقى بعد إعادة التشغيل ويمكن مراجعتها في نظام التحكم بالإصدارات."
+      },
+      {
+        "id": "sysctl-code",
+        "type": "code",
+        "language": "ini",
+        "filename": "/etc/sysctl.d/90-hardening.conf",
+        "caption": "خط أساس لتحصين النواة",
+        "highlight": [
+          2,
+          5,
+          8
+        ],
+        "code": "# Hide kernel pointers and dmesg from unprivileged users\nkernel.kptr_restrict = 2\nkernel.dmesg_restrict = 1\n# Block unprivileged eBPF and restrict ptrace to parent processes\nkernel.unprivileged_bpf_disabled = 1\nkernel.yama.ptrace_scope = 1\n# Do not allow core dumps from setuid programs; limit perf use\nfs.suid_dumpable = 0\nkernel.perf_event_paranoid = 3\n# Network hygiene frequently checked in audits\nnet.ipv4.conf.all.rp_filter = 1\nnet.ipv4.conf.all.accept_redirects = 0"
+      },
+      {
+        "id": "sysctl-explain",
+        "type": "text",
+        "markdown": "تُخفي `kptr_restrict = 2` عناوين النواة عن الجميع، مما يُضعف تقنيات تسريب العناوين. وتُغلق `unprivileged_bpf_disabled = 1` سطح هجوم معروفاً، لأن eBPF ينفّذ شيفرة داخل النواة. وتمنع `ptrace_scope = 1` عمليةً من قراءة ذاكرة عملية غير مرتبطة بها، مما يحدّ من سرقة بيانات الاعتماد من الذاكرة.\n\nوتضيف معاملات الإقلاع المزيد: `lockdown=integrity` يفعّل القفل، و`module.sig_enforce=1` يفرض الوحدات الموقّعة، و`init_on_alloc=1` يصفّر الذاكرة عند التخصيص. بعد ضبطها تأكد عبر `cat /proc/cmdline`. وفي الإنتاج جرّب كل تغيير على خادم تجريبي أولاً، فبعض المشغّلات وأدوات المراقبة تحتاج eBPF أو ptrace."
+      },
+      {
+        "id": "audit",
+        "type": "text",
+        "markdown": "## تدقيق أحداث مستوى النواة\n\nلا يمكنك التحقيق فيما لم يُسجَّل أصلاً. يرتبط `auditd` بالنواة ويسجّل الأحداث ذات الصلة الأمنية. ركّز على الإجراءات التي تغيّر النواة نفسها: تحميل الوحدات، وتغيير الوقت، واستخدام `ptrace`، وتعديل قواعد التدقيق."
+      },
+      {
+        "id": "audit-term",
+        "type": "terminal",
+        "title": "auditd rules and a module-load event",
+        "prompt": "root@host:~#",
+        "lines": [
+          {
+            "cmd": "cat /etc/audit/rules.d/kernel.rules",
+            "output": "-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k kmod\n-a always,exit -F arch=b64 -S ptrace -k ptrace_use\n-w /etc/audit/ -p wa -k audit_config\n-e 2",
+            "comment": "الخيار الأخير -e 2 يقفل القواعد حتى إعادة التشغيل"
+          },
+          {
+            "cmd": "augenrules --load && auditctl -s | head -3",
+            "output": "enabled 2\nfailure 1\npid 812"
+          },
+          {
+            "cmd": "ausearch -k kmod -i --start today",
+            "output": "type=SYSCALL msg=audit(11/11/2026 09:14:02.113:5521) : arch=x86_64 syscall=finit_module success=yes exit=0 auid=admin uid=root exe=/usr/sbin/modprobe comm=modprobe key=kmod\ntype=PATH ... name=/lib/modules/6.8.0/extra/diag_helper.ko",
+            "comment": "وحدة غير متوقعة من مجلد extra: حقّق في من حمّلها"
+          }
+        ]
+      },
+      {
+        "id": "rootkit",
+        "type": "text",
+        "markdown": "## التحقق من جهاز مشتبه به\n\nحين يُشتبه باختراق على مستوى النواة، اعمل من الخارج إلى الداخل ولا تثق بما يخبرك به الجهاز دون مصدر ثانٍ.\n\n1. **افحص أعلام التلوث (Taint).** يعيد `cat /proc/sys/kernel/tainted` قناعاً بتّياً. القيمة غير الصفرية تدل على تحميل وحدة خارجية أو غير موقّعة أو مفروضة.\n2. **قارن المنظورات.** اعرض الوحدات بـ `lsmod` ثم قارنها بـ `/sys/module/` وسجل النواة. الوحدة التي تظهر في منظور دون آخر خيط قوي.\n3. **افحص eBPF.** شغّل `bpftool prog show` و`bpftool net` لرؤية البرامج المحمّلة. البرامج المجهولة المرتبطة بخطّافات الشبكة أو التتبّع تستحق الانتباه.\n4. **تحقق من الحزم.** في أنظمة RPM استخدم `rpm -Va`، وفي Debian استخدم `debsums -c`. تظهر هنا الملفات التنفيذية المعدّلة.\n5. **التقط الذاكرة والقرص ثم حلّلهما بعيداً عن الجهاز.** اجمع الذاكرة بأداة موثوقة وافحصها لاحقاً بـ Volatility كما في [التحليل الجنائي للذاكرة وتحليل البرمجيات الخبيثة](/learn/security-operations-dfir/memory-forensics-and-malware-analysis).\n\nوإن كان الجهاز إنتاجياً فنسّق الاستجابة عبر عمليتك في [الاستجابة المتقدمة للحوادث](/learn/security-operations-dfir/advanced-incident-response) قبل إيقافه، لأن إطفاءه يتلف الأدلة المتطايرة."
+      },
+      {
+        "id": "verify-term",
+        "type": "terminal",
+        "title": "Quick integrity checks",
+        "prompt": "root@host:~#",
+        "lines": [
+          {
+            "cmd": "cat /proc/sys/kernel/tainted",
+            "output": "12288",
+            "comment": "12288 = البتان 12 و13: وحدة خارجية وغير موقّعة"
+          },
+          {
+            "cmd": "cat /sys/kernel/security/lockdown",
+            "output": "none [integrity] confidentiality"
+          },
+          {
+            "cmd": "bpftool prog show | head -4",
+            "output": "41: kprobe  name trace_exec  tag 6b1c...  gpl\n        loaded_at 2026-11-10T22:01:44+0000  uid 0\n        xlated 312B  jited 201B  memlock 4096B",
+            "comment": "هل هذا البرنامج جزء من حزمة المراقبة المعتمدة؟"
+          }
+        ]
+      },
+      {
+        "id": "mistakes",
+        "type": "text",
+        "markdown": "## أخطاء شائعة وموازنات\n\nالتحصين موازنة بين الأمان وقابلية التشغيل. تخطئ الفرق غالباً بأربع طرق:\n\n- **ضبط القيم دون حفظها.** القيمة المعدّلة بـ `sysctl -w` تزول عند إعادة التشغيل، فيمرّ التدقيق اليوم ويفشل بعد نافذة التحديثات التالية.\n- **قفل التدقيق مبكراً.** مع `-e 2` يحتاج أي تعديل على القواعد إلى إعادة تشغيل. اختبر القواعد جيداً أولاً ثم اقفلها.\n- **تجاهل الحاويات.** تشارك الحاويات نواة المضيف، فيؤثر خلل واحد في النواة على كل الحاويات. طبّق seccomp وملف وحدة أمان على الحاويات أيضاً وأبقِ النواة محدَّثة.\n- **اعتبار التحديث اختيارياً.** معظم دفاعات النواة تخفّف أثر الخلل ولا تزيله. تابع نشرات النواة واستخدم الترقيع الحي حيث يصعب جدولة إعادة التشغيل.\n\nسجّل كل انحراف عن خط الأساس مع مالك وتاريخ انتهاء. تصبح هذه القائمة مدخلاً مفيداً لـ [اختبار فعالية الضوابط الأمنية](/learn/security-operations-dfir/security-control-effectiveness-testing)."
+      },
+      {
+        "id": "tips",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تثق بأدوات الجهاز المخترَق نفسه",
+        "markdown": "إذا عُبث بالنواة نفسها فقد تُجبَر `ps` و`ls` و`lsmod` على الكذب. استخدم ملفات تنفيذية سليمة من وسائط للقراءة فقط، وقارن بمنظور ثانٍ كتحليل الذاكرة أو القرص، واعتبر النتيجة النظيفة من الجهاز غير حاسمة لا دليلاً."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة Linux افتراضية تملكها، أنشئ الملف `/etc/sysctl.d/90-hardening.conf` بخط الأساس أعلاه ثم شغّل `sudo sysctl --system`. بعد ذلك:\n\n1. تأكد من كل قيمة بالأمر `sysctl kernel.kptr_restrict kernel.yama.ptrace_scope`.\n2. أضف قواعد التدقيق الثلاث من مثال الطرفية وحمّلها، ثم شغّل `sudo modprobe dummy` وابحث عن الحدث بالأمر `ausearch -k kmod -i`.\n3. سجّل قيمتي `/proc/sys/kernel/tainted` و`/sys/kernel/security/lockdown` واكتب جملة عمّا تخبرك به كل نتيجة.\n4. أزل الوحدة بـ `sudo modprobe -r dummy` ولاحظ حدث التدقيق الثاني."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "KASLR",
+            "definition": "تعشية تخطيط ذاكرة النواة عند الإقلاع."
+          },
+          {
+            "term": "القفل (Lockdown)",
+            "definition": "وضع في النواة يمنع الجذر من تعديل النواة العاملة."
+          },
+          {
+            "term": "Seccomp",
+            "definition": "مرشّح يحدّ من استدعاءات النظام المتاحة للعملية."
+          },
+          {
+            "term": "LSM",
+            "definition": "وحدة أمان Linux، الإطار الذي تقوم عليه SELinux وAppArmor."
+          },
+          {
+            "term": "Taint flag",
+            "definition": "قناع بتّي يبيّن أن النواة حمّلت شيفرة غير معتادة أو غير مدعومة."
+          },
+          {
+            "term": "eBPF",
+            "definition": "آلية لتشغيل برامج معزولة داخل النواة."
+          },
+          {
+            "term": "auditd",
+            "definition": "خدمة التدقيق في Linux التي تسجّل أحداث النواة."
+          },
+          {
+            "term": "Secure Boot",
+            "definition": "تحقق البرنامج الثابت من توقيعات المحمّل والنواة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي إعداد يمنع عملية من قراءة ذاكرة عملية غير مرتبطة بها؟",
+            "options": [
+              "kernel.yama.ptrace_scope = 1",
+              "kernel.dmesg_restrict = 1",
+              "fs.suid_dumpable = 0",
+              "net.ipv4.conf.all.rp_filter = 1"
+            ],
+            "answer": 0,
+            "explanation": "يحصر Yama استخدام ptrace في علاقة الأب بالابن."
+          },
+          {
+            "question": "أي مما يلي حمايات على مستوى النواة؟ اختر كل ما ينطبق.",
+            "options": [
+              "توقيع الوحدات",
+              "وضع القفل",
+              "Seccomp",
+              "مانع النوافذ المنبثقة في المتصفح"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "الثلاثة الأولى ميزات نواة، أما مانع النوافذ المنبثقة فلا علاقة له."
+          },
+          {
+            "question": "القيمة غير الصفرية في /proc/sys/kernel/tainted تعني على الأرجح:",
+            "options": [
+              "القرص ممتلئ",
+              "حُمّلت وحدة غير معتادة أو غير موقّعة",
+              "جدار الحماية متوقف",
+              "الوقت غير متزامن"
+            ],
+            "answer": 1,
+            "explanation": "تسجّل بتات التلوث تحميل وحدات خارجية أو غير موقّعة أو مفروضة."
+          },
+          {
+            "question": "لماذا تقارن lsmod مع /sys/module وتحليل الذاكرة؟",
+            "options": [
+              "الأدوات المعبوث بها قد تخفي البيانات في منظور واحد",
+              "لأنه أسرع",
+              "لأن auditd يتطلبه",
+              "لأنه يشفّر المخرجات"
+            ],
+            "answer": 0,
+            "explanation": "الفرق بين منظورات مستقلة يكشف الإخفاء."
+          },
+          {
+            "question": "ماذا يفعل خيار قاعدة التدقيق -e 2؟",
+            "options": [
+              "يعطّل التدقيق",
+              "يقفل القواعد حتى إعادة التشغيل",
+              "يحذف السجلات القديمة",
+              "يضاعف حجم السجل"
+            ],
+            "answer": 1,
+            "explanation": "يمنع الوضع الثابت المهاجم من إزالة القواعد بصمت."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- النواة أساس الثقة، فحصّنها وتحقق منها.\n- اجمع الضوابط في طبقات: Secure Boot والقفل وتوقيع الوحدات وseccomp ووحدة أمان.\n- استخدم `sysctl` ومعاملات الإقلاع لخط أساس مراجَع وقابل للتكرار.\n- دقّق تحميل الوحدات و`ptrace` وتغيير القواعد عبر `auditd` واقفل القواعد.\n- على الجهاز المشتبه به قارن منظورات مستقلة وحلّل الذاكرة بعيداً عنه.\n- قراءة ذات صلة: [الصيد المتقدم للتهديدات](/learn/security-operations-dfir/advanced-threat-hunting)."
+      }
+    ]
+  }
+}

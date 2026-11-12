@@ -1,0 +1,570 @@
+{
+ "slug": "database-point-in-time-recovery",
+ "title": "Database Point-in-Time Recovery",
+ "summary": "Combine base backups with archived transaction logs to restore a database to the moment before a mistake or attack, and secure the log archive that makes it possible.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain how base backups and transaction logs enable point-in-time recovery",
+  "Configure continuous WAL archiving in PostgreSQL",
+  "Choose a correct recovery target and perform a restore",
+  "Protect the log archive against tampering and deletion",
+  "Verify a restored database and measure RPO and RTO"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 14:32 an engineer runs a cleanup script against the production database instead of staging. A table of 400,000 customer orders is emptied. The last nightly backup is from 02:00, so restoring it would lose twelve hours of real orders. The business asked for a recovery point objective of five minutes.\n\nA nightly backup cannot meet that target. Point-in-time recovery (PITR) can. It restores a database to any chosen moment, such as 14:31, by replaying the changes recorded since the last full backup. The same method helps after ransomware, a bad deployment or a malicious insider, as long as the log of changes is complete and protected."
+  },
+  {
+   "id": "how",
+   "type": "text",
+   "markdown": "## Step 1: Understand the two ingredients\n\nPITR always needs two things:\n\n1. **A base backup**: a consistent copy of the database files taken at a known time.\n2. **A continuous log of changes**: every committed transaction, written in order. PostgreSQL calls this the write-ahead log (WAL); MySQL calls it the binary log (binlog); SQL Server uses transaction log backups.\n\nTo recover, you restore the base backup, then replay the log forward and stop at your target. If any log segment is missing, replay stops at the gap, and everything after it is lost. Log completeness is therefore as important as the base backup.\n\n| Engine | Change log | Archive method | Recover to time |\n|:--|:--|:--|:--|\n| PostgreSQL | WAL segments | `archive_command` or `pg_receivewal` | `recovery_target_time` |\n| MySQL / MariaDB | Binary log | `mysqlbinlog` copy, replication | `mysqlbinlog --stop-datetime` |\n| SQL Server | Transaction log | `BACKUP LOG` schedule | `RESTORE ... STOPAT` |\n\nThe rest of this lesson uses PostgreSQL, but the design carries over to the others."
+  },
+  {
+   "id": "pitr-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Recovering to 14:31",
+   "data": {
+    "actors": [
+     {
+      "id": "db",
+      "label": "Production DB",
+      "sub": "db01",
+      "icon": "database"
+     },
+     {
+      "id": "arc",
+      "label": "WAL archive",
+      "sub": "immutable bucket",
+      "icon": "lock"
+     },
+     {
+      "id": "dba",
+      "label": "DBA",
+      "sub": "alice",
+      "icon": "user"
+     },
+     {
+      "id": "rec",
+      "label": "Recovery host",
+      "sub": "db-restore",
+      "icon": "server"
+     }
+    ],
+    "steps": [
+     {
+      "from": "db",
+      "to": "arc",
+      "label": "Ship WAL",
+      "detail": "every segment",
+      "note": "Each completed WAL segment is copied to the archive within a minute.",
+      "tone": "secure"
+     },
+     {
+      "from": "db",
+      "to": "db",
+      "label": "14:32 bad DELETE",
+      "note": "A destructive statement commits and is recorded in the log like any other.",
+      "tone": "danger"
+     },
+     {
+      "from": "dba",
+      "to": "rec",
+      "label": "Stop and restore base backup",
+      "detail": "02:00",
+      "note": "The DBA restores the latest base backup to a separate host, never over production."
+     },
+     {
+      "from": "arc",
+      "to": "rec",
+      "label": "Fetch WAL",
+      "detail": "02:00 to 14:31",
+      "note": "The recovery host pulls WAL segments through restore_command."
+     },
+     {
+      "from": "rec",
+      "to": "rec",
+      "label": "Replay, stop at 14:31:00",
+      "note": "Replay halts just before the bad transaction.",
+      "tone": "success"
+     },
+     {
+      "from": "dba",
+      "to": "rec",
+      "label": "Verify rows, then promote",
+      "note": "Counts and checksums are compared before the database goes live.",
+      "tone": "secure"
+     }
+    ]
+   }
+  },
+  {
+   "id": "arch",
+   "type": "text",
+   "markdown": "## Step 2: Turn on continuous archiving\n\nArchiving must be enabled before the incident. Without it, only full backups exist and recovery is limited to their timestamps.\n\nA failed `archive_command` silently fills the disk of the production server, so monitor it. Use a tool built for the job, such as pgBackRest or WAL-G, instead of a hand-written `cp`. These tools compress, encrypt, verify checksums and talk to object storage.\n\nThe settings below are typical."
+  },
+  {
+   "id": "conf",
+   "type": "code",
+   "language": "ini",
+   "filename": "postgresql.conf",
+   "caption": "Continuous archiving with pgBackRest. The stanza name and paths are examples.",
+   "code": "wal_level = replica\narchive_mode = on\narchive_command = 'pgbackrest --stanza=orders archive-push %p'\narchive_timeout = 60        # force a segment at least every minute\nmax_wal_senders = 5\n\n# /etc/pgbackrest/pgbackrest.conf\n[global]\nrepo1-type=s3\nrepo1-s3-bucket=example-db-archive\nrepo1-s3-endpoint=s3.example.com\nrepo1-s3-region=us-east-1\nrepo1-cipher-type=aes-256-cbc\nrepo1-cipher-pass=<from-vault>\nrepo1-retention-full=4\nrepo1-retention-diff=7\nstart-fast=y\n\n[orders]\npg1-path=/var/lib/postgresql/16/main"
+  },
+  {
+   "id": "secure",
+   "type": "text",
+   "markdown": "## Step 3: Secure the archive\n\nThe archive contains every change ever made, including sensitive rows. It is also the single thing an attacker must destroy to make PITR impossible. Protect it like production data and like a backup repository:\n\n- **Separate credentials.** The database host may write segments but not delete them. Retention runs from a different identity. See [Backup access control](/learn/security-architecture-resilience/backup-access-control).\n- **Encrypt** archives with a key kept in a vault, with a second copy of the key offline. Losing the key loses the backups.\n- **Immutability.** Keep archive objects under write-once retention so a stolen credential cannot erase history. See [Immutable and offline backups](/learn/security-architecture-resilience/immutable-and-offline-backups).\n- **Monitor gaps.** Alert when no segment has arrived for five minutes, or when `pg_stat_archiver` reports failures.\n- **Isolate the restore host** and give it only read access to the archive.\n\nAlso remember that a point-in-time restore replays whatever happened, including an attacker's changes. Choose the target before the malicious activity began, which means you need audit logs to know when that was."
+  },
+  {
+   "id": "restore-term",
+   "type": "terminal",
+   "title": "Restore to a point in time with pgBackRest",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "pgbackrest --stanza=orders info",
+     "prompt": "db-restore$",
+     "output": "stanza: orders\n    status: ok\n    full backup: 20261112-020001F\n        timestamp start/stop: 2026-11-12 02:00:01 / 02:11:44\n        database size: 84.2GB\n    wal archive min/max: 000000010000002A00000011 / 000000010000002A000000C7",
+     "comment": "The archive is healthy and covers the target. Confirm the maximum is later than 14:31."
+    },
+    {
+     "cmd": "pgbackrest --stanza=orders --delta --type=time \"--target=2026-11-12 14:31:00+00\" --target-action=pause restore",
+     "prompt": "db-restore$",
+     "output": "INFO: restore command begin 2.53: --target=2026-11-12 14:31:00+00 --type=time\nINFO: restore backup set 20261112-020001F\nINFO: write /var/lib/postgresql/16/main/postgresql.auto.conf\nINFO: restore command end: completed successfully (11m 20s)",
+     "comment": "target-action=pause lets you inspect the data before making it permanent."
+    },
+    {
+     "cmd": "psql -c \"SELECT count(*) FROM orders;\"",
+     "prompt": "db-restore$",
+     "output": " count\n--------\n 412907\n(1 row)",
+     "comment": "The orders are back. Now run pg_wal_replay_resume() to promote."
+    }
+   ]
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Never restore over production first",
+   "markdown": "Restore to a separate host, verify, and only then redirect the application or copy the missing rows back. Overwriting production on the first attempt removes your evidence and leaves no second chance if you chose the wrong target time."
+  },
+  {
+   "id": "targets",
+   "type": "text",
+   "markdown": "## Choosing the right recovery target\n\nA wrong target is the most common reason a PITR attempt fails. PostgreSQL offers several kinds.\n\n| Target | Setting | Best for |\n|:--|:--|:--|\n| Time | `recovery_target_time` | A known incident time from logs |\n| Transaction ID | `recovery_target_xid` | Exact stop before one bad transaction |\n| Named point | `recovery_target_name` | Before a planned risky change, using `pg_create_restore_point()` |\n| End of log | no target | Hardware failure with nothing to undo |\n\nBefore a risky migration, create a named restore point. It costs nothing and removes guesswork later. When the cause is an attack, find the first malicious statement in the audit log, then pick a time just before it. Also note the timeline: after a recovery, PostgreSQL starts a new timeline so that old and new history never mix. Keep archives from all timelines."
+  },
+  {
+   "id": "verify",
+   "type": "text",
+   "markdown": "## Step 4: Verify and measure\n\nAfter replay, do not trust the result until you check it.\n\n1. **Row counts and key totals** for important tables, compared with business reports.\n2. **Integrity checks**: `pg_amcheck` or application-level reconciliation, such as order totals against payments.\n3. **Latest transaction**: the newest row should be seconds before the target time.\n4. **Application smoke test** against the restored copy.\n\nRecord two numbers on every test. The **achieved RPO** is the gap between the failure and the last recovered transaction. The **achieved RTO** is the elapsed time from declaring the incident to a working database. Compare both with the targets in [Recovery point objective (RPO)](/learn/security-architecture-resilience/recovery-point-objective-rpo) and [Recovery time objective (RTO)](/learn/security-architecture-resilience/recovery-time-objective-rto). In the example above, restore took 11 minutes of copying and replay, but total RTO also included the 20 minutes spent deciding on the target time. Practice shortens that decision time more than any tuning."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use a throwaway PostgreSQL instance in a lab VM or container you own.\n\n1. Create a database with a table of 1,000 rows and enable `archive_mode` with a local directory as the archive.\n2. Take a base backup with `pg_basebackup`.\n3. Insert 500 more rows and note the time. Wait one minute, then run `DELETE FROM` on the table and note the time again.\n4. Switch the WAL segment with `SELECT pg_switch_wal();`.\n5. Restore the base backup to a new data directory, set `restore_command` and `recovery_target_time` to one second before the delete, and start the server.\n6. Confirm 1,500 rows exist, then write down the achieved RPO and RTO."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "PITR",
+     "definition": "Point-in-time recovery: restoring a database to a chosen moment."
+    },
+    {
+     "term": "Base backup",
+     "definition": "A consistent full copy of the database files."
+    },
+    {
+     "term": "WAL",
+     "definition": "Write-ahead log: PostgreSQL's ordered record of changes."
+    },
+    {
+     "term": "Binlog",
+     "definition": "MySQL's binary log of data changes."
+    },
+    {
+     "term": "Recovery target",
+     "definition": "The time, transaction or named point where replay stops."
+    },
+    {
+     "term": "WAL archive",
+     "definition": "Long-term storage of completed WAL segments."
+    },
+    {
+     "term": "pgBackRest",
+     "definition": "A backup tool for PostgreSQL with archiving, encryption and restore support."
+    },
+    {
+     "term": "Achieved RPO",
+     "definition": "The measured data loss from a real or test recovery."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What two components does point-in-time recovery require?",
+     "options": [
+      "A base backup and a continuous change log",
+      "Two full backups",
+      "A replica and a firewall",
+      "A snapshot and an email"
+     ],
+     "answer": 0,
+     "explanation": "The base backup gives the starting state and the log replays changes up to the target."
+    },
+    {
+     "question": "What happens if one WAL segment is missing from the archive?",
+     "options": [
+      "Replay continues normally",
+      "Replay stops at the gap and later changes are lost",
+      "The database restores faster",
+      "The base backup is deleted"
+     ],
+     "answer": 1,
+     "explanation": "Changes must be replayed in order, so a gap blocks everything after it."
+    },
+    {
+     "question": "Which controls protect the WAL archive? (Choose all that apply.)",
+     "options": [
+      "Write-only credentials for the database host",
+      "Write-once retention",
+      "Encryption with a vaulted key",
+      "Granting the host delete rights"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "The first three limit what an attacker or mistake can destroy. Delete rights on the host defeat the design."
+    },
+    {
+     "question": "Why restore to a separate host first?",
+     "options": [
+      "To keep evidence and allow a second attempt at the target time",
+      "Because production cannot run PostgreSQL",
+      "To avoid encryption",
+      "It is required by licenses"
+     ],
+     "answer": 0,
+     "explanation": "Verifying on a copy avoids making a wrong choice permanent."
+    },
+    {
+     "question": "Which values should you record after each recovery test? (Choose all that apply.)",
+     "options": [
+      "Achieved RPO",
+      "Achieved RTO",
+      "Row counts compared with business reports",
+      "The color of the dashboard"
+     ],
+     "answer": [
+      0,
+      1,
+      2
+     ],
+     "explanation": "Measured RPO, RTO and reconciliation results show whether recovery meets business needs."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- PITR combines a base backup with a complete, ordered change log.\n- Enable continuous archiving before you need it and monitor it for gaps.\n- Protect the archive with separate credentials, encryption and immutability.\n- Restore to a separate host, stop before the bad transaction, then verify.\n- Measure achieved RPO and RTO in every test.\n\nNext, automate the rebuild of the surrounding systems in [Infrastructure recovery automation](/learn/security-architecture-resilience/infrastructure-recovery-automation)."
+  }
+ ],
+ "ar": {
+  "title": "استعادة قواعد البيانات إلى نقطة زمنية محددة",
+  "summary": "اجمع بين النسخ الأساسية وسجلات المعاملات المؤرشفة لاستعادة قاعدة البيانات إلى لحظة ما قبل الخطأ أو الهجوم، وأمّن أرشيف السجلات الذي يجعل ذلك ممكنًا.",
+  "objectives": [
+   "شرح كيف تتيح النسخ الأساسية وسجلات المعاملات الاستعادة إلى نقطة زمنية",
+   "ضبط أرشفة WAL المستمرة في PostgreSQL",
+   "اختيار هدف استعادة صحيح وتنفيذ الاستعادة",
+   "حماية أرشيف السجلات من العبث والحذف",
+   "التحقق من قاعدة البيانات المستعادة وقياس RPO وRTO"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في الساعة 14:32 ينفّذ مهندس سكربت تنظيف على قاعدة بيانات الإنتاج بدل بيئة الاختبار، فيُفرَّغ جدول يضم 400 ألف طلب عميل. آخر نسخة احتياطية ليلية كانت في الساعة 02:00، واستعادتها تعني خسارة اثنتي عشرة ساعة من الطلبات الحقيقية، بينما طلبت المؤسسة هدف نقطة استعادة (RPO) قدره خمس دقائق.\n\nلا تستطيع النسخة الليلية تحقيق هذا الهدف، لكن الاستعادة إلى نقطة زمنية (PITR) تستطيع. فهي تعيد قاعدة البيانات إلى أي لحظة تختارها، كالساعة 14:31، بإعادة تنفيذ التغييرات المسجّلة منذ آخر نسخة كاملة. وتنفع الطريقة نفسها بعد هجوم الفدية أو نشر خاطئ أو موظف داخلي خبيث، شريطة أن يكون سجل التغييرات كاملًا ومحميًا."
+   },
+   {
+    "id": "how",
+    "type": "text",
+    "markdown": "## الخطوة الأولى: افهم المكوّنين\n\nتحتاج الاستعادة إلى نقطة زمنية دائمًا إلى أمرين:\n\n1. **نسخة أساسية**: نسخة متسقة من ملفات قاعدة البيانات أُخذت في وقت معروف.\n2. **سجل مستمر للتغييرات**: كل معاملة مُثبَّتة مكتوبة بالترتيب. يسميه PostgreSQL سجل الكتابة المسبقة (WAL)، ويسميه MySQL السجل الثنائي (binlog)، ويستخدم SQL Server نسخ سجل المعاملات.\n\nللاستعادة تسترجع النسخة الأساسية ثم تعيد تشغيل السجل إلى الأمام وتتوقف عند هدفك. وإذا فُقد أي مقطع من السجل يتوقف التشغيل عند الفجوة ويضيع كل ما بعدها. لذا فاكتمال السجل بأهمية النسخة الأساسية نفسها.\n\n| المحرّك | سجل التغييرات | طريقة الأرشفة | الاستعادة إلى وقت |\n|:--|:--|:--|:--|\n| PostgreSQL | مقاطع WAL | `archive_command` أو `pg_receivewal` | `recovery_target_time` |\n| MySQL / MariaDB | السجل الثنائي | نسخ `mysqlbinlog` أو التماثل | `mysqlbinlog --stop-datetime` |\n| SQL Server | سجل المعاملات | جدولة `BACKUP LOG` | `RESTORE ... STOPAT` |\n\nيستخدم باقي الدرس PostgreSQL، لكن التصميم ينطبق على المحركات الأخرى."
+   },
+   {
+    "id": "pitr-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "الاستعادة إلى الساعة 14:31",
+    "data": {
+     "actors": [
+      {
+       "id": "db",
+       "label": "قاعدة الإنتاج",
+       "sub": "db01",
+       "icon": "database"
+      },
+      {
+       "id": "arc",
+       "label": "أرشيف WAL",
+       "sub": "حاوية غير قابلة للتعديل",
+       "icon": "lock"
+      },
+      {
+       "id": "dba",
+       "label": "DBA",
+       "sub": "alice",
+       "icon": "user"
+      },
+      {
+       "id": "rec",
+       "label": "مضيف الاستعادة",
+       "sub": "db-restore",
+       "icon": "server"
+      }
+     ],
+     "steps": [
+      {
+       "from": "db",
+       "to": "arc",
+       "label": "شحن WAL",
+       "detail": "كل مقطع",
+       "note": "يُنسخ كل مقطع WAL مكتمل إلى الأرشيف خلال دقيقة.",
+       "tone": "secure"
+      },
+      {
+       "from": "db",
+       "to": "db",
+       "label": "14:32 أمر DELETE خاطئ",
+       "note": "تُثبَّت جملة مدمّرة وتُسجَّل في السجل كأي جملة أخرى.",
+       "tone": "danger"
+      },
+      {
+       "from": "dba",
+       "to": "rec",
+       "label": "إيقاف واستعادة النسخة الأساسية",
+       "detail": "02:00",
+       "note": "يستعيد مسؤول القاعدة أحدث نسخة أساسية على مضيف منفصل، وليس فوق الإنتاج."
+      },
+      {
+       "from": "arc",
+       "to": "rec",
+       "label": "جلب WAL",
+       "detail": "02:00 to 14:31",
+       "note": "يسحب مضيف الاستعادة مقاطع WAL عبر restore_command."
+      },
+      {
+       "from": "rec",
+       "to": "rec",
+       "label": "إعادة التنفيذ والتوقف عند 14:31:00",
+       "note": "تتوقف إعادة التنفيذ قبل المعاملة الخاطئة مباشرة.",
+       "tone": "success"
+      },
+      {
+       "from": "dba",
+       "to": "rec",
+       "label": "التحقق من الصفوف ثم الترقية",
+       "note": "تُقارَن الأعداد والمجاميع الاختبارية قبل تشغيل القاعدة.",
+       "tone": "secure"
+      }
+     ]
+    }
+   },
+   {
+    "id": "arch",
+    "type": "text",
+    "markdown": "## الخطوة الثانية: فعّل الأرشفة المستمرة\n\nيجب تفعيل الأرشفة قبل وقوع الحادث. فبدونها لا توجد إلا نسخ كاملة، وتقتصر الاستعادة على أوقاتها.\n\nالفشل في `archive_command` يملأ قرص خادم الإنتاج بصمت، فراقبه. واستخدم أداة مصممة لهذه المهمة مثل pgBackRest أو WAL-G بدل أمر `cp` مكتوب يدويًا، فهي تضغط وتشفّر وتتحقق من المجاميع الاختبارية وتتعامل مع التخزين الكائني.\n\nالإعدادات الآتية نموذجية."
+   },
+   {
+    "id": "conf",
+    "type": "code",
+    "language": "ini",
+    "filename": "postgresql.conf",
+    "caption": "أرشفة مستمرة بواسطة pgBackRest. اسم الـ stanza والمسارات أمثلة.",
+    "code": "wal_level = replica\narchive_mode = on\narchive_command = 'pgbackrest --stanza=orders archive-push %p'\narchive_timeout = 60        # force a segment at least every minute\nmax_wal_senders = 5\n\n# /etc/pgbackrest/pgbackrest.conf\n[global]\nrepo1-type=s3\nrepo1-s3-bucket=example-db-archive\nrepo1-s3-endpoint=s3.example.com\nrepo1-s3-region=us-east-1\nrepo1-cipher-type=aes-256-cbc\nrepo1-cipher-pass=<from-vault>\nrepo1-retention-full=4\nrepo1-retention-diff=7\nstart-fast=y\n\n[orders]\npg1-path=/var/lib/postgresql/16/main"
+   },
+   {
+    "id": "secure",
+    "type": "text",
+    "markdown": "## الخطوة الثالثة: أمّن الأرشيف\n\nيحتوي الأرشيف كل تغيير جرى على الإطلاق، بما في ذلك الصفوف الحساسة. وهو أيضًا الشيء الوحيد الذي يجب على المهاجم تدميره ليجعل PITR مستحيلة. احمِه كما تحمي بيانات الإنتاج ومستودع النسخ الاحتياطي:\n\n- **بيانات اعتماد منفصلة.** يستطيع مضيف القاعدة كتابة المقاطع لا حذفها، ويجري الاحتفاظ والتنظيف بهوية مختلفة. راجع [التحكم في الوصول إلى النسخ الاحتياطية](/learn/security-architecture-resilience/backup-access-control).\n- **التشفير** بمفتاح محفوظ في خزنة مع نسخة ثانية دون اتصال. فقدان المفتاح يعني فقدان النسخ.\n- **عدم القابلية للتعديل.** احتفظ بكائنات الأرشيف تحت حفظ لمرة واحدة حتى لا تمحو بيانات اعتماد مسروقة السجل. راجع [النسخ الاحتياطية غير القابلة للتعديل ودون اتصال](/learn/security-architecture-resilience/immutable-and-offline-backups).\n- **راقب الفجوات.** نبّه عند عدم وصول أي مقطع خلال خمس دقائق أو عندما يبلّغ `pg_stat_archiver` عن إخفاقات.\n- **اعزل مضيف الاستعادة** وامنحه وصول قراءة فقط إلى الأرشيف.\n\nوتذكّر أن الاستعادة إلى نقطة زمنية تعيد تنفيذ كل ما حدث، بما فيه تغييرات المهاجم. اختر هدفًا قبل بدء النشاط الخبيث، وهذا يتطلب سجلات تدقيق لمعرفة وقته."
+   },
+   {
+    "id": "restore-term",
+    "type": "terminal",
+    "title": "الاستعادة إلى نقطة زمنية بواسطة pgBackRest",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "pgbackrest --stanza=orders info",
+      "prompt": "db-restore$",
+      "output": "stanza: orders\n    status: ok\n    full backup: 20261112-020001F\n        timestamp start/stop: 2026-11-12 02:00:01 / 02:11:44\n        database size: 84.2GB\n    wal archive min/max: 000000010000002A00000011 / 000000010000002A000000C7",
+      "comment": "الأرشيف سليم ويغطي الهدف. تأكد أن الحد الأقصى أحدث من 14:31."
+     },
+     {
+      "cmd": "pgbackrest --stanza=orders --delta --type=time \"--target=2026-11-12 14:31:00+00\" --target-action=pause restore",
+      "prompt": "db-restore$",
+      "output": "INFO: restore command begin 2.53: --target=2026-11-12 14:31:00+00 --type=time\nINFO: restore backup set 20261112-020001F\nINFO: write /var/lib/postgresql/16/main/postgresql.auto.conf\nINFO: restore command end: completed successfully (11m 20s)",
+      "comment": "يتيح target-action=pause فحص البيانات قبل تثبيتها نهائيًا."
+     },
+     {
+      "cmd": "psql -c \"SELECT count(*) FROM orders;\"",
+      "prompt": "db-restore$",
+      "output": " count\n--------\n 412907\n(1 row)",
+      "comment": "عادت الطلبات. شغّل الآن pg_wal_replay_resume() للترقية."
+     }
+    ]
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تستعد فوق الإنتاج أولًا",
+    "markdown": "استعد على مضيف منفصل، وتحقق، ثم وجّه التطبيق أو انسخ الصفوف المفقودة فقط. الكتابة فوق الإنتاج من المحاولة الأولى تزيل الأدلة ولا تترك فرصة ثانية إن اخترت وقتًا خاطئًا."
+   },
+   {
+    "id": "targets",
+    "type": "text",
+    "markdown": "## اختيار هدف الاستعادة الصحيح\n\nأكثر أسباب فشل محاولات PITR شيوعًا هو اختيار هدف خاطئ. ويقدّم PostgreSQL أنواعًا عدة.\n\n| الهدف | الإعداد | الأنسب لـ |\n|:--|:--|:--|\n| الوقت | `recovery_target_time` | وقت حادث معروف من السجلات |\n| معرّف المعاملة | `recovery_target_xid` | التوقف بدقة قبل معاملة خاطئة واحدة |\n| نقطة مسماة | `recovery_target_name` | ما قبل تغيير محفوف بالمخاطر مخطط له، باستخدام `pg_create_restore_point()` |\n| نهاية السجل | بلا هدف | عطل عتادي لا يوجد ما يُتراجع عنه |\n\nأنشئ نقطة استعادة مسماة قبل أي ترحيل محفوف بالمخاطر؛ فهي بلا كلفة وتزيل التخمين لاحقًا. وحين يكون السبب هجومًا فابحث عن أول جملة خبيثة في سجل التدقيق ثم اختر وقتًا قبلها مباشرة. ولاحظ الخط الزمني (timeline) أيضًا: بعد الاستعادة يبدأ PostgreSQL خطًا زمنيًا جديدًا حتى لا يختلط التاريخان القديم والجديد، فاحتفظ بأرشيفات كل الخطوط الزمنية."
+   },
+   {
+    "id": "verify",
+    "type": "text",
+    "markdown": "## الخطوة الرابعة: تحقّق وقِس\n\nبعد إعادة التنفيذ لا تثق بالنتيجة قبل التحقق منها.\n\n1. **أعداد الصفوف والمجاميع المفتاحية** للجداول المهمة، مقارنةً بتقارير الأعمال.\n2. **فحوص السلامة**: `pg_amcheck` أو مطابقة على مستوى التطبيق، كمقارنة مجاميع الطلبات بالمدفوعات.\n3. **آخر معاملة**: يجب أن يسبق أحدث صف وقت الهدف بثوانٍ.\n4. **اختبار دخان للتطبيق** على النسخة المستعادة.\n\nسجّل رقمين في كل اختبار. **RPO المتحقق** هو الفجوة بين الفشل وآخر معاملة مستعادة. و**RTO المتحقق** هو الزمن المنقضي من إعلان الحادث حتى تعمل القاعدة. قارنهما بالأهداف في [هدف نقطة الاستعادة (RPO)](/learn/security-architecture-resilience/recovery-point-objective-rpo) و[هدف زمن الاستعادة (RTO)](/learn/security-architecture-resilience/recovery-time-objective-rto). في المثال أعلاه استغرق النسخ وإعادة التنفيذ 11 دقيقة، لكن RTO الكلي شمل أيضًا 20 دقيقة قضيناها في تحديد وقت الهدف. والتدرّب يقصّر زمن القرار أكثر من أي ضبط تقني."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم نسخة PostgreSQL مؤقتة في آلة افتراضية مخبرية أو حاوية تملكها.\n\n1. أنشئ قاعدة بيانات بجدول من 1000 صف وفعّل `archive_mode` مع مجلد محلي أرشيفًا.\n2. خذ نسخة أساسية بالأمر `pg_basebackup`.\n3. أدخل 500 صف إضافية ودوّن الوقت. انتظر دقيقة ثم نفّذ `DELETE FROM` على الجدول ودوّن الوقت مجددًا.\n4. بدّل مقطع WAL بالأمر `SELECT pg_switch_wal();`.\n5. استعد النسخة الأساسية إلى مجلد بيانات جديد، واضبط `restore_command` و`recovery_target_time` على ثانية قبل الحذف، ثم شغّل الخادم.\n6. تأكد من وجود 1500 صف، ثم دوّن RPO وRTO المتحققين."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "المصطلحات الأساسية",
+    "items": [
+     {
+      "term": "PITR",
+      "definition": "الاستعادة إلى نقطة زمنية: إعادة قاعدة البيانات إلى لحظة محددة."
+     },
+     {
+      "term": "النسخة الأساسية",
+      "definition": "نسخة كاملة متسقة من ملفات قاعدة البيانات."
+     },
+     {
+      "term": "WAL",
+      "definition": "سجل الكتابة المسبقة: سجل PostgreSQL المرتّب للتغييرات."
+     },
+     {
+      "term": "Binlog",
+      "definition": "السجل الثنائي لتغييرات البيانات في MySQL."
+     },
+     {
+      "term": "هدف الاستعادة",
+      "definition": "الوقت أو المعاملة أو النقطة المسماة التي تتوقف عندها إعادة التنفيذ."
+     },
+     {
+      "term": "أرشيف WAL",
+      "definition": "تخزين طويل الأمد لمقاطع WAL المكتملة."
+     },
+     {
+      "term": "pgBackRest",
+      "definition": "أداة نسخ احتياطي لـ PostgreSQL تدعم الأرشفة والتشفير والاستعادة."
+     },
+     {
+      "term": "RPO المتحقق",
+      "definition": "فقدان البيانات المقيس في استعادة حقيقية أو تجريبية."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ما المكوّنان اللذان تتطلبهما الاستعادة إلى نقطة زمنية؟",
+      "options": [
+       "نسخة أساسية وسجل تغييرات مستمر",
+       "نسختان كاملتان",
+       "نسخة متماثلة وجدار حماية",
+       "لقطة وبريد إلكتروني"
+      ],
+      "answer": 0,
+      "explanation": "تعطي النسخة الأساسية الحالة الابتدائية، ويعيد السجل تنفيذ التغييرات حتى الهدف."
+     },
+     {
+      "question": "ماذا يحدث إذا فُقد مقطع WAL واحد من الأرشيف؟",
+      "options": [
+       "تستمر إعادة التنفيذ بصورة طبيعية",
+       "تتوقف إعادة التنفيذ عند الفجوة وتضيع التغييرات اللاحقة",
+       "تُستعاد القاعدة أسرع",
+       "تُحذف النسخة الأساسية"
+      ],
+      "answer": 1,
+      "explanation": "يجب إعادة تنفيذ التغييرات بالترتيب، لذا تحجب الفجوة كل ما بعدها."
+     },
+     {
+      "question": "أي الضوابط تحمي أرشيف WAL؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "بيانات اعتماد كتابة فقط لمضيف القاعدة",
+       "حفظ لمرة واحدة",
+       "تشفير بمفتاح في خزنة",
+       "منح المضيف صلاحية الحذف"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "تحدّ الثلاثة الأولى مما يستطيع مهاجم أو خطأ تدميره، أما صلاحية الحذف للمضيف فتُبطل التصميم."
+     },
+     {
+      "question": "لماذا تُجرى الاستعادة أولًا على مضيف منفصل؟",
+      "options": [
+       "للاحتفاظ بالأدلة وإتاحة محاولة ثانية لوقت الهدف",
+       "لأن الإنتاج لا يشغّل PostgreSQL",
+       "لتجنب التشفير",
+       "تشترطه التراخيص"
+      ],
+      "answer": 0,
+      "explanation": "التحقق على نسخة يمنع تثبيت اختيار خاطئ نهائيًا."
+     },
+     {
+      "question": "أي القيم ينبغي تسجيلها بعد كل اختبار استعادة؟ (اختر كل ما ينطبق.)",
+      "options": [
+       "RPO المتحقق",
+       "RTO المتحقق",
+       "أعداد الصفوف مقارنة بتقارير الأعمال",
+       "لون لوحة المتابعة"
+      ],
+      "answer": [
+       0,
+       1,
+       2
+      ],
+      "explanation": "تبيّن قياسات RPO وRTO ونتائج المطابقة هل تفي الاستعادة باحتياجات الأعمال."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- تجمع PITR بين نسخة أساسية وسجل تغييرات كامل ومرتّب.\n- فعّل الأرشفة المستمرة قبل أن تحتاج إليها وراقب الفجوات.\n- احمِ الأرشيف ببيانات اعتماد منفصلة وتشفير وعدم قابلية للتعديل.\n- استعد على مضيف منفصل، وتوقف قبل المعاملة الخاطئة، ثم تحقّق.\n- قِس RPO وRTO المتحققين في كل اختبار.\n\nثم أتمت إعادة بناء الأنظمة المحيطة في [أتمتة استعادة البنية التحتية](/learn/security-architecture-resilience/infrastructure-recovery-automation)."
+   }
+  ]
+ }
+}

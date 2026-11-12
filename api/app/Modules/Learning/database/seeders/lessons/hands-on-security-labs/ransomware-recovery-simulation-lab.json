@@ -1,0 +1,624 @@
+{
+  "slug": "ransomware-recovery-simulation-lab",
+  "title": "Ransomware Recovery Simulation Lab",
+  "summary": "Practice ransomware recovery on a throwaway VM: set RPO and RTO, simulate the effect harmlessly, isolate, check backups, restore from before the first change and verify.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Define RPO and RTO for lab systems",
+    "Explain the 3-2-1-1 backup pattern and immutability",
+    "Isolate, protect backups and find the earliest safe restore point",
+    "Restore with restic and verify the result",
+    "Measure recovery time and list improvements"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Ransomware is the incident that organizations rehearse least and fear most. Files become unreadable, a note demands payment, and the business stops. Whether recovery takes hours or weeks depends on decisions made long before the attack: whether backups exist, whether they are separate from the network the attacker controls, and whether anyone has ever tested a restore.\n\nThis lab practices recovery, not attack. You will simulate the *effect* of ransomware on a throwaway VM you own, using nothing more than a harmless rename of dummy files. Then you will work through detection, containment, a backup integrity check, a restore, and verification, measuring how long it really takes. The aim is to find out whether your backups work before you need them, a concern that began in [Backup and Disaster Recovery Lab](/learn/hands-on-security-labs/backup-and-disaster-recovery-lab)."
+    },
+    {
+      "id": "goals",
+      "type": "text",
+      "markdown": "## Step 1: Set recovery targets first\n\nTwo numbers shape every recovery plan. The **recovery point objective (RPO)** is how much data you can afford to lose, measured as time: if backups run nightly, your RPO is up to 24 hours. The **recovery time objective (RTO)** is how long the service can stay down. Write both for each system before the exercise, and compare them with what you measure.\n\n| System | RPO | RTO | Backup method |\n|:--|:--|:--|:--|\n| Lab file share | 24 hours | 4 hours | Nightly encrypted snapshot |\n| Web application | 24 hours | 2 hours | Image plus database dump |\n| Wazuh manager | 7 days | 8 hours | Weekly configuration backup |\n\nThe most important design rule is the **3-2-1-1** pattern: three copies of data, on two kinds of media, one copy off-site, and one copy that is offline or **immutable**. Ransomware operators deliberately search for and delete backups. A backup that the compromised account can modify is not protection, it is another target."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "From encrypted files to a verified service",
+      "caption": "Note that restore comes after containment and an integrity check, never before.",
+      "data": {
+        "token": "Service",
+        "nodes": [
+          {
+            "id": "det",
+            "label": "Detect",
+            "sub": "Alert or user report",
+            "icon": "alert"
+          },
+          {
+            "id": "iso",
+            "label": "Isolate",
+            "sub": "Cut the network",
+            "icon": "firewall"
+          },
+          {
+            "id": "bk",
+            "label": "Assess backups",
+            "sub": "Integrity check",
+            "icon": "database"
+          },
+          {
+            "id": "rb",
+            "label": "Rebuild",
+            "sub": "Clean host",
+            "icon": "server"
+          },
+          {
+            "id": "rs",
+            "label": "Restore data",
+            "sub": "Last good snapshot",
+            "icon": "file"
+          },
+          {
+            "id": "ver",
+            "label": "Verify",
+            "sub": "Hashes and tests",
+            "icon": "shield"
+          },
+          {
+            "id": "mon",
+            "label": "Monitor",
+            "sub": "Watch for reentry",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "at": "det",
+            "caption": "Users report unreadable files and a note. The SIEM shows a spike of file renames.",
+            "tone": "warning"
+          },
+          {
+            "at": "iso",
+            "caption": "Disconnect the host and block its shares. Do not power it off yet.",
+            "tone": "danger"
+          },
+          {
+            "at": "bk",
+            "caption": "Check that the backup repository is intact and was not touched by the attacker.",
+            "tone": "warning"
+          },
+          {
+            "at": "rb",
+            "caption": "Build a clean host from a known-good image. Do not restore onto the old system."
+          },
+          {
+            "at": "rs",
+            "caption": "Restore the last snapshot from before the first sign of compromise."
+          },
+          {
+            "at": "ver",
+            "caption": "Compare hashes, open sample files and run the application's tests.",
+            "tone": "success"
+          },
+          {
+            "at": "mon",
+            "caption": "Reset all credentials, then watch closely for signs of the same actor returning.",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "simulate",
+      "type": "text",
+      "markdown": "## Step 2: Simulate the effect safely\n\nUse a snapshot-capable VM that holds only dummy data. Take a backup first, so you have something to restore, and snapshot the VM so you can rewind the whole exercise. The simulation below does not encrypt anything. It renames dummy files and leaves a note, which is enough to trigger file integrity monitoring and to create a realistic recovery task.\n\nDo not write or run code that actually encrypts files, and never test on real data or on machines you do not own. The learning here is in the response, not in the attack mechanics."
+    },
+    {
+      "id": "term1",
+      "type": "terminal",
+      "title": "labfile",
+      "prompt": "$",
+      "caption": "White team step: take a backup, then simulate the effect on dummy data only.",
+      "lines": [
+        {
+          "cmd": "restic -r /mnt/backup/lab-repo backup /srv/labshare",
+          "output": "Files:         1200 new,     0 changed,     0 unmodified\nsnapshot 4f8e1a2c saved",
+          "comment": "Backup first. The repository password comes from a protected environment variable, never the command line."
+        },
+        {
+          "cmd": "cd /srv/labshare && for f in docs/*.txt; do mv \"$f\" \"$f.locked\"; done && echo 'LAB EXERCISE: files renamed for recovery practice' > READ_ME_LAB.txt && ls docs | head -n 3",
+          "output": "report1.txt.locked\nreport2.txt.locked\nreport3.txt.locked",
+          "comment": "A harmless rename that mimics the visible effect. Real ransomware would also destroy the originals and try to reach backups."
+        }
+      ]
+    },
+    {
+      "id": "detect",
+      "type": "text",
+      "markdown": "## Step 3: Detect, contain and protect the backups\n\nIn a real attack the first hint is often volume: thousands of files changed in minutes, a new extension, or a note appearing in every folder. File integrity monitoring and endpoint logs can alert on this. In your SIEM, a query for a high number of file modifications per host per minute is a simple and effective detection, one you can build with the tools from [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab).\n\nThen act in this order:\n\n1. **Isolate the affected hosts** from the network, ideally by disabling the switch port or the virtual NIC. Keep them powered on if you can, since memory may hold useful evidence.\n2. **Protect the backups.** Disconnect the backup repository from the network, rotate its credentials and confirm no snapshots were deleted.\n3. **Identify the scope.** Which hosts, which shares, which accounts? Find the first changed file, because its time marks the earliest point to restore from.\n4. **Reset credentials** that the affected systems could reach, including service accounts and domain accounts, once you are confident of the scope."
+    },
+    {
+      "id": "term2",
+      "type": "terminal",
+      "title": "recovery",
+      "prompt": "$",
+      "caption": "Check the repository first, then restore into a clean location and verify.",
+      "lines": [
+        {
+          "cmd": "restic -r /mnt/backup/lab-repo check",
+          "output": "using temporary cache in /tmp/restic-check-cache-31842\ncreate exclusive lock for repository\nload indexes\ncheck all packs\ncheck snapshots, trees and blobs\nno errors were found",
+          "comment": "Run an integrity check before trusting the repository."
+        },
+        {
+          "cmd": "restic -r /mnt/backup/lab-repo snapshots",
+          "output": "ID        Time                 Host     Paths\n4f8e1a2c  2026-03-10 02:00:03  labfile  /srv/labshare\n9d02b7e1  2026-03-09 02:00:02  labfile  /srv/labshare",
+          "comment": "Pick the newest snapshot taken BEFORE the first changed file. Here that is 02:00, ahead of the 10:21 incident."
+        },
+        {
+          "cmd": "time restic -r /mnt/backup/lab-repo restore 4f8e1a2c --target /srv/restore-test",
+          "output": "restoring <Snapshot 4f8e1a2c of [/srv/labshare]> to /srv/restore-test\nSummary: Restored 1210 files/dirs (38.2 MiB) in 0:04\n\nreal    0m5.412s",
+          "comment": "This is your measured restore time. Compare it with the RTO you wrote down, then add the time for rebuild and verification."
+        },
+        {
+          "cmd": "diff <(cd /srv/restore-test/srv/labshare && find . -type f | sort) <(cd /srv/labshare && find . -type f -not -name '*.locked' -not -name 'READ_ME_LAB.txt' | sort) | head -n 3",
+          "output": "",
+          "comment": "An empty diff means the restored tree matches expectations. Always spot-check by opening files, not only counting them."
+        }
+      ]
+    },
+    {
+      "id": "lessons",
+      "type": "text",
+      "markdown": "## Step 4: Verify, harden and learn\n\nRestoring files is not the finish line. Verify that the data is complete and usable, that the application starts, and that the restored host is clean. If the original system was compromised, rebuild it from a trusted image instead of restoring over the top, or you may reintroduce the attacker's foothold.\n\nThen ask why it was possible and how to shorten the next recovery:\n\n- Were backups reachable with the same credentials the attacker obtained? Move them to a separate identity or an immutable store.\n- Did anyone know who could authorize isolating a system? Write that down.\n- Did the restore take longer than the RTO? Automate the slow steps.\n- Was detection fast enough? Add the volume alert and test it.\n\nNotice that paying a ransom is a legal, financial and law-enforcement matter, not a technical shortcut. It does not guarantee a working decryptor, and it does not remove the attacker's access. Involve management, legal counsel and the relevant authorities early, and focus your engineering effort on restore capability, which is the thing you control."
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## Step 5: Design backups that survive an attacker\n\nThink of backup design as a set of questions an attacker would ask. Can I reach the backup server from a compromised workstation? Can I use a stolen administrator password to delete snapshots? Does the backup agent hold a credential with write access to the repository? Each yes is a weakness you can remove.\n\n| Weakness | Stronger design |\n|:--|:--|\n| Backup share mounted read-write on production hosts | Pull-based backups: the backup server connects out, hosts cannot reach it |\n| Same admin account manages production and backups | Separate identity with multi-factor authentication |\n| Repository on the same network and domain | Separate network segment, no domain trust |\n| Deletions take effect immediately | Retention lock or object-lock for a fixed period |\n| Only the data is backed up | Also back up configuration, keys and a rebuild runbook |\n\nThe last row is often forgotten. Restoring data onto a server that you cannot rebuild is useless, so store infrastructure definitions, such as your Proxmox templates and configuration management files, alongside the data. Practice rebuilding from them at least once a year, and keep a printed or offline copy of the recovery contacts and steps, because the systems that hold the digital copy may be the ones that are down."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "An untested backup is a hope, not a control",
+      "markdown": "Many organizations discover during an incident that backups were incomplete, encrypted with a key they cannot find, or silently failing for months. Test restores on a schedule, record how long they take and which files you spot-checked, and keep the repository password and recovery documentation somewhere that does not depend on the systems being recovered."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Practice the whole chain",
+      "markdown": "Combine this exercise with [Incident Response Simulation Lab](/learn/hands-on-security-labs/incident-response-simulation-lab). Run detection, evidence handling and communication first, then restore. A real recovery needs both skill sets at once, and the handoff between them is where most delays hide."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a throwaway VM **you own**, holding only dummy data:\n\n1. Write the RPO and RTO for the VM and snapshot it.\n2. Create a restic repository on a separate disk, back up the dummy share and run `restic check`.\n3. Run the rename simulation and note the time you noticed.\n4. Isolate the VM, check the repository, pick the right snapshot and restore into a new directory with `time`.\n5. Compare the file lists and open three restored files.\n6. Compare your measured total with your RTO and write three improvements, one of them about backup protection."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "RPO",
+          "definition": "Recovery point objective: the maximum acceptable data loss, measured in time."
+        },
+        {
+          "term": "RTO",
+          "definition": "Recovery time objective: the maximum acceptable downtime."
+        },
+        {
+          "term": "3-2-1-1",
+          "definition": "Three copies, two media, one off-site, one offline or immutable."
+        },
+        {
+          "term": "Immutable backup",
+          "definition": "A backup that cannot be changed or deleted for a set period."
+        },
+        {
+          "term": "Isolation",
+          "definition": "Disconnecting a system from the network to stop spread."
+        },
+        {
+          "term": "Restore test",
+          "definition": "A scheduled exercise that proves backups can be recovered."
+        },
+        {
+          "term": "Rebuild",
+          "definition": "Creating a clean system from a trusted image instead of cleaning the old one."
+        },
+        {
+          "term": "Integrity check",
+          "definition": "A test that backup data is complete and uncorrupted."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What does RPO describe?",
+          "options": [
+            "How much data loss is acceptable, measured in time",
+            "How long a restore takes",
+            "The number of backup copies",
+            "The size of the repository"
+          ],
+          "answer": 0,
+          "explanation": "RPO is about data loss. RTO is about downtime."
+        },
+        {
+          "question": "Why must at least one backup copy be offline or immutable?",
+          "options": [
+            "Attackers target reachable backups to prevent recovery",
+            "It makes backups faster",
+            "It is required by restic",
+            "It reduces storage cost"
+          ],
+          "answer": 0,
+          "explanation": "If the compromised account can delete backups, they offer no protection against ransomware."
+        },
+        {
+          "question": "Which are correct recovery steps? (Choose all that apply.)",
+          "options": [
+            "Isolate affected hosts before restoring",
+            "Check repository integrity before trusting it",
+            "Restore from a snapshot taken before the first changed file",
+            "Restore over the compromised system immediately"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Contain first, trust nothing unchecked and restore from before the compromise. Restoring over a compromised host can keep the attacker's foothold."
+        },
+        {
+          "question": "What is the best way to find the earliest safe restore point?",
+          "options": [
+            "Find the first changed file and restore from before its time",
+            "Use the oldest snapshot ever taken",
+            "Use whatever snapshot is largest",
+            "Ask the attacker"
+          ],
+          "answer": 0,
+          "explanation": "The first modification marks the start of impact. Snapshots before it are the candidates, subject to checking for earlier compromise."
+        },
+        {
+          "question": "Why measure restore time during a drill?",
+          "options": [
+            "To compare reality with the RTO and find slow steps",
+            "To impress auditors only",
+            "Because restic requires it",
+            "Timing has no value"
+          ],
+          "answer": 0,
+          "explanation": "An RTO is only a wish until a measured restore shows it is achievable."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou set RPO and RTO targets, simulated the visible effect of ransomware with a harmless rename, and practiced recovery in the right order: isolate, protect and verify the backups, rebuild clean, restore from before the first change, and verify the result. You measured the restore against your targets and listed improvements, especially immutable backups. This completes the hands-on labs in this group. To bring detection, response and recovery together, build the capstone [End-to-End Security Monitoring Project](/learn/hands-on-security-labs/end-to-end-security-monitoring-project)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر محاكاة التعافي من برمجيات الفدية",
+    "summary": "تدرّب على التعافي من برمجيات الفدية على آلة تجريبية: حدّد RPO وRTO وحاكِ الأثر دون ضرر واعزل وافحص النسخ واستعد من قبل أول تغيير وتحقق.",
+    "objectives": [
+      "تحديد RPO وRTO لأنظمة المختبر",
+      "شرح نمط النسخ 3-2-1-1 وعدم قابلية التغيير",
+      "العزل وحماية النسخ وإيجاد أبكر نقطة استعادة آمنة",
+      "الاستعادة بـ restic والتحقق من النتيجة",
+      "قياس زمن التعافي وسرد التحسينات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "برمجيات الفدية هي الحادث الذي تتدرب عليه المؤسسات أقل ما يكون وتخشاه أكثر ما يكون. تصبح الملفات غير مقروءة وتطلب رسالة دفعًا ويتوقف العمل. وتعتمد مدة التعافي، ساعات أو أسابيع، على قرارات اتُّخذت قبل الهجوم بزمن طويل: هل توجد نسخ احتياطية، وهل هي منفصلة عن الشبكة التي يتحكم بها المهاجم، وهل جرّب أحد استعادة فعلية.\n\nيتدرب هذا المختبر على التعافي لا على الهجوم. ستحاكي *أثر* برمجيات الفدية على آلة افتراضية للتجربة **تملكها**، بإعادة تسمية غير ضارة لملفات وهمية لا أكثر. ثم تعمل عبر الكشف والاحتواء وفحص سلامة النسخ الاحتياطية والاستعادة والتحقق، وتقيس كم يستغرق ذلك فعلًا. والهدف معرفة هل تعمل نسخك الاحتياطية قبل أن تحتاج إليها، وهو همّ بدأ في [مختبر النسخ الاحتياطي والتعافي من الكوارث](/learn/hands-on-security-labs/backup-and-disaster-recovery-lab)."
+      },
+      {
+        "id": "goals",
+        "type": "text",
+        "markdown": "## الخطوة 1: حدّد أهداف التعافي أولًا\n\nيحدد رقمان شكل كل خطة تعافٍ. **هدف نقطة الاسترداد (RPO)** هو كمية البيانات التي تتحمل خسارتها مقيسة بالزمن: فإن كانت النسخ ليلية فـ RPO لديك حتى 24 ساعة. و**هدف زمن الاسترداد (RTO)** هو المدة التي تتحمل فيها توقف الخدمة. اكتب كليهما لكل نظام قبل التمرين وقارنهما بما تقيسه.\n\n| النظام | RPO | RTO | طريقة النسخ |\n|:--|:--|:--|:--|\n| مشاركة ملفات المختبر | 24 ساعة | 4 ساعات | لقطة ليلية مشفرة |\n| تطبيق الويب | 24 ساعة | ساعتان | صورة مع تفريغ قاعدة بيانات |\n| مدير Wazuh | 7 أيام | 8 ساعات | نسخة إعدادات أسبوعية |\n\nوأهم قاعدة تصميم هي نمط **3-2-1-1**: ثلاث نسخ من البيانات على نوعين من الوسائط، ونسخة واحدة خارج الموقع، ونسخة واحدة غير متصلة أو **غير قابلة للتغيير (Immutable)**. يبحث مشغّلو الفدية عمدًا عن النسخ الاحتياطية ويحذفونها. والنسخة التي يستطيع الحساب المخترَق تعديلها ليست حماية بل هدف آخر."
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "من الملفات المشفرة إلى خدمة متحقق منها",
+        "caption": "لاحظ أن الاستعادة تأتي بعد الاحتواء وفحص السلامة، وليس قبلهما أبدًا.",
+        "data": {
+          "token": "الخدمة",
+          "nodes": [
+            {
+              "id": "det",
+              "label": "الكشف",
+              "sub": "Alert or user report",
+              "icon": "alert"
+            },
+            {
+              "id": "iso",
+              "label": "العزل",
+              "sub": "Cut the network",
+              "icon": "firewall"
+            },
+            {
+              "id": "bk",
+              "label": "تقييم النسخ",
+              "sub": "Integrity check",
+              "icon": "database"
+            },
+            {
+              "id": "rb",
+              "label": "إعادة البناء",
+              "sub": "Clean host",
+              "icon": "server"
+            },
+            {
+              "id": "rs",
+              "label": "استعادة البيانات",
+              "sub": "Last good snapshot",
+              "icon": "file"
+            },
+            {
+              "id": "ver",
+              "label": "التحقق",
+              "sub": "Hashes and tests",
+              "icon": "shield"
+            },
+            {
+              "id": "mon",
+              "label": "المراقبة",
+              "sub": "Watch for reentry",
+              "icon": "eye"
+            }
+          ],
+          "steps": [
+            {
+              "at": "det",
+              "caption": "يبلّغ المستخدمون عن ملفات غير مقروءة ورسالة. ويُظهر SIEM ارتفاعًا في إعادات التسمية.",
+              "tone": "warning"
+            },
+            {
+              "at": "iso",
+              "caption": "افصل المضيف واحجب مشاركاته. ولا تطفئه الآن.",
+              "tone": "danger"
+            },
+            {
+              "at": "bk",
+              "caption": "تحقق من سلامة مستودع النسخ وأن المهاجم لم يلمسه.",
+              "tone": "warning"
+            },
+            {
+              "at": "rb",
+              "caption": "ابنِ مضيفًا نظيفًا من صورة معروفة السلامة. ولا تستعد على النظام القديم."
+            },
+            {
+              "at": "rs",
+              "caption": "استعد آخر لقطة سبقت أول علامة اختراق."
+            },
+            {
+              "at": "ver",
+              "caption": "قارن البصمات وافتح عينات من الملفات وشغّل اختبارات التطبيق.",
+              "tone": "success"
+            },
+            {
+              "at": "mon",
+              "caption": "أعد ضبط كل بيانات الاعتماد ثم راقب عن كثب عودة الجهة نفسها.",
+              "tone": "secure"
+            }
+          ]
+        }
+      },
+      {
+        "id": "simulate",
+        "type": "text",
+        "markdown": "## الخطوة 2: حاكِ الأثر بأمان\n\nاستخدم آلة افتراضية تدعم اللقطات ولا تحوي سوى بيانات وهمية. خذ نسخة احتياطية أولًا لتملك ما تستعيده، والتقط لقطة للآلة لتعيد التمرين كله. لا تشفّر المحاكاة أدناه أي شيء. إنها تعيد تسمية ملفات وهمية وتترك رسالة، وهذا يكفي لإطلاق مراقبة سلامة الملفات ولإنشاء مهمة تعافٍ واقعية.\n\nلا تكتب ولا تشغّل شيفرة تشفّر الملفات فعلًا، ولا تجرّب على بيانات حقيقية أو على آلات لا تملكها. التعلم هنا في الاستجابة لا في آليات الهجوم."
+      },
+      {
+        "id": "term1",
+        "type": "terminal",
+        "title": "labfile",
+        "prompt": "$",
+        "caption": "خطوة الفريق الأبيض: خذ نسخة احتياطية ثم حاكِ الأثر على بيانات وهمية فقط.",
+        "lines": [
+          {
+            "cmd": "restic -r /mnt/backup/lab-repo backup /srv/labshare",
+            "output": "Files:         1200 new,     0 changed,     0 unmodified\nsnapshot 4f8e1a2c saved",
+            "comment": "النسخة الاحتياطية أولًا. وتأتي كلمة مرور المستودع من متغير بيئة محمي لا من سطر الأوامر."
+          },
+          {
+            "cmd": "cd /srv/labshare && for f in docs/*.txt; do mv \"$f\" \"$f.locked\"; done && echo 'LAB EXERCISE: files renamed for recovery practice' > READ_ME_LAB.txt && ls docs | head -n 3",
+            "output": "report1.txt.locked\nreport2.txt.locked\nreport3.txt.locked",
+            "comment": "إعادة تسمية غير ضارة تحاكي الأثر الظاهر. أما الفدية الحقيقية فتتلف الأصول وتحاول الوصول إلى النسخ الاحتياطية."
+          }
+        ]
+      },
+      {
+        "id": "detect",
+        "type": "text",
+        "markdown": "## الخطوة 3: اكشف واحتوِ واحمِ النسخ الاحتياطية\n\nفي هجوم حقيقي غالبًا ما يكون أول تلميح هو الحجم: آلاف الملفات تتغير في دقائق، أو امتداد جديد، أو رسالة تظهر في كل مجلد. ويمكن لمراقبة سلامة الملفات وسجلات الأجهزة الطرفية أن تنبّه على ذلك. وفي SIEM يُعدّ استعلام عن عدد كبير من تعديلات الملفات لكل مضيف في الدقيقة كشفًا بسيطًا وفعالًا، يمكنك بناؤه بأدوات [مختبر SIEM المركزي](/learn/hands-on-security-labs/centralized-siem-lab).\n\nثم تصرّف بهذا الترتيب:\n\n1. **اعزل المضيفات المتأثرة** عن الشبكة، ويفضل بتعطيل منفذ المفتاح أو بطاقة الشبكة الافتراضية. وأبقِها شغّالة إن أمكن لأن الذاكرة قد تحوي أدلة مفيدة.\n2. **احمِ النسخ الاحتياطية.** افصل مستودع النسخ عن الشبكة وبدّل بيانات اعتماده وتأكد من عدم حذف أي لقطات.\n3. **حدّد النطاق.** أي المضيفات وأي المشاركات وأي الحسابات؟ ابحث عن أول ملف تغيّر لأن وقته يحدد أبكر نقطة للاستعادة منها.\n4. **أعد ضبط بيانات الاعتماد** التي كانت الأنظمة المتأثرة تصل إليها، ومنها حسابات الخدمة وحسابات النطاق، حين تطمئن إلى النطاق."
+      },
+      {
+        "id": "term2",
+        "type": "terminal",
+        "title": "recovery",
+        "prompt": "$",
+        "caption": "افحص المستودع أولًا ثم استعد إلى موضع نظيف وتحقق.",
+        "lines": [
+          {
+            "cmd": "restic -r /mnt/backup/lab-repo check",
+            "output": "using temporary cache in /tmp/restic-check-cache-31842\ncreate exclusive lock for repository\nload indexes\ncheck all packs\ncheck snapshots, trees and blobs\nno errors were found",
+            "comment": "شغّل فحص السلامة قبل أن تثق بالمستودع."
+          },
+          {
+            "cmd": "restic -r /mnt/backup/lab-repo snapshots",
+            "output": "ID        Time                 Host     Paths\n4f8e1a2c  2026-03-10 02:00:03  labfile  /srv/labshare\n9d02b7e1  2026-03-09 02:00:02  labfile  /srv/labshare",
+            "comment": "اختر أحدث لقطة أُخذت قبل أول ملف تغيّر. وهنا هي 02:00 قبل حادث 10:21."
+          },
+          {
+            "cmd": "time restic -r /mnt/backup/lab-repo restore 4f8e1a2c --target /srv/restore-test",
+            "output": "restoring <Snapshot 4f8e1a2c of [/srv/labshare]> to /srv/restore-test\nSummary: Restored 1210 files/dirs (38.2 MiB) in 0:04\n\nreal    0m5.412s",
+            "comment": "هذا زمن استعادتك المقيس. قارنه بـ RTO الذي كتبته ثم أضف زمن إعادة البناء والتحقق."
+          },
+          {
+            "cmd": "diff <(cd /srv/restore-test/srv/labshare && find . -type f | sort) <(cd /srv/labshare && find . -type f -not -name '*.locked' -not -name 'READ_ME_LAB.txt' | sort) | head -n 3",
+            "output": "",
+            "comment": "يعني الفرق الفارغ أن الشجرة المستعادة تطابق المتوقع. وافحص عينات بفتح الملفات لا بعدّها فقط."
+          }
+        ]
+      },
+      {
+        "id": "lessons",
+        "type": "text",
+        "markdown": "## الخطوة 4: تحقق وحصّن وتعلّم\n\nاستعادة الملفات ليست خط النهاية. تحقق من اكتمال البيانات وصلاحيتها للاستخدام ومن أن التطبيق يعمل وأن المضيف المستعاد نظيف. وإن كان النظام الأصلي مخترَقًا فأعد بناءه من صورة موثوقة بدل الاستعادة فوقه، وإلا قد تعيد موطئ قدم المهاجم.\n\nثم اسأل لماذا كان ذلك ممكنًا وكيف تقصّر التعافي القادم:\n\n- هل كانت النسخ الاحتياطية قابلة للوصول ببيانات الاعتماد نفسها التي حصل عليها المهاجم؟ انقلها إلى هوية منفصلة أو مخزن غير قابل للتغيير.\n- هل عرف أحد من يملك تفويض عزل نظام؟ دوّن ذلك.\n- هل استغرقت الاستعادة أكثر من RTO؟ أتمت الخطوات البطيئة.\n- هل كان الكشف سريعًا بما يكفي؟ أضف تنبيه الحجم واختبره.\n\nوتنبّه إلى أن دفع الفدية مسألة قانونية ومالية ومتعلقة بجهات إنفاذ القانون وليس اختصارًا تقنيًا. فهو لا يضمن أداة فك تشفير تعمل ولا يزيل وصول المهاجم. أشرك الإدارة والمستشار القانوني والجهات المختصة مبكرًا، وركّز جهدك الهندسي على القدرة على الاستعادة، وهي ما تتحكم به."
+      },
+      {
+        "id": "design",
+        "type": "text",
+        "markdown": "## الخطوة 5: صمّم نسخًا تصمد أمام المهاجم\n\nفكّر في تصميم النسخ الاحتياطية كمجموعة أسئلة يطرحها المهاجم. هل أستطيع الوصول إلى خادم النسخ من محطة عمل مخترَقة؟ وهل أستطيع استخدام كلمة مرور مسؤول مسروقة لحذف اللقطات؟ وهل يحمل وكيل النسخ بيانات اعتماد لها صلاحية كتابة على المستودع؟ كل «نعم» ضعف تستطيع إزالته.\n\n| الضعف | التصميم الأقوى |\n|:--|:--|\n| مشاركة النسخ مركّبة للقراءة والكتابة على مضيفات الإنتاج | نسخ بالسحب: يتصل خادم النسخ للخارج ولا تصل إليه المضيفات |\n| حساب مسؤول واحد يدير الإنتاج والنسخ | هوية منفصلة مع مصادقة متعددة العوامل |\n| المستودع على الشبكة والنطاق نفسيهما | شريحة شبكة منفصلة دون ثقة بالنطاق |\n| تسري عمليات الحذف فورًا | قفل احتفاظ أو قفل كائنات لمدة محددة |\n| نسخ البيانات فقط | نسخ الإعدادات والمفاتيح ودليل إعادة البناء أيضًا |\n\nكثيرًا ما يُنسى الصف الأخير. فاستعادة البيانات على خادم لا تستطيع إعادة بنائه لا فائدة منها، لذا خزّن تعريفات البنية التحتية، مثل قوالب Proxmox وملفات إدارة الإعدادات، بجانب البيانات. وتمرّن على إعادة البناء منها مرة في السنة على الأقل، واحتفظ بنسخة مطبوعة أو غير متصلة من جهات الاتصال وخطوات التعافي، لأن الأنظمة التي تحمل النسخة الرقمية قد تكون هي المتوقفة."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "النسخة غير المختبرة أمل لا ضابط",
+        "markdown": "تكتشف مؤسسات كثيرة أثناء الحادث أن النسخ ناقصة أو مشفرة بمفتاح لا تجده أو تفشل بصمت منذ شهور. اختبر الاستعادة وفق جدول وسجّل مدتها والملفات التي فحصت عينات منها، واحتفظ بكلمة مرور المستودع ووثائق التعافي في موضع لا يعتمد على الأنظمة التي تُستعاد."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "تمرّن على السلسلة كلها",
+        "markdown": "اجمع هذا التمرين مع [مختبر محاكاة الاستجابة للحوادث](/learn/hands-on-security-labs/incident-response-simulation-lab). نفّذ الكشف والتعامل مع الأدلة والتواصل أولًا ثم الاستعادة. فالتعافي الحقيقي يحتاج المجموعتين من المهارات معًا، وفي التسليم بينهما تختبئ معظم التأخيرات."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على آلة افتراضية للتجربة **تملكها** ولا تحوي سوى بيانات وهمية:\n\n1. اكتب RPO وRTO للآلة والتقط لقطة منها.\n2. أنشئ مستودع restic على قرص منفصل وانسخ المشاركة الوهمية احتياطيًا وشغّل `restic check`.\n3. نفّذ محاكاة إعادة التسمية ودوّن الوقت الذي لاحظت فيه.\n4. اعزل الآلة وافحص المستودع واختر اللقطة الصحيحة واستعد إلى مجلد جديد بالأمر `time`.\n5. قارن قوائم الملفات وافتح ثلاثة ملفات مستعادة.\n6. قارن إجمالي زمنك المقيس بـ RTO واكتب ثلاثة تحسينات أحدها يخص حماية النسخ الاحتياطية."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "RPO",
+            "definition": "هدف نقطة الاسترداد: أقصى فقدان بيانات مقبول مقيسًا بالزمن."
+          },
+          {
+            "term": "RTO",
+            "definition": "هدف زمن الاسترداد: أقصى توقف مقبول."
+          },
+          {
+            "term": "3-2-1-1",
+            "definition": "ثلاث نسخ ووسيطان ونسخة خارج الموقع ونسخة غير متصلة أو غير قابلة للتغيير."
+          },
+          {
+            "term": "نسخة غير قابلة للتغيير",
+            "definition": "نسخة احتياطية لا يمكن تعديلها أو حذفها خلال مدة محددة."
+          },
+          {
+            "term": "العزل",
+            "definition": "فصل نظام عن الشبكة لوقف الانتشار."
+          },
+          {
+            "term": "اختبار الاستعادة",
+            "definition": "تمرين مجدول يثبت إمكانية استرداد النسخ."
+          },
+          {
+            "term": "إعادة البناء",
+            "definition": "إنشاء نظام نظيف من صورة موثوقة بدل تنظيف القديم."
+          },
+          {
+            "term": "فحص السلامة",
+            "definition": "اختبار يثبت اكتمال بيانات النسخة وعدم تلفها."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ماذا يصف RPO؟",
+            "options": [
+              "مقدار فقدان البيانات المقبول مقيسًا بالزمن",
+              "مدة الاستعادة",
+              "عدد النسخ الاحتياطية",
+              "حجم المستودع"
+            ],
+            "answer": 0,
+            "explanation": "يتعلق RPO بفقدان البيانات، أما RTO فيتعلق بزمن التوقف."
+          },
+          {
+            "question": "لماذا يجب أن تكون نسخة واحدة على الأقل غير متصلة أو غير قابلة للتغيير؟",
+            "options": [
+              "لأن المهاجمين يستهدفون النسخ القابلة للوصول لمنع التعافي",
+              "لأنها تسرّع النسخ",
+              "لأن restic يشترط ذلك",
+              "لأنها تقلل كلفة التخزين"
+            ],
+            "answer": 0,
+            "explanation": "إن كان الحساب المخترَق يستطيع حذف النسخ فلا تحميك من الفدية."
+          },
+          {
+            "question": "أي مما يلي خطوات تعافٍ صحيحة؟ (اختر كل ما ينطبق)",
+            "options": [
+              "عزل المضيفات المتأثرة قبل الاستعادة",
+              "فحص سلامة المستودع قبل الوثوق به",
+              "الاستعادة من لقطة سبقت أول ملف تغيّر",
+              "الاستعادة فوق النظام المخترَق فورًا"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "احتوِ أولًا ولا تثق بما لم يُفحص واستعد من قبل الاختراق. فالاستعادة فوق مضيف مخترَق قد تبقي موطئ قدم المهاجم."
+          },
+          {
+            "question": "ما أفضل طريقة لإيجاد أبكر نقطة استعادة آمنة؟",
+            "options": [
+              "إيجاد أول ملف تغيّر والاستعادة من قبل وقته",
+              "استخدام أقدم لقطة على الإطلاق",
+              "استخدام أكبر لقطة",
+              "سؤال المهاجم"
+            ],
+            "answer": 0,
+            "explanation": "يحدد أول تعديل بداية الأثر. واللقطات السابقة له هي المرشحة، مع التحقق من وجود اختراق أبكر."
+          },
+          {
+            "question": "لماذا نقيس زمن الاستعادة أثناء التمرين؟",
+            "options": [
+              "لمقارنة الواقع بـ RTO وإيجاد الخطوات البطيئة",
+              "لإبهار المدققين فقط",
+              "لأن restic يتطلبه",
+              "لا قيمة للتوقيت"
+            ],
+            "answer": 0,
+            "explanation": "RTO مجرد أمنية حتى يثبت استرداد مقيس إمكانية تحقيقه."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nحدّدت أهداف RPO وRTO وحاكيت الأثر المرئي لبرمجيات الفدية بإعادة تسمية غير ضارة، وتدرّبت على التعافي بالترتيب الصحيح: اعزل واحمِ النسخ وتحقق منها وأعد البناء نظيفًا واستعد من قبل أول تغيير وتحقق من النتيجة. وقسْت الاستعادة بأهدافك وسردت التحسينات وبخاصة النسخ غير القابلة للتغيير. وبهذا تكتمل المختبرات العملية في هذه المجموعة. ولجمع الكشف والاستجابة والتعافي معًا ابنِ المشروع الختامي [مشروع المراقبة الأمنية المتكاملة](/learn/hands-on-security-labs/end-to-end-security-monitoring-project)."
+      }
+    ]
+  }
+}

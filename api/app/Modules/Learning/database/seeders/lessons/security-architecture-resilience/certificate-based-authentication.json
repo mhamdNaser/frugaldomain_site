@@ -1,0 +1,592 @@
+{
+  "slug": "certificate-based-authentication",
+  "title": "Certificate-Based Authentication",
+  "summary": "Learn how X.509 certificates prove identity for users, devices and services, how mutual TLS works, and how to run issuance, revocation and renewal without outages.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain how a certificate binds an identity to a public key through a CA chain",
+    "Describe the mutual TLS handshake and what each side verifies",
+    "Compare certificate authentication with passwords and tokens",
+    "Configure and test client-certificate authentication on a web server",
+    "Plan revocation, renewal and monitoring for certificates"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A payments API accepts calls only from partner servers. Early on, partners authenticated with a shared API key. When one partner's key appeared in a public repository, the team had to coordinate a rotation with every partner in the same week.\n\nCertificates solve this class of problem. Instead of a shared secret, each caller holds a private key that never leaves its machine and a certificate that a trusted authority has signed. The server verifies the signature chain and the caller proves possession of the key. There is nothing to leak in transit and nothing to share. This lesson covers how that works and, just as important, how to operate it."
+    },
+    {
+      "id": "basics",
+      "type": "text",
+      "markdown": "## What a certificate contains\n\nAn **X.509 certificate** is a signed statement: \"this public key belongs to this subject.\" The important fields are:\n\n- **Subject** and **Subject Alternative Names (SAN)**: the identity, such as a user principal name, a device name or a DNS name.\n- **Public key**: the key the subject proves it holds.\n- **Issuer** and **signature**: the certificate authority (CA) that vouches for the binding.\n- **Validity**: `notBefore` and `notAfter` dates.\n- **Key usage and extended key usage**: what the key may do, for example *Client Authentication* or *Smart Card Logon*.\n- **Revocation pointers**: CRL distribution points and OCSP responder addresses.\n\nTrust flows through a **chain**: a root CA, usually offline, signs an intermediate CA, which signs leaf certificates. Clients and servers hold the root in their trust store and verify every link. Keep the root offline and issue through intermediates so that one compromise does not require rebuilding all trust."
+    },
+    {
+      "id": "mtls",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Mutual TLS handshake",
+      "data": {
+        "actors": [
+          {
+            "id": "cl",
+            "label": "Client service",
+            "sub": "orders.example.com",
+            "icon": "server"
+          },
+          {
+            "id": "sv",
+            "label": "API gateway",
+            "sub": "api.example.com",
+            "icon": "firewall"
+          },
+          {
+            "id": "ca",
+            "label": "Internal CA",
+            "sub": "trust anchor",
+            "icon": "key"
+          }
+        ],
+        "steps": [
+          {
+            "from": "cl",
+            "to": "sv",
+            "label": "ClientHello",
+            "detail": "TLS 1.3",
+            "note": "The client starts TLS and lists supported ciphers and versions."
+          },
+          {
+            "from": "sv",
+            "to": "cl",
+            "label": "Server certificate + CertificateRequest",
+            "detail": "chain: api.example.com",
+            "note": "The server proves its own identity and asks the client for a certificate as well."
+          },
+          {
+            "from": "cl",
+            "to": "cl",
+            "label": "Validate server chain",
+            "tone": "secure",
+            "note": "The client checks the chain to its trusted root, the hostname in the SAN and the validity dates."
+          },
+          {
+            "from": "cl",
+            "to": "sv",
+            "label": "Client certificate + CertificateVerify",
+            "detail": "signature with private key",
+            "note": "The client sends its certificate and signs the handshake transcript, proving it holds the private key."
+          },
+          {
+            "from": "sv",
+            "to": "ca",
+            "label": "Check chain, EKU, revocation",
+            "detail": "OCSP / CRL",
+            "note": "The gateway validates the chain, requires Client Authentication usage and checks revocation status."
+          },
+          {
+            "from": "sv",
+            "to": "cl",
+            "label": "Finished: identity mapped",
+            "detail": "subject CN=orders-svc",
+            "tone": "success",
+            "note": "Both sides are authenticated. The gateway maps the subject to a role and enforces authorization."
+          },
+          {
+            "from": "sv",
+            "to": "cl",
+            "label": "Connection refused",
+            "detail": "expired or untrusted cert",
+            "tone": "blocked",
+            "note": "Without a valid certificate from a trusted CA, the handshake fails before any request is processed."
+          }
+        ]
+      }
+    },
+    {
+      "id": "compare",
+      "type": "text",
+      "markdown": "## Why use certificates\n\n| Property | Password | API token or key | Client certificate |\n|:--|:--|:--|:--|\n| Secret sent over the wire | Yes | Yes | No, only a signature |\n| Phishable | Yes | Sometimes | No, bound to the TLS session |\n| Shared between users | Often | Often | Rare, per device or service |\n| Expires | Rarely | Sometimes | Always |\n| Revocable centrally | By reset | By revoke | Via CRL or OCSP |\n| Operational cost | Low | Low | Higher: needs PKI |\n\nCertificates shine for **machine identities** (services, devices, VPN gateways, Wi-Fi 802.1X with EAP-TLS) and for **high-assurance people** (smart cards, hardware-backed certificates). In Windows environments, smart-card logon uses **PKINIT** to obtain Kerberos tickets with a certificate; see [Kerberos Authentication Security](/learn/security-architecture-resilience/kerberos-authentication-security) and [Active Directory Security](/learn/security-architecture-resilience/active-directory-security) for the surrounding controls.\n\nThe price is operations. Someone must issue, renew and revoke at scale, and a forgotten expiry causes an outage."
+    },
+    {
+      "id": "config",
+      "type": "text",
+      "markdown": "## Configuring a server to require client certificates\n\nThe web server must trust a specific CA for clients, require a certificate and pass the verified identity to the application."
+    },
+    {
+      "id": "nginx",
+      "type": "code",
+      "language": "nginx",
+      "filename": "api.example.com.conf",
+      "caption": "nginx requiring and verifying client certificates, with CRL checking. Strip these headers from incoming requests at the edge so clients cannot forge them.",
+      "code": "server {\n    listen 443 ssl;\n    server_name api.example.com;\n\n    ssl_certificate         /etc/pki/api/server.pem;\n    ssl_certificate_key     /etc/pki/api/server.key;\n    ssl_protocols           TLSv1.2 TLSv1.3;\n\n    # Trust only our internal client CA\n    ssl_client_certificate  /etc/pki/ca/client-ca-chain.pem;\n    ssl_verify_client       on;\n    ssl_verify_depth        2;\n    ssl_crl                 /etc/pki/ca/client-ca.crl;\n\n    location / {\n        proxy_set_header X-Client-DN $ssl_client_s_dn;\n        proxy_set_header X-Client-Verify $ssl_client_verify;\n        proxy_pass http://127.0.0.1:8080;\n    }\n}",
+      "highlight": [
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    {
+      "id": "openssl",
+      "type": "terminal",
+      "title": "Inspecting and testing with OpenSSL",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "openssl x509 -in orders-svc.pem -noout -subject -issuer -dates -ext extendedKeyUsage",
+          "output": "subject=CN = orders-svc, O = Example Corp\nissuer=CN = Example Issuing CA 01\nnotBefore=Nov 12 09:00:00 2026 GMT\nnotAfter=Feb 10 09:00:00 2027 GMT\nX509v3 Extended Key Usage:\n    TLS Web Client Authentication",
+          "comment": "A 90-day lifetime and a client-auth usage are what you want to see."
+        },
+        {
+          "cmd": "openssl verify -CAfile client-ca-chain.pem orders-svc.pem",
+          "output": "orders-svc.pem: OK",
+          "comment": "Confirms the chain to the trusted CA."
+        },
+        {
+          "cmd": "curl --cert orders-svc.pem --key orders-svc.key --cacert server-ca.pem https://api.example.com/health",
+          "output": "{\"status\":\"ok\",\"caller\":\"orders-svc\"}",
+          "comment": "A valid client certificate gets through."
+        },
+        {
+          "cmd": "curl --cacert server-ca.pem https://api.example.com/health",
+          "output": "curl: (56) OpenSSL SSL_read: tlsv13 alert certificate required, errno 0",
+          "comment": "No certificate, no session. This is the behavior you want."
+        }
+      ],
+      "caption": "Run these only against servers you own or administer."
+    },
+    {
+      "id": "mapping",
+      "type": "text",
+      "markdown": "## Mapping a certificate to access\n\n\nA valid certificate proves who is calling; it does not decide what they may do. Keep authentication and authorization separate.\n\n\n- **Map on stable identifiers.** Use a SAN URI, a SPIFFE-style ID or a device GUID rather than a free-text common name that anyone could choose at enrollment.\n- **Authorize by role.** The gateway looks up the subject in a policy table and grants only the endpoints that role needs.\n- **Bind to the device.** For people, prefer certificates stored in a TPM or smart card so the private key cannot be exported to another machine.\n- **Log the serial number.** Every request should record subject and serial, which lets you trace and revoke one credential without disturbing others.\n\n\nWhen a certificate maps to a service account, review it with the rest of your non-human identities, because a certificate with broad permissions is as dangerous as any shared password."
+    },
+    {
+      "id": "life",
+      "type": "text",
+      "markdown": "## Operating certificates: issuance, revocation, renewal\n\n### Issuance\nAutomate enrollment with ACME, SCEP, EST or an internal CA API, and bind issuance to a verified identity (an approved device, a workload identity, a managed enrollment). A CA that signs anything with a CSR is an attacker's gift.\n\n### Short lifetimes\nShort certificates, from hours to 90 days, reduce the need for revocation. Automation makes this practical: services renew themselves long before expiry. Public TLS lifetimes are already shrinking, and internal PKI should follow.\n\n### Revocation\nUse **OCSP** or **CRLs** for emergencies: key compromise, a lost smart card, a decommissioned service. Decide in advance whether servers **fail open** (availability) or **fail closed** (security) when the responder is unreachable. High-assurance systems fail closed with a cached or stapled response.\n\n### Monitoring\nInventory every certificate, alert 30, 14 and 7 days before expiry, and watch **Certificate Transparency** logs for unexpected public issuance for your domains. Protect CA private keys in an HSM and log every signing operation. The same signing idea powers [SSH Key Management](/learn/security-architecture-resilience/ssh-key-management) certificates, and federation often replaces certificates for people, as covered in [Identity Federation](/learn/security-architecture-resilience/identity-federation)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Where certificate programs fail",
+      "markdown": "- **Expired certificates** are the top cause of PKI outages. Monitor and automate renewal.\n- **Private keys stored beside the certificate** on shared drives or in tickets.\n- **Overbroad trust stores.** Trusting every public CA for client authentication lets anyone with a public certificate in.\n- **Mapping only on the common name.** Match on SAN or a strong identifier and enforce key usage.\n- **No revocation path** tested. Practice revoking before the incident."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Work on a VM you own. Never reuse these keys elsewhere.\n\n1. Create a lab CA: `openssl req -x509 -newkey ed25519 -nodes -keyout ca.key -out ca.pem -subj \"/CN=Lab Root\" -days 30`.\n2. Issue a server certificate for `localhost` and a client certificate with the extension `extendedKeyUsage=clientAuth`.\n3. Run `openssl s_server -accept 8443 -cert server.pem -key server.key -CAfile ca.pem -Verify 1` and connect with `openssl s_client -cert client.pem -key client.key -connect localhost:8443`.\n4. Repeat without the client certificate and read the error.\n5. Revoke the client certificate, generate a CRL and observe how your server behaves when the CRL is missing."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "X.509 certificate",
+          "definition": "A signed document binding an identity to a public key, with validity and usage constraints."
+        },
+        {
+          "term": "Certificate authority (CA)",
+          "definition": "The entity that signs certificates and vouches for the identity binding."
+        },
+        {
+          "term": "Trust chain",
+          "definition": "The path from a leaf certificate through intermediates to a trusted root."
+        },
+        {
+          "term": "Mutual TLS (mTLS)",
+          "definition": "TLS where both client and server present certificates and authenticate each other."
+        },
+        {
+          "term": "Subject Alternative Name (SAN)",
+          "definition": "The certificate field listing the identities (DNS names, UPNs) the certificate is valid for."
+        },
+        {
+          "term": "CRL",
+          "definition": "A signed list of revoked certificate serial numbers published by the CA."
+        },
+        {
+          "term": "OCSP",
+          "definition": "A protocol for querying the revocation status of one certificate in real time."
+        },
+        {
+          "term": "PKINIT",
+          "definition": "A Kerberos extension that uses certificates to obtain tickets, enabling smart-card logon."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "In mutual TLS, what does the client prove by signing the handshake transcript?",
+          "options": [
+            "That its certificate is public",
+            "That it holds the private key matching the certificate",
+            "That the server is trusted",
+            "That the password is correct"
+          ],
+          "answer": 1,
+          "explanation": "A certificate is public. Only the holder of the private key can produce the matching signature."
+        },
+        {
+          "question": "Why keep the root CA offline and issue through intermediates?",
+          "options": [
+            "Intermediates are faster",
+            "A compromised intermediate can be revoked without rebuilding all trust",
+            "Roots cannot sign certificates",
+            "It is required by TLS 1.3"
+          ],
+          "answer": 1,
+          "explanation": "The root is the anchor in every trust store. Limiting its exposure protects the whole hierarchy."
+        },
+        {
+          "question": "Which items does a server typically verify on a client certificate? (Choose all that apply.)",
+          "options": [
+            "Chain to a trusted CA",
+            "Validity dates",
+            "Extended key usage for client authentication",
+            "The client's favorite cipher"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Chain, validity, usage and revocation are checked. Cipher preference is negotiation, not identity."
+        },
+        {
+          "question": "What is the most common cause of certificate-related outages?",
+          "options": [
+            "Weak ciphers",
+            "Unexpected expiry",
+            "Too many CAs",
+            "Short key sizes"
+          ],
+          "answer": 1,
+          "explanation": "Forgotten renewals take services down. Inventory, alerts and automated renewal prevent it."
+        },
+        {
+          "question": "Which practices strengthen a client-certificate deployment? (Choose all that apply.)",
+          "options": [
+            "Short lifetimes with automated renewal",
+            "Trusting every public CA for client auth",
+            "Protecting CA keys in an HSM",
+            "Testing revocation procedures"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "Trust only the CA you operate for clients, keep its keys in hardware, and rehearse revocation."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A certificate binds an identity to a public key through a **CA chain**; the holder proves it with a private-key signature.\n- **mTLS** authenticates both sides and sends no reusable secret.\n- Certificates suit machines and high-assurance users; the cost is running a PKI well.\n- Prefer **short lifetimes and automation**; plan **revocation** and decide fail-open or fail-closed.\n- Monitor expiry, protect CA keys in an HSM and restrict which CAs are trusted for clients.\n\nNext, see how identities cross organizational boundaries without certificates in [Identity Federation](/learn/security-architecture-resilience/identity-federation)."
+    }
+  ],
+  "ar": {
+    "title": "المصادقة القائمة على الشهادات",
+    "summary": "تعرّف كيف تثبت شهادات X.509 هوية المستخدمين والأجهزة والخدمات، وكيف يعمل TLS المتبادل، وكيف تدير الإصدار والإبطال والتجديد دون انقطاعات.",
+    "objectives": [
+      "شرح كيف تربط الشهادة هوية بمفتاح عام عبر سلسلة سلطات CA",
+      "وصف مصافحة TLS المتبادل وما يتحقق منه كل طرف",
+      "المقارنة بين المصادقة بالشهادات وكلمات المرور والرموز",
+      "إعداد المصادقة بشهادة العميل على خادم ويب واختبارها",
+      "تخطيط الإبطال والتجديد والمراقبة للشهادات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تقبل واجهة API للمدفوعات الاتصالات من خوادم الشركاء فقط. في البداية صادق الشركاء بمفتاح API مشترك. وحين ظهر مفتاح أحد الشركاء في مستودع عام، اضطر الفريق إلى تنسيق تدوير مع كل شريك في الأسبوع نفسه.\n\nتحل الشهادات هذا النوع من المشكلات. فبدل سر مشترك، يحتفظ كل مستدعٍ بمفتاح خاص لا يغادر جهازه وبشهادة وقّعتها سلطة موثوقة. ويتحقق الخادم من سلسلة التوقيعات ويثبت المستدعي امتلاكه للمفتاح. فلا شيء يتسرب أثناء النقل ولا شيء يُشارك. يغطي هذا الدرس كيف يعمل ذلك، وكيف يُشغَّل، وهو الأهم."
+      },
+      {
+        "id": "basics",
+        "type": "text",
+        "markdown": "## ما تحويه الشهادة\n\n**شهادة X.509** عبارة موقّعة: «هذا المفتاح العام يخص هذا الموضوع». وأهم حقولها:\n\n- **الموضوع (Subject)** و**الأسماء البديلة للموضوع (SAN)**: الهوية، مثل اسم مستخدم رئيسي أو اسم جهاز أو اسم DNS.\n- **المفتاح العام**: المفتاح الذي يثبت الموضوع أنه يمتلكه.\n- **المُصدِر (Issuer)** و**التوقيع**: سلطة الشهادات (CA) التي تضمن الربط.\n- **الصلاحية**: تاريخا `notBefore` و`notAfter`.\n- **استخدام المفتاح والاستخدام الموسّع**: ما يجوز للمفتاح فعله، مثل *Client Authentication* أو *Smart Card Logon*.\n- **مؤشرات الإبطال**: نقاط توزيع CRL وعناوين مستجيب OCSP.\n\nتنتقل الثقة عبر **سلسلة**: سلطة جذر، تكون عادةً غير متصلة بالشبكة، توقّع سلطة وسيطة، توقّع بدورها شهادات الأوراق. ويحتفظ العملاء والخوادم بالجذر في مخزن الثقة ويتحققون من كل حلقة. أبقِ الجذر غير متصل وأصدر عبر الوسيطات حتى لا يتطلب اختراق واحد إعادة بناء الثقة كلها."
+      },
+      {
+        "id": "mtls",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "مصافحة TLS المتبادل",
+        "data": {
+          "actors": [
+            {
+              "id": "cl",
+              "label": "خدمة العميل",
+              "sub": "orders.example.com",
+              "icon": "server"
+            },
+            {
+              "id": "sv",
+              "label": "بوابة API",
+              "sub": "api.example.com",
+              "icon": "firewall"
+            },
+            {
+              "id": "ca",
+              "label": "سلطة CA الداخلية",
+              "sub": "trust anchor",
+              "icon": "key"
+            }
+          ],
+          "steps": [
+            {
+              "from": "cl",
+              "to": "sv",
+              "label": "ClientHello",
+              "detail": "TLS 1.3",
+              "note": "يبدأ العميل TLS ويسرد الشيفرات والإصدارات المدعومة."
+            },
+            {
+              "from": "sv",
+              "to": "cl",
+              "label": "شهادة الخادم وطلب شهادة",
+              "detail": "chain: api.example.com",
+              "note": "يثبت الخادم هويته ويطلب من العميل شهادة أيضًا."
+            },
+            {
+              "from": "cl",
+              "to": "cl",
+              "label": "التحقق من سلسلة الخادم",
+              "tone": "secure",
+              "note": "يفحص العميل السلسلة حتى جذره الموثوق واسم المضيف في SAN وتواريخ الصلاحية."
+            },
+            {
+              "from": "cl",
+              "to": "sv",
+              "label": "شهادة العميل وCertificateVerify",
+              "detail": "signature with private key",
+              "note": "يرسل العميل شهادته ويوقّع سجل المصافحة، مثبتًا امتلاكه المفتاح الخاص."
+            },
+            {
+              "from": "sv",
+              "to": "ca",
+              "label": "فحص السلسلة وEKU والإبطال",
+              "detail": "OCSP / CRL",
+              "note": "تتحقق البوابة من السلسلة وتشترط استخدام Client Authentication وتفحص حالة الإبطال."
+            },
+            {
+              "from": "sv",
+              "to": "cl",
+              "label": "اكتمال المصافحة وربط الهوية",
+              "detail": "subject CN=orders-svc",
+              "tone": "success",
+              "note": "صودق على الطرفين. تربط البوابة الموضوع بدور وتفرض التفويض."
+            },
+            {
+              "from": "sv",
+              "to": "cl",
+              "label": "رفض الاتصال",
+              "detail": "expired or untrusted cert",
+              "tone": "blocked",
+              "note": "دون شهادة صالحة من سلطة موثوقة تفشل المصافحة قبل معالجة أي طلب."
+            }
+          ]
+        }
+      },
+      {
+        "id": "compare",
+        "type": "text",
+        "markdown": "## لماذا نستخدم الشهادات\n\n| الخاصية | كلمة المرور | رمز أو مفتاح API | شهادة العميل |\n|:--|:--|:--|:--|\n| سر يُرسل عبر الشبكة | نعم | نعم | لا، توقيع فقط |\n| قابل للتصيّد | نعم | أحيانًا | لا، مرتبط بجلسة TLS |\n| مشترك بين المستخدمين | غالبًا | غالبًا | نادرًا، لكل جهاز أو خدمة |\n| ينتهي | نادرًا | أحيانًا | دائمًا |\n| قابل للإبطال مركزيًا | بإعادة التعيين | بالإبطال | عبر CRL أو OCSP |\n| الكلفة التشغيلية | منخفضة | منخفضة | أعلى: يحتاج PKI |\n\nتتألق الشهادات في **هويات الأجهزة** (الخدمات والأجهزة وبوابات VPN وشبكات Wi-Fi مع 802.1X وEAP-TLS) وفي **الأشخاص ذوي الضمان العالي** (البطاقات الذكية والشهادات المرتبطة بالعتاد). وفي بيئات Windows يستخدم الدخول بالبطاقة الذكية **PKINIT** للحصول على تذاكر Kerberos بشهادة؛ انظر [أمان مصادقة Kerberos](/learn/security-architecture-resilience/kerberos-authentication-security) و[أمان Active Directory](/learn/security-architecture-resilience/active-directory-security) للضوابط المحيطة.\n\nوالثمن هو التشغيل. فلا بد أن يُصدر أحدٌ الشهادات ويجددها ويبطلها على نطاق واسع، ويسبب انتهاء منسي انقطاعًا."
+      },
+      {
+        "id": "config",
+        "type": "text",
+        "markdown": "## إعداد الخادم لاشتراط شهادات العميل\n\nيجب أن يثق خادم الويب بسلطة محددة للعملاء، وأن يشترط شهادة، وأن يمرر الهوية المتحقق منها إلى التطبيق."
+      },
+      {
+        "id": "nginx",
+        "type": "code",
+        "language": "nginx",
+        "filename": "api.example.com.conf",
+        "caption": "يشترط nginx شهادات العميل ويتحقق منها مع فحص CRL. أزل هذه الترويسات من الطلبات الواردة عند الحافة كي لا يستطيع العملاء تزويرها.",
+        "code": "server {\n    listen 443 ssl;\n    server_name api.example.com;\n\n    ssl_certificate         /etc/pki/api/server.pem;\n    ssl_certificate_key     /etc/pki/api/server.key;\n    ssl_protocols           TLSv1.2 TLSv1.3;\n\n    # Trust only our internal client CA\n    ssl_client_certificate  /etc/pki/ca/client-ca-chain.pem;\n    ssl_verify_client       on;\n    ssl_verify_depth        2;\n    ssl_crl                 /etc/pki/ca/client-ca.crl;\n\n    location / {\n        proxy_set_header X-Client-DN $ssl_client_s_dn;\n        proxy_set_header X-Client-Verify $ssl_client_verify;\n        proxy_pass http://127.0.0.1:8080;\n    }\n}",
+        "highlight": [
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "id": "openssl",
+        "type": "terminal",
+        "title": "الفحص والاختبار بـOpenSSL",
+        "prompt": "$",
+        "lines": [
+          {
+            "cmd": "openssl x509 -in orders-svc.pem -noout -subject -issuer -dates -ext extendedKeyUsage",
+            "output": "subject=CN = orders-svc, O = Example Corp\nissuer=CN = Example Issuing CA 01\nnotBefore=Nov 12 09:00:00 2026 GMT\nnotAfter=Feb 10 09:00:00 2027 GMT\nX509v3 Extended Key Usage:\n    TLS Web Client Authentication",
+            "comment": "عمر 90 يومًا واستخدام مصادقة العميل هو ما ينبغي أن تراه."
+          },
+          {
+            "cmd": "openssl verify -CAfile client-ca-chain.pem orders-svc.pem",
+            "output": "orders-svc.pem: OK",
+            "comment": "يؤكد السلسلة حتى السلطة الموثوقة."
+          },
+          {
+            "cmd": "curl --cert orders-svc.pem --key orders-svc.key --cacert server-ca.pem https://api.example.com/health",
+            "output": "{\"status\":\"ok\",\"caller\":\"orders-svc\"}",
+            "comment": "شهادة عميل صالحة تمر."
+          },
+          {
+            "cmd": "curl --cacert server-ca.pem https://api.example.com/health",
+            "output": "curl: (56) OpenSSL SSL_read: tlsv13 alert certificate required, errno 0",
+            "comment": "لا شهادة، لا جلسة. وهذا هو السلوك المطلوب."
+          }
+        ],
+        "caption": "نفّذ هذه الأوامر فقط ضد خوادم تملكها أو تديرها."
+      },
+      {
+        "id": "mapping",
+        "type": "text",
+        "markdown": "## ربط الشهادة بالصلاحيات\n\n\nتثبت الشهادة الصالحة من يتصل، ولا تقرر ما يحق له فعله. أبقِ المصادقة والتفويض منفصلين.\n\n\n- **اربط بمعرّفات ثابتة.** استخدم URI في SAN أو معرّفًا بنمط SPIFFE أو GUID للجهاز بدل اسم شائع نصي حر يستطيع أي شخص اختياره عند التسجيل.\n- **فوّض حسب الدور.** تبحث البوابة عن الموضوع في جدول سياسات وتمنح نقاط النهاية التي يحتاجها ذلك الدور فقط.\n- **اربط بالجهاز.** للأشخاص، فضّل الشهادات المخزنة في وحدة TPM أو بطاقة ذكية حتى لا يمكن تصدير المفتاح الخاص إلى جهاز آخر.\n- **سجّل الرقم التسلسلي.** ينبغي أن يسجل كل طلب الموضوع والرقم التسلسلي، مما يتيح تتبع بيانات اعتماد واحدة وإبطالها دون إزعاج غيرها.\n\n\nوحين ترتبط الشهادة بحساب خدمة فراجعها مع بقية الهويات غير البشرية، لأن شهادة بصلاحيات واسعة خطيرة كأي كلمة مرور مشتركة."
+      },
+      {
+        "id": "life",
+        "type": "text",
+        "markdown": "## تشغيل الشهادات: الإصدار والإبطال والتجديد\n\n### الإصدار\nأتمت التسجيل عبر ACME أو SCEP أو EST أو واجهة برمجية للسلطة الداخلية، واربط الإصدار بهوية متحقق منها (جهاز معتمد أو هوية حِمل عمل أو تسجيل مُدار). والسلطة التي توقّع أي طلب CSR هدية للمهاجم.\n\n### الأعمار القصيرة\nالشهادات القصيرة، من ساعات إلى 90 يومًا، تقلل الحاجة إلى الإبطال. وتجعل الأتمتة ذلك عمليًا: إذ تجدد الخدمات نفسها قبل الانتهاء بزمن طويل. وأعمار شهادات TLS العامة تتقلص أصلًا، وعلى بنية PKI الداخلية أن تحذو حذوها.\n\n### الإبطال\nاستخدم **OCSP** أو **قوائم CRL** للطوارئ: اختراق مفتاح أو ضياع بطاقة ذكية أو إيقاف خدمة. وقرر مسبقًا هل **يفتح الخادم (Fail Open)** مراعاةً للتوافر أم **يغلق (Fail Closed)** مراعاةً للأمان عند تعذر الوصول إلى المستجيب. وتغلق الأنظمة عالية الضمان مع استجابة مخزنة مؤقتًا أو مدبّسة.\n\n### المراقبة\nاجرد كل شهادة، وأطلق تنبيهات قبل الانتهاء بـ30 و14 و7 أيام، وراقب سجلات **شفافية الشهادات (Certificate Transparency)** بحثًا عن إصدار عام غير متوقع لنطاقاتك. واحمِ المفاتيح الخاصة للسلطات في وحدة HSM وسجّل كل عملية توقيع. وتقوم فكرة التوقيع نفسها خلف شهادات [إدارة مفاتيح SSH](/learn/security-architecture-resilience/ssh-key-management)، وكثيرًا ما يحل الاتحاد محل الشهادات للأشخاص كما في [اتحاد الهويات](/learn/security-architecture-resilience/identity-federation)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "أين تفشل برامج الشهادات",
+        "markdown": "- **الشهادات المنتهية** أول سبب لانقطاعات PKI. راقب وأتمت التجديد.\n- **مفاتيح خاصة مخزنة بجانب الشهادة** في مجلدات مشتركة أو تذاكر.\n- **مخازن ثقة واسعة أكثر من اللازم.** الوثوق بكل سلطة عامة لمصادقة العميل يسمح بدخول أي حامل شهادة عامة.\n- **الربط بالاسم الشائع وحده.** طابق على SAN أو معرّف قوي واشترط استخدام المفتاح.\n- **عدم اختبار مسار الإبطال.** تدرّب على الإبطال قبل الحادثة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "اعمل على آلة افتراضية تملكها. لا تعِد استخدام هذه المفاتيح في أي مكان آخر.\n\n1. أنشئ سلطة تجريبية: `openssl req -x509 -newkey ed25519 -nodes -keyout ca.key -out ca.pem -subj \"/CN=Lab Root\" -days 30`.\n2. أصدر شهادة خادم لـ`localhost` وشهادة عميل بالامتداد `extendedKeyUsage=clientAuth`.\n3. شغّل `openssl s_server -accept 8443 -cert server.pem -key server.key -CAfile ca.pem -Verify 1` واتصل بالأمر `openssl s_client -cert client.pem -key client.key -connect localhost:8443`.\n4. كرّر دون شهادة العميل واقرأ الخطأ.\n5. أبطل شهادة العميل وولّد CRL ولاحظ سلوك الخادم عند غياب CRL."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "شهادة X.509",
+            "definition": "وثيقة موقّعة تربط هوية بمفتاح عام مع قيود للصلاحية والاستخدام."
+          },
+          {
+            "term": "سلطة الشهادات (CA)",
+            "definition": "الجهة التي توقّع الشهادات وتضمن ربط الهوية."
+          },
+          {
+            "term": "سلسلة الثقة",
+            "definition": "المسار من شهادة الورقة عبر الوسيطات إلى جذر موثوق."
+          },
+          {
+            "term": "TLS المتبادل",
+            "definition": "TLS يقدّم فيه العميل والخادم شهادتيهما ويصادق كلٌّ منهما الآخر."
+          },
+          {
+            "term": "الاسم البديل للموضوع (SAN)",
+            "definition": "حقل الشهادة الذي يسرد الهويات (أسماء DNS وUPN) التي تصلح لها الشهادة."
+          },
+          {
+            "term": "قائمة الإبطال (CRL)",
+            "definition": "قائمة موقّعة بالأرقام التسلسلية للشهادات المبطلة تنشرها السلطة."
+          },
+          {
+            "term": "بروتوكول OCSP",
+            "definition": "بروتوكول للاستعلام الفوري عن حالة إبطال شهادة واحدة."
+          },
+          {
+            "term": "PKINIT",
+            "definition": "امتداد لـKerberos يستخدم الشهادات للحصول على التذاكر، ويتيح الدخول بالبطاقة الذكية."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "في TLS المتبادل، ماذا يثبت العميل بتوقيع سجل المصافحة؟",
+            "options": [
+              "أن شهادته عامة",
+              "أنه يمتلك المفتاح الخاص المطابق للشهادة",
+              "أن الخادم موثوق",
+              "أن كلمة المرور صحيحة"
+            ],
+            "answer": 1,
+            "explanation": "الشهادة عامة. ولا ينتج التوقيع المطابق إلا حائز المفتاح الخاص."
+          },
+          {
+            "question": "لماذا يُبقى الجذر غير متصل ويُصدر عبر الوسيطات؟",
+            "options": [
+              "الوسيطات أسرع",
+              "يمكن إبطال وسيط مخترق دون إعادة بناء الثقة كلها",
+              "الجذور لا تستطيع التوقيع",
+              "يتطلبه TLS 1.3"
+            ],
+            "answer": 1,
+            "explanation": "الجذر هو المرساة في كل مخزن ثقة. وتقليل تعرّضه يحمي التسلسل الهرمي كله."
+          },
+          {
+            "question": "أي العناصر يتحقق منها الخادم عادةً في شهادة العميل؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "السلسلة حتى سلطة موثوقة",
+              "تواريخ الصلاحية",
+              "الاستخدام الموسّع للمفتاح لمصادقة العميل",
+              "الشيفرة المفضلة لدى العميل"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "تُفحص السلسلة والصلاحية والاستخدام والإبطال. أما تفضيل الشيفرة فتفاوض وليس هوية."
+          },
+          {
+            "question": "ما أكثر أسباب الانقطاعات المرتبطة بالشهادات شيوعًا؟",
+            "options": [
+              "شيفرات ضعيفة",
+              "انتهاء غير متوقع",
+              "سلطات كثيرة جدًا",
+              "أحجام مفاتيح قصيرة"
+            ],
+            "answer": 1,
+            "explanation": "التجديدات المنسية توقف الخدمات. والجرد والتنبيهات والتجديد الآلي تمنع ذلك."
+          },
+          {
+            "question": "أي الممارسات تقوّي نشر شهادات العميل؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "أعمار قصيرة مع تجديد آلي",
+              "الوثوق بكل سلطة عامة لمصادقة العميل",
+              "حماية مفاتيح السلطة في HSM",
+              "اختبار إجراءات الإبطال"
+            ],
+            "answer": [
+              0,
+              2,
+              3
+            ],
+            "explanation": "ثق بالسلطة التي تشغّلها للعملاء فقط، واحفظ مفاتيحها في عتاد، وتدرّب على الإبطال."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- تربط الشهادة هوية بمفتاح عام عبر **سلسلة سلطات CA**؛ ويثبتها حاملها بتوقيع المفتاح الخاص.\n- يصادق **TLS المتبادل** الطرفين ولا يرسل سرًا قابلًا لإعادة الاستخدام.\n- تناسب الشهادات الأجهزة والمستخدمين ذوي الضمان العالي؛ وثمنها تشغيل PKI بإتقان.\n- فضّل **الأعمار القصيرة والأتمتة**؛ وخطط **للإبطال** وقرر الفتح أو الإغلاق عند الفشل.\n- راقب الانتهاء واحمِ مفاتيح السلطات في HSM وقيّد السلطات الموثوقة للعملاء.\n\nبعد ذلك، تعرّف كيف تعبر الهويات حدود المؤسسات دون شهادات في درس [اتحاد الهويات](/learn/security-architecture-resilience/identity-federation)."
+      }
+    ]
+  }
+}

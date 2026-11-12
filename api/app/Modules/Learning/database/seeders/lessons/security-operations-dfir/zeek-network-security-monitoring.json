@@ -1,0 +1,546 @@
+{
+  "slug": "zeek-network-security-monitoring",
+  "title": "Zeek Network Security Monitoring",
+  "summary": "Learn what Zeek records, how to deploy a sensor you own, and how to hunt through conn, dns and ssl logs using the uid.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain how Zeek differs from a signature-based IDS",
+    "Describe the main Zeek logs and the uid",
+    "Deploy a standalone sensor with a correct site policy",
+    "Query logs to find long connections and beaconing",
+    "Handle network metadata responsibly"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A user reports that a laptop in the finance VLAN feels slow. Your EDR shows nothing unusual, and the firewall only logged allowed HTTPS traffic. You need to know what that laptop actually talked to, for how long, and how much data moved. A packet capture would answer the question, but nobody can read terabytes of PCAP by hand.\n\n**Zeek** solves this by watching a copy of the network traffic and writing a compact, structured record of everything it understands: connections, DNS lookups, HTTP requests, TLS handshakes, files and more. It is less an alarm system than a flight recorder for the network. In this lesson you will learn what Zeek produces, how to deploy it on a sensor you own, and how to query its logs. The logs feed the same pipelines described in [Centralized Log Management](/learn/security-operations-dfir/centralized-log-management)."
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## What Zeek is and is not\n\nZeek (formerly Bro) is a passive network analysis framework. It reads packets from a mirror port, a network TAP or a PCAP file, reassembles streams, decodes protocols and runs event handlers written in the Zeek scripting language. Its main output is not alerts but **logs**.\n\nThat makes Zeek different from a signature-based IDS such as Suricata (see [Suricata IDS/IPS](/learn/security-operations-dfir/suricata-ids-ips)). The two are complementary.\n\n| Question | Suricata | Zeek |\n|:--|:--|:--|\n| Main output | Alerts from signatures | Protocol logs and metadata |\n| Strength | Known-bad patterns, inline blocking | Context, hunting, retrospective analysis |\n| Typical question | \"Did a rule fire?\" | \"What did 10.20.5.14 talk to last Tuesday?\" |\n| Extensibility | Rule files | Full scripting language and packages |\n\nBecause Zeek keeps metadata even when nothing looks malicious, you can investigate an incident long after the traffic has gone. Metadata is also far smaller than full packet capture, so you can retain weeks or months of it."
+    },
+    {
+      "id": "logs",
+      "type": "text",
+      "markdown": "## The log files you will use most\n\nZeek writes one log per protocol or analyzer, in tab-separated text or JSON. Every connection gets a unique identifier called the **uid**, and every other log carries that same uid. This is how you pivot from a DNS lookup to the connection that followed it, to the file that was transferred.\n\n| Log | What it records | Common use |\n|:--|:--|:--|\n| `conn.log` | Every flow: addresses, ports, duration, bytes, state | Beaconing, data volume, scanning |\n| `dns.log` | Queries and answers | Rare domains, tunneling, resolution history |\n| `http.log` | Method, host, URI, user agent, status | Web activity in cleartext |\n| `ssl.log` | TLS version, SNI, certificate validation | Unexpected destinations, expired certificates |\n| `files.log` | File hashes, MIME types, source | Hash lookups against threat intelligence |\n| `notice.log` | Events that scripts flagged as interesting | Starting point for triage |\n| `weird.log` | Protocol violations and oddities | Evasion attempts and broken software |\n\nThe `conn_state` field in `conn.log` is worth learning early. `S0` means a SYN was seen with no reply, `SF` is a normal completed connection, and `REJ` is a rejected attempt. A host with hundreds of `S0` records to many destinations is a scanning candidate."
+    },
+    {
+      "id": "cfg",
+      "type": "code",
+      "language": "ini",
+      "filename": "/opt/zeek/etc/node.cfg",
+      "caption": "A standalone sensor listening on a SPAN or TAP interface, plus the matching site policy.",
+      "code": "[zeek]\ntype=standalone\nhost=localhost\ninterface=eth1\n\n# ---- /opt/zeek/share/zeek/site/local.zeek ----\n# @load base/frameworks/notice\n# @load policy/tuning/json-logs\n# @load policy/protocols/ssl/validate-certs\n# @load policy/frameworks/files/hash-all-files\n# redef Site::local_nets += { 10.20.0.0/16, 192.0.2.0/24 };"
+    },
+    {
+      "id": "deploy",
+      "type": "text",
+      "markdown": "## Deploying a sensor\n\nA Zeek sensor needs three things: a copy of the traffic, enough CPU for the busiest hour, and fast disks for logs.\n\n1. **Get traffic.** Use a switch SPAN port or a network TAP on the link you want to watch, typically the internet edge and the data center core. The capture interface needs no IP address.\n2. **Define your networks.** Set `Site::local_nets` so Zeek can tell internal from external hosts. Without it, many scripts and your own queries will be wrong.\n3. **Choose the format.** Loading `policy/tuning/json-logs` produces JSON, which SIEMs ingest easily. TSV is smaller and works well with `zeek-cut`.\n4. **Deploy and monitor.** Run `zeekctl deploy`, then `zeekctl status` and `zeekctl diag` to confirm it is running and not dropping packets.\n5. **Ship the logs.** Forward them with Filebeat, the Splunk Universal Forwarder or Wazuh to your SIEM.\n\nEncrypted traffic limits what Zeek can see, but not everything. For TLS it still records the server name (SNI), certificate details, JA3/JA4 fingerprints, sizes and timing. That is enough to spot an unexpected destination or a regular heartbeat."
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "analyst@sensor01:/opt/zeek/logs/current",
+      "prompt": "$",
+      "caption": "Hunting in the finance VLAN. Addresses are documentation examples.",
+      "lines": [
+        {
+          "comment": "Confirm the sensor is healthy and not dropping packets",
+          "cmd": "zeekctl status",
+          "output": "Name         Type       Host          Status    Pid    Started\nzeek         standalone localhost     running   2417   12 Nov 08:01:12"
+        },
+        {
+          "comment": "Longest connections from the suspect laptop",
+          "cmd": "zeek-cut id.orig_h id.resp_h id.resp_p service duration orig_bytes < conn.log | awk '$1==\"10.20.5.14\"' | sort -k5 -nr | head -3",
+          "output": "10.20.5.14  203.0.113.50  443  ssl  86112.4  9120455\n10.20.5.14  198.51.100.7 443  ssl  7203.9   88104\n10.20.5.14  192.0.2.10    53   dns  0.03     64"
+        },
+        {
+          "comment": "Beacon check: count connections per destination",
+          "cmd": "zeek-cut id.resp_h < conn.log | sort | uniq -c | sort -nr | head -2",
+          "output": "   1440 203.0.113.50\n    212 192.0.2.10"
+        },
+        {
+          "comment": "Pivot to the TLS server name for that destination",
+          "cmd": "zeek-cut ts id.orig_h server_name validation_status < ssl.log | grep 203.0.113.50 | head -1",
+          "output": "1762934521.12  10.20.5.14  updates.example.net  self signed certificate"
+        }
+      ]
+    },
+    {
+      "id": "note-read",
+      "type": "callout",
+      "variant": "note",
+      "title": "Reading the output",
+      "markdown": "The laptop holds one connection open for about 24 hours and sent roughly 9 MB outbound. There are 1,440 connections to the same address, exactly one per minute. A fixed interval, a self-signed certificate and a name that does not match a known vendor are all leads. They justify deeper investigation, but they do not prove compromise on their own."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "From packet to log record",
+      "caption": "Zeek sits beside the traffic, never in the path.",
+      "data": {
+        "token": "Packet",
+        "nodes": [
+          {
+            "id": "lan",
+            "label": "Laptop",
+            "sub": "10.20.5.14",
+            "icon": "laptop"
+          },
+          {
+            "id": "sw",
+            "label": "Switch",
+            "sub": "SPAN port",
+            "icon": "switch"
+          },
+          {
+            "id": "zeek",
+            "label": "Zeek",
+            "sub": "Decode and scripts",
+            "icon": "eye"
+          },
+          {
+            "id": "logs",
+            "label": "Log files",
+            "sub": "conn, dns, ssl",
+            "icon": "log"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "Search and alerts",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "lan",
+            "caption": "The laptop opens a TLS connection to an external server."
+          },
+          {
+            "at": "sw",
+            "caption": "The switch forwards the packet normally and mirrors a copy to the sensor."
+          },
+          {
+            "at": "zeek",
+            "caption": "Zeek reassembles the stream and identifies the protocol by content, not only by port.",
+            "tone": "secure"
+          },
+          {
+            "at": "logs",
+            "caption": "Event handlers write conn.log, ssl.log and dns.log rows sharing one uid."
+          },
+          {
+            "at": "siem",
+            "caption": "Forwarders ship the logs; analysts query them and detections correlate them.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "scripts",
+      "type": "text",
+      "markdown": "## Scripts, notices and packages\n\nZeek scripts are event driven. When the analyzer sees a TLS certificate, it raises an event, and your handler can inspect fields and call `NOTICE()` to write to `notice.log`. You rarely write scripts from scratch: the standard distribution ships policies, and the Zeek package manager (`zkg`) installs community packages such as JA3 or file-extraction add-ons.\n\nStart with these practical rules:\n\n- Load the built-in policies before writing your own.\n- Tune notices by suppressing repeated alerts for the same source with the `Notice::policy` framework.\n- Test every change on a PCAP with `zeek -r sample.pcap local` before deploying it to a live sensor.\n- Track scripts in version control, just like detection rules.\n\nSecurity Onion bundles Zeek, Suricata and Elastic, so many teams meet Zeek there first; see [Security Onion Architecture](/learn/security-operations-dfir/security-onion-architecture)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Capture only what you are authorized to monitor",
+      "markdown": "Network metadata can reveal personal browsing habits. Deploy sensors only on networks your organization owns, document the purpose in your monitoring policy, restrict access to the logs and apply a retention limit. Never run a sensor on a network you are not authorized to monitor."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use a home lab or a VM you own.\n\n1. Install Zeek from your distribution packages or the official repository and run `zeek --version`.\n2. Capture a few minutes of your own browsing with `tcpdump -i eth0 -w lab.pcap`, then stop it.\n3. Replay it: `mkdir out && cd out && zeek -r ../lab.pcap`.\n4. Run `zeek-cut query answers < dns.log | head` and `zeek-cut id.resp_h resp_bytes < conn.log | sort -k2 -nr | head`.\n5. Pick one uid from `conn.log` and find the same uid in `ssl.log` or `http.log`. Write two sentences about what the pivot told you."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Zeek",
+          "definition": "A passive network analysis framework that turns traffic into structured logs."
+        },
+        {
+          "term": "uid",
+          "definition": "A unique connection identifier shared by every log that describes that connection."
+        },
+        {
+          "term": "conn.log",
+          "definition": "The log with one row per network flow, including bytes, duration and state."
+        },
+        {
+          "term": "SPAN port",
+          "definition": "A switch feature that copies traffic from other ports to a monitoring port."
+        },
+        {
+          "term": "Network TAP",
+          "definition": "A hardware device that passively copies traffic on a link."
+        },
+        {
+          "term": "Notice",
+          "definition": "A Zeek event flagged by a script as worth an analyst's attention."
+        },
+        {
+          "term": "zeek-cut",
+          "definition": "A command-line helper that extracts chosen columns from TSV logs."
+        },
+        {
+          "term": "JA3",
+          "definition": "A fingerprint of the TLS client hello that helps identify client software."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the main output of Zeek?",
+          "options": [
+            "Blocked packets",
+            "Structured protocol logs",
+            "Full packet captures only",
+            "Antivirus verdicts"
+          ],
+          "answer": 1,
+          "explanation": "Zeek is passive and writes metadata logs. Alerts are a secondary output produced by scripts."
+        },
+        {
+          "question": "How do you connect a DNS lookup to the connection that followed it?",
+          "options": [
+            "By the uid field",
+            "By the file name",
+            "By the log timestamp only",
+            "You cannot"
+          ],
+          "answer": 0,
+          "explanation": "Each connection has a uid that appears in conn.log and in the protocol log. Timestamps alone are ambiguous on busy networks."
+        },
+        {
+          "question": "Which are valid ways to feed traffic to a Zeek sensor? (Choose all that apply.)",
+          "options": [
+            "A switch SPAN port",
+            "A network TAP",
+            "A PCAP file replay",
+            "Reading the firewall rule base"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Zeek needs packets. SPAN, TAP and PCAP files all supply them; a rule base contains no traffic."
+        },
+        {
+          "question": "A host shows hundreds of conn_state S0 records to many different destinations. What is the most likely explanation?",
+          "options": [
+            "Normal web browsing",
+            "Scanning activity",
+            "Completed file transfers",
+            "DNS caching"
+          ],
+          "answer": 1,
+          "explanation": "S0 means a SYN with no reply. Many of them across many targets is the signature pattern of a scan or a broken client."
+        },
+        {
+          "question": "Why should you set Site::local_nets?",
+          "options": [
+            "So Zeek can distinguish internal from external hosts",
+            "To enable encryption",
+            "To increase disk speed",
+            "To block malicious IPs"
+          ],
+          "answer": 0,
+          "explanation": "Many scripts and queries depend on knowing which side is local. Without the setting, results are misleading."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Zeek is a passive sensor that records what it sees as structured logs, giving you a searchable history of the network.\n- The `uid` links `conn.log`, `dns.log`, `ssl.log` and `files.log` for one connection.\n- Deploy it on a SPAN or TAP, define `Site::local_nets`, choose JSON or TSV, and monitor for packet drops.\n- Encrypted traffic still leaves useful metadata: SNI, certificates, fingerprints, sizes and timing.\n- Zeek complements signature tools; correlate its logs with other sources as described in [Log Correlation and Event Enrichment](/learn/security-operations-dfir/log-correlation-and-event-enrichment)."
+    }
+  ],
+  "ar": {
+    "title": "المراقبة الأمنية للشبكات باستخدام Zeek",
+    "summary": "تعرّف ما يسجّله Zeek، وكيف تنشر مستشعراً تملكه، وكيف تصطاد في سجلات conn وdns وssl باستخدام uid.",
+    "objectives": [
+      "شرح الفرق بين Zeek ونظام كشف تسلل قائم على التواقيع",
+      "وصف أهم سجلات Zeek ومعرّف uid",
+      "نشر مستشعر مستقل بسياسة موقع صحيحة",
+      "الاستعلام في السجلات لاكتشاف الاتصالات الطويلة والنبضات",
+      "التعامل مع البيانات الوصفية للشبكة بمسؤولية"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "يبلّغ مستخدم أن حاسوباً محمولاً في شبكة الشؤون المالية بطيء. لا تُظهر أداة EDR شيئاً غريباً، ولا يسجّل جدار الحماية سوى حركة HTTPS مسموحة. تريد أن تعرف مع من تحدّث هذا الجهاز فعلاً، ولكم من الوقت، وكم حجم البيانات التي انتقلت. يجيب التقاط الحزم (PCAP) عن السؤال، لكن لا أحد يقرأ تيرابايتات من الحزم يدوياً.\n\nيحلّ **Zeek** المشكلة بمراقبة نسخة من حركة الشبكة وكتابة سجل مضغوط ومنظَّم لكل ما يفهمه: الاتصالات واستعلامات DNS وطلبات HTTP ومصافحات TLS والملفات وغيرها. فهو أقرب إلى صندوق أسود للشبكة منه إلى جهاز إنذار. ستتعلم في هذا الدرس ما ينتجه Zeek، وكيف تنشره على مستشعر تملكه، وكيف تستعلم عن سجلاته. وتغذّي هذه السجلات المسارات نفسها المشروحة في [إدارة السجلات المركزية](/learn/security-operations-dfir/centralized-log-management)."
+      },
+      {
+        "id": "what",
+        "type": "text",
+        "markdown": "## ما هو Zeek وما ليس هو\n\nZeek (كان يُسمّى Bro) إطار تحليل شبكي سلبي. يقرأ الحزم من منفذ مرآة (Mirror port) أو من نقطة وصول شبكية (TAP) أو من ملف PCAP، ثم يعيد تجميع التدفقات ويفكّ ترميز البروتوكولات وينفّذ معالجات أحداث مكتوبة بلغة Zeek. ومخرجاته الرئيسة ليست تنبيهات بل **سجلات**.\n\nوهذا ما يميّزه عن نظام كشف التسلل المعتمد على التواقيع مثل Suricata (انظر [نظام Suricata لكشف التسلل ومنعه](/learn/security-operations-dfir/suricata-ids-ips)). والأداتان متكاملتان.\n\n| السؤال | Suricata | Zeek |\n|:--|:--|:--|\n| المخرج الرئيس | تنبيهات من التواقيع | سجلات بروتوكولات وبيانات وصفية |\n| نقطة القوة | الأنماط الخبيثة المعروفة والحظر المباشر | السياق والصيد والتحليل الاسترجاعي |\n| السؤال النموذجي | «هل انطلقت قاعدة؟» | «بمن اتصل `10.20.5.14` يوم الثلاثاء الماضي؟» |\n| قابلية التوسعة | ملفات القواعد | لغة برمجة كاملة وحزم |\n\nولأن Zeek يحتفظ بالبيانات الوصفية حتى حين لا يبدو شيء خبيثاً، يمكنك التحقيق في حادثة بعد مرور الحركة بزمن طويل. والبيانات الوصفية أصغر كثيراً من الالتقاط الكامل للحزم، فيمكنك الاحتفاظ بأسابيع أو أشهر منها."
+      },
+      {
+        "id": "logs",
+        "type": "text",
+        "markdown": "## ملفات السجل الأكثر استخداماً\n\nيكتب Zeek سجلاً واحداً لكل بروتوكول أو محلّل، بصيغة نصية مفصولة بعلامات جدولة أو بصيغة JSON. ويحصل كل اتصال على معرّف فريد يسمى **uid**، ويحمل كل سجل آخر المعرّف نفسه. وبهذا تنتقل من استعلام DNS إلى الاتصال الذي تلاه، ثم إلى الملف الذي نُقل.\n\n| السجل | ما يسجّله | الاستخدام الشائع |\n|:--|:--|:--|\n| `conn.log` | كل تدفق: العناوين والمنافذ والمدة والبايتات والحالة | اكتشاف النبضات المنتظمة وحجم البيانات والمسح |\n| `dns.log` | الاستعلامات والإجابات | النطاقات النادرة والنفق عبر DNS وتاريخ الاستبانة |\n| `http.log` | الطريقة والمضيف والمسار ووكيل المستخدم والحالة | نشاط الويب غير المشفّر |\n| `ssl.log` | إصدار TLS واسم الخادم (SNI) والتحقق من الشهادة | الوجهات غير المتوقعة والشهادات المنتهية |\n| `files.log` | تجزئات الملفات وأنواعها ومصدرها | مطابقة التجزئات مع استخبارات التهديد |\n| `notice.log` | أحداث وسمتها السكربتات بأنها مهمة | نقطة انطلاق الفرز |\n| `weird.log` | مخالفات البروتوكول والشذوذات | محاولات التهرب والبرمجيات المعطوبة |\n\nيستحق الحقل `conn_state` في `conn.log` أن تتعلمه مبكراً. فالقيمة `S0` تعني رؤية SYN دون ردّ، و`SF` اتصال عادي مكتمل، و`REJ` محاولة مرفوضة. والمضيف الذي يملك مئات سجلات `S0` نحو وجهات كثيرة مرشّح لأن يكون ماسحاً."
+      },
+      {
+        "id": "cfg",
+        "type": "code",
+        "language": "ini",
+        "filename": "/opt/zeek/etc/node.cfg",
+        "caption": "مستشعر مستقل يستمع على واجهة SPAN أو TAP، مع سياسة الموقع المرافقة.",
+        "code": "[zeek]\ntype=standalone\nhost=localhost\ninterface=eth1\n\n# ---- /opt/zeek/share/zeek/site/local.zeek ----\n# @load base/frameworks/notice\n# @load policy/tuning/json-logs\n# @load policy/protocols/ssl/validate-certs\n# @load policy/frameworks/files/hash-all-files\n# redef Site::local_nets += { 10.20.0.0/16, 192.0.2.0/24 };"
+      },
+      {
+        "id": "deploy",
+        "type": "text",
+        "markdown": "## نشر مستشعر\n\nيحتاج مستشعر Zeek إلى ثلاثة أشياء: نسخة من الحركة، ومعالجاً كافياً لأشد ساعات الحمل، وأقراصاً سريعة للسجلات.\n\n1. **احصل على الحركة.** استخدم منفذ SPAN في المحوّل أو جهاز TAP على الوصلة التي تريد مراقبتها، وغالباً حافة الإنترنت وقلب مركز البيانات. ولا تحتاج واجهة الالتقاط إلى عنوان IP.\n2. **عرّف شبكاتك.** اضبط `Site::local_nets` ليميّز Zeek بين المضيفات الداخلية والخارجية. وبدونه تخطئ سكربتات كثيرة واستعلاماتك أيضاً.\n3. **اختر الصيغة.** يُنتج تحميل `policy/tuning/json-logs` سجلات JSON تسهل على أنظمة SIEM استيعابها. أمّا TSV فأصغر حجماً ويناسب الأداة `zeek-cut`.\n4. **انشر وراقب.** شغّل `zeekctl deploy` ثم `zeekctl status` و`zeekctl diag` للتأكد من أنه يعمل ولا يُسقط حزماً.\n5. **أرسل السجلات.** أعد توجيهها بأداة Filebeat أو Splunk Universal Forwarder أو Wazuh إلى نظام SIEM.\n\nيحدّ التشفير مما يراه Zeek لكنه لا يعميه. ففي TLS ما زال يسجّل اسم الخادم (SNI) وتفاصيل الشهادة وبصمات JA3/JA4 والأحجام والتوقيت، وهذا يكفي لاكتشاف وجهة غير متوقعة أو نبضة منتظمة."
+      },
+      {
+        "id": "term",
+        "type": "terminal",
+        "title": "analyst@sensor01:/opt/zeek/logs/current",
+        "prompt": "$",
+        "caption": "الصيد في شبكة الشؤون المالية. العناوين أمثلة توثيقية.",
+        "lines": [
+          {
+            "comment": "تأكد أن المستشعر سليم ولا يُسقط حزماً",
+            "cmd": "zeekctl status",
+            "output": "Name         Type       Host          Status    Pid    Started\nzeek         standalone localhost     running   2417   12 Nov 08:01:12"
+          },
+          {
+            "comment": "أطول الاتصالات من الحاسوب المشبوه",
+            "cmd": "zeek-cut id.orig_h id.resp_h id.resp_p service duration orig_bytes < conn.log | awk '$1==\"10.20.5.14\"' | sort -k5 -nr | head -3",
+            "output": "10.20.5.14  203.0.113.50  443  ssl  86112.4  9120455\n10.20.5.14  198.51.100.7 443  ssl  7203.9   88104\n10.20.5.14  192.0.2.10    53   dns  0.03     64"
+          },
+          {
+            "comment": "فحص النبضات: عدد الاتصالات لكل وجهة",
+            "cmd": "zeek-cut id.resp_h < conn.log | sort | uniq -c | sort -nr | head -2",
+            "output": "   1440 203.0.113.50\n    212 192.0.2.10"
+          },
+          {
+            "comment": "الانتقال إلى اسم خادم TLS لتلك الوجهة",
+            "cmd": "zeek-cut ts id.orig_h server_name validation_status < ssl.log | grep 203.0.113.50 | head -1",
+            "output": "1762934521.12  10.20.5.14  updates.example.net  self signed certificate"
+          }
+        ]
+      },
+      {
+        "id": "note-read",
+        "type": "callout",
+        "variant": "note",
+        "title": "قراءة المخرجات",
+        "markdown": "يبقي الحاسوب اتصالاً واحداً مفتوحاً نحو 24 ساعة ويرسل قرابة 9 ميغابايت إلى الخارج. وهناك 1440 اتصالاً بالعنوان نفسه، أي واحد كل دقيقة بالضبط. الفاصل الثابت والشهادة الموقّعة ذاتياً واسم لا يطابق مورّداً معروفاً كلها خيوط تستحق التحقيق، لكنها لا تثبت الاختراق وحدها."
+      },
+      {
+        "id": "flow",
+        "type": "animation",
+        "kind": "flow",
+        "title": "من الحزمة إلى سجل مسجَّل",
+        "caption": "يقف Zeek بجانب الحركة، ولا يكون أبداً في مسارها.",
+        "data": {
+          "token": "حزمة",
+          "nodes": [
+            {
+              "id": "lan",
+              "label": "الحاسوب",
+              "sub": "10.20.5.14",
+              "icon": "laptop"
+            },
+            {
+              "id": "sw",
+              "label": "المحوّل",
+              "sub": "منفذ SPAN",
+              "icon": "switch"
+            },
+            {
+              "id": "zeek",
+              "label": "Zeek",
+              "sub": "فك الترميز والسكربتات",
+              "icon": "eye"
+            },
+            {
+              "id": "logs",
+              "label": "ملفات السجل",
+              "sub": "conn, dns, ssl",
+              "icon": "log"
+            },
+            {
+              "id": "siem",
+              "label": "SIEM",
+              "sub": "بحث وتنبيهات",
+              "icon": "database"
+            }
+          ],
+          "steps": [
+            {
+              "at": "lan",
+              "caption": "يفتح الحاسوب اتصال TLS بخادم خارجي."
+            },
+            {
+              "at": "sw",
+              "caption": "يمرّر المحوّل الحزمة كالمعتاد ويرسل نسخة مرآة إلى المستشعر."
+            },
+            {
+              "at": "zeek",
+              "caption": "يعيد Zeek تجميع التدفق ويتعرف البروتوكول من محتواه لا من المنفذ فقط.",
+              "tone": "secure"
+            },
+            {
+              "at": "logs",
+              "caption": "تكتب معالجات الأحداث صفوفاً في conn.log وssl.log وdns.log تشترك في uid واحد."
+            },
+            {
+              "at": "siem",
+              "caption": "تنقل أدوات الإرسال السجلات، ويستعلم عنها المحللون وتربطها قواعد الكشف.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "scripts",
+        "type": "text",
+        "markdown": "## السكربتات والإشعارات والحزم\n\nسكربتات Zeek مدفوعة بالأحداث. فحين يرى المحلل شهادة TLS يطلق حدثاً، ويستطيع معالجك فحص الحقول واستدعاء `NOTICE()` للكتابة في `notice.log`. ونادراً ما تكتب سكربتات من الصفر، فالتوزيعة القياسية تتضمن سياسات جاهزة، ويثبّت مدير حزم Zeek (`zkg`) حزماً من المجتمع مثل JA3 وإضافات استخراج الملفات.\n\nابدأ بهذه القواعد العملية:\n\n- حمّل السياسات المضمَّنة قبل أن تكتب سياساتك.\n- اضبط الإشعارات بكتم التنبيهات المتكررة للمصدر نفسه عبر إطار `Notice::policy`.\n- اختبر كل تغيير على ملف PCAP بالأمر `zeek -r sample.pcap local` قبل نشره على مستشعر حي.\n- احفظ السكربتات في نظام إدارة الإصدارات كما تفعل مع قواعد الكشف.\n\nتضم منصة Security Onion كلاً من Zeek وSuricata وElastic، ولذلك يلتقي فرق كثيرة بـ Zeek هناك أولاً، انظر [بنية Security Onion](/learn/security-operations-dfir/security-onion-architecture)."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "لا تلتقط إلا ما أنت مخوَّل بمراقبته",
+        "markdown": "قد تكشف البيانات الوصفية للشبكة عادات التصفح الشخصية. انشر المستشعرات في شبكات تملكها مؤسستك فقط، ووثّق الغرض في سياسة المراقبة، وقيّد الوصول إلى السجلات، وحدّد مدة احتفاظ. ولا تشغّل مستشعراً على شبكة غير مخوَّل لك بمراقبتها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم مختبراً منزلياً أو جهازاً افتراضياً تملكه.\n\n1. ثبّت Zeek من حزم توزيعتك أو من المستودع الرسمي وشغّل `zeek --version`.\n2. التقط بضع دقائق من تصفحك الخاص بالأمر `tcpdump -i eth0 -w lab.pcap` ثم أوقفه.\n3. أعد تشغيل الملف: `mkdir out && cd out && zeek -r ../lab.pcap`.\n4. نفّذ `zeek-cut query answers < dns.log | head` و`zeek-cut id.resp_h resp_bytes < conn.log | sort -k2 -nr | head`.\n5. اختر uid واحداً من `conn.log` وابحث عنه في `ssl.log` أو `http.log`. اكتب جملتين عمّا كشفه لك هذا الانتقال."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "Zeek",
+            "definition": "إطار تحليل شبكي سلبي يحوّل الحركة إلى سجلات منظَّمة."
+          },
+          {
+            "term": "uid",
+            "definition": "معرّف فريد للاتصال تشترك فيه كل السجلات التي تصفه."
+          },
+          {
+            "term": "conn.log",
+            "definition": "سجل فيه صف لكل تدفق شبكي، يشمل البايتات والمدة والحالة."
+          },
+          {
+            "term": "منفذ SPAN",
+            "definition": "ميزة في المحوّل تنسخ حركة منافذ أخرى إلى منفذ مراقبة."
+          },
+          {
+            "term": "جهاز TAP الشبكي",
+            "definition": "جهاز مادي ينسخ الحركة على الوصلة بصورة سلبية."
+          },
+          {
+            "term": "الإشعار (Notice)",
+            "definition": "حدث يعلّمه سكربت في Zeek بأنه يستحق انتباه المحلل."
+          },
+          {
+            "term": "zeek-cut",
+            "definition": "أداة سطر أوامر تستخرج أعمدة محددة من سجلات TSV."
+          },
+          {
+            "term": "JA3",
+            "definition": "بصمة لرسالة TLS الأولى من العميل تساعد على تمييز برنامج العميل."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما المخرج الرئيس لـ Zeek؟",
+            "options": [
+              "حزم محظورة",
+              "سجلات بروتوكولات منظَّمة",
+              "التقاط كامل للحزم فقط",
+              "أحكام مضاد الفيروسات"
+            ],
+            "answer": 1,
+            "explanation": "Zeek سلبي ويكتب سجلات وصفية. والتنبيهات مخرج ثانوي تنتجه السكربتات."
+          },
+          {
+            "question": "كيف تربط استعلام DNS بالاتصال الذي تلاه؟",
+            "options": [
+              "بالحقل uid",
+              "باسم الملف",
+              "بالطابع الزمني للسجل فقط",
+              "لا يمكن"
+            ],
+            "answer": 0,
+            "explanation": "لكل اتصال uid يظهر في conn.log وفي سجل البروتوكول. والطابع الزمني وحده ملتبس في الشبكات المزدحمة."
+          },
+          {
+            "question": "أي مما يلي طرق صالحة لتزويد مستشعر Zeek بالحركة؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "منفذ SPAN في المحوّل",
+              "جهاز TAP شبكي",
+              "إعادة تشغيل ملف PCAP",
+              "قراءة قواعد جدار الحماية"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "يحتاج Zeek إلى حزم. ويوفرها SPAN وTAP وملفات PCAP، أما قواعد الجدار فلا تحتوي حركة."
+          },
+          {
+            "question": "يظهر مضيف بمئات سجلات conn_state بقيمة S0 نحو وجهات كثيرة مختلفة. ما التفسير الأرجح؟",
+            "options": [
+              "تصفح ويب عادي",
+              "نشاط مسح",
+              "نقل ملفات مكتمل",
+              "تخزين DNS مؤقتاً"
+            ],
+            "answer": 1,
+            "explanation": "S0 تعني SYN دون ردّ. وكثرتها نحو أهداف عديدة نمط مسح معروف أو عميل معطوب."
+          },
+          {
+            "question": "لماذا يجب ضبط Site::local_nets؟",
+            "options": [
+              "ليميّز Zeek المضيفات الداخلية من الخارجية",
+              "لتفعيل التشفير",
+              "لزيادة سرعة القرص",
+              "لحظر عناوين IP الخبيثة"
+            ],
+            "answer": 0,
+            "explanation": "تعتمد سكربتات واستعلامات كثيرة على معرفة الطرف المحلي. وبدون الإعداد تضلّل النتائج."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- Zeek مستشعر سلبي يسجّل ما يراه في سجلات منظَّمة، فيمنحك تاريخاً قابلاً للبحث عن الشبكة.\n- يربط `uid` بين `conn.log` و`dns.log` و`ssl.log` و`files.log` للاتصال الواحد.\n- انشره على SPAN أو TAP، وعرّف `Site::local_nets`، واختر JSON أو TSV، وراقب إسقاط الحزم.\n- يترك التشفير بيانات وصفية مفيدة: SNI والشهادات والبصمات والأحجام والتوقيت.\n- يكمّل Zeek أدوات التواقيع؛ فاربط سجلاته بمصادر أخرى كما في [ربط السجلات وإثراء الأحداث](/learn/security-operations-dfir/log-correlation-and-event-enrichment)."
+      }
+    ]
+  }
+}

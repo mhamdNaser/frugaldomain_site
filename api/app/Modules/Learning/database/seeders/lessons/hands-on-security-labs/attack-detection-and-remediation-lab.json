@@ -1,0 +1,656 @@
+{
+  "slug": "attack-detection-and-remediation-lab",
+  "title": "Attack Detection and Remediation Lab",
+  "summary": "Run a scoped purple-team exercise on your own lab: simulate a scan, failed logins and a persistence change, detect each with Suricata and Wazuh, remediate, and build a coverage table.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Plan a scoped purple-team exercise with rules of engagement",
+    "Detect a scan, failed logins and persistence in Suricata and Wazuh",
+    "Separate immediate remediation from root-cause fixes",
+    "Build a detection coverage table and retest fixes"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Detection rules that have never seen an attack are guesses. You do not know whether your SIEM would notice a port scan, a password-guessing run or a new scheduled task until something like that happens in front of it. A **purple-team** exercise closes that gap: you play the attacker in a small, safe way against systems you own, watch what the defenders see, and fix whatever was missed.\n\nIn this lab you run three tiny, harmless simulations against your own lab network: reconnaissance, repeated failed logins and a persistence change. For each one you find the evidence, write or tune a detection, remediate, and record the result. You use the SIEM from [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab) and the sensor from [IDS/IPS Deployment Lab](/learn/hands-on-security-labs/ids-ips-deployment-lab). Nothing here uses exploits or malware, and you must run it only on VMs that belong to you."
+    },
+    {
+      "id": "plan",
+      "type": "text",
+      "markdown": "## Step 1: Plan the exercise\n\nWrite the plan before you touch a keyboard. Each row is a hypothesis: \"if this happens, we will see it here.\" The MITRE ATT&CK identifiers give you a common vocabulary for reporting.\n\n| Simulation | ATT&CK | Expected evidence | Expected response |\n|:--|:--|:--|:--|\n| TCP port scan of the target | T1046 | Suricata alert, firewall deny counts | Block source, review exposure |\n| Six wrong SSH passwords | T1110 | Wazuh rule 5710/5712 | Temporary block, check for success |\n| New user and a cron file | T1136, T1053 | `useradd` event, file integrity alert | Remove, rotate credentials, find cause |\n\nRules of engagement: only your own VMs, a written start and stop time, a snapshot of each VM beforehand and a rollback plan. The attacker VM sits on its own lab VLAN with the address 198.51.100.23 in this example, and the target is 10.10.20.10."
+    },
+    {
+      "id": "seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "One simulation, end to end",
+      "caption": "The attacker VM generates a harmless scan, the sensor and SIEM detect it, and the analyst remediates.",
+      "data": {
+        "actors": [
+          {
+            "id": "att",
+            "label": "Attacker VM",
+            "sub": "198.51.100.23",
+            "icon": "attacker"
+          },
+          {
+            "id": "tgt",
+            "label": "Target",
+            "sub": "10.10.20.10",
+            "icon": "server"
+          },
+          {
+            "id": "ids",
+            "label": "Suricata",
+            "sub": "sensor",
+            "icon": "eye"
+          },
+          {
+            "id": "siem",
+            "label": "Wazuh SIEM",
+            "sub": "10.10.40.5",
+            "icon": "log"
+          },
+          {
+            "id": "an",
+            "label": "Analyst",
+            "sub": "you",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "from": "att",
+            "to": "tgt",
+            "label": "SYN x 1000",
+            "detail": "nmap -sS",
+            "note": "The simulated scan sends SYN packets to many ports on your own target.",
+            "tone": "attack"
+          },
+          {
+            "from": "tgt",
+            "to": "att",
+            "label": "RST / SYN-ACK",
+            "detail": "open vs closed",
+            "note": "Open ports answer SYN-ACK and closed ports answer RST. That difference is what a scan measures.",
+            "tone": "warning"
+          },
+          {
+            "from": "ids",
+            "to": "siem",
+            "label": "Alert sid 1000001",
+            "detail": "eve.json",
+            "note": "The threshold rule fires after 30 SYNs in 10 seconds from one source.",
+            "tone": "danger"
+          },
+          {
+            "from": "siem",
+            "to": "an",
+            "label": "Level 10 alert",
+            "detail": "source 198.51.100.23",
+            "note": "The SIEM correlates and shows the alert with the scanner address.",
+            "tone": "warning"
+          },
+          {
+            "from": "an",
+            "to": "ids",
+            "label": "Block and tune",
+            "detail": "firewall set",
+            "note": "The analyst blocks the source and records the detection as covered.",
+            "tone": "secure"
+          },
+          {
+            "from": "an",
+            "to": "an",
+            "label": "Update coverage table",
+            "note": "Result written down: T1046 detected in 6 seconds.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recon",
+      "type": "text",
+      "markdown": "## Step 2: Simulate and detect reconnaissance\n\nStart with a scan, because it is the loudest and easiest step. Run a TCP SYN scan from the attacker VM against the target's first 1,000 ports, and look at what the sensor saw. If nothing fired, the detection gap is your first finding.\n\nA scan alone is not an attack, so do not over-react in production. The value of the alert is early warning and context: if the same address later shows a login failure, the two events tell one story. Do not forget to check what the scan found. Every open port you did not expect is a remediation item, whether or not anyone was scanning."
+    },
+    {
+      "id": "rules",
+      "type": "code",
+      "language": "plain",
+      "filename": "local.rules and local_rules.xml",
+      "caption": "A Suricata threshold rule for SYN scans, and a Wazuh rule that flags new files under /etc/cron.d. Test both before you rely on them.",
+      "code": "# /etc/suricata/rules/local.rules\nalert tcp any any -> $HOME_NET any (msg:\"LAB Possible TCP SYN scan\"; flags:S,12; threshold: type both, track by_src, count 30, seconds 10; classtype:attempted-recon; sid:1000001; rev:1;)\n\n<!-- /var/ossec/etc/rules/local_rules.xml (Wazuh) -->\n<group name=\"local,persistence,\">\n  <rule id=\"100200\" level=\"12\">\n    <if_sid>554</if_sid>\n    <field name=\"file\">^/etc/cron\\.d/</field>\n    <description>New file in /etc/cron.d (possible persistence)</description>\n    <mitre><id>T1053.003</id></mitre>\n  </rule>\n</group>\n",
+      "highlight": [
+        2,
+        6,
+        7,
+        8
+      ]
+    },
+    {
+      "id": "term-detect",
+      "type": "terminal",
+      "title": "sensor / attacker",
+      "prompt": "$",
+      "caption": "Run the scan from your own attacker VM and read the alert.",
+      "lines": [
+        {
+          "cmd": "nmap -sS -p 1-1000 10.10.20.10",
+          "output": "Starting Nmap 7.94 at 2026-11-12 11:02 UTC\nNmap scan report for 10.10.20.10\nPORT    STATE SERVICE\n22/tcp  open  ssh\n80/tcp  open  http\n5432/tcp closed postgresql\nNmap done: 1 IP address (1 host up) scanned in 3.41 seconds",
+          "comment": "Run from the attacker VM at 198.51.100.23. Port 22 and 80 are open, as planned."
+        },
+        {
+          "cmd": "sudo jq -c 'select(.event_type==\"alert\") | {t:.timestamp, sig:.alert.signature, src:.src_ip}' /var/log/suricata/eve.json | tail -n 1",
+          "output": "{\"t\":\"2026-11-12T11:02:05.882+0000\",\"sig\":\"LAB Possible TCP SYN scan\",\"src\":\"198.51.100.23\"}",
+          "comment": "On the sensor: the alert fired about two seconds after the scan began."
+        },
+        {
+          "cmd": "sudo nft add element inet filter blocklist '{ 198.51.100.23 timeout 1h }'",
+          "output": "",
+          "comment": "Remediation: a one-hour block, using the set from the Security Automation Lab."
+        }
+      ]
+    },
+    {
+      "id": "auth",
+      "type": "text",
+      "markdown": "## Step 3: Simulate failed logins and a persistence change\n\nFor the password test, make six SSH attempts with a deliberately wrong password from the attacker VM, using the normal `ssh` client. Do not use a cracking tool or a real wordlist; six attempts are enough to trigger rules 5710 and 5712. Then check the part many people forget: **was there a success afterward?** A wall of failures followed by one successful login from the same address is the real alarm.\n\nFor persistence, log in to the target as an administrator and create a test user and a harmless cron file that only writes a line to a log. These are the same file changes a real intruder makes, which is why [Linux Server Hardening Lab](/learn/hands-on-security-labs/linux-server-hardening-lab) watches them. Your file-integrity monitor should flag the new file, and the SIEM should record the new account."
+    },
+    {
+      "id": "term-persist",
+      "type": "terminal",
+      "title": "target (10.10.20.10)",
+      "prompt": "$",
+      "caption": "A harmless persistence simulation, the evidence, and the cleanup. Run only on your own VM.",
+      "lines": [
+        {
+          "cmd": "echo '*/5 * * * * root logger lab-test' | sudo tee /etc/cron.d/lab-test && sudo useradd -m labtest",
+          "output": "*/5 * * * * root logger lab-test",
+          "comment": "Creates a test user and a cron job that only writes a syslog line."
+        },
+        {
+          "cmd": "sudo jq -c 'select(.rule.id==\"100200\" or .rule.id==\"5902\") | {rule:.rule.id, desc:.rule.description}' /var/ossec/logs/alerts/alerts.json | tail -n 2",
+          "output": "{\"rule\":\"5902\",\"desc\":\"New user added to the system\"}\n{\"rule\":\"100200\",\"desc\":\"New file in /etc/cron.d (possible persistence)\"}",
+          "comment": "Run on the manager: both the account change and the new file were detected."
+        },
+        {
+          "cmd": "sudo rm /etc/cron.d/lab-test && sudo userdel -r labtest && sudo grep -c labtest /etc/passwd",
+          "output": "0",
+          "comment": "Cleanup and verification: the account is gone and no trace remains in passwd."
+        }
+      ]
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Stay inside your scope",
+      "markdown": "Scanning or guessing passwords on a system you do not own or lack written permission to test is illegal in many countries, even on a cloud provider or a friend's server. Keep the attacker and target on an isolated lab network, keep the attacker VM's gateway disabled and never point these tests at the internet."
+    },
+    {
+      "id": "report",
+      "type": "text",
+      "markdown": "## Step 4: Remediate, then report what you learned\n\nRemediation has two layers. The **immediate** layer stops the activity: block the source, remove the test account, disable the cron file. The **root-cause** layer fixes why it was possible: close ports you did not need, limit SSH to the management network, require keys instead of passwords and add alerting where there was a gap.\n\nThen fill in a coverage table. It is the main product of the exercise and a strong portfolio artifact.\n\n| Technique | Detected? | Time to detect | Gap or fix |\n|:--|:--|:--|:--|\n| T1046 scan | Yes | 2 s | Tuned threshold to 30 SYNs |\n| T1110 guessing | Yes | 4 s | Added alert for success after failures |\n| T1136 new user | Yes | 1 s | None |\n| T1053 cron file | No, then yes | n/a | Wrote rule 100200 |\n\nRepeat each simulation after the fix to prove that it works. A fix you have not re-tested is only a theory. Next, see how a full incident feels in [Incident Response Simulation Lab](/learn/hands-on-security-labs/incident-response-simulation-lab)."
+    },
+    {
+      "id": "note",
+      "type": "callout",
+      "variant": "note",
+      "title": "Read the results honestly",
+      "markdown": "A simulation proves only what it tested. A scan from a lab VLAN is louder and slower than one from a patient intruder, and six failed logins are far fewer than a real campaign. Treat a pass as evidence for that scenario, not as proof of safety. Record what you did not test, such as encrypted traffic, other protocols and quiet, low-volume activity, so the next exercise can cover it."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Time-box and snapshot",
+      "markdown": "Take a VM snapshot before each simulation and revert afterward, so leftover accounts and files cannot confuse the next test. Note the exact start and end time of each action, because you will need it to find the events in the SIEM."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On an isolated lab with an attacker VM, a target VM, a sensor and a SIEM **you own**:\n\n1. Write the plan table, the rules of engagement and the start and stop time, then snapshot every VM.\n2. Add the Suricata rule and the Wazuh rule, test them, and restart the services.\n3. Run `nmap -sS -p 1-1000` against the target and find the alert in `eve.json`.\n4. Make six wrong SSH logins and find rules 5710 and 5712. Check whether any login succeeded.\n5. Create the test user and cron file, find both alerts, then clean up and verify.\n6. Block the attacker address with an expiring rule.\n7. Fill in the coverage table, fix one gap, repeat that simulation and record the result."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Purple team",
+          "definition": "Attackers and defenders working together to test and improve detections."
+        },
+        {
+          "term": "MITRE ATT&CK",
+          "definition": "A public knowledge base of adversary techniques, used to label and report detections."
+        },
+        {
+          "term": "Rules of engagement",
+          "definition": "The written scope, timing and limits of a test."
+        },
+        {
+          "term": "Reconnaissance",
+          "definition": "Gathering information about a target, such as which ports are open."
+        },
+        {
+          "term": "Persistence",
+          "definition": "Changes an intruder makes to keep access, such as new accounts or scheduled tasks."
+        },
+        {
+          "term": "File integrity monitoring",
+          "definition": "Detecting added or changed files by comparing them with a known state."
+        },
+        {
+          "term": "Detection coverage",
+          "definition": "The set of techniques you can reliably detect, with time to detect."
+        },
+        {
+          "term": "Root cause",
+          "definition": "The underlying weakness that made an event possible."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "What is the purpose of a purple-team exercise?",
+          "options": [
+            "To test whether defenders see simulated attacker activity and fix gaps",
+            "To attack production without telling anyone",
+            "To replace the SIEM",
+            "To avoid writing reports"
+          ],
+          "answer": 0,
+          "explanation": "Purple teaming turns assumptions about detection into measured results."
+        },
+        {
+          "question": "What must exist before any simulation? (Choose all that apply.)",
+          "options": [
+            "A written scope on systems you own",
+            "Snapshots of the VMs",
+            "Permission from a stranger's server owner is unnecessary",
+            "A start and stop time"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Scope, snapshots and timing keep the exercise safe and make events easy to find. Testing someone else's server without permission is never acceptable."
+        },
+        {
+          "question": "After a burst of failed SSH logins, which question matters most?",
+          "options": [
+            "Was there a successful login from the same address?",
+            "What color is the dashboard?",
+            "Did the CPU temperature rise?",
+            "How many agents are installed?"
+          ],
+          "answer": 0,
+          "explanation": "A success after failures can mean the guessing worked, which turns noise into an incident."
+        },
+        {
+          "question": "Which is a root-cause remediation for an exposed SSH service?",
+          "options": [
+            "Restrict SSH to the management network and require keys",
+            "Block one address forever",
+            "Reboot the server",
+            "Delete the logs"
+          ],
+          "answer": 0,
+          "explanation": "Reducing exposure and strengthening authentication removes the weakness, not just one attacker."
+        },
+        {
+          "question": "Why repeat a simulation after you fix a detection?",
+          "options": [
+            "To prove the fix works",
+            "To increase alert volume",
+            "To fill the disk",
+            "It is required by Suricata"
+          ],
+          "answer": 0,
+          "explanation": "An untested fix is an assumption. Re-running the test closes the loop."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou ran a planned, scoped purple-team exercise: a port scan, repeated failed logins and a persistence change, all on systems you own. For each you found the evidence, wrote or tuned a detection, remediated the immediate activity and the root cause, and recorded time to detect in a coverage table. Detection you have never tested is a guess, so keep repeating this loop as your lab grows. For a full-length incident, continue to [Incident Response Simulation Lab](/learn/hands-on-security-labs/incident-response-simulation-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر كشف الهجمات ومعالجتها",
+    "summary": "نفّذ تمرين فريق بنفسجي محدد النطاق على مختبرك: حاكِ مسحًا ومحاولات دخول فاشلة وتغيير بقاء، واكشف كلًّا بـ Suricata وWazuh وعالجه، وابنِ جدول تغطية.",
+    "objectives": [
+      "التخطيط لتمرين فريق بنفسجي محدد النطاق بقواعد اشتباك",
+      "كشف المسح والدخول الفاشل والبقاء في Suricata وWazuh",
+      "التمييز بين المعالجة الفورية وإصلاح السبب الجذري",
+      "بناء جدول تغطية الكشف وإعادة اختبار الإصلاحات"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "قواعد الكشف التي لم ترَ هجومًا قط مجرد تخمين. فلا تعرف هل سيلاحظ نظام SIEM لديك مسحًا للمنافذ أو تخمينًا لكلمات المرور أو مهمة مجدولة جديدة حتى يحدث شيء من ذلك أمامه. وتُغلق تمارين **الفريق البنفسجي (Purple Team)** هذه الفجوة: تؤدي دور المهاجم بطريقة صغيرة وآمنة ضد أنظمة تملكها، وتراقب ما يراه المدافعون، وتصلح ما فاتهم.\n\nستنفّذ في هذا المختبر ثلاث محاكاة صغيرة غير ضارة ضد شبكة مختبرك: استطلاع، ومحاولات دخول فاشلة متكررة، وتغيير للبقاء (Persistence). وفي كل محاكاة تجد الدليل وتكتب كشفًا أو تضبطه وتعالج وتسجل النتيجة. تستخدم نظام SIEM من [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab) والمجسّ من [IDS/IPS Deployment Lab](/learn/hands-on-security-labs/ids-ips-deployment-lab). لا شيء هنا يستخدم ثغرات أو برمجيات خبيثة، ويجب ألا تشغّله إلا على أجهزة افتراضية تملكها."
+      },
+      {
+        "id": "plan",
+        "type": "text",
+        "markdown": "## الخطوة 1: خطّط للتمرين\n\nاكتب الخطة قبل أن تلمس لوحة المفاتيح. كل صف فرضية: «إذا حدث هذا فسنراه هنا». وتمنحك معرّفات MITRE ATT&CK مفردات مشتركة للتقرير.\n\n| المحاكاة | ATT&CK | الدليل المتوقع | الاستجابة المتوقعة |\n|:--|:--|:--|:--|\n| مسح منافذ TCP للهدف | T1046 | تنبيه Suricata وعدّادات رفض جدار الحماية | حظر المصدر ومراجعة التعرّض |\n| ست كلمات مرور SSH خاطئة | T1110 | قاعدة Wazuh رقم 5710/5712 | حظر مؤقت وفحص وجود دخول ناجح |\n| مستخدم جديد وملف cron | T1136 وT1053 | حدث `useradd` وتنبيه سلامة الملفات | الإزالة وتدوير بيانات الاعتماد وإيجاد السبب |\n\nقواعد الاشتباك: أجهزتك أنت فقط، ووقت بدء وانتهاء مكتوبان، ولقطة لكل جهاز مسبقًا، وخطة تراجع. يقع جهاز المهاجم على شبكة VLAN مخبرية خاصة بعنوان 198.51.100.23 في هذا المثال، والهدف هو 10.10.20.10."
+      },
+      {
+        "id": "seq",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "محاكاة واحدة من البداية إلى النهاية",
+        "caption": "يولّد جهاز المهاجم مسحًا غير ضار، فيكتشفه المجسّ وSIEM، ثم يعالج المحلل.",
+        "data": {
+          "actors": [
+            {
+              "id": "att",
+              "label": "جهاز المهاجم",
+              "sub": "198.51.100.23",
+              "icon": "attacker"
+            },
+            {
+              "id": "tgt",
+              "label": "الهدف",
+              "sub": "10.10.20.10",
+              "icon": "server"
+            },
+            {
+              "id": "ids",
+              "label": "Suricata",
+              "sub": "sensor",
+              "icon": "eye"
+            },
+            {
+              "id": "siem",
+              "label": "Wazuh SIEM",
+              "sub": "10.10.40.5",
+              "icon": "log"
+            },
+            {
+              "id": "an",
+              "label": "المحلل",
+              "sub": "you",
+              "icon": "user"
+            }
+          ],
+          "steps": [
+            {
+              "from": "att",
+              "to": "tgt",
+              "label": "SYN x 1000",
+              "detail": "nmap -sS",
+              "note": "يرسل المسح المحاكى حزم SYN إلى منافذ كثيرة على هدفك أنت.",
+              "tone": "attack"
+            },
+            {
+              "from": "tgt",
+              "to": "att",
+              "label": "RST / SYN-ACK",
+              "detail": "open vs closed",
+              "note": "تردّ المنافذ المفتوحة بـ SYN-ACK والمغلقة بـ RST، وهذا الفرق هو ما يقيسه المسح.",
+              "tone": "warning"
+            },
+            {
+              "from": "ids",
+              "to": "siem",
+              "label": "Alert sid 1000001",
+              "detail": "eve.json",
+              "note": "تنطلق قاعدة العتبة بعد 30 حزمة SYN في 10 ثوانٍ من مصدر واحد.",
+              "tone": "danger"
+            },
+            {
+              "from": "siem",
+              "to": "an",
+              "label": "Level 10 alert",
+              "detail": "source 198.51.100.23",
+              "note": "يربط SIEM الأحداث ويعرض التنبيه مع عنوان الماسح.",
+              "tone": "warning"
+            },
+            {
+              "from": "an",
+              "to": "ids",
+              "label": "Block and tune",
+              "detail": "firewall set",
+              "note": "يحظر المحلل المصدر ويسجل الكشف على أنه مغطّى.",
+              "tone": "secure"
+            },
+            {
+              "from": "an",
+              "to": "an",
+              "label": "Update coverage table",
+              "note": "تُدوَّن النتيجة: رُصد T1046 خلال 6 ثوانٍ.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "recon",
+        "type": "text",
+        "markdown": "## الخطوة 2: حاكِ الاستطلاع واكشفه\n\nابدأ بمسح لأنه الأعلى ضجيجًا والأسهل. شغّل مسح TCP SYN من جهاز المهاجم ضد أول 1000 منفذ في الهدف، وانظر ما رآه المجسّ. وإذا لم ينطلق شيء فالفجوة في الكشف هي أول نتائجك.\n\nالمسح وحده ليس هجومًا، فلا تبالغ في ردة الفعل في الإنتاج. وقيمة التنبيه هي الإنذار المبكر والسياق: فإذا ظهر العنوان نفسه لاحقًا في فشل دخول، روى الحدثان قصة واحدة. ولا تنسَ فحص ما كشفه المسح؛ فكل منفذ مفتوح لم تتوقعه بند معالجة سواء كان أحد يمسح أم لا."
+      },
+      {
+        "id": "rules",
+        "type": "code",
+        "language": "plain",
+        "filename": "local.rules and local_rules.xml",
+        "caption": "قاعدة عتبة في Suricata لمسح SYN، وقاعدة Wazuh تُعلِم بالملفات الجديدة تحت `/etc/cron.d`. اختبرهما قبل الاعتماد عليهما.",
+        "code": "# /etc/suricata/rules/local.rules\nalert tcp any any -> $HOME_NET any (msg:\"LAB Possible TCP SYN scan\"; flags:S,12; threshold: type both, track by_src, count 30, seconds 10; classtype:attempted-recon; sid:1000001; rev:1;)\n\n<!-- /var/ossec/etc/rules/local_rules.xml (Wazuh) -->\n<group name=\"local,persistence,\">\n  <rule id=\"100200\" level=\"12\">\n    <if_sid>554</if_sid>\n    <field name=\"file\">^/etc/cron\\.d/</field>\n    <description>New file in /etc/cron.d (possible persistence)</description>\n    <mitre><id>T1053.003</id></mitre>\n  </rule>\n</group>\n",
+        "highlight": [
+          2,
+          6,
+          7,
+          8
+        ]
+      },
+      {
+        "id": "term-detect",
+        "type": "terminal",
+        "title": "sensor / attacker",
+        "prompt": "$",
+        "caption": "شغّل المسح من جهاز المهاجم الخاص بك واقرأ التنبيه.",
+        "lines": [
+          {
+            "cmd": "nmap -sS -p 1-1000 10.10.20.10",
+            "output": "Starting Nmap 7.94 at 2026-11-12 11:02 UTC\nNmap scan report for 10.10.20.10\nPORT    STATE SERVICE\n22/tcp  open  ssh\n80/tcp  open  http\n5432/tcp closed postgresql\nNmap done: 1 IP address (1 host up) scanned in 3.41 seconds",
+            "comment": "يُشغَّل من جهاز المهاجم 198.51.100.23. المنفذان 22 و80 مفتوحان كما هو مخطط."
+          },
+          {
+            "cmd": "sudo jq -c 'select(.event_type==\"alert\") | {t:.timestamp, sig:.alert.signature, src:.src_ip}' /var/log/suricata/eve.json | tail -n 1",
+            "output": "{\"t\":\"2026-11-12T11:02:05.882+0000\",\"sig\":\"LAB Possible TCP SYN scan\",\"src\":\"198.51.100.23\"}",
+            "comment": "على المجسّ: انطلق التنبيه بعد نحو ثانيتين من بدء المسح."
+          },
+          {
+            "cmd": "sudo nft add element inet filter blocklist '{ 198.51.100.23 timeout 1h }'",
+            "output": "",
+            "comment": "المعالجة: حظر لمدة ساعة باستخدام المجموعة من مختبر أتمتة الأمن."
+          }
+        ]
+      },
+      {
+        "id": "auth",
+        "type": "text",
+        "markdown": "## الخطوة 3: حاكِ الدخول الفاشل وتغيير البقاء\n\nلاختبار كلمات المرور، نفّذ ست محاولات SSH بكلمة مرور خاطئة عمدًا من جهاز المهاجم بعميل `ssh` العادي. لا تستخدم أداة كسر ولا قائمة كلمات حقيقية؛ فست محاولات تكفي لتشغيل القاعدتين 5710 و5712. ثم افحص ما ينساه كثيرون: **هل حدث دخول ناجح بعد ذلك؟** سيل من الإخفاقات يتبعه دخول ناجح من العنوان نفسه هو الإنذار الحقيقي.\n\nولاختبار البقاء، سجّل الدخول إلى الهدف مسؤولًا وأنشئ مستخدمًا تجريبيًا وملف cron غير ضار لا يكتب إلا سطرًا في سجل. هذه هي تغييرات الملفات نفسها التي يجريها المتسلل الحقيقي، ولهذا يراقبها [Linux Server Hardening Lab](/learn/hands-on-security-labs/linux-server-hardening-lab). يجب أن يُعلِم مراقب سلامة الملفات بالملف الجديد وأن يسجل SIEM الحساب الجديد."
+      },
+      {
+        "id": "term-persist",
+        "type": "terminal",
+        "title": "target (10.10.20.10)",
+        "prompt": "$",
+        "caption": "محاكاة بقاء غير ضارة والدليل والتنظيف. شغّلها على جهازك فقط.",
+        "lines": [
+          {
+            "cmd": "echo '*/5 * * * * root logger lab-test' | sudo tee /etc/cron.d/lab-test && sudo useradd -m labtest",
+            "output": "*/5 * * * * root logger lab-test",
+            "comment": "ينشئ مستخدمًا تجريبيًا ومهمة cron لا تكتب غير سطر في syslog."
+          },
+          {
+            "cmd": "sudo jq -c 'select(.rule.id==\"100200\" or .rule.id==\"5902\") | {rule:.rule.id, desc:.rule.description}' /var/ossec/logs/alerts/alerts.json | tail -n 2",
+            "output": "{\"rule\":\"5902\",\"desc\":\"New user added to the system\"}\n{\"rule\":\"100200\",\"desc\":\"New file in /etc/cron.d (possible persistence)\"}",
+            "comment": "يُشغَّل على المدير: كُشف تغيير الحساب والملف الجديد كلاهما."
+          },
+          {
+            "cmd": "sudo rm /etc/cron.d/lab-test && sudo userdel -r labtest && sudo grep -c labtest /etc/passwd",
+            "output": "0",
+            "comment": "التنظيف والتحقق: اختفى الحساب ولا أثر له في passwd."
+          }
+        ]
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "ابقَ داخل نطاقك",
+        "markdown": "مسح نظام لا تملكه أو لا تملك إذنًا مكتوبًا باختباره، أو تخمين كلمات مروره، مخالف للقانون في دول كثيرة حتى لو كان على مزوّد سحابي أو خادم صديق. أبقِ المهاجم والهدف على شبكة مخبرية معزولة، وعطّل بوابة جهاز المهاجم، ولا توجّه هذه الاختبارات إلى الإنترنت أبدًا."
+      },
+      {
+        "id": "report",
+        "type": "text",
+        "markdown": "## الخطوة 4: عالج ثم أبلِغ بما تعلمته\n\nللمعالجة طبقتان. **الفورية** توقف النشاط: احظر المصدر وأزل الحساب التجريبي وعطّل ملف cron. و**طبقة السبب الجذري** تصلح ما أتاح الأمر: أغلق المنافذ غير اللازمة، وقصر SSH على شبكة الإدارة، واشترط المفاتيح بدل كلمات المرور، وأضف تنبيهًا حيث كانت الفجوة.\n\nثم املأ جدول التغطية. فهو الناتج الرئيس للتمرين وعنصر قوي في ملف الأعمال.\n\n| التقنية | هل كُشفت؟ | زمن الكشف | الفجوة أو الإصلاح |\n|:--|:--|:--|:--|\n| مسح T1046 | نعم | ثانيتان | ضبط العتبة على 30 حزمة SYN |\n| تخمين T1110 | نعم | 4 ثوانٍ | إضافة تنبيه للنجاح بعد الإخفاقات |\n| مستخدم جديد T1136 | نعم | ثانية | لا شيء |\n| ملف cron T1053 | لا ثم نعم | غير متاح | كتابة القاعدة 100200 |\n\nكرّر كل محاكاة بعد الإصلاح لتثبت نجاحه؛ فالإصلاح الذي لم تعد اختباره مجرد نظرية. وبعد ذلك اطّلع على شعور حادثة كاملة في [Incident Response Simulation Lab](/learn/hands-on-security-labs/incident-response-simulation-lab)."
+      },
+      {
+        "id": "note",
+        "type": "callout",
+        "variant": "note",
+        "title": "اقرأ النتائج بصدق",
+        "markdown": "المحاكاة تثبت ما اختبرته فقط. فالمسح من شبكة VLAN مخبرية أعلى ضجيجًا وأسرع من مسح متسلل صبور، وست محاولات فاشلة أقل بكثير من حملة حقيقية. اعتبر النجاح دليلًا على ذلك السيناريو لا برهانًا على الأمان. ودوّن ما لم تختبره، كالحركة المشفرة وبروتوكولات أخرى والنشاط الهادئ منخفض الحجم، ليغطيه التمرين التالي."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "حدّد المدة والتقط لقطات",
+        "markdown": "التقط لقطة للجهاز قبل كل محاكاة وارجع إليها بعدها، كي لا تربك الحسابات والملفات المتبقية الاختبار التالي. دوّن وقت بدء كل إجراء ووقت انتهائه بدقة لأنك ستحتاجه للعثور على الأحداث في SIEM."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على مختبر معزول يضم جهاز مهاجم وجهاز هدف ومجسًّا ونظام SIEM **تملكها**:\n\n1. اكتب جدول الخطة وقواعد الاشتباك ووقت البدء والانتهاء، ثم التقط لقطة لكل جهاز.\n2. أضف قاعدة Suricata وقاعدة Wazuh واختبرهما وأعد تشغيل الخدمتين.\n3. شغّل `nmap -sS -p 1-1000` ضد الهدف وابحث عن التنبيه في `eve.json`.\n4. نفّذ ست محاولات SSH خاطئة وابحث عن القاعدتين 5710 و5712، وافحص هل نجح أي دخول.\n5. أنشئ المستخدم التجريبي وملف cron وابحث عن التنبيهين ثم نظّف وتحقق.\n6. احظر عنوان المهاجم بقاعدة منتهية الصلاحية.\n7. املأ جدول التغطية وأصلح فجوة واحدة وأعد تلك المحاكاة وسجّل النتيجة."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "الفريق البنفسجي",
+            "definition": "مهاجمون ومدافعون يعملون معًا لاختبار الكشف وتحسينه."
+          },
+          {
+            "term": "MITRE ATT&CK",
+            "definition": "قاعدة معرفة عامة بتقنيات الخصوم تُستخدم لتسمية الكشوفات والإبلاغ عنها."
+          },
+          {
+            "term": "قواعد الاشتباك",
+            "definition": "النطاق والتوقيت والحدود المكتوبة للاختبار."
+          },
+          {
+            "term": "الاستطلاع",
+            "definition": "جمع معلومات عن هدف، كالمنافذ المفتوحة."
+          },
+          {
+            "term": "البقاء",
+            "definition": "تغييرات يجريها المتسلل للحفاظ على الوصول كحسابات جديدة أو مهام مجدولة."
+          },
+          {
+            "term": "مراقبة سلامة الملفات",
+            "definition": "كشف الملفات المضافة أو المتغيرة بمقارنتها بحالة معروفة."
+          },
+          {
+            "term": "تغطية الكشف",
+            "definition": "مجموعة التقنيات التي يمكنك كشفها بموثوقية مع زمن الكشف."
+          },
+          {
+            "term": "السبب الجذري",
+            "definition": "الضعف الأساسي الذي أتاح وقوع الحدث."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "ما غاية تمرين الفريق البنفسجي؟",
+            "options": [
+              "اختبار هل يرى المدافعون نشاط المهاجم المحاكى وإصلاح الفجوات",
+              "مهاجمة الإنتاج دون إبلاغ أحد",
+              "استبدال SIEM",
+              "تجنّب كتابة التقارير"
+            ],
+            "answer": 0,
+            "explanation": "يحوّل الفريق البنفسجي افتراضات الكشف إلى نتائج مقيسة."
+          },
+          {
+            "question": "ما الذي يجب أن يوجد قبل أي محاكاة؟ (اختر كل ما ينطبق)",
+            "options": [
+              "نطاق مكتوب على أنظمة تملكها",
+              "لقطات للأجهزة الافتراضية",
+              "إذن مالك خادم غريب غير لازم",
+              "وقت بدء وانتهاء"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "النطاق واللقطات والتوقيت تحفظ التمرين آمنًا وتسهّل العثور على الأحداث، أما اختبار خادم غيرك دون إذن فمرفوض دائمًا."
+          },
+          {
+            "question": "بعد دفعة من إخفاقات SSH، أي سؤال هو الأهم؟",
+            "options": [
+              "هل حدث دخول ناجح من العنوان نفسه؟",
+              "ما لون لوحة المعلومات؟",
+              "هل ارتفعت حرارة المعالج؟",
+              "كم عدد الوكلاء المثبتين؟"
+            ],
+            "answer": 0,
+            "explanation": "النجاح بعد الإخفاقات قد يعني أن التخمين نجح، فيتحول الضجيج إلى حادثة."
+          },
+          {
+            "question": "أيٌّ من الآتي معالجة للسبب الجذري لخدمة SSH معرَّضة؟",
+            "options": [
+              "قصر SSH على شبكة الإدارة واشتراط المفاتيح",
+              "حظر عنوان واحد إلى الأبد",
+              "إعادة تشغيل الخادم",
+              "حذف السجلات"
+            ],
+            "answer": 0,
+            "explanation": "تقليل التعرّض وتقوية المصادقة يزيلان الضعف لا مهاجمًا واحدًا فقط."
+          },
+          {
+            "question": "لماذا تُعاد المحاكاة بعد إصلاح الكشف؟",
+            "options": [
+              "لإثبات أن الإصلاح يعمل",
+              "لزيادة عدد التنبيهات",
+              "لملء القرص",
+              "تشترطه Suricata"
+            ],
+            "answer": 0,
+            "explanation": "الإصلاح غير المختبر افتراض، وإعادة الاختبار تُغلق الحلقة."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nنفّذت تمرينًا بنفسجيًا مخططًا ومحدّد النطاق: مسح منافذ ومحاولات دخول فاشلة متكررة وتغيير للبقاء، كله على أنظمة تملكها. وفي كل محاكاة وجدت الدليل وكتبت كشفًا أو ضبطته وعالجت النشاط الفوري والسبب الجذري وسجلت زمن الكشف في جدول التغطية. الكشف الذي لم تختبره تخمين، فكرّر هذه الحلقة كلما كبر مختبرك. ولحادثة كاملة تابع إلى [Incident Response Simulation Lab](/learn/hands-on-security-labs/incident-response-simulation-lab)."
+      }
+    ]
+  }
+}

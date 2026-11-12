@@ -1,0 +1,578 @@
+{
+ "slug": "syslog-architecture",
+ "title": "Syslog Architecture",
+ "summary": "Understand the syslog message format, transports and relay design, and configure rsyslog to receive and forward logs securely.",
+ "duration_minutes": 25,
+ "objectives": [
+  "Decode the fields of a syslog message, including facility and severity",
+  "Compare UDP, TCP and TLS transports",
+  "Design a relay architecture with a central receiver",
+  "Configure rsyslog to receive and forward logs over TLS"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A firewall, a switch and a Linux server all need to report events, but they come from different vendors and speak no common language. Syslog is the answer that has survived for decades: a simple, text-based way for almost any device to send a message to a remote receiver.\n\nBecause it is so simple, syslog is also easy to get wrong. Messages sent over UDP can vanish, forged messages are accepted, and unparsed text is hard to search. In this lesson you will learn the message format, the transport options, how to design relays, and how to configure rsyslog on a host you own."
+  },
+  {
+   "id": "format",
+   "type": "text",
+   "markdown": "## Anatomy of a syslog message\n\nThe modern format is RFC 5424. A message has a priority, a header and a body:\n\n`<PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG`\n\nThe **priority (PRI)** packs two numbers: `PRI = facility * 8 + severity`. The facility says which subsystem produced the message (for example `auth`, `kern`, `local0` to `local7`). The severity runs from 0 to 7:\n\n| Severity | Name | Meaning |\n|:--|:--|:--|\n| 0 | Emergency | System unusable |\n| 1 | Alert | Act immediately |\n| 2 | Critical | Critical condition |\n| 3 | Error | Error condition |\n| 4 | Warning | Warning |\n| 5 | Notice | Normal but significant |\n| 6 | Informational | Routine event |\n| 7 | Debug | Debugging detail |\n\nSo `<34>` means facility 4 (`auth`) and severity 2 (critical). Older devices still send the BSD format of RFC 3164, which has no year, no time zone and no structured data. Your collector must handle both."
+  },
+  {
+   "id": "sample",
+   "type": "terminal",
+   "title": "syslog",
+   "prompt": "$",
+   "caption": "A real-looking RFC 5424 message and how to read it. All names and addresses are documentation examples.",
+   "lines": [
+    {
+     "cmd": "logger -n logs.example.com -P 514 -T --rfc5424 -p auth.crit \"test: privilege change on lab host\"",
+     "comment": "Send a test message over TCP from a host you own"
+    },
+    {
+     "cmd": "tail -n 1 /var/log/remote/web01/messages.log",
+     "output": "<34>1 2026-11-12T09:15:02+00:00 web01 sudo 4411 - - admin : TTY=pts/0 ; USER=root ; COMMAND=/bin/bash",
+     "comment": "34 = auth(4) * 8 + critical(2); timestamp has year and offset; host and program are separate fields"
+    }
+   ]
+  },
+  {
+   "id": "transport",
+   "type": "text",
+   "markdown": "## Choosing a transport\n\nThe classic port is UDP 514. It is fast and stateless, which is also its weakness.\n\n| Transport | Port | Delivery | Protection |\n|:--|:--|:--|:--|\n| UDP | 514 | None. Packets drop silently under load | None; sender is easily spoofed |\n| TCP | 514 or 601 | Reliable, ordered | None on the wire |\n| TLS (RFC 5425) | 6514 | Reliable | Encryption and server or mutual authentication |\n| RELP | 2514 | Reliable with application acknowledgments | Optional TLS |\n\nUse TLS for anything that crosses an untrusted segment, and for sources that carry credentials or personal data. Keep UDP only for devices that offer nothing else, and place them on a dedicated management VLAN with ACLs that allow only the collector address."
+  },
+  {
+   "id": "relay-anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "A secure relay path",
+   "caption": "Devices send to a local relay, which buffers and forwards to the central receiver over TLS.",
+   "data": {
+    "actors": [
+     {
+      "id": "fw",
+      "label": "Firewall",
+      "sub": "192.0.2.10",
+      "icon": "firewall"
+     },
+     {
+      "id": "rel",
+      "label": "Site relay",
+      "sub": "192.0.2.20",
+      "icon": "server"
+     },
+     {
+      "id": "cen",
+      "label": "Central receiver",
+      "sub": "logs.example.com",
+      "icon": "log"
+     },
+     {
+      "id": "siem",
+      "label": "SIEM index",
+      "sub": "Search",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "from": "fw",
+      "to": "rel",
+      "label": "UDP 514",
+      "detail": "<134> deny tcp ...",
+      "note": "The firewall can only speak UDP syslog, so it sends to a relay on the same segment."
+     },
+     {
+      "from": "rel",
+      "to": "rel",
+      "label": "Queue",
+      "detail": "disk buffer",
+      "note": "The relay writes each message to a disk queue before forwarding.",
+      "tone": "secure"
+     },
+     {
+      "from": "rel",
+      "to": "cen",
+      "label": "TLS 6514",
+      "detail": "mutual auth",
+      "note": "The relay opens an encrypted, authenticated TCP session to the central receiver.",
+      "tone": "secure"
+     },
+     {
+      "from": "cen",
+      "to": "rel",
+      "label": "ACK",
+      "detail": "RELP / TCP",
+      "note": "The receiver acknowledges, so the relay can drop the queued copy."
+     },
+     {
+      "from": "cen",
+      "to": "siem",
+      "label": "Parsed events",
+      "detail": "JSON",
+      "note": "The receiver parses and indexes the events.",
+      "tone": "success"
+     },
+     {
+      "from": "fw",
+      "to": "rel",
+      "label": "Receiver offline",
+      "detail": "queue grows",
+      "note": "If the WAN link fails, the relay keeps queuing and no events are lost.",
+      "tone": "warning"
+     }
+    ]
+   }
+  },
+  {
+   "id": "design",
+   "type": "text",
+   "markdown": "## Relay and receiver design\n\nA flat design, where every device sends straight to one server, works for a small lab. At scale use tiers:\n\n- **Site relays** accept weak protocols from local devices, add a queue, and forward over TLS.\n- **Central receivers** sit behind a load balancer, authenticate relays, and write to the SIEM.\n- **Separate storage** keeps a raw, write-once archive apart from the searchable index.\n\nSet **per-source rate limits** so a flooding device cannot starve others. Plan capacity in events per second (EPS), and add 50 percent headroom for incident peaks. Finally, store the original source IP, because a relay replaces it in the packet header."
+  },
+  {
+   "id": "rs-recv",
+   "type": "code",
+   "language": "ini",
+   "code": "# /etc/rsyslog.d/10-central.conf  (central receiver)\nmodule(load=\"imtcp\"\n       StreamDriver.Name=\"gtls\"\n       StreamDriver.Mode=\"1\"\n       StreamDriver.AuthMode=\"x509/name\"\n       PermittedPeer=[\"*.example.com\"])\n\nglobal(DefaultNetstreamDriver=\"gtls\"\n       DefaultNetstreamDriverCAFile=\"/etc/rsyslog.d/ca.pem\"\n       DefaultNetstreamDriverCertFile=\"/etc/rsyslog.d/server-cert.pem\"\n       DefaultNetstreamDriverKeyFile=\"/etc/rsyslog.d/server-key.pem\")\n\ninput(type=\"imtcp\" port=\"6514\")\n\ntemplate(name=\"PerHost\" type=\"string\"\n         string=\"/var/log/remote/%HOSTNAME%/%PROGRAMNAME%.log\")\n\n*.* action(type=\"omfile\" dynaFile=\"PerHost\")\n",
+   "filename": "/etc/rsyslog.d/10-central.conf",
+   "caption": "A TLS-only receiver. Peers must present a certificate whose name matches *.example.com, and logs are split per host."
+  },
+  {
+   "id": "rs-fwd",
+   "type": "code",
+   "language": "ini",
+   "code": "# /etc/rsyslog.d/90-forward.conf  (client or relay)\nglobal(DefaultNetstreamDriver=\"gtls\"\n       DefaultNetstreamDriverCAFile=\"/etc/rsyslog.d/ca.pem\")\n\naction(type=\"omfwd\" target=\"logs.example.com\" port=\"6514\" protocol=\"tcp\"\n       StreamDriver=\"gtls\" StreamDriverMode=\"1\"\n       StreamDriverAuthMode=\"x509/name\"\n       StreamDriverPermittedPeers=\"logs.example.com\"\n       queue.type=\"LinkedList\" queue.filename=\"fwdq\"\n       queue.maxDiskSpace=\"1g\" queue.saveOnShutdown=\"on\"\n       action.resumeRetryCount=\"-1\")\n",
+   "filename": "/etc/rsyslog.d/90-forward.conf",
+   "caption": "The client side adds a disk-assisted queue and infinite retry, so a receiver outage does not lose events."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "UDP syslog can be forged",
+   "markdown": "Anyone who can send a packet to port 514 can inject fake events, such as a successful login that never happened, or flood the receiver to hide real ones. Restrict the source addresses with firewall rules, prefer TLS with certificate checks, and never treat unauthenticated syslog as proof on its own."
+  },
+  {
+   "id": "harden",
+   "type": "text",
+   "markdown": "## Hardening the receiver\n\nThe receiver is a high-value target because it holds every log. Treat it like a security appliance, not a general server.\n\n1. **Minimal host.** Install only the logging service, patch it on a schedule, and disable interactive logins for ordinary users.\n2. **Network control.** Allow inbound 6514 only from known relays and 514 only from the management VLAN. Block all outbound traffic that is not needed.\n3. **Certificate hygiene.** Use a private certificate authority, give each relay its own certificate, and set short lifetimes with automatic renewal. An expired certificate silently stops collection.\n4. **Disk protection.** Put logs on a separate volume, monitor free space, and rotate with compression. A full disk is the most common cause of lost events.\n5. **Integrity.** Hash archived files daily and store the hashes elsewhere, so you can prove the archive was not edited.\n\nAlso decide who may read the logs. Authentication logs can reveal usernames and internal addresses, so grant access by role."
+  },
+  {
+   "id": "pitfalls",
+   "type": "text",
+   "markdown": "## Common mistakes\n\nTeams new to syslog often repeat the same errors:\n\n- **Time zones.** Devices that omit the zone are read as the receiver's local time. Configure UTC on the device when it allows.\n- **One huge file.** Writing everything to `messages` makes later searches slow. Split by host and program.\n- **Ignoring severity.** Do not drop `debug` and `info` blindly; some security events, such as VPN logins, are logged as informational.\n- **No test messages.** Add a heartbeat from each relay every minute so silence is detectable.\n- **Trusting the source field.** Behind NAT or relays the packet source is not the original device. Use the hostname inside the message or a structured field."
+  },
+  {
+   "id": "check",
+   "type": "text",
+   "markdown": "## Verify and troubleshoot\n\nTest each hop in order. First check the config with `rsyslogd -N1`. Then confirm the listener with `ss -tlnp | grep 6514`. Send a test with `logger` and watch the receiver file. If nothing arrives, look at the client's queue directory, check the certificate dates with `openssl x509 -noout -dates`, and confirm the clock is correct, since TLS fails on skewed time. Finally check the firewall ACL between the sender and the receiver.\n\nFor how events then become searchable alerts, see [Centralized Log Management](/learn/security-operations-dfir/centralized-log-management) and [Wazuh Security Monitoring](/learn/security-operations-dfir/wazuh-security-monitoring)."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "Use two Linux virtual machines in a lab network you own. On the first, build the receiver with a self-signed lab certificate authority and the receiver file above. On the second, add the forwarding file. Send `logger -p auth.warning \"lab test\"` and locate the message under `/var/log/remote/`. Decode its PRI value by hand (facility times 8, plus severity). Then stop the receiver for one minute, send five more messages, restart it, and confirm all five arrive."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Facility",
+     "definition": "The subsystem that produced a message, such as auth or local0."
+    },
+    {
+     "term": "Severity",
+     "definition": "A 0 to 7 level from emergency to debug."
+    },
+    {
+     "term": "PRI",
+     "definition": "The priority value: facility times 8 plus severity."
+    },
+    {
+     "term": "RFC 5424",
+     "definition": "The modern, structured syslog message format."
+    },
+    {
+     "term": "Relay",
+     "definition": "A syslog server that receives, buffers and forwards messages."
+    },
+    {
+     "term": "RELP",
+     "definition": "A reliable syslog protocol with application-level acknowledgments."
+    },
+    {
+     "term": "EPS",
+     "definition": "Events per second, used to size receivers."
+    },
+    {
+     "term": "Disk-assisted queue",
+     "definition": "A buffer on disk that holds messages while the destination is unreachable."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "What does a PRI of <34> represent?",
+     "options": [
+      "Facility 3, severity 4",
+      "Facility 4, severity 2",
+      "Facility 2, severity 4",
+      "Facility 34, severity 0"
+     ],
+     "answer": 1,
+     "explanation": "34 = 4 * 8 + 2, so facility auth (4) with severity critical (2)."
+    },
+    {
+     "question": "Which weaknesses apply to plain UDP syslog? Choose all that apply.",
+     "options": [
+      "Messages can be lost silently",
+      "Senders can be spoofed",
+      "Traffic is always encrypted",
+      "There is no delivery acknowledgment"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "UDP syslog has no reliability, authentication or encryption."
+    },
+    {
+     "question": "Which transport gives encryption and peer authentication?",
+     "options": [
+      "UDP 514",
+      "TCP 514",
+      "TLS on 6514",
+      "SNMP trap"
+     ],
+     "answer": 2,
+     "explanation": "RFC 5425 defines syslog over TLS, normally on port 6514."
+    },
+    {
+     "question": "Why place a relay at each site?",
+     "options": [
+      "To avoid needing a SIEM",
+      "To buffer events and upgrade weak protocols to TLS",
+      "To change severity values",
+      "To disable NTP"
+     ],
+     "answer": 1,
+     "explanation": "A relay absorbs outages and wraps legacy UDP traffic in a secure session."
+    },
+    {
+     "question": "Which rsyslog setting keeps events during a receiver outage?",
+     "options": [
+      "queue.type with a disk file and unlimited retry",
+      "global severity filter",
+      "imudp module",
+      "template string"
+     ],
+     "answer": 0,
+     "explanation": "A disk-assisted queue plus action.resumeRetryCount=-1 keeps retrying without loss."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\nSyslog is the universal transport for device logs. Read the PRI to get facility and severity, prefer RFC 5424, and use TLS or RELP instead of bare UDP where you can. Put relays with disk queues at each site, authenticate them with certificates, rate-limit each source, and verify every hop. Next, see the Windows equivalent in [Windows Event Forwarding](/learn/security-operations-dfir/windows-event-forwarding)."
+  }
+ ],
+ "ar": {
+  "title": "بنية Syslog",
+  "summary": "افهم صيغة رسائل syslog وبروتوكولات نقلها وتصميم المرحّلات، واضبط rsyslog لاستقبال السجلات وإعادة توجيهها بأمان.",
+  "objectives": [
+   "فك رموز حقول رسالة syslog بما فيها المرفق (Facility) والخطورة (Severity)",
+   "المقارنة بين نقل UDP وTCP وTLS",
+   "تصميم بنية مرحّلات مع مستقبل مركزي",
+   "ضبط rsyslog لاستقبال السجلات وإعادة توجيهها عبر TLS"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "يحتاج جدار الحماية والمبدّل وخادم Linux كلها إلى الإبلاغ عن أحداثها، لكنها من موردين مختلفين ولا تتكلم لغة مشتركة. وsyslog هو الحل الذي صمد عقوداً: طريقة نصية بسيطة تتيح لأي جهاز تقريباً إرسال رسالة إلى مستقبل بعيد.\n\nوبسبب بساطته يسهل أيضاً أن تخطئ في استخدامه. فالرسائل المرسلة عبر UDP قد تضيع، والرسائل المزوّرة تُقبل، والنص غير المحلّل يصعب البحث فيه. في هذا الدرس ستتعلم صيغة الرسالة وخيارات النقل وتصميم المرحّلات (Relays) وضبط rsyslog على مضيف تملكه."
+   },
+   {
+    "id": "format",
+    "type": "text",
+    "markdown": "## تشريح رسالة syslog\n\nالصيغة الحديثة هي RFC 5424. تتألف الرسالة من أولوية (Priority) وترويسة وجسم:\n\n`<PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG`\n\nتحزم **الأولوية (PRI)** رقمين: `PRI = facility * 8 + severity`. يحدد المرفق (Facility) النظام الفرعي الذي أنتج الرسالة (مثل `auth` و`kern` و`local0` إلى `local7`). وتمتد الخطورة (Severity) من 0 إلى 7:\n\n| الخطورة | الاسم | المعنى |\n|:--|:--|:--|\n| 0 | Emergency | النظام غير صالح للاستخدام |\n| 1 | Alert | يلزم التصرف فوراً |\n| 2 | Critical | حالة حرجة |\n| 3 | Error | حالة خطأ |\n| 4 | Warning | تحذير |\n| 5 | Notice | طبيعي لكنه مهم |\n| 6 | Informational | حدث روتيني |\n| 7 | Debug | تفاصيل تصحيح |\n\nإذن `<34>` تعني المرفق 4 (`auth`) والخطورة 2 (حرجة). وما زالت أجهزة أقدم ترسل صيغة BSD الواردة في RFC 3164، ولا تحتوي سنة ولا منطقة زمنية ولا بيانات منظمة. يجب أن يتعامل مجمّعك مع الصيغتين."
+   },
+   {
+    "id": "sample",
+    "type": "terminal",
+    "title": "syslog",
+    "prompt": "$",
+    "caption": "رسالة بصيغة RFC 5424 وطريقة قراءتها. كل الأسماء والعناوين أمثلة توثيقية.",
+    "lines": [
+     {
+      "cmd": "logger -n logs.example.com -P 514 -T --rfc5424 -p auth.crit \"test: privilege change on lab host\"",
+      "comment": "إرسال رسالة اختبار عبر TCP من مضيف تملكه"
+     },
+     {
+      "cmd": "tail -n 1 /var/log/remote/web01/messages.log",
+      "output": "<34>1 2026-11-12T09:15:02+00:00 web01 sudo 4411 - - admin : TTY=pts/0 ; USER=root ; COMMAND=/bin/bash",
+      "comment": "34 = auth(4) * 8 + حرج(2)؛ الطابع الزمني يتضمن السنة والإزاحة؛ المضيف والبرنامج حقلان منفصلان"
+     }
+    ]
+   },
+   {
+    "id": "transport",
+    "type": "text",
+    "markdown": "## اختيار بروتوكول النقل\n\nالمنفذ التقليدي هو UDP 514. وهو سريع وبلا حالة، وهذا نفسه نقطة ضعفه.\n\n| النقل | المنفذ | التسليم | الحماية |\n|:--|:--|:--|:--|\n| UDP | 514 | لا ضمان. تسقط الحزم بصمت تحت الحمل | لا حماية؛ وانتحال المرسل سهل |\n| TCP | 514 أو 601 | موثوق ومرتب | لا حماية على الشبكة |\n| TLS (RFC 5425) | 6514 | موثوق | تشفير ومصادقة الخادم أو المصادقة المتبادلة |\n| RELP | 2514 | موثوق مع إقرارات على مستوى التطبيق | TLS اختياري |\n\nاستخدم TLS لكل ما يعبر مقطعاً غير موثوق، ولمصادر تحمل بيانات اعتماد أو بيانات شخصية. أبقِ UDP للأجهزة التي لا تقدم غيره، وضعها في VLAN إدارة مخصص مع قوائم تحكم بالوصول (ACL) لا تسمح إلا بعنوان المجمّع."
+   },
+   {
+    "id": "relay-anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "مسار مرحّل آمن",
+    "caption": "ترسل الأجهزة إلى مرحّل محلي يخزّن مؤقتاً ويعيد التوجيه إلى المستقبل المركزي عبر TLS.",
+    "data": {
+     "actors": [
+      {
+       "id": "fw",
+       "label": "جدار الحماية",
+       "sub": "192.0.2.10",
+       "icon": "firewall"
+      },
+      {
+       "id": "rel",
+       "label": "مرحّل الموقع",
+       "sub": "192.0.2.20",
+       "icon": "server"
+      },
+      {
+       "id": "cen",
+       "label": "المستقبل المركزي",
+       "sub": "logs.example.com",
+       "icon": "log"
+      },
+      {
+       "id": "siem",
+       "label": "فهرس SIEM",
+       "sub": "بحث",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "from": "fw",
+       "to": "rel",
+       "label": "UDP 514",
+       "detail": "<134> deny tcp ...",
+       "note": "لا يتكلم جدار الحماية إلا syslog عبر UDP، فيرسل إلى مرحّل في المقطع نفسه."
+      },
+      {
+       "from": "rel",
+       "to": "rel",
+       "label": "طابور",
+       "detail": "مخزن على القرص",
+       "note": "يكتب المرحّل كل رسالة في طابور على القرص قبل إعادة التوجيه.",
+       "tone": "secure"
+      },
+      {
+       "from": "rel",
+       "to": "cen",
+       "label": "TLS 6514",
+       "detail": "مصادقة متبادلة",
+       "note": "يفتح المرحّل جلسة TCP مشفرة وموثّقة مع المستقبل المركزي.",
+       "tone": "secure"
+      },
+      {
+       "from": "cen",
+       "to": "rel",
+       "label": "ACK",
+       "detail": "RELP / TCP",
+       "note": "يقر المستقبل بالاستلام فيستطيع المرحّل حذف النسخة المخزنة."
+      },
+      {
+       "from": "cen",
+       "to": "siem",
+       "label": "أحداث محلَّلة",
+       "detail": "JSON",
+       "note": "يحلّل المستقبل الأحداث ويفهرسها.",
+       "tone": "success"
+      },
+      {
+       "from": "fw",
+       "to": "rel",
+       "label": "المستقبل غير متاح",
+       "detail": "الطابور يكبر",
+       "note": "إذا انقطع رابط WAN يواصل المرحّل التخزين ولا تضيع أحداث.",
+       "tone": "warning"
+      }
+     ]
+    }
+   },
+   {
+    "id": "design",
+    "type": "text",
+    "markdown": "## تصميم المرحّلات والمستقبلات\n\nيصلح التصميم المسطح، حيث يرسل كل جهاز مباشرة إلى خادم واحد، لمختبر صغير. وعلى النطاق الكبير استخدم طبقات:\n\n- **مرحّلات المواقع** تقبل بروتوكولات ضعيفة من الأجهزة المحلية وتضيف طابوراً وتعيد التوجيه عبر TLS.\n- **مستقبلات مركزية** خلف موزّع أحمال، تتحقق من هوية المرحّلات وتكتب في SIEM.\n- **تخزين منفصل** يحفظ أرشيفاً خاماً يُكتب مرة واحدة بعيداً عن الفهرس القابل للبحث.\n\nحدد **حدوداً للمعدل لكل مصدر** حتى لا يُجوّع جهاز مغرِق غيره. خطّط السعة بعدد الأحداث في الثانية (EPS) وأضف 50 بالمئة هامشاً لذروات الحوادث. وأخيراً احفظ عنوان المصدر الأصلي، لأن المرحّل يستبدله في ترويسة الحزمة."
+   },
+   {
+    "id": "rs-recv",
+    "type": "code",
+    "language": "ini",
+    "code": "# /etc/rsyslog.d/10-central.conf  (central receiver)\nmodule(load=\"imtcp\"\n       StreamDriver.Name=\"gtls\"\n       StreamDriver.Mode=\"1\"\n       StreamDriver.AuthMode=\"x509/name\"\n       PermittedPeer=[\"*.example.com\"])\n\nglobal(DefaultNetstreamDriver=\"gtls\"\n       DefaultNetstreamDriverCAFile=\"/etc/rsyslog.d/ca.pem\"\n       DefaultNetstreamDriverCertFile=\"/etc/rsyslog.d/server-cert.pem\"\n       DefaultNetstreamDriverKeyFile=\"/etc/rsyslog.d/server-key.pem\")\n\ninput(type=\"imtcp\" port=\"6514\")\n\ntemplate(name=\"PerHost\" type=\"string\"\n         string=\"/var/log/remote/%HOSTNAME%/%PROGRAMNAME%.log\")\n\n*.* action(type=\"omfile\" dynaFile=\"PerHost\")\n",
+    "filename": "/etc/rsyslog.d/10-central.conf",
+    "caption": "مستقبل يعمل بـ TLS فقط. يجب أن يقدم النظير شهادة يطابق اسمها *.example.com، وتُفصل السجلات لكل مضيف."
+   },
+   {
+    "id": "rs-fwd",
+    "type": "code",
+    "language": "ini",
+    "code": "# /etc/rsyslog.d/90-forward.conf  (client or relay)\nglobal(DefaultNetstreamDriver=\"gtls\"\n       DefaultNetstreamDriverCAFile=\"/etc/rsyslog.d/ca.pem\")\n\naction(type=\"omfwd\" target=\"logs.example.com\" port=\"6514\" protocol=\"tcp\"\n       StreamDriver=\"gtls\" StreamDriverMode=\"1\"\n       StreamDriverAuthMode=\"x509/name\"\n       StreamDriverPermittedPeers=\"logs.example.com\"\n       queue.type=\"LinkedList\" queue.filename=\"fwdq\"\n       queue.maxDiskSpace=\"1g\" queue.saveOnShutdown=\"on\"\n       action.resumeRetryCount=\"-1\")\n",
+    "filename": "/etc/rsyslog.d/90-forward.conf",
+    "caption": "يضيف جانب العميل طابوراً مدعوماً بالقرص وإعادة محاولة غير محدودة، فلا تضيع الأحداث عند تعطل المستقبل."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "يمكن تزوير syslog عبر UDP",
+    "markdown": "يستطيع أي شخص يرسل حزمة إلى المنفذ 514 حقن أحداث مزيفة، مثل تسجيل دخول ناجح لم يحدث قط، أو إغراق المستقبل لإخفاء أحداث حقيقية. قيّد عناوين المصدر بقواعد جدار الحماية، وفضّل TLS مع التحقق من الشهادات، ولا تعتبر syslog غير الموثّق دليلاً قائماً بذاته."
+   },
+   {
+    "id": "harden",
+    "type": "text",
+    "markdown": "## تحصين المستقبل\n\nالمستقبل هدف عالي القيمة لأنه يحتفظ بكل السجلات. تعامل معه كجهاز أمني لا كخادم عام.\n\n1. **مضيف أدنى.** ثبّت خدمة التسجيل فقط، وحدّثها وفق جدول، وعطّل تسجيل الدخول التفاعلي للمستخدمين العاديين.\n2. **ضبط الشبكة.** اسمح بالمنفذ 6514 الوارد من المرحّلات المعروفة فقط، وبالمنفذ 514 من VLAN الإدارة فقط. واحجب كل حركة صادرة غير لازمة.\n3. **نظافة الشهادات.** استخدم جهة إصدار خاصة، وأعطِ كل مرحّل شهادته، وحدد أعماراً قصيرة مع تجديد تلقائي. فالشهادة المنتهية توقف الجمع بصمت.\n4. **حماية القرص.** ضع السجلات على وحدة تخزين منفصلة، وراقب المساحة الحرة، ودوّر السجلات مع الضغط. وامتلاء القرص أشيع أسباب فقدان الأحداث.\n5. **السلامة.** احسب بصمات الملفات المؤرشفة يومياً واحفظها في مكان آخر، لتثبت أن الأرشيف لم يُعدَّل.\n\nوحدد كذلك من يحق له قراءة السجلات. فسجلات المصادقة قد تكشف أسماء مستخدمين وعناوين داخلية، لذا امنح الوصول حسب الدور."
+   },
+   {
+    "id": "pitfalls",
+    "type": "text",
+    "markdown": "## أخطاء شائعة\n\nيكرر الفرق الجديدة على syslog الأخطاء نفسها غالباً:\n\n- **المناطق الزمنية.** الأجهزة التي تحذف المنطقة تُقرأ بتوقيت المستقبل المحلي. اضبط UTC على الجهاز متى أتاح ذلك.\n- **ملف ضخم واحد.** كتابة كل شيء في `messages` تبطئ البحث لاحقاً. افصل حسب المضيف والبرنامج.\n- **تجاهل الخطورة.** لا تُسقط `debug` و`info` بلا تدقيق؛ فبعض الأحداث الأمنية مثل تسجيلات VPN تُسجَّل بمستوى معلوماتي.\n- **غياب رسائل الاختبار.** أضف نبضاً من كل مرحّل كل دقيقة حتى يمكن كشف الصمت.\n- **الوثوق بحقل المصدر.** خلف NAT أو المرحّلات لا يكون مصدر الحزمة هو الجهاز الأصلي. استخدم اسم المضيف داخل الرسالة أو حقلاً منظماً."
+   },
+   {
+    "id": "check",
+    "type": "text",
+    "markdown": "## التحقق وإصلاح الأعطال\n\nاختبر كل قفزة بالترتيب. افحص الإعداد أولاً بالأمر `rsyslogd -N1`. ثم تأكد من المنصت بالأمر `ss -tlnp | grep 6514`. أرسل رسالة اختبار بـ `logger` وراقب ملف المستقبل. فإن لم يصل شيء فانظر في مجلد الطابور لدى العميل، وافحص تواريخ الشهادة بالأمر `openssl x509 -noout -dates`، وتأكد من صحة الساعة لأن TLS يفشل مع الوقت المنحرف. وأخيراً افحص قائمة ACL على جدار الحماية بين المرسل والمستقبل.\n\nولمعرفة كيف تتحول الأحداث بعد ذلك إلى تنبيهات قابلة للبحث، راجع [الإدارة المركزية للسجلات](/learn/security-operations-dfir/centralized-log-management) و[المراقبة الأمنية باستخدام Wazuh](/learn/security-operations-dfir/wazuh-security-monitoring)."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "استخدم جهازي Linux افتراضيين في شبكة مخبرية تملكها. على الأول ابنِ المستقبل بجهة إصدار شهادات مخبرية ذاتية وملف المستقبل أعلاه. وعلى الثاني أضف ملف إعادة التوجيه. أرسل `logger -p auth.warning \"lab test\"` وابحث عن الرسالة تحت `/var/log/remote/`. فكّ قيمة PRI يدوياً (المرفق × 8 + الخطورة). ثم أوقف المستقبل دقيقة، وأرسل خمس رسائل أخرى، وأعد تشغيله وتأكد أن الخمس وصلت كلها."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "المرفق (Facility)",
+      "definition": "النظام الفرعي الذي أنتج الرسالة مثل auth أو local0."
+     },
+     {
+      "term": "الخطورة (Severity)",
+      "definition": "مستوى من 0 إلى 7 من الطوارئ إلى التصحيح."
+     },
+     {
+      "term": "PRI",
+      "definition": "قيمة الأولوية: المرفق × 8 + الخطورة."
+     },
+     {
+      "term": "RFC 5424",
+      "definition": "صيغة رسائل syslog الحديثة المنظمة."
+     },
+     {
+      "term": "المرحّل (Relay)",
+      "definition": "خادم syslog يستقبل الرسائل ويخزنها مؤقتاً ويعيد توجيهها."
+     },
+     {
+      "term": "RELP",
+      "definition": "بروتوكول syslog موثوق بإقرارات على مستوى التطبيق."
+     },
+     {
+      "term": "EPS",
+      "definition": "عدد الأحداث في الثانية، ويُستخدم لتحجيم المستقبلات."
+     },
+     {
+      "term": "الطابور المدعوم بالقرص (Disk-assisted queue)",
+      "definition": "مخزن مؤقت على القرص يحتفظ بالرسائل حين يتعذر الوصول إلى الوجهة."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "ماذا تمثل قيمة PRI التي تساوي <34>؟",
+      "options": [
+       "المرفق 3 والخطورة 4",
+       "المرفق 4 والخطورة 2",
+       "المرفق 2 والخطورة 4",
+       "المرفق 34 والخطورة 0"
+      ],
+      "answer": 1,
+      "explanation": "34 = 4 × 8 + 2، أي المرفق auth (4) بخطورة حرجة (2)."
+     },
+     {
+      "question": "أي نقاط الضعف التالية تنطبق على syslog عبر UDP العادي؟ اختر كل ما ينطبق.",
+      "options": [
+       "قد تضيع الرسائل بصمت",
+       "يمكن انتحال المرسل",
+       "الحركة مشفرة دائماً",
+       "لا يوجد إقرار بالتسليم"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "لا يوفر UDP موثوقية ولا مصادقة ولا تشفيراً."
+     },
+     {
+      "question": "أي نقل يوفر التشفير ومصادقة النظير؟",
+      "options": [
+       "UDP 514",
+       "TCP 514",
+       "TLS على 6514",
+       "مصيدة SNMP"
+      ],
+      "answer": 2,
+      "explanation": "يعرّف RFC 5425 حمل syslog فوق TLS، وعادةً على المنفذ 6514."
+     },
+     {
+      "question": "لماذا يوضع مرحّل في كل موقع؟",
+      "options": [
+       "لتجنب الحاجة إلى SIEM",
+       "لتخزين الأحداث مؤقتاً وترقية البروتوكولات الضعيفة إلى TLS",
+       "لتغيير قيم الخطورة",
+       "لتعطيل NTP"
+      ],
+      "answer": 1,
+      "explanation": "يمتص المرحّل الانقطاعات ويغلف حركة UDP القديمة بجلسة آمنة."
+     },
+     {
+      "question": "أي إعداد في rsyslog يحفظ الأحداث أثناء تعطل المستقبل؟",
+      "options": [
+       "queue.type مع ملف على القرص وإعادة محاولة غير محدودة",
+       "مرشح خطورة عام",
+       "وحدة imudp",
+       "سلسلة القالب"
+      ],
+      "answer": 0,
+      "explanation": "الطابور المدعوم بالقرص مع action.resumeRetryCount=-1 يواصل المحاولة دون فقدان."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\nsyslog هو وسيلة النقل العامة لسجلات الأجهزة. اقرأ PRI لتحصل على المرفق والخطورة، وفضّل RFC 5424، واستخدم TLS أو RELP بدل UDP المجرد حيثما أمكن. ضع مرحّلات بطوابير على القرص في كل موقع، ووثّقها بالشهادات، وحدّد معدلاً لكل مصدر، وتحقق من كل قفزة. وبعد ذلك تعرّف على المكافئ في Windows ضمن [إعادة توجيه أحداث Windows](/learn/security-operations-dfir/windows-event-forwarding)."
+   }
+  ]
+ }
+}

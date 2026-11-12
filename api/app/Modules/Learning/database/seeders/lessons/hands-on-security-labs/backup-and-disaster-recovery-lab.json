@@ -1,0 +1,560 @@
+{
+  "slug": "backup-and-disaster-recovery-lab",
+  "title": "Backup and Disaster Recovery Lab",
+  "summary": "Set RPO and RTO targets, back up a web server and PostgreSQL with restic to an append-only repository, add an offline copy, and time a full rebuild.",
+  "duration_minutes": 35,
+  "objectives": [
+    "Define RPO and RTO targets per system",
+    "Build a 3-2-1 layout with an append-only repository",
+    "Back up files and PostgreSQL with restic",
+    "Verify backups at three levels",
+    "Measure real recovery time in a restore drill"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "A backup you have never restored is a hope, not a control. Ransomware, a bad `DROP TABLE`, a failed disk or a mistaken `rm -rf` all end in the same question: how much data did we lose, and how long until we are working again? Answering that question with numbers, before the disaster, is the point of this lab.\n\nYou will back up a Linux web server and its PostgreSQL database to a separate backup VM with **restic**, add an offline copy, destroy the server on purpose, restore it, and time the whole thing. Along the way you apply the ideas from [The 3-2-1 Backup Strategy](/learn/security-architecture-resilience/the-3-2-1-backup-strategy) and prepare for [Ransomware Recovery Simulation Lab](/learn/hands-on-security-labs/ransomware-recovery-simulation-lab). Everything here runs on VMs you own."
+    },
+    {
+      "id": "targets",
+      "type": "text",
+      "markdown": "## Step 1: Set recovery targets first\n\nDecide what \"recovered\" means before you choose tools. Two numbers drive every backup design.\n\n- **Recovery point objective (RPO)**: the most data you can afford to lose, measured in time. A nightly backup means an RPO of up to 24 hours.\n- **Recovery time objective (RTO)**: the longest outage you can tolerate before the service is back.\n\nFor the lab, assume the web server and database have an RPO of 4 hours and an RTO of 60 minutes. Write them down, because the end of the lab tests whether you met them.\n\n| System | Data | RPO | RTO | Method |\n|:--|:--|:--|:--|:--|\n| web-01 | `/etc`, `/var/www` | 24 h | 60 min | restic file backup |\n| db-01 | PostgreSQL | 4 h | 60 min | `pg_dump` plus restic |\n| siem-01 | Configuration only | 24 h | 4 h | restic, rebuild from the installer |\n\nNot everything needs the same targets. Tight objectives cost more, so spend them where the business impact is highest."
+    },
+    {
+      "id": "layout",
+      "type": "text",
+      "markdown": "## Step 2: Design the 3-2-1 layout\n\nThe classic rule is **three copies** of the data, on **two different media**, with **one copy offsite or offline**. In a home lab this maps naturally:\n\n1. The live data on `web-01` and `db-01`.\n2. A restic repository on a dedicated backup VM, `bkp-01` (192.0.2.50 in this lab), on its own disk.\n3. An offline copy on an external USB disk that you attach only during the copy, or a bucket with object lock in a cloud account you own.\n\nThe backup VM is the most important design decision. Place it on the management network, allow only SSH from the servers, and give the servers a key that can **append** but not delete. If ransomware encrypts `web-01` and the same credentials can wipe the repository, you have one copy, not three. See [Multi-VLAN Network Security Lab](/learn/hands-on-security-labs/multi-vlan-network-security-lab) for the network side."
+    },
+    {
+      "id": "append",
+      "type": "code",
+      "language": "bash",
+      "filename": "bkp-01: ~/.ssh/authorized_keys",
+      "caption": "Restrict the backup key so it can only run restic in append-only mode (the key shown is a placeholder).",
+      "code": "command=\"restic serve --stdio --append-only /srv/restic-repo\",restrict,no-port-forwarding ssh-ed25519 AAAA...PLACEHOLDER backup@web-01\n",
+      "highlight": [
+        1
+      ]
+    },
+    {
+      "id": "cycle-anim",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "The backup and recovery loop",
+      "caption": "A backup program is a loop. Every stage can fail silently, so each one needs a check.",
+      "data": {
+        "center": "Backup program",
+        "items": [
+          {
+            "label": "Define RPO and RTO",
+            "sub": "Business decides the targets"
+          },
+          {
+            "label": "Back up",
+            "sub": "Encrypted, scheduled, append-only"
+          },
+          {
+            "label": "Verify",
+            "sub": "Integrity check and sample restore"
+          },
+          {
+            "label": "Copy offline",
+            "sub": "Third copy beyond the network"
+          },
+          {
+            "label": "Restore drill",
+            "sub": "Measure the real RTO"
+          },
+          {
+            "label": "Improve",
+            "sub": "Fix gaps, update the runbook"
+          }
+        ]
+      }
+    },
+    {
+      "id": "backup",
+      "type": "text",
+      "markdown": "## Step 3: Back up files and the database\n\nInstall restic on each server, create a repository password file readable only by root, and initialize the repository. restic encrypts everything on the client before it leaves the host, so the repository server never sees plain data.\n\nFor PostgreSQL, do not copy the live data directory. Take a logical dump in the custom format, which is compressed and restorable table by table, and include the dump in the restic run. Keep the repository password somewhere other than the servers it protects, such as a password manager and a sealed printed copy. Without it, the backups are unreadable by everyone, including you."
+    },
+    {
+      "id": "term-backup",
+      "type": "terminal",
+      "title": "db-01",
+      "prompt": "$",
+      "caption": "Initialize the repository, dump the database and back up. Passwords are read from a root-only file.",
+      "lines": [
+        {
+          "cmd": "export RESTIC_REPOSITORY=sftp:backup@192.0.2.50:/srv/restic-repo RESTIC_PASSWORD_FILE=/root/.restic-pass",
+          "output": "",
+          "comment": "Repository location and password file; no secret appears on the command line."
+        },
+        {
+          "cmd": "sudo -E restic init",
+          "output": "created restic repository 5f3a1c2e9b at sftp:backup@192.0.2.50:/srv/restic-repo\n\nPlease note that knowledge of your password is required to access the repository.",
+          "comment": "The repository is encrypted. Lose the password and the data is gone."
+        },
+        {
+          "cmd": "sudo -u postgres pg_dump -Fc appdb > /var/backups/appdb.dump",
+          "output": "",
+          "comment": "Custom-format logical dump of the application database."
+        },
+        {
+          "cmd": "sudo -E restic backup /etc /var/www /var/backups/appdb.dump --tag nightly",
+          "output": "Files:          412 new,     0 changed,     0 unmodified\nDirs:            58 new\nAdded to the repository: 38.214 MiB (11.902 MiB stored)\nsnapshot 8c1d4e7a saved",
+          "comment": "Deduplication and compression: 38 MiB of data cost 12 MiB of storage."
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Step 4: Verify, then restore\n\nA successful backup message proves only that the program finished. Verification has three layers.\n\n- **Repository integrity**: `restic check` confirms the structure is consistent. Add `--read-data-subset=10%` weekly to read a sample of the actual data.\n- **Sample restore**: restore a few files and the database dump to a scratch directory and compare checksums.\n- **Full rebuild**: restore a whole system on a fresh VM. This is the only test that measures RTO.\n\nFor the rebuild, delete `web-01` in your hypervisor, create a new VM from your base template, install restic, and restore. Start a stopwatch when you begin and stop it when the web page loads again. Restore the database with `pg_restore` into a new database first, and check row counts before you point the application at it."
+    },
+    {
+      "id": "term-restore",
+      "type": "terminal",
+      "title": "web-01 (rebuilt)",
+      "prompt": "$",
+      "caption": "Check integrity, list snapshots, restore the web root and the dump.",
+      "lines": [
+        {
+          "cmd": "sudo -E restic check --read-data-subset=10%",
+          "output": "using temporary cache in /tmp/restic-check-cache-4417\nload indexes\ncheck all packs\ncheck snapshots, trees and blobs\nread 10.0% of data packs\nno errors were found",
+          "comment": "The repository structure and the sampled data are intact."
+        },
+        {
+          "cmd": "sudo -E restic snapshots --tag nightly",
+          "output": "ID        Time                 Host    Tags     Paths\n8c1d4e7a  2026-11-12 02:00:04  db-01   nightly  /etc, /var/www, /var/backups/appdb.dump\n1fa9b320  2026-11-13 02:00:03  db-01   nightly  /etc, /var/www, /var/backups/appdb.dump\n2 snapshots",
+          "comment": "Pick the newest snapshot that predates the incident, not necessarily the latest one."
+        },
+        {
+          "cmd": "sudo -E restic restore 8c1d4e7a --target /restore --include /var/www",
+          "output": "restoring <Snapshot 8c1d4e7a of [/etc /var/www /var/backups/appdb.dump] at 2026-11-12 02:00:04 by root@db-01> to /restore\nSummary: Restored 311 files/dirs (31.4 MiB) in 0:02",
+          "comment": "Restore to a scratch path first, then compare before overwriting anything."
+        },
+        {
+          "cmd": "sudo -E restic restore 8c1d4e7a --target /restore --include /var/backups/appdb.dump && sudo -u postgres pg_restore -d appdb_restored --no-owner /restore/var/backups/appdb.dump && sudo -u postgres psql -d appdb_restored -c 'SELECT count(*) FROM orders;'",
+          "output": "restoring <Snapshot 8c1d4e7a ...> to /restore\n count\n-------\n 18422\n(1 row)",
+          "comment": "Row count matches the number recorded before the disaster (the empty database appdb_restored was created beforehand)."
+        }
+      ]
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Backups can be destroyed too",
+      "markdown": "Modern ransomware looks for backup agents, mounted shares and stored credentials before it encrypts. Keep the backup server off the domain, use credentials that cannot delete, patch it first and keep one copy that is disconnected. Test that a compromised `web-01` really cannot remove snapshots from `bkp-01`."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Write the runbook while calm",
+      "markdown": "During a real outage, nobody thinks clearly. Keep a one-page runbook with the order of restoration, where the repository password is stored, the commands you tested, and who to call. Update it after every drill, and store a printed or offline copy, because the wiki may be down too."
+    },
+    {
+      "id": "measure",
+      "type": "text",
+      "markdown": "## Step 5: Measure, then compare with your targets\n\nAfter the rebuild, fill in the real numbers. A typical first result is humbling: the data restore took two minutes, but finding the password, building the VM and reinstalling packages took fifty.\n\n| Step | Planned | Measured |\n|:--|:--|:--|\n| Create VM from template | 5 min | 8 min |\n| Install restic and restore files | 10 min | 22 min |\n| Restore database and verify counts | 10 min | 14 min |\n| Application test | 5 min | 6 min |\n| **Total RTO** | 30 min | 50 min |\n\nCompare the total with the 60-minute target. If you are close to the limit, automate the slow steps with a VM template that already contains restic. Also check the RPO: the newest snapshot should be less than four hours old. Schedule backups with a systemd timer and alert when a run fails or when the newest snapshot is too old, as in [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab)."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On VMs **you own** (a web VM, a database VM and a backup VM):\n\n1. Write the RPO and RTO for each system in a table.\n2. Install restic, initialize a repository on the backup VM and run a first backup of `/etc`, `/var/www` and a `pg_dump` file.\n3. Restrict the backup key to append-only mode and confirm that a deletion attempt from the web VM fails.\n4. Run `restic check`, then restore one file and compare its `sha256sum` with the original.\n5. Copy the repository to a USB disk or an object-lock bucket, then disconnect it.\n6. Delete the web VM, rebuild it from a template, restore, and record the stopwatch time against your RTO.\n7. Write the one-page runbook, including where the password is kept."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "RPO",
+          "definition": "Recovery point objective: the maximum acceptable data loss, measured in time."
+        },
+        {
+          "term": "RTO",
+          "definition": "Recovery time objective: the maximum acceptable time to restore the service."
+        },
+        {
+          "term": "3-2-1 rule",
+          "definition": "Three copies, two media types, one copy offsite or offline."
+        },
+        {
+          "term": "Append-only",
+          "definition": "A repository mode that accepts new backups but refuses deletion or modification."
+        },
+        {
+          "term": "Snapshot",
+          "definition": "A point-in-time record of backed-up data that you can restore from."
+        },
+        {
+          "term": "Immutable backup",
+          "definition": "A copy that cannot be altered or deleted for a set period, even by an administrator."
+        },
+        {
+          "term": "Restore drill",
+          "definition": "A planned test that rebuilds a system from backups and measures the real recovery time."
+        },
+        {
+          "term": "Runbook",
+          "definition": "A short, tested procedure that tells responders what to do and in what order."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "A team backs up nightly. What is the worst-case RPO?",
+          "options": [
+            "About 24 hours of data",
+            "Zero",
+            "One hour",
+            "Depends on the RTO"
+          ],
+          "answer": 0,
+          "explanation": "If failure occurs just before the next run, everything since the last nightly backup is lost."
+        },
+        {
+          "question": "Which measures protect backups from ransomware? (Choose all that apply.)",
+          "options": [
+            "Append-only credentials",
+            "An offline or object-lock copy",
+            "Mounting the repository as a writable share on every server",
+            "Keeping the backup server off the domain"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Credentials that cannot delete, a disconnected copy and separation from the domain all limit what an attacker can destroy. A writable share on every server hands the attacker the backups."
+        },
+        {
+          "question": "Which test is the only one that measures your real RTO?",
+          "options": [
+            "restic check",
+            "Reading the backup log",
+            "A full rebuild from backups with a stopwatch",
+            "Counting snapshots"
+          ],
+          "answer": 2,
+          "explanation": "Integrity checks prove the data is readable, but only a timed rebuild includes provisioning, finding credentials and application testing."
+        },
+        {
+          "question": "Why use pg_dump instead of copying the live PostgreSQL data directory?",
+          "options": [
+            "It gives a consistent, restorable copy while the database runs",
+            "It is always faster",
+            "It removes the need for passwords",
+            "It encrypts the data"
+          ],
+          "answer": 0,
+          "explanation": "A file copy of a running database can be inconsistent. A logical dump is a consistent snapshot that restores table by table."
+        },
+        {
+          "question": "Where should the repository password be stored?",
+          "options": [
+            "Only on the server being backed up",
+            "Separately from the protected servers, such as a password manager plus a sealed copy",
+            "In the public wiki",
+            "In the backup file names"
+          ],
+          "answer": 1,
+          "explanation": "If the password lives only on the failed server, the backups cannot be decrypted when you need them."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\nYou set RPO and RTO first, built a 3-2-1 layout with an append-only repository, backed up files and a database with restic, verified at three levels and rebuilt a server from nothing while timing it. The measured RTO is the honest answer to \"how long are we down?\", and the drill showed which steps to automate. Keep backups out of reach of the systems they protect, hold one disconnected copy, and repeat the drill on a schedule. Next, apply the same discipline to [Ransomware Recovery Simulation Lab](/learn/hands-on-security-labs/ransomware-recovery-simulation-lab)."
+    }
+  ],
+  "ar": {
+    "title": "مختبر النسخ الاحتياطي والتعافي من الكوارث",
+    "summary": "حدّد أهداف RPO وRTO، وانسخ خادم ويب وPostgreSQL بـ restic إلى مستودع للإضافة فقط، وأضف نسخة غير متصلة، وقِس زمن إعادة بناء كاملة.",
+    "objectives": [
+      "تحديد أهداف RPO وRTO لكل نظام",
+      "بناء توزيع 3-2-1 بمستودع للإضافة فقط",
+      "نسخ الملفات وPostgreSQL بـ restic",
+      "التحقق من النسخ على ثلاثة مستويات",
+      "قياس زمن التعافي الفعلي في تمرين استعادة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "النسخة الاحتياطية التي لم تُجرَّب استعادتها أمنيةٌ لا ضابطٌ أمني. فالفدية (Ransomware) أو أمر `DROP TABLE` خاطئ أو تعطّل قرص أو أمر `rm -rf` بالخطأ، كلها تنتهي بسؤال واحد: كم من البيانات فقدنا، وكم يلزمنا من الوقت لنعود إلى العمل؟ والإجابة عن هذا السؤال بالأرقام قبل وقوع الكارثة هي غاية هذا المختبر.\n\nستنسخ احتياطيًا خادم ويب لينكس وقاعدة بيانات PostgreSQL إلى جهاز افتراضي مستقل للنسخ الاحتياطي باستخدام **restic**، ثم تضيف نسخة غير متصلة، ثم تدمّر الخادم عمدًا، وتستعيده، وتقيس الزمن كاملًا. وبذلك تطبّق أفكار [The 3-2-1 Backup Strategy](/learn/security-architecture-resilience/the-3-2-1-backup-strategy) وتتهيأ لمختبر [Ransomware Recovery Simulation Lab](/learn/hands-on-security-labs/ransomware-recovery-simulation-lab). كل ما يلي يعمل على أجهزة افتراضية تملكها."
+      },
+      {
+        "id": "targets",
+        "type": "text",
+        "markdown": "## الخطوة 1: حدّد أهداف التعافي أولًا\n\nقرّر ما معنى «تمّ التعافي» قبل اختيار الأدوات، فرقمان اثنان يحكمان كل تصميم للنسخ الاحتياطي.\n\n- **هدف نقطة الاسترداد (RPO)**: أقصى قدر من البيانات يمكنك تحمّل فقده، مقيسًا بالزمن. النسخ الليلي يعني RPO يصل إلى 24 ساعة.\n- **هدف زمن الاسترداد (RTO)**: أطول مدة انقطاع تتحملها قبل عودة الخدمة.\n\nافترض في المختبر أن خادم الويب وقاعدة البيانات لهما RPO مدته 4 ساعات وRTO مدته 60 دقيقة. دوّنهما لأن نهاية المختبر تختبر هل حققتهما.\n\n| النظام | البيانات | RPO | RTO | الأسلوب |\n|:--|:--|:--|:--|:--|\n| web-01 | `/etc` و`/var/www` | 24 ساعة | 60 دقيقة | نسخ ملفات بـ restic |\n| db-01 | PostgreSQL | 4 ساعات | 60 دقيقة | `pg_dump` ثم restic |\n| siem-01 | الإعدادات فقط | 24 ساعة | 4 ساعات | restic وإعادة البناء من المثبّت |\n\nلا تحتاج كل الأنظمة إلى الأهداف نفسها؛ فالأهداف الصارمة أعلى كلفة، فأنفقها حيث يكون الأثر على العمل أكبر."
+      },
+      {
+        "id": "layout",
+        "type": "text",
+        "markdown": "## الخطوة 2: صمّم توزيع 3-2-1\n\nالقاعدة الكلاسيكية هي **ثلاث نسخ** من البيانات، على **وسيطين مختلفين**، مع **نسخة واحدة خارج الموقع أو غير متصلة**. وفي المختبر المنزلي يتحقق ذلك بسهولة:\n\n1. البيانات الحية على `web-01` و`db-01`.\n2. مستودع restic على جهاز افتراضي مخصص للنسخ الاحتياطي هو `bkp-01` (العنوان 192.0.2.50 في هذا المختبر) على قرص خاص به.\n3. نسخة غير متصلة على قرص USB خارجي لا توصله إلا أثناء النسخ، أو حاوية مع قفل الكائنات (Object Lock) في حساب سحابي تملكه.\n\nجهاز النسخ الاحتياطي هو أهم قرار تصميمي. ضعه على شبكة الإدارة، واسمح فيه بـ SSH من الخوادم فقط، وامنح الخوادم مفتاحًا يستطيع **الإضافة** ولا يستطيع الحذف. فإذا شفّر برنامج الفدية `web-01` وكانت بيانات الاعتماد نفسها قادرة على مسح المستودع، فلديك نسخة واحدة لا ثلاث. راجع [Multi-VLAN Network Security Lab](/learn/hands-on-security-labs/multi-vlan-network-security-lab) للجانب الشبكي."
+      },
+      {
+        "id": "append",
+        "type": "code",
+        "language": "bash",
+        "filename": "bkp-01: ~/.ssh/authorized_keys",
+        "caption": "قيّد مفتاح النسخ الاحتياطي بحيث يشغّل restic في وضع الإضافة فقط (المفتاح الظاهر نص بديل).",
+        "code": "command=\"restic serve --stdio --append-only /srv/restic-repo\",restrict,no-port-forwarding ssh-ed25519 AAAA...PLACEHOLDER backup@web-01\n",
+        "highlight": [
+          1
+        ]
+      },
+      {
+        "id": "cycle-anim",
+        "type": "animation",
+        "kind": "cycle",
+        "title": "حلقة النسخ الاحتياطي والتعافي",
+        "caption": "برنامج النسخ الاحتياطي حلقة متصلة، وكل مرحلة قد تفشل بصمت، لذا تحتاج كل مرحلة إلى فحص.",
+        "data": {
+          "center": "برنامج النسخ",
+          "items": [
+            {
+              "label": "حدّد RPO وRTO",
+              "sub": "يحدد العمل الأهداف"
+            },
+            {
+              "label": "انسخ احتياطيًا",
+              "sub": "مشفّر ومجدول وللإضافة فقط"
+            },
+            {
+              "label": "تحقّق",
+              "sub": "فحص السلامة واستعادة عيّنة"
+            },
+            {
+              "label": "انسخ خارج الاتصال",
+              "sub": "نسخة ثالثة خارج الشبكة"
+            },
+            {
+              "label": "تمرين الاستعادة",
+              "sub": "قِس الـ RTO الفعلي"
+            },
+            {
+              "label": "حسّن",
+              "sub": "أصلح الثغرات وحدّث الدليل"
+            }
+          ]
+        }
+      },
+      {
+        "id": "backup",
+        "type": "text",
+        "markdown": "## الخطوة 3: انسخ الملفات وقاعدة البيانات\n\nثبّت restic على كل خادم، وأنشئ ملف كلمة مرور للمستودع لا يقرؤه غير root، ثم هيّئ المستودع. يشفّر restic كل شيء عند العميل قبل مغادرته المضيف، فلا يرى خادم المستودع البيانات الصريحة أبدًا.\n\nوفي PostgreSQL لا تنسخ مجلد البيانات الحي، بل خذ تفريغًا منطقيًا بالصيغة المخصصة (custom)، فهي مضغوطة وتتيح الاستعادة جدولًا جدولًا، ثم أدرج التفريغ في تشغيل restic. واحفظ كلمة مرور المستودع في مكان غير الخوادم التي تحميها، كمدير كلمات المرور ونسخة مطبوعة مختومة؛ فبدونها تصبح النسخ غير مقروءة للجميع، وأنت منهم."
+      },
+      {
+        "id": "term-backup",
+        "type": "terminal",
+        "title": "db-01",
+        "prompt": "$",
+        "caption": "هيّئ المستودع وفرّغ قاعدة البيانات وانسخ احتياطيًا. تُقرأ كلمات المرور من ملف خاص بالمستخدم root.",
+        "lines": [
+          {
+            "cmd": "export RESTIC_REPOSITORY=sftp:backup@192.0.2.50:/srv/restic-repo RESTIC_PASSWORD_FILE=/root/.restic-pass",
+            "output": "",
+            "comment": "موقع المستودع وملف كلمة المرور؛ فلا يظهر أي سر في سطر الأوامر."
+          },
+          {
+            "cmd": "sudo -E restic init",
+            "output": "created restic repository 5f3a1c2e9b at sftp:backup@192.0.2.50:/srv/restic-repo\n\nPlease note that knowledge of your password is required to access the repository.",
+            "comment": "المستودع مشفّر. وإذا ضاعت كلمة المرور ضاعت البيانات."
+          },
+          {
+            "cmd": "sudo -u postgres pg_dump -Fc appdb > /var/backups/appdb.dump",
+            "output": "",
+            "comment": "تفريغ منطقي بالصيغة المخصصة لقاعدة بيانات التطبيق."
+          },
+          {
+            "cmd": "sudo -E restic backup /etc /var/www /var/backups/appdb.dump --tag nightly",
+            "output": "Files:          412 new,     0 changed,     0 unmodified\nDirs:            58 new\nAdded to the repository: 38.214 MiB (11.902 MiB stored)\nsnapshot 8c1d4e7a saved",
+            "comment": "إزالة التكرار والضغط: كلّفت 38 ميبيبايت من البيانات 12 ميبيبايت من التخزين."
+          }
+        ]
+      },
+      {
+        "id": "verify",
+        "type": "text",
+        "markdown": "## الخطوة 4: تحقّق ثم استعد\n\nرسالة نجاح النسخ لا تثبت إلا أن البرنامج انتهى. أما التحقق فله ثلاث طبقات.\n\n- **سلامة المستودع**: يؤكد `restic check` اتساق البنية. أضف `--read-data-subset=10%` أسبوعيًا لقراءة عيّنة من البيانات الفعلية.\n- **استعادة عيّنة**: استعد بعض الملفات وتفريغ القاعدة إلى مجلد مؤقت وقارن المجاميع الاختبارية (Checksums).\n- **إعادة بناء كاملة**: استعد نظامًا كاملًا على جهاز افتراضي جديد. وهذا الاختبار الوحيد الذي يقيس RTO.\n\nللإعادة الكاملة، احذف `web-01` من المحاكي (Hypervisor)، وأنشئ جهازًا جديدًا من القالب الأساسي، وثبّت restic ثم استعد. شغّل المؤقت عند البدء وأوقفه حين تُحمَّل صفحة الويب مجددًا. واستعد القاعدة بـ `pg_restore` إلى قاعدة جديدة أولًا، وتحقق من أعداد الصفوف قبل توجيه التطبيق إليها."
+      },
+      {
+        "id": "term-restore",
+        "type": "terminal",
+        "title": "web-01 (rebuilt)",
+        "prompt": "$",
+        "caption": "افحص السلامة واعرض اللقطات واستعد جذر الويب والتفريغ.",
+        "lines": [
+          {
+            "cmd": "sudo -E restic check --read-data-subset=10%",
+            "output": "using temporary cache in /tmp/restic-check-cache-4417\nload indexes\ncheck all packs\ncheck snapshots, trees and blobs\nread 10.0% of data packs\nno errors were found",
+            "comment": "بنية المستودع والعيّنة المقروءة سليمتان."
+          },
+          {
+            "cmd": "sudo -E restic snapshots --tag nightly",
+            "output": "ID        Time                 Host    Tags     Paths\n8c1d4e7a  2026-11-12 02:00:04  db-01   nightly  /etc, /var/www, /var/backups/appdb.dump\n1fa9b320  2026-11-13 02:00:03  db-01   nightly  /etc, /var/www, /var/backups/appdb.dump\n2 snapshots",
+            "comment": "اختر أحدث لقطة تسبق الحادثة، وليس بالضرورة آخر لقطة."
+          },
+          {
+            "cmd": "sudo -E restic restore 8c1d4e7a --target /restore --include /var/www",
+            "output": "restoring <Snapshot 8c1d4e7a of [/etc /var/www /var/backups/appdb.dump] at 2026-11-12 02:00:04 by root@db-01> to /restore\nSummary: Restored 311 files/dirs (31.4 MiB) in 0:02",
+            "comment": "استعد إلى مسار مؤقت أولًا ثم قارن قبل الكتابة فوق أي شيء."
+          },
+          {
+            "cmd": "sudo -E restic restore 8c1d4e7a --target /restore --include /var/backups/appdb.dump && sudo -u postgres pg_restore -d appdb_restored --no-owner /restore/var/backups/appdb.dump && sudo -u postgres psql -d appdb_restored -c 'SELECT count(*) FROM orders;'",
+            "output": "restoring <Snapshot 8c1d4e7a ...> to /restore\n count\n-------\n 18422\n(1 row)",
+            "comment": "يطابق عدد الصفوف الرقم المسجَّل قبل الكارثة (أُنشئت القاعدة الفارغة appdb_restored مسبقًا)."
+          }
+        ]
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "يمكن تدمير النسخ الاحتياطية أيضًا",
+        "markdown": "تبحث برامج الفدية الحديثة عن وكلاء النسخ الاحتياطي والمشاركات المركّبة وبيانات الاعتماد المحفوظة قبل أن تبدأ التشفير. أبقِ خادم النسخ خارج النطاق (Domain)، واستخدم بيانات اعتماد لا تملك صلاحية الحذف، وحدّثه قبل غيره، واحتفظ بنسخة واحدة مفصولة عن الشبكة. واختبر فعليًا أن `web-01` المخترَق لا يستطيع إزالة اللقطات من `bkp-01`."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "اكتب دليل التشغيل وأنت هادئ",
+        "markdown": "أثناء انقطاع حقيقي لا يفكّر أحد بوضوح. احتفظ بدليل تشغيل من صفحة واحدة يتضمن ترتيب الاستعادة ومكان كلمة مرور المستودع والأوامر التي جرّبتها وجهة الاتصال. وحدّثه بعد كل تمرين، واحفظ نسخة مطبوعة أو غير متصلة لأن موقع الويكي قد يكون معطلًا أيضًا."
+      },
+      {
+        "id": "measure",
+        "type": "text",
+        "markdown": "## الخطوة 5: قِس ثم قارن بأهدافك\n\nبعد إعادة البناء دوّن الأرقام الحقيقية. والنتيجة الأولى المعتادة متواضعة: استغرقت استعادة البيانات دقيقتين، أما العثور على كلمة المرور وبناء الجهاز وتثبيت الحزم فاستغرق خمسين.\n\n| الخطوة | المخطط | المقيس |\n|:--|:--|:--|\n| إنشاء جهاز من القالب | 5 دقائق | 8 دقائق |\n| تثبيت restic واستعادة الملفات | 10 دقائق | 22 دقيقة |\n| استعادة القاعدة والتحقق من الأعداد | 10 دقائق | 14 دقيقة |\n| اختبار التطبيق | 5 دقائق | 6 دقائق |\n| **إجمالي RTO** | 30 دقيقة | 50 دقيقة |\n\nقارن الإجمالي بهدف الستين دقيقة. وإذا اقتربت من الحد فأتمت الخطوات البطيئة بقالب جهاز يحوي restic مسبقًا. وافحص أيضًا الـ RPO: يجب أن تكون أحدث لقطة أحدث من أربع ساعات. جدوِل النسخ بمؤقّت systemd ونبّه عند فشل أي تشغيل أو عند قِدم آخر لقطة، كما في [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab)."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على أجهزة افتراضية **تملكها** (جهاز ويب وجهاز قاعدة بيانات وجهاز نسخ احتياطي):\n\n1. دوّن RPO وRTO لكل نظام في جدول.\n2. ثبّت restic وهيّئ مستودعًا على جهاز النسخ وأجرِ أول نسخة لـ `/etc` و`/var/www` وملف `pg_dump`.\n3. قيّد مفتاح النسخ بوضع الإضافة فقط وتأكد من فشل محاولة الحذف من جهاز الويب.\n4. شغّل `restic check` ثم استعد ملفًا واحدًا وقارن `sha256sum` الخاص به بالأصل.\n5. انسخ المستودع إلى قرص USB أو حاوية بقفل الكائنات ثم افصله.\n6. احذف جهاز الويب وأعد بناءه من قالب واستعد، وسجّل زمن المؤقت مقابل RTO.\n7. اكتب دليل التشغيل من صفحة واحدة متضمنًا مكان حفظ كلمة المرور."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "RPO",
+            "definition": "هدف نقطة الاسترداد: أقصى فقد مقبول للبيانات مقيسًا بالزمن."
+          },
+          {
+            "term": "RTO",
+            "definition": "هدف زمن الاسترداد: أقصى زمن مقبول لإعادة الخدمة."
+          },
+          {
+            "term": "قاعدة 3-2-1",
+            "definition": "ثلاث نسخ على وسيطين مختلفين مع نسخة واحدة خارج الموقع أو غير متصلة."
+          },
+          {
+            "term": "الإضافة فقط",
+            "definition": "وضع مستودع يقبل نسخًا جديدة ويرفض الحذف أو التعديل."
+          },
+          {
+            "term": "اللقطة",
+            "definition": "سجل للبيانات المنسوخة عند لحظة محددة يمكن الاستعادة منه."
+          },
+          {
+            "term": "نسخة غير قابلة للتغيير",
+            "definition": "نسخة لا يمكن تعديلها أو حذفها خلال مدة محددة حتى من المسؤول."
+          },
+          {
+            "term": "تمرين الاستعادة",
+            "definition": "اختبار مخطط يعيد بناء نظام من النسخ ويقيس زمن التعافي الفعلي."
+          },
+          {
+            "term": "دليل التشغيل",
+            "definition": "إجراء قصير مُجرَّب يبيّن للمستجيبين ما يفعلونه وبأي ترتيب."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "يجري فريق نسخًا احتياطيًا ليليًا. ما أسوأ RPO؟",
+            "options": [
+              "نحو 24 ساعة من البيانات",
+              "صفر",
+              "ساعة واحدة",
+              "يعتمد على RTO"
+            ],
+            "answer": 0,
+            "explanation": "إذا وقع العطل قبيل التشغيل التالي ضاع كل ما بعد آخر نسخ ليلي."
+          },
+          {
+            "question": "أي الإجراءات تحمي النسخ الاحتياطية من الفدية؟ (اختر كل ما ينطبق)",
+            "options": [
+              "بيانات اعتماد للإضافة فقط",
+              "نسخة غير متصلة أو بقفل الكائنات",
+              "تركيب المستودع كمشاركة قابلة للكتابة على كل خادم",
+              "إبقاء خادم النسخ خارج النطاق"
+            ],
+            "answer": [
+              0,
+              1,
+              3
+            ],
+            "explanation": "بيانات الاعتماد غير القادرة على الحذف والنسخة المفصولة والفصل عن النطاق تحدّ مما يستطيع المهاجم تدميره، أما المشاركة القابلة للكتابة على كل خادم فتسلّمه النسخ."
+          },
+          {
+            "question": "أي اختبار هو الوحيد الذي يقيس RTO الفعلي؟",
+            "options": [
+              "restic check",
+              "قراءة سجل النسخ",
+              "إعادة بناء كاملة من النسخ مع مؤقت",
+              "عدّ اللقطات"
+            ],
+            "answer": 2,
+            "explanation": "فحوص السلامة تثبت أن البيانات مقروءة، لكن إعادة البناء الموقوتة وحدها تشمل التجهيز والعثور على بيانات الاعتماد واختبار التطبيق."
+          },
+          {
+            "question": "لماذا نستخدم pg_dump بدل نسخ مجلد بيانات PostgreSQL الحي؟",
+            "options": [
+              "يعطي نسخة متسقة قابلة للاستعادة أثناء عمل القاعدة",
+              "هو دائمًا أسرع",
+              "يلغي الحاجة إلى كلمات المرور",
+              "يشفّر البيانات"
+            ],
+            "answer": 0,
+            "explanation": "نسخ ملفات قاعدة تعمل قد يكون غير متسق، أما التفريغ المنطقي فلقطة متسقة تُستعاد جدولًا جدولًا."
+          },
+          {
+            "question": "أين تُحفظ كلمة مرور المستودع؟",
+            "options": [
+              "على الخادم المنسوخ فقط",
+              "منفصلة عن الخوادم المحمية كمدير كلمات مرور مع نسخة مختومة",
+              "في الويكي العام",
+              "في أسماء ملفات النسخ"
+            ],
+            "answer": 1,
+            "explanation": "إذا كانت كلمة المرور على الخادم المعطّل فقط تعذّر فك تشفير النسخ حين تحتاج إليها."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\nحدّدت RPO وRTO أولًا، وبنيت توزيع 3-2-1 بمستودع للإضافة فقط، ونسخت ملفات وقاعدة بيانات بـ restic، وتحققت على ثلاثة مستويات، وأعدت بناء خادم من العدم مع قياس الزمن. الـ RTO المقيس هو الجواب الصادق عن سؤال «كم نبقى متوقفين؟»، وقد بيّن التمرين أي الخطوات تستحق الأتمتة. أبقِ النسخ بعيدة عن متناول الأنظمة التي تحميها، واحتفظ بنسخة مفصولة، وكرّر التمرين دوريًا. وبعد ذلك طبّق الانضباط نفسه في [Ransomware Recovery Simulation Lab](/learn/hands-on-security-labs/ransomware-recovery-simulation-lab)."
+      }
+    ]
+  }
+}

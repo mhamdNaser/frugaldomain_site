@@ -1,0 +1,548 @@
+{
+  "slug": "log-correlation-and-event-enrichment",
+  "title": "Log Correlation and Event Enrichment",
+  "summary": "Learn how to join events from different log sources and enrich them with asset, identity, location and threat context, using SPL and KQL examples.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Explain correlation and enrichment and why they matter",
+    "Prepare time, fields and identities so joins are reliable",
+    "Write a multi-source correlation query in SPL and KQL",
+    "Choose between ingest-time and search-time enrichment",
+    "Avoid common correlation pitfalls"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "At 02:14 a firewall logs a denied connection from 203.0.113.77. At 02:16 a VPN gateway records a failed login for the account `jdoe`. At 02:19 a domain controller logs a successful sign-in for the same account from a new country. Each event alone is routine noise. Together they are a probable account takeover.\n\nNo single log source tells that story. **Correlation** is the practice of linking events from different sources by shared fields and time, and **enrichment** is the practice of adding context, such as who owns a host or whether an address is known to be hostile. Together they turn a pile of lines into evidence that an analyst can act on. This lesson shows how to build both, using concepts that apply to Splunk, Elastic and Microsoft Sentinel alike. The raw material comes from [Centralized Log Management](/learn/security-operations-dfir/centralized-log-management) and [Syslog Architecture](/learn/security-operations-dfir/syslog-architecture)."
+    },
+    {
+      "id": "prereq",
+      "type": "text",
+      "markdown": "## Three things correlation depends on\n\nCorrelation fails quietly when its foundations are weak. Check these before writing a single rule.\n\n1. **Synchronized time.** If the firewall clock is six minutes ahead of the domain controller, your sequence is wrong. Use NTP everywhere, store timestamps in UTC and record both event time and ingest time.\n2. **Normalized fields.** One source calls the address `src`, another `SourceIp`, a third `client_ip`. Map them to a common schema such as the Elastic Common Schema (ECS), Splunk CIM or Microsoft ASIM so one query works for all of them.\n3. **Stable identities.** Join keys must mean the same thing across sources. `jdoe`, `JDOE` and `jdoe@example.com` are one person. Normalize case and domain suffixes at ingest.\n\nA useful habit is to keep a short list of **join keys**: user, host, source IP, destination IP, process ID, session ID and, for network sensors, the connection uid used by Zeek (see [Zeek Network Security Monitoring](/learn/security-operations-dfir/zeek-network-security-monitoring))."
+    },
+    {
+      "id": "enrich",
+      "type": "text",
+      "markdown": "## Enrichment sources\n\nEnrichment answers the first questions an analyst would otherwise ask by hand. Each source adds fields to the event.\n\n| Source | Fields added | Question it answers |\n|:--|:--|:--|\n| Asset inventory / CMDB | owner, criticality, business unit | \"How much does this host matter?\" |\n| Identity directory | department, manager, privileged flag | \"Is this a normal user or a domain admin?\" |\n| GeoIP database | country, ASN | \"Is this sign-in location plausible?\" |\n| Threat intelligence | indicator match, feed, confidence | \"Is this address known to be hostile?\" |\n| Vulnerability scanner | open CVEs on the host | \"Could this be exploited?\" |\n| DHCP / VPN logs | IP-to-device-and-user mapping | \"Who held this address at 02:19?\" |\n\nTwo practical rules apply. First, enrich at the right time. **Ingest-time** enrichment is fast to search but frozen: if a host changes owner, old events keep the old value. **Search-time** enrichment (lookups, joins) is always current but costs query time. Second, never trust a single indicator. A feed match raises priority, but old or shared addresses produce false positives, so record the feed name and confidence alongside the match."
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "correlation_account_takeover.spl",
+      "caption": "A Splunk search that joins VPN, domain controller and CMDB data by user, then enriches with a lookup. Index and field names are examples.",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "code": "index=vpn OR index=wineventlog earliest=-30m\n| eval user=lower(coalesce(user, Account_Name))\n| eval stage=case(sourcetype==\"vpn:auth\" AND action==\"failure\",\"vpn_fail\",\n                  EventCode==4624 AND Logon_Type IN (3,10),\"dc_success\")\n| where isnotnull(stage)\n| stats earliest(_time) AS first_seen values(stage) AS stages\n        dc(src_ip) AS src_count values(src_ip) AS src_ips BY user\n| where mvcount(stages)=2 AND src_count>=1\n| lookup asset_cmdb user OUTPUT owner_dept criticality\n| lookup geoip src_ips OUTPUT country\n| table user stages src_ips country owner_dept criticality"
+    },
+    {
+      "id": "kql",
+      "type": "text",
+      "markdown": "## The same idea in KQL\n\nThe concepts are portable. In Microsoft Sentinel you join the sign-in table to a watchlist that holds your asset data. The query below finds users with several failed sign-ins followed by a success within 15 minutes.\n\nNotice what the query does not do: it does not decide that the user is compromised. It produces a short, enriched list so an analyst can decide. Always prefer a narrow time window and a threshold you can explain. A rule that says \"more than five failures\" is easy to defend and easy to tune; a rule nobody can describe is not."
+    },
+    {
+      "id": "kqlcode",
+      "type": "code",
+      "language": "plain",
+      "filename": "failed_then_success.kql",
+      "caption": "Failures followed by a success, enriched from a watchlist named AssetOwners.",
+      "highlight": [
+        10,
+        11
+      ],
+      "code": "let window = 15m;\nlet fails = SigninLogs\n    | where TimeGenerated > ago(1h) and ResultType != 0\n    | summarize FailCount = count(), FirstFail = min(TimeGenerated) by UserPrincipalName, IPAddress;\nSigninLogs\n| where TimeGenerated > ago(1h) and ResultType == 0\n| join kind=inner fails on UserPrincipalName\n| where TimeGenerated between (FirstFail .. FirstFail + window) and FailCount >= 5\n| extend Country = tostring(LocationDetails.countryOrRegion)\n| join kind=leftouter (_GetWatchlist('AssetOwners')) on $left.UserPrincipalName == $right.SearchKey\n| project TimeGenerated, UserPrincipalName, IPAddress, Country, FailCount, Department, Criticality"
+    },
+    {
+      "id": "seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Correlating three sources into one alert",
+      "caption": "Each source is harmless alone; the SIEM joins them on the user key.",
+      "data": {
+        "actors": [
+          {
+            "id": "vpn",
+            "label": "VPN gateway",
+            "sub": "vpn01",
+            "icon": "globe"
+          },
+          {
+            "id": "dc",
+            "label": "Domain controller",
+            "sub": "dc01",
+            "icon": "server"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "Correlation engine",
+            "icon": "database"
+          },
+          {
+            "id": "an",
+            "label": "Analyst",
+            "sub": "SOC",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "from": "vpn",
+            "to": "siem",
+            "label": "5 failed logins",
+            "detail": "user=jdoe src=203.0.113.77",
+            "note": "The VPN sends authentication failures with a normalized user field."
+          },
+          {
+            "from": "dc",
+            "to": "siem",
+            "label": "Success 4624",
+            "detail": "user=jdoe type=10",
+            "note": "Minutes later the domain controller records a successful remote logon."
+          },
+          {
+            "from": "siem",
+            "to": "siem",
+            "label": "Join on user",
+            "note": "The rule matches both stages inside the 15-minute window.",
+            "tone": "warning"
+          },
+          {
+            "from": "siem",
+            "to": "siem",
+            "label": "Enrich",
+            "detail": "GeoIP, CMDB, TI",
+            "note": "Lookups add country, department, criticality and feed confidence."
+          },
+          {
+            "from": "siem",
+            "to": "an",
+            "label": "Alert: probable takeover",
+            "tone": "danger",
+            "note": "The analyst receives one enriched alert instead of three unrelated lines."
+          },
+          {
+            "from": "an",
+            "to": "an",
+            "label": "Verify and respond",
+            "tone": "success",
+            "note": "Contact the user, reset credentials and review the session."
+          }
+        ]
+      }
+    },
+    {
+      "id": "patterns",
+      "type": "text",
+      "markdown": "## Four correlation patterns worth knowing\n\nMost useful rules fit one of four shapes.\n\n- **Sequence.** Event A is followed by event B within a window, such as failed logins followed by a success. This is the pattern in the queries above.\n- **Threshold.** Count something per entity per window, for example more than 100 distinct destination ports from one host in five minutes.\n- **Rarity.** Flag a value the entity has never produced before, such as the first sign-in from a new country or the first run of a tool on a server.\n- **Cross-source confirmation.** Require two independent sources to agree. A DNS query to a suspicious domain is a weak signal; the same query followed by a proxy connection from the same host is stronger.\n\nWhen a rule is noisy, ask which of the four shapes it uses and whether an extra condition from another shape would narrow it. Combining a threshold with a rarity check is often enough to cut false positives by half."
+    },
+    {
+      "id": "pitfalls",
+      "type": "text",
+      "markdown": "## Common pitfalls\n\n- **Over-joining.** Joining raw high-volume logs is slow and expensive. Filter and aggregate each side first, then join the small results.\n- **Time windows that are too wide.** A 24-hour window will correlate unrelated events. Pick the shortest window that still catches the behavior.\n- **Stale reference data.** A CMDB export from last quarter will mislabel hosts. Refresh lookups on a schedule and record the refresh time.\n- **Missing data.** If a source stops sending, the rule goes silent and looks healthy. Add a health check for each source, an alert when expected volume drops.\n- **Shared addresses.** NAT gateways and proxies hide the real client. Prefer the user or device key over the IP when you can.\n\nBuild correlation rules as small reusable steps and write the expected result in the rule description. Rules written this way can later be exported to a portable format, as covered in [Sigma Detection Rules](/learn/security-operations-dfir/sigma-detection-rules)."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Record why an event was enriched",
+      "markdown": "Store the enrichment source and version next to each added field, for example `enrich.geoip.db=2026-11-01`. When an analyst questions a result, you can show exactly which data produced it."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "Use sample logs you created, or a free Elastic or Splunk instance in a lab VM.\n\n1. Create two small CSV files: `vpn.csv` (time, user, result, src_ip) and `assets.csv` (user, department, criticality). Use `192.0.2.x` addresses and fake users.\n2. Ingest them as two sources, or load them into a spreadsheet or SQLite.\n3. Write a query that finds users with three or more failures followed by a success within 15 minutes.\n4. Add the department and criticality from `assets.csv` as enrichment.\n5. Change the window from 15 minutes to 24 hours and note how many extra, unrelated results appear. Write one sentence on what you would choose and why."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Correlation",
+          "definition": "Linking events from different sources by shared fields and time."
+        },
+        {
+          "term": "Enrichment",
+          "definition": "Adding context such as owner, location or reputation to an event."
+        },
+        {
+          "term": "Normalization",
+          "definition": "Mapping source-specific field names to a common schema."
+        },
+        {
+          "term": "Join key",
+          "definition": "A field, such as user or host, used to match events across sources."
+        },
+        {
+          "term": "Lookup",
+          "definition": "A reference table that adds fields at search time."
+        },
+        {
+          "term": "ECS / CIM / ASIM",
+          "definition": "Common schemas used by Elastic, Splunk and Microsoft Sentinel."
+        },
+        {
+          "term": "Time window",
+          "definition": "The maximum interval in which related events must occur."
+        },
+        {
+          "term": "Threat intelligence",
+          "definition": "Indicators and context about known hostile infrastructure."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Why does clock skew between log sources break correlation?",
+          "options": [
+            "It increases storage use",
+            "Events appear in the wrong order or outside the window",
+            "It disables lookups",
+            "It changes the user name"
+          ],
+          "answer": 1,
+          "explanation": "Correlation depends on sequence and time windows. If clocks differ, related events may fall outside the window or be reversed."
+        },
+        {
+          "question": "What is the main advantage of search-time enrichment over ingest-time enrichment?",
+          "options": [
+            "It is always faster",
+            "It always uses current reference data",
+            "It needs no reference data",
+            "It removes duplicates"
+          ],
+          "answer": 1,
+          "explanation": "Search-time lookups reflect the latest table, at the cost of extra query time. Ingest-time values are frozen at the moment of collection."
+        },
+        {
+          "question": "Which belong in a good list of join keys? (Choose all that apply.)",
+          "options": [
+            "Normalized user name",
+            "Host name",
+            "Session or connection ID",
+            "The color of the dashboard"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "User, host and session identifiers are stable across sources when normalized. Dashboard color is irrelevant."
+        },
+        {
+          "question": "A correlation rule stops firing after a log source goes offline. What control would have caught this?",
+          "options": [
+            "A larger time window",
+            "A source health or volume-drop alert",
+            "A bigger dashboard",
+            "More threat feeds"
+          ],
+          "answer": 1,
+          "explanation": "Silent sources make rules look healthy while blind. Monitor expected volume per source."
+        },
+        {
+          "question": "Why is a threat intelligence match alone not enough to call an event malicious?",
+          "options": [
+            "Feeds are always wrong",
+            "Addresses can be old, shared or low confidence",
+            "Matches cannot be stored",
+            "Feeds only cover internal IPs"
+          ],
+          "answer": 1,
+          "explanation": "A match raises priority but needs context. Record feed name and confidence and verify with other evidence."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- Correlation links events across sources; enrichment adds the context an analyst would otherwise look up by hand.\n- Reliable correlation needs synchronized time, normalized fields and stable identities.\n- Choose ingest-time or search-time enrichment deliberately, and always record the source of enriched fields.\n- Keep windows narrow, thresholds explainable and sources monitored for silence.\n- The output of good correlation is an enriched alert that feeds [Security Alert Triage](/learn/security-operations-dfir/security-alert-triage)."
+    }
+  ],
+  "ar": {
+    "title": "ربط السجلات وإثراء الأحداث",
+    "summary": "تعلّم كيف تضمّ أحداثاً من مصادر سجلات مختلفة وتثريها بسياق الأصول والهوية والموقع والتهديد، بأمثلة SPL وKQL.",
+    "objectives": [
+      "شرح الربط والإثراء وأهميتهما",
+      "تهيئة الوقت والحقول والهويات لتكون الضمّات موثوقة",
+      "كتابة استعلام ربط متعدد المصادر بلغتي SPL وKQL",
+      "الاختيار بين الإثراء عند الاستيعاب ووقت البحث",
+      "تجنّب أخطاء الربط الشائعة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "في الساعة 02:14 يسجّل جدار الحماية اتصالاً مرفوضاً من `203.0.113.77`. وفي 02:16 تسجّل بوابة VPN محاولة دخول فاشلة للحساب `jdoe`. وفي 02:19 يسجّل متحكّم النطاق دخولاً ناجحاً للحساب نفسه من بلد جديد. كل حدث منفرد ضجيج معتاد، لكنها مجتمعةً استيلاء محتمل على حساب.\n\nلا يروي مصدر سجل واحد هذه القصة. و**الربط (Correlation)** هو ضمّ الأحداث من مصادر مختلفة بحقول مشتركة وبالزمن، أمّا **الإثراء (Enrichment)** فهو إضافة السياق، كمالك الجهاز أو كون العنوان معروفاً بعدائيته. وبهما يتحول ركام الأسطر إلى أدلة يستطيع المحلل التصرف بناءً عليها. يبيّن هذا الدرس كيف تبني الاثنين بمفاهيم تنطبق على Splunk وElastic وMicrosoft Sentinel. ومادتها الخام تأتي من [إدارة السجلات المركزية](/learn/security-operations-dfir/centralized-log-management) و[بنية Syslog](/learn/security-operations-dfir/syslog-architecture)."
+      },
+      {
+        "id": "prereq",
+        "type": "text",
+        "markdown": "## ثلاثة أسس يعتمد عليها الربط\n\nيفشل الربط بصمت حين تضعف أسسه. تحقق منها قبل أن تكتب قاعدة واحدة.\n\n1. **وقت متزامن.** إذا تقدّمت ساعة جدار الحماية ست دقائق على متحكّم النطاق فتسلسلك خاطئ. استخدم بروتوكول NTP في كل مكان، وخزّن الطوابع بالتوقيت العالمي (UTC)، وسجّل وقت الحدث ووقت الاستيعاب معاً.\n2. **حقول موحّدة.** يسمّي مصدر العنوان `src` وآخر `SourceIp` وثالث `client_ip`. اربطها بمخطط مشترك مثل Elastic Common Schema (ECS) أو Splunk CIM أو Microsoft ASIM ليعمل استعلام واحد على الجميع.\n3. **هويات مستقرة.** يجب أن تعني مفاتيح الربط الشيء نفسه عبر المصادر. فـ `jdoe` و`JDOE` و`jdoe@example.com` شخص واحد. وحّد حالة الأحرف ولواحق النطاق عند الاستيعاب.\n\nومن العادات المفيدة الاحتفاظ بقائمة قصيرة من **مفاتيح الربط**: المستخدم، والمضيف، وعنوان المصدر، وعنوان الوجهة، ومعرّف العملية، ومعرّف الجلسة، وفي مستشعرات الشبكة معرّف الاتصال uid الذي يستخدمه Zeek (انظر [المراقبة الأمنية للشبكات باستخدام Zeek](/learn/security-operations-dfir/zeek-network-security-monitoring))."
+      },
+      {
+        "id": "enrich",
+        "type": "text",
+        "markdown": "## مصادر الإثراء\n\nيجيب الإثراء عن الأسئلة الأولى التي كان المحلل سيطرحها يدوياً. وكل مصدر يضيف حقولاً إلى الحدث.\n\n| المصدر | الحقول المضافة | السؤال الذي يجيب عنه |\n|:--|:--|:--|\n| جرد الأصول / CMDB | المالك والأهمية ووحدة الأعمال | «ما أهمية هذا الجهاز؟» |\n| دليل الهويات | القسم والمدير وعلامة الامتياز | «هل هذا مستخدم عادي أم مدير نطاق؟» |\n| قاعدة GeoIP | البلد ونظام ASN | «هل موقع الدخول معقول؟» |\n| استخبارات التهديد | مطابقة المؤشر والمصدر ودرجة الثقة | «هل العنوان معروف بعدائيته؟» |\n| ماسح الثغرات | الثغرات (CVE) المفتوحة على الجهاز | «هل يمكن استغلاله؟» |\n| سجلات DHCP / VPN | ربط العنوان بالجهاز والمستخدم | «من كان يحمل هذا العنوان في 02:19؟» |\n\nوتنطبق قاعدتان عمليتان. الأولى أن تثري في الوقت المناسب. فالإثراء **عند الاستيعاب** سريع البحث لكنه مجمَّد: إذا تغيّر مالك جهاز بقيت الأحداث القديمة بالقيمة القديمة. أما الإثراء **وقت البحث** (الجداول المرجعية والضمّ) فحديث دائماً لكنه يكلّف زمن استعلام. والثانية ألا تثق بمؤشر واحد. فمطابقة مصدر استخبارات ترفع الأولوية، لكن العناوين القديمة أو المشتركة تُنتج إيجابيات كاذبة، فسجّل اسم المصدر ودرجة الثقة مع المطابقة."
+      },
+      {
+        "id": "spl",
+        "type": "code",
+        "language": "plain",
+        "filename": "correlation_account_takeover.spl",
+        "caption": "بحث Splunk يضم بيانات VPN ومتحكّم النطاق وCMDB بحسب المستخدم، ثم يثريها بجدول مرجعي. أسماء الفهارس والحقول أمثلة.",
+        "highlight": [
+          6,
+          7,
+          8,
+          9,
+          10
+        ],
+        "code": "index=vpn OR index=wineventlog earliest=-30m\n| eval user=lower(coalesce(user, Account_Name))\n| eval stage=case(sourcetype==\"vpn:auth\" AND action==\"failure\",\"vpn_fail\",\n                  EventCode==4624 AND Logon_Type IN (3,10),\"dc_success\")\n| where isnotnull(stage)\n| stats earliest(_time) AS first_seen values(stage) AS stages\n        dc(src_ip) AS src_count values(src_ip) AS src_ips BY user\n| where mvcount(stages)=2 AND src_count>=1\n| lookup asset_cmdb user OUTPUT owner_dept criticality\n| lookup geoip src_ips OUTPUT country\n| table user stages src_ips country owner_dept criticality"
+      },
+      {
+        "id": "kql",
+        "type": "text",
+        "markdown": "## الفكرة نفسها بلغة KQL\n\nالمفاهيم قابلة للنقل. ففي Microsoft Sentinel تضمّ جدول تسجيلات الدخول إلى قائمة مراقبة (Watchlist) تحمل بيانات أصولك. يجد الاستعلام التالي المستخدمين الذين فشل دخولهم مرات عدة ثم نجح خلال 15 دقيقة.\n\nولاحظ ما لا يفعله الاستعلام: فهو لا يقرّر أن المستخدم مخترَق. إنه ينتج قائمة قصيرة مثراة ليقرّر المحلل. فضّل دائماً نافذة زمنية ضيقة وعتبة تستطيع شرحها. القاعدة التي تقول «أكثر من خمسة إخفاقات» سهلة الدفاع عنها وضبطها، أما القاعدة التي لا يستطيع أحد وصفها فلا."
+      },
+      {
+        "id": "kqlcode",
+        "type": "code",
+        "language": "plain",
+        "filename": "failed_then_success.kql",
+        "caption": "إخفاقات يعقبها نجاح، مع إثراء من قائمة مراقبة اسمها AssetOwners.",
+        "highlight": [
+          10,
+          11
+        ],
+        "code": "let window = 15m;\nlet fails = SigninLogs\n    | where TimeGenerated > ago(1h) and ResultType != 0\n    | summarize FailCount = count(), FirstFail = min(TimeGenerated) by UserPrincipalName, IPAddress;\nSigninLogs\n| where TimeGenerated > ago(1h) and ResultType == 0\n| join kind=inner fails on UserPrincipalName\n| where TimeGenerated between (FirstFail .. FirstFail + window) and FailCount >= 5\n| extend Country = tostring(LocationDetails.countryOrRegion)\n| join kind=leftouter (_GetWatchlist('AssetOwners')) on $left.UserPrincipalName == $right.SearchKey\n| project TimeGenerated, UserPrincipalName, IPAddress, Country, FailCount, Department, Criticality"
+      },
+      {
+        "id": "seq",
+        "type": "animation",
+        "kind": "sequence",
+        "title": "ربط ثلاثة مصادر في تنبيه واحد",
+        "caption": "كل مصدر بريء وحده؛ ويضمّها نظام SIEM بمفتاح المستخدم.",
+        "data": {
+          "actors": [
+            {
+              "id": "vpn",
+              "label": "بوابة VPN",
+              "sub": "vpn01",
+              "icon": "globe"
+            },
+            {
+              "id": "dc",
+              "label": "متحكّم النطاق",
+              "sub": "dc01",
+              "icon": "server"
+            },
+            {
+              "id": "siem",
+              "label": "SIEM",
+              "sub": "محرك الربط",
+              "icon": "database"
+            },
+            {
+              "id": "an",
+              "label": "المحلل",
+              "sub": "SOC",
+              "icon": "user"
+            }
+          ],
+          "steps": [
+            {
+              "from": "vpn",
+              "to": "siem",
+              "label": "5 محاولات فاشلة",
+              "detail": "user=jdoe src=203.0.113.77",
+              "note": "ترسل VPN إخفاقات المصادقة بحقل مستخدم موحّد."
+            },
+            {
+              "from": "dc",
+              "to": "siem",
+              "label": "نجاح 4624",
+              "detail": "user=jdoe type=10",
+              "note": "بعد دقائق يسجّل متحكّم النطاق دخولاً بعيداً ناجحاً."
+            },
+            {
+              "from": "siem",
+              "to": "siem",
+              "label": "ضمّ بحسب المستخدم",
+              "note": "تطابق القاعدة المرحلتين داخل نافذة 15 دقيقة.",
+              "tone": "warning"
+            },
+            {
+              "from": "siem",
+              "to": "siem",
+              "label": "إثراء",
+              "detail": "GeoIP, CMDB, TI",
+              "note": "تضيف الجداول المرجعية البلد والقسم والأهمية وثقة المصدر."
+            },
+            {
+              "from": "siem",
+              "to": "an",
+              "label": "تنبيه: استيلاء محتمل",
+              "tone": "danger",
+              "note": "يتلقى المحلل تنبيهاً واحداً مثرىً بدل ثلاثة أسطر غير مترابطة."
+            },
+            {
+              "from": "an",
+              "to": "an",
+              "label": "تحقق واستجب",
+              "tone": "success",
+              "note": "تواصل مع المستخدم وأعد تعيين بيانات الاعتماد وراجع الجلسة."
+            }
+          ]
+        }
+      },
+      {
+        "id": "patterns",
+        "type": "text",
+        "markdown": "## أربعة أنماط للربط تستحق المعرفة\n\nتندرج أغلب القواعد المفيدة في أحد أربعة أشكال.\n\n- **التسلسل.** يتبع الحدث A الحدثَ B خلال نافذة، كإخفاقات دخول يعقبها نجاح. وهذا النمط في الاستعلامات أعلاه.\n- **العتبة.** عدّ شيئاً لكل كيان في كل نافذة، مثل أكثر من 100 منفذ وجهة مختلف من مضيف واحد خلال خمس دقائق.\n- **الندرة.** ارفع علماً على قيمة لم ينتجها الكيان من قبل، كأول دخول من بلد جديد أو أول تشغيل لأداة على خادم.\n- **التأكيد عبر المصادر.** اشترط اتفاق مصدرين مستقلين. فاستعلام DNS لنطاق مشبوه إشارة ضعيفة، وإذا أعقبه اتصال عبر الوكيل من المضيف نفسه صار أقوى.\n\nحين تكثر ضوضاء قاعدة، اسأل أي الأشكال الأربعة تستخدم، وهل يضيّقها شرط إضافي من شكل آخر. وغالباً يكفي الجمع بين عتبة وفحص ندرة لخفض الإيجابيات الكاذبة إلى النصف."
+      },
+      {
+        "id": "pitfalls",
+        "type": "text",
+        "markdown": "## أخطاء شائعة\n\n- **الإفراط في الضم.** ضمّ سجلات خام عالية الحجم بطيء ومكلف. رشّح كل طرف وجمّعه أولاً ثم اضمم النتائج الصغيرة.\n- **نوافذ زمنية واسعة.** نافذة 24 ساعة ستربط أحداثاً لا علاقة بينها. اختر أقصر نافذة تلتقط السلوك.\n- **بيانات مرجعية قديمة.** تصدير CMDB من الربع الماضي سيسمّي الأجهزة خطأً. حدّث الجداول المرجعية دورياً وسجّل وقت التحديث.\n- **بيانات مفقودة.** إذا توقف مصدر عن الإرسال صمتت القاعدة وبدت سليمة. أضف فحص سلامة لكل مصدر، وتنبيهاً عند انخفاض الحجم المتوقع.\n- **عناوين مشتركة.** تخفي بوابات NAT والوكلاء العميل الحقيقي. فضّل مفتاح المستخدم أو الجهاز على عنوان IP متى أمكن.\n\nابنِ قواعد الربط خطوات صغيرة قابلة لإعادة الاستخدام، واكتب النتيجة المتوقعة في وصف القاعدة. وتُصدَّر القواعد المكتوبة هكذا لاحقاً إلى صيغة قابلة للنقل، كما في [قواعد الكشف Sigma](/learn/security-operations-dfir/sigma-detection-rules)."
+      },
+      {
+        "id": "tip",
+        "type": "callout",
+        "variant": "tip",
+        "title": "سجّل سبب إثراء الحدث",
+        "markdown": "خزّن مصدر الإثراء وإصداره بجانب كل حقل مضاف، مثل `enrich.geoip.db=2026-11-01`. وحين يشكّك محلل في نتيجة تستطيع أن تُريه البيانات التي أنتجتها."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "استخدم سجلات تجريبية أنشأتها، أو نسخة مجانية من Elastic أو Splunk في جهاز افتراضي مخبري.\n\n1. أنشئ ملفَّي CSV صغيرين: `vpn.csv` (الوقت، المستخدم، النتيجة، عنوان المصدر) و`assets.csv` (المستخدم، القسم، الأهمية). استخدم عناوين `192.0.2.x` ومستخدمين وهميين.\n2. استوعبهما كمصدرين، أو حمّلهما في جدول بيانات أو SQLite.\n3. اكتب استعلاماً يجد المستخدمين الذين فشل دخولهم ثلاث مرات أو أكثر ثم نجح خلال 15 دقيقة.\n4. أضف القسم والأهمية من `assets.csv` إثراءً.\n5. غيّر النافذة من 15 دقيقة إلى 24 ساعة ولاحظ كم نتيجة إضافية غير ذات صلة ظهرت. اكتب جملة عمّا ستختاره ولماذا."
+      },
+      {
+        "id": "keyterms",
+        "type": "keyterms",
+        "title": "المصطلحات الأساسية",
+        "items": [
+          {
+            "term": "الربط (Correlation)",
+            "definition": "ضمّ أحداث من مصادر مختلفة بحقول مشتركة وبالزمن."
+          },
+          {
+            "term": "الإثراء (Enrichment)",
+            "definition": "إضافة سياق مثل المالك أو الموقع أو السمعة إلى الحدث."
+          },
+          {
+            "term": "التوحيد (Normalization)",
+            "definition": "ربط أسماء الحقول الخاصة بكل مصدر بمخطط مشترك."
+          },
+          {
+            "term": "مفتاح الربط",
+            "definition": "حقل مثل المستخدم أو المضيف يُستخدم لمطابقة الأحداث عبر المصادر."
+          },
+          {
+            "term": "الجدول المرجعي (Lookup)",
+            "definition": "جدول مرجعي يضيف حقولاً وقت البحث."
+          },
+          {
+            "term": "ECS / CIM / ASIM",
+            "definition": "مخططات مشتركة تستخدمها Elastic وSplunk وMicrosoft Sentinel."
+          },
+          {
+            "term": "النافذة الزمنية",
+            "definition": "أقصى فترة يجب أن تقع فيها الأحداث المترابطة."
+          },
+          {
+            "term": "استخبارات التهديد",
+            "definition": "مؤشرات وسياق عن بنى تحتية عدائية معروفة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "لماذا يفسد اختلاف الساعات بين مصادر السجلات الربط؟",
+            "options": [
+              "يزيد استهلاك التخزين",
+              "تظهر الأحداث بترتيب خاطئ أو خارج النافذة",
+              "يعطّل الجداول المرجعية",
+              "يغيّر اسم المستخدم"
+            ],
+            "answer": 1,
+            "explanation": "يعتمد الربط على التسلسل والنوافذ الزمنية. فإذا اختلفت الساعات قد تقع الأحداث المترابطة خارج النافذة أو تنعكس."
+          },
+          {
+            "question": "ما الميزة الرئيسة للإثراء وقت البحث على الإثراء عند الاستيعاب؟",
+            "options": [
+              "أسرع دائماً",
+              "يستخدم دائماً بيانات مرجعية حديثة",
+              "لا يحتاج بيانات مرجعية",
+              "يزيل التكرار"
+            ],
+            "answer": 1,
+            "explanation": "تعكس الجداول وقت البحث أحدث نسخة مقابل زمن استعلام إضافي. أما قيم الاستيعاب فمجمّدة لحظة الجمع."
+          },
+          {
+            "question": "أي مما يلي يصلح ضمن قائمة جيدة لمفاتيح الربط؟ (اختر كل ما ينطبق.)",
+            "options": [
+              "اسم المستخدم الموحّد",
+              "اسم المضيف",
+              "معرّف الجلسة أو الاتصال",
+              "لون لوحة المعلومات"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "معرّفات المستخدم والمضيف والجلسة ثابتة عبر المصادر إذا وُحّدت. ولون اللوحة لا علاقة له."
+          },
+          {
+            "question": "توقفت قاعدة ربط عن الإطلاق بعد انقطاع مصدر سجلات. أي ضابط كان سيكتشف ذلك؟",
+            "options": [
+              "نافذة زمنية أكبر",
+              "تنبيه سلامة المصدر أو انخفاض الحجم",
+              "لوحة أكبر",
+              "مصادر استخبارات أكثر"
+            ],
+            "answer": 1,
+            "explanation": "تجعل المصادر الصامتة القواعد تبدو سليمة وهي عمياء. راقب الحجم المتوقع لكل مصدر."
+          },
+          {
+            "question": "لماذا لا تكفي مطابقة استخبارات التهديد وحدها لوصف الحدث بأنه خبيث؟",
+            "options": [
+              "المصادر دائماً خاطئة",
+              "قد تكون العناوين قديمة أو مشتركة أو منخفضة الثقة",
+              "لا يمكن تخزين المطابقات",
+              "المصادر تغطي العناوين الداخلية فقط"
+            ],
+            "answer": 1,
+            "explanation": "ترفع المطابقة الأولوية لكنها تحتاج سياقاً. سجّل اسم المصدر والثقة وتحقق بأدلة أخرى."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- يربط الربط الأحداث عبر المصادر، ويضيف الإثراء السياق الذي كان المحلل سيبحث عنه يدوياً.\n- يحتاج الربط الموثوق إلى وقت متزامن وحقول موحّدة وهويات مستقرة.\n- اختر الإثراء عند الاستيعاب أو وقت البحث عن قصد، وسجّل دائماً مصدر الحقول المضافة.\n- أبقِ النوافذ ضيقة والعتبات قابلة للشرح والمصادر مراقَبة من حيث الصمت.\n- ناتج الربط الجيد تنبيه مثرى يغذّي [فرز التنبيهات الأمنية](/learn/security-operations-dfir/security-alert-triage)."
+      }
+    ]
+  }
+}

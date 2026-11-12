@@ -1,0 +1,546 @@
+{
+  "slug": "hypervisor-and-virtualization-internals",
+  "title": "Hypervisor and Virtualization Internals",
+  "summary": "Understand how hypervisors create and isolate virtual machines, where isolation can fail, and how to monitor and acquire evidence from hosts you administer.",
+  "duration_minutes": 30,
+  "objectives": [
+    "Compare Type 1 and Type 2 hypervisors and name their key components",
+    "Explain how guest isolation is enforced and the categories of weakness",
+    "Monitor the virtualization management plane for risky actions",
+    "Acquire a guest's memory and disk from the host and preserve custody"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Your company runs 400 virtual machines on a cluster of eight hosts. An alert arrives: a VM in the finance network is communicating with a VM in the guest Wi-Fi network, even though no route exists between them. Either the network design has a hole, or something is crossing a boundary that is not drawn on the network diagram: the **hypervisor**.\n\nThe hypervisor is the layer that creates the illusion of many computers on one. Whoever controls it controls every guest, so it is both a high-value target and a rich source of evidence. For a SOC analyst or examiner, understanding how it works explains how isolation can fail, where to collect logs, and how to acquire a VM's memory and disk without touching the guest at all. This lesson covers the architecture, the isolation boundaries, the management plane and a practical monitoring and forensics approach on hosts you administer. Related lessons: [Advanced Linux Kernel Security](/learn/security-operations-dfir/advanced-linux-kernel-security) and [Memory Forensics and Malware Analysis](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)."
+    },
+    {
+      "id": "types",
+      "type": "text",
+      "markdown": "## Hypervisor types and components\n\nA hypervisor shares CPU, memory, storage and network between guests. Two designs are common:\n\n| Design | Examples | Notes |\n|:--|:--|:--|\n| **Type 1 (bare metal)** | VMware ESXi, Hyper-V, Xen, Proxmox VE (KVM on Linux) | Runs directly on hardware; used in data centers |\n| **Type 2 (hosted)** | VirtualBox, VMware Workstation | Runs as an application on a normal OS; common on analyst laptops |\n\nKVM blurs the line: it turns the Linux kernel itself into a hypervisor, and QEMU provides the emulated devices for each guest.\n\nKey components you should be able to name:\n\n- **CPU virtualization extensions** (Intel VT-x, AMD-V) let guest code run natively while the hypervisor traps sensitive operations.\n- **Memory virtualization** uses a second translation table (EPT or NPT) so each guest sees its own address space.\n- **Virtual devices** (network cards, disks, USB) are emulated in software, usually by a user-space process such as QEMU. These are the largest attack surface because they are complex code that parses guest-controlled data.\n- **Paravirtual drivers** (virtio, VMware Tools) trade strict emulation for speed and need host-side support."
+    },
+    {
+      "id": "boundary-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Where isolation sits between guest and host",
+      "caption": "A guest request crosses several boundaries; a flaw in any emulated device can weaken the last one.",
+      "data": {
+        "token": "I/O request",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "Guest app",
+            "sub": "ring 3",
+            "icon": "laptop"
+          },
+          {
+            "id": "gk",
+            "label": "Guest kernel",
+            "sub": "ring 0 (guest)",
+            "icon": "cpu"
+          },
+          {
+            "id": "hv",
+            "label": "Hypervisor",
+            "sub": "VM exit trap",
+            "icon": "shield"
+          },
+          {
+            "id": "dev",
+            "label": "Device model",
+            "sub": "QEMU / vmx process",
+            "icon": "bug"
+          },
+          {
+            "id": "host",
+            "label": "Host kernel",
+            "sub": "real disk and NIC",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "A guest application writes to its virtual disk."
+          },
+          {
+            "at": "gk",
+            "caption": "The guest kernel sends the request to what it believes is real hardware."
+          },
+          {
+            "at": "hv",
+            "caption": "The CPU traps the privileged operation (a VM exit) and hands control to the hypervisor."
+          },
+          {
+            "at": "dev",
+            "caption": "The device model parses guest-controlled data. This is the most exposed code in the stack.",
+            "tone": "warning"
+          },
+          {
+            "at": "host",
+            "caption": "The host kernel performs the real I/O and returns the result. Logs here show every guest's activity.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "escape",
+      "type": "text",
+      "markdown": "## How isolation fails (conceptually)\n\nVirtual machine isolation is strong but not absolute. Defenders should know the categories of weakness without needing exploit details:\n\n- **Device-model flaws.** A bug in an emulated device, such as a virtual network card or floppy controller, can let a guest corrupt the process that serves it. Mitigation: remove unused virtual devices and keep the hypervisor patched.\n- **Shared-resource side channels.** Co-located guests share caches and CPUs, which can leak information through timing. Mitigation: dedicated hosts for sensitive workloads, vendor microcode and mitigations.\n- **Management-plane compromise.** Stolen vCenter, Proxmox or Hyper-V administrator credentials give legitimate control of every guest, with no flaw required. This is the most common real-world route.\n- **Misconfiguration.** Shared clipboards, shared folders, passthrough devices, exposed management interfaces and snapshots with plaintext secrets.\n\nIn practice, attackers who reach a hypervisor host usually arrive through identity and management access. For this reason the detection effort belongs mostly in the management plane, as discussed in [Ransomware Defense Engineering](/learn/security-operations-dfir/ransomware-defense-engineering), where hypervisor encryption is a known tactic."
+    },
+    {
+      "id": "mgmt",
+      "type": "text",
+      "markdown": "## Monitoring the management plane\n\nCollect these sources centrally, and alert on high-risk actions:\n\n| Source | Events worth alerting on |\n|:--|:--|\n| ESXi `hostd.log`, `shell.log`, `auth.log` | SSH enabled, shell opened, root login, lockdown mode disabled |\n| vCenter events | New admin role, VM export, snapshot of domain controller |\n| Proxmox `/var/log/pve/tasks`, auth log | API token created, console opened, backup job changed |\n| Hyper-V Event IDs (Operational log) | VM created or exported, virtual switch changed |\n\nA useful SIEM query looks for administration outside change windows. The example below is Splunk SPL over ESXi logs."
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "esxi-after-hours-admin.spl",
+      "caption": "Detect ESXi shell or SSH enablement outside change windows",
+      "highlight": [
+        2,
+        3,
+        5
+      ],
+      "code": "index=esxi sourcetype=vmware:esxlog:hostd\n  (\"SSH access has been enabled\" OR \"ESXi Shell for the host has been enabled\" OR \"Lockdown mode disabled\")\n| eval hour=strftime(_time,\"%H\")\n| where hour<6 OR hour>20\n| stats count min(_time) AS first_seen values(user) AS users by host\n| convert ctime(first_seen)"
+    },
+    {
+      "id": "forensics",
+      "type": "text",
+      "markdown": "## Forensics from the hypervisor side\n\nVirtualization gives responders a major advantage: you can capture a guest **from outside**, so malware inside cannot interfere with the capture.\n\n1. **Snapshot with memory.** A snapshot that includes memory saves RAM into a file (`.vmsn`/`.vmem` on VMware, a state file on KVM). Treat the snapshot as evidence and hash it immediately.\n2. **Copy the disk files** (`.vmdk`, `.qcow2`, `.vhdx`) and hash them. Work on copies only.\n3. **Convert for analysis.** Mount the disk read-only with `qemu-nbd` or convert it to raw, then examine it with your usual disk tools.\n4. **Analyze memory.** Feed the `.vmem` or a KVM dump to Volatility.\n5. **Record the host context**: the hypervisor logs, who took the snapshot, and the time, to preserve the chain of custody."
+    },
+    {
+      "id": "kvm-term",
+      "type": "terminal",
+      "title": "Acquire a KVM guest from the host (lab host you own)",
+      "prompt": "admin@kvm01:~$",
+      "lines": [
+        {
+          "cmd": "virsh list --all",
+          "output": " Id   Name        State\n--------------------------\n 4    finance-vm  running"
+        },
+        {
+          "cmd": "virsh dump finance-vm /evidence/finance-vm.mem --memory-only --format=elf",
+          "output": "Domain 'finance-vm' dumped to /evidence/finance-vm.mem",
+          "comment": "Memory is captured from outside the guest"
+        },
+        {
+          "cmd": "virsh snapshot-create-as finance-vm ir-0001 --disk-only --atomic",
+          "output": "Domain snapshot ir-0001 created",
+          "comment": "Disk-only snapshot freezes the base image for copying"
+        },
+        {
+          "cmd": "sha256sum /evidence/finance-vm.mem | tee /evidence/finance-vm.mem.sha256",
+          "output": "9f3a6c1e0b7d...  /evidence/finance-vm.mem",
+          "comment": "Hash immediately and log it in the case record"
+        }
+      ]
+    },
+    {
+      "id": "harden",
+      "type": "text",
+      "markdown": "## A practical hardening checklist\n\nUse this short list when you review a virtualization cluster:\n\n- Disable SSH and the local shell on hosts except during approved maintenance, and enforce lockdown mode.\n- Require MFA and named accounts for every management console; remove shared `root` use.\n- Remove virtual devices that no workload needs, and disable clipboard and drag-and-drop between guest and host.\n- Patch the hypervisor and firmware on a defined schedule, and subscribe to vendor advisories.\n- Segment management, storage, migration and guest networks from each other.\n- Encrypt VM disks and backups, and keep one backup copy offline or immutable.\n- Forward every management log to the SIEM before an incident, not during one.\n\nEach item removes a path that attackers have used in real incidents, and each is easy to verify, which makes the list suitable for periodic audits."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Protect the hypervisor first",
+      "markdown": "Never join hypervisor management interfaces to the production domain without MFA and a separate admin tier. A single stolen administrator password can encrypt or export every guest. Keep management on an isolated network, back up outside the cluster, and test restores."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Try it yourself",
+      "markdown": "On a KVM or VirtualBox lab host you own, create a small Linux guest with no sensitive data.\n\n1. List your virtual devices (`virsh dumpxml <vm>` or the VM settings) and write down any you do not need, such as a floppy, sound card or shared folder.\n2. Take a snapshot that includes memory, then compute its SHA-256 hash.\n3. From inside the guest, run `sleep 600 &`. Capture memory from the host and confirm the string `sleep` appears with `strings` on the dump.\n4. Write a three-line chain-of-custody note: what, when, and hash."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Key terms",
+      "items": [
+        {
+          "term": "Hypervisor",
+          "definition": "Software that creates and runs virtual machines."
+        },
+        {
+          "term": "VM exit",
+          "definition": "A trap that transfers control from guest to hypervisor."
+        },
+        {
+          "term": "EPT / NPT",
+          "definition": "Hardware tables translating guest memory addresses."
+        },
+        {
+          "term": "Device model",
+          "definition": "Software emulating hardware such as NICs and disks for a guest."
+        },
+        {
+          "term": "Management plane",
+          "definition": "The consoles and APIs used to control hosts and guests."
+        },
+        {
+          "term": "Snapshot",
+          "definition": "A saved point-in-time state of a VM's disk and optionally memory."
+        },
+        {
+          "term": "VMI",
+          "definition": "Virtual machine introspection: inspecting a guest from the hypervisor."
+        },
+        {
+          "term": "virtio",
+          "definition": "A standard family of paravirtual drivers for speed."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Check your understanding",
+      "questions": [
+        {
+          "question": "Which hypervisor component is usually the largest attack surface?",
+          "options": [
+            "Emulated virtual devices",
+            "The CPU's VT-x feature",
+            "The license file",
+            "The boot logo"
+          ],
+          "answer": 0,
+          "explanation": "Device models are complex code that parses guest-controlled input."
+        },
+        {
+          "question": "What is the most common real-world route to controlling many guests?",
+          "options": [
+            "Stolen management credentials",
+            "A CPU design flaw",
+            "A broken cable",
+            "DNS caching"
+          ],
+          "answer": 0,
+          "explanation": "Management access gives legitimate control without any exploit."
+        },
+        {
+          "question": "Why capture memory from the hypervisor? Choose all that apply.",
+          "options": [
+            "Malware in the guest cannot interfere",
+            "No agent needs to be installed in the guest",
+            "The guest keeps running with little disturbance",
+            "It removes the need for hashing"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Hashing is always required for evidence integrity."
+        },
+        {
+          "question": "Which is a Type 1 hypervisor?",
+          "options": [
+            "VMware ESXi",
+            "VirtualBox on Windows",
+            "VMware Workstation",
+            "A browser sandbox"
+          ],
+          "answer": 0,
+          "explanation": "ESXi runs directly on hardware."
+        },
+        {
+          "question": "Which log event deserves an alert?",
+          "options": [
+            "ESXi SSH enabled at 03:00",
+            "A VM powered on during patching",
+            "NTP sync success",
+            "Backup completed"
+          ],
+          "answer": 0,
+          "explanation": "Enabling remote shell access off-hours is a classic precursor to abuse."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Summary\n\n- A hypervisor creates guests by trapping privileged operations and emulating devices.\n- Emulated devices are the largest code attack surface; management credentials are the most common real attack route.\n- Collect and alert on hypervisor management logs, especially off-hours shell and SSH changes.\n- Acquire memory and disks from the host side, hash immediately and keep the chain of custody.\n- Keep management networks isolated and backups outside the cluster.\n- Related reading: [Security Monitoring Architecture](/learn/security-operations-dfir/security-monitoring-architecture)."
+    }
+  ],
+  "ar": {
+    "title": "البنية الداخلية للمشرفات الافتراضية والمحاكاة الافتراضية",
+    "summary": "افهم كيف تنشئ المشرفات الافتراضية الأجهزة الافتراضية وتعزلها، وأين قد ينهار العزل، وكيف تراقب المضيفين وتجمع الأدلة منهم.",
+    "objectives": [
+      "المقارنة بين المشرفات من النوعين الأول والثاني وتسمية مكوّناتها الرئيسية",
+      "شرح كيف يُفرض عزل الضيوف وفئات الضعف",
+      "مراقبة مستوى إدارة المحاكاة الافتراضية بحثاً عن إجراءات خطرة",
+      "التقاط ذاكرة الضيف وقرصه من المضيف مع حفظ سلسلة العهدة"
+    ],
+    "blocks": [
+      {
+        "id": "intro",
+        "type": "text",
+        "markdown": "تشغّل شركتك 400 جهازاً افتراضياً على عنقود من ثمانية مضيفين. يصل تنبيه: جهاز افتراضي في شبكة المالية يتواصل مع جهاز افتراضي في شبكة الواي فاي للضيوف، رغم عدم وجود مسار بينهما. إما أن في تصميم الشبكة ثغرة، أو أن شيئاً يعبر حداً غير مرسوم في مخطط الشبكة: **المشرف الافتراضي (Hypervisor)**.\n\nالمشرف الافتراضي هو الطبقة التي تخلق وهم حواسيب كثيرة على جهاز واحد. ومن يتحكم به يتحكم بكل الضيوف، فهو هدف عالي القيمة ومصدر غني بالأدلة في آنٍ واحد. وفهم عمله يشرح للمحلل أو الفاحص كيف يمكن أن ينهار العزل، وأين تُجمع السجلات، وكيف يُلتقط قرص الجهاز الافتراضي وذاكرته دون لمس النظام الضيف. يغطي هذا الدرس البنية وحدود العزل ومستوى الإدارة ونهجاً عملياً للمراقبة والتحليل الجنائي على مضيفين تديرهم. دروس ذات صلة: [أمن نواة Linux المتقدم](/learn/security-operations-dfir/advanced-linux-kernel-security) و[التحليل الجنائي للذاكرة وتحليل البرمجيات الخبيثة](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)."
+      },
+      {
+        "id": "types",
+        "type": "text",
+        "markdown": "## أنواع المشرفات ومكوّناتها\n\nيتقاسم المشرف الافتراضي المعالج والذاكرة والتخزين والشبكة بين الضيوف. ثمة تصميمان شائعان:\n\n| التصميم | أمثلة | ملاحظات |\n|:--|:--|:--|\n| **النوع الأول (على العتاد مباشرة)** | VMware ESXi وHyper-V وXen وProxmox VE (KVM على Linux) | يعمل مباشرة على العتاد، ويُستخدم في مراكز البيانات |\n| **النوع الثاني (مُستضاف)** | VirtualBox وVMware Workstation | يعمل كتطبيق على نظام تشغيل عادي، وشائع على حواسيب المحللين |\n\nتمحو KVM الحدّ بين النوعين: تجعل نواة Linux نفسها مشرفاً افتراضياً، ويوفّر QEMU الأجهزة المحاكاة لكل ضيف.\n\nمكوّنات أساسية ينبغي أن تسمّيها:\n\n- **امتدادات المعالج للمحاكاة الافتراضية** (Intel VT-x وAMD-V) تتيح تنفيذ شيفرة الضيف أصلياً بينما يعترض المشرف العمليات الحساسة.\n- **المحاكاة الافتراضية للذاكرة** تستخدم جدول ترجمة ثانياً (EPT أو NPT) ليرى كل ضيف فضاء عناوين خاصاً به.\n- **الأجهزة الافتراضية** (بطاقات الشبكة والأقراص وUSB) تُحاكى برمجياً، غالباً عبر عملية في فضاء المستخدم مثل QEMU. وهي أكبر سطح هجوم لأنها شيفرة معقدة تحلّل بيانات يتحكم بها الضيف.\n- **المشغّلات شبه الافتراضية** (virtio وVMware Tools) تضحّي بالمحاكاة الصارمة لصالح السرعة وتحتاج دعماً من جهة المضيف."
+      },
+      {
+        "id": "boundary-anim",
+        "type": "animation",
+        "kind": "flow",
+        "title": "أين يقع العزل بين الضيف والمضيف",
+        "caption": "يعبر طلب الضيف عدة حدود، وقد يُضعف خلل في أي جهاز محاكى الحدّ الأخير.",
+        "data": {
+          "token": "طلب إدخال/إخراج",
+          "nodes": [
+            {
+              "id": "app",
+              "label": "تطبيق الضيف",
+              "sub": "ring 3",
+              "icon": "laptop"
+            },
+            {
+              "id": "gk",
+              "label": "نواة الضيف",
+              "sub": "ring 0 (guest)",
+              "icon": "cpu"
+            },
+            {
+              "id": "hv",
+              "label": "المشرف",
+              "sub": "VM exit trap",
+              "icon": "shield"
+            },
+            {
+              "id": "dev",
+              "label": "نموذج الجهاز",
+              "sub": "QEMU / vmx process",
+              "icon": "bug"
+            },
+            {
+              "id": "host",
+              "label": "نواة المضيف",
+              "sub": "real disk and NIC",
+              "icon": "server"
+            }
+          ],
+          "steps": [
+            {
+              "at": "app",
+              "caption": "يكتب تطبيق الضيف على قرصه الافتراضي."
+            },
+            {
+              "at": "gk",
+              "caption": "ترسل نواة الضيف الطلب إلى ما تظنه عتاداً حقيقياً."
+            },
+            {
+              "at": "hv",
+              "caption": "يعترض المعالج العملية المميّزة (VM exit) ويسلّم التحكم للمشرف."
+            },
+            {
+              "at": "dev",
+              "caption": "يحلّل نموذج الجهاز بيانات يتحكم بها الضيف، وهذه أكثر شيفرة مكشوفة في المنظومة.",
+              "tone": "warning"
+            },
+            {
+              "at": "host",
+              "caption": "تنفّذ نواة المضيف الإدخال والإخراج الفعلي وتعيد النتيجة. وتُظهر السجلات هنا نشاط كل ضيف.",
+              "tone": "success"
+            }
+          ]
+        }
+      },
+      {
+        "id": "escape",
+        "type": "text",
+        "markdown": "## كيف ينهار العزل (من حيث المفهوم)\n\nعزل الأجهزة الافتراضية قوي لكنه ليس مطلقاً. على المدافعين معرفة فئات الضعف دون حاجة إلى تفاصيل الاستغلال:\n\n- **ثغرات نماذج الأجهزة.** قد يتيح خلل في جهاز محاكى، كبطاقة شبكة افتراضية أو متحكم قرص مرن، للضيف إفساد العملية التي تخدمه. التخفيف: أزل الأجهزة الافتراضية غير المستخدمة وأبقِ المشرف محدَّثاً.\n- **القنوات الجانبية للموارد المشتركة.** تتشارك الضيوف المتجاورة الذواكر المخبّئية والمعالجات، فقد تتسرب معلومات عبر التوقيت. التخفيف: مضيفون مخصصون للأعمال الحساسة وتحديثات المعالج وإجراءات الحد من المورّد.\n- **اختراق مستوى الإدارة.** سرقة بيانات اعتماد مدير vCenter أو Proxmox أو Hyper-V تمنح تحكماً مشروعاً بكل الضيوف دون أي ثغرة. وهذا أشيع طريق في الواقع.\n- **سوء الإعداد.** الحافظة المشتركة والمجلدات المشتركة والأجهزة الممرَّرة وواجهات الإدارة المكشوفة واللقطات التي تحوي أسراراً نصية.\n\nعملياً، يصل المهاجمون إلى مضيف المشرف عادةً عبر الهوية والوصول الإداري. ولهذا يقع جهد الكشف في الغالب على مستوى الإدارة، كما في [هندسة الدفاع ضد برمجيات الفدية](/learn/security-operations-dfir/ransomware-defense-engineering) حيث يُعد تشفير المشرف تكتيكاً معروفاً."
+      },
+      {
+        "id": "mgmt",
+        "type": "text",
+        "markdown": "## مراقبة مستوى الإدارة\n\nاجمع هذه المصادر مركزياً ونبّه على الإجراءات عالية الخطورة:\n\n| المصدر | أحداث تستحق التنبيه |\n|:--|:--|\n| ESXi: `hostd.log` و`shell.log` و`auth.log` | تفعيل SSH، فتح الطرفية، دخول root، تعطيل وضع القفل |\n| أحداث vCenter | دور مدير جديد، تصدير جهاز افتراضي، لقطة لمتحكم النطاق |\n| Proxmox: `/var/log/pve/tasks` وسجل المصادقة | إنشاء رمز API، فتح وحدة تحكم، تغيير مهمة نسخ احتياطي |\n| معرّفات أحداث Hyper-V (سجل التشغيل) | إنشاء جهاز افتراضي أو تصديره، تغيير المحوّل الافتراضي |\n\nيبحث استعلام SIEM مفيد عن الإدارة خارج نوافذ التغيير. المثال أدناه بلغة Splunk SPL على سجلات ESXi."
+      },
+      {
+        "id": "spl",
+        "type": "code",
+        "language": "plain",
+        "filename": "esxi-after-hours-admin.spl",
+        "caption": "كشف تفعيل طرفية ESXi أو SSH خارج نوافذ التغيير",
+        "highlight": [
+          2,
+          3,
+          5
+        ],
+        "code": "index=esxi sourcetype=vmware:esxlog:hostd\n  (\"SSH access has been enabled\" OR \"ESXi Shell for the host has been enabled\" OR \"Lockdown mode disabled\")\n| eval hour=strftime(_time,\"%H\")\n| where hour<6 OR hour>20\n| stats count min(_time) AS first_seen values(user) AS users by host\n| convert ctime(first_seen)"
+      },
+      {
+        "id": "forensics",
+        "type": "text",
+        "markdown": "## التحليل الجنائي من جهة المشرف\n\nتمنح المحاكاة الافتراضية المستجيبين ميزة كبرى: يمكنك التقاط الضيف **من الخارج**، فلا تستطيع البرمجية الخبيثة داخله التدخل في الالتقاط.\n\n1. **التقط لقطة مع الذاكرة.** اللقطة التي تشمل الذاكرة تحفظ الـ RAM في ملف (`.vmsn`/`.vmem` في VMware، وملف حالة في KVM). عامل اللقطة كدليل واحسب بصمتها فوراً.\n2. **انسخ ملفات القرص** (`.vmdk` و`.qcow2` و`.vhdx`) واحسب بصماتها. اعمل على النسخ فقط.\n3. **حوّل للتحليل.** اربط القرص للقراءة فقط عبر `qemu-nbd` أو حوّله إلى صيغة خام ثم افحصه بأدوات القرص المعتادة.\n4. **حلّل الذاكرة.** مرّر `.vmem` أو تفريغ KVM إلى Volatility.\n5. **سجّل سياق المضيف**: سجلات المشرف ومن أخذ اللقطة ووقتها، للحفاظ على سلسلة العهدة."
+      },
+      {
+        "id": "kvm-term",
+        "type": "terminal",
+        "title": "Acquire a KVM guest from the host (lab host you own)",
+        "prompt": "admin@kvm01:~$",
+        "lines": [
+          {
+            "cmd": "virsh list --all",
+            "output": " Id   Name        State\n--------------------------\n 4    finance-vm  running"
+          },
+          {
+            "cmd": "virsh dump finance-vm /evidence/finance-vm.mem --memory-only --format=elf",
+            "output": "Domain 'finance-vm' dumped to /evidence/finance-vm.mem",
+            "comment": "تُلتقط الذاكرة من خارج الضيف"
+          },
+          {
+            "cmd": "virsh snapshot-create-as finance-vm ir-0001 --disk-only --atomic",
+            "output": "Domain snapshot ir-0001 created",
+            "comment": "تجمّد اللقطة القرصية الصورة الأساسية للنسخ"
+          },
+          {
+            "cmd": "sha256sum /evidence/finance-vm.mem | tee /evidence/finance-vm.mem.sha256",
+            "output": "9f3a6c1e0b7d...  /evidence/finance-vm.mem",
+            "comment": "احسب البصمة فوراً وسجّلها في سجل القضية"
+          }
+        ]
+      },
+      {
+        "id": "harden",
+        "type": "text",
+        "markdown": "## قائمة تحصين عملية\n\nاستخدم هذه القائمة القصيرة عند مراجعة عنقود محاكاة افتراضية:\n\n- عطّل SSH والطرفية المحلية على المضيفين إلا أثناء الصيانة المعتمدة، وفعّل وضع القفل.\n- اشترط المصادقة متعددة العوامل والحسابات المسمّاة لكل وحدة إدارة، وأوقف الاستخدام المشترك لـ `root`.\n- أزل الأجهزة الافتراضية التي لا يحتاجها أي حمل عمل، وعطّل الحافظة والسحب والإفلات بين الضيف والمضيف.\n- حدّث المشرف والبرنامج الثابت وفق جدول محدد، واشترك في نشرات المورّد.\n- افصل شبكات الإدارة والتخزين والترحيل والضيوف عن بعضها.\n- شفّر أقراص الأجهزة الافتراضية والنسخ الاحتياطية، واحتفظ بنسخة واحدة معزولة أو غير قابلة للتعديل.\n- أرسل كل سجلات الإدارة إلى SIEM قبل الحادث لا أثناءه.\n\nيزيل كل بند مساراً استخدمه المهاجمون في حوادث حقيقية، ويسهل التحقق من كل بند، مما يجعل القائمة مناسبة للتدقيق الدوري."
+      },
+      {
+        "id": "warn",
+        "type": "callout",
+        "variant": "warning",
+        "title": "احمِ المشرف أولاً",
+        "markdown": "لا تضمّ واجهات إدارة المشرف إلى نطاق الإنتاج دون مصادقة متعددة العوامل وطبقة إدارية مستقلة. قد تكفي كلمة مرور مدير واحدة مسروقة لتشفير كل الضيوف أو تصديرها. أبقِ الإدارة في شبكة معزولة، وخذ النسخ الاحتياطية خارج العنقود، واختبر الاستعادة."
+      },
+      {
+        "id": "lab",
+        "type": "callout",
+        "variant": "lab",
+        "title": "جرّب بنفسك",
+        "markdown": "على مضيف مختبر KVM أو VirtualBox تملكه، أنشئ ضيف Linux صغيراً بلا بيانات حساسة.\n\n1. اعرض أجهزتك الافتراضية (`virsh dumpxml <vm>` أو إعدادات الجهاز) ودوّن ما لا تحتاجه مثل القرص المرن أو بطاقة الصوت أو المجلد المشترك.\n2. التقط لقطة تشمل الذاكرة ثم احسب بصمة SHA-256 لها.\n3. من داخل الضيف شغّل `sleep 600 &`. التقط الذاكرة من المضيف وتأكد من ظهور النص `sleep` باستخدام `strings` على التفريغ.\n4. اكتب ملاحظة عهدة من ثلاثة أسطر: ماذا ومتى والبصمة."
+      },
+      {
+        "id": "terms",
+        "type": "keyterms",
+        "title": "مصطلحات أساسية",
+        "items": [
+          {
+            "term": "المشرف الافتراضي (Hypervisor)",
+            "definition": "برنامج ينشئ الأجهزة الافتراضية ويشغّلها."
+          },
+          {
+            "term": "VM exit",
+            "definition": "اعتراض ينقل التحكم من الضيف إلى المشرف."
+          },
+          {
+            "term": "EPT / NPT",
+            "definition": "جداول عتادية تترجم عناوين ذاكرة الضيف."
+          },
+          {
+            "term": "نموذج الجهاز",
+            "definition": "برنامج يحاكي عتاداً كبطاقات الشبكة والأقراص للضيف."
+          },
+          {
+            "term": "مستوى الإدارة",
+            "definition": "وحدات التحكم وواجهات API المستخدمة لإدارة المضيفين والضيوف."
+          },
+          {
+            "term": "اللقطة (Snapshot)",
+            "definition": "حالة محفوظة في لحظة معيّنة لقرص الجهاز الافتراضي وربما ذاكرته."
+          },
+          {
+            "term": "VMI",
+            "definition": "فحص الضيف من المشرف دون الاعتماد على النظام الضيف."
+          },
+          {
+            "term": "virtio",
+            "definition": "عائلة معيارية من المشغّلات شبه الافتراضية لتحسين السرعة."
+          }
+        ]
+      },
+      {
+        "id": "quiz",
+        "type": "quiz",
+        "title": "تحقّق من فهمك",
+        "questions": [
+          {
+            "question": "أي مكوّن في المشرف هو عادةً أكبر سطح هجوم؟",
+            "options": [
+              "الأجهزة الافتراضية المحاكاة",
+              "ميزة VT-x في المعالج",
+              "ملف الترخيص",
+              "شعار الإقلاع"
+            ],
+            "answer": 0,
+            "explanation": "نماذج الأجهزة شيفرة معقدة تحلّل مدخلات يتحكم بها الضيف."
+          },
+          {
+            "question": "ما أشيع طريق في الواقع للتحكم بعدة ضيوف؟",
+            "options": [
+              "بيانات اعتماد إدارة مسروقة",
+              "خلل في تصميم المعالج",
+              "كابل تالف",
+              "تخزين DNS المؤقت"
+            ],
+            "answer": 0,
+            "explanation": "يمنح الوصول الإداري تحكماً مشروعاً دون استغلال."
+          },
+          {
+            "question": "لماذا تلتقط الذاكرة من المشرف؟ اختر كل ما ينطبق.",
+            "options": [
+              "لا تستطيع البرمجية الخبيثة في الضيف التدخل",
+              "لا حاجة لتثبيت وكيل في الضيف",
+              "يستمر الضيف بالعمل بإزعاج ضئيل",
+              "يلغي الحاجة إلى البصمات"
+            ],
+            "answer": [
+              0,
+              1,
+              2
+            ],
+            "explanation": "حساب البصمة مطلوب دائماً لسلامة الأدلة."
+          },
+          {
+            "question": "أي مما يلي مشرف من النوع الأول؟",
+            "options": [
+              "VMware ESXi",
+              "VirtualBox on Windows",
+              "VMware Workstation",
+              "A browser sandbox"
+            ],
+            "answer": 0,
+            "explanation": "يعمل ESXi مباشرة على العتاد."
+          },
+          {
+            "question": "أي حدث سجل يستحق التنبيه؟",
+            "options": [
+              "تفعيل SSH على ESXi عند 03:00",
+              "تشغيل جهاز افتراضي أثناء التحديث",
+              "نجاح مزامنة NTP",
+              "اكتمال النسخ الاحتياطي"
+            ],
+            "answer": 0,
+            "explanation": "تفعيل الوصول البعيد خارج أوقات العمل مقدّمة كلاسيكية لإساءة الاستخدام."
+          }
+        ]
+      },
+      {
+        "id": "summary",
+        "type": "text",
+        "markdown": "## الخلاصة\n\n- ينشئ المشرف الضيوف باعتراض العمليات المميّزة ومحاكاة الأجهزة.\n- الأجهزة المحاكاة أكبر سطح هجوم من جهة الشيفرة، وبيانات اعتماد الإدارة أشيع طريق هجوم فعلي.\n- اجمع سجلات إدارة المشرف ونبّه عليها، خاصة تغييرات الطرفية وSSH خارج أوقات العمل.\n- التقط الذاكرة والأقراص من جهة المضيف، واحسب البصمة فوراً واحفظ سلسلة العهدة.\n- أبقِ شبكات الإدارة معزولة والنسخ الاحتياطية خارج العنقود.\n- قراءة ذات صلة: [معمارية المراقبة الأمنية](/learn/security-operations-dfir/security-monitoring-architecture)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,570 @@
+{
+ "slug": "ldap-security",
+ "title": "LDAP Security",
+ "summary": "Secure an LDAP directory end to end: encrypt the channel, require strong binds, limit anonymous reads, apply access control and watch for abuse.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Explain what LDAP stores and why directories are high-value targets",
+  "Compare simple, SASL and anonymous binds and choose a safe default",
+  "Enable LDAPS or StartTLS and verify the certificate chain",
+  "Write least-privilege access control for an OpenLDAP-style directory",
+  "Detect LDAP injection, enumeration and password spraying in logs"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "A company migrates its intranet apps to a central login. Within a week, a developer points a test script at the directory server, binds without a password and downloads every employee name, email address and group membership. Nothing was hacked: the directory simply allowed anonymous reads over an unencrypted port.\n\n**LDAP** (Lightweight Directory Access Protocol) is the language applications use to query and update a directory. Wiki logins, VPN gateways, mail servers and Linux hosts all ask it \"who is this user, and what groups are they in?\" That makes the directory a map of your organization and, through its password hashes, a store of credentials. This lesson shows how to lock it down."
+  },
+  {
+   "id": "model",
+   "type": "text",
+   "markdown": "## What an LDAP directory holds\n\nA directory is a tree. Each entry has a **distinguished name (DN)** such as `uid=alice,ou=People,dc=example,dc=com` and attributes like `cn`, `mail`, `memberOf` and `userPassword`. Clients search the tree with a **base DN**, a **scope** and a **filter** such as `(&(objectClass=person)(uid=alice))`.\n\nThree things make it sensitive:\n\n- **Identity data.** Names, phone numbers and org structure help phishing and social engineering.\n- **Credentials.** `userPassword` may hold hashes that can be cracked offline if exposed.\n- **Authorization data.** Group membership decides what users can do in dozens of applications.\n\nAttackers therefore try three moves: read the tree (enumeration), guess passwords against bind operations (spraying), and inject filter syntax through vulnerable applications."
+  },
+  {
+   "id": "binds",
+   "type": "text",
+   "markdown": "## Bind types and transport\n\nA **bind** authenticates the client. Pick the weakest-risk option that works.\n\n| Bind type | How it authenticates | Risk | Recommendation |\n|:--|:--|:--|:--|\n| Anonymous | No credentials | Enumeration of the tree | Disable, or allow only the root DSE |\n| Simple | DN plus password in clear text | Password sniffed on the wire | Only inside TLS |\n| SASL (GSSAPI, SCRAM) | Challenge-response or Kerberos | Low when configured well | Preferred for services |\n| Client certificate (SASL EXTERNAL) | Mutual TLS | Low, needs PKI | Best for machine accounts |\n\nPlain LDAP on **TCP 389** sends simple-bind passwords unencrypted. You have two ways to protect them:\n\n- **LDAPS** wraps the whole session in TLS on **TCP 636**.\n- **StartTLS** upgrades a normal port 389 session to TLS after connecting.\n\nEither is acceptable. What matters is that the server **refuses** any bind before TLS is established. Also verify the server certificate: a client that ignores certificate errors accepts any attacker in the middle."
+  },
+  {
+   "id": "cfg",
+   "type": "code",
+   "language": "bash",
+   "filename": "slapd-hardening.ldif",
+   "code": "# OpenLDAP (cn=config): require TLS and strong binds\ndn: cn=config\nchangetype: modify\nreplace: olcTLSCertificateFile\nolcTLSCertificateFile: /etc/ldap/tls/ldap.example.com.crt\n-\nreplace: olcTLSCertificateKeyFile\nolcTLSCertificateKeyFile: /etc/ldap/tls/ldap.example.com.key\n-\nreplace: olcTLSProtocolMin\nolcTLSProtocolMin: 3.3\n-\nreplace: olcSecurity\nolcSecurity: tls=128 ssf=128\n\ndn: olcDatabase={-1}frontend,cn=config\nchangetype: modify\nreplace: olcRequires\nolcRequires: authc\n-\nreplace: olcDisallows\nolcDisallows: bind_anon",
+   "caption": "Hardening an OpenLDAP server: TLS 1.2 minimum (3.3), a minimum 128-bit security strength factor, authentication required and anonymous binds disallowed."
+  },
+  {
+   "id": "acl",
+   "type": "text",
+   "markdown": "## Access control: least privilege inside the tree\n\nEncryption protects the wire; **access control lists (ACLs)** protect the data. Decide per attribute who may read, write or only compare it.\n\n- Users may change their own `userPassword`, but never read it.\n- An application's service account may search `ou=People` and read `uid`, `cn`, `mail`, nothing else.\n- Only a small admin group writes group membership.\n- Nobody except the directory itself reads password hashes.\n\nUse **separate service accounts per application** with a narrow search base. A shared account that can read everything means one leaked config file exposes the whole directory. Store hashes with a modern scheme (`{ARGON2}` or at least salted `{SSHA512}`), never `{SSHA}` or `{MD5}`."
+  },
+  {
+   "id": "acl-cfg",
+   "type": "code",
+   "language": "bash",
+   "filename": "acl.ldif",
+   "code": "dn: olcDatabase={1}mdb,cn=config\nchangetype: modify\nreplace: olcAccess\n# Rule 0: password hashes -- self may write, auth service may compare, nobody reads\nolcAccess: {0}to attrs=userPassword by self write by anonymous auth by * none\n# Rule 1: the wiki account reads only a few attributes under People\nolcAccess: {1}to dn.subtree=\"ou=People,dc=example,dc=com\" attrs=uid,cn,mail by dn.exact=\"uid=svc-wiki,ou=Services,dc=example,dc=com\" read by * none\n# Rule 2: default deny\nolcAccess: {2}to * by * none",
+   "caption": "Rules are evaluated in order and the first match wins, so the password rule comes first and an explicit default deny closes the list."
+  },
+  {
+   "id": "verify",
+   "type": "terminal",
+   "title": "Verify TLS and anonymous access",
+   "lines": [
+    {
+     "cmd": "ldapsearch -x -H ldap://ldap.example.com -b dc=example,dc=com -s base",
+     "output": "ldap_bind: Confidential authentication required (13)\n\tadditional info: confidentiality required",
+     "comment": "Plain port 389 with no TLS is refused, as intended."
+    },
+    {
+     "cmd": "ldapsearch -x -ZZ -H ldap://ldap.example.com -b ou=People,dc=example,dc=com uid=alice",
+     "output": "ldap_bind: Inappropriate authentication (48)\n\tadditional info: anonymous bind disallowed",
+     "comment": "StartTLS (-ZZ) succeeded, but anonymous reads are blocked."
+    },
+    {
+     "cmd": "openssl s_client -connect ldap.example.com:636 -verify_return_error </dev/null | grep -E 'Verify return|Protocol'",
+     "output": "Protocol  : TLSv1.3\nVerify return code: 0 (ok)",
+     "comment": "The certificate chain validates and TLS 1.3 is negotiated."
+    }
+   ],
+   "caption": "Three quick checks against a server you own: cleartext refused, anonymous refused, certificate valid."
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "sequence",
+   "title": "Simple bind over StartTLS",
+   "data": {
+    "actors": [
+     {
+      "id": "app",
+      "label": "Application",
+      "sub": "198.51.100.20",
+      "icon": "server"
+     },
+     {
+      "id": "dir",
+      "label": "LDAP server",
+      "sub": "ldap.example.com",
+      "icon": "database"
+     }
+    ],
+    "steps": [
+     {
+      "from": "app",
+      "to": "dir",
+      "label": "Connect",
+      "detail": "TCP 389",
+      "note": "The application opens a normal connection to port 389."
+     },
+     {
+      "from": "app",
+      "to": "dir",
+      "label": "StartTLS request",
+      "detail": "extended op",
+      "note": "Before any credentials, the client asks to upgrade the channel."
+     },
+     {
+      "from": "dir",
+      "to": "app",
+      "label": "Certificate",
+      "detail": "CN=ldap.example.com",
+      "note": "The server presents its certificate; the client validates the chain and hostname.",
+      "tone": "secure"
+     },
+     {
+      "from": "app",
+      "to": "dir",
+      "label": "Bind",
+      "detail": "uid=svc-wiki + secret",
+      "note": "The password now travels inside the encrypted tunnel.",
+      "tone": "secure"
+     },
+     {
+      "from": "dir",
+      "to": "app",
+      "label": "Bind success",
+      "detail": "resultCode 0",
+      "note": "The server checks the hash and accepts the bind.",
+      "tone": "success"
+     },
+     {
+      "from": "app",
+      "to": "dir",
+      "label": "Search",
+      "detail": "(uid=alice)",
+      "note": "The ACL limits the reply to the attributes this account may read.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "ops",
+   "type": "text",
+   "markdown": "## Operating the directory safely\n\nHardening is not a one-time task. Four habits keep a directory trustworthy:\n\n1. **Log what matters.** Enable connection and result logging, ship it to your SIEM and alert on failed-bind bursts, new service accounts and changes to ACLs or group membership.\n2. **Protect replication.** Replicas must use TLS and mutual authentication too. A weak replica is a back door to the same data.\n3. **Patch and back up.** Directory software is exposed to every application in the company, so apply fixes promptly and test restores of the database, not just the backup job.\n4. **Review accounts regularly.** Remove service accounts for retired applications and rotate secrets on a schedule.\n\nFinally, keep the directory off the internet. Only application servers, VPN gateways and domain members should reach ports 389 and 636, enforced by a firewall rule that names each source network, for example 192.0.2.0/24 for the application tier."
+  },
+  {
+   "id": "attacks",
+   "type": "text",
+   "markdown": "## Attacks and defenses\n\n| Attack | What it does | Defense | Detection |\n|:--|:--|:--|:--|\n| Anonymous enumeration | Dumps users and groups | `disallow bind_anon`, ACL default deny | Binds with empty DN in logs |\n| Password spraying | One password against many `uid` values | Lockout, rate limiting, MFA upstream | Many `err=49` from one source |\n| LDAP injection | Attacker alters a filter via unescaped input | Escape input, use parameterized filter APIs | Filters containing `*)(` in app logs |\n| Credential sniffing | Reads simple binds on port 389 | Require TLS, SSF minimum | Port 389 sessions without TLS |\n| Hash theft | Reads `userPassword` | ACL deny, strong hash scheme | Reads of `userPassword` by non-auth accounts |\n\n### LDAP injection in one example\nAn application builds the filter `(&(uid=INPUT)(userPassword=...))` by concatenating strings. Input such as `*` changes the meaning. The fix is not blacklisting characters; it is **escaping** special characters (`*`, `(`, `)`, backslash, NUL) with the library function, or using an API that binds values separately, plus a service account that could not read much anyway."
+  },
+  {
+   "id": "detect",
+   "type": "code",
+   "language": "bash",
+   "filename": "detect-spray.sh",
+   "code": "# slapd logs at loglevel 'stats'; err=49 means invalid credentials\ngrep 'RESULT' /var/log/slapd.log | grep 'err=49' \\\n  | sed -E 's/.*conn=([0-9]+).*/\\1/' | sort | uniq -c | sort -rn | head\n# Map conn IDs back to client IPs from the ACCEPT lines\ngrep 'ACCEPT from IP=' /var/log/slapd.log | tail -3",
+   "caption": "Count failed binds per connection, then map the noisy connections back to source addresses (for example 203.0.113.45:51022)."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Do not disable certificate checks",
+   "markdown": "Many legacy apps ship with `TLS_REQCERT never` or `LDAP_OPT_X_TLS_NEVER`. It makes encryption cosmetic, because an attacker with a forged certificate is accepted. Import your internal CA into the trust store and require `demand` instead."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a disposable VM you own, install OpenLDAP (`slapd`) and add three sample users under `dc=example,dc=com`.\n\n1. Run an anonymous `ldapsearch` and confirm it returns users.\n2. Apply the hardening LDIF and the ACLs above.\n3. Repeat the search: plain, `-ZZ` anonymous, and `-ZZ -D` with a service account.\n4. Confirm the service account cannot read `userPassword`.\n5. Fail five binds on purpose and find the `err=49` lines in the log.\n\nWrite one sentence on which control stopped each step."
+  },
+  {
+   "id": "kt",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "LDAP",
+     "definition": "Protocol for querying and modifying a directory service."
+    },
+    {
+     "term": "DN",
+     "definition": "Distinguished name, the unique path of an entry in the tree."
+    },
+    {
+     "term": "Bind",
+     "definition": "The authentication operation that sets the client identity."
+    },
+    {
+     "term": "LDAPS",
+     "definition": "LDAP wrapped in TLS on TCP 636."
+    },
+    {
+     "term": "StartTLS",
+     "definition": "Upgrade of a port 389 session to TLS."
+    },
+    {
+     "term": "SASL",
+     "definition": "Framework for pluggable authentication such as GSSAPI or SCRAM."
+    },
+    {
+     "term": "ACL",
+     "definition": "Rules that decide who can read or write which attributes."
+    },
+    {
+     "term": "LDAP injection",
+     "definition": "Altering a search filter through unescaped input."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Which setting best prevents passwords being sniffed during a simple bind?",
+     "options": [
+      "Longer passwords",
+      "Require TLS (LDAPS or StartTLS) before binding",
+      "Rename the directory suffix",
+      "Use a non-standard port only"
+     ],
+     "answer": 1,
+     "explanation": "Simple binds send the password in clear text, so the channel must be encrypted first. A different port or a longer password does not change that."
+    },
+    {
+     "question": "Which are valid defenses against LDAP injection? (choose all that apply)",
+     "options": [
+      "Escape special characters in filter input",
+      "Use a library that binds filter values separately",
+      "Give the application account read access to everything",
+      "Limit the service account to a narrow search base"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Escaping and parameterized filters remove the flaw; a narrow account limits damage. Broad read access makes injection worse."
+    },
+    {
+     "question": "An ACL list ends without a final rule. What is the safest way to finish it?",
+     "options": [
+      "Leave it, defaults are always deny",
+      "Add an explicit `to * by * none`",
+      "Add `to * by * read`",
+      "Add `by anonymous write`"
+     ],
+     "answer": 1,
+     "explanation": "Defaults vary by version and database, so an explicit default deny makes the policy visible and testable."
+    },
+    {
+     "question": "Your log shows hundreds of `err=49` results from 203.0.113.45 across many different uid values. What is this most likely?",
+     "options": [
+      "Normal replication",
+      "Password spraying",
+      "A certificate expiry",
+      "LDAP injection"
+     ],
+     "answer": 1,
+     "explanation": "One source trying many accounts with failures is the spraying pattern. Add lockout or rate limiting and review the source."
+    },
+    {
+     "question": "Which bind method is best for a machine account that already has a PKI?",
+     "options": [
+      "Anonymous",
+      "Simple bind with a shared password",
+      "SASL EXTERNAL with a client certificate",
+      "Simple bind on port 389"
+     ],
+     "answer": 2,
+     "explanation": "Mutual TLS removes shared secrets from config files and gives each machine its own revocable identity."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- A directory is a high-value target: identities, groups and possibly password hashes.\n- Require TLS before any bind, validate certificates, and disable anonymous binds.\n- Prefer SASL or client certificates for services; use simple binds only inside TLS.\n- Apply attribute-level ACLs with a default deny, and give each application its own narrow account.\n- Escape filter input to stop injection, and watch logs for `err=49` bursts and unexpected reads.\n\nNext, see how these ideas apply to the most common directory in business: [Active Directory Security](/learn/security-architecture-resilience/active-directory-security). For the account types that connect to it, read [Service Account Security](/learn/security-architecture-resilience/service-account-security)."
+  }
+ ],
+ "ar": {
+  "title": "أمن LDAP",
+  "summary": "تأمين دليل LDAP من البداية إلى النهاية: تشفير القناة، وفرض الربط القوي، وتقييد القراءة المجهولة، وتطبيق التحكم بالوصول ومراقبة إساءة الاستخدام.",
+  "objectives": [
+   "شرح ما يخزّنه LDAP ولماذا تُعدّ الأدلة أهدافًا عالية القيمة",
+   "المقارنة بين الربط البسيط وربط SASL والربط المجهول واختيار الأكثر أمانًا",
+   "تفعيل LDAPS أو StartTLS والتحقق من سلسلة الشهادات",
+   "كتابة تحكم بالوصول بأقل الصلاحيات لدليل من نوع OpenLDAP",
+   "اكتشاف حقن LDAP والتعداد ورذاذ كلمات المرور في السجلات"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "تنقل شركة تطبيقاتها الداخلية إلى تسجيل دخول مركزي. وبعد أسبوع يوجّه مطوّر سكربتًا تجريبيًا إلى خادم الدليل، فيرتبط دون كلمة مرور وينزّل أسماء كل الموظفين وبريدهم وعضويات مجموعاتهم. لم يحدث اختراق: فقد سمح الدليل بالقراءة المجهولة عبر منفذ غير مشفّر.\n\nبروتوكول **LDAP** (Lightweight Directory Access Protocol) هو اللغة التي تستعملها التطبيقات للاستعلام عن الدليل وتعديله. تسأله بوابات الدخول ومخدّمات البريد وأجهزة لينكس: «من هذا المستخدم وما مجموعاته؟». لذلك يصبح الدليل خريطة لمؤسستك، ومخزنًا لبيانات الاعتماد عبر تجزئات كلمات المرور. يبيّن هذا الدرس كيف تُحكِم تأمينه."
+   },
+   {
+    "id": "model",
+    "type": "text",
+    "markdown": "## ما الذي يحتويه دليل LDAP\n\nالدليل شجرة، ولكل مدخل **اسم مميّز (DN)** مثل `uid=alice,ou=People,dc=example,dc=com` وخصائص مثل `cn` و`mail` و`memberOf` و`userPassword`. يبحث العملاء في الشجرة بتحديد **DN الأساس** و**النطاق** و**مرشّح** مثل `(&(objectClass=person)(uid=alice))`.\n\nثلاثة أمور تجعله حسّاسًا:\n\n- **بيانات الهوية.** الأسماء وأرقام الهواتف والهيكل التنظيمي تفيد في التصيّد والهندسة الاجتماعية.\n- **بيانات الاعتماد.** قد تحوي `userPassword` تجزئات يمكن كسرها دون اتصال إن انكشفت.\n- **بيانات التفويض.** عضوية المجموعات تحدّد ما يستطيعه المستخدم في عشرات التطبيقات.\n\nلذلك يحاول المهاجم ثلاث حركات: قراءة الشجرة (التعداد)، وتخمين كلمات المرور عبر عمليات الربط (الرذاذ)، وحقن صيغة المرشّح عبر تطبيقات ضعيفة."
+   },
+   {
+    "id": "binds",
+    "type": "text",
+    "markdown": "## أنواع الربط والنقل\n\nيتحقق **الربط (Bind)** من هوية العميل. اختر الخيار الأقل خطرًا الذي يلبّي الحاجة.\n\n| نوع الربط | طريقة التحقق | الخطر | التوصية |\n|:--|:--|:--|:--|\n| مجهول | بلا بيانات اعتماد | تعداد الشجرة | عطّله أو اسمح بجذر DSE فقط |\n| بسيط | DN وكلمة مرور نصية | التقاط كلمة المرور من الشبكة | داخل TLS فقط |\n| SASL (‏GSSAPI وSCRAM) | تحدٍّ واستجابة أو Kerberos | منخفض عند حسن الإعداد | المفضّل للخدمات |\n| شهادة عميل (SASL EXTERNAL) | TLS متبادل | منخفض ويحتاج PKI | الأفضل لحسابات الأجهزة |\n\nيرسل LDAP العادي على **TCP 389** كلمات مرور الربط البسيط دون تشفير. وهناك طريقتان لحمايتها:\n\n- **LDAPS** يغلّف الجلسة كلها بـ TLS على **TCP 636**.\n- **StartTLS** يرقّي جلسة المنفذ 389 العادية إلى TLS بعد الاتصال.\n\nكلتاهما مقبولة. المهم أن **يرفض** الخادم أي ربط قبل إنشاء TLS. وتحقّق أيضًا من شهادة الخادم، فالعميل الذي يتجاهل أخطاء الشهادة يقبل أي وسيط مهاجم."
+   },
+   {
+    "id": "cfg",
+    "type": "code",
+    "language": "bash",
+    "filename": "slapd-hardening.ldif",
+    "code": "# OpenLDAP (cn=config): require TLS and strong binds\ndn: cn=config\nchangetype: modify\nreplace: olcTLSCertificateFile\nolcTLSCertificateFile: /etc/ldap/tls/ldap.example.com.crt\n-\nreplace: olcTLSCertificateKeyFile\nolcTLSCertificateKeyFile: /etc/ldap/tls/ldap.example.com.key\n-\nreplace: olcTLSProtocolMin\nolcTLSProtocolMin: 3.3\n-\nreplace: olcSecurity\nolcSecurity: tls=128 ssf=128\n\ndn: olcDatabase={-1}frontend,cn=config\nchangetype: modify\nreplace: olcRequires\nolcRequires: authc\n-\nreplace: olcDisallows\nolcDisallows: bind_anon",
+    "caption": "تقوية خادم OpenLDAP: TLS 1.2 كحدّ أدنى (3.3)، وعامل قوة أمان لا يقل عن 128 بت، واشتراط المصادقة ومنع الربط المجهول."
+   },
+   {
+    "id": "acl",
+    "type": "text",
+    "markdown": "## التحكم بالوصول: أقل الصلاحيات داخل الشجرة\n\nيحمي التشفير الشبكة، وتحمي **قوائم التحكم بالوصول (ACL)** البيانات. حدّد لكل خاصية من يقرؤها أو يكتبها أو يقارن بها فقط.\n\n- يستطيع المستخدم تغيير `userPassword` الخاصة به، ولا يقرؤها أبدًا.\n- يبحث حساب خدمة التطبيق في `ou=People` ويقرأ `uid` و`cn` و`mail` فقط.\n- مجموعة إدارية صغيرة وحدها تكتب عضوية المجموعات.\n- لا أحد سوى الدليل نفسه يقرأ تجزئات كلمات المرور.\n\nاستعمل **حساب خدمة مستقلًا لكل تطبيق** مع أساس بحث ضيّق. فالحساب المشترك الذي يقرأ كل شيء يعني أن تسرّب ملف إعداد واحد يكشف الدليل كله. وخزّن التجزئات بنظام حديث (`{ARGON2}` أو على الأقل `{SSHA512}` المملّح) لا `{SSHA}` ولا `{MD5}`."
+   },
+   {
+    "id": "acl-cfg",
+    "type": "code",
+    "language": "bash",
+    "filename": "acl.ldif",
+    "code": "dn: olcDatabase={1}mdb,cn=config\nchangetype: modify\nreplace: olcAccess\n# Rule 0: password hashes -- self may write, auth service may compare, nobody reads\nolcAccess: {0}to attrs=userPassword by self write by anonymous auth by * none\n# Rule 1: the wiki account reads only a few attributes under People\nolcAccess: {1}to dn.subtree=\"ou=People,dc=example,dc=com\" attrs=uid,cn,mail by dn.exact=\"uid=svc-wiki,ou=Services,dc=example,dc=com\" read by * none\n# Rule 2: default deny\nolcAccess: {2}to * by * none",
+    "caption": "تُقيَّم القواعد بالترتيب وأول تطابق يحسم، لذا تأتي قاعدة كلمة المرور أولًا وتُغلق القائمة بمنع افتراضي صريح."
+   },
+   {
+    "id": "verify",
+    "type": "terminal",
+    "title": "Verify TLS and anonymous access",
+    "lines": [
+     {
+      "cmd": "ldapsearch -x -H ldap://ldap.example.com -b dc=example,dc=com -s base",
+      "output": "ldap_bind: Confidential authentication required (13)\n\tadditional info: confidentiality required",
+      "comment": "Plain port 389 with no TLS is refused, as intended."
+     },
+     {
+      "cmd": "ldapsearch -x -ZZ -H ldap://ldap.example.com -b ou=People,dc=example,dc=com uid=alice",
+      "output": "ldap_bind: Inappropriate authentication (48)\n\tadditional info: anonymous bind disallowed",
+      "comment": "StartTLS (-ZZ) succeeded, but anonymous reads are blocked."
+     },
+     {
+      "cmd": "openssl s_client -connect ldap.example.com:636 -verify_return_error </dev/null | grep -E 'Verify return|Protocol'",
+      "output": "Protocol  : TLSv1.3\nVerify return code: 0 (ok)",
+      "comment": "The certificate chain validates and TLS 1.3 is negotiated."
+     }
+    ],
+    "caption": "ثلاثة فحوص سريعة على خادم تملكه: رفض النص الصريح، ورفض المجهول، وصحة الشهادة."
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "sequence",
+    "title": "ربط بسيط عبر StartTLS",
+    "data": {
+     "actors": [
+      {
+       "id": "app",
+       "label": "Application",
+       "sub": "198.51.100.20",
+       "icon": "server"
+      },
+      {
+       "id": "dir",
+       "label": "LDAP server",
+       "sub": "ldap.example.com",
+       "icon": "database"
+      }
+     ],
+     "steps": [
+      {
+       "from": "app",
+       "to": "dir",
+       "label": "Connect",
+       "detail": "TCP 389",
+       "note": "يفتح التطبيق اتصالًا عاديًا بالمنفذ 389."
+      },
+      {
+       "from": "app",
+       "to": "dir",
+       "label": "StartTLS request",
+       "detail": "extended op",
+       "note": "قبل أي بيانات اعتماد يطلب العميل ترقية القناة."
+      },
+      {
+       "from": "dir",
+       "to": "app",
+       "label": "Certificate",
+       "detail": "CN=ldap.example.com",
+       "note": "يعرض الخادم شهادته ويتحقق العميل من السلسلة واسم المضيف.",
+       "tone": "secure"
+      },
+      {
+       "from": "app",
+       "to": "dir",
+       "label": "Bind",
+       "detail": "uid=svc-wiki + secret",
+       "note": "تنتقل كلمة المرور الآن داخل النفق المشفّر.",
+       "tone": "secure"
+      },
+      {
+       "from": "dir",
+       "to": "app",
+       "label": "Bind success",
+       "detail": "resultCode 0",
+       "note": "يفحص الخادم التجزئة ويقبل الربط.",
+       "tone": "success"
+      },
+      {
+       "from": "app",
+       "to": "dir",
+       "label": "Search",
+       "detail": "(uid=alice)",
+       "note": "تحصر قائمة التحكم الرد في الخصائص المسموحة لهذا الحساب.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "ops",
+    "type": "text",
+    "markdown": "## تشغيل الدليل بأمان\n\nالتقوية ليست مهمة لمرة واحدة. أربع عادات تُبقي الدليل موثوقًا:\n\n1. **سجّل ما يهم.** فعّل تسجيل الاتصالات والنتائج، وأرسله إلى نظام إدارة المعلومات والأحداث الأمنية (SIEM)، وأطلق تنبيهًا عند دفعات الربط الفاشل والحسابات الخدمية الجديدة وتغييرات ACL أو عضوية المجموعات.\n2. **احمِ النسخ المتماثل.** يجب أن تستعمل النسخ المتماثلة TLS والمصادقة المتبادلة أيضًا، فالنسخة الضعيفة باب خلفي إلى البيانات نفسها.\n3. **حدّث واحتفظ بنسخ احتياطية.** برمجيات الدليل مكشوفة لكل تطبيقات الشركة، فطبّق التصحيحات بسرعة واختبر استعادة قاعدة البيانات وليس مهمة النسخ فقط.\n4. **راجع الحسابات دوريًا.** احذف حسابات الخدمة للتطبيقات المتقاعدة وبدّل الأسرار وفق جدول.\n\nوأخيرًا أبقِ الدليل بعيدًا عن الإنترنت. يجب ألا يصل إلى المنفذين 389 و636 إلا خوادم التطبيقات وبوابات VPN وأعضاء النطاق، بقاعدة جدار حماية تسمّي كل شبكة مصدر، مثل 192.0.2.0/24 لطبقة التطبيقات."
+   },
+   {
+    "id": "attacks",
+    "type": "text",
+    "markdown": "## الهجمات والدفاعات\n\n| الهجوم | ما يفعله | الدفاع | الكشف |\n|:--|:--|:--|:--|\n| التعداد المجهول | تفريغ المستخدمين والمجموعات | `disallow bind_anon` ومنع افتراضي في ACL | ارتباطات بـ DN فارغ في السجلات |\n| رذاذ كلمات المرور | كلمة مرور واحدة مقابل قيم `uid` كثيرة | القفل وتحديد المعدل وMFA في المنبع | أخطاء `err=49` كثيرة من مصدر واحد |\n| حقن LDAP | يغيّر المهاجم المرشّح عبر مدخل غير مُهرَّب | تهريب المدخلات واستعمال واجهات مرشّح معلّمة | مرشّحات فيها `*)(` في سجلات التطبيق |\n| التقاط بيانات الاعتماد | قراءة الربط البسيط على المنفذ 389 | اشتراط TLS وحدّ أدنى لـ SSF | جلسات المنفذ 389 دون TLS |\n| سرقة التجزئات | قراءة `userPassword` | منع ACL وتجزئة قوية | قراءات `userPassword` من حسابات غير المصادقة |\n\n### حقن LDAP بمثال واحد\nيبني تطبيق المرشّح `(&(uid=INPUT)(userPassword=...))` بدمج النصوص، فيغيّر مدخل مثل `*` المعنى. الحل ليس حظر محارف بعينها بل **تهريب** المحارف الخاصة (`*` و`(` و`)` والشرطة المائلة العكسية وNUL) بدالة المكتبة، أو استعمال واجهة تربط القيم بشكل منفصل، مع حساب خدمة لا يقرأ الكثير أصلًا."
+   },
+   {
+    "id": "detect",
+    "type": "code",
+    "language": "bash",
+    "filename": "detect-spray.sh",
+    "code": "# slapd logs at loglevel 'stats'; err=49 means invalid credentials\ngrep 'RESULT' /var/log/slapd.log | grep 'err=49' \\\n  | sed -E 's/.*conn=([0-9]+).*/\\1/' | sort | uniq -c | sort -rn | head\n# Map conn IDs back to client IPs from the ACCEPT lines\ngrep 'ACCEPT from IP=' /var/log/slapd.log | tail -3",
+    "caption": "عدّ عمليات الربط الفاشلة لكل اتصال ثم اربط الاتصالات الكثيرة الضجيج بعناوين المصدر (مثل 203.0.113.45:51022)."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "لا تعطّل فحص الشهادات",
+    "markdown": "تأتي تطبيقات قديمة كثيرة بإعداد `TLS_REQCERT never` أو `LDAP_OPT_X_TLS_NEVER`، فيصبح التشفير شكليًا لأن المهاجم بشهادة مزوّرة يُقبل. استورد الجهة المصدِرة الداخلية إلى مخزن الثقة واشترط `demand` بدلًا من ذلك."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في جهاز افتراضي مؤقت تملكه ثبّت OpenLDAP (`slapd`) وأضف ثلاثة مستخدمين تجريبيين تحت `dc=example,dc=com`.\n\n1. نفّذ `ldapsearch` مجهولًا وتأكد أنه يعيد المستخدمين.\n2. طبّق ملف LDIF للتقوية وقوائم ACL أعلاه.\n3. أعد البحث: عاديًا، ثم `-ZZ` مجهولًا، ثم `-ZZ -D` بحساب خدمة.\n4. تأكد أن حساب الخدمة لا يقرأ `userPassword`.\n5. افشل في خمس عمليات ربط عمدًا وابحث عن أسطر `err=49` في السجل.\n\nاكتب جملة واحدة عن الضابط الذي أوقف كل خطوة."
+   },
+   {
+    "id": "kt",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "LDAP",
+      "definition": "بروتوكول للاستعلام عن خدمة الدليل وتعديلها."
+     },
+     {
+      "term": "الاسم المميّز (DN)",
+      "definition": "المسار الفريد للمدخل في الشجرة."
+     },
+     {
+      "term": "الربط (Bind)",
+      "definition": "عملية المصادقة التي تحدد هوية العميل."
+     },
+     {
+      "term": "LDAPS",
+      "definition": "LDAP داخل TLS على المنفذ TCP 636."
+     },
+     {
+      "term": "StartTLS",
+      "definition": "ترقية جلسة المنفذ 389 إلى TLS."
+     },
+     {
+      "term": "SASL",
+      "definition": "إطار لآليات مصادقة قابلة للتبديل مثل GSSAPI وSCRAM."
+     },
+     {
+      "term": "قائمة التحكم بالوصول (ACL)",
+      "definition": "قواعد تحدد من يقرأ أو يكتب أي الخصائص."
+     },
+     {
+      "term": "حقن LDAP",
+      "definition": "تغيير مرشّح البحث عبر مدخل غير مُهرَّب."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "أي إعداد يمنع التقاط كلمات المرور في الربط البسيط على أفضل وجه؟",
+      "options": [
+       "كلمات مرور أطول",
+       "اشتراط TLS (‏LDAPS أو StartTLS) قبل الربط",
+       "إعادة تسمية لاحقة الدليل",
+       "استعمال منفذ غير قياسي فقط"
+      ],
+      "answer": 1,
+      "explanation": "يرسل الربط البسيط كلمة المرور نصًا صريحًا، فلا بد من تشفير القناة أولًا. ولا يغيّر المنفذ المختلف ولا طول كلمة المرور هذا."
+     },
+     {
+      "question": "أي مما يلي دفاعات صحيحة ضد حقن LDAP؟ (اختر كل ما ينطبق)",
+      "options": [
+       "تهريب المحارف الخاصة في مدخل المرشّح",
+       "استعمال مكتبة تربط قيم المرشّح بشكل منفصل",
+       "منح حساب التطبيق قراءة كل شيء",
+       "حصر حساب الخدمة في أساس بحث ضيّق"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "التهريب والمرشّحات المعلّمة يزيلان الثغرة، والحساب الضيّق يحدّ الضرر، أما القراءة الواسعة فتزيد الأمر سوءًا."
+     },
+     {
+      "question": "تنتهي قائمة ACL دون قاعدة أخيرة. ما أأمن طريقة لإنهائها؟",
+      "options": [
+       "تركها فالافتراضي دائمًا منع",
+       "إضافة `to * by * none` صراحة",
+       "إضافة `to * by * read`",
+       "إضافة `by anonymous write`"
+      ],
+      "answer": 1,
+      "explanation": "تختلف الافتراضات بحسب الإصدار وقاعدة البيانات، والمنع الافتراضي الصريح يجعل السياسة مرئية وقابلة للاختبار."
+     },
+     {
+      "question": "يُظهر سجلك مئات نتائج `err=49` من 203.0.113.45 عبر قيم uid مختلفة كثيرة. ما أرجح تفسير؟",
+      "options": [
+       "نسخ متماثل عادي",
+       "رذاذ كلمات المرور",
+       "انتهاء صلاحية شهادة",
+       "حقن LDAP"
+      ],
+      "answer": 1,
+      "explanation": "مصدر واحد يجرّب حسابات كثيرة مع فشل متكرر هو نمط الرذاذ. أضف قفلًا أو تحديدًا للمعدل وراجع المصدر."
+     },
+     {
+      "question": "أي طريقة ربط هي الأفضل لحساب جهاز يملك بنية PKI؟",
+      "options": [
+       "مجهول",
+       "ربط بسيط بكلمة مرور مشتركة",
+       "SASL EXTERNAL بشهادة عميل",
+       "ربط بسيط على المنفذ 389"
+      ],
+      "answer": 2,
+      "explanation": "يزيل TLS المتبادل الأسرار المشتركة من ملفات الإعداد ويعطي كل جهاز هوية مستقلة قابلة للإلغاء."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- الدليل هدف عالي القيمة: هويات ومجموعات وربما تجزئات كلمات مرور.\n- اشترط TLS قبل أي ربط، وتحقق من الشهادات، وعطّل الربط المجهول.\n- فضّل SASL أو شهادات العميل للخدمات، ولا تستعمل الربط البسيط إلا داخل TLS.\n- طبّق ACL على مستوى الخصائص مع منع افتراضي، وامنح كل تطبيق حسابًا ضيّقًا خاصًا به.\n- هرّب مدخلات المرشّح لمنع الحقن، وراقب السجلات بحثًا عن دفعات `err=49` وقراءات غير متوقعة.\n\nبعد ذلك انظر كيف تنطبق هذه الأفكار على أشهر دليل في الأعمال: [أمن Active Directory](/learn/security-architecture-resilience/active-directory-security). ولأنواع الحسابات التي تتصل به اقرأ [أمن حسابات الخدمة](/learn/security-architecture-resilience/service-account-security)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,528 @@
+{
+ "slug": "automated-incident-enrichment",
+ "title": "Automated Incident Enrichment",
+ "summary": "Add reputation, ownership and privilege context to alerts automatically so analysts can triage in seconds, safely.",
+ "duration_minutes": 30,
+ "objectives": [
+  "Identify the observables worth enriching and their sources",
+  "Design an idempotent, cached, fail-soft enrichment pipeline",
+  "Apply guardrails for data leakage, secrets and untrusted content",
+  "Measure the pipeline with triage-time and accuracy metrics"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 02:10 an alert arrives: `Outbound connection to 203.0.113.45 from host FIN-LT-0412`. The analyst now needs ten answers before deciding anything. Who owns the laptop? Is the user an administrator? Is the address known as bad? Was the same address seen on other hosts? Each answer lives in a different console, and collecting them by hand takes fifteen minutes per alert.\n\n**Incident enrichment** is the step of adding context to an alert so a human or a playbook can decide quickly. Automating it removes the slowest, most repetitive part of triage. The analyst opens the case and finds the context already attached. This lesson shows how to design an enrichment pipeline that is fast, safe and measurable."
+  },
+  {
+   "id": "what",
+   "type": "text",
+   "markdown": "## Step 1: Decide what to enrich\n\nEnrichment is driven by the **observables** inside an alert: an IP address, a domain, a file hash, a user name, a host name. For each type, decide which questions matter and which source answers them.\n\n| Observable | Question | Typical source |\n|:--|:--|:--|\n| Public IP | Is it known malicious? Who owns it? | Threat intelligence platform, WHOIS, passive DNS |\n| Domain or URL | How old is it? Is it categorized as risky? | Threat intelligence, DNS history |\n| File hash | Is it known? Is it signed? | Reputation service, EDR, sandbox |\n| User | Role, manager, privileged groups, recent sign-ins | Directory, IAM, identity provider |\n| Host | Owner, criticality, patch level, open vulnerabilities | CMDB, asset inventory, vulnerability scanner |\n| Internal IP | Which host held it at that time? | DHCP logs, NAC, EDR |\n\nKeep the list short. Every extra lookup adds latency, cost and a new thing that can fail. A good rule is to enrich only with data that changes the decision: severity, containment choice or escalation path."
+  },
+  {
+   "id": "design",
+   "type": "text",
+   "markdown": "## Step 2: Design the pipeline\n\nA reliable pipeline has five stages: **extract** observables, **normalize** them, **look up** each one in parallel, **score** the combined result and **write** it back to the case. The order matters. Normalizing first (lowercase domains, strip ports, defang) prevents duplicate lookups and cache misses.\n\nThree design rules keep the pipeline dependable:\n\n- **Idempotent.** Running enrichment twice must not create duplicate notes or duplicate tickets.\n- **Fail soft.** If one source times out, record `source unavailable` and continue. An alert must never be stuck because a reputation API is slow.\n- **Cache.** The same address often appears in hundreds of alerts. Cache results for a period suited to the data: minutes for reputation, hours for WHOIS, days for domain age.\n\nThis is also where your SOAR platform or a small service fits. See [Security API Integration](/learn/security-architecture-resilience/security-api-integration) for authenticating and calling the sources safely."
+  },
+  {
+   "id": "anim",
+   "type": "animation",
+   "kind": "flow",
+   "title": "Enrichment pipeline for one alert",
+   "data": {
+    "token": "Alert",
+    "nodes": [
+     {
+      "id": "siem",
+      "label": "SIEM",
+      "sub": "alert source",
+      "icon": "log"
+     },
+     {
+      "id": "soar",
+      "label": "SOAR",
+      "sub": "playbook",
+      "icon": "cpu"
+     },
+     {
+      "id": "ti",
+      "label": "Threat intel",
+      "sub": "ti.example.com",
+      "icon": "globe"
+     },
+     {
+      "id": "cmdb",
+      "label": "CMDB / IAM",
+      "sub": "owner, role",
+      "icon": "database"
+     },
+     {
+      "id": "case",
+      "label": "Case",
+      "sub": "analyst queue",
+      "icon": "user"
+     }
+    ],
+    "steps": [
+     {
+      "at": "siem",
+      "caption": "The SIEM raises an alert with an IP, a host and a user."
+     },
+     {
+      "at": "soar",
+      "caption": "The playbook extracts and normalizes the observables."
+     },
+     {
+      "at": "ti",
+      "caption": "Reputation, WHOIS and passive DNS are queried in parallel with a short timeout.",
+      "tone": "secure"
+     },
+     {
+      "at": "cmdb",
+      "caption": "Host owner, criticality and user privileges are fetched from internal systems.",
+      "tone": "secure"
+     },
+     {
+      "at": "soar",
+      "caption": "Results are merged and a risk score is computed; a failed source is marked, not fatal.",
+      "tone": "warning"
+     },
+     {
+      "at": "case",
+      "caption": "The case opens with the context attached and a suggested priority.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "code",
+   "type": "code",
+   "language": "python",
+   "filename": "enrich_alert.py",
+   "code": "import os, time, requests\n\nTI = \"https://ti.example.com/api/v1\"\nTOKEN = os.environ[\"TI_API_TOKEN\"]          # injected by the vault, never hard-coded\n_cache = {}                                 # {key: (expires_at, value)}\n\ndef lookup_ip(ip, ttl=900):\n    hit = _cache.get(ip)\n    if hit and hit[0] > time.time():\n        return hit[1]                       # cache hit: no API call\n    try:\n        r = requests.get(f\"{TI}/ip/{ip}\", timeout=3,\n                         headers={\"Authorization\": f\"Bearer {TOKEN}\"})\n        r.raise_for_status()\n        value = r.json()\n    except requests.RequestException as e:\n        return {\"status\": \"source unavailable\", \"error\": type(e).__name__}\n    _cache[ip] = (time.time() + ttl, value)\n    return value\n\ndef score(ti, host):\n    points = 0\n    points += 50 if ti.get(\"verdict\") == \"malicious\" else 0\n    points += 30 if host.get(\"criticality\") == \"high\" else 0\n    points += 20 if host.get(\"user_is_admin\") else 0\n    return min(points, 100)",
+   "caption": "A minimal enrichment step: cached lookup, short timeout, fail-soft result and a transparent score."
+  },
+  {
+   "id": "term",
+   "type": "terminal",
+   "title": "Example enrichment result",
+   "lines": [
+    {
+     "prompt": "$",
+     "cmd": "python enrich_alert.py --alert 48213",
+     "output": "alert=48213 ip=203.0.113.45 host=FIN-LT-0412\nti.verdict=malicious ti.first_seen=2026-10-30 ti.source=ti.example.com\nhost.owner=a.rahman host.criticality=high user_is_admin=True\nwhois=unavailable (timeout after 3s)\nscore=100 priority=P1 notes_written=1",
+     "comment": "The WHOIS source failed softly; the alert still reached the analyst with a P1 score."
+    },
+    {
+     "prompt": "$",
+     "cmd": "python enrich_alert.py --alert 48213",
+     "output": "alert=48213 notes_written=0 (already enriched, skipped)",
+     "comment": "Running it again changes nothing: the step is idempotent."
+    }
+   ],
+   "caption": "Realistic output from a lab environment using documentation addresses."
+  },
+  {
+   "id": "scoring",
+   "type": "text",
+   "markdown": "## Turning context into a priority\n\nA score is only useful if the analyst can see why it was given. Keep the formula simple and show every contributing factor in the case note: `ti.verdict=malicious (+50)`, `criticality=high (+30)`, `user_is_admin (+20)`. A black-box number invites distrust, and an analyst who distrusts the score will re-do the lookups by hand, which defeats the purpose.\n\nTwo patterns help. First, use **hard rules for rare, severe combinations**, for example any alert involving a domain controller is at least P2 whatever the reputation says. Second, treat a missing source as neutral, not as good news: an unavailable WHOIS lookup adds no points and removes none, but the note records the gap. Finally, store the raw responses with a timestamp. Threat intelligence changes, and during a post-incident review you need to know what the pipeline knew at the time of the alert."
+  },
+  {
+   "id": "guard",
+   "type": "text",
+   "markdown": "## Step 3: Add guardrails\n\nEnrichment touches external services and untrusted data, so treat it as a security component, not just a convenience.\n\n- **Least privilege.** Give the pipeline read-only API keys scoped to lookups. It should not be able to change firewall rules or disable accounts unless a separate, approved response step does so.\n- **Rate limits and budgets.** Paid reputation APIs charge per query. Cache and deduplicate, and set a daily ceiling that raises an alert when reached.\n- **Data minimization.** Do not send internal host names, user names or full file contents to public services. Send hashes and public IP addresses only. Internal data stays in internal sources.\n- **Untrusted content.** Text returned by a third party, such as a page title or a WHOIS comment, is attacker-influenced. Render it as plain text, never execute it, and defang links before showing them.\n- **Secrets.** Load tokens from a vault or environment at run time, as in the code above.\n\nDecide too what automation may *decide* and what it may only *suggest*. A score of 100 should open a P1 case, but isolating a finance laptop should still wait for approval until the team trusts the data."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "Enrichment can leak data",
+   "markdown": "Sending an internal host name or a customer e-mail address to a public lookup site tells that site, and anyone watching its logs, what you are investigating. Look up only public indicators externally."
+  },
+  {
+   "id": "measure",
+   "type": "text",
+   "markdown": "## Step 4: Measure the result\n\nAutomation without measurement is a guess. Track a few numbers before and after rollout:\n\n| Metric | Meaning | Healthy direction |\n|:--|:--|:--|\n| Time to triage | Alert created to first analyst decision | Down |\n| Enrichment coverage | Share of alerts with all required context | Up, above 95 percent |\n| Source failure rate | Lookups that time out or error | Down |\n| False-priority rate | Cases whose automated priority an analyst changed | Down |\n\nReview the false-priority rate monthly. Every time an analyst changes the score, ask which input misled the pipeline and adjust the weights. The pipeline is a living detection control, so keep its logic in version control and review changes like any other code. The next lessons, [Detection-as-Code](/learn/security-architecture-resilience/detection-as-code) and [Security Testing and Validation Automation](/learn/security-architecture-resilience/security-testing-and-validation-automation), apply the same discipline to rules and tests."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "In a lab, write a script that reads five alerts from a CSV file (use `192.0.2.10`, `198.51.100.7` and `203.0.113.45` as sample addresses). For each one, look up the owner in a local `assets.csv`, simulate a reputation lookup with a dictionary, and print a score. Add a simulated timeout for one source and confirm the script reports `source unavailable` and still finishes. Run it twice and check that no duplicate output is produced."
+  },
+  {
+   "id": "terms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Enrichment",
+     "definition": "Adding context from other systems to an alert so it can be judged quickly."
+    },
+    {
+     "term": "Observable",
+     "definition": "A data point in an alert, such as an IP, domain, hash, user or host."
+    },
+    {
+     "term": "SOAR",
+     "definition": "Security orchestration, automation and response: a platform that runs playbooks across tools."
+    },
+    {
+     "term": "Idempotent",
+     "definition": "Safe to run repeatedly with the same result and no duplicates."
+    },
+    {
+     "term": "Fail soft",
+     "definition": "Continue with partial results when one source is unavailable."
+    },
+    {
+     "term": "Defanging",
+     "definition": "Altering a URL or IP so it cannot be clicked or resolved by accident."
+    },
+    {
+     "term": "Time to triage",
+     "definition": "Time from alert creation to the first analyst decision."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "Why normalize observables before looking them up?",
+     "options": [
+      "It prevents duplicate lookups and cache misses.",
+      "It makes the alert more severe.",
+      "It removes the need for an API token.",
+      "It encrypts the observable."
+     ],
+     "answer": 0,
+     "explanation": "Lowercase domains and stripped ports make equal indicators identical, so the cache works and you pay for each lookup once."
+    },
+    {
+     "question": "One reputation API times out. What should the pipeline do?",
+     "options": [
+      "Hold the alert until the API recovers.",
+      "Record the source as unavailable and continue.",
+      "Delete the alert.",
+      "Mark the indicator as clean."
+     ],
+     "answer": 1,
+     "explanation": "Fail soft: partial context is better than a stuck alert, and treating a failure as clean would hide threats."
+    },
+    {
+     "question": "Which data may be sent to a public lookup service? Choose all that apply.",
+     "options": [
+      "A file hash",
+      "A public IP address",
+      "An internal host name",
+      "A customer e-mail address"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "Hashes and public IPs are public indicators. Internal names and customer data reveal your environment and stay inside internal sources."
+    },
+    {
+     "question": "Which practices make an enrichment step safe to re-run? Choose all that apply.",
+     "options": [
+      "Check whether the case already has the note",
+      "Use a stable key per alert for writes",
+      "Create a new ticket on every run",
+      "Append the same note each time"
+     ],
+     "answer": [
+      0,
+      1
+     ],
+     "explanation": "Idempotence comes from detecting prior work or writing under a stable key. Creating or appending on every run produces duplicates."
+    },
+    {
+     "question": "A WHOIS comment returned by a third party contains odd text. How do you treat it?",
+     "options": [
+      "As trusted internal data",
+      "As plain text, never executed, with links defanged",
+      "As a command for the playbook",
+      "It is safe to ignore all handling"
+     ],
+     "answer": 1,
+     "explanation": "External content can be influenced by attackers, so display it inertly and never feed it to a shell or template."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Enrichment adds only the context that changes the decision: reputation, ownership, privilege and criticality.\n- Build the pipeline as extract, normalize, look up in parallel, score and write back.\n- Make it idempotent, cached and fail-soft.\n- Protect it with read-only keys, data minimization, vaulted secrets and inert handling of third-party text.\n- Measure time to triage, coverage and false-priority rate, and keep the logic in version control."
+  }
+ ],
+ "ar": {
+  "title": "الإثراء الآلي لبيانات الحوادث",
+  "summary": "أضف سياق السمعة والملكية والصلاحيات إلى التنبيهات آليًا ليفرزها المحللون في ثوانٍ وبأمان.",
+  "objectives": [
+   "تحديد المؤشرات الجديرة بالإثراء ومصادرها",
+   "تصميم خط إثراء عديم الأثر المتكرر ومخزَّن مؤقتًا وفاشل بلين",
+   "تطبيق ضوابط تمنع تسرّب البيانات وتحمي الأسرار والمحتوى غير الموثوق",
+   "قياس الخط بمقاييس زمن الفرز والدقة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "في الساعة 02:10 يصل تنبيه نصّه: `Outbound connection to 203.0.113.45 from host FIN-LT-0412`. يحتاج المحلل الآن إلى عشر إجابات قبل أن يقرّر أيَّ شيء: من يملك الحاسوب المحمول؟ هل المستخدم مسؤول نظام؟ هل العنوان معروف بسوء السمعة؟ وهل ظهر العنوان نفسه على أجهزة أخرى؟ كل إجابة موجودة في لوحة تحكم مختلفة، وجمعها يدويًا يستغرق خمس عشرة دقيقة لكل تنبيه.\n\nيُقصد بـ**إثراء الحوادث (Incident Enrichment)** إضافة السياق إلى التنبيه ليتمكّن المحلل أو سيناريو الاستجابة من القرار بسرعة. وأتمتته تزيل الجزء الأبطأ والأكثر تكرارًا من الفرز الأولي، فيفتح المحلل الحالة ويجد السياق مرفقًا بها. يوضّح هذا الدرس كيف تصمّم خط إثراء سريعًا وآمنًا وقابلًا للقياس."
+   },
+   {
+    "id": "what",
+    "type": "text",
+    "markdown": "## الخطوة 1: حدّد ما تريد إثراءه\n\nيقوم الإثراء على **المؤشرات الملاحَظة (Observables)** داخل التنبيه: عنوان IP أو نطاق أو بصمة ملف أو اسم مستخدم أو اسم جهاز. لكل نوع حدّد الأسئلة المهمة والمصدر الذي يجيب عنها.\n\n| المؤشر | السؤال | المصدر المعتاد |\n|:--|:--|:--|\n| عنوان IP عام | هل هو خبيث معروف؟ ومن يملكه؟ | منصة استخبارات التهديدات، WHOIS، سجل DNS السلبي |\n| نطاق أو رابط | ما عمره؟ وهل صُنّف خطرًا؟ | استخبارات التهديدات، تاريخ DNS |\n| بصمة ملف | هل هو معروف؟ وهل هو موقَّع؟ | خدمة السمعة، EDR، بيئة العزل |\n| مستخدم | الدور والمدير والمجموعات المميزة وآخر عمليات الدخول | الدليل، إدارة الهوية، مزوّد الهوية |\n| جهاز | المالك والأهمية ومستوى التحديث والثغرات المفتوحة | CMDB، جرد الأصول، ماسح الثغرات |\n| عنوان IP داخلي | أي جهاز امتلكه في ذلك الوقت؟ | سجلات DHCP، NAC، EDR |\n\nأبقِ القائمة قصيرة، فكل بحث إضافي يزيد التأخير والتكلفة ونقطة فشل جديدة. والقاعدة الجيدة أن تُثري فقط بما يغيّر القرار: درجة الخطورة أو خيار الاحتواء أو مسار التصعيد."
+   },
+   {
+    "id": "design",
+    "type": "text",
+    "markdown": "## الخطوة 2: صمّم الخط\n\nيتألف الخط الموثوق من خمس مراحل: **استخراج** المؤشرات، و**توحيدها (Normalize)**، و**البحث** عن كل مؤشر بالتوازي، و**تقييم** النتيجة المجمّعة، ثم **الكتابة** في الحالة. والترتيب مهم، فالتوحيد أولًا (أحرف صغيرة للنطاقات وحذف المنافذ وتعطيل الروابط) يمنع تكرار البحث وإخفاقات الذاكرة المؤقتة.\n\nثلاث قواعد تجعل الخط موثوقًا:\n\n- **عديم الأثر المتكرر (Idempotent).** تشغيل الإثراء مرتين يجب ألا يُنشئ ملاحظات أو تذاكر مكررة.\n- **الفشل الليّن.** إذا انتهت مهلة أحد المصادر فسجّل `source unavailable` وتابع. يجب ألا يتعلّق تنبيه بسبب بطء واجهة سمعة.\n- **التخزين المؤقت (Cache).** يظهر العنوان نفسه غالبًا في مئات التنبيهات. خزّن النتائج لمدة تناسب البيانات: دقائق للسمعة، وساعات لـ WHOIS، وأيام لعمر النطاق.\n\nوهنا يأتي دور منصة SOAR أو خدمة صغيرة. راجع [تكامل واجهات برمجة الأمن](/learn/security-architecture-resilience/security-api-integration) لمعرفة المصادقة على المصادر واستدعائها بأمان."
+   },
+   {
+    "id": "anim",
+    "type": "animation",
+    "kind": "flow",
+    "title": "خط إثراء لتنبيه واحد",
+    "data": {
+     "token": "تنبيه",
+     "nodes": [
+      {
+       "id": "siem",
+       "label": "SIEM",
+       "sub": "مصدر التنبيه",
+       "icon": "log"
+      },
+      {
+       "id": "soar",
+       "label": "SOAR",
+       "sub": "سيناريو",
+       "icon": "cpu"
+      },
+      {
+       "id": "ti",
+       "label": "استخبارات",
+       "sub": "ti.example.com",
+       "icon": "globe"
+      },
+      {
+       "id": "cmdb",
+       "label": "CMDB / IAM",
+       "sub": "المالك والدور",
+       "icon": "database"
+      },
+      {
+       "id": "case",
+       "label": "الحالة",
+       "sub": "طابور المحلل",
+       "icon": "user"
+      }
+     ],
+     "steps": [
+      {
+       "at": "siem",
+       "caption": "يُصدر نظام SIEM تنبيهًا يحوي عنوان IP وجهازًا ومستخدمًا."
+      },
+      {
+       "at": "soar",
+       "caption": "يستخرج السيناريو المؤشرات ويوحّدها."
+      },
+      {
+       "at": "ti",
+       "caption": "تُستعلَم السمعة وWHOIS وDNS السلبي بالتوازي مع مهلة قصيرة.",
+       "tone": "secure"
+      },
+      {
+       "at": "cmdb",
+       "caption": "تُجلب بيانات مالك الجهاز وأهميته وصلاحيات المستخدم من الأنظمة الداخلية.",
+       "tone": "secure"
+      },
+      {
+       "at": "soar",
+       "caption": "تُدمج النتائج وتُحسب درجة الخطورة، ويُوسَم المصدر الفاشل دون أن يوقف العملية.",
+       "tone": "warning"
+      },
+      {
+       "at": "case",
+       "caption": "تُفتح الحالة وفيها السياق مرفقًا مع أولوية مقترحة.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "code",
+    "type": "code",
+    "language": "python",
+    "filename": "enrich_alert.py",
+    "code": "import os, time, requests\n\nTI = \"https://ti.example.com/api/v1\"\nTOKEN = os.environ[\"TI_API_TOKEN\"]          # injected by the vault, never hard-coded\n_cache = {}                                 # {key: (expires_at, value)}\n\ndef lookup_ip(ip, ttl=900):\n    hit = _cache.get(ip)\n    if hit and hit[0] > time.time():\n        return hit[1]                       # cache hit: no API call\n    try:\n        r = requests.get(f\"{TI}/ip/{ip}\", timeout=3,\n                         headers={\"Authorization\": f\"Bearer {TOKEN}\"})\n        r.raise_for_status()\n        value = r.json()\n    except requests.RequestException as e:\n        return {\"status\": \"source unavailable\", \"error\": type(e).__name__}\n    _cache[ip] = (time.time() + ttl, value)\n    return value\n\ndef score(ti, host):\n    points = 0\n    points += 50 if ti.get(\"verdict\") == \"malicious\" else 0\n    points += 30 if host.get(\"criticality\") == \"high\" else 0\n    points += 20 if host.get(\"user_is_admin\") else 0\n    return min(points, 100)",
+    "caption": "خطوة إثراء مبسّطة: بحث مخزَّن مؤقتًا ومهلة قصيرة ونتيجة تفشل بلين ودرجة شفافة."
+   },
+   {
+    "id": "term",
+    "type": "terminal",
+    "title": "مثال على نتيجة الإثراء",
+    "lines": [
+     {
+      "prompt": "$",
+      "cmd": "python enrich_alert.py --alert 48213",
+      "output": "alert=48213 ip=203.0.113.45 host=FIN-LT-0412\nti.verdict=malicious ti.first_seen=2026-10-30 ti.source=ti.example.com\nhost.owner=a.rahman host.criticality=high user_is_admin=True\nwhois=unavailable (timeout after 3s)\nscore=100 priority=P1 notes_written=1",
+      "comment": "فشل مصدر WHOIS بلين، ومع ذلك وصل التنبيه إلى المحلل بدرجة P1."
+     },
+     {
+      "prompt": "$",
+      "cmd": "python enrich_alert.py --alert 48213",
+      "output": "alert=48213 notes_written=0 (already enriched, skipped)",
+      "comment": "إعادة التشغيل لا تغيّر شيئًا: الخطوة عديمة الأثر المتكرر."
+     }
+    ],
+    "caption": "مخرجات واقعية من بيئة مخبرية تستخدم عناوين التوثيق."
+   },
+   {
+    "id": "scoring",
+    "type": "text",
+    "markdown": "## تحويل السياق إلى أولوية\n\nلا تفيد الدرجة إلا إذا رأى المحلل سبب منحها. أبقِ المعادلة بسيطة واعرض كل عامل مساهم في ملاحظة الحالة: `ti.verdict=malicious (+50)` و`criticality=high (+30)` و`user_is_admin (+20)`. الرقم الغامض يولّد عدم الثقة، والمحلل الذي لا يثق بالدرجة سيعيد عمليات البحث يدويًا، وهذا يهدم الغاية من الأتمتة.\n\nيفيد أسلوبان. الأول استخدام **قواعد صارمة للتراكيب النادرة الشديدة**، فمثلًا أي تنبيه يخص وحدة تحكم النطاق لا تقل أولويته عن P2 مهما كانت السمعة. والثاني اعتبار المصدر المفقود محايدًا لا خبرًا سارًا: بحث WHOIS غير المتاح لا يضيف نقاطًا ولا يخصمها، لكن الملاحظة تسجّل الفجوة. وأخيرًا احفظ الاستجابات الخام مع الطابع الزمني، فاستخبارات التهديدات تتغير، وتحتاج في المراجعة اللاحقة إلى معرفة ما كان الخط يعلمه وقت التنبيه."
+   },
+   {
+    "id": "guard",
+    "type": "text",
+    "markdown": "## الخطوة 3: أضف الضوابط الوقائية\n\nيتعامل الإثراء مع خدمات خارجية وبيانات غير موثوقة، فعامِله كمكوّن أمني لا كمجرد وسيلة راحة.\n\n- **أقل الصلاحيات.** امنح الخط مفاتيح واجهات للقراءة فقط ومقصورة على البحث. يجب ألا يستطيع تعديل قواعد جدار الحماية أو تعطيل الحسابات إلا عبر خطوة استجابة منفصلة معتمدة.\n- **حدود المعدل والميزانيات.** تحاسب واجهات السمعة المدفوعة لكل استعلام. خزّن مؤقتًا وأزل التكرار، وحدّد سقفًا يوميًا يُصدر تنبيهًا عند بلوغه.\n- **تقليل البيانات.** لا ترسل أسماء الأجهزة الداخلية أو المستخدمين أو محتوى الملفات إلى خدمات عامة. أرسل البصمات وعناوين IP العامة فقط، وتبقى البيانات الداخلية في المصادر الداخلية.\n- **المحتوى غير الموثوق.** النص العائد من طرف ثالث، مثل عنوان صفحة أو تعليق في WHOIS، قد يتأثر بالمهاجم. اعرضه نصًا عاديًا ولا تنفّذه أبدًا، وعطّل الروابط قبل عرضها.\n- **الأسرار.** حمّل الرموز من خزنة أو من البيئة وقت التشغيل كما في الشيفرة أعلاه.\n\nوحدّد كذلك ما يجوز للأتمتة أن *تقرره* وما يجوز لها أن *تقترحه* فقط. درجة 100 تفتح حالة P1، لكن عزل حاسوب مالي يظل بحاجة إلى موافقة إلى أن يثق الفريق بالبيانات."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "الإثراء قد يسرّب البيانات",
+    "markdown": "إرسال اسم جهاز داخلي أو بريد عميل إلى موقع بحث عام يخبر ذلك الموقع، ومن يراقب سجلاته، بما تحقق فيه. ابحث خارجيًا عن المؤشرات العامة فقط."
+   },
+   {
+    "id": "measure",
+    "type": "text",
+    "markdown": "## الخطوة 4: قِس النتيجة\n\nالأتمتة دون قياس مجرد تخمين. تتبّع بعض الأرقام قبل الإطلاق وبعده:\n\n| المقياس | المعنى | الاتجاه السليم |\n|:--|:--|:--|\n| زمن الفرز | من إنشاء التنبيه إلى أول قرار للمحلل | ينخفض |\n| تغطية الإثراء | نسبة التنبيهات التي اكتمل سياقها المطلوب | ترتفع فوق 95 بالمئة |\n| معدل فشل المصادر | عمليات البحث التي انتهت مهلتها أو أخفقت | ينخفض |\n| معدل الأولوية الخاطئة | الحالات التي غيّر المحلل أولويتها الآلية | ينخفض |\n\nراجع معدل الأولوية الخاطئة شهريًا. وكلما غيّر المحلل الدرجة فاسأل أي مدخل ضلّل الخط، ثم عدّل الأوزان. فالخط ضابط كشف حيّ، فاحفظ منطقه في نظام إدارة الإصدارات وراجع تغييراته كأي شيفرة أخرى. وتطبّق الدروس التالية، [الكشف كشيفرة](/learn/security-architecture-resilience/detection-as-code) و[أتمتة الاختبار والتحقق الأمني](/learn/security-architecture-resilience/security-testing-and-validation-automation)، الانضباط نفسه على القواعد والاختبارات."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "في بيئة مخبرية، اكتب سكربتًا يقرأ خمسة تنبيهات من ملف CSV (استخدم `192.0.2.10` و`198.51.100.7` و`203.0.113.45` عناوين تجريبية). ابحث لكل تنبيه عن المالك في ملف `assets.csv` محلي، وحاكِ بحث السمعة بقاموس، ثم اطبع الدرجة. أضف مهلة وهمية لأحد المصادر وتأكد من أن السكربت يطبع `source unavailable` ويكمل عمله. شغّله مرتين وتحقق من عدم تكرار المخرجات."
+   },
+   {
+    "id": "terms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "الإثراء",
+      "definition": "إضافة سياق من أنظمة أخرى إلى التنبيه ليُقيَّم بسرعة."
+     },
+     {
+      "term": "المؤشر الملاحَظ",
+      "definition": "عنصر بيانات في التنبيه مثل IP أو نطاق أو بصمة أو مستخدم أو جهاز."
+     },
+     {
+      "term": "SOAR",
+      "definition": "منصة تنسيق وأتمتة واستجابة أمنية تشغّل السيناريوهات عبر الأدوات."
+     },
+     {
+      "term": "عديم الأثر المتكرر",
+      "definition": "آمن للتشغيل المتكرر بالنتيجة نفسها ودون تكرار."
+     },
+     {
+      "term": "الفشل الليّن",
+      "definition": "المتابعة بنتائج جزئية عند تعذّر أحد المصادر."
+     },
+     {
+      "term": "تعطيل الروابط",
+      "definition": "تعديل الرابط أو العنوان كي لا يُنقر أو يُحلّ عن غير قصد."
+     },
+     {
+      "term": "زمن الفرز",
+      "definition": "الزمن من إنشاء التنبيه إلى أول قرار من المحلل."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "لماذا توحَّد المؤشرات قبل البحث عنها؟",
+      "options": [
+       "يمنع تكرار البحث وإخفاقات الذاكرة المؤقتة.",
+       "يجعل التنبيه أشد خطورة.",
+       "يلغي الحاجة إلى رمز الواجهة.",
+       "يشفّر المؤشر."
+      ],
+      "answer": 0,
+      "explanation": "الأحرف الصغيرة وحذف المنافذ تجعل المؤشرات المتساوية متطابقة، فتعمل الذاكرة المؤقتة وتدفع مرة واحدة لكل بحث."
+     },
+     {
+      "question": "انتهت مهلة إحدى واجهات السمعة. ماذا يفعل الخط؟",
+      "options": [
+       "يحتجز التنبيه حتى تتعافى الواجهة.",
+       "يسجّل المصدر غير متاح ويتابع.",
+       "يحذف التنبيه.",
+       "يصنّف المؤشر سليمًا."
+      ],
+      "answer": 1,
+      "explanation": "الفشل الليّن: السياق الجزئي أفضل من تنبيه عالق، واعتبار الفشل سلامة يخفي التهديدات."
+     },
+     {
+      "question": "أي البيانات يجوز إرسالها إلى خدمة بحث عامة؟ اختر كل ما ينطبق.",
+      "options": [
+       "بصمة ملف",
+       "عنوان IP عام",
+       "اسم جهاز داخلي",
+       "بريد إلكتروني لعميل"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "البصمات وعناوين IP العامة مؤشرات عامة. أما الأسماء الداخلية وبيانات العملاء فتكشف بيئتك وتبقى في المصادر الداخلية."
+     },
+     {
+      "question": "أي الممارسات تجعل خطوة الإثراء آمنة لإعادة التشغيل؟ اختر كل ما ينطبق.",
+      "options": [
+       "التحقق من وجود الملاحظة في الحالة",
+       "استخدام مفتاح ثابت لكل تنبيه عند الكتابة",
+       "إنشاء تذكرة جديدة عند كل تشغيل",
+       "إلحاق الملاحظة نفسها في كل مرة"
+      ],
+      "answer": [
+       0,
+       1
+      ],
+      "explanation": "عدم تكرار الأثر ينتج من اكتشاف العمل السابق أو الكتابة بمفتاح ثابت. أما الإنشاء أو الإلحاق في كل مرة فيولّد نسخًا مكررة."
+     },
+     {
+      "question": "تعليق WHOIS عائد من طرف ثالث يحوي نصًا غريبًا. كيف تتعامل معه؟",
+      "options": [
+       "بيانات داخلية موثوقة",
+       "نص عادي لا يُنفَّذ أبدًا مع تعطيل الروابط",
+       "أمر يُمرَّر إلى السيناريو",
+       "لا حاجة إلى أي معالجة"
+      ],
+      "answer": 1,
+      "explanation": "المحتوى الخارجي قد يتأثر بالمهاجمين، فاعرضه بلا أثر ولا تمرّره إلى صدفة أو قالب."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يضيف الإثراء السياق الذي يغيّر القرار فقط: السمعة والملكية والصلاحيات والأهمية.\n- ابنِ الخط بالترتيب: استخراج، توحيد، بحث بالتوازي، تقييم، ثم كتابة.\n- اجعله عديم الأثر المتكرر ومخزَّنًا مؤقتًا وفاشلًا بلين.\n- احمِه بمفاتيح للقراءة فقط وتقليل البيانات وأسرار في خزنة ومعاملة خاملة لنصوص الأطراف الثالثة.\n- قِس زمن الفرز والتغطية ومعدل الأولوية الخاطئة، واحفظ المنطق في نظام إدارة الإصدارات."
+   }
+  ]
+ }
+}

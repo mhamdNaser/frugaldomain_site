@@ -1,0 +1,578 @@
+{
+ "slug": "grafana-and-prometheus-infrastructure-monitoring",
+ "title": "Grafana and Prometheus Infrastructure Monitoring",
+ "summary": "Learn how Prometheus collects metrics, how PromQL and alert rules reveal suspicious changes in behavior, and how Grafana dashboards support security triage.",
+ "duration_minutes": 28,
+ "objectives": [
+  "Explain the Prometheus pull model and its main components",
+  "Write PromQL queries that compare current behavior with a baseline",
+  "Create alert rules for silent targets and abnormal traffic",
+  "Design secure, focused Grafana dashboards"
+ ],
+ "blocks": [
+  {
+   "id": "intro",
+   "type": "text",
+   "markdown": "At 02:10 a file server starts running slowly. Disk writes triple, CPU climbs, and a backup job that normally finishes in an hour is still running at dawn. Nothing in the SIEM fired, because no one logged in and no rule matched. The first sign was in the **metrics**: a sudden change in resource use. An encryption job, a crypto miner or a data-staging process all leave this kind of footprint before any signature exists.\n\n**Prometheus** collects and stores those numbers, and **Grafana** turns them into dashboards and alerts. Security teams use them for availability, capacity and as a second source of evidence. This lesson shows how they work, how to query them, and how to alert on behavior that affects security. It complements the log-based view in [Elastic Security and SIEM](/learn/security-operations-dfir/elastic-security-and-siem)."
+  },
+  {
+   "id": "model",
+   "type": "text",
+   "markdown": "## How Prometheus works\n\nPrometheus uses a **pull model**. Every 15 seconds or so, the server makes an HTTP request to each configured **target** and reads the plain-text metrics it exposes at `/metrics`. Each sample is stored in a time-series database with a timestamp.\n\n| Piece | What it does |\n|:--|:--|\n| **Exporter** | Exposes metrics for a system. `node_exporter` covers Linux hosts, `windows_exporter` covers Windows |\n| **Prometheus server** | Scrapes targets, stores time series, evaluates rules |\n| **Alertmanager** | Groups, deduplicates, silences and routes alerts |\n| **Grafana** | Dashboards, exploration and its own alerting |\n\nEvery series is a metric name plus **labels**, for example `node_cpu_seconds_total{instance=\"fs01\", mode=\"idle\"}`. Labels are what you filter and group by. There are four metric types: a **counter** only goes up (bytes sent), a **gauge** goes up and down (memory in use), and **histograms** and **summaries** record distributions such as request latency.\n\nThe pull model has a security advantage. Targets do not need outbound access to the monitoring server, and Prometheus knows when a target stops answering because the `up` metric becomes 0. A host that silently disappears from monitoring is itself a finding."
+  },
+  {
+   "id": "cfg",
+   "type": "code",
+   "language": "yaml",
+   "filename": "prometheus.yml",
+   "caption": "A minimal scrape configuration. Targets use example.com names and a private address; the highlighted lines show TLS and a credential placeholder for the Windows exporter.",
+   "highlight": [
+    12,
+    13,
+    14,
+    15
+   ],
+   "code": "global:\n  scrape_interval: 15s\n  evaluation_interval: 15s\n\nrule_files:\n  - /etc/prometheus/rules/*.yml\n\nscrape_configs:\n  - job_name: linux-hosts\n    static_configs:\n      - targets: ['fs01.example.com:9100', '10.20.0.15:9100']\n        labels: {env: prod, owner: infra}\n  - job_name: windows-hosts\n    scheme: https\n    tls_config:\n      ca_file: /etc/prometheus/ca.pem\n    basic_auth:\n      username: prometheus\n      password_file: /etc/prometheus/secrets/win_exporter.pass\n    static_configs:\n      - targets: ['dc01.example.com:9182']\n\nalerting:\n  alertmanagers:\n    - static_configs:\n        - targets: ['alertmanager.example.com:9093']"
+  },
+  {
+   "id": "promql",
+   "type": "text",
+   "markdown": "## Querying with PromQL\n\n**PromQL** is the query language. A bare metric name returns the latest value for every matching series. Most useful queries combine a **range selector**, a **function** and an **aggregation**.\n\n- `rate(node_network_transmit_bytes_total[5m])` converts a counter into bytes per second over five minutes. Always wrap counters in `rate()` or `increase()`, because the raw value only ever grows.\n- `sum by (instance) (...)` collapses the series to one per host.\n- `avg_over_time`, `max_over_time` and `quantile_over_time` summarize a window.\n- `... > 0.9` filters results, so a query can double as an alert condition.\n\nThe security-relevant questions are about **change**. How much outbound traffic does `fs01` normally send at night? Did disk write rate jump compared to the same hour last week? PromQL answers with the `offset` modifier, for example `rate(...[5m]) / rate(...[5m] offset 1w)`. A ratio above 3 means the host is behaving three times busier than usual.\n\nKeep label cardinality low. Never put a user name, IP address or URL into a label on a high-volume metric, because each unique value creates a new series and can exhaust memory."
+  },
+  {
+   "id": "rules",
+   "type": "code",
+   "language": "yaml",
+   "filename": "rules/security-behavior.yml",
+   "caption": "Two alert rules: an exporter that stopped answering, and outbound traffic far above the same hour last week. Both are starting points for investigation, not verdicts.",
+   "highlight": [
+    5,
+    13,
+    14
+   ],
+   "code": "groups:\n  - name: security-behavior\n    rules:\n      - alert: MonitoringTargetDown\n        expr: up{env=\"prod\"} == 0\n        for: 5m\n        labels: {severity: high}\n        annotations:\n          summary: \"{{ $labels.instance }} stopped answering scrapes\"\n      - alert: OutboundTrafficSpike\n        expr: |\n          sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m]))\n            > 3 * sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m] offset 1w))\n            and sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m])) > 5e6\n        for: 15m\n        labels: {severity: medium}\n        annotations:\n          summary: \"{{ $labels.instance }} sends 3x its usual outbound traffic\""
+  },
+  {
+   "id": "flow",
+   "type": "animation",
+   "kind": "flow",
+   "title": "From metric to notification",
+   "caption": "How an outbound-traffic spike on a file server reaches an analyst.",
+   "data": {
+    "token": "Sample",
+    "nodes": [
+     {
+      "id": "host",
+      "label": "File server",
+      "sub": "node_exporter :9100",
+      "icon": "server"
+     },
+     {
+      "id": "prom",
+      "label": "Prometheus",
+      "sub": "Scrape every 15s",
+      "icon": "database"
+     },
+     {
+      "id": "rule",
+      "label": "Alert rule",
+      "sub": "OutboundTrafficSpike",
+      "icon": "eye"
+     },
+     {
+      "id": "am",
+      "label": "Alertmanager",
+      "sub": "Group and route",
+      "icon": "cpu"
+     },
+     {
+      "id": "graf",
+      "label": "Grafana",
+      "sub": "Dashboard",
+      "icon": "globe"
+     },
+     {
+      "id": "soc",
+      "label": "Analyst",
+      "sub": "Pager and ticket",
+      "icon": "user"
+     }
+    ],
+    "steps": [
+     {
+      "at": "host",
+      "caption": "The exporter exposes the current network transmit counter at /metrics."
+     },
+     {
+      "at": "prom",
+      "caption": "Prometheus scrapes the counter and stores one sample per 15 seconds."
+     },
+     {
+      "at": "rule",
+      "caption": "The rule compares the current rate to the same time last week and finds a ratio of 4.2.",
+      "tone": "warning"
+     },
+     {
+      "at": "rule",
+      "caption": "The condition holds for 15 minutes, so the alert moves from pending to firing.",
+      "tone": "danger"
+     },
+     {
+      "at": "am",
+      "caption": "Alertmanager deduplicates it and routes it to the on-call channel."
+     },
+     {
+      "at": "graf",
+      "caption": "The analyst opens the Grafana panel to see when the rise began and which interface carried it."
+     },
+     {
+      "at": "soc",
+      "caption": "A ticket is opened and the analyst correlates the time window with SIEM and proxy logs.",
+      "tone": "success"
+     }
+    ]
+   }
+  },
+  {
+   "id": "grafana",
+   "type": "text",
+   "markdown": "## Grafana in the security workflow\n\nGrafana connects to many **data sources**: Prometheus, Loki for logs, Elasticsearch, SQL databases and cloud monitoring APIs. A single dashboard can show a metric panel next to the log lines from the same minute, which speeds up triage.\n\nGood security dashboards share a few habits:\n\n1. **One question per dashboard.** \"Is the authentication tier healthy?\" beats a wall of unrelated graphs.\n2. **Use variables.** A dropdown for `instance` or `env` replaces a dozen copies of the same panel.\n3. **Show thresholds and baselines.** A line for \"normal\" tells the viewer what to ignore.\n4. **Link to runbooks** from panel descriptions so the next step is one click away.\n\nGrafana can also evaluate its own alert rules and send them through contact points such as email, chat and webhooks. Use Prometheus rules when you want alerts stored as code next to the scrape configuration. Use Grafana alerting when rules span several data sources, for example a Prometheus metric and a Loki log count.\n\nHarden the stack itself. Monitoring holds a map of your infrastructure. Put Grafana behind SSO and TLS, disable anonymous access, give viewers the Viewer role only, and restrict `/metrics` endpoints to the Prometheus server's address with a firewall rule."
+  },
+  {
+   "id": "tbl",
+   "type": "text",
+   "markdown": "## Metrics, logs and traces compared\n\nMetrics are one of three observability signals. Each answers a different question, and a security team needs all of them.\n\n| Signal | Strength | Weakness | Security example |\n|:--|:--|:--|:--|\n| **Metrics** | Cheap, fast, ideal for trends and thresholds | No detail about individual events | Outbound bytes tripled overnight |\n| **Logs** | Rich detail about a single event | Larger and slower to search | Which account started the transfer |\n| **Traces** | Follow one request across services | Needs application instrumentation | Which microservice called the database |\n\nUse metrics to **notice**, logs to **explain**. The strongest practice is to jump from a metric alert to the logs of the same host and minute. For the log side of that workflow, see [Log Correlation and Event Enrichment](/learn/security-operations-dfir/log-correlation-and-event-enrichment) and [Continuous Security Monitoring](/learn/security-operations-dfir/continuous-security-monitoring)."
+  },
+  {
+   "id": "term",
+   "type": "terminal",
+   "title": "Checking targets and running a query",
+   "prompt": "$",
+   "lines": [
+    {
+     "cmd": "curl -s 'http://prometheus.example.com:9090/api/v1/query?query=up==0' | jq '.data.result[].metric.instance'",
+     "output": "\"dc02.example.com:9182\"",
+     "comment": "One target is down. A domain controller that stops reporting deserves a call, not just a ticket."
+    },
+    {
+     "cmd": "promtool check rules /etc/prometheus/rules/security-behavior.yml",
+     "output": "Checking /etc/prometheus/rules/security-behavior.yml\n  SUCCESS: 2 rules found",
+     "comment": "Always validate rule syntax before reloading the server."
+    }
+   ],
+   "caption": "Finding silent targets through the HTTP API and validating a rule file with promtool."
+  },
+  {
+   "id": "warn",
+   "type": "callout",
+   "variant": "warning",
+   "title": "A spike is not proof of an attack",
+   "markdown": "Backups, patch windows, quarter-end reports and software releases all create large traffic and CPU changes. Compare against a baseline that includes these events, record them in a calendar the alert can consult, and treat a metric alert as a reason to look at logs, not as a conclusion. Also keep in mind that an attacker with admin rights can stop an exporter, so combine metric monitoring with the `up == 0` rule above."
+  },
+  {
+   "id": "lab",
+   "type": "callout",
+   "variant": "lab",
+   "title": "Try it yourself",
+   "markdown": "On a lab Linux VM you own:\n\n1. Install `node_exporter` and Prometheus, then add the VM to `scrape_configs` as shown above.\n2. In the Prometheus expression browser, run `rate(node_cpu_seconds_total{mode!=\"idle\"}[5m])` and identify the busiest mode.\n3. Write the `MonitoringTargetDown` rule, run `promtool check rules` on it, and reload Prometheus.\n4. Stop `node_exporter` on the VM and watch the alert go from pending to firing.\n5. In Grafana, add Prometheus as a data source and build one panel showing outbound bytes per second. Add a text note stating what \"normal\" looks like."
+  },
+  {
+   "id": "keyterms",
+   "type": "keyterms",
+   "title": "Key terms",
+   "items": [
+    {
+     "term": "Exporter",
+     "definition": "A process that exposes a system's metrics over HTTP for Prometheus to scrape."
+    },
+    {
+     "term": "Scrape",
+     "definition": "A pull request in which Prometheus reads metrics from a target."
+    },
+    {
+     "term": "Label",
+     "definition": "A key-value pair attached to a series, used to filter and group."
+    },
+    {
+     "term": "Counter",
+     "definition": "A metric that only increases, used with rate() or increase()."
+    },
+    {
+     "term": "PromQL",
+     "definition": "The Prometheus query language for selecting and computing over time series."
+    },
+    {
+     "term": "Alertmanager",
+     "definition": "The service that groups, deduplicates, silences and routes Prometheus alerts."
+    },
+    {
+     "term": "Cardinality",
+     "definition": "The number of unique label combinations, which drives memory use."
+    },
+    {
+     "term": "Data source",
+     "definition": "A backend, such as Prometheus or Loki, that Grafana queries."
+    }
+   ]
+  },
+  {
+   "id": "quiz",
+   "type": "quiz",
+   "title": "Check your understanding",
+   "questions": [
+    {
+     "question": "How does Prometheus normally collect metrics?",
+     "options": [
+      "Targets push data to it over syslog",
+      "It pulls (scrapes) each target's /metrics endpoint on a schedule",
+      "Grafana forwards its dashboards to it",
+      "Alertmanager copies data from the SIEM"
+     ],
+     "answer": 1,
+     "explanation": "Prometheus uses a pull model, which also lets it detect a silent target through the up metric."
+    },
+    {
+     "question": "Why must a counter such as node_network_transmit_bytes_total be wrapped in rate()?",
+     "options": [
+      "The raw counter is encrypted",
+      "The raw value only grows, so it does not show the current speed",
+      "rate() deletes old samples",
+      "Counters cannot be graphed"
+     ],
+     "answer": 1,
+     "explanation": "rate() turns a growing total into a per-second speed, which is what you compare and alert on."
+    },
+    {
+     "question": "Which are good practices for a monitoring stack that holds a map of your infrastructure? (Choose all that apply.)",
+     "options": [
+      "Put Grafana behind SSO and TLS",
+      "Restrict /metrics to the Prometheus server address",
+      "Enable anonymous Admin access for convenience",
+      "Alert when production targets stop answering"
+     ],
+     "answer": [
+      0,
+      1,
+      3
+     ],
+     "explanation": "Anonymous admin access exposes the whole environment; the other options reduce exposure or detect tampering."
+    },
+    {
+     "question": "An alert fires: outbound traffic is 4x last week at 02:00. What is the best next step?",
+     "options": [
+      "Isolate the host immediately without checking",
+      "Ignore it because metrics have no detail",
+      "Check scheduled jobs, then correlate the time window with logs",
+      "Delete the rule"
+     ],
+     "answer": 2,
+     "explanation": "Metrics tell you something changed; logs and change calendars tell you why."
+    },
+    {
+     "question": "Why should you avoid putting a client IP address into a label on a busy metric?",
+     "options": [
+      "It breaks TLS",
+      "Each unique value creates a new series and can exhaust memory",
+      "Labels cannot contain digits",
+      "It disables Alertmanager"
+     ],
+     "answer": 1,
+     "explanation": "High cardinality is the most common cause of Prometheus memory problems. Put per-IP detail in logs instead."
+    }
+   ]
+  },
+  {
+   "id": "summary",
+   "type": "text",
+   "markdown": "## Summary\n\n- Prometheus pulls metrics from exporters, stores them as labeled time series and evaluates alert rules.\n- PromQL uses `rate()`, aggregation and `offset` to compare current behavior with a baseline.\n- Alertmanager routes alerts; Grafana visualizes and can join metrics and logs.\n- Use metrics to notice a change and logs to explain it.\n- Protect the monitoring stack and alert when targets go silent.\n\nNext, learn how to join events from different sources in [Log Correlation and Event Enrichment](/learn/security-operations-dfir/log-correlation-and-event-enrichment)."
+  }
+ ],
+ "ar": {
+  "title": "مراقبة البنية التحتية باستخدام Grafana وPrometheus",
+  "summary": "تعرّف كيف يجمع Prometheus المقاييس، وكيف تكشف PromQL وقواعد التنبيه التغيرات المشبوهة في السلوك، وكيف تدعم لوحات Grafana فرز الأحداث الأمنية.",
+  "objectives": [
+   "شرح نموذج السحب في Prometheus ومكوّناته الرئيسية",
+   "كتابة استعلامات PromQL تقارن السلوك الحالي بخط مرجعي",
+   "إنشاء قواعد تنبيه للأهداف الصامتة والحركة غير الطبيعية",
+   "تصميم لوحات Grafana آمنة ومركّزة"
+  ],
+  "blocks": [
+   {
+    "id": "intro",
+    "type": "text",
+    "markdown": "عند الثانية والعاشرة فجراً يبطؤ خادم ملفات: تتضاعف عمليات الكتابة على القرص ثلاث مرات، ويرتفع استهلاك المعالج، وتستمر مهمة نسخ احتياطي تنتهي عادة خلال ساعة حتى الفجر. لم يطلق نظام SIEM أي تنبيه لأن أحداً لم يسجّل الدخول ولم تتطابق قاعدة. كانت أولى العلامات في **المقاييس (Metrics)**: تغيّر مفاجئ في استهلاك الموارد. فمهمة تشفير أو برنامج تعدين أو عملية تجهيز بيانات للتسريب تترك هذا النوع من الأثر قبل ظهور أي توقيع.\n\nيجمع **Prometheus** هذه الأرقام ويخزّنها، ويحوّلها **Grafana** إلى لوحات معلومات وتنبيهات. تستخدمهما فرق الأمن لمتابعة التوافر والسعة ومصدراً ثانياً للأدلة. يوضّح هذا الدرس طريقة عملهما وكيفية الاستعلام عنهما وإطلاق التنبيهات على سلوك يؤثر في الأمن. وهو يكمّل النظرة المبنية على السجلات في [Elastic Security وSIEM](/learn/security-operations-dfir/elastic-security-and-siem)."
+   },
+   {
+    "id": "model",
+    "type": "text",
+    "markdown": "## كيف يعمل Prometheus\n\nيعتمد Prometheus **نموذج السحب (Pull)**: كل 15 ثانية تقريباً يرسل الخادم طلب HTTP إلى كل **هدف (Target)** مُعدّ ويقرأ المقاييس النصية التي يعرضها على المسار `/metrics`. تُخزَّن كل عيّنة في قاعدة بيانات سلاسل زمنية مع ختم زمني.\n\n| المكوّن | وظيفته |\n|:--|:--|\n| **المُصدِّر (Exporter)** | يعرض مقاييس نظام ما. يغطي `node_exporter` أجهزة لينكس، و`windows_exporter` أجهزة ويندوز |\n| **خادم Prometheus** | يسحب من الأهداف ويخزّن السلاسل الزمنية ويقيّم القواعد |\n| **Alertmanager** | يجمّع التنبيهات ويزيل تكرارها ويكتمها ويوجّهها |\n| **Grafana** | لوحات المعلومات والاستكشاف وتنبيهاتها الخاصة |\n\nكل سلسلة هي اسم مقياس مع **وسوم (Labels)**، مثل `node_cpu_seconds_total{instance=\"fs01\", mode=\"idle\"}`. الوسوم هي ما ترشّح به وتجمّع. وللمقاييس أربعة أنواع: **العدّاد (Counter)** يزداد فقط (بايتات مرسلة)، و**المقياس (Gauge)** يصعد ويهبط (الذاكرة المستخدمة)، أما **المدرّجات (Histograms)** و**الملخصات (Summaries)** فتسجل توزيعات مثل زمن الاستجابة.\n\nللنموذج ميزة أمنية: لا تحتاج الأهداف إلى وصول صادر نحو خادم المراقبة، ويعرف Prometheus متى يتوقف هدف عن الرد لأن المقياس `up` يصبح 0. والجهاز الذي يختفي بصمت من المراقبة هو نفسه نتيجة تستحق التحقيق."
+   },
+   {
+    "id": "cfg",
+    "type": "code",
+    "language": "yaml",
+    "filename": "prometheus.yml",
+    "caption": "إعداد سحب مبسّط. تستخدم الأهداف أسماء example.com وعنواناً خاصاً، وتُظهر الأسطر المظلّلة TLS وعنصراً نائباً لبيانات الاعتماد لمُصدِّر ويندوز.",
+    "highlight": [
+     12,
+     13,
+     14,
+     15
+    ],
+    "code": "global:\n  scrape_interval: 15s\n  evaluation_interval: 15s\n\nrule_files:\n  - /etc/prometheus/rules/*.yml\n\nscrape_configs:\n  - job_name: linux-hosts\n    static_configs:\n      - targets: ['fs01.example.com:9100', '10.20.0.15:9100']\n        labels: {env: prod, owner: infra}\n  - job_name: windows-hosts\n    scheme: https\n    tls_config:\n      ca_file: /etc/prometheus/ca.pem\n    basic_auth:\n      username: prometheus\n      password_file: /etc/prometheus/secrets/win_exporter.pass\n    static_configs:\n      - targets: ['dc01.example.com:9182']\n\nalerting:\n  alertmanagers:\n    - static_configs:\n        - targets: ['alertmanager.example.com:9093']"
+   },
+   {
+    "id": "promql",
+    "type": "text",
+    "markdown": "## الاستعلام بلغة PromQL\n\n**PromQL** هي لغة الاستعلام. اسم المقياس وحده يعيد آخر قيمة لكل سلسلة مطابقة. وتجمع معظم الاستعلامات المفيدة بين **محدّد نطاق (Range selector)** و**دالة** و**تجميع**.\n\n- `rate(node_network_transmit_bytes_total[5m])` يحوّل العدّاد إلى بايت في الثانية على خمس دقائق. غلّف العدّادات دائماً بـ `rate()` أو `increase()` لأن القيمة الخام تزداد فقط.\n- `sum by (instance) (...)` يختزل السلاسل إلى سلسلة لكل جهاز.\n- تلخّص `avg_over_time` و`max_over_time` و`quantile_over_time` نافذة زمنية.\n- `... > 0.9` يرشّح النتائج، فيصلح الاستعلام شرطاً للتنبيه.\n\nالأسئلة المهمة أمنياً تتعلق بـ**التغيّر**: كم حركة صادرة يرسلها `fs01` عادة ليلاً؟ هل قفز معدل الكتابة على القرص مقارنة بالساعة نفسها الأسبوع الماضي؟ تجيب PromQL بالمعدِّل `offset`، مثل `rate(...[5m]) / rate(...[5m] offset 1w)`. نسبة فوق 3 تعني أن الجهاز أنشط بثلاثة أضعاف المعتاد.\n\nأبقِ عدد القيم المميّزة للوسوم (Cardinality) منخفضاً. لا تضع اسم مستخدم أو عنوان IP أو رابطاً في وسم على مقياس عالي الحجم، لأن كل قيمة فريدة تنشئ سلسلة جديدة وقد تستنزف الذاكرة."
+   },
+   {
+    "id": "rules",
+    "type": "code",
+    "language": "yaml",
+    "filename": "rules/security-behavior.yml",
+    "caption": "قاعدتا تنبيه: مُصدِّر توقف عن الرد، وحركة صادرة تفوق كثيراً الساعة نفسها في الأسبوع الماضي. كلتاهما نقطة بداية للتحقيق وليستا حكماً.",
+    "highlight": [
+     5,
+     13,
+     14
+    ],
+    "code": "groups:\n  - name: security-behavior\n    rules:\n      - alert: MonitoringTargetDown\n        expr: up{env=\"prod\"} == 0\n        for: 5m\n        labels: {severity: high}\n        annotations:\n          summary: \"{{ $labels.instance }} stopped answering scrapes\"\n      - alert: OutboundTrafficSpike\n        expr: |\n          sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m]))\n            > 3 * sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m] offset 1w))\n            and sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m])) > 5e6\n        for: 15m\n        labels: {severity: medium}\n        annotations:\n          summary: \"{{ $labels.instance }} sends 3x its usual outbound traffic\""
+   },
+   {
+    "id": "flow",
+    "type": "animation",
+    "kind": "flow",
+    "title": "من المقياس إلى الإشعار",
+    "caption": "كيف يصل ارتفاع الحركة الصادرة على خادم ملفات إلى المحلّل.",
+    "data": {
+     "token": "عيّنة",
+     "nodes": [
+      {
+       "id": "host",
+       "label": "خادم الملفات",
+       "sub": "node_exporter :9100",
+       "icon": "server"
+      },
+      {
+       "id": "prom",
+       "label": "Prometheus",
+       "sub": "سحب كل 15 ثانية",
+       "icon": "database"
+      },
+      {
+       "id": "rule",
+       "label": "قاعدة التنبيه",
+       "sub": "OutboundTrafficSpike",
+       "icon": "eye"
+      },
+      {
+       "id": "am",
+       "label": "Alertmanager",
+       "sub": "تجميع وتوجيه",
+       "icon": "cpu"
+      },
+      {
+       "id": "graf",
+       "label": "Grafana",
+       "sub": "لوحة معلومات",
+       "icon": "globe"
+      },
+      {
+       "id": "soc",
+       "label": "المحلّل",
+       "sub": "منبّه وتذكرة",
+       "icon": "user"
+      }
+     ],
+     "steps": [
+      {
+       "at": "host",
+       "caption": "يعرض المُصدِّر عدّاد الإرسال الشبكي الحالي على /metrics."
+      },
+      {
+       "at": "prom",
+       "caption": "يسحب Prometheus العدّاد ويخزّن عيّنة كل 15 ثانية."
+      },
+      {
+       "at": "rule",
+       "caption": "تقارن القاعدة المعدل الحالي بالوقت نفسه الأسبوع الماضي وتجد نسبة 4.2.",
+       "tone": "warning"
+      },
+      {
+       "at": "rule",
+       "caption": "يستمر الشرط 15 دقيقة فينتقل التنبيه من الانتظار إلى الإطلاق.",
+       "tone": "danger"
+      },
+      {
+       "at": "am",
+       "caption": "يزيل Alertmanager تكراره ويوجّهه إلى قناة المناوب."
+      },
+      {
+       "at": "graf",
+       "caption": "يفتح المحلّل لوحة Grafana ليرى متى بدأ الارتفاع وأي واجهة حملته."
+      },
+      {
+       "at": "soc",
+       "caption": "تُفتح تذكرة ويربط المحلّل النافذة الزمنية مع سجلات SIEM والوكيل.",
+       "tone": "success"
+      }
+     ]
+    }
+   },
+   {
+    "id": "grafana",
+    "type": "text",
+    "markdown": "## Grafana في سير العمل الأمني\n\nتتصل Grafana بمصادر **بيانات (Data sources)** كثيرة: Prometheus وLoki للسجلات وElasticsearch وقواعد SQL وواجهات المراقبة السحابية. تعرض لوحة واحدة لوحة مقياس بجانب أسطر السجل من الدقيقة نفسها، ما يسرّع الفرز.\n\nتتشارك لوحات المعلومات الأمنية الجيدة في عادات قليلة:\n\n1. **سؤال واحد لكل لوحة.** «هل طبقة المصادقة سليمة؟» أفضل من جدار رسوم لا صلة بينها.\n2. **استخدم المتغيّرات.** قائمة منسدلة لـ `instance` أو `env` تغني عن عشرات النسخ من اللوحة نفسها.\n3. **أظهر العتبات والخطوط المرجعية.** خط «الطبيعي» يخبر القارئ بما يتجاهله.\n4. **اربط بدليل التشغيل (Runbook)** من وصف اللوحة ليكون الإجراء التالي على بعد نقرة.\n\nيمكن لـ Grafana أيضاً تقييم قواعد تنبيه خاصة بها وإرسالها عبر نقاط اتصال مثل البريد والدردشة وWebhook. استخدم قواعد Prometheus عندما تريد التنبيهات شيفرةً مخزنة بجانب إعداد السحب، واستخدم تنبيهات Grafana عندما تمتد القاعدة على عدة مصادر، كمقياس Prometheus وعدد سجلات من Loki.\n\nحصّن المنظومة نفسها، فالمراقبة تحمل خريطة لبنيتك التحتية. ضع Grafana خلف SSO وTLS، وعطّل الوصول المجهول، وامنح المشاهدين دور Viewer فقط، وقيّد نقاط `/metrics` بعنوان خادم Prometheus عبر قاعدة جدار حماية."
+   },
+   {
+    "id": "tbl",
+    "type": "text",
+    "markdown": "## مقارنة المقاييس والسجلات والتتبّع\n\nالمقاييس إحدى ثلاث إشارات للرصد (Observability)، وتجيب كل منها عن سؤال مختلف، ويحتاج فريق الأمن إليها جميعاً.\n\n| الإشارة | نقطة القوة | نقطة الضعف | مثال أمني |\n|:--|:--|:--|:--|\n| **المقاييس** | رخيصة وسريعة وتناسب الاتجاهات والعتبات | بلا تفاصيل عن الأحداث الفردية | تضاعفت البايتات الصادرة ثلاث مرات ليلاً |\n| **السجلات** | تفاصيل غنية عن حدث واحد | أكبر حجماً وأبطأ بحثاً | أي حساب بدأ النقل |\n| **التتبّع (Traces)** | تتبع طلب واحد عبر الخدمات | تتطلب أدوات قياس داخل التطبيق | أي خدمة مصغّرة استدعت قاعدة البيانات |\n\nاستخدم المقاييس لـ**الملاحظة** والسجلات لـ**التفسير**. وأقوى الممارسات هي الانتقال من تنبيه المقياس إلى سجلات الجهاز نفسه في الدقيقة نفسها. وللجانب المتعلق بالسجلات في سير العمل هذا انظر [ربط السجلات وإثراء الأحداث](/learn/security-operations-dfir/log-correlation-and-event-enrichment) و[المراقبة الأمنية المستمرة](/learn/security-operations-dfir/continuous-security-monitoring)."
+   },
+   {
+    "id": "term",
+    "type": "terminal",
+    "title": "فحص الأهداف وتنفيذ استعلام",
+    "prompt": "$",
+    "lines": [
+     {
+      "cmd": "curl -s 'http://prometheus.example.com:9090/api/v1/query?query=up==0' | jq '.data.result[].metric.instance'",
+      "output": "\"dc02.example.com:9182\"",
+      "comment": "هدف واحد متوقف. مراقب نطاق يتوقف عن الإبلاغ يستحق مكالمة وليس تذكرة فقط."
+     },
+     {
+      "cmd": "promtool check rules /etc/prometheus/rules/security-behavior.yml",
+      "output": "Checking /etc/prometheus/rules/security-behavior.yml\n  SUCCESS: 2 rules found",
+      "comment": "تحقق دائماً من صياغة القواعد قبل إعادة تحميل الخادم."
+     }
+    ],
+    "caption": "إيجاد الأهداف الصامتة عبر واجهة HTTP والتحقق من ملف قواعد بالأداة promtool."
+   },
+   {
+    "id": "warn",
+    "type": "callout",
+    "variant": "warning",
+    "title": "الارتفاع ليس دليلاً على هجوم",
+    "markdown": "النسخ الاحتياطي ونوافذ التحديث وتقارير نهاية الربع وإصدارات البرمجيات كلها تحدث تغيرات كبيرة في الحركة والمعالج. قارن بخط مرجعي يتضمن هذه الأحداث، وسجّلها في تقويم تطّلع عليه القاعدة، واعتبر تنبيه المقياس سبباً لفحص السجلات لا استنتاجاً. وتذكّر أن مهاجماً بصلاحيات مدير قد يوقف المُصدِّر، فادمج مراقبة المقاييس مع قاعدة `up == 0` أعلاه."
+   },
+   {
+    "id": "lab",
+    "type": "callout",
+    "variant": "lab",
+    "title": "جرّب بنفسك",
+    "markdown": "على جهاز Linux افتراضي تجريبي تملكه:\n\n1. ثبّت `node_exporter` وPrometheus، ثم أضف الجهاز إلى `scrape_configs` كما سبق.\n2. في متصفح التعابير في Prometheus نفّذ `rate(node_cpu_seconds_total{mode!=\"idle\"}[5m])` وحدّد النمط الأكثر نشاطاً.\n3. اكتب القاعدة `MonitoringTargetDown` وشغّل عليها `promtool check rules` ثم أعد تحميل Prometheus.\n4. أوقف `node_exporter` على الجهاز وراقب انتقال التنبيه من الانتظار إلى الإطلاق.\n5. في Grafana أضف Prometheus مصدر بيانات وابنِ لوحة تعرض البايتات الصادرة في الثانية، وأضف ملاحظة نصية توضّح شكل الوضع الطبيعي."
+   },
+   {
+    "id": "keyterms",
+    "type": "keyterms",
+    "title": "مصطلحات أساسية",
+    "items": [
+     {
+      "term": "Exporter",
+      "definition": "عملية تعرض مقاييس نظام عبر HTTP ليسحبها Prometheus."
+     },
+     {
+      "term": "Scrape",
+      "definition": "طلب سحب يقرأ فيه Prometheus المقاييس من هدف."
+     },
+     {
+      "term": "Label",
+      "definition": "زوج مفتاح وقيمة مرتبط بسلسلة زمنية، يُستخدم في الترشيح والتجميع."
+     },
+     {
+      "term": "Counter",
+      "definition": "مقياس يزداد فقط، ويُستخدم مع rate() أو increase()."
+     },
+     {
+      "term": "PromQL",
+      "definition": "لغة استعلام Prometheus لاختيار السلاسل الزمنية والحساب عليها."
+     },
+     {
+      "term": "Alertmanager",
+      "definition": "الخدمة التي تجمّع تنبيهات Prometheus وتزيل تكرارها وتكتمها وتوجّهها."
+     },
+     {
+      "term": "Cardinality",
+      "definition": "عدد تركيبات الوسوم الفريدة، وهو ما يحدد استهلاك الذاكرة."
+     },
+     {
+      "term": "Data source",
+      "definition": "واجهة خلفية مثل Prometheus أو Loki تستعلم عنها Grafana."
+     }
+    ]
+   },
+   {
+    "id": "quiz",
+    "type": "quiz",
+    "title": "تحقّق من فهمك",
+    "questions": [
+     {
+      "question": "كيف يجمع Prometheus المقاييس عادة؟",
+      "options": [
+       "تدفع الأهداف البيانات إليه عبر syslog",
+       "يسحب من نقطة /metrics لكل هدف بجدول زمني",
+       "ترسل Grafana لوحاتها إليه",
+       "ينسخ Alertmanager البيانات من SIEM"
+      ],
+      "answer": 1,
+      "explanation": "يستخدم Prometheus نموذج السحب، ما يتيح له كشف الهدف الصامت عبر المقياس up."
+     },
+     {
+      "question": "لماذا يجب تغليف عدّاد مثل node_network_transmit_bytes_total بالدالة rate()؟",
+      "options": [
+       "العدّاد الخام مشفّر",
+       "القيمة الخام تزداد فقط فلا تُظهر السرعة الحالية",
+       "rate() تحذف العيّنات القديمة",
+       "لا يمكن رسم العدّادات"
+      ],
+      "answer": 1,
+      "explanation": "تحوّل rate() المجموع المتزايد إلى سرعة في الثانية، وهي ما تقارنه وتنبّه عليه."
+     },
+     {
+      "question": "أي مما يلي ممارسات جيدة لمنظومة مراقبة تحمل خريطة بنيتك التحتية؟ (اختر كل ما ينطبق)",
+      "options": [
+       "وضع Grafana خلف SSO وTLS",
+       "تقييد /metrics بعنوان خادم Prometheus",
+       "تفعيل وصول مسؤول مجهول للراحة",
+       "التنبيه عند توقف الأهداف الإنتاجية عن الرد"
+      ],
+      "answer": [
+       0,
+       1,
+       3
+      ],
+      "explanation": "الوصول المجهول للمسؤول يكشف البيئة كلها، أما الخيارات الأخرى فتقلل التعرض أو تكشف العبث."
+     },
+     {
+      "question": "يُطلق تنبيه: الحركة الصادرة 4 أضعاف الأسبوع الماضي عند 02:00. ما أفضل خطوة تالية؟",
+      "options": [
+       "عزل الجهاز فوراً دون فحص",
+       "تجاهله لأن المقاييس بلا تفاصيل",
+       "فحص المهام المجدولة ثم ربط النافذة الزمنية بالسجلات",
+       "حذف القاعدة"
+      ],
+      "answer": 2,
+      "explanation": "تخبرك المقاييس أن شيئاً تغيّر، وتخبرك السجلات وتقاويم التغيير لماذا."
+     },
+     {
+      "question": "لماذا تتجنب وضع عنوان IP للعميل في وسم على مقياس مزدحم؟",
+      "options": [
+       "يكسر TLS",
+       "كل قيمة فريدة تنشئ سلسلة جديدة وقد تستنزف الذاكرة",
+       "لا تقبل الوسوم الأرقام",
+       "يعطّل Alertmanager"
+      ],
+      "answer": 1,
+      "explanation": "الكاردينالية العالية أشيع سبب لمشكلات ذاكرة Prometheus. ضع تفاصيل كل عنوان في السجلات بدلاً من ذلك."
+     }
+    ]
+   },
+   {
+    "id": "summary",
+    "type": "text",
+    "markdown": "## الخلاصة\n\n- يسحب Prometheus المقاييس من المُصدِّرات ويخزّنها سلاسل زمنية موسومة ويقيّم قواعد التنبيه.\n- تستخدم PromQL الدالة `rate()` والتجميع و`offset` لمقارنة السلوك الحالي بخط مرجعي.\n- يوجّه Alertmanager التنبيهات، وتعرض Grafana البيانات ويمكنها الجمع بين المقاييس والسجلات.\n- استخدم المقاييس لملاحظة التغيّر والسجلات لتفسيره.\n- احمِ منظومة المراقبة ونبّه عندما تصمت الأهداف.\n\nبعد ذلك تعلّم كيف تربط أحداث المصادر المختلفة في [ربط السجلات وإثراء الأحداث](/learn/security-operations-dfir/log-correlation-and-event-enrichment)."
+   }
+  ]
+ }
+}
