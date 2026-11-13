@@ -14,6 +14,8 @@ class DesktopSoftwareResource extends JsonResource
             'name' => $this->name,
             'summary' => $this->summary,
             'readme' => $this->readme,
+            // An object even when empty, so the client can index it by language.
+            'translations' => (object) ($this->translations ?? []),
             'platform' => $this->platform,
             'platform_name' => $this->platform_name,
             'environment' => $this->environment,

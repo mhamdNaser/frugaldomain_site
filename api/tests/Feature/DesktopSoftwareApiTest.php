@@ -4,7 +4,9 @@ namespace Tests\Feature;
 
 use App\Modules\DesktopSoftware\Models\DesktopSoftware;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use App\Modules\DesktopSoftware\Requests\StoreDesktopSoftwareRequest;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Validator;
 use Tests\TestCase;
 
 class DesktopSoftwareApiTest extends TestCase
@@ -79,6 +81,32 @@ class DesktopSoftwareApiTest extends TestCase
 
         $this->getJson('/api/desktop-apps/draft-tool')->assertNotFound();
         $this->get('/api/desktop-apps/draft-tool/download')->assertNotFound();
+    }
+
+    public function test_translations_are_returned_by_language(): void
+    {
+        DesktopSoftware::create($this->software('released-tool', [
+            'translations' => ['hi' => ['name' => 'रिलीज़ टूल', 'readme' => "पैकेज इंस्टॉल करें।
+"]],
+        ]));
+
+        $this->getJson('/api/desktop-apps')
+            ->assertOk()
+            ->assertJsonPath('data.0.translations.hi.name', 'रिलीज़ टूल')
+            ->assertJsonPath('data.0.translations.hi.readme', "पैकेज इंस्टॉल करें।
+");
+    }
+
+    public function test_translations_accept_only_the_site_languages(): void
+    {
+        $rules = array_intersect_key(
+            (new StoreDesktopSoftwareRequest())->rules(),
+            array_flip(['translations', 'translations.*', 'translations.*.name', 'translations.*.summary', 'translations.*.readme'])
+        );
+
+        $this->assertTrue(Validator::make(['translations' => ['zh' => ['name' => '工具']]], $rules)->passes());
+        $this->assertFalse(Validator::make(['translations' => ['fr' => ['name' => 'Outil']]], $rules)->passes());
+        $this->assertFalse(Validator::make(['translations' => ['tr' => ['title' => 'Araç']]], $rules)->passes());
     }
 
     private function software(string $slug, array $overrides = []): array

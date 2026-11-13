@@ -44,6 +44,8 @@ class AppResource extends JsonResource
             'name' => $this->name,
             'tagline' => $this->tagline,
             'summary' => $this->summary,
+            // An object even when empty, so the client can index it by language.
+            'translations' => (object) ($this->translations ?? []),
             'type' => $this->type,
             'status' => $this->status,
             'version' => $this->version,

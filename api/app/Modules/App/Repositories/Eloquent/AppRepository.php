@@ -139,6 +139,7 @@ class AppRepository implements AppRepositoryInterface
             'name',
             'tagline',
             'summary',
+            'translations',
             'type',
             'status',
             'version',

@@ -31,6 +31,12 @@ class StoreAppRequest extends FormRequest
             'name' => 'required|string|max:255',
             'tagline' => 'nullable|string|max:500',
             'summary' => 'nullable|string',
+            // The other languages of the site; English is the columns above.
+            'translations' => 'nullable|array:ar,hi,zh,tr',
+            'translations.*' => 'nullable|array:name,tagline,summary',
+            'translations.*.name' => 'nullable|string|max:255',
+            'translations.*.tagline' => 'nullable|string|max:500',
+            'translations.*.summary' => 'nullable|string',
 
             'type' => ['nullable', 'string', Rule::in(['react', 'static', 'vue', 'other'])],
             'status' => ['nullable', 'string', Rule::in(['draft', 'published'])],

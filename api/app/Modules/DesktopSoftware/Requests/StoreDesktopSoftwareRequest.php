@@ -31,6 +31,12 @@ class StoreDesktopSoftwareRequest extends FormRequest
             'name' => 'required|string|max:255',
             'summary' => 'nullable|string',
             'readme' => 'required|string|max:1048576',
+            // The other languages of the site; English is the columns above.
+            'translations' => 'nullable|array:ar,hi,zh,tr',
+            'translations.*' => 'nullable|array:name,summary,readme',
+            'translations.*.name' => 'nullable|string|max:255',
+            'translations.*.summary' => 'nullable|string',
+            'translations.*.readme' => 'nullable|string|max:1048576',
             'platform' => ['required', 'string', Rule::in(['windows', 'linux', 'macos', 'other'])],
             'platform_name' => [
                 Rule::requiredIf($this->input('platform') === 'other'),

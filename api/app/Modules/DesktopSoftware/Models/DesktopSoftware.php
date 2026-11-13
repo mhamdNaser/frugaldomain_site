@@ -14,6 +14,7 @@ class DesktopSoftware extends Model
         'name',
         'summary',
         'readme',
+        'translations',
         'platform',
         'platform_name',
         'environment',
@@ -28,6 +29,7 @@ class DesktopSoftware extends Model
 
     protected $casts = [
         'is_open_source' => 'boolean',
+        'translations' => 'array',
         'ordering' => 'integer',
     ];
 
