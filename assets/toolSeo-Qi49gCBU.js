@@ -1,0 +1,1 @@
+import{D as f}from"./devToolSeo-BjcWavcO.js";function t(o,e){const i=f[o]||{};return e?{...i,name:e.name||i.name,title:e.title,description:e.description||i.description,faq:e.faq||i.faq,features:e.features||i.features}:i}export{t};
