@@ -29,6 +29,26 @@ class CatalogueTranslationsSeederTest extends TestCase
         }
     }
 
+    public function test_arabic_docs_move_to_translations_and_english_takes_their_place(): void
+    {
+        $id = 'نظرة-عامة-ومعمارية-النظام';
+        $app = App::create([
+            'slug' => 'kanaf', 'name' => 'Kanaf',
+            'docs' => [['id' => $id, 'title' => 'نظرة عامة ومعمارية النظام', 'body' => 'نص عربي', 'steps' => []]],
+        ]);
+
+        $this->seed(AppTranslationsSeeder::class);
+        $this->seed(AppTranslationsSeeder::class);
+
+        $app = $app->fresh();
+        $this->assertDoesNotMatchRegularExpression('/\p{Arabic}/u', $app->docs[0]['title']);
+        $this->assertSame($id, $app->docs[0]['id']);
+        $this->assertSame('نص عربي', $app->translations['ar']['docs'][$id]['body']);
+        foreach (['hi', 'zh', 'tr'] as $lang) {
+            $this->assertNotEmpty($app->translations[$lang]['docs'][$id]['body']);
+        }
+    }
+
     public function test_desktop_translations_fill_summary_and_readme(): void
     {
         $software = DesktopSoftware::create([

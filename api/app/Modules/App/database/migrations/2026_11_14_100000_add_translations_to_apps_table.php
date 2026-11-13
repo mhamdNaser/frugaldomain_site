@@ -8,7 +8,7 @@ return new class extends Migration
 {
     /**
      * The app's name, tagline and summary in the site's other languages:
-     * {"ar": {"name": ..., "tagline": ..., "summary": ...}, "hi": {...}, "zh": {...}, "tr": {...}}.
+     * {"ar": {"name": ..., "tagline": ..., "summary": ..., "docs": {"<section id>": {"title", "body", "steps"}}}, "hi": {...}, ...}.
      * The English stays in its own columns; a missing field falls back to it.
      */
     public function up(): void
