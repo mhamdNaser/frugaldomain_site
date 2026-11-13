@@ -1,0 +1,1 @@
+const o={"Error 404":"错误 404","Page not |found":"页面|未找到","The page you are looking for does not exist, or it has moved.":"您要查找的页面不存在，或已移至其他地址。","Page not found | FrugalDomain":"页面未找到 | FrugalDomain","Go Home":"返回首页","In progress":"进行中","Coming |Soon":"即将|推出","We are working hard to bring you something amazing. Stay tuned!":"我们正在努力为您带来精彩内容，敬请期待！"};export{o as default};
