@@ -7,6 +7,7 @@ use App\Modules\Learning\Models\LearningCourse;
 use App\Modules\Learning\Models\LearningLesson;
 use App\Modules\Learning\Models\LearningMedia;
 use App\Modules\Learning\Models\LearningStage;
+use App\Modules\Learning\Models\LearningTranslation;
 use App\Modules\Learning\Models\LearningUnit;
 use Illuminate\Support\Facades\DB;
 
@@ -24,25 +25,86 @@ class LearningPresenter
      * Read from the current request every time: the router keeps controller
      * instances (and so this presenter) alive across requests.
      */
-    public function isArabic(): bool
+    public function language(): string
     {
         $request = request();
-        $lang = $request?->query('lang') ?: $request?->header('X-Language');
+        $lang = strtolower((string) ($request?->query('lang') ?: $request?->header('X-Language')));
 
-        return strtolower((string) $lang) === 'ar';
+        return $lang === 'ar' || in_array($lang, LearningTranslation::LOCALES, true) ? $lang : 'en';
+    }
+
+    public function isArabic(): bool
+    {
+        return $this->language() === 'ar';
     }
 
     /** `$model->field` in the requested language, falling back to English. */
     private function tr($model, string $field)
     {
-        if ($this->isArabic()) {
-            $value = $model->{$field.'_ar'} ?? null;
-            if ($value !== null && $value !== '' && $value !== []) {
-                return $value;
-            }
+        $value = $this->isArabic() ? ($model->{$field.'_ar'} ?? null) : $this->extraField($model, $field);
+
+        return $value !== null && $value !== '' && $value !== [] ? $value : $model->{$field};
+    }
+
+    /** Short texts of the extra locales (learning_translations), per request: [type][id] => fields. */
+    private array $extra = [];
+
+    private ?int $extraRequest = null;
+
+    private function extraLocale(): ?string
+    {
+        $locale = $this->language();
+        if (! in_array($locale, LearningTranslation::LOCALES, true)) {
+            return null;
+        }
+        // The presenter outlives a request (see above), its cache must not.
+        if ($this->extraRequest !== spl_object_id(request())) {
+            $this->extra = [];
+            $this->extraRequest = spl_object_id(request());
         }
 
-        return $model->{$field};
+        return $locale;
+    }
+
+    private function extraField($model, string $field)
+    {
+        $type = LearningTranslation::TYPES[get_class($model)] ?? null;
+        if (! $type || ! ($locale = $this->extraLocale())) {
+            return null;
+        }
+
+        if ($type === 'lesson') {
+            $this->preloadLessons([$model->id]);
+        } elseif (! isset($this->extra[$type])) {
+            // Categories, courses, stages and units are a few hundred short rows: load the lot once.
+            $this->extra[$type] = LearningTranslation::query()
+                ->where('locale', $locale)->where('model_type', $type)
+                ->get(['model_id', 'fields'])
+                ->mapWithKeys(fn ($row) => [$row->model_id => $row->fields ?? []])
+                ->all();
+        }
+
+        return $this->extra[$type][$model->id][$field] ?? null;
+    }
+
+    /** Lesson titles/summaries for a whole syllabus in one query (never the bodies). */
+    private function preloadLessons(array $ids): void
+    {
+        if (! ($locale = $this->extraLocale())) {
+            return;
+        }
+        $missing = array_values(array_filter($ids, fn ($id) => ! array_key_exists($id, $this->extra['lesson'] ?? [])));
+        if (! $missing) {
+            return;
+        }
+        $found = LearningTranslation::query()
+            ->where('locale', $locale)->where('model_type', 'lesson')->whereIn('model_id', $missing)
+            ->get(['model_id', 'fields'])
+            ->mapWithKeys(fn ($row) => [$row->model_id => $row->fields ?? []])
+            ->all();
+        foreach ($missing as $id) {
+            $this->extra['lesson'][$id] = $found[$id] ?? [];
+        }
     }
 
     private function hasArabicContent(LearningLesson $lesson): bool
@@ -54,9 +116,9 @@ class LearningPresenter
     {
         $data = [
             'slug' => $category->slug,
-            'name' => $category->name,
+            'name' => $admin ? $category->name : $this->tr($category, 'name'),
             'name_ar' => $category->name_ar,
-            'description' => $category->description,
+            'description' => $admin ? $category->description : $this->tr($category, 'description'),
             'description_ar' => $category->description_ar,
             'icon' => $category->icon,
             'color' => $category->color,
@@ -89,7 +151,7 @@ class LearningPresenter
             'cover_url' => $course->coverUrl(),
             'category' => $course->category ? [
                 'slug' => $course->category->slug,
-                'name' => $course->category->name,
+                'name' => $admin ? $course->category->name : $this->tr($course->category, 'name'),
                 'name_ar' => $course->category->name_ar,
                 'color' => $course->category->color,
                 'icon' => $course->category->icon,
@@ -123,6 +185,10 @@ class LearningPresenter
                 DB::raw("CASE WHEN blocks_ar IS NULL OR JSON_LENGTH(blocks_ar) = 0 THEN 0 ELSE 1 END as has_ar"),
             ]);
         }]);
+
+        if (! $admin) {
+            $this->preloadLessons($course->stages->flatMap->units->flatMap->lessons->pluck('id')->all());
+        }
 
         $lessonsCount = 0;
         $publishedCount = 0;
@@ -220,18 +286,29 @@ class LearningPresenter
         $position = collect($sequence)->search(fn ($l) => $l->id === $lesson->id);
         $neighbour = fn ($l) => $l ? ['slug' => $l->slug, 'title' => $this->tr($l, 'title')] : null;
 
-        // Arabic content is served whole or not at all: mixing languages
+        // Translated content is served whole or not at all: mixing languages
         // block by block would read worse than either.
-        $arabicContent = $this->isArabic() && $this->hasArabicContent($lesson);
+        $locale = $this->extraLocale();
+        $extra = $locale ? LearningTranslation::query()
+            ->where('model_type', 'lesson')->where('model_id', $lesson->id)->where('locale', $locale)
+            ->first() : null;
+
+        if ($this->isArabic() && $this->hasArabicContent($lesson)) {
+            [$contentLanguage, $summary, $objectives, $blocks] = ['ar', $lesson->summary_ar, $lesson->objectives_ar, $lesson->blocks_ar];
+        } elseif (! empty($extra?->blocks)) {
+            [$contentLanguage, $summary, $objectives, $blocks] = [$locale, $extra->fields['summary'] ?? null, $extra->fields['objectives'] ?? null, $extra->blocks];
+        } else {
+            [$contentLanguage, $summary, $objectives, $blocks] = ['en', null, null, $lesson->blocks];
+        }
 
         $data = [
             'slug' => $lesson->slug,
             'title' => $this->tr($lesson, 'title'),
-            'summary' => $arabicContent ? ($lesson->summary_ar ?: $lesson->summary) : $lesson->summary,
+            'summary' => $summary ?: $lesson->summary,
             'duration_minutes' => $lesson->duration_minutes,
-            'objectives' => $arabicContent ? ($lesson->objectives_ar ?: $lesson->objectives ?? []) : ($lesson->objectives ?? []),
-            'blocks' => $this->resolveMedia(($arabicContent ? $lesson->blocks_ar : $lesson->blocks) ?? []),
-            'content_language' => $arabicContent ? 'ar' : 'en',
+            'objectives' => $objectives ?: ($lesson->objectives ?? []),
+            'blocks' => $this->resolveMedia($blocks ?? []),
+            'content_language' => $contentLanguage,
             'has_ar' => $this->hasArabicContent($lesson),
             'updated_at' => $lesson->updated_at?->toIso8601String(),
             'course' => [
@@ -241,7 +318,7 @@ class LearningPresenter
                 'accent_color' => $course->accent_color ?: $course->category?->color,
                 'category' => $course->category ? [
                     'slug' => $course->category->slug,
-                    'name' => $course->category->name,
+                    'name' => $this->tr($course->category, 'name'),
                     'name_ar' => $course->category->name_ar,
                 ] : null,
             ],

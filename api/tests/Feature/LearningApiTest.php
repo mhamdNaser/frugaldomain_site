@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Modules\Learning\database\seeders\LearningCurriculumSeeder;
 use App\Modules\Learning\Models\LearningCourse;
 use App\Modules\Learning\Models\LearningLesson;
+use App\Modules\Learning\Models\LearningTranslation;
 use App\Modules\Learning\Services\CourseTransfer;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Validation\ValidationException;
@@ -259,6 +260,52 @@ class LearningApiTest extends TestCase
         $this->getJson('/api/learn/courses/demo', ['X-Language' => 'ar'])
             ->assertJsonPath('data.stages.0.units.0.lessons.0.has_ar', true)
             ->assertJsonPath('data.stages.0.units.0.lessons.2.has_ar', false);
+    }
+
+    public function test_extra_locales_are_served_from_translations_and_fall_back_to_english(): void
+    {
+        app(CourseTransfer::class)->import($this->document());
+        $this->signIn();
+        $course = LearningCourse::where('slug', 'demo')->first();
+        $first = LearningLesson::where('slug', 'first')->first();
+        $third = LearningLesson::where('slug', 'third')->first();
+
+        LearningTranslation::create(['model_type' => 'course', 'model_id' => $course->id, 'locale' => 'tr', 'fields' => ['title' => 'Demo kurs']]);
+        LearningTranslation::create(['model_type' => 'category', 'model_id' => $course->category_id, 'locale' => 'tr', 'fields' => ['name' => 'Siber güvenlik']]);
+        LearningTranslation::create([
+            'model_type' => 'lesson', 'model_id' => $first->id, 'locale' => 'tr',
+            'fields' => ['title' => 'Birinci ders', 'summary' => 'Özet'],
+            'blocks' => [['id' => 'a', 'type' => 'text', 'markdown' => '## Merhaba']],
+        ]);
+        // A title but no body: the title is translated, the content stays English.
+        LearningTranslation::create(['model_type' => 'lesson', 'model_id' => $third->id, 'locale' => 'tr', 'fields' => ['title' => 'Üçüncü ders']]);
+
+        $this->getJson('/api/learn/courses/demo/lessons/first', ['X-Language' => 'tr'])
+            ->assertOk()
+            ->assertJsonPath('data.title', 'Birinci ders')
+            ->assertJsonPath('data.summary', 'Özet')
+            ->assertJsonPath('data.content_language', 'tr')
+            ->assertJsonPath('data.blocks.0.markdown', '## Merhaba')
+            ->assertJsonPath('data.course.title', 'Demo kurs')
+            ->assertJsonPath('data.course.category.name', 'Siber güvenlik')
+            ->assertJsonPath('data.next.title', 'Üçüncü ders');
+
+        $this->getJson('/api/learn/courses/demo/lessons/third', ['X-Language' => 'tr'])
+            ->assertJsonPath('data.title', 'Üçüncü ders')
+            ->assertJsonPath('data.content_language', 'en');
+
+        $this->getJson('/api/learn/courses/demo', ['X-Language' => 'tr'])
+            ->assertJsonPath('data.title', 'Demo kurs')
+            ->assertJsonPath('data.stages.0.title', 'Stage one')
+            ->assertJsonPath('data.stages.0.units.0.lessons.0.title', 'Birinci ders')
+            ->assertJsonPath('data.stages.0.units.0.lessons.1.title', 'Second lesson');
+
+        // Another extra locale, and an unknown one, get English.
+        $this->getJson('/api/learn/courses/demo/lessons/first', ['X-Language' => 'hi'])
+            ->assertJsonPath('data.title', 'First lesson')
+            ->assertJsonPath('data.content_language', 'en');
+        $this->getJson('/api/learn/courses/demo', ['X-Language' => 'xx'])
+            ->assertJsonPath('data.title', 'Demo course');
     }
 
     public function test_fill_mode_adds_arabic_to_existing_lessons(): void

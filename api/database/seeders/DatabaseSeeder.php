@@ -11,6 +11,7 @@ use App\Modules\Drawing\database\seeders\DrawingTemplateSeeder;
 use App\Modules\Icon\database\seeders\IconSeeder;
 use App\Modules\Icon\database\seeders\IconV2Seeder;
 use App\Modules\Learning\database\seeders\LearningCurriculumSeeder;
+use App\Modules\Learning\database\seeders\LearningTranslationsSeeder;
 use App\Modules\Locale\database\seeders\LanguageSeeder;
 use App\Modules\User\database\seeders\AdminSeeder;
 use App\Modules\User\database\seeders\RolePermissionSeeder;
@@ -40,6 +41,8 @@ class DatabaseSeeder extends Seeder
             // The learning curriculum. Fill-only: it never overwrites a
             // lesson that has been edited in the dashboard.
             LearningCurriculumSeeder::class,
+            // Extra lesson languages (hi, zh, tr) from their files; must follow the curriculum.
+            LearningTranslationsSeeder::class,
 
             // App logos. Fill-only: sets `logo` where it is empty, nothing else.
             AppLogoSeeder::class,
