@@ -51,6 +51,21 @@ class AnalyticsController extends Controller
         return response()->json(null, 204);
     }
 
+    public function trackToolUse(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            // The English path of the tool page, never a URL.
+            'tool' => ['required', 'string', 'max:120', 'regex:#^/[A-Za-z0-9/_-]*$#'],
+            'action' => ['required', 'string', 'max:40', 'regex:/^[a-z0-9_-]+$/'],
+            'locale' => ['nullable', 'string', 'in:en,ar,hi,zh,tr'],
+            'session_id' => ['nullable', 'string', 'max:64'],
+        ]);
+
+        $this->recorder->recordToolUse($request, $data);
+
+        return response()->json(null, 204);
+    }
+
     // ------------------------------------------------------------- reporting
     // Admin only; wired behind auth in the route file.
 
@@ -75,6 +90,7 @@ class AnalyticsController extends Controller
                 'entry_exit_pages' => $this->statistics->entryExitPages($days, 8),
                 'learning' => $this->statistics->learning($days, 8),
                 'downloads' => $this->statistics->downloads($days),
+                'tool_usage' => $this->statistics->toolUsage($days),
                 'audience' => $this->statistics->audience($days),
                 // The statistics page shows only the top three; the dedicated
                 // icon page asks for the full list.

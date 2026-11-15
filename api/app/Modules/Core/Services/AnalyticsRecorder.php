@@ -3,6 +3,7 @@
 namespace App\Modules\Core\Services;
 
 use App\Modules\Core\Models\DownloadEvent;
+use App\Modules\Core\Models\ToolUse;
 use App\Modules\Core\Models\IconEvent;
 use App\Modules\Core\Models\Scopes\ExcludeStaffScope;
 use App\Modules\Core\Models\LoginEvent;
@@ -226,6 +227,35 @@ class AnalyticsRecorder
             ]);
         } catch (Throwable $e) {
             Log::warning('Failed to record download.', ['error' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    /** Record one use of a tool; staff and bots are skipped like everywhere else. */
+    public function recordToolUse(Request $request, array $payload): ?ToolUse
+    {
+        try {
+            if ($this->isStaff($request, $payload)) {
+                return null;
+            }
+
+            $context = $this->context($request);
+            if ($context['device_type'] === 'bot') {
+                return null;
+            }
+
+            return ToolUse::create([
+                'tool' => $payload['tool'],
+                'action' => $payload['action'],
+                'locale' => $payload['locale'] ?? 'en',
+                'user_id' => $this->userId($request),
+                'session_id' => $this->sessionId($request, $payload),
+                'country' => $context['country'],
+                'device_type' => $context['device_type'],
+                'occurred_at' => now(),
+            ]);
+        } catch (Throwable $e) {
+            Log::warning('Failed to record tool use.', ['error' => $e->getMessage()]);
             return null;
         }
     }

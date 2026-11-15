@@ -6,6 +6,7 @@ use App\Modules\Core\Models\DownloadEvent;
 use App\Modules\Core\Models\IconEvent;
 use App\Modules\Core\Models\LoginEvent;
 use App\Modules\Core\Models\PageVisit;
+use App\Modules\Core\Models\ToolUse;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -328,10 +329,34 @@ class AnalyticsStatisticsService
         'account' => ['/login', '/register', '/account', '/forgot-password'],
     ];
 
-    /** SQL for the path with any /ar prefix removed ("/ar" itself is "/"). */
+    /** The language prefixes of the site's URLs (English has none). */
+    private const LOCALES = ['ar' => 'Arabic', 'hi' => 'Hindi', 'zh' => 'Chinese', 'tr' => 'Turkish'];
+
+    /** SQL for the path with any language prefix removed ("/ar" itself is "/"). */
     private function basePathSql(): string
     {
-        return "CASE WHEN path = '/ar' THEN '/' WHEN path LIKE '/ar/%' THEN SUBSTRING(path, 4) ELSE path END";
+        [$roots, $prefixes] = $this->localeSqlLists();
+
+        return "CASE WHEN path IN ({$roots}) THEN '/' WHEN SUBSTRING(path, 1, 4) IN ({$prefixes}) THEN SUBSTRING(path, 4) ELSE path END";
+    }
+
+    /** SQL for the page's language code ('en' when it has no prefix). */
+    private function localeSql(): string
+    {
+        [$roots, $prefixes] = $this->localeSqlLists();
+
+        return "CASE WHEN path IN ({$roots}) OR SUBSTRING(path, 1, 4) IN ({$prefixes}) THEN SUBSTRING(path, 2, 2) ELSE 'en' END";
+    }
+
+    /** "'/ar','/hi',..." and "'/ar/','/hi/',..." for the SQL above. */
+    private function localeSqlLists(): array
+    {
+        $codes = array_keys(self::LOCALES);
+
+        return [
+            implode(',', array_map(fn ($c) => "'/{$c}'", $codes)),
+            implode(',', array_map(fn ($c) => "'/{$c}/'", $codes)),
+        ];
     }
 
     /** SQL that maps a path to its SECTIONS key, or 'other'. */
@@ -344,8 +369,8 @@ class AnalyticsStatisticsService
             foreach ($prefixes as $prefix) {
                 $quoted = DB::getPdo()->quote(strtolower($prefix));
                 $conditions[] = $prefix === '/'
-                    ? "LOWER({$base}) = '/'"
-                    : "(LOWER({$base}) = {$quoted} OR LOWER({$base}) LIKE CONCAT({$quoted}, '/%'))";
+                    ? "(LOWER({$base}) = '/' OR LOWER({$base}) LIKE '/?%')"
+                    : "(LOWER({$base}) = {$quoted} OR LOWER({$base}) LIKE CONCAT({$quoted}, '/%') OR LOWER({$base}) LIKE CONCAT({$quoted}, '?%'))";
             }
             $cases[] = 'WHEN ' . implode(' OR ', $conditions) . " THEN '{$key}'";
         }
@@ -443,10 +468,10 @@ class AnalyticsStatisticsService
         $newVisitors = (int) DB::query()->fromSub($firstSeen, 'f')->where('first_seen', '>=', $since)->count();
 
         $visitors = (int) ($depth->visitors ?? 0);
-        $arabic = PageVisit::where('visited_at', '>=', $since)
-            ->where(fn ($q) => $q->where('path', '/ar')->orWhere('path', 'like', '/ar/%'))
-            ->count();
-        $all = PageVisit::where('visited_at', '>=', $since)->count();
+        $perLocale = PageVisit::where('visited_at', '>=', $since)
+            ->selectRaw($this->localeSql() . ' as code, COUNT(*) as total')
+            ->groupBy('code')
+            ->pluck('total', 'code');
 
         return [
             'visitors' => $visitors,
@@ -454,10 +479,11 @@ class AnalyticsStatisticsService
             'returning_visitors' => max(0, $visitors - $newVisitors),
             'bounce_rate' => $visitors > 0 ? round(((int) $depth->single_page) * 100 / $visitors, 1) : 0,
             'pages_per_visitor' => $depth->avg_views ? round((float) $depth->avg_views, 1) : 0,
-            'languages' => [
-                ['label' => 'English', 'total' => $all - $arabic],
-                ['label' => 'Arabic', 'total' => $arabic],
-            ],
+            'languages' => collect(['en' => 'English'] + self::LOCALES)
+                ->map(fn ($label, $code) => ['code' => $code, 'label' => $label, 'total' => (int) ($perLocale[$code] ?? 0)])
+                ->sortByDesc('total')
+                ->values()
+                ->all(),
         ];
     }
 
@@ -588,6 +614,54 @@ class AnalyticsStatisticsService
                 ->selectRaw('platform as label, COUNT(*) as total')
                 ->groupBy('platform')
                 ->orderByDesc('total')
+                ->get()
+                ->map(fn ($row) => ['label' => $row->label, 'total' => (int) $row->total])
+                ->all(),
+        ];
+    }
+
+    /**
+     * Tools that were actually used, not just opened. `rate` is the share of
+     * the page's visitors who used the tool: a low rate on a busy page means
+     * the tool confuses people or does not do what the page promises.
+     */
+    public function toolUsage(int $days = 30, int $limit = 20): array
+    {
+        $since = Carbon::now()->subDays($days);
+        $base = $this->basePathSql();
+
+        $items = ToolUse::where('occurred_at', '>=', $since)
+            ->selectRaw('tool, COUNT(*) as uses, COUNT(DISTINCT session_id) as users')
+            ->groupBy('tool')
+            ->orderByDesc('uses')
+            ->limit($limit)
+            ->get()
+            ->map(function ($row) use ($since, $base) {
+                // Paths are recorded with their query string: /json-toolkit?x=1.
+                $visitors = (int) PageVisit::where('visited_at', '>=', $since)
+                    ->where(fn ($q) => $q->whereRaw("{$base} = ?", [$row->tool])->orWhereRaw("{$base} LIKE ?", [$row->tool . '?%']))
+                    ->distinct()
+                    ->count('session_id');
+
+                return [
+                    'tool' => $row->tool,
+                    'uses' => (int) $row->uses,
+                    'users' => (int) $row->users,
+                    'visitors' => $visitors,
+                    'rate' => $visitors > 0 ? min(100, round($row->users * 100 / $visitors, 1)) : null,
+                ];
+            })->all();
+
+        return [
+            'today' => ToolUse::whereDate('occurred_at', Carbon::today())->count(),
+            'period' => ToolUse::where('occurred_at', '>=', $since)->count(),
+            'users' => ToolUse::where('occurred_at', '>=', $since)->distinct()->count('session_id'),
+            'items' => $items,
+            'actions' => ToolUse::where('occurred_at', '>=', $since)
+                ->selectRaw('action as label, COUNT(*) as total')
+                ->groupBy('action')
+                ->orderByDesc('total')
+                ->limit(10)
                 ->get()
                 ->map(fn ($row) => ['label' => $row->label, 'total' => (int) $row->total])
                 ->all(),

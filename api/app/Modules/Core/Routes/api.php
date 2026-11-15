@@ -21,6 +21,7 @@ Route::post('/site/contact-us', [SiteContactController::class, 'store']);
 // what these endpoints exist to count. They return 204 and never a body.
 Route::post('/track/visit', [AnalyticsController::class, 'trackVisit']);
 Route::post('/track/icon', [AnalyticsController::class, 'trackIconEvent']);
+Route::post('/track/tool', [AnalyticsController::class, 'trackToolUse'])->middleware('throttle:60,1');
 
 
 Route::prefix('admin')->group(function () {

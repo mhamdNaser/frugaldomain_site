@@ -140,4 +140,34 @@ class AnalyticsInsightsTest extends TestCase
         $this->assertSame(1, $downloads['period']);
         $this->assertSame('tool', $downloads['items'][0]['slug']);
     }
+
+    public function test_tool_uses_are_counted_against_the_page_visitors_in_every_language(): void
+    {
+        $this->visit('/hi/json-toolkit', 'v1');
+        $this->visit('/json-toolkit?tab=diff', 'v2');
+        $this->visit('/zh', 'v3');
+        foreach ([['v1', 'format', 'hi'], ['v1', 'copy', 'hi'], ['v2', 'format', 'en']] as [$sid, $action, $locale]) {
+            $this->postJson('/api/track/tool', ['tool' => '/json-toolkit', 'action' => $action, 'locale' => $locale, 'session_id' => $sid])
+                ->assertNoContent();
+        }
+        $this->postJson('/api/track/tool', ['tool' => 'https://evil.example', 'action' => 'x'])->assertStatus(422);
+
+        $admin = $this->user('tools@example.com', 'admin');
+        Sanctum::actingAs($admin);
+        $this->postJson('/api/track/tool', ['tool' => '/json-toolkit', 'action' => 'format', 'session_id' => 'staff']);
+
+        $data = $this->getJson('/api/admin/analytics/overview?days=30')->assertOk()->json('data');
+
+        $usage = $data['tool_usage'];
+        $this->assertSame(3, $usage['period']);
+        $this->assertSame(2, $usage['users']);
+        $this->assertSame(['tool' => '/json-toolkit', 'uses' => 3, 'users' => 2, 'visitors' => 2, 'rate' => 100], $usage['items'][0]);
+
+        $sections = collect($data['sections'])->keyBy('section');
+        $this->assertSame(2, $sections['dev_tools']['visits']);
+        $this->assertSame(1, $sections['home']['visits']);
+
+        $languages = collect($data['engagement']['languages'])->pluck('total', 'code');
+        $this->assertEquals(['en' => 1, 'hi' => 1, 'zh' => 1, 'ar' => 0, 'tr' => 0], $languages->all());
+    }
 }
