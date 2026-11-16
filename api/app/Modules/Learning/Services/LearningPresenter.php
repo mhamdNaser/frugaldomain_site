@@ -190,6 +190,16 @@ class LearningPresenter
             $this->preloadLessons($course->stages->flatMap->units->flatMap->lessons->pluck('id')->all());
         }
 
+        // Dashboard only: which extra locales each lesson has a body in (lesson id => [locale, ...]).
+        $translated = $admin ? LearningTranslation::query()
+            ->where('model_type', 'lesson')
+            ->whereIn('model_id', $course->stages->flatMap->units->flatMap->lessons->pluck('id'))
+            ->whereNotNull('blocks')
+            ->get(['model_id', 'locale'])
+            ->groupBy('model_id')
+            ->map(fn ($rows) => $rows->pluck('locale')->sort()->values()->all())
+            ->all() : [];
+
         $lessonsCount = 0;
         $publishedCount = 0;
         $minutes = 0;
@@ -207,9 +217,9 @@ class LearningPresenter
             return $row + $extra;
         };
 
-        $stages = $course->stages->map(function (LearningStage $stage) use ($admin, $node, &$lessonsCount, &$publishedCount, &$minutes) {
-            $units = $stage->units->map(function (LearningUnit $unit) use ($admin, $node, &$lessonsCount, &$publishedCount, &$minutes) {
-                $lessons = $unit->lessons->map(function (LearningLesson $lesson) use ($admin, $node, &$lessonsCount, &$publishedCount, &$minutes) {
+        $stages = $course->stages->map(function (LearningStage $stage) use ($admin, $node, $translated, &$lessonsCount, &$publishedCount, &$minutes) {
+            $units = $stage->units->map(function (LearningUnit $unit) use ($admin, $node, $translated, &$lessonsCount, &$publishedCount, &$minutes) {
+                $lessons = $unit->lessons->map(function (LearningLesson $lesson) use ($admin, $node, $translated, &$lessonsCount, &$publishedCount, &$minutes) {
                     $lessonsCount++;
                     if ($lesson->isPublished()) {
                         $publishedCount++;
@@ -220,7 +230,8 @@ class LearningPresenter
                         'duration_minutes' => $lesson->duration_minutes,
                         'available' => $lesson->isPublished(),
                         'has_ar' => (bool) ($lesson->has_ar ?? false),
-                    ] + ($admin ? ['id' => $lesson->id, 'unit_id' => $lesson->unit_id, 'status' => $lesson->status, 'ordering' => $lesson->ordering] : []));
+                    ] + ($admin ? ['id' => $lesson->id, 'unit_id' => $lesson->unit_id, 'status' => $lesson->status, 'ordering' => $lesson->ordering,
+                        'translated_locales' => $translated[$lesson->id] ?? []] : []));
                 })->values()->all();
 
                 return $node($unit, ['lessons' => $lessons]
