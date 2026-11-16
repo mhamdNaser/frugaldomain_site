@@ -1,0 +1,348 @@
+{
+  "title": "PostgreSQL सुरक्षा लैब",
+  "summary": "अपने स्वामित्व वाले PostgreSQL 16 सर्वर को परतों में हार्डन करें: नेटवर्क एक्सपोज़र, pg_hba.conf ऑथेंटिकेशन, TLS, न्यूनतम-विशेषाधिकार रोल और ऑडिट लॉगिंग, फिर हर नियंत्रण का परीक्षण करें।",
+  "objectives": [
+    "PostgreSQL तक पहुँच नियंत्रित करने वाली परतों को समझाना",
+    "ऐसे pg_hba.conf नियम लिखना जो SCRAM और TLS अनिवार्य करें",
+    "न्यूनतम-विशेषाधिकार वाले ग्रुप और लॉगिन रोल बनाना",
+    "एप्लिकेशन होस्ट से अनुमत और अस्वीकृत कनेक्शनों को सत्यापित करना",
+    "जाँच में सहायक लॉगिंग और ऑडिटिंग चालू करना"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "एक छोटा वेब ऐप अपने ग्राहकों, ऑर्डरों और पासवर्ड हैश को PostgreSQL में रखता है। डेटाबेस डिफ़ॉल्ट सेटिंग्स से इंस्टॉल हुआ था, एप्लिकेशन `postgres` सुपरयूज़र के रूप में कनेक्ट होता है, और सर्वर हर नेटवर्क इंटरफ़ेस पर सुनता है। अभी कुछ टूटा नहीं है, लेकिन एक SQL इंजेक्शन बग या एक लीक हुई `.env` फ़ाइल हमलावर को पूरा डेटाबेस और ऑपरेटिंग सिस्टम तक का रास्ता दे सकती है।\n\nइस लैब में आप **अपने स्वामित्व वाले** PostgreSQL 16 सर्वर को हार्डन करते हैं, जैसे [Cybersecurity Home Lab Design](/learn/hands-on-security-labs/cybersecurity-home-lab-design) में बताई गई आपकी होम लैब की कोई VM। आप तय करेंगे कि कौन कनेक्ट कर सकता है, विशेषाधिकारों को रोल में बाँटेंगे, एन्क्रिप्टेड कनेक्शन अनिवार्य करेंगे, ऑडिटिंग चालू करेंगे और फिर साबित करेंगे कि हर नियंत्रण काम करता है।"
+    },
+    {
+      "id": "layers",
+      "type": "text",
+      "markdown": "## चरण 1: पहुँच की परतों को समझें\n\nPostgreSQL कई स्वतंत्र परतों में पहुँच तय करता है। हार्डनिंग का अर्थ है हर परत को कड़ा करना, क्योंकि किसी एक परत की गलती से डेटा उजागर नहीं होना चाहिए।\n\n| परत | किससे नियंत्रित | यह कौन-सा प्रश्न हल करती है |\n|:--|:--|:--|\n| नेटवर्क | `listen_addresses`, होस्ट फ़ायरवॉल | क्या पैकेट पोर्ट तक पहुँच भी सकता है? |\n| ऑथेंटिकेशन | `pg_hba.conf` | कौन-सा यूज़र, कहाँ से, किस तरीके से? |\n| ट्रांसपोर्ट | `ssl` सेटिंग्स | क्या सेशन एन्क्रिप्टेड है? |\n| ऑथराइज़ेशन | रोल और `GRANT` | यह रोल क्या पढ़ या बदल सकता है? |\n| ऑडिटिंग | `log_*` सेटिंग्स, `pgaudit` | क्या हम बाद में देख सकते हैं कि क्या हुआ? |\n\nएनिमेशन एक एप्लिकेशन कनेक्शन को इन परतों से गुज़रते हुए दिखाता है।"
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "परतों से गुज़रता एक एप्लिकेशन कनेक्शन",
+      "caption": "हर परत मना कर सकती है। केवल वही कनेक्शन डेटा तक पहुँचता है जो सभी परतों से गुज़रता है।",
+      "data": {
+        "token": "कनेक्शन",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "ऐप सर्वर",
+            "sub": "10.20.0.15",
+            "icon": "server"
+          },
+          {
+            "id": "fw",
+            "label": "होस्ट फ़ायरवॉल",
+            "sub": "TCP/5432",
+            "icon": "firewall"
+          },
+          {
+            "id": "hba",
+            "label": "pg_hba.conf",
+            "sub": "scram-sha-256",
+            "icon": "key"
+          },
+          {
+            "id": "tls",
+            "label": "TLS",
+            "sub": "hostssl",
+            "icon": "lock"
+          },
+          {
+            "id": "role",
+            "label": "रोल",
+            "sub": "app_rw",
+            "icon": "user"
+          },
+          {
+            "id": "db",
+            "label": "PostgreSQL",
+            "sub": "shop",
+            "icon": "database"
+          },
+          {
+            "id": "log",
+            "label": "ऑडिट लॉग",
+            "sub": "pgaudit",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "ऐप, यूज़र app_rw के रूप में 10.20.0.5:5432 से कनेक्शन खोलता है।"
+          },
+          {
+            "at": "fw",
+            "caption": "होस्ट फ़ायरवॉल 5432 को केवल 10.20.0.15 से अनुमत करता है।",
+            "tone": "success"
+          },
+          {
+            "at": "hba",
+            "caption": "मेल खाती hostssl पंक्ति SCRAM-SHA-256 पासवर्ड माँगती है।",
+            "tone": "secure"
+          },
+          {
+            "at": "tls",
+            "caption": "किसी पासवर्ड की जाँच से पहले सेशन एन्क्रिप्ट हो जाता है।",
+            "tone": "secure"
+          },
+          {
+            "at": "role",
+            "caption": "app_rw शॉप टेबल पर केवल SELECT, INSERT और UPDATE कर सकता है।"
+          },
+          {
+            "at": "db",
+            "caption": "क्वेरी चलती है। इस रोल के लिए DROP TABLE अस्वीकार कर दी जाएगी।",
+            "tone": "success"
+          },
+          {
+            "at": "log",
+            "caption": "स्टेटमेंट और रोल ऑडिट लॉग में लिखे जाते हैं।"
+          },
+          {
+            "at": "fw",
+            "token": "TCP/5432",
+            "caption": "192.0.2.50 से आया स्कैन फ़ायरवॉल द्वारा ड्रॉप कर दिया जाता है और कभी PostgreSQL तक नहीं पहुँचता।",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "network",
+      "type": "text",
+      "markdown": "## चरण 2: नेटवर्क एक्सपोज़र घटाएँ\n\nडिफ़ॉल्ट रूप से PostgreSQL केवल `localhost` पर सुनता है, लेकिन कई ट्यूटोरियल इसे `*` कर देते हैं। केवल उसी एक इंटरफ़ेस से बाइंड करें जिसकी एप्लिकेशन को ज़रूरत है, और होस्ट फ़ायरवॉल से केवल एप्लिकेशन सर्वर को अनुमति दें।\n\n`postgresql.conf` संपादित करें, फिर सेवा रीस्टार्ट करें। 5432 को कभी इंटरनेट पर उजागर न करें। यदि दूरस्थ प्रशासन चाहिए, तो SSH टनल या VPN उपयोग करें।"
+    },
+    {
+      "id": "conf",
+      "type": "code",
+      "language": "ini",
+      "filename": "postgresql.conf",
+      "caption": "नेटवर्क, पासवर्ड और TLS सेटिंग्स (अंश)।",
+      "highlight": [
+        2,
+        4,
+        5,
+        6
+      ],
+      "code": "# Network\nlisten_addresses = '10.20.0.5'          # not '*'\n# Authentication and TLS\npassword_encryption = scram-sha-256     # no md5 for new passwords\nssl = on\nssl_cert_file = '/etc/postgresql/16/main/server.crt'\nssl_key_file  = '/etc/postgresql/16/main/server.key'\nssl_min_protocol_version = 'TLSv1.2'\n# Logging\nlog_connections = on\nlog_disconnections = on\nlog_line_prefix = '%m [%p] %u@%d %h '\nlog_statement = 'ddl'\n"
+    },
+    {
+      "id": "hba",
+      "type": "text",
+      "markdown": "## चरण 3: pg_hba.conf से ऑथेंटिकेशन को कसें\n\nPostgreSQL `pg_hba.conf` को ऊपर से नीचे पढ़ता है और **पहली** मेल खाती पंक्ति का उपयोग करता है। क्रम मायने रखता है। सबसे विशिष्ट नियमों से शुरू करें और अंत में स्पष्ट reject रखें।\n\n`trust` से बचें, जो बिना पासवर्ड के किसी भी दावा किए गए यूज़र को स्वीकार कर लेता है। नए सेटअप के लिए `md5` से बचें, क्योंकि SCRAM-SHA-256 रीप्ले और ऑफ़लाइन अनुमान के विरुद्ध कहीं बेहतर है। `hostssl` का उपयोग करें ताकि बिना TLS का प्रयास मेल ही न खाए।"
+    },
+    {
+      "id": "hbacode",
+      "type": "code",
+      "language": "plain",
+      "filename": "pg_hba.conf",
+      "caption": "पहला मेल जीतता है, इसलिए अंतिम reject पंक्ति सुरक्षा जाल है।",
+      "highlight": [
+        3,
+        4,
+        6
+      ],
+      "code": "# TYPE   DATABASE  USER      ADDRESS          METHOD\nlocal    all       postgres                   peer\nhostssl  shop      app_rw    10.20.0.15/32    scram-sha-256\nhostssl  shop      app_ro    10.20.0.16/32    scram-sha-256\nhostssl  all       dba_alice 10.20.0.99/32    scram-sha-256\nhost     all       all       0.0.0.0/0        reject\n"
+    },
+    {
+      "id": "roles",
+      "type": "text",
+      "markdown": "## चरण 4: रोल से न्यूनतम विशेषाधिकार लागू करें\n\nएप्लिकेशन कभी सुपरयूज़र नहीं होना चाहिए। हर काम के लिए एक **ग्रुप** रोल बनाएँ, उसे केवल वही दें जो उस काम को चाहिए, और लॉगिन रोल को उससे इनहेरिट करने दें। `public` स्कीमा के व्यापक डिफ़ॉल्ट अधिकार भी वापस लें।\n\nनीचे की कमांड प्लेसहोल्डर पासवर्ड उपयोग करती हैं। असली सेटअप में लंबे यादृच्छिक मान बनाएँ और उन्हें शेल हिस्ट्री में नहीं, सीक्रेट्स मैनेजर में रखें।"
+    },
+    {
+      "id": "sql",
+      "type": "code",
+      "language": "sql",
+      "filename": "harden.sql",
+      "caption": "postgres के रूप में चलाएँ: sudo -u postgres psql -d shop -f harden.sql",
+      "highlight": [
+        2,
+        3,
+        7,
+        8
+      ],
+      "code": "-- Remove broad defaults\nREVOKE ALL ON DATABASE shop FROM PUBLIC;\nREVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\n-- Group roles (cannot log in)\nCREATE ROLE shop_rw NOLOGIN;\nCREATE ROLE shop_ro NOLOGIN;\nGRANT CONNECT ON DATABASE shop TO shop_rw, shop_ro;\nGRANT USAGE ON SCHEMA public TO shop_rw, shop_ro;\nGRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO shop_rw;\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO shop_ro;\n\n-- Login roles inherit from groups\nCREATE ROLE app_rw LOGIN PASSWORD 'REPLACE_WITH_GENERATED_SECRET' CONNECTION LIMIT 20 IN ROLE shop_rw;\nCREATE ROLE app_ro LOGIN PASSWORD 'REPLACE_WITH_GENERATED_SECRET' CONNECTION LIMIT 5 IN ROLE shop_ro;\n"
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## चरण 5: साबित करें कि नियंत्रण काम करते हैं\n\nजिस नियंत्रण का कभी परीक्षण नहीं हुआ वह केवल अनुमान है। एप्लिकेशन होस्ट से, अभी बनाए रोल के साथ परीक्षण करें, और अनुमत और अस्वीकृत दोनों स्थितियाँ जाँचें।\n\n1. TLS अनिवार्य करके कनेक्ट करें और पुष्टि करें कि सेशन एन्क्रिप्टेड है।\n2. `app_rw` के रूप में कोई विनाशकारी स्टेटमेंट चलाएँ और पुष्टि करें कि PostgreSQL उसे अस्वीकार करता है।\n3. ऐसे पते से कनेक्ट करने का प्रयास करें जिसकी `pg_hba.conf` में कोई पंक्ति नहीं है और पुष्टि करें कि वह अस्वीकृत होता है।\n4. लॉग पढ़ें और पुष्टि करें कि हर प्रयास ने निशान छोड़ा।"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "app-host",
+      "prompt": "$",
+      "caption": "एप्लिकेशन होस्ट (10.20.0.15) से टिप्पणी सहित परीक्षण रन।",
+      "lines": [
+        {
+          "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=require\" -c \"\\conninfo\"",
+          "output": "You are connected to database \"shop\" as user \"app_rw\" on host \"10.20.0.5\" at port \"5432\".\nSSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)",
+          "comment": "TLS 1.3 उपयोग में है।"
+        },
+        {
+          "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=require\" -c \"DROP TABLE orders;\"",
+          "output": "ERROR:  must be owner of table orders",
+          "comment": "न्यूनतम विशेषाधिकार काम करता है: एप्लिकेशन डेटा नष्ट नहीं कर सकता।"
+        },
+        {
+          "cmd": "psql \"host=10.20.0.5 dbname=shop user=app_rw sslmode=disable\" -c \"SELECT 1;\"",
+          "output": "psql: error: connection to server at \"10.20.0.5\", port 5432 failed: FATAL:  no pg_hba.conf entry for host \"10.20.0.15\", user \"app_rw\", database \"shop\", no encryption",
+          "comment": "hostssl पंक्तियाँ सादे-पाठ सेशन अस्वीकार करती हैं।"
+        },
+        {
+          "prompt": "$ (on the server)",
+          "cmd": "sudo tail -n 3 /var/log/postgresql/postgresql-16-main.log",
+          "output": "2026-11-12 09:14:02.118 UTC [4121] app_rw@shop 10.20.0.15 ERROR:  must be owner of table orders\n2026-11-12 09:14:02.118 UTC [4121] app_rw@shop 10.20.0.15 STATEMENT:  DROP TABLE orders;\n2026-11-12 09:14:09.771 UTC [4130] [unknown]@[unknown] 10.20.0.15 FATAL:  no pg_hba.conf entry for host \"10.20.0.15\"",
+          "comment": "हर अस्वीकृत प्रयास रोल और स्रोत पते के साथ लॉग होता है।"
+        }
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "text",
+      "markdown": "## चरण 6: ऑडिट, बैकअप और पैच\n\nऊपर की `log_*` सेटिंग्स कनेक्शन और DDL रिकॉर्ड करती हैं। संवेदनशील टेबल पर पढ़ने और लिखने के स्टेटमेंट-स्तर ऑडिट के लिए `pgaudit` एक्सटेंशन इंस्टॉल करें और केवल ज़रूरी क्लास लॉग करें, जैसे `write` और `role`। सब कुछ लॉग करने से डिस्क भर जाती है और काम की पंक्तियाँ छिप जाती हैं।\n\nफिर तीन आम कमियाँ बंद करें:\n\n- **बैकअप** एन्क्रिप्टेड हों और नियमित रूप से रीस्टोर किए जाएँ। देखें [Backup and Disaster Recovery Lab](/learn/hands-on-security-labs/backup-and-disaster-recovery-lab)।\n- **पैचिंग**: PostgreSQL के माइनर रिलीज़ तुरंत लगाएँ, क्योंकि उनमें सुरक्षा सुधार होते हैं।\n- **मॉनिटरिंग**: लॉग को अपने SIEM को भेजें, जैसा [Centralized SIEM Lab](/learn/hands-on-security-labs/centralized-siem-lab) में बनाया गया है, और बार-बार होने वाली ऑथेंटिकेशन विफलताओं पर अलर्ट रखें।"
+    },
+    {
+      "id": "mistakes",
+      "type": "text",
+      "markdown": "## देखने योग्य आम गलतियाँ\n\nजब आप विरासत में मिले डेटाबेस की समीक्षा करें, तो पहले यह छोटी सूची जाँचें। हर बिंदु कई डेटा उल्लंघनों के पीछे का असली पैटर्न है, और हर एक को ठीक करना सस्ता है।\n\n| निष्कर्ष | यह नुकसान क्यों करता है | समाधान |\n|:--|:--|:--|\n| `pg_hba.conf` में `trust` या `0.0.0.0/0` | पोर्ट तक पहुँचने वाला कोई भी लॉगिन कर सकता है | विशिष्ट पते, SCRAM, अंत में `reject` |\n| एप्लिकेशन `postgres` उपयोग करता है | एक इंजेक्शन बग पूर्ण नियंत्रण बन जाता है, फ़ाइल एक्सेस सहित | ग्रुप रोल के साथ समर्पित लॉगिन रोल |\n| हर एनवायरनमेंट में एक ही पासवर्ड | डेवलपमेंट से लीक होने पर प्रोडक्शन उजागर होता है | प्रति एनवायरनमेंट अद्वितीय जनरेटेड सीक्रेट |\n| ऐप और डेटाबेस के बीच TLS नहीं | क्रेडेंशियल और डेटा नेटवर्क पर साफ़ टेक्स्ट में जाते हैं | `hostssl` और `sslmode=verify-full` |\n| लॉग केवल डेटाबेस होस्ट पर रखे गए | हमलावर सबूत मिटा सकता है | लॉग को सेंट्रल कलेक्टर को फ़ॉरवर्ड करें |\n\nध्यान दें कि इनमें से किसी समाधान को व्यावसायिक उत्पाद नहीं चाहिए। इन्हें एक चेकलिस्ट और हर बदलाव के बाद दोबारा परखने का अनुशासन चाहिए। चेकलिस्ट को कोड की तरह मानें: उसे अपने कॉन्फ़िगरेशन के पास रखें, हर अपग्रेड के बाद चलाएँ, और परिणाम दर्ज करें। जो हार्डनिंग साल में एक बार जाँची जाती है वह भटक जाती है; जो हर बदलाव पर जाँची जाती है वह असली बनी रहती है।"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "खुद को बाहर न कर लें",
+      "markdown": "`pg_hba.conf` संपादित करते समय हमेशा एक काम करता एडमिन सेशन खुला रखें, और रीलोड से पहले फ़ाइल जाँचें। गलत पंक्ति में एक टाइपो सबको रोक सकता है, आपको भी। `SELECT pg_reload_conf();` से रीलोड करें और दूसरे टर्मिनल से परीक्षण करें।"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "रीलोड से पहले फ़ाइल जाँचें",
+      "markdown": "`pg_hba_file_rules` व्यू को क्वेरी करें और `error` कॉलम देखें। यह कुछ लागू किए बिना हर पंक्ति की सिंटैक्स त्रुटियाँ दिखाता है, इसलिए पहुँच खोने से पहले ही गलतियाँ पकड़ ली जाती हैं।"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "खुद करके देखें",
+      "markdown": "**आपके स्वामित्व वाली** PostgreSQL VM पर:\n\n1. स्नैपशॉट लें, फिर अपने पतों के साथ `postgresql.conf` और `pg_hba.conf` के उदाहरण लागू करें।\n2. `harden.sql` चलाएँ और जनरेट किए पासवर्ड के साथ दो लॉगिन रोल बनाएँ।\n3. चरण 5 के तीनों परीक्षण दोहराएँ और सटीक त्रुटि संदेश दर्ज करें।\n4. किसी दूसरी VM से, फ़ायरवॉल नियम चालू करने से पहले और बाद में `nmap -p 5432 <db-ip>` चलाएँ, और अंतर नोट करें।\n5. `SELECT usename, passwd LIKE 'SCRAM%' FROM pg_shadow;` चलाएँ और पुष्टि करें कि हर पासवर्ड SCRAM उपयोग करता है।\n6. एक अनुच्छेद लिखें कि चोरी हुआ ऐप पासवर्ड किसी दूसरे होस्ट से उपयोग करने पर कौन-सी परत उसे रोकती।"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "मुख्य शब्द",
+      "items": [
+        {
+          "term": "न्यूनतम विशेषाधिकार (Least privilege)",
+          "definition": "किसी रोल को केवल उतनी पहुँच देना जितनी उसके काम को चाहिए।"
+        },
+        {
+          "term": "pg_hba.conf",
+          "definition": "होस्ट-आधारित ऑथेंटिकेशन फ़ाइल; पहली मेल खाती पंक्ति तय करती है कि कनेक्शन कैसे ऑथेंटिकेट होगा।"
+        },
+        {
+          "term": "SCRAM-SHA-256",
+          "definition": "चैलेंज-रिस्पॉन्स पासवर्ड तरीका जो पासवर्ड कभी नहीं भेजता और md5 से बेहतर ऑफ़लाइन अनुमान का प्रतिरोध करता है।"
+        },
+        {
+          "term": "hostssl",
+          "definition": "pg_hba.conf का कनेक्शन प्रकार जो केवल TLS-एन्क्रिप्टेड TCP कनेक्शनों से मेल खाता है।"
+        },
+        {
+          "term": "रोल (Role)",
+          "definition": "PostgreSQL की एक पहचान जो ऑब्जेक्ट की स्वामी हो सकती है, विशेषाधिकार रख सकती है और, अनुमति हो तो, लॉगिन कर सकती है।"
+        },
+        {
+          "term": "सुपरयूज़र (Superuser)",
+          "definition": "ऐसा रोल जो सभी अनुमति जाँचों को लाँघ जाता है; एप्लिकेशन को इसे कभी उपयोग नहीं करना चाहिए।"
+        },
+        {
+          "term": "pgaudit",
+          "definition": "ऐसा एक्सटेंशन जो PostgreSQL लॉग में विस्तृत सेशन और ऑब्जेक्ट ऑडिट रिकॉर्ड लिखता है।"
+        },
+        {
+          "term": "गहराई में रक्षा (Defense in depth)",
+          "definition": "स्वतंत्र नियंत्रणों को परत-दर-परत रखना ताकि एक विफलता डेटा को उजागर न करे।"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "अपनी समझ जाँचें",
+      "questions": [
+        {
+          "question": "कौन-सी फ़ाइल तय करती है कि कौन-से यूज़र किन पतों से, किस तरीके से कनेक्ट कर सकते हैं?",
+          "options": [
+            "postgresql.conf",
+            "pg_hba.conf",
+            "pg_ident.conf",
+            "recovery.conf"
+          ],
+          "answer": 1,
+          "explanation": "pg_hba.conf में होस्ट-आधारित ऑथेंटिकेशन नियम होते हैं। postgresql.conf में listen_addresses जैसी सर्वर सेटिंग्स होती हैं।"
+        },
+        {
+          "question": "pg_hba.conf में पंक्तियों का क्रम महत्वपूर्ण क्यों है?",
+          "options": [
+            "पहली मेल खाती पंक्ति उपयोग होती है और बाकी अनदेखी की जाती हैं",
+            "अंतिम मेल खाती पंक्ति उपयोग होती है",
+            "सभी मेल खाती पंक्तियाँ मिला दी जाती हैं",
+            "क्रम केवल लॉगिंग को प्रभावित करता है"
+          ],
+          "answer": 0,
+          "explanation": "PostgreSQL पहले मेल पर रुक जाता है, इसलिए शुरू की कोई व्यापक पंक्ति बाद की सख़्त पंक्ति को ओवरराइड कर सकती है।"
+        },
+        {
+          "question": "इस लैब में कौन-सी सेटिंग्स डेटाबेस सर्वर की सुरक्षा सुधारती हैं? (सभी सही चुनें।)",
+          "options": [
+            "listen_addresses = '*'",
+            "password_encryption = scram-sha-256",
+            "अंत में reject नियम वाली hostssl पंक्तियाँ",
+            "एप्लिकेशन का postgres के रूप में कनेक्ट होना"
+          ],
+          "answer": [
+            1,
+            2
+          ],
+          "explanation": "SCRAM और अंत में reject वाली hostssl सुरक्षा सुधारती हैं। हर इंटरफ़ेस पर सुनना और एप्लिकेशन के लिए सुपरयूज़र उपयोग करना हमले की सतह बढ़ाते हैं।"
+        },
+        {
+          "question": "एप्लिकेशन रोल DROP TABLE orders चलाता है और त्रुटि मिलती है। यह किस सिद्धांत के कारण हुआ?",
+          "options": [
+            "न्यूनतम विशेषाधिकार (Least privilege)",
+            "अस्पष्टता से सुरक्षा (Security through obscurity)",
+            "खुला छोड़ना (Fail open)",
+            "कुंजी एस्क्रो (Key escrow)"
+          ],
+          "answer": 0,
+          "explanation": "रोल को केवल SELECT, INSERT और UPDATE दिए गए थे और वह टेबल का स्वामी नहीं है, इसलिए विनाशकारी DDL अस्वीकार हो जाता है।"
+        },
+        {
+          "question": "pg_hba.conf बदलाव का परीक्षण करने का सबसे सुरक्षित तरीका क्या है?",
+          "options": [
+            "बैकअप सेशन के बिना संपादित करें और रीस्टार्ट करें",
+            "एक एडमिन सेशन खुला रखें, pg_hba_file_rules जाँचें, रीलोड करें, दूसरे टर्मिनल से परीक्षण करें",
+            "पहले हर तरीके को trust पर सेट करें",
+            "केवल प्रोडक्शन में परीक्षण करें"
+          ],
+          "answer": 1,
+          "explanation": "खुला एडमिन सेशन और सिंटैक्स जाँच, किसी नियम के वैध यूज़र को रोकने पर तुरंत रोलबैक करने देते हैं।"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## सारांश\n\nआपने PostgreSQL को परतों में हार्डन किया: संकीर्ण listen पता और होस्ट फ़ायरवॉल, SCRAM और TLS वाले `pg_hba.conf` नियम, न्यूनतम-विशेषाधिकार रोल, और ऐसी लॉगिंग जो साबित करे कि क्या हुआ। हर नियंत्रण का अनुमत और अस्वीकृत दोनों स्थितियों में परीक्षण किया गया। SQL और कॉन्फ़िगरेशन फ़ाइलों को वर्ज़न कंट्रोल में रखें ताकि अगला सर्वर हार्डन होकर ही शुरू हो। अगली लैब यही सोच वेब टियर पर लागू करती है: [Nginx and Laravel Security Lab](/learn/hands-on-security-labs/nginx-and-laravel-security-lab)।"
+    }
+  ]
+}

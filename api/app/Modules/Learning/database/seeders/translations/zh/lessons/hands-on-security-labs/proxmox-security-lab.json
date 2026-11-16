@@ -1,0 +1,328 @@
+{
+  "title": "Proxmox 安全实验室",
+  "summary": "在你自己拥有的硬件上安装 Proxmox VE，加固宿主机，在没有物理端口的网桥上隔离实验区域，并自动化虚拟机的构建、快照和备份。",
+  "objectives": [
+    "描述 Proxmox 架构及其与安全相关的部分",
+    "通过更新、双因素认证、SSH 密钥和数据中心防火墙加固宿主机",
+    "使用没有物理端口的网桥隔离实验区域",
+    "使用 qm 和 vzdump 创建虚拟机、快照和备份"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "第一个实验用装有 VirtualBox 的笔记本电脑就足够了，但合上盖子它就停止工作。当你的实验室扩展到包含防火墙、SIEM 和多台服务器时，你就需要一台持续运行、能创建快照并能自我备份的专用机器。**Proxmox VE** 正是如此：它是一个基于 Debian 的免费开源虚拟化平台，提供 KVM 虚拟机、容器、Web 界面和内置防火墙。\n\n不过有一个问题。虚拟机管理程序（hypervisor）控制着其上的每一台虚拟机，因此它是实验室中最有价值的攻击目标。在本课中，你将在自己拥有的硬件上安装 Proxmox，然后在其上构建任何东西之前先保护好宿主机。"
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## 步骤 1：理解架构\n\nProxmox 运行在普通的 x86 服务器或迷你电脑上，并需要在 BIOS 中启用虚拟化。其中有三个部分与安全相关：\n\n| 部分 | 说明 | 安全关注点 |\n|:--|:--|:--|\n| 宿主机 (Debian) | 基础操作系统和 Proxmox 服务 | 补丁、SSH 和 root 访问 |\n| Web UI 和 API（端口 8006） | 管理一切的入口 | 绝不能面向互联网 |\n| Linux 网桥 (`vmbr0`, `vmbr1`) | 用于虚拟机网络的虚拟交换机 | 决定哪些虚拟机可以互相通信 |\n\n良好的实验室布局使用两个网桥。`vmbr0` 连接到物理网卡，只承载管理流量。`vmbr1` **完全没有物理端口**，因此它是一台纯虚拟交换机，实验区域就位于其上。只有防火墙虚拟机在两个网桥上都有网卡。这与 [隔离的虚拟安全实验室](/learn/hands-on-security-labs/isolated-virtual-security-lab) 中的单一出口思路相同，只是现在运行在专用主机上。"
+    },
+    {
+      "id": "harden",
+      "type": "text",
+      "markdown": "## 步骤 2：首先保护宿主机\n\n在创建任何虚拟机之前先完成以下步骤：\n\n1. **从官方 ISO 安装**并校验其校验和。为宿主机设置静态管理地址，例如 `10.10.10.5`。\n2. **更新。** 全新安装使用企业版软件源，需要订阅。对于实验室，请切换到无订阅软件源并执行完整升级。\n3. **在 Proxmox 域中创建一个具名管理员用户**，日常工作使用它而不是 `root@pam`。\n4. **为该用户在 Web 界面中启用双因素认证**（TOTP）。\n5. **使用 SSH 密钥**并禁用 root 的密码登录。\n6. **在数据中心级别启用 Proxmox 防火墙**，并且只允许来自你的管理地址访问端口 8006 和 SSH。\n\n步骤 6 中的防火墙设置最为重要。如果在没有先放行你自己的地址的情况下启用它，你会把自己锁在外面，所以要先添加放行规则。"
+    },
+    {
+      "id": "host-cli",
+      "type": "terminal",
+      "title": "在 Proxmox 宿主机上（以 root 身份，通过控制台）",
+      "prompt": "root@pve01:~#",
+      "lines": [
+        {
+          "cmd": "echo \"deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription\" > /etc/apt/sources.list.d/pve-no-sub.list",
+          "comment": "仅限实验室的软件源；生产环境请使用企业版软件源"
+        },
+        {
+          "cmd": "apt update && apt full-upgrade -y",
+          "output": "Reading package lists... Done\n12 upgraded, 0 newly installed, 0 to remove."
+        },
+        {
+          "cmd": "pveum user add labadmin@pve --comment \"Lab administrator\"",
+          "comment": "日常工作使用具名账户而不是 root"
+        },
+        {
+          "cmd": "pveum acl modify / --users labadmin@pve --roles Administrator",
+          "comment": "授予内置的 Administrator 角色"
+        },
+        {
+          "cmd": "pveum passwd labadmin@pve",
+          "output": "Enter new password: ********\nRetype new password: ********",
+          "comment": "使用密码管理器生成的长且唯一的密码"
+        },
+        {
+          "cmd": "grep -E '^(PermitRootLogin|PasswordAuthentication)' /etc/ssh/sshd_config",
+          "output": "PermitRootLogin prohibit-password\nPasswordAuthentication no",
+          "comment": "在安装好你的公钥之后，仅允许密钥登录"
+        },
+        {
+          "cmd": "pve-firewall status",
+          "output": "Status: enabled/running",
+          "comment": "在添加针对 10.10.10.0/24 的放行规则后确认"
+        }
+      ]
+    },
+    {
+      "id": "net-conf",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/network/interfaces",
+      "caption": "vmbr0 面向管理局域网。vmbr1 没有物理端口，因此实验流量无法离开宿主机。",
+      "code": "auto vmbr0\niface vmbr0 inet static\n    address 10.10.10.5/24\n    gateway 10.10.10.1\n    bridge-ports eno1\n    bridge-stp off\n    bridge-fd 0\n\nauto vmbr1\niface vmbr1 inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n    bridge-vlan-aware yes",
+      "highlight": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14
+      ]
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "安全地管理 Proxmox",
+      "data": {
+        "actors": [
+          {
+            "id": "adm",
+            "label": "管理员电脑",
+            "sub": "10.10.10.20",
+            "icon": "laptop"
+          },
+          {
+            "id": "fw",
+            "label": "PVE 防火墙",
+            "sub": ":8006 / :22",
+            "icon": "firewall"
+          },
+          {
+            "id": "pve",
+            "label": "pve01",
+            "sub": "Web UI + API",
+            "icon": "server"
+          },
+          {
+            "id": "bad",
+            "label": "其他主机",
+            "sub": "10.10.30.20",
+            "icon": "attacker"
+          }
+        ],
+        "steps": [
+          {
+            "from": "adm",
+            "to": "fw",
+            "label": "HTTPS :8006",
+            "note": "管理员从允许的管理地址打开 Web 界面。"
+          },
+          {
+            "from": "fw",
+            "to": "pve",
+            "label": "放行",
+            "tone": "success",
+            "note": "数据中心规则匹配源地址并转发该连接。"
+          },
+          {
+            "from": "pve",
+            "to": "adm",
+            "label": "登录 + TOTP",
+            "tone": "secure",
+            "note": "仅有密码是不够的：还需要一次性验证码。"
+          },
+          {
+            "from": "bad",
+            "to": "fw",
+            "label": "HTTPS :8006",
+            "tone": "attack",
+            "note": "客户端区域中的一台虚拟机尝试访问管理界面。"
+          },
+          {
+            "from": "fw",
+            "to": "bad",
+            "label": "丢弃 + 记录日志",
+            "tone": "blocked",
+            "note": "没有规则允许该源地址，因此连接被丢弃并记录日志。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "vms",
+      "type": "text",
+      "markdown": "## 步骤 3：通过命令行创建实验虚拟机\n\nWeb 界面很方便，但 `qm` 命令能让你的实验室**可重复构建**，而可重复的构建是雇主看重的技能。下面的示例在隔离网桥上创建一台服务器，并且不在管理网桥上配置网卡。\n\n请注意三个选择。该虚拟机只连接到 `vmbr1`，因此无法访问管理网络。磁盘位于你可控的本地存储上。并且在安装完成后立即创建快照。\n\n对于备份，`vzdump` 会创建虚拟机的压缩副本。请把归档存放在与虚拟机本身不同的磁盘或机器上，因为与虚拟机在同一磁盘上的备份会随磁盘一起损坏。"
+    },
+    {
+      "id": "qm",
+      "type": "terminal",
+      "title": "构建、快照与备份",
+      "prompt": "root@pve01:~#",
+      "lines": [
+        {
+          "cmd": "qm create 201 --name srv-web-01 --memory 2048 --cores 2 --net0 virtio,bridge=vmbr1,tag=20 --scsi0 local-lvm:16 --ostype l26",
+          "output": "",
+          "comment": "VLAN 标签 20 使其位于服务器区域"
+        },
+        {
+          "cmd": "qm start 201",
+          "comment": "从控制台安装操作系统，然后继续"
+        },
+        {
+          "cmd": "qm snapshot 201 clean-baseline --description \"Patched, no services\"",
+          "comment": "供后续练习使用的回滚点"
+        },
+        {
+          "cmd": "vzdump 201 --storage backup-disk --mode snapshot --compress zstd",
+          "output": "INFO: starting new backup job: vzdump 201 --mode snapshot\nINFO: Finished Backup of VM 201 (00:01:42)\nINFO: Backup job finished successfully",
+          "comment": "归档保存在单独的磁盘上"
+        },
+        {
+          "cmd": "qm listsnapshot 201",
+          "output": "`-> clean-baseline   2025-01-15 10:20:41   Patched, no services\n `-> current           You are here!"
+        }
+      ]
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "切勿将端口 8006 暴露到互联网",
+      "markdown": "从家用路由器对 Proxmox Web 界面做端口转发，会让你的整个实验室只隔着一次登录就暴露在互联网面前。如果需要远程访问，请使用你自己控制的 VPN，并让该界面只能从管理网络访问。"
+    },
+    {
+      "id": "monitor",
+      "type": "text",
+      "markdown": "## 步骤 4：监控宿主机\n\n安全的宿主机同时也是受监控的宿主机。请定期检查认证日志：`journalctl -u ssh` 和 `/var/log/pveproxy/access.log` 会显示谁在何时连接过。之后你会把这些日志发送到中央收集器，详见 [集中式 SIEM 实验室](/learn/hands-on-security-labs/centralized-siem-lab)。\n\n最后，保持一套简单的维护例程。每月为宿主机打补丁，至少测试一次从备份恢复（未经测试的备份只是一种希望），并在每次添加虚拟机时检查数据中心防火墙规则。把每一次变更记录在你的设计文件中。"
+    },
+    {
+      "id": "hygiene",
+      "type": "text",
+      "markdown": "## 步骤 5：同样保护好客户机\n\n保护宿主机只完成了一半的工作。每台虚拟机也需要自己的基本防护，而虚拟机管理程序为你提供了落实这些防护的工具。\n\n- **虚拟机级防火墙。** Proxmox 可以在每台虚拟机的虚拟网卡上过滤流量。按虚拟机和按接口启用它，然后编写诸如“仅允许来自 10.10.10.20 的 TCP 22”之类的规则。这会在同一网桥内增加第二层防护，因此同一区域中的两台服务器仍然可以相互隔离。\n- **最小化硬件。** 移除你不使用的设备，例如 USB 直通、多余的网卡和光驱。每个虚拟设备都是可能含有缺陷的代码。\n- **使用角色，而非 root。** 创建一个只能启动、停止和快照单台虚拟机的角色，并把它授予辅助账户。最小权限原则同样适用于虚拟机管理程序。\n- **资源限制。** 设置内存和 CPU 限制，使某一台失控或吵闹的虚拟机无法耗尽防火墙虚拟机的资源，进而让整个实验室离线。\n\n最后，在备注字段中为每台虚拟机标注其所属区域和用途。当你有二十台机器时，清晰的标签能帮你发现那台不该存在的机器。"
+    },
+    {
+      "id": "note",
+      "type": "callout",
+      "variant": "note",
+      "title": "快照还是备份？",
+      "markdown": "快照是与虚拟机存放在同一存储上的快速回滚点。备份则是单独的完整副本。快照用于几分钟内就会撤销的实验，备份用于任何你无法承担重建代价的内容。两者兼用是常态：在有风险的变更之前做快照，每周做备份。请记得测试恢复，因为从未恢复过的备份是未经验证的。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自动手",
+      "markdown": "在你自己拥有的机器上（闲置电脑或启用了虚拟化的嵌套虚拟机），安装 Proxmox VE 并按照加固步骤操作：无订阅软件源、启用 TOTP 的具名管理员、仅密钥登录的 SSH，以及仅允许来自你的管理地址访问 8006 和 SSH 的数据中心防火墙。创建没有物理端口的 `vmbr1`，用 `qm create` 在其上构建一台虚拟机，为它创建快照，并在删除虚拟机内的一个文件后恢复该快照。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "Proxmox VE",
+          "definition": "一个开源虚拟化平台，整合了 KVM 虚拟机、容器和 Web 界面。"
+        },
+        {
+          "term": "KVM",
+          "definition": "Linux 内核功能，利用硬件虚拟化将宿主机变成虚拟机管理程序。"
+        },
+        {
+          "term": "Linux 网桥 (Linux bridge)",
+          "definition": "宿主机内部的虚拟交换机，用于连接虚拟机的网卡。"
+        },
+        {
+          "term": "数据中心防火墙 (Datacenter firewall)",
+          "definition": "Proxmox 中在整个集群范围内应用规则的防火墙级别。"
+        },
+        {
+          "term": "TOTP",
+          "definition": "基于时间的一次性验证码，用作第二认证因素。"
+        },
+        {
+          "term": "pveum",
+          "definition": "用于管理 Proxmox 用户、角色和权限的命令行工具。"
+        },
+        {
+          "term": "vzdump",
+          "definition": "创建虚拟机和容器备份的 Proxmox 工具。"
+        },
+        {
+          "term": "管理网络 (Management network)",
+          "definition": "仅用于管理基础设施的独立网络。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "为什么 vmbr1 没有物理端口？",
+          "options": [
+            "为了更快",
+            "这样实验流量就留在宿主机内部，除非防火墙虚拟机将其路由出去",
+            "因为 Proxmox 禁止使用物理端口",
+            "为了节省磁盘空间"
+          ],
+          "answer": 1,
+          "explanation": "没有物理端口的网桥是纯虚拟交换机，因此除非拥有第二块网卡的虚拟机转发，否则任何流量都不会离开。"
+        },
+        {
+          "question": "下列哪些步骤可以加固 Proxmox 宿主机？请选择所有适用项。",
+          "options": [
+            "为管理员用户启用 TOTP",
+            "在家用路由器上转发端口 8006",
+            "使用 SSH 密钥并禁用 root 密码登录",
+            "仅允许来自管理网络访问 8006"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "双因素认证、基于密钥的 SSH 和源地址限制可以降低风险。将 8006 暴露到互联网则会增加风险。"
+        },
+        {
+          "question": "在启用数据中心防火墙之前必须做什么？",
+          "options": [
+            "重启宿主机",
+            "添加一条放行你自己管理地址的规则",
+            "删除所有虚拟机",
+            "禁用 SSH"
+          ],
+          "answer": 1,
+          "explanation": "如果没有放行你的地址的规则，默认策略可能会把你锁在 Web 界面和 SSH 之外。"
+        },
+        {
+          "question": "为什么要把 vzdump 归档存放在不同的磁盘上？",
+          "options": [
+            "同一磁盘上的备份会随该磁盘故障而丢失",
+            "这样可以使备份更小",
+            "Proxmox 要求这样做",
+            "这样可以加快快照速度"
+          ],
+          "answer": 0,
+          "explanation": "与原始数据处于同一故障域的备份不是真正的备份。"
+        },
+        {
+          "question": "哪条命令用于创建虚拟机快照？",
+          "options": [
+            "vzdump 201",
+            "qm snapshot 201 clean-baseline",
+            "pveum passwd",
+            "pve-firewall status"
+          ],
+          "answer": 1,
+          "explanation": "`qm snapshot` 保存一个回滚点。`vzdump` 则生成完整的备份归档。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\nProxmox 为你的实验室提供了一个长期的家，但虚拟机管理程序是最核心的资产。要为它打补丁，为管理员提供启用双因素认证的具名账户，使用 SSH 密钥，并让 Web 界面位于管理网络上的数据中心防火墙之后。将实验区域放在没有物理端口的网桥上，用 `qm` 构建虚拟机，并用 `vzdump` 备份到单独的磁盘。接下来，在 [多 VLAN 网络安全实验室](/learn/hands-on-security-labs/multi-vlan-network-security-lab) 中把实验室划分为多个 VLAN。"
+    }
+  ]
+}

@@ -57,7 +57,7 @@ second model review pass. Sonnet translators, 8 in parallel, 3-4 lessons each.
 |:--|:--|:--|:--|
 | 0 | Table, API, seeder, tools; Arabic mechanical audit and fixes; all 10 syllabi in hi/zh/tr | - | done 2026-11-14 |
 | 1 | networking-foundations-ccna | 41 lessons x 3 | done 2026-11-16 (4 rounds, 123 lesson-translations) | |
-| 2 | hands-on-security-labs + ot-ics-security | 44 x 3 | |
+| 2 | hands-on-security-labs + ot-ics-security | 44 x 3 | labs round 1 done 2026-11-16 (first 10 in course order); next: labs lessons 11-32, then ot-ics-security |
 | 3 | network-automation-devops | 49 x 3 | |
 | 4 | security-operations-dfir | 50 x 3 | |
 | 5 | offensive-security-for-defense | 57 x 3 | |

@@ -1,0 +1,326 @@
+{
+  "title": "Nginx 与 Laravel 安全实验室",
+  "summary": "加固你自己拥有的 Nginx 和 Laravel 技术栈：TLS、安全响应头、点文件和速率限制规则、生产环境 Laravel 设置和文件权限，然后用 curl 从外部验证。",
+  "objectives": [
+    "解释加固后的 Web 技术栈的各个层次",
+    "为 Nginx 配置 TLS、响应头、点文件拒绝和速率限制",
+    "应用适合生产环境的 Laravel 设置和文件权限",
+    "使用 curl 从外部验证各项控制",
+    "安全地推行 CSP 等响应头"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一个 Laravel 应用运行在小型 VPS 上的 Nginx 之后。它可以正常工作，但对服务器的扫描显示：每个响应中都带有 Nginx 版本号，由于 Web 根目录中的一个笔误导致 `.env` 可被访问，调试模式一直开着，并且没有安全响应头。每个问题单独看都似乎不严重，但合在一起，它们会为攻击者勾勒出你的技术栈地图，有时还会泄露数据库密码。\n\n在本实验中，你将在 [隔离的虚拟安全实验室](/learn/hands-on-security-labs/isolated-virtual-security-lab) 中你自己的测试虚拟机里，加固一个**你自己拥有**的 Nginx 和 Laravel 技术栈。你将修复 Web 服务器层、框架层和文件权限，然后使用 `curl` 从外部验证结果。"
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## 步骤 1：了解你要保护的对象\n\n一个请求会经过多个组件。每个组件都可以实施不同的控制，因此请把它们视为不同的层。\n\n| 层 | 主要风险 | 控制措施 |\n|:--|:--|:--|\n| TLS | 窃听、降级 | TLS 1.2+、HSTS |\n| Nginx | 信息泄露、滥用 | 隐藏版本号、速率限制、响应头 |\n| PHP-FPM | 通过上传文件执行代码 | 只允许 `index.php` |\n| Laravel | 调试信息泄露、弱会话 | `APP_DEBUG=false`、安全 Cookie |\n| 文件系统 | 机密暴露 | Web 根目录仅为 `public/`，严格的所有权 |\n\n动画展示了在加固后的技术栈中，恶意请求和正常请求各会遭遇什么。"
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "请求遇到加固后的 Web 技术栈",
+      "caption": "正常请求到达 Laravel；探测机密文件或速率过高的请求会在更早的环节被拦截。",
+      "data": {
+        "token": "请求",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "客户端",
+            "sub": "203.0.113.40",
+            "icon": "laptop"
+          },
+          {
+            "id": "tls",
+            "label": "TLS",
+            "sub": "443",
+            "icon": "lock"
+          },
+          {
+            "id": "nginx",
+            "label": "Nginx",
+            "sub": "规则与限制",
+            "icon": "firewall"
+          },
+          {
+            "id": "fpm",
+            "label": "PHP-FPM",
+            "sub": "index.php",
+            "icon": "cpu"
+          },
+          {
+            "id": "app",
+            "label": "Laravel",
+            "sub": "中间件",
+            "icon": "shield"
+          },
+          {
+            "id": "db",
+            "label": "数据库",
+            "sub": "10.20.0.5",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "client",
+            "token": "GET /",
+            "caption": "访客通过 HTTPS 请求主页。"
+          },
+          {
+            "at": "tls",
+            "token": "GET /",
+            "caption": "会话协商 TLS 1.3；HTTP 的 80 端口只做重定向。",
+            "tone": "secure"
+          },
+          {
+            "at": "nginx",
+            "token": "GET /",
+            "caption": "Nginx 添加安全响应头，并将请求传递给 PHP-FPM。",
+            "tone": "success"
+          },
+          {
+            "at": "fpm",
+            "token": "GET /",
+            "caption": "只有 index.php 会被执行；前端控制器启动 Laravel。"
+          },
+          {
+            "at": "app",
+            "token": "GET /",
+            "caption": "中间件检查 CSRF、会话和授权，然后查询数据库。"
+          },
+          {
+            "at": "nginx",
+            "token": "GET /.env",
+            "caption": "对 /.env 的探测匹配了拒绝规则，在不接触 PHP 的情况下返回 404。",
+            "tone": "blocked"
+          },
+          {
+            "at": "nginx",
+            "token": "60 req/s",
+            "caption": "对 /login 的突发请求超过速率限制，收到 429。",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "nginx",
+      "type": "text",
+      "markdown": "## 步骤 2：加固 Nginx\n\n先从服务器透露了什么以及接受什么入手。隐藏版本号，强制使用 HTTPS，设置安全响应头，并对登录路由进行速率限制。只提供 Laravel 的 `public/` 目录，绝不要提供项目根目录。\n\n有两个细节容易被忽略。第一，`add_header` 指令不会被继承到自己定义了 `add_header` 的块中，因此要重复写出它们，或者使用同一个 include 文件。第二，拒绝除 `/.well-known/` 之外的所有点文件，证书续期需要该路径。"
+    },
+    {
+      "id": "nginxconf",
+      "type": "code",
+      "language": "nginx",
+      "filename": "/etc/nginx/sites-available/app.example.com",
+      "caption": "一个加固后的 server 块。证书路径是占位符，请换成你自己的。",
+      "highlight": [
+        1,
+        2,
+        15,
+        19,
+        23,
+        26
+      ],
+      "code": "limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;\n\nserver {\n    listen 80;\n    server_name app.example.com;\n    return 301 https://$host$request_uri;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name app.example.com;\n    root /var/www/app/public;\n    index index.php;\n    server_tokens off;\n\n    ssl_certificate     /etc/ssl/example/fullchain.pem;\n    ssl_certificate_key /etc/ssl/example/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header X-Frame-Options \"SAMEORIGIN\" always;\n    add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n    add_header Content-Security-Policy \"default-src 'self'\" always;\n\n    location ~ /\\.(?!well-known) { deny all; return 404; }\n\n    location = /login {\n        limit_req zone=login burst=5 nodelay;\n        try_files $uri /index.php?$query_string;\n    }\n\n    location / { try_files $uri $uri/ /index.php?$query_string; }\n\n    location ~ \\.php$ {\n        include fastcgi_params;\n        fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        # Only the front controller may execute\n        fastcgi_split_path_info ^(.+\\.php)(/.+)$;\n    }\n}\n"
+    },
+    {
+      "id": "laravel",
+      "type": "text",
+      "markdown": "## 步骤 3：加固 Laravel\n\n该框架有很强的默认设置，但生产环境的设置是你的工作。大多数 Laravel 事件来自配置，而不是框架漏洞。\n\n- 设置 `APP_ENV=production` 和 `APP_DEBUG=false`。调试页面会打印环境变量值和堆栈跟踪。\n- 使用 `php artisan key:generate` 只生成一次 `APP_KEY`，保密，并且绝不要提交 `.env`。\n- 使用 `SESSION_SECURE_COOKIE=true` 和 `SESSION_SAME_SITE=lax`，使 Cookie 只通过 HTTPS 传输。\n- 使用带参数绑定的 Eloquent 或查询构建器。绝不要把用户输入拼接进 SQL。\n- 提交 `composer.lock`，并定期运行 `composer audit` 检查有漏洞的软件包。\n- 使用 `php artisan config:cache` 缓存配置，这也能阻止零散的 `env()` 读取。\n\n最后是文件权限。只有 `storage/` 和 `bootstrap/cache/` 需要对 PHP 用户可写。"
+    },
+    {
+      "id": "perms",
+      "type": "code",
+      "language": "bash",
+      "filename": "permissions.sh",
+      "caption": "代码归部署用户所有，可写路径归 Web 用户所有。",
+      "highlight": [
+        2,
+        4,
+        6
+      ],
+      "code": "# Code is read-only for the web server\nsudo chown -R deploy:www-data /var/www/app\nsudo find /var/www/app -type f -exec chmod 640 {} \\;\nsudo find /var/www/app -type d -exec chmod 750 {} \\;\n# Only these two need writes\nsudo chmod -R ug+rwX /var/www/app/storage /var/www/app/bootstrap/cache\nsudo chmod 600 /var/www/app/.env\nphp artisan config:cache && php artisan route:cache\ncomposer audit\n"
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## 步骤 4：从外部验证\n\n只有当外部观察者看到结果时，加固才算完成。请在实验室中的另一台机器上使用 `curl`，因为它能准确显示攻击者或扫描器所看到的内容。测试响应头、点文件规则、HTTP 重定向和登录速率限制。"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "lab-client",
+      "prompt": "$",
+      "caption": "针对 app.example.com 上的测试虚拟机进行验证（通过你的 hosts 文件解析）。",
+      "lines": [
+        {
+          "cmd": "curl -sI http://app.example.com/ | head -n 3",
+          "output": "HTTP/1.1 301 Moved Permanently\nServer: nginx\nLocation: https://app.example.com/",
+          "comment": "重定向正常，并且没有显示版本号。"
+        },
+        {
+          "cmd": "curl -sI https://app.example.com/ | grep -Ei 'strict|nosniff|frame|referrer|content-security'",
+          "output": "strict-transport-security: max-age=31536000\nx-content-type-options: nosniff\nx-frame-options: SAMEORIGIN\nreferrer-policy: strict-origin-when-cross-origin\ncontent-security-policy: default-src 'self'",
+          "comment": "五个响应头全部存在。"
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://app.example.com/.env",
+          "output": "404",
+          "comment": "机密文件没有被提供，并且响应不会透露它是否存在。"
+        },
+        {
+          "cmd": "for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' https://app.example.com/login; done; echo",
+          "output": "200 200 200 200 200 200 503 503 503 503 503 503",
+          "comment": "突发额度用完后，Nginx 拒绝请求。如果你更想要 429，请使用 limit_req_status 429。"
+        }
+      ]
+    },
+    {
+      "id": "monitor",
+      "type": "text",
+      "markdown": "## 步骤 5：查看日志\n\n控制措施会悄无声息地失效，所以要检查你是否能看到攻击。Nginx 访问日志会记录每一次探测，包括被你拦截的。按路径统计被拦截的探测，看看扫描器在找什么，并像 [集中式 SIEM 实验室](/learn/hands-on-security-labs/centralized-siem-lab) 中那样，把日志发送到你的 SIEM 进行关联分析。\n\n对于主动防护，Fail2ban 之类的工具可以读取反复出现的 404 或 401 响应，并添加临时防火墙规则。请先在排除你自己地址的情况下测试它，因为封锁了你自己的规则是了解锁定问题的一条捷径。\n\n最后，使用 [防火墙规则测试实验室](/learn/hands-on-security-labs/firewall-rule-testing-lab) 测试服务器前面的防火墙层。从外部应该只能访问 80 和 443 端口。"
+    },
+    {
+      "id": "headers",
+      "type": "text",
+      "markdown": "## 每个响应头究竟起什么作用\n\n响应头成本很低，但前提是你理解每一个所保护的对象。不理解就照抄一份列表，会导致页面损坏和虚假的安全感。\n\n| 响应头 | 防范对象 | 常见错误 |\n|:--|:--|:--|\n| `Strict-Transport-Security` | 降级到明文 HTTP | 在 HTTPS 尚未在所有地方可用之前设置很长的 `max-age` |\n| `X-Content-Type-Options` | 浏览器猜测文件类型并运行它 | 忘记对上传的文件设置 |\n| `X-Frame-Options` | 通过嵌入框架的点击劫持 | 阻止了你自己合法的嵌入 |\n| `Referrer-Policy` | 向其他网站泄露完整 URL | 敏感路径仍使用默认值 |\n| `Content-Security-Policy` | 跨站脚本攻击的影响 | 到处允许 `unsafe-inline` |\n\n响应头是一层防护，而不是修复手段。如果你的应用存在跨站脚本漏洞，良好的策略可以减轻损害，但你仍然要修复该漏洞。同样，速率限制会减缓密码猜解，但不能取代强密码和多因素认证。可以把 Nginx 看作门口的守卫，把 Laravel 看作每个房间的锁：两者你都需要，并且要知道其中任何一个何时受到考验。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "切勿只在生产环境中测试响应头策略",
+      "markdown": "严格的 `Content-Security-Policy` 可能会悄悄破坏脚本、字体和支付组件。请先从 `Content-Security-Policy-Report-Only` 开始，查看浏览器控制台，调整策略，然后再强制执行。HSTS 具有黏性：浏览器会在整个 `max-age` 期间记住它，因此请从较短的值开始。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "为响应头使用单一的 include 文件",
+      "markdown": "把 `add_header` 行放在 `/etc/nginx/snippets/security-headers.conf` 中，并在每个自己设置响应头的 `location` 中添加 `include`。这样可以避开继承陷阱，并且只需在一处审计。在执行 `sudo systemctl reload nginx` 之前，务必先运行 `sudo nginx -t`。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自动手",
+      "markdown": "在一台**你自己拥有**、运行着 Nginx、PHP-FPM 和全新 Laravel 应用的测试虚拟机中：\n\n1. 运行步骤 4 中的四项 `curl` 检查，并把输出保存为基线。\n2. 应用 Nginx server 块，然后设置 `APP_DEBUG=false` 并运行权限命令。\n3. 运行 `sudo nginx -t`，重新加载，并重复检查。比较前后的输出。\n4. 临时设置 `APP_DEBUG=true`，触发一个错误页面，并记下该页面透露了哪些值。然后再把它关闭。\n5. 运行 `composer audit` 并记下它报告的任何安全公告。\n6. 先添加 `Content-Security-Policy-Report-Only`，然后决定在强制执行之前你会修改什么。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "HSTS",
+          "definition": "一个响应头，告诉浏览器在一段设定的时间内对某个域名只使用 HTTPS。"
+        },
+        {
+          "term": "Content-Security-Policy",
+          "definition": "一个响应头，用于限制脚本、样式和其他资源可以从何处加载，从而降低 XSS 的影响。"
+        },
+        {
+          "term": "server_tokens",
+          "definition": "Nginx 的设置，控制版本号是否出现在响应和错误页面中。"
+        },
+        {
+          "term": "速率限制 (Rate limiting)",
+          "definition": "限制客户端在一段时间内可以发送的请求数量，从而减缓密码猜解和滥用。"
+        },
+        {
+          "term": "前端控制器 (Front controller)",
+          "definition": "单一的入口脚本（Laravel 中为 public/index.php），所有动态请求都经由它处理。"
+        },
+        {
+          "term": "APP_DEBUG",
+          "definition": "显示详细错误页面的 Laravel 设置；在生产环境中必须为 false。"
+        },
+        {
+          "term": "APP_KEY",
+          "definition": "Laravel 中用于加密 Cookie 和签名数据的密钥；泄露它可能导致会话被伪造。"
+        },
+        {
+          "term": "composer audit",
+          "definition": "一条命令，对照已知安全公告检查已安装的 PHP 软件包。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "对于 Laravel 应用，Nginx 的文档根目录应该是哪个目录？",
+          "options": [
+            "项目根目录",
+            "public/",
+            "storage/",
+            "vendor/"
+          ],
+          "answer": 1,
+          "explanation": "只有 public/ 是用来对外提供服务的。提供项目根目录可能暴露 .env、源代码和 vendor 文件。"
+        },
+        {
+          "question": "在生产环境中设置 APP_DEBUG=false 的主要原因是什么？",
+          "options": [
+            "它使页面加载更快",
+            "调试页面可能泄露环境变量值和堆栈跟踪",
+            "它会加密数据库",
+            "它会启用 HTTPS"
+          ],
+          "answer": 1,
+          "explanation": "详细的错误页面可能把配置、路径，有时还有凭据泄露给任何触发错误的人。"
+        },
+        {
+          "question": "下列哪些是本实验中的加固步骤？（选择所有适用项。）",
+          "options": [
+            "server_tokens off",
+            "拒绝对点文件的请求，但 .well-known 除外",
+            "对整个项目执行 chmod 777",
+            "对登录路由进行速率限制"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "隐藏版本号、拒绝点文件和限制登录尝试可以减少暴露面。chmod 777 会让任何本地用户都能修改代码，绝不合适。"
+        },
+        {
+          "question": "某个 location 块定义了自己的 add_header 行。server 块中的响应头会怎样？",
+          "options": [
+            "它们会被合并",
+            "它们不会被继承到该 location 中",
+            "Nginx 拒绝启动",
+            "它们会重复出现两次"
+          ],
+          "answer": 1,
+          "explanation": "只有当下一级没有定义任何 add_header 时，Nginx 才会继承它，因此要重复写出响应头或使用 include 文件。"
+        },
+        {
+          "question": "为什么要以仅报告模式启动新的 Content-Security-Policy？",
+          "options": [
+            "它更安全",
+            "在阻止任何内容之前，先看看会破坏什么",
+            "浏览器要求这样做",
+            "它会禁用脚本"
+          ],
+          "answer": 1,
+          "explanation": "仅报告模式只记录违规而不阻止，因此你可以先修复合法的资源。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你分三层加固了 Web 层：Nginx 隐藏其版本号，重定向到 HTTPS，设置安全响应头，阻止点文件并限制登录尝试；Laravel 以生产模式运行，使用安全 Cookie 和经过审计的软件包；文件系统只暴露 `public/`，并把机密文件保持在权限 600。随后你用 `curl` 从外部验证了每一项结论。请把 Nginx 文件、`.env.example` 和权限脚本放入版本控制。接下来，在技术栈前面部署一道防火墙：[防火墙规则测试实验室](/learn/hands-on-security-labs/firewall-rule-testing-lab)。"
+    }
+  ]
+}

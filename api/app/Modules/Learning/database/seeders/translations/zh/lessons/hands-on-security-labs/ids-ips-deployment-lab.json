@@ -1,0 +1,311 @@
+{
+  "title": "IDS/IPS 部署实验",
+  "summary": "在你自己拥有的传感器上部署 Suricata：选择 IDS 或 IPS 模式，配置抓包与 eve.json，用无害流量编写并测试本地规则，并在阻断之前先做调优。",
+  "objectives": [
+    "比较 IDS、串联式 IPS 和镜像端口部署方式",
+    "配置 Suricata 的抓包、HOME_NET 和 eve.json",
+    "安全地编写并验证本地检测规则",
+    "通过禁用和抑制条目来调优嘈杂的签名",
+    "规划从检测到防御的安全过渡"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "你的防火墙允许 TCP/443 通往 Web 服务器，因此它无法区分正常请求和隐藏在这条被允许流量中的恶意请求。网络**入侵检测系统 (IDS)** 监视流量并发出告警。**入侵防御系统 (IPS)** 位于通信路径中，还可以丢弃数据包。两者都通过签名和协议分析来检查数据包内容。\n\n本实验在你自己拥有的 Linux 传感器上部署开源引擎 **Suricata**。你将放置它，先以被动 IDS 方式运行，用无害流量编写并测试本地规则，调优去除噪声，然后才考虑 IPS 模式。关于与基于代理的平台集成，请稍后继续学习 [Wazuh 与 Suricata 集成实验](/learn/hands-on-security-labs/wazuh-and-suricata-integration-lab)。"
+    },
+    {
+      "id": "modes",
+      "type": "text",
+      "markdown": "## 第 1 步：选择部署模式\n\n模式决定了流量如何到达传感器，因而也决定了传感器能做什么。\n\n| 模式 | 如何看到流量 | 能否阻断？ | 风险 |\n|:--|:--|:--|:--|\n| **使用 SPAN 或 TAP 的 IDS** | 来自镜像端口的流量副本 | 否 | 若镜像超载则会丢包 |\n| **串联式 IPS (NFQUEUE)** | 内核将流量排入队列交给 Suricata | 是 | 误报或崩溃可能中断生产环境 |\n| **串联网桥** | 传感器桥接两个接口 | 是 | 传感器故障会切断链路，且没有故障放行 |\n\n先在镜像端口或启用了混杂模式的虚拟交换机上以 IDS 模式开始。先有可见性，之后再阻断。在 Proxmox 实验中，将 DMZ 网桥镜像到传感器的第二个接口，具体见 [Proxmox 安全实验](/learn/hands-on-security-labs/proxmox-security-lab)。"
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "被动 IDS 模式下从数据包到告警",
+      "caption": "传感器处理的是副本，因此检查绝不会延迟真实流量。",
+      "data": {
+        "token": "数据包",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "客户端",
+            "sub": "203.0.113.40",
+            "icon": "laptop"
+          },
+          {
+            "id": "sw",
+            "label": "镜像端口",
+            "sub": "SPAN",
+            "icon": "switch"
+          },
+          {
+            "id": "web",
+            "label": "Web 服务器",
+            "sub": "10.10.20.10",
+            "icon": "server"
+          },
+          {
+            "id": "sur",
+            "label": "Suricata",
+            "sub": "eth1 AF_PACKET",
+            "icon": "eye"
+          },
+          {
+            "id": "eve",
+            "label": "eve.json",
+            "sub": "告警与流日志",
+            "icon": "log"
+          },
+          {
+            "id": "soc",
+            "label": "分析员",
+            "sub": "SIEM",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "client",
+            "caption": "客户端向 Web 服务器发送带有可疑 User-Agent 的 HTTP 请求。"
+          },
+          {
+            "at": "sw",
+            "caption": "交换机转发数据包，并将一份副本镜像到传感器。"
+          },
+          {
+            "at": "web",
+            "caption": "原始数据包原封不动地到达 Web 服务器。",
+            "tone": "success"
+          },
+          {
+            "at": "sur",
+            "caption": "Suricata 重组数据流，解码 HTTP，并与规则进行比对。"
+          },
+          {
+            "at": "sur",
+            "caption": "规则 sid 1000001 匹配到实验测试字符串。",
+            "tone": "warning"
+          },
+          {
+            "at": "eve",
+            "caption": "一条告警记录连同流、规则和签名被写入 eve.json。"
+          },
+          {
+            "at": "soc",
+            "caption": "SIEM 摄取该告警，分析员对其进行研判。",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "install",
+      "type": "text",
+      "markdown": "## 第 2 步：安装并配置传感器\n\n从你的发行版或项目仓库安装 Suricata，然后编辑 `suricata.yaml`。一开始只有少数设置重要。\n\n- `HOME_NET` 必须列出你的内部地址范围。错误的值会让许多规则悄无声息地永远不匹配。\n- `af-packet` 指定抓包接口。\n- 应启用 `eve-log`，使告警、DNS、HTTP、TLS 和流事件以 JSON 形式写出。\n- 关闭抓包接口上的硬件卸载，因为校验和或分段卸载会让传感器看不到真实的数据包。"
+    },
+    {
+      "id": "yaml",
+      "type": "code",
+      "language": "yaml",
+      "filename": "/etc/suricata/suricata.yaml",
+      "caption": "关键设置（节选）。地址为实验范围。",
+      "highlight": [
+        2,
+        3,
+        8,
+        12
+      ],
+      "code": "vars:\n  address-groups:\n    HOME_NET: \"[10.10.10.0/24,10.10.20.0/24]\"\n    EXTERNAL_NET: \"!$HOME_NET\"\n\naf-packet:\n  - interface: eth1\n    cluster-id: 99\n    cluster-type: cluster_flow\n\noutputs:\n  - eve-log:\n      enabled: yes\n      filename: eve.json\n      types: [alert, http, dns, tls, flow]\n\ndefault-rule-path: /var/lib/suricata/rules\nrule-files:\n  - suricata.rules\n  - local.rules\n"
+    },
+    {
+      "id": "rules",
+      "type": "text",
+      "markdown": "## 第 3 步：编写并测试本地规则\n\n一条规则包含**动作**、**头部**（协议、地址、端口）以及括号中的**选项**。请把你自己的规则放在 `local.rules` 中，并赋予 1,000,000 或更大的 `sid`，这样它们永远不会与社区规则集冲突。\n\n我们将检测 `User-Agent` 头中的一个无害标记字符串，这样无需任何攻击代码就能测试。稍后可以用你自己的真实指标替换该标记。\n\n保存后，运行 `suricata -T` 测试配置，用 `suricata-update` 更新受管规则，然后重启服务。"
+    },
+    {
+      "id": "rule",
+      "type": "code",
+      "language": "plain",
+      "filename": "/var/lib/suricata/rules/local.rules",
+      "caption": "仅用于实验的规则。该标记字符串是为本练习虚构的。",
+      "highlight": [
+        1
+      ],
+      "code": "alert http $EXTERNAL_NET any -> $HOME_NET any (msg:\"LAB User-Agent marker seen\"; flow:established,to_server; http.user_agent; content:\"lab-ids-test\"; nocase; classtype:policy-violation; sid:1000001; rev:1;)\n"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "sensor",
+      "prompt": "$",
+      "caption": "验证配置，从你自己的客户端生成无害的测试流量，并读取告警。",
+      "lines": [
+        {
+          "cmd": "sudo suricata -T -c /etc/suricata/suricata.yaml",
+          "output": "i: suricata: This is Suricata version 7.0.5 RELEASE running in SYSTEM mode\ni: suricata: Configuration provided was successfully loaded. Exiting.",
+          "comment": "重启之前务必先测试配置。"
+        },
+        {
+          "cmd": "sudo systemctl restart suricata && sudo suricata-update list-sources | head -n 3",
+          "output": "Name: et/open\n  Vendor: Proofpoint\n  Summary: Emerging Threats Open Ruleset",
+          "comment": "社区规则集提供广泛的覆盖。"
+        },
+        {
+          "prompt": "client$",
+          "cmd": "curl -s -o /dev/null -A 'lab-ids-test' http://10.10.20.10/",
+          "output": "",
+          "comment": "来自你实验环境中客户端的、携带该标记的无害请求。"
+        },
+        {
+          "prompt": "sensor$",
+          "cmd": "jq -c 'select(.event_type==\"alert\") | {src:.src_ip, dst:.dest_ip, sig:.alert.signature, sid:.alert.signature_id}' /var/log/suricata/eve.json | tail -n 1",
+          "output": "{\"src\":\"10.10.10.15\",\"dst\":\"10.10.20.10\",\"sig\":\"LAB User-Agent marker seen\",\"sid\":1000001}",
+          "comment": "规则已触发。请注意来源：EXTERNAL_NET 为 !HOME_NET，因此如果客户端位于你的实验地址范围内，请相应调整。"
+        }
+      ]
+    },
+    {
+      "id": "tune",
+      "type": "text",
+      "markdown": "## 第 4 步：先调优，再阻断\n\n刚部署、带有完整社区规则集的传感器噪声很大。噪声会让分析员习惯性地忽视告警，这比没有告警更糟。请循环调优：查看告警最多的签名，判断每一个属于真实活动、误报还是低价值，然后采取行动。\n\n- **禁用**与你的环境无关的规则，通过 `disable.conf` 完成。\n- 通过 `threshold.config` 条目，针对某台已知正常的主机**抑制**某条规则，而不是对所有人禁用它。\n- 对于频繁的扫描，**修改**阈值，使每个来源每小时只告警一次。\n- **保留**针对你实际运行的服务（如 Web 和 DNS）的高价值规则。\n\n只有在经过数周安静的调优之后，才应测试 IPS 模式。将少量高置信度规则从 `alert` 转换为 `drop`，用 NFQUEUE 选项运行 Suricata，并在准备好回滚计划的前提下进行测试。如果队列进程崩溃，要提前决定流量是故障放行还是故障阻断。"
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## 第 5 步：像分析员一样研判告警\n\n告警是一个问题，而不是答案。一条告警触发时，按顺序问四件事。\n\n1. **规则可信吗？** 阅读签名及其分类。它描述的模式真的表明有危害吗？\n2. **目标存在漏洞吗？** 针对你并未运行的软件的漏洞利用告警，只是信息性的。\n3. **目标接下来做了什么？** 在 `eve.json` 中查看同一条流，再查看 Web 服务器日志和主机。成功的响应或新的出站连接会提高优先级。\n4. **它是某种模式的一部分吗？** 一个来源接触多台主机或触发多条规则，说明是扫描或攻击行动。\n\n把结果记下来：真阳性、良性或误报。这些标签是下一轮调优的原材料，也向招聘经理表明你能依据证据进行推理，而不只是安装工具。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "检测不等于防御",
+      "markdown": "IDS 只负责报告。加密流量（TLS 1.3）会让签名规则看不到载荷，除非你检查 TLS SNI 和证书字段等元数据，或在你控制的代理上终止 TLS。请把 IDS 的覆盖视为部分覆盖，并将其与终端日志以及[防火墙规则测试实验](/learn/hands-on-security-labs/firewall-rule-testing-lab)中的防火墙测试配合使用。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "测量丢包",
+      "markdown": "检查 `stats.log` 或 `stats` 事件中的 `capture.kernel_drops`。该值不断上升意味着传感器处理不过来，每一次丢弃都是你从未检查过的流量。请为它分配更多 CPU、调整 `cluster_flow`，或减少镜像的流量。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "自己动手试试",
+      "markdown": "在**你自己拥有**的、连接到实验网桥镜像的传感器虚拟机上：\n\n1. 安装 Suricata，设置 `HOME_NET` 和 `af-packet`，然后运行 `sudo suricata -T`。\n2. 添加本地规则，重启，并从实验客户端生成带有该标记的请求。\n3. 在 `eve.json` 中用 `jq` 过滤器确认告警并记录各字段。\n4. 运行 `suricata-update`，浏览一天，然后用 `jq` 和 `sort | uniq -c` 列出前五个签名。\n5. 选择一条嘈杂的规则，仅针对单台主机抑制它。记录你的理由。\n6. 写一份简短计划，说明如何将一条规则改为 `drop`：什么测试能证明它是安全的，以及你将如何回滚？"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "IDS",
+          "definition": "检查流量或日志并发出告警、但不阻断的系统。"
+        },
+        {
+          "term": "IPS",
+          "definition": "串联部署的系统，除告警外还可以丢弃或重置恶意流量。"
+        },
+        {
+          "term": "SPAN / TAP",
+          "definition": "将网络流量复制到传感器的方式，可通过交换机镜像端口或物理分路器实现。"
+        },
+        {
+          "term": "签名 (Signature)",
+          "definition": "描述已知恶意或违反策略的流量模式的规则。"
+        },
+        {
+          "term": "HOME_NET",
+          "definition": "Suricata 中列出你所防御网络的变量；许多规则依赖于它。"
+        },
+        {
+          "term": "eve.json",
+          "definition": "Suricata 的 JSON 事件日志，包含告警和协议元数据。"
+        },
+        {
+          "term": "误报 (False positive)",
+          "definition": "针对实际上无害的活动发出的告警。"
+        },
+        {
+          "term": "NFQUEUE",
+          "definition": "一种 Linux 机制，将数据包从内核防火墙交给用户态程序以作出裁决。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "IDS 和 IPS 的主要区别是什么？",
+          "options": [
+            "IPS 可以串联丢弃流量；IDS 只告警",
+            "IDS 总是更快",
+            "IPS 无法读取载荷",
+            "它们是同一种产品"
+          ],
+          "answer": 0,
+          "explanation": "两者都检查流量，但只有串联式 IPS 位于通信路径中并能阻断。IDS 处理副本并报告。"
+        },
+        {
+          "question": "为什么要先在镜像端口上以 IDS 模式开始？",
+          "options": [
+            "在你调优时，它不会破坏生产流量",
+            "它会加密流量",
+            "法律要求这样做",
+            "它不占用 CPU"
+          ],
+          "answer": 0,
+          "explanation": "被动传感器处理的是副本，因此错误和误报不会阻断真实用户。"
+        },
+        {
+          "question": "下列哪些操作是有效的调优步骤？（选择所有适用项。）",
+          "options": [
+            "针对某台已知正常的主机抑制一条规则",
+            "禁用与你的服务无关的规则",
+            "将 HOME_NET 设为 any",
+            "定期查看告警最多的签名"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "有针对性的抑制、禁用无关规则和定期审查都能减少噪声。将 HOME_NET 设为 any 会破坏有方向性规则的逻辑。"
+        },
+        {
+          "question": "capture.kernel_drops 计数器不断上升意味着什么？",
+          "options": [
+            "规则非常好",
+            "传感器在丢失数据包，没有对其进行检查",
+            "TLS 被禁用",
+            "日志被加密"
+          ],
+          "answer": 1,
+          "explanation": "内核丢弃的是传感器从未看到的数据包，这是检测中的盲区。"
+        },
+        {
+          "question": "为什么 TLS 1.3 会限制基于签名的检测？",
+          "options": [
+            "载荷被加密，只剩下大部分元数据",
+            "它会阻止 Suricata",
+            "它会移除 IP 头",
+            "它会拖慢网络"
+          ],
+          "answer": 0,
+          "explanation": "匹配 HTTP 内容的签名无法看到加密会话内部，因此需要依靠 SNI、证书和流行为。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你把 Suricata 传感器放在了镜像网段上，配置了 `HOME_NET`、抓包和 `eve.json`，编写了实验规则，并通过生成无害流量并找到告警来证明它有效。你学会了在阻断之前先用禁用和抑制条目进行调优，关注内核丢包，并带着回滚方案规划 IPS 转换。告警只有被人看到才有用，因此下一个实验将集中收集它们：[集中式 SIEM 实验](/learn/hands-on-security-labs/centralized-siem-lab)。"
+    }
+  ]
+}

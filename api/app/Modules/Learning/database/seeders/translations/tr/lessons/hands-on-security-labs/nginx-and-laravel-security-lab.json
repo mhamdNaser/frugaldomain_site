@@ -1,0 +1,326 @@
+{
+  "title": "Nginx ve Laravel Güvenlik Laboratuvarı",
+  "summary": "Sahip olduğunuz bir Nginx ve Laravel yığınını sıkılaştırın: TLS, güvenlik başlıkları, nokta dosyası ve hız sınırı kuralları, üretim Laravel ayarları ve dosya izinleri; ardından curl ile dışarıdan doğrulayın.",
+  "objectives": [
+    "Sıkılaştırılmış bir web yığınının katmanlarını açıklamak",
+    "Nginx'i TLS, başlıklar, nokta dosyası reddi ve hız sınırlarıyla yapılandırmak",
+    "Üretime uygun güvenli Laravel ayarlarını ve dosya izinlerini uygulamak",
+    "Denetimleri curl ile dışarıdan doğrulamak",
+    "CSP gibi başlıkları güvenle devreye almak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Bir Laravel uygulaması küçük bir VPS üzerinde Nginx'in arkasında çalışıyor. Çalışıyor, ancak sunucunun taranması her yanıtta Nginx sürümünü, web kökündeki bir yazım hatası yüzünden erişilebilen `.env` dosyasını, açık bırakılmış hata ayıklama modunu ve hiç güvenlik başlığı olmadığını gösteriyor. Her biri tek başına küçük görünür. Birlikte ise saldırgana yığınınızın haritasını, bazen de veritabanı parolanızı verir.\n\nBu laboratuvarda, [Yalıtılmış Sanal Güvenlik Laboratuvarı](/learn/hands-on-security-labs/isolated-virtual-security-lab) dersindeki kendi test VM'nizde **sahibi olduğunuz** bir Nginx ve Laravel yığınını sıkılaştıracaksınız. Web sunucusu katmanını, çerçeve katmanını ve dosya izinlerini düzeltecek, ardından sonucu `curl` ile dışarıdan doğrulayacaksınız."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## Adım 1: Neyi koruduğunuzu bilin\n\nBir istek birkaç bileşenden geçer. Her biri farklı bir denetim uygulayabilir; bu yüzden onlara katman olarak bakın.\n\n| Katman | Başlıca risk | Denetim |\n|:--|:--|:--|\n| TLS | Dinleme, sürüm düşürme | TLS 1.2+, HSTS |\n| Nginx | Bilgi sızıntıları, kötüye kullanım | Gizlenmiş sürüm, hız sınırları, başlıklar |\n| PHP-FPM | Yüklemelerden kod çalıştırma | Yalnızca `index.php`'ye izin ver |\n| Laravel | Hata ayıklama sızıntıları, zayıf oturumlar | `APP_DEBUG=false`, güvenli çerezler |\n| Dosya sistemi | Gizli bilgilerin açığa çıkması | Web kökü yalnızca `public/`, sıkı sahiplik |\n\nAnimasyon, sıkılaştırılmış bir yığında düşmanca ve normal isteklere ne olduğunu gösterir."
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Sıkılaştırılmış bir web yığınıyla karşılaşan istekler",
+      "caption": "Normal istekler Laravel'e ulaşır; gizli bilgi arayan istekler veya aşırı hızdaki istekler daha önce durdurulur.",
+      "data": {
+        "token": "İstek",
+        "nodes": [
+          {
+            "id": "client",
+            "label": "İstemci",
+            "sub": "203.0.113.40",
+            "icon": "laptop"
+          },
+          {
+            "id": "tls",
+            "label": "TLS",
+            "sub": "443",
+            "icon": "lock"
+          },
+          {
+            "id": "nginx",
+            "label": "Nginx",
+            "sub": "Kurallar ve sınırlar",
+            "icon": "firewall"
+          },
+          {
+            "id": "fpm",
+            "label": "PHP-FPM",
+            "sub": "index.php",
+            "icon": "cpu"
+          },
+          {
+            "id": "app",
+            "label": "Laravel",
+            "sub": "Ara katman (middleware)",
+            "icon": "shield"
+          },
+          {
+            "id": "db",
+            "label": "Veritabanı",
+            "sub": "10.20.0.5",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "client",
+            "token": "GET /",
+            "caption": "Bir ziyaretçi ana sayfayı HTTPS üzerinden ister."
+          },
+          {
+            "at": "tls",
+            "token": "GET /",
+            "caption": "Oturum TLS 1.3 üzerinde anlaşır; HTTP port 80 yalnızca yönlendirme yapar.",
+            "tone": "secure"
+          },
+          {
+            "at": "nginx",
+            "token": "GET /",
+            "caption": "Nginx güvenlik başlıklarını ekler ve isteği PHP-FPM'e iletir.",
+            "tone": "success"
+          },
+          {
+            "at": "fpm",
+            "token": "GET /",
+            "caption": "Yalnızca index.php çalıştırılır; ön denetleyici (front controller) Laravel'i başlatır."
+          },
+          {
+            "at": "app",
+            "token": "GET /",
+            "caption": "Ara katman CSRF, oturum ve yetkilendirmeyi denetler, ardından veritabanını sorgular."
+          },
+          {
+            "at": "nginx",
+            "token": "GET /.env",
+            "caption": "/.env için yapılan bir yoklama bir reddetme kuralıyla eşleşir ve PHP'ye dokunmadan 404 alır.",
+            "tone": "blocked"
+          },
+          {
+            "at": "nginx",
+            "token": "60 istek/sn",
+            "caption": "/login üzerindeki bir yoğunluk hız sınırını aşar ve 429 alır.",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "nginx",
+      "type": "text",
+      "markdown": "## Adım 2: Nginx'i sıkılaştırın\n\nSunucunun neyi ifşa ettiğiyle ve neyi kabul ettiğiyle başlayın. Sürümü gizleyin, HTTPS'i zorunlu kılın, güvenlik başlıklarını ayarlayın ve oturum açma yoluna hız sınırı koyun. Laravel'in yalnızca `public/` dizinini sunun; proje kökünü asla sunmayın.\n\nİki ayrıntı kolayca gözden kaçar. Birincisi, `add_header` yönergeleri kendi `add_header` tanımını yapan bir bloğa miras kalmaz; bu yüzden onları tekrarlayın veya tek bir include dosyası kullanın. İkincisi, sertifika yenilemenin ihtiyaç duyduğu `/.well-known/` dışındaki her nokta dosyasını reddedin."
+    },
+    {
+      "id": "nginxconf",
+      "type": "code",
+      "language": "nginx",
+      "filename": "/etc/nginx/sites-available/app.example.com",
+      "caption": "Sıkılaştırılmış bir sunucu bloğu. Sertifika yolları kendi yollarınız için yer tutucudur.",
+      "highlight": [
+        1,
+        2,
+        15,
+        19,
+        23,
+        26
+      ],
+      "code": "limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;\n\nserver {\n    listen 80;\n    server_name app.example.com;\n    return 301 https://$host$request_uri;\n}\n\nserver {\n    listen 443 ssl;\n    http2 on;\n    server_name app.example.com;\n    root /var/www/app/public;\n    index index.php;\n    server_tokens off;\n\n    ssl_certificate     /etc/ssl/example/fullchain.pem;\n    ssl_certificate_key /etc/ssl/example/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n\n    add_header Strict-Transport-Security \"max-age=31536000\" always;\n    add_header X-Content-Type-Options \"nosniff\" always;\n    add_header X-Frame-Options \"SAMEORIGIN\" always;\n    add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n    add_header Content-Security-Policy \"default-src 'self'\" always;\n\n    location ~ /\\.(?!well-known) { deny all; return 404; }\n\n    location = /login {\n        limit_req zone=login burst=5 nodelay;\n        try_files $uri /index.php?$query_string;\n    }\n\n    location / { try_files $uri $uri/ /index.php?$query_string; }\n\n    location ~ \\.php$ {\n        include fastcgi_params;\n        fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        # Only the front controller may execute\n        fastcgi_split_path_info ^(.+\\.php)(/.+)$;\n    }\n}\n"
+    },
+    {
+      "id": "laravel",
+      "type": "text",
+      "markdown": "## Adım 3: Laravel'i sıkılaştırın\n\nÇerçevenin güçlü varsayılanları vardır, ancak üretim ayarları sizin işinizdir. Laravel olaylarının çoğu çerçeve hatalarından değil, yapılandırmadan kaynaklanır.\n\n- `APP_ENV=production` ve `APP_DEBUG=false` ayarlayın. Hata ayıklama sayfaları ortam değerlerini ve yığın izlerini yazdırır.\n- `APP_KEY` değerini `php artisan key:generate` ile bir kez üretin, gizli tutun ve `.env` dosyasını asla depoya göndermeyin.\n- Çerezler yalnızca HTTPS üzerinden gitsin diye `SESSION_SECURE_COOKIE=true` ve `SESSION_SAME_SITE=lax` kullanın.\n- Bağlamalı (binding) Eloquent veya sorgu oluşturucuyu kullanın. Kullanıcı girdisini asla SQL'e birleştirmeyin.\n- `composer.lock` dosyasını depoda tutun ve savunmasız paketleri kontrol etmek için düzenli olarak `composer audit` çalıştırın.\n- Yapılandırmayı `php artisan config:cache` ile önbelleğe alın; bu aynı zamanda başıboş `env()` okumalarını da durdurur.\n\nSon olarak dosya izinleri. PHP kullanıcısı tarafından yazılabilir olması gereken yalnızca `storage/` ve `bootstrap/cache/` dizinleridir."
+    },
+    {
+      "id": "perms",
+      "type": "code",
+      "language": "bash",
+      "filename": "permissions.sh",
+      "caption": "Kod bir dağıtım kullanıcısına, yazılabilir yollar web kullanıcısına aittir.",
+      "highlight": [
+        2,
+        4,
+        6
+      ],
+      "code": "# Code is read-only for the web server\nsudo chown -R deploy:www-data /var/www/app\nsudo find /var/www/app -type f -exec chmod 640 {} \\;\nsudo find /var/www/app -type d -exec chmod 750 {} \\;\n# Only these two need writes\nsudo chmod -R ug+rwX /var/www/app/storage /var/www/app/bootstrap/cache\nsudo chmod 600 /var/www/app/.env\nphp artisan config:cache && php artisan route:cache\ncomposer audit\n"
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## Adım 4: Dışarıdan doğrulayın\n\nSıkılaştırma, dışarıdaki bir gözlemci sonucu gördüğünde tamamlanır. Laboratuvarınızdaki başka bir makineden `curl` kullanın; çünkü bir saldırganın veya tarayıcının tam olarak ne gördüğünü gösterir. Başlıkları, nokta dosyası kuralını, HTTP yönlendirmesini ve oturum açma hız sınırını test edin."
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "lab-client",
+      "prompt": "$",
+      "caption": "app.example.com adresindeki bir test VM'sine karşı doğrulama (hosts dosyanız üzerinden çözümlenir).",
+      "lines": [
+        {
+          "cmd": "curl -sI http://app.example.com/ | head -n 3",
+          "output": "HTTP/1.1 301 Moved Permanently\nServer: nginx\nLocation: https://app.example.com/",
+          "comment": "Yönlendirme çalışıyor ve hiçbir sürüm numarası gösterilmiyor."
+        },
+        {
+          "cmd": "curl -sI https://app.example.com/ | grep -Ei 'strict|nosniff|frame|referrer|content-security'",
+          "output": "strict-transport-security: max-age=31536000\nx-content-type-options: nosniff\nx-frame-options: SAMEORIGIN\nreferrer-policy: strict-origin-when-cross-origin\ncontent-security-policy: default-src 'self'",
+          "comment": "Beş başlığın hepsi mevcut."
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w '%{http_code}\\n' https://app.example.com/.env",
+          "output": "404",
+          "comment": "Gizli dosya sunulmuyor ve yanıt var olduğunu ele vermiyor."
+        },
+        {
+          "cmd": "for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' https://app.example.com/login; done; echo",
+          "output": "200 200 200 200 200 200 503 503 503 503 503 503",
+          "comment": "Burst hakkı tükendikten sonra Nginx istekleri reddeder. 429 tercih ederseniz limit_req_status 429 kullanın."
+        }
+      ]
+    },
+    {
+      "id": "monitor",
+      "type": "text",
+      "markdown": "## Adım 5: Günlükleri izleyin\n\nDenetimler sessizce başarısız olur; bu yüzden saldırıları görebildiğinizi kontrol edin. Nginx erişim günlüğü, engellediklerinizi de içeren her yoklamayı kaydeder. Tarayıcıların neyi aradığını görmek için engellenen yoklamaları yola göre sayın ve korelasyon için günlüğü, [Merkezi SIEM Laboratuvarı](/learn/hands-on-security-labs/centralized-siem-lab) dersindeki gibi SIEM'inize gönderin.\n\nAktif koruma için Fail2ban gibi bir araç yinelenen 404 veya 401 yanıtlarını okuyabilir ve geçici bir güvenlik duvarı kuralı ekleyebilir. Önce kendi adresiniz hariç tutulmuş olarak test edin; çünkü sizi engelleyen bir kural, kilitlenmeleri öğrenmenin hızlı bir yoludur.\n\nSon olarak, sunucunun önündeki güvenlik duvarı katmanını [Güvenlik Duvarı Kural Testi Laboratuvarı](/learn/hands-on-security-labs/firewall-rule-testing-lab) ile test edin. Dışarıdan yalnızca 80 ve 443 portlarına erişilebilmelidir."
+    },
+    {
+      "id": "headers",
+      "type": "text",
+      "markdown": "## Her başlık gerçekte ne yapar\n\nBaşlıklar ucuzdur, ancak yalnızca her birinin neyi koruduğunu anlarsanız. Bir listeyi anlamadan kopyalamak bozuk sayfalara ve yanlış güvene yol açar.\n\n| Başlık | Neye karşı korur | Tipik hata |\n|:--|:--|:--|\n| `Strict-Transport-Security` | Düz HTTP'ye sürüm düşürme | HTTPS her yerde çalışmadan uzun bir `max-age` vermek |\n| `X-Content-Type-Options` | Tarayıcıların dosya türünü tahmin edip çalıştırması | Yüklenen dosyalarda unutmak |\n| `X-Frame-Options` | Sayfalarınızı çerçeveleyerek tıklama hırsızlığı (clickjacking) | Kendi meşru gömmelerinizi engellemek |\n| `Referrer-Policy` | Tam URL'lerin diğer sitelere sızması | Hassas yollar için varsayılanı bırakmak |\n| `Content-Security-Policy` | Siteler arası betik çalıştırmanın (XSS) etkisi | Her yerde `unsafe-inline` izni vermek |\n\nBir başlık bir katmandır, çözüm değildir. Uygulamanızda bir siteler arası betik çalıştırma açığı varsa iyi bir politika hasarı azaltır, ancak yine de açığı onarırsınız. Aynı şekilde, hız sınırı parola tahminini yavaşlatır, ancak güçlü parolaların ve çok faktörlü kimlik doğrulamanın yerini tutmaz. Nginx'i kapıdaki bekçi, Laravel'i her odadaki kilit olarak düşünün: ikisini de istersiniz ve ikisinden biri sınandığında bunu bilmek istersiniz."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Bir başlık politikasını asla yalnızca üretimde test etmeyin",
+      "markdown": "Sıkı bir `Content-Security-Policy`, betikleri, yazı tiplerini ve ödeme bileşenlerini sessizce bozabilir. `Content-Security-Policy-Report-Only` ile başlayın, tarayıcı konsolunu okuyun, politikayı ayarlayın ve ancak ondan sonra zorunlu kılın. HSTS kalıcıdır: tarayıcılar onu tüm `max-age` süresince hatırlar; bu yüzden kısa bir değerle başlayın."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Başlıklar için tek bir include dosyası kullanın",
+      "markdown": "`add_header` satırlarını `/etc/nginx/snippets/security-headers.conf` dosyasına koyun ve kendi başlıklarını ayarlayan her `location` içine `include` ekleyin. Bu, miras tuzağını önler ve denetlemek için tek bir yer bırakır. `sudo systemctl reload nginx` komutundan önce her zaman `sudo nginx -t` çalıştırın."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Nginx, PHP-FPM ve yeni bir Laravel uygulaması çalıştıran, **sahibi olduğunuz** bir test VM'sinde:\n\n1. 4. Adım'daki dört `curl` kontrolünü çalıştırın ve çıktıyı başlangıç değeriniz olarak kaydedin.\n2. Nginx sunucu bloğunu uygulayın, ardından `APP_DEBUG=false` ayarlayın ve izin komutlarını çalıştırın.\n3. `sudo nginx -t` çalıştırın, yeniden yükleyin ve kontrolleri tekrarlayın. Öncesi ve sonrası çıktıyı karşılaştırın.\n4. `APP_DEBUG=true` değerini geçici olarak ayarlayın, bir hata sayfası tetikleyin ve sayfanın hangi değerleri ifşa ettiğini not edin. Sonra tekrar kapatın.\n5. `composer audit` çalıştırın ve bildirdiği güvenlik uyarılarını not edin.\n6. Önce `Content-Security-Policy-Report-Only` ekleyin, ardından zorunlu kılmadan önce neyi değiştireceğinize karar verin."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "HSTS",
+          "definition": "Tarayıcılara bir alan adı için belirli bir süre yalnızca HTTPS kullanmalarını söyleyen bir başlık."
+        },
+        {
+          "term": "Content-Security-Policy",
+          "definition": "Betiklerin, stillerin ve diğer kaynakların nereden yüklenebileceğini sınırlayan ve XSS'in etkisini azaltan bir başlık."
+        },
+        {
+          "term": "server_tokens",
+          "definition": "Sürüm numarasının yanıtlarda ve hata sayfalarında görünüp görünmeyeceğini denetleyen Nginx ayarı."
+        },
+        {
+          "term": "Hız sınırlama (Rate limiting)",
+          "definition": "Bir istemcinin belirli bir sürede gönderebileceği istek sayısını kısıtlamak; parola tahminini ve kötüye kullanımı yavaşlatır."
+        },
+        {
+          "term": "Ön denetleyici (Front controller)",
+          "definition": "Tüm dinamik isteklerin geçtiği tek giriş betiği; Laravel'de public/index.php."
+        },
+        {
+          "term": "APP_DEBUG",
+          "definition": "Ayrıntılı hata sayfalarını gösteren Laravel ayarı; üretimde false olmalıdır."
+        },
+        {
+          "term": "APP_KEY",
+          "definition": "Laravel'de çerezleri ve imzalı verileri şifrelemek için kullanılan gizli anahtar; sızması sahte oturumlara olanak tanıyabilir."
+        },
+        {
+          "term": "composer audit",
+          "definition": "Kurulu PHP paketlerini bilinen güvenlik uyarılarına karşı kontrol eden bir komut."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anladığınızı kontrol edin",
+      "questions": [
+        {
+          "question": "Bir Laravel uygulaması için Nginx belge kökü hangi dizin olmalıdır?",
+          "options": [
+            "Proje kökü",
+            "public/",
+            "storage/",
+            "vendor/"
+          ],
+          "answer": 1,
+          "explanation": "Yalnızca public/ sunulmak üzere tasarlanmıştır. Proje kökünü sunmak .env, kaynak kodu ve vendor dosyalarını açığa çıkarabilir."
+        },
+        {
+          "question": "Üretimde APP_DEBUG=false ayarlamanın ana nedeni nedir?",
+          "options": [
+            "Sayfaları daha hızlı yükler",
+            "Hata ayıklama sayfaları ortam değerlerini ve yığın izlerini ifşa edebilir",
+            "Veritabanını şifreler",
+            "HTTPS'i etkinleştirir"
+          ],
+          "answer": 1,
+          "explanation": "Ayrıntılı hata sayfaları, bir hatayı tetikleyen herkese yapılandırmayı, yolları ve bazen kimlik bilgilerini sızdırabilir."
+        },
+        {
+          "question": "Bunlardan hangileri bu laboratuvardaki sıkılaştırma adımlarıdır? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "server_tokens off",
+            ".well-known dışındaki nokta dosyası isteklerini reddetmek",
+            "Tüm projede chmod 777",
+            "Oturum açma yoluna hız sınırı koymak"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Sürümü gizlemek, nokta dosyalarını reddetmek ve oturum açma denemelerini sınırlamak maruziyeti azaltır. chmod 777 herhangi bir yerel kullanıcının kodu değiştirmesine izin verir ve asla uygun değildir."
+        },
+        {
+          "question": "Bir location bloğu kendi add_header satırlarını tanımlıyor. Sunucu bloğundaki başlıklara ne olur?",
+          "options": [
+            "Birleştirilirler",
+            "O location'a miras kalmazlar",
+            "Nginx başlamayı reddeder",
+            "İki katına çıkarlar"
+          ],
+          "answer": 1,
+          "explanation": "Nginx, add_header'ı yalnızca alt düzey hiç tanımlamadığında miras alır; bu yüzden başlıkları tekrarlayın veya bir include dosyası kullanın."
+        },
+        {
+          "question": "Yeni bir Content-Security-Policy neden yalnızca raporlama (report-only) modunda başlatılır?",
+          "options": [
+            "Daha güvenlidir",
+            "Hiçbir şeyi engellemeden önce neyin bozulacağını görmek için",
+            "Tarayıcılar bunu şart koşar",
+            "Betikleri devre dışı bırakır"
+          ],
+          "answer": 1,
+          "explanation": "Yalnızca raporlama modu ihlalleri engellemeden günlüğe kaydeder; böylece önce meşru kaynakları düzeltebilirsiniz."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\nWeb katmanını üç katmanda sıkılaştırdınız: Nginx sürümünü gizler, HTTPS'e yönlendirir, güvenlik başlıklarını ayarlar, nokta dosyalarını engeller ve oturum açma denemelerini sınırlar; Laravel üretim modunda, güvenli çerezlerle ve denetlenmiş paketlerle çalışır; dosya sistemi yalnızca `public/` dizinini açığa çıkarır ve gizli bilgileri 600 kipinde tutar. Ardından her iddiayı dışarıdan `curl` ile doğruladınız. Nginx dosyasını, `.env.example` dosyasını ve izin betiğini sürüm kontrolünde tutun. Sıradaki adımda yığının önüne bir güvenlik duvarı koyun: [Güvenlik Duvarı Kural Testi Laboratuvarı](/learn/hands-on-security-labs/firewall-rule-testing-lab)."
+    }
+  ]
+}

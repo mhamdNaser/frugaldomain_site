@@ -1,0 +1,327 @@
+{
+  "title": "集中式 SIEM 实验室",
+  "summary": "在你自己拥有的虚拟机上构建一个小型 Wazuh SIEM：规划日志源、注册代理、接收受限的 syslog、编写并测试关联规则，并保护 SIEM 本身。",
+  "objectives": [
+    "围绕调查问题规划日志源",
+    "部署 Wazuh 服务器并注册 Linux 代理",
+    "仅从受限地址接收来自网络设备的 syslog",
+    "使用 wazuh-logtest 编写并测试自定义规则",
+    "保护、保留并监控 SIEM 管道"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "事件发生后，第一个问题是“发生了什么，是什么时候？”如果每台服务器都保存自己的日志，答案就分散在十台机器上，而且攻击者可能已经抹除了被入侵那台机器上的日志。**安全信息与事件管理 (SIEM)** 平台集中收集日志，对其进行标准化，应用检测规则，并把证据保存在攻击者不易触及的地方。\n\n在本实验中，你将在自己拥有的虚拟机上使用免费且应用广泛的 **Wazuh** 构建一个小型 SIEM。你将规划数据源，用代理转发 Linux 日志，接收来自网络设备的 syslog，编写自定义规则，安全地测试它，并搜索告警。你在 [PostgreSQL 安全实验室](/learn/hands-on-security-labs/postgresql-security-lab) 中构建的服务器以及 [IDS/IPS 部署实验室](/learn/hands-on-security-labs/ids-ips-deployment-lab) 中的传感器，就是你的第一批日志源。"
+    },
+    {
+      "id": "plan",
+      "type": "text",
+      "markdown": "## 步骤 1：规划你的日志源\n\n不要收集所有内容。从你想回答的问题出发，然后收集能回答这些问题的日志源。\n\n| 问题 | 日志源 | 事件示例 |\n|:--|:--|:--|\n| 谁登录了？ | Linux `auth.log`、Windows 安全日志 | 失败和成功的 SSH 登录 |\n| Web 层看到了什么？ | Nginx 访问日志和错误日志 | 来自同一地址的大量 404 |\n| 网络阻止了什么？ | 防火墙和 IDS 日志 | `FW-DENY`、Suricata 告警 |\n| 数据发生了什么？ | PostgreSQL 日志 | 认证失败、DDL |\n| 主机上有什么变化？ | 文件完整性监控 | `/etc/passwd` 发生变化 |\n\n三种传输方式是：主机上的**代理**（最适合丰富的主机数据）、**syslog**（适用于无法运行代理的网络设备）和 **API**（适用于云服务）。此外，请在每个日志源上使用 NTP 同步时钟。没有一致的时间，你就无法构建时间线。"
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "一行日志到达分析师的路径",
+      "caption": "收集、解码、规则匹配和索引将原始文本变成可搜索的告警。",
+      "data": {
+        "token": "日志行",
+        "nodes": [
+          {
+            "id": "host",
+            "label": "Linux 服务器",
+            "sub": "10.10.20.10",
+            "icon": "server"
+          },
+          {
+            "id": "agent",
+            "label": "Wazuh 代理",
+            "sub": "TCP/1514",
+            "icon": "cpu"
+          },
+          {
+            "id": "mgr",
+            "label": "管理器",
+            "sub": "10.10.40.5",
+            "icon": "shield"
+          },
+          {
+            "id": "rules",
+            "label": "解码器与规则",
+            "sub": "local_rules.xml",
+            "icon": "file"
+          },
+          {
+            "id": "idx",
+            "label": "索引器",
+            "sub": "可搜索的存储",
+            "icon": "database"
+          },
+          {
+            "id": "dash",
+            "label": "仪表板",
+            "sub": "TCP/443",
+            "icon": "eye"
+          },
+          {
+            "id": "analyst",
+            "label": "分析师",
+            "sub": "分诊",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "host",
+            "caption": "sshd 将“Failed password for invalid user admin from 198.51.100.23”写入 auth.log。"
+          },
+          {
+            "at": "agent",
+            "caption": "代理读取新的日志行，并通过加密且经过认证的通道发送。",
+            "tone": "secure"
+          },
+          {
+            "at": "mgr",
+            "caption": "管理器收到它；日志现在被存放在远离被入侵主机的地方。",
+            "tone": "success"
+          },
+          {
+            "at": "rules",
+            "caption": "sshd 解码器提取出用户和源 IP；规则 5710 匹配。",
+            "tone": "warning"
+          },
+          {
+            "at": "rules",
+            "caption": "来自同一 IP 的两分钟内十次匹配触发暴力破解关联规则。",
+            "tone": "danger"
+          },
+          {
+            "at": "idx",
+            "caption": "告警连同代理名称、规则 ID 和级别一起被索引。"
+          },
+          {
+            "at": "dash",
+            "caption": "仪表板列出该告警及其源地址。"
+          },
+          {
+            "at": "analyst",
+            "caption": "分析师检查时间线，然后在防火墙上阻止该地址。",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "deploy",
+      "type": "text",
+      "markdown": "## 步骤 2：安装服务器并注册代理\n\n对于实验室，请在至少有 4 个 vCPU 和 8 GB 内存的虚拟机上使用 Wazuh 一体化安装程序。它会安装管理器、索引器和仪表板。生产环境会把这些角色分开部署。\n\n在每台被监控的 Linux 主机上，设置管理器地址后安装代理，然后启动服务。代理通过密钥交换向管理器注册，并开始转发其配置中列出的日志文件。请把管理器放在你 [多 VLAN 网络安全实验室](/learn/hands-on-security-labs/multi-vlan-network-security-lab) 中的管理 VLAN 上，并根据需要只允许 TCP/1514、TCP/1515 和 TCP/443。"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "web-01",
+      "prompt": "$",
+      "caption": "在被监控主机上注册代理（管理器地址仅为示例）。",
+      "lines": [
+        {
+          "cmd": "sudo WAZUH_MANAGER='10.10.40.5' WAZUH_AGENT_NAME='web-01' apt-get install -y wazuh-agent",
+          "output": "Setting up wazuh-agent (4.9.0-1) ...",
+          "comment": "管理器地址和代理名称在安装时设置。"
+        },
+        {
+          "cmd": "sudo systemctl enable --now wazuh-agent && sudo systemctl is-active wazuh-agent",
+          "output": "active",
+          "comment": "服务正在运行。"
+        },
+        {
+          "prompt": "manager$",
+          "cmd": "sudo /var/ossec/bin/agent_control -l",
+          "output": "Wazuh agent_control. List of available agents:\n   ID: 000, Name: siem-01 (server), IP: 127.0.0.1, Active/Local\n   ID: 001, Name: web-01, IP: 10.10.20.10, Active",
+          "comment": "web-01 已注册并处于 Active 状态。"
+        }
+      ]
+    },
+    {
+      "id": "syslog",
+      "type": "text",
+      "markdown": "## 步骤 3：添加 syslog 和自定义规则\n\n防火墙网关和 Suricata 传感器可以通过 syslog 转发日志。在管理器的 `ossec.conf` 中，添加一个 `remote` 块，**仅接受来自你信任的地址**的 syslog。\n\n然后编写自定义规则。内置规则涵盖通用事件。自定义规则则加入你自己的上下文，例如针对受限端口的防火墙拒绝。自定义规则 ID 从 100000 开始，存放在 `local_rules.xml` 中。在重启任何服务之前，请使用 `wazuh-logtest` 针对示例日志行测试规则。"
+    },
+    {
+      "id": "xml",
+      "type": "code",
+      "language": "plain",
+      "filename": "/var/ossec/etc/ossec.conf and local_rules.xml",
+      "caption": "syslog 监听器（仅限网关）以及一条在防火墙反复拒绝时触发告警的规则。",
+      "highlight": [
+        3,
+        4,
+        5,
+        12,
+        13,
+        14
+      ],
+      "code": "<!-- ossec.conf -->\n<remote>\n  <connection>syslog</connection>\n  <port>514</port>\n  <protocol>udp</protocol>\n  <allowed-ips>10.10.40.1</allowed-ips>\n</remote>\n\n<!-- local_rules.xml -->\n<group name=\"local,firewall,\">\n  <rule id=\"100100\" level=\"10\" frequency=\"8\" timeframe=\"60\">\n    <if_matched_sid>4100</if_matched_sid>\n    <same_source_ip />\n    <description>Repeated firewall denies from one source (possible scan)</description>\n    <mitre><id>T1046</id></mitre>\n  </rule>\n</group>\n"
+    },
+    {
+      "id": "search",
+      "type": "text",
+      "markdown": "## 步骤 4：搜索、构建检测并保护数据安全\n\n数据流动起来之后，要学会提问。在仪表板或 `alerts.json` 中，按代理、规则 ID、级别和源地址进行筛选。构建几个每天查看的已保存搜索：按来源统计的失败登录、新创建的用户、按主机统计的高级别告警，以及被拒绝次数最多的目的端口。\n\n然后保护 SIEM 本身，因为它现在保存着你最敏感的证据。\n\n- 限制对仪表板的访问，使用多因素认证，并将管理员角色与分析师角色分开。\n- 关注管理器的磁盘使用情况和保留策略。决定原始日志与告警各保留多久。\n- 备份配置、规则和索引器快照。请参阅 [备份与灾难恢复实验室](/learn/hands-on-security-labs/backup-and-disaster-recovery-lab)。\n- 监控管道：当某个代理停止上报时发出告警。一台安静的主机要么是健康的，要么是盲区。\n\n接下来的实验将使用这个 SIEM 进行响应演练，从 [事件响应模拟实验室](/learn/hands-on-security-labs/incident-response-simulation-lab) 开始。"
+    },
+    {
+      "id": "logtest",
+      "type": "terminal",
+      "title": "manager",
+      "prompt": "$",
+      "caption": "使用示例日志行安全地测试 sshd 解码器和暴力破解规则。",
+      "lines": [
+        {
+          "cmd": "echo 'Nov 12 10:20:01 web-01 sshd[2211]: Failed password for invalid user admin from 198.51.100.23 port 40122 ssh2' | sudo /var/ossec/bin/wazuh-logtest -q",
+          "output": "**Phase 2: Completed decoding.\n    name: 'sshd'\n    srcip: '198.51.100.23'\n    srcuser: 'admin'\n\n**Phase 3: Completed filtering (rules).\n    id: '5710'\n    level: '5'\n    description: 'sshd: Attempt to login using a non-existent user'",
+          "comment": "解码器提取出了用户和源 IP，规则 5710 匹配。"
+        },
+        {
+          "cmd": "sudo jq -c 'select(.rule.level>=10) | {t:.timestamp, agent:.agent.name, rule:.rule.id, ip:.data.srcip}' /var/ossec/logs/alerts/alerts.json | tail -n 2",
+          "output": "{\"t\":\"2026-11-12T10:21:44.120+0000\",\"agent\":\"web-01\",\"rule\":\"5712\",\"ip\":\"198.51.100.23\"}",
+          "comment": "规则 5712 是内置的暴力破解关联规则。级别 10 及以上值得立即关注。"
+        }
+      ]
+    },
+    {
+      "id": "limits",
+      "type": "text",
+      "markdown": "## SIEM 无法为你做的事\n\nSIEM 是工具，而不是警卫。它只显示你发送给它的内容，并且只对你教它识别的内容发出告警。对初学者来说，有三个局限很重要。\n\n- **盲区**：没有代理的主机，或者什么都不记录的应用，是不可见的。请维护一份资产清单，并与活动代理列表进行比较。\n- **告警疲劳**：过多低价值的告警会掩盖真正重要的那一条。检查每条经常触发的规则，并决定是修复、调优还是移除。\n- **人员与流程**：没有人负责的告警不是控制措施。写明谁来查看仪表板、多久查看一次，以及接下来会发生什么。这种责任归属才是安全团队真正实践的内容。\n\n当你在作品集或面试中描述这个实验时，请提到这些局限。这表明你理解运维，而不仅仅是安装。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "日志中可能包含机密",
+      "markdown": "应用有时会在 URL 和错误信息中记录密码、令牌或个人数据。请检查你转发的内容，在源头对敏感字段进行脱敏，并限制谁可以读取原始日志。访问控制薄弱的 SIEM 会成为窃取一切的单一场所。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "从少量检测开始",
+      "markdown": "五条经过调优且值得信赖的规则，胜过五百条被忽视的规则。选择失败登录、新的特权用户、反复的防火墙拒绝、高级别 IDS 告警和代理静默。只有当你能说清每条规则触发时分析师应该做什么，才再添加更多。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自动手",
+      "markdown": "在**你自己拥有**的虚拟机上（一台 SIEM 虚拟机和一台 Linux 主机）：\n\n1. 安装 Wazuh 一体化服务器，并将该 Linux 主机注册为代理。使用 `agent_control -l` 确认它显示为 `Active`。\n2. 从你自己的第二台虚拟机，使用错误密码对该主机进行五次失败的 SSH 登录。在仪表板中找到这些告警。\n3. 将网关的 syslog 转发到管理器，并把 `allowed-ips` 限制为该网关。\n4. 将规则 100100 添加到 `local_rules.xml`，使用 `wazuh-logtest` 测试一行示例日志，重启管理器，并通过从你自己的测试主机反复触发防火墙拒绝来触发它。\n5. 停止代理两分钟，并记下仪表板如何显示这种静默。\n6. 写下你为原始日志选择的保留期限及原因。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "SIEM",
+          "definition": "收集、标准化、关联并存储安全事件，用于检测和调查的平台。"
+        },
+        {
+          "term": "代理 (Agent)",
+          "definition": "主机上读取本地日志并将其安全发送给管理器的软件。"
+        },
+        {
+          "term": "Syslog",
+          "definition": "用于发送日志消息的标准协议，被网络设备广泛使用。"
+        },
+        {
+          "term": "解码器 (Decoder)",
+          "definition": "从原始日志行中提取用户和源 IP 等字段的解析器。"
+        },
+        {
+          "term": "关联规则 (Correlation rule)",
+          "definition": "针对多个事件的模式触发的规则，例如短时间内多次失败。"
+        },
+        {
+          "term": "保留期 (Retention)",
+          "definition": "日志和告警在删除前被存储的时长，需在调查需求与存储成本之间取得平衡。"
+        },
+        {
+          "term": "文件完整性监控 (File integrity monitoring)",
+          "definition": "通过对比不同时间的校验和，检测重要文件的意外变化。"
+        },
+        {
+          "term": "日志源 (Log source)",
+          "definition": "其事件被转发到 SIEM 的任何系统，例如服务器、防火墙或应用。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "为什么要把日志转发到集中的 SIEM，而不是保存在每台服务器上？",
+          "options": [
+            "它使服务器更快",
+            "即使主机被入侵，证据仍然保留，并且可以对事件进行关联",
+            "它消除了对防火墙的需求",
+            "它会加密服务器"
+          ],
+          "answer": 1,
+          "explanation": "集中存储可以保护证据不被被入侵主机上的篡改所影响，并让你跨系统关联事件。"
+        },
+        {
+          "question": "对于无法运行软件的网络交换机，哪种传输方式最合适？",
+          "options": [
+            "代理",
+            "Syslog",
+            "USB 驱动器",
+            "电子邮件"
+          ],
+          "answer": 1,
+          "explanation": "网络设备通常使用 syslog 转发事件，管理器在受限的监听器上接收它。"
+        },
+        {
+          "question": "下列哪些项应包含在首批 SIEM 检测中？（选择所有适用项。）",
+          "options": [
+            "反复的登录失败",
+            "新的特权用户",
+            "把每一次 DNS 查询都定为高严重性",
+            "停止上报的代理"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "这些是高价值且可解释的检测。把每次 DNS 查询都评为高严重性会淹没分析师。"
+        },
+        {
+          "question": "wazuh-logtest 可以让你做什么？",
+          "options": [
+            "在部署规则之前测试示例日志行是如何被解码和匹配的",
+            "安装代理",
+            "删除旧告警",
+            "扫描网络"
+          ],
+          "answer": 0,
+          "explanation": "它让一行日志通过解码器和规则并显示结果，因此错误在进入生产环境之前就能被发现。"
+        },
+        {
+          "question": "为什么必须在所有日志源上同步时钟 (NTP)？",
+          "options": [
+            "为了节省磁盘空间",
+            "这样来自不同系统的事件才能被放入一条准确的时间线",
+            "为了加密日志",
+            "否则 Wazuh 会拒绝启动"
+          ],
+          "answer": 1,
+          "explanation": "关联和调查依赖于准确的时间戳；时钟漂移会打乱事件的先后顺序。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你围绕问题规划了日志源，部署了 Wazuh 服务器，注册了代理，接受了受限的 syslog，编写并测试了自定义关联规则，并学会了搜索告警和保护 SIEM 本身。集中的日志存储为你提供时间线、关联分析，以及在主机被入侵后仍然存在的证据。保持首批检测少而可信，留意静默的代理，并把 SIEM 当作高价值资产。现在你可以把这一基础带入后续实验中的响应工作。"
+    }
+  ]
+}
