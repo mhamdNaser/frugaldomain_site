@@ -1,0 +1,338 @@
+{
+  "title": "二层安全：DHCP 监听、DAI 与端口安全",
+  "summary": "了解常见的二层威胁，并在 Cisco 接入交换机上配置端口安全、DHCP 监听和动态 ARP 检测 (Dynamic ARP Inspection) 来阻止这些威胁。",
+  "objectives": [
+    "在概念层面描述 MAC 泛洪、非法 DHCP 服务器、DHCP 耗尽和 ARP 欺骗",
+    "配置带有最大数量、粘滞 (sticky) MAC 学习和违规模式的端口安全",
+    "手动以及通过 errdisable recovery 恢复处于 err-disabled 状态的端口",
+    "配置带有信任端口和速率限制的 DHCP 监听，并读取绑定表",
+    "解释动态 ARP 检测如何使用绑定表，并对其进行验证"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "办公室、教室和会议室里的交换机端口很容易接触到。任何人都可以接入一台笔记本电脑、一台小型非网管交换机或一台家用 Wi-Fi 路由器。大多数情况下这是无心之举，但同一个开放端口也可能被用来撑爆交换机的 MAC 表、下发伪造的默认网关，或者通过伪造 ARP 应答来重定向流量。\n\n二层协议是为可信网络设计的，没有内置的身份验证。Cisco 接入交换机增加了三项互补的功能来弥补这一缺口：**端口安全**、**DHCP 监听**和**动态 ARP 检测 (DAI)**。在本课中，你将了解每项功能分别防御什么，在接入交换机上配置这三项功能，并对其进行验证。"
+    },
+    {
+      "id": "threats",
+      "type": "text",
+      "markdown": "## 二层威胁概述\n\n理解这些威胁并不需要攻击工具；你需要知道的是它们滥用了哪种协议行为，以及哪项功能可以阻止它们。\n\n| 威胁 | 发生了什么 | 主要防御措施 |\n|:--|:--|:--|\n| **MAC 泛洪** | 设备发送来自数千个伪造源 MAC 的帧。MAC 地址表被填满，交换机会将未知单播帧从 VLAN 内的每个端口泛洪出去，从而暴露流量。 | 端口安全 |\n| **非法 DHCP 服务器** | 未经授权的设备用错误的默认网关或 DNS 服务器应答 DHCP 请求，使客户端的流量经过它，或者直接破坏连通性。 | DHCP 监听 |\n| **DHCP 耗尽** | 设备使用大量伪造的 MAC 请求租约，直到合法地址池被耗尽。 | 端口安全和 DHCP 监听速率限制 |\n| **ARP 欺骗** | 设备发送未经请求的 ARP 应答，将网关的 IP 地址映射到自己的 MAC，从而形成中间人位置。 | 动态 ARP 检测 |\n\nARP 本身在 [TCP、UDP、ICMP 与 ARP](/learn/networking-foundations-ccna/tcp-udp-icmp-and-arp) 中介绍，正常的 DHCP 交互过程在 [DHCPv4 客户端、服务器与中继](/learn/networking-foundations-ccna/dhcpv4-client-server-and-relay) 中介绍。非法 DHCP 服务器往往是意外造成的，例如好心的用户接入了一台家用路由器，但对客户端造成的影响是一样的。"
+    },
+    {
+      "id": "portsec",
+      "type": "text",
+      "markdown": "## 端口安全\n\n端口安全限制**哪些以及多少个 MAC 地址**可以向接入端口发送帧。它只在静态配置为 `switchport mode access`（或 `trunk`）的端口上工作，对动态端口无效。\n\n- **`maximum`** 设置端口接受多少个安全 MAC。默认值为 1；接在 IP 电话后面的 PC 通常需要 2 个。\n- **安全地址**可以静态配置、动态学习，或者通过 `mac-address sticky` 以**粘滞 (sticky)** 地址的方式学习。粘滞地址会写入运行配置，因此用 `copy running-config startup-config` 保存后，重新加载也不会丢失。\n\n### 违规模式\n\n当达到最大数量之后又有来自新 MAC 的帧到达，或者某个安全 MAC 出现在同一 VLAN 的另一个端口上时，就会发生违规。\n\n| 模式 | 丢弃违规帧 | Syslog 和 SNMP 陷阱 | 违规计数器 | 端口状态 |\n|:--|:--|:--|:--|:--|\n| `protect` | 是 | 否 | 否 | 保持 up |\n| `restrict` | 是 | 是 | 递增 | 保持 up |\n| `shutdown`（默认） | 是 | 是 | 递增 | **err-disabled** |\n\n处于 err-disabled 状态的端口会一直保持关闭，直到管理员先输入 `shutdown` 再输入 `no shutdown`，或者由 **errdisable recovery** 在设定的时间间隔后自动将其恢复。自动恢复虽然方便，但如果原因仍然存在，端口会再次被禁用。"
+    },
+    {
+      "id": "snooping",
+      "type": "text",
+      "markdown": "## DHCP 监听\n\nDHCP 监听将交换机端口分为两组：\n\n- **信任端口 (Trusted ports)** 通向合法的 DHCP 服务器，通常是上行链路。所有 DHCP 消息都被允许通过。\n- **非信任端口 (Untrusted ports)** 连接终端设备。启用监听后，所有端口默认都是非信任端口。DISCOVER 和 REQUEST 等客户端消息被允许，但 **OFFER、ACK 和 NAK 等服务器消息会被丢弃**。\n\n仅这一条规则就能阻止非法 DHCP 服务器。监听还会检查客户端请求的源 MAC 是否与 DHCP 负载中的客户端硬件地址一致，并丢弃来自与原租约不同端口的 RELEASE 或 DECLINE 消息。\n\n### 绑定表\n\n当合法的 DHCPACK 经过时，交换机会将客户端的 **MAC 地址、IP 地址、租期、VLAN 和端口**记录到 **DHCP 监听绑定表**中。其他功能把这张表作为可信数据来源：DAI 用它来验证 ARP，IP Source Guard 用它来阻止伪造的源 IP 地址。\n\n### 速率限制与 option 82\n\n`ip dhcp snooping limit rate` 限制非信任端口上每秒的 DHCP 数据包数量；超过限制的端口会被置为 err-disabled，从而减缓耗尽攻击的尝试。默认情况下，交换机还会在客户端请求中插入 **option 82**（中继代理信息）。如果上游中继或服务器拒绝该选项，客户端将无法获得地址，因此许多设计会用 `no ip dhcp snooping information option` 将其禁用。"
+    },
+    {
+      "id": "snoop-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "非法 DHCP Offer 与伪造 ARP 应答被丢弃",
+      "caption": "服务器消息只在信任端口上被接受，DAI 会根据绑定表检查每一个 ARP 数据包。",
+      "data": {
+        "token": "DHCPDISCOVER",
+        "nodes": [
+          {
+            "id": "pc",
+            "label": "客户端 PC",
+            "sub": "Gi1/0/5 非信任",
+            "icon": "laptop"
+          },
+          {
+            "id": "rogue",
+            "label": "非法主机",
+            "sub": "Gi1/0/7 非信任",
+            "icon": "attacker"
+          },
+          {
+            "id": "sw",
+            "label": "接入交换机",
+            "sub": "监听 + DAI，VLAN 10",
+            "icon": "switch"
+          },
+          {
+            "id": "up",
+            "label": "上行链路",
+            "sub": "Gi1/0/24 信任",
+            "icon": "shield"
+          },
+          {
+            "id": "srv",
+            "label": "DHCP 服务器",
+            "sub": "192.168.99.10",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "pc",
+            "token": "DHCPDISCOVER",
+            "caption": "新客户端广播 DHCPDISCOVER。非信任端口上允许客户端消息。"
+          },
+          {
+            "at": "sw",
+            "token": "DHCPDISCOVER",
+            "caption": "交换机检查速率限制，并在 VLAN 10 内转发该广播，包括转发到上行链路和非法主机所在端口。"
+          },
+          {
+            "at": "rogue",
+            "token": "DHCPOFFER",
+            "caption": "Gi1/0/7 上的非法 DHCP 服务器（也许是被误接入的家用路由器）用自己的 Offer 和伪造的网关进行应答。",
+            "tone": "attack"
+          },
+          {
+            "at": "sw",
+            "token": "DHCPOFFER",
+            "caption": "非信任端口上不允许出现服务器消息。交换机丢弃非法的 DHCPOFFER 并记录日志。",
+            "tone": "blocked"
+          },
+          {
+            "at": "srv",
+            "token": "DHCPOFFER",
+            "caption": "合法服务器（通过路由器的 DHCP 中继到达）发出其 Offer。",
+            "tone": "secure"
+          },
+          {
+            "at": "up",
+            "token": "DHCPOFFER",
+            "caption": "该 Offer 从信任的上行链路到达，因此交换机将其转发给客户端。",
+            "tone": "success"
+          },
+          {
+            "at": "pc",
+            "token": "DHCPACK",
+            "caption": "客户端请求所提供的地址，服务器通过 DHCPACK 予以确认，同样经由信任端口。",
+            "tone": "success"
+          },
+          {
+            "at": "sw",
+            "token": "绑定",
+            "caption": "看到 ACK 后，交换机添加一条绑定：0050.56a1.0b22、192.168.10.21、VLAN 10、Gi1/0/5。",
+            "tone": "success"
+          },
+          {
+            "at": "rogue",
+            "token": "ARP 应答",
+            "caption": "随后，非法主机发送伪造的 ARP 应答：“192.168.10.1 位于我的 MAC”。",
+            "tone": "attack"
+          },
+          {
+            "at": "sw",
+            "token": "ARP 应答",
+            "caption": "DAI 在 Gi1/0/7 上找不到该 IP 与 MAC 的绑定，于是丢弃该 ARP 应答。网关的映射保持正确。",
+            "tone": "blocked"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dai",
+      "type": "text",
+      "markdown": "## 动态 ARP 检测\n\nDAI 会检查在启用它的 VLAN 中、非信任端口上收到的**每一个 ARP 请求和应答**。对于每个数据包，交换机会将发送方 MAC 和发送方 IP 地址与该端口和 VLAN 对应的 DHCP 监听绑定表进行比较：\n\n- 如果存在匹配的绑定，则转发该 ARP 数据包。\n- 如果不存在，则**丢弃并记录日志**。声称拥有网关 IP 地址的伪造应答永远不会到达其他主机。\n\n以下几点在实践中很重要：\n\n- DAI 依赖于 DHCP 监听。请先在相同的 VLAN 上启用监听，否则所有客户端的 ARP 都会被丢弃。\n- 使用**静态 IP 地址**的主机没有绑定。请用 ARP ACL 放行它们，或将它们连接到信任端口。\n- 用 `ip arp inspection trust` 信任上行链路和通向其他交换机的端口，这样已在别处检查过的 ARP 流量就不会被重复检查。\n- `ip arp inspection validate src-mac dst-mac ip` 会增加额外检查，例如以太网源 MAC 是否与 ARP 负载中的发送方 MAC 一致。\n- 非信任端口默认限制为每秒 15 个 ARP 数据包。超过该限制会使端口进入 err-disabled 状态。\n\n下面的配置在接入交换机 SW1 上组合了这三项功能。Gi1/0/24 是通往汇聚层和 DHCP 服务器的上行链路；用户端口为非信任端口。"
+    },
+    {
+      "id": "config",
+      "type": "code",
+      "language": "cisco",
+      "filename": "SW1-l2-security.cfg",
+      "code": "! ---- Port security on a user access port ----\ninterface GigabitEthernet1/0/5\n description User PC and IP phone\n switchport mode access\n switchport access vlan 10\n switchport port-security\n switchport port-security maximum 2\n switchport port-security mac-address sticky\n switchport port-security violation restrict\n!\n! ---- Automatic recovery from err-disabled ----\nerrdisable recovery cause psecure-violation\nerrdisable recovery cause dhcp-rate-limit\nerrdisable recovery cause arp-inspection\nerrdisable recovery interval 300\n!\n! ---- DHCP snooping ----\nip dhcp snooping\nip dhcp snooping vlan 10\nno ip dhcp snooping information option\n!\ninterface GigabitEthernet1/0/24\n description Uplink toward the legitimate DHCP server\n ip dhcp snooping trust\n ip arp inspection trust\n!\ninterface range GigabitEthernet1/0/1 - 23\n ip dhcp snooping limit rate 15\n!\n! ---- Dynamic ARP Inspection (uses the snooping binding table) ----\nip arp inspection vlan 10\nip arp inspection validate src-mac dst-mac ip",
+      "caption": "接入端口上的端口安全、带有信任上行链路和速率限制的 DHCP 监听，以及针对 VLAN 10 的 DAI。",
+      "highlight": [
+        7,
+        8,
+        9,
+        18,
+        24,
+        28,
+        31
+      ]
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "验证 SW1 上的二层安全",
+      "prompt": "SW1#",
+      "lines": [
+        {
+          "cmd": "show port-security interface GigabitEthernet1/0/5",
+          "output": "Port Security              : Enabled\nPort Status                : Secure-up\nViolation Mode             : Restrict\nAging Time                 : 0 mins\nAging Type                 : Absolute\nSecureStatic Address Aging : Disabled\nMaximum MAC Addresses      : 2\nTotal MAC Addresses        : 2\nConfigured MAC Addresses   : 0\nSticky MAC Addresses       : 2\nLast Source Address:Vlan   : 0050.56a1.0d44:10\nSecurity Violation Count   : 3"
+        },
+        {
+          "comment": "restrict 模式保持端口 up，但会统计违规次数。两个合法 MAC 已被学习为粘滞地址；一个未知 MAC 已尝试了三次。"
+        },
+        {
+          "cmd": "show ip dhcp snooping binding",
+          "output": "MacAddress          IpAddress        Lease(sec)  Type           VLAN  Interface\n------------------  ---------------  ----------  -------------  ----  --------------------\n00:50:56:A1:0B:22   192.168.10.21    86112       dhcp-snooping   10    GigabitEthernet1/0/5\n00:50:56:A1:0C:33   192.168.10.34    85940       dhcp-snooping   10    GigabitEthernet1/0/6\nTotal number of bindings: 2"
+        },
+        {
+          "comment": "由 DHCP 监听构建的绑定表：每个客户端的 MAC、租用的 IP、VLAN 和端口。DAI 和 IP Source Guard 依赖该表。"
+        },
+        {
+          "cmd": "show logging | include DHCP_SNOOPING|SW_DAI",
+          "output": "%DHCP_SNOOPING-5-DHCP_SNOOPING_UNTRUSTED_PORT: DHCP_SNOOPING drop message on untrusted port, message type: DHCPOFFER, MAC sa: 0050.56a1.0e55\n%SW_DAI-4-DHCP_SNOOPING_DENY: 1 Invalid ARPs (Res) on Gi1/0/7, vlan 10.([0050.56a1.0e55/192.168.10.1/0050.56a1.0b22/192.168.10.21/10:42:07 UTC Sun Nov 8 2026])"
+        },
+        {
+          "comment": "Gi1/0/7 上的非法主机发送了一个 DHCPOFFER，随后又发送了冒充网关 192.168.10.1 的伪造 ARP 应答。两者均被丢弃。"
+        },
+        {
+          "cmd": "show ip arp inspection statistics vlan 10",
+          "output": " Vlan      Forwarded        Dropped     DHCP Drops      ACL Drops\n ----      ---------        -------     ----------      ---------\n   10           1840              9              9              0\n\n Vlan   DHCP Permits    ACL Permits  Probe Permits   Source MAC Failures\n ----   ------------    -----------  -------------   -------------------\n   10           1802              0             38                     0"
+        },
+        {
+          "comment": "DHCP Drops 统计没有匹配绑定的 ARP 数据包。Probe Permits 是发送方 IP 为 0.0.0.0 的 ARP 探测，这类数据包被允许通过。"
+        },
+        {
+          "cmd": "show interfaces status err-disabled",
+          "output": "Port         Name               Status       Reason               Err-disabled Vlans\nGi1/0/7      Meeting room       err-disabled dhcp-rate-limit"
+        },
+        {
+          "comment": "该端口还超过了 DHCP 速率限制，处于 err-disabled 状态。如果原因已消除，errdisable recovery 会在 300 秒后将其恢复。"
+        }
+      ],
+      "caption": "用各自的 show 命令检查每项功能；日志会告诉你什么被丢弃了、在哪里被丢弃。"
+    },
+    {
+      "id": "pitfalls",
+      "type": "callout",
+      "variant": "warning",
+      "title": "学习者常犯的错误",
+      "markdown": "- **启用监听却没有信任上行链路。** 这样所有合法的 OFFER 和 ACK 都会被丢弃，没有客户端能获得地址。\n- **在监听建立绑定之前就启用 DAI。** 已有租约的客户端此时还没有绑定；请在维护窗口期间进行变更，或先等租约续约。\n- **忘记静态主机。** 启用 DAI 后，使用固定地址的打印机或服务器需要 ARP ACL 或信任端口。\n- **Option 82 不匹配。** 如果启用监听后地址无法使用，请检查 `no ip dhcp snooping information option`，或者将中继配置为信任 option 82。\n- **粘滞 MAC 未保存。** 在保存之前，粘滞地址只存在于运行配置中。\n- **在动态端口上配置端口安全。** 在将端口设置为 access 或 trunk 模式之前，IOS 会拒绝该命令。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "构建纵深防御",
+      "markdown": "这些功能保护接入层，但与其他控制措施配合使用效果最佳：关闭未使用的端口并将其放入未使用的 VLAN，在主机端口上设置 `spanning-tree portfast` 和 BPDU Guard（参见 [Rapid PVST+ 与 STP 保护功能](/learn/networking-foundations-ccna/rapid-pvst-plus-and-stp-protection-features)），并在需要知道*是谁*接入而不仅仅是哪个 MAC 时使用 802.1X 与 [AAA、TACACS+ 与 RADIUS](/learn/networking-foundations-ccna/aaa-with-tacacs-plus-and-radius)。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "在 Cisco Packet Tracer 中或在你自己拥有的实验交换机上：\n\n1. 将充当 DHCP 服务器（或中继）的路由器连接到交换机的 Gi1/0/24，并将两台 PC 连接到 VLAN 10 中的 Gi1/0/5 和 Gi1/0/6。\n2. 为 VLAN 10 启用 DHCP 监听，但**不要**信任上行链路。确认 PC 不再获得地址，然后添加 `ip dhcp snooping trust` 并续租。\n3. 检查两个客户端的 `show ip dhcp snooping binding`。\n4. 在 Gi1/0/7 上添加第二台配置为 DHCP 服务器的路由器，并在日志中观察其 Offer 被丢弃。\n5. 在 Gi1/0/6 上配置 `maximum 1` 和 `violation shutdown` 的端口安全，将另一台 PC 连接到该端口，并观察端口进入 err-disabled 状态。用 `shutdown` / `no shutdown` 手动恢复。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "端口安全 (Port security)",
+          "definition": "一种交换机功能，限制哪些以及多少个源 MAC 地址可以使用接入端口，并带有可配置的违规处理动作。"
+        },
+        {
+          "term": "粘滞 MAC (Sticky MAC)",
+          "definition": "动态学习并写入运行配置的安全 MAC 地址，因此可以被保存。"
+        },
+        {
+          "term": "违规模式 (Violation mode)",
+          "definition": "发生端口安全违规时的处理动作：protect（静默丢弃）、restrict（丢弃、记录日志并计数）或 shutdown（将端口置为 err-disabled）。"
+        },
+        {
+          "term": "err-disabled 状态 (err-disabled)",
+          "definition": "一种端口状态，IOS 因安全违规等错误条件而关闭了该端口。"
+        },
+        {
+          "term": "DHCP 监听 (DHCP snooping)",
+          "definition": "一种交换机功能，在非信任端口上丢弃 DHCP 服务器消息，并将租约记录到绑定表中。"
+        },
+        {
+          "term": "信任端口 (Trusted port)",
+          "definition": "接受 DHCP 服务器消息和 ARP 数据包而不加检查的端口，通常是上行链路。"
+        },
+        {
+          "term": "绑定表 (Binding table)",
+          "definition": "DHCP 监听数据库，记录每个客户端的 MAC 地址、IP 地址、租约、VLAN 和端口。"
+        },
+        {
+          "term": "动态 ARP 检测 (Dynamic ARP Inspection)",
+          "definition": "一种交换机功能，根据绑定表验证非信任端口上的 ARP 数据包，并丢弃伪造的数据包。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "哪种端口安全违规模式会丢弃违规帧并递增违规计数器，但保持端口 up？",
+          "options": [
+            "protect",
+            "restrict",
+            "shutdown",
+            "sticky"
+          ],
+          "answer": 1,
+          "explanation": "restrict 会丢弃帧、发送 syslog 消息和 SNMP 陷阱，并对违规计数。protect 静默丢弃；shutdown 将端口置为 err-disabled。sticky 是一种学习方式，而不是模式。"
+        },
+        {
+          "question": "VLAN 10 上已启用 DHCP 监听。当下列消息到达非信任端口时，哪些会被丢弃？（选择所有适用项。）",
+          "options": [
+            "DHCPDISCOVER",
+            "DHCPOFFER",
+            "DHCPACK",
+            "DHCPREQUEST"
+          ],
+          "answer": [
+            1,
+            2
+          ],
+          "explanation": "OFFER 和 ACK 是服务器消息，只在信任端口上被接受。DISCOVER 和 REQUEST 是正常的客户端消息，会被允许。"
+        },
+        {
+          "question": "动态 ARP 检测使用哪种信息来源来判断非信任端口上的 ARP 应答是否有效？",
+          "options": [
+            "路由器的路由表",
+            "DHCP 监听绑定表，或 ARP ACL",
+            "交换机的 MAC 地址表",
+            "生成树拓扑"
+          ],
+          "answer": 1,
+          "explanation": "DAI 将发送方 IP 和 MAC 与 DHCP 监听学到的绑定进行比较。使用静态地址的主机必须通过 ARP ACL 放行。"
+        },
+        {
+          "question": "在接入交换机上启用 DHCP 监听后，没有客户端获得地址。可能的原因有哪些？（选择所有适用项。）",
+          "options": [
+            "通往 DHCP 服务器的上行链路没有被信任",
+            "上游中继拒绝交换机插入的 option 82",
+            "未启用 DAI",
+            "客户端端口是非信任端口"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "如果上行链路不被信任，所有服务器应答都会被丢弃。交换机插入的 option 82 也可能被上游拒绝。客户端端口为非信任端口是正常的，而 DHCP 并不要求启用 DAI。"
+        },
+        {
+          "question": "一个启用了 shutdown 模式端口安全的端口处于 err-disabled 状态。哪些操作可以将其恢复？（选择所有适用项。）",
+          "options": [
+            "在接口上先执行 shutdown，再执行 no shutdown",
+            "errdisable recovery cause psecure-violation 并设置恢复间隔",
+            "clear mac address-table dynamic",
+            "移除违规设备，使端口能够干净地恢复"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "手动 shutdown/no shutdown 或配置的 errdisable recovery 会重新启用端口。必须先消除原因，否则端口会再次被禁用。清除 MAC 表不会改变端口状态。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- MAC 泛洪、非法 DHCP 服务器、DHCP 耗尽和 ARP 欺骗都滥用了没有身份验证的二层协议。\n- **端口安全**限制接入端口上的 MAC 数量；将它们学习为**粘滞 (sticky)** 地址，并选择一种违规模式：`protect`、`restrict` 或 `shutdown`（默认，err-disable）。\n- **DHCP 监听**在非信任端口上丢弃服务器消息，对 DHCP 进行速率限制，并构建**绑定表**。只信任通向真实服务器的上行链路。\n- **DAI** 根据绑定表检查非信任端口上的每个 ARP 数据包并丢弃伪造的数据包；它需要 DHCP 监听。\n- 使用 `show port-security interface`、`show ip dhcp snooping binding`、`show ip arp inspection statistics` 和 `show interfaces status err-disabled` 进行验证。\n\n继续学习 [边缘端口：主机、接入点、VoIP 与设备](/learn/networking-foundations-ccna/edge-ports-hosts-access-points-voip-and-appliances)，了解这些功能如何适配接入端口上的不同设备。"
+    }
+  ]
+}

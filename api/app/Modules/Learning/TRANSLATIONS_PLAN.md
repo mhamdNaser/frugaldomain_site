@@ -41,6 +41,7 @@ LEARNING_SEED_MODE=merge php artisan db:seed --class="App\Modules\Learning\datab
 cd api/app/Modules/Learning
 python -I tools/i18n.py extract <course> <work> <slug> <slug> ...    # English text only, no code/ids
 # translators: <work>/<slug>.src.json -> <work>/<slug>.<locale>.json  (tools/TRANSLATOR_BRIEF.md)
+python -I -X utf8 tools/dedup_terms.py <work> <locale>               # "TACACS+ (TACACS+)" -> "TACACS+"
 python -I tools/i18n.py merge <locale> <course> <work>               # rebuilds full lessons, refuses missing keys
 python -I tools/i18n.py audit <locale> <course>                      # structure, code, links, script share
 python -I tools/i18n.py status                                       # coverage table
@@ -55,7 +56,7 @@ second model review pass. Sonnet translators, 8 in parallel, 3-4 lessons each.
 | Phase | Content | Size | State |
 |:--|:--|:--|:--|
 | 0 | Table, API, seeder, tools; Arabic mechanical audit and fixes; all 10 syllabi in hi/zh/tr | - | done 2026-11-14 |
-| 1 | networking-foundations-ccna | 41 lessons x 3 | rounds 1-3 done 2026-11-16 (first 30 in course order, computer-systems-fundamentals .. wireless-principles-bands-channels-rf-and-security); next: lessons 31-41 (last round of this phase) |
+| 1 | networking-foundations-ccna | 41 lessons x 3 | done 2026-11-16 (4 rounds, 123 lesson-translations) | |
 | 2 | hands-on-security-labs + ot-ics-security | 44 x 3 | |
 | 3 | network-automation-devops | 49 x 3 | |
 | 4 | security-operations-dfir | 50 x 3 | |

@@ -1,0 +1,355 @@
+{
+  "title": "Ansible ile Yapılandırma Yönetimi",
+  "summary": "Cisco IOS XE yapılandırmasını kod olarak yönetmek için Ansible kullanın: bir envanter ve playbook oluşturun, idempotent modüllere güvenin, check mode ile deneme çalıştırması yapın, gizli bilgileri Vault ile koruyun ve Ansible'ı Puppet ve Chef ile karşılaştırın.",
+  "objectives": [
+    "Yapılandırma yönetimini, yapılandırma kaymasını (configuration drift) ve Ansible'ın ajansız (agentless) push modelini açıklamak",
+    "Cisco IOS XE cihazları için bağlantı değişkenleri içeren bir YAML envanteri oluşturmak",
+    "ios_facts, ios_vlans ve ios_config kullanan bir playbook yazmak",
+    "İdempotentliği (idempotency) açıklamak ve değişiklikleri uygulamadan önce --check ve --diff ile check mode kullanmak",
+    "Gizli bilgileri Ansible Vault ile korumak ve Ansible'ı Puppet ve Chef ile karşılaştırmak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Şirketinizde 120 erişim anahtarı var. Güvenlik ekibi, Cuma gününe kadar her anahtarda yeni bir yazıcı VLAN'ı ve yeni bir NTP sunucusu istiyor. Bunu elle yapmak 120 SSH oturumu, yüzlerce elle yazılmış komut ve birkaç anahtarın diğerlerinden hafifçe farklı kalması için gerçek bir ihtimal demektir. Aylar içinde bu küçük farklar, yani **yapılandırma kayması (configuration drift)**, sorun gidermeyi ve denetimleri çok daha zorlaştırır.\n\n**Yapılandırma yönetimi (configuration management)** araçları bu sorunu, istenen yapılandırmayı bir kez dosyalarda tanımlayıp birçok cihaza tutarlı ve tekrarlanabilir biçimde uygulayarak çözer. CCNA yol haritası sizden Ansible, Puppet ve Chef'i karşılaştırmanızı ister. Bu ders, ağ ekiplerinin en sık başladığı araç olan **Ansible**'a odaklanır ve envanterden doğrulanmış değişikliğe kadar eksiksiz, güvenli bir iş akışı gösterir."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## Ansible nasıl çalışır\n\nAnsible, birkaç basit tasarım tercihini izleyen açık kaynaklı bir otomasyon aracıdır:\n\n- **Ajansız (agentless).** Yönetilen cihazlara hiçbir şey kurulmaz. Ansible **SSH** üzerinden veya NETCONF ya da RESTCONF gibi cihaz API'leri aracılığıyla bağlanır.\n- **Push modeli.** Genellikle bir Linux ana makinesi olan **kontrol düğümü (control node)** (bkz. [Linux Temelleri](/learn/networking-foundations-ccna/linux-fundamentals)), bir playbook çalıştırdığınızda değişiklikleri iter. Cihazlar değişiklikleri sorgulamaz (poll etmez).\n- **YAML dosyaları.** Envanter, değişkenler ve playbook'lar, Git'te tuttuğunuz, kod gibi gözden geçirip sürümlediğiniz, insan tarafından okunabilir metin dosyalarıdır. Buna **kod olarak altyapı (infrastructure as code)** denir.\n- **Bildirimsel (declarative) modüller.** İstenen durumu tanımlarsınız (\"VLAN 30 vardır ve adı PRINTERS'tır\"); modül hangi komutların, varsa, gerektiğini kendisi çözer.\n\nSunucularda Ansible, hedefe küçük programlar kopyalar ve onları orada çalıştırır. Ağ cihazları Python çalıştıramaz; bu nedenle **ağ modülleri kontrol düğümünde çalışır** ve `network_cli` bağlantısını kullanarak bir SSH oturumu üzerinden CLI komutları gönderir. SSH oturumunun kendisi, elle açacağınız oturumla aynıdır; bkz. [SSH, RDP ve Uzaktan Yönetim](/learn/networking-foundations-ccna/ssh-rdp-and-remote-administration)."
+    },
+    {
+      "id": "inventory",
+      "type": "text",
+      "markdown": "## Envanter\n\n**Envanter (inventory)**, Ansible'ın yönettiği cihazları listeler ve gruplar; böylece bir playbook tek tek adlar yerine \"tüm erişim anahtarlarını\" hedefleyebilir. Bir gruba bağlı değişkenler, gruptaki her ana makine için geçerlidir. Burada bunlar Ansible'a nasıl bağlanacağını söyler: `network_cli` bağlantısı, `cisco.ios.ios` platformu, kullanıcı adı ve ayrıcalıklı EXEC moduna ulaşmak için `become` ile `enable` yöntemi.\n\nParola envanterde yazılı değildir. Şifrelenmiş bir dosyada duran `vault_netops_password` değişkenine başvurur."
+    },
+    {
+      "id": "inv",
+      "type": "code",
+      "language": "yaml",
+      "filename": "inventory.yml",
+      "code": "all:\n  children:\n    access_switches:\n      hosts:\n        sw1:\n          ansible_host: 192.168.99.11\n        sw2:\n          ansible_host: 192.168.99.12\n      vars:\n        ansible_connection: ansible.netcommon.network_cli\n        ansible_network_os: cisco.ios.ios\n        ansible_user: netops\n        ansible_password: \"{{ vault_netops_password }}\"\n        ansible_become: true\n        ansible_become_method: enable",
+      "caption": "Bir iki anahtarlık grup ve Cisco IOS XE için bağlantı ayarlarını içeren bir YAML envanteri.",
+      "highlight": [
+        3,
+        10,
+        11,
+        13
+      ]
+    },
+    {
+      "id": "playbook",
+      "type": "text",
+      "markdown": "## Playbook'lar, görevler ve modüller\n\nBir **playbook** bir veya daha fazla **play** içerir. Her play envanterden bir grubu hedefler ve bir **görev (task)** listesini sırayla çalıştırır. Her görev, bağımsız değişkenlerle bir **modülü** çağırır. Cisco IOS ve IOS XE için modüller `cisco.ios` koleksiyonunda paketlenmiştir.\n\n| Modül | Amaç |\n|:--|:--|\n| `cisco.ios.ios_facts` | Model, yazılım sürümü, arayüzler ve seri numarası gibi olguları (facts) toplar |\n| `cisco.ios.ios_command` | `show` komutlarını çalıştırır ve çıktılarını döndürür; yapılandırmayı değiştirmez |\n| `cisco.ios.ios_config` | Belirli yapılandırma satırlarının bulunmasını sağlar; yapılandırmayı kaydedebilir |\n| `cisco.ios.ios_vlans` | VLAN'ları yapılandırılmış veri olarak yöneten bir **kaynak modülüdür (resource module)** |\n\n`ios_vlans`, `ios_interfaces` ve `ios_acls` gibi kaynak modülleri bir `state` alır. **merged** listelediğinizi ekler veya günceller, **replaced** listelenen öğeleri tam olarak eşleştirir, **overridden** tüm kaynağı listeyle eşleştirir ve geri kalan her şeyi kaldırır, **deleted** ise onları siler. Öğrenirken `merged` seçin; `overridden` güçlüdür ancak listelemeyi unuttuğunuz VLAN'ları silebilir."
+    },
+    {
+      "id": "play",
+      "type": "code",
+      "language": "yaml",
+      "filename": "site.yml",
+      "code": "---\n- name: Standardize access switches\n  hosts: access_switches\n  gather_facts: false\n\n  tasks:\n    - name: Gather minimal device facts\n      cisco.ios.ios_facts:\n        gather_subset: min\n\n    - name: Report model and software version\n      ansible.builtin.debug:\n        msg: \"{{ inventory_hostname }} is a {{ ansible_net_model }} running {{ ansible_net_version }}\"\n\n    - name: Ensure the standard VLANs exist\n      cisco.ios.ios_vlans:\n        config:\n          - vlan_id: 10\n            name: USERS\n          - vlan_id: 30\n            name: PRINTERS\n          - vlan_id: 99\n            name: MGMT\n        state: merged\n\n    - name: Ensure the NTP server is configured\n      cisco.ios.ios_config:\n        lines:\n          - ntp server 192.168.99.5\n        save_when: modified",
+      "caption": "Tek bir play, dört görev: olguları topla, raporla, üç VLAN'ın var olmasını sağla ve NTP sunucusu satırının var olmasını sağla.",
+      "highlight": [
+        8,
+        16,
+        24,
+        27,
+        30
+      ]
+    },
+    {
+      "id": "run-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Bir playbook çalıştırması sırasında ne olur",
+      "caption": "Ansible bağlanır, karşılaştırır ve yalnızca farkı gönderir.",
+      "data": {
+        "actors": [
+          {
+            "id": "eng",
+            "label": "Mühendis",
+            "sub": "onaylanmış değişiklik",
+            "icon": "user"
+          },
+          {
+            "id": "ctl",
+            "label": "Kontrol düğümü",
+            "sub": "Linux üzerinde Ansible",
+            "icon": "server"
+          },
+          {
+            "id": "sw1",
+            "label": "sw1",
+            "sub": "192.168.99.11",
+            "icon": "switch"
+          },
+          {
+            "id": "sw2",
+            "label": "sw2",
+            "sub": "192.168.99.12",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "eng",
+            "to": "ctl",
+            "label": "ansible-playbook site.yml",
+            "detail": "önce --check, sonra gerçek çalıştırma",
+            "note": "Mühendis playbook'u çalıştırır. Ansible envanteri, grup değişkenlerini ve vault'u okur; vault'u vault parolasıyla çözer."
+          },
+          {
+            "from": "ctl",
+            "to": "sw1",
+            "label": "SSH (network_cli)",
+            "detail": "TCP/22, enable",
+            "note": "Anahtara hiçbir ajan kurulmaz. Ağ modülleri kontrol düğümünde çalışır ve bir SSH oturumu açar, ardından enable moduna girer.",
+            "tone": "secure"
+          },
+          {
+            "from": "sw1",
+            "to": "ctl",
+            "label": "show version, show vlan brief",
+            "detail": "yapılandırılmış veriye ayrıştırıldı",
+            "note": "Ansible olguları ve mevcut VLAN yapılandırmasını toplar ve CLI çıktısını yapılandırılmış veriye ayrıştırır."
+          },
+          {
+            "from": "ctl",
+            "to": "ctl",
+            "label": "İstenen ile gerçeği karşılaştır",
+            "detail": "sw1'de VLAN 30 eksik",
+            "note": "Modül, playbook'taki istenen durumu sw1'in gerçek durumuyla karşılaştırır.",
+            "tone": "warning"
+          },
+          {
+            "from": "ctl",
+            "to": "sw1",
+            "label": "vlan 30 / name PRINTERS",
+            "detail": "yalnızca eksik satırlar",
+            "note": "Yalnızca fark gönderilir. VLAN 10 ve 99 zaten var, bu yüzden onlar için komut üretilmez.",
+            "tone": "secure"
+          },
+          {
+            "from": "ctl",
+            "to": "sw2",
+            "label": "SSH + show vlan brief",
+            "detail": "aynı görevler paralel",
+            "note": "Aynı görevler sw2'ye karşı aynı anda çalışır; varsayılan olarak Ansible beş ana makinede paralel çalışır."
+          },
+          {
+            "from": "ctl",
+            "to": "ctl",
+            "label": "sw2 zaten uyumlu",
+            "detail": "komut gerekmiyor",
+            "note": "sw2 zaten istenen durumla eşleşiyor; bu yüzden modül ok bildirir ve hiçbir şey göndermez.",
+            "tone": "success"
+          },
+          {
+            "from": "ctl",
+            "to": "eng",
+            "label": "PLAY RECAP",
+            "detail": "sw1 changed=2, sw2 changed=0",
+            "note": "Özet, çalıştırmayı her ana makine için toplar: ok, changed, failed veya unreachable olan görevler.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "idempotency",
+      "type": "text",
+      "markdown": "## İdempotentlik ve check mode\n\nBir görev, bir kez veya on kez çalıştırılması aynı sonucu verdiğinde **idempotent**tir. `ios_vlans` görevi her seferinde körü körüne `vlan 30` yazmaz. Mevcut VLAN'ları okur, istenen durumla karşılaştırır ve yalnızca bir şey eksik veya farklı olduğunda komut gönderir. Çıktı her görevi ana makine başına şöyle bildirir:\n\n- **ok**: cihaz zaten eşleşiyordu; hiçbir şey gönderilmedi.\n- **changed**: Ansible, istenen duruma ulaşmak için bir değişiklik yaptı.\n- **failed** veya **unreachable**: bir şeyler ters gitti; hata mesajını okuyun.\n\nİdempotentlik sayesinde aynı playbook'u düzenli olarak bir **uyumluluk kontrolü** olarak çalıştırabilirsiniz: hiç değişiklik beklemediğiniz bir çalıştırmada görülen herhangi bir `changed`, birinin cihazı elle değiştirdiği anlamına gelir.\n\nBir cihaza dokunmadan önce **check mode** kullanın. `--check`, modüllerin yapılandırma göndermeden neyin *değişeceğini* bildirmesini sağlar; `--diff` ise bunu destekleyen modüller için önce ve sonra ayrıntılarını gösterir. Önce tek bir cihazı denemek için `--limit`, üretilen komutları görmek için `-v` ekleyin."
+    },
+    {
+      "id": "vault",
+      "type": "text",
+      "markdown": "## Değişkenler ve Ansible Vault ile gizli bilgiler\n\n**Değişkenler** playbook'ları yeniden kullanılabilir kılar. Lokasyona veya gruba göre değişen değerleri, örneğin NTP sunucularını veya VLAN listelerini, `group_vars/` ve `host_vars/` dosyalarına koyun ve onlara `{{ variable_name }}` ile başvurun.\n\nGizli bilgiler ekstra özen gerektirir. Parolaları, SNMP community'lerini veya API token'larını asla düz metin olarak saklamayın ve asla Git'e göndermeyin (commit etmeyin). **Ansible Vault**, bir dosyayı veya tek bir değeri AES-256 ile şifreler:\n\n- `ansible-vault create`, `edit`, `view` ve `encrypt` şifrelenmiş dosyaları yönetir.\n- Çalışma zamanında vault parolasını `--ask-vault-pass` ile veya korunan bir parola dosyasıyla sağlayın.\n- Vault değişkenlerini, örneğin `vault_` öneki ile açıkça adlandırın ve onlara normal değişkenlerden başvurun.\n\nVault'u, ayrıcalıkları AAA ile sınırlanmış özel bir otomasyon hesabıyla birleştirin; böylece otomasyon işini yapabilir ve fazlasını yapamaz."
+    },
+    {
+      "id": "run",
+      "type": "terminal",
+      "title": "Gizli bilgileri şifreleme, kontrol etme, uygulama ve yeniden çalıştırma",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "ansible-vault create group_vars/access_switches/vault.yml",
+          "output": "New Vault password: \nConfirm New Vault password: "
+        },
+        {
+          "comment": "Düzenleyici açılır; `vault_netops_password: <password>` yazıp kaydedersiniz. Dosya AES-256 ile şifrelenmiş olarak saklanır."
+        },
+        {
+          "cmd": "head -2 group_vars/access_switches/vault.yml",
+          "output": "$ANSIBLE_VAULT;1.1;AES256\n36383162623565306639623438613566643533316233376437653139383861343236343737643865"
+        },
+        {
+          "comment": "Diskte yalnızca şifreli metin bulunur, bu yüzden dosya Git'e gönderilebilir. Envanter değişkene başvurur, parolanın kendisine asla."
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml site.yml --ask-vault-pass --check --diff",
+          "output": "Vault password: \n\nPLAY [Standardize access switches] *********************************************\n\nTASK [Gather minimal device facts] *********************************************\nok: [sw1]\nok: [sw2]\n\nTASK [Report model and software version] ***************************************\nok: [sw1] => {\n    \"msg\": \"sw1 is a C9200L-24P-4G running 17.09.04a\"\n}\nok: [sw2] => {\n    \"msg\": \"sw2 is a C9200L-24P-4G running 17.09.04a\"\n}\n\nTASK [Ensure the standard VLANs exist] *****************************************\nchanged: [sw1]\nok: [sw2]\n\nTASK [Ensure the NTP server is configured] *************************************\nchanged: [sw1]\nok: [sw2]\n\nPLAY RECAP *********************************************************************\nsw1                        : ok=4    changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0\nsw2                        : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+        },
+        {
+          "comment": "Check mode: her modül istenen durumu anahtarla karşılaştırır ve yapılandırma göndermeden neyin *değişeceğini* bildirir. sw1'de VLAN 30 ve NTP sunucusu eksiktir; sw2 zaten uyumludur. --diff, bunu destekleyen modüller için önce/sonra ayrıntılarını yazdırır."
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml site.yml --ask-vault-pass --check --limit sw1 -v",
+          "output": "...\nTASK [Ensure the standard VLANs exist] *****************************************\nchanged: [sw1] => {\"changed\": true, \"commands\": [\"vlan 30\", \"name PRINTERS\"], ...}\n\nTASK [Ensure the NTP server is configured] *************************************\nchanged: [sw1] => {\"changed\": true, \"commands\": [\"ntp server 192.168.99.5\"], \"updates\": [\"ntp server 192.168.99.5\"]}\n..."
+        },
+        {
+          "comment": "-v eklemek her modülün göndereceği tam komutları gösterir. Yalnızca eksik satırlar görünür (çıktı kısaltılmıştır)."
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml site.yml --ask-vault-pass",
+          "output": "...\nchanged: [sw1]\n...\nPLAY RECAP ****...\nsw1                        : ok=4    changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml site.yml --ask-vault-pass",
+          "output": "...\nPLAY RECAP *********************************************************************\nsw1                        : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0\nsw2                        : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+        },
+        {
+          "comment": "Gerçek çalıştırma, sw1'deki iki değişikliği uygular. Aynı playbook'u tekrar çalıştırmak hiçbir şeyi değiştirmez: buna idempotentlik denir."
+        }
+      ],
+      "caption": "Önce check mode'da çalıştırın, uygulayın, ardından hiçbir şeyin değişmediğini doğrulamak için tekrar çalıştırın."
+    },
+    {
+      "id": "compare",
+      "type": "text",
+      "markdown": "## Ansible, Puppet ve Chef\n\n| | Ansible | Puppet | Chef |\n|:--|:--|:--|:--|\n| Yönetilen düğümde ajan | Hayır (ajansız) | Evet, Puppet agent (ajansız seçenekler vardır) | Evet, Chef Infra Client |\n| Model | Kontrol düğümünden push | Pull: ajanlar Puppet sunucusuna bağlanır | Pull: istemciler Chef sunucusuna bağlanır |\n| Dil | YAML playbook'ları | Puppet DSL manifest'leri (bildirimsel) | Ruby DSL recipe'leri ve cookbook'ları |\n| Aktarım | SSH veya cihaz API'leri | Sunucuya HTTPS (TCP 8140) | Sunucuya HTTPS (TCP 443) |\n| Ağ cihazlarına uygunluk | Güçlü: ajan gerekmez | Sınırlı: çoğu anahtar ajan çalıştıramaz | Sınırlı: çoğu anahtar ajan çalıştıramaz |\n\nPuppet ve Chef, istenen durumu düzenli olarak zorlayan bir ajanın avantaj olduğu büyük sunucu filolarını yönetmek için popülerdir. Yönlendiriciler ve anahtarlar için ajansız Ansible modeli genellikle benimsenmesi en kolay olandır."
+    },
+    {
+      "id": "warning",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Öğrenenlerin hata yaptığı yerler",
+      "markdown": "- **Check mode'u atlamak.** Her zaman önce `--check` çalıştırın; ideal olarak tek bir cihazda `--limit` ile.\n- **Değişiklik yapmak için `ios_command` kullanmak.** Bu modül `show` komutları içindir; yapılandırma için `ios_config` veya kaynak modüllerini kullanın.\n- **`overridden` seçeneğini rastgele seçmek.** Listenizde olmayan her VLAN'ı, diğer ekiplerin bağlı olduğu VLAN'lar dahil, kaldırır.\n- **Düz metin parolalar.** Ansible Vault kullanın ve `vault_` dosyalarını her commit'ten önce şifreli tutun.\n- **\"ok\" değerinin \"doğru\" anlamına geldiğini varsaymak.** Yalnızca cihazın playbook ile eşleştiği anlamına gelir. Playbook yanlışsa her cihaz tutarlı biçimde yanlış olur."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Bir Linux VM veya WSL üzerinde ve sahip olduğunuz laboratuvar anahtarlarıyla (veya sanal bir IOS XE laboratuvarıyla):\n\n1. Ansible'ı ve koleksiyonu kurun: `python3 -m pip install ansible` ve `ansible-galaxy collection install cisco.ios`.\n2. Laboratuvar anahtarlarınız için `inventory.yml` dosyasını ve şifreli bir `group_vars/access_switches/vault.yml` dosyasını oluşturun; ikincisi için `ansible-vault create` kullanın.\n3. Bağlantıyı kanıtlamak için önce yalnızca olgu ve hata ayıklama görevlerini çalıştırın: `ansible-playbook -i inventory.yml site.yml --ask-vault-pass --tags facts` (bu görevlere `tags: facts` ekleyin).\n4. Tüm playbook'u `--check -v --limit sw1` ile çalıştırın ve göndereceği komutları okuyun.\n5. Uygulayın, ardından tekrar çalıştırın ve özetin `changed=0` gösterdiğini doğrulayın.\n6. Bir anahtarda VLAN 30'u elle silin ve Ansible'ın kaymayı düzeltmesini görmek için playbook'u çalıştırın."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Yapılandırma yönetimi (Configuration management)",
+          "definition": "Cihazların istenen yapılandırmasını dosyalarda tanımlamak ve onu tutarlı ve tekrarlanabilir biçimde uygulamak."
+        },
+        {
+          "term": "Yapılandırma kayması (Configuration drift)",
+          "definition": "Aynı yapılandırmayı paylaşması gereken cihazlar arasında zamanla oluşan, kayıt altına alınmamış farklar."
+        },
+        {
+          "term": "Kontrol düğümü (Control node)",
+          "definition": "Ansible'ın kurulu olduğu ve playbook'ların çalıştırıldığı ana makine."
+        },
+        {
+          "term": "Envanter (Inventory)",
+          "definition": "Yönetilen ana makineleri listeleyen, gruplayan ve onlara değişkenler bağlayan bir dosya."
+        },
+        {
+          "term": "Playbook",
+          "definition": "Envanter gruplarına karşı çalıştırılacak otomasyonu tanımlayan, play'ler ve görevlerden oluşan bir YAML dosyası."
+        },
+        {
+          "term": "Modül (Module)",
+          "definition": "Bir görev tarafından çağrılan, cisco.ios.ios_vlans gibi, bir tür değişikliği veya sorguyu gerçekleştiren iş birimi."
+        },
+        {
+          "term": "İdempotentlik (Idempotency)",
+          "definition": "Aynı görevin tekrar tekrar çalıştırılmasının, gereksiz değişiklikler yapmadan aynı sonucu vermesi özelliği."
+        },
+        {
+          "term": "Check mode (Kontrol modu)",
+          "definition": "--check ile etkinleştirilen ve modüllerin hiçbir şeyi değiştirmeden neyin değişeceğini bildirdiği bir deneme çalıştırması (dry run)."
+        },
+        {
+          "term": "Ansible Vault",
+          "definition": "Gizli bilgi içeren dosyaları veya değerleri AES-256 ile şifreleyen Ansible özelliği."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı sınayın",
+      "questions": [
+        {
+          "question": "Hangi ifadeler Ansible'ı tanımlar? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "Ajansızdır",
+            "Bir kontrol düğümünden push modelini kullanır",
+            "Playbook'ları Ruby ile yazılır",
+            "Cisco IOS cihazlarına genellikle SSH üzerinden bağlanır"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Ansible ajan gerektirmez, değişiklikleri kontrol düğümünden iter ve IOS cihazları için SSH (network_cli) kullanır. Playbook'lar YAML'dır; Ruby, Chef'in dilidir."
+        },
+        {
+          "question": "Aynı anahtara karşı bir playbook'u art arda iki kez çalıştırıyorsunuz. İkinci çalıştırma changed=0 bildiriyor. Bu neyi gösterir?",
+          "options": [
+            "İkinci çalıştırma sessizce başarısız oldu",
+            "İdempotentlik: cihaz zaten istenen durumla eşleşiyor",
+            "Check mode otomatik olarak etkinleşti",
+            "Vault parolası yanlıştı"
+          ],
+          "answer": 1,
+          "explanation": "İdempotent modüller istenen ve gerçek durumu karşılaştırır ve zaten eşleştiklerinde hiçbir şey göndermez; bu yüzden ikinci çalıştırma hiçbir şeyi değiştirmez."
+        },
+        {
+          "question": "`ansible-playbook site.yml --check --diff` ne yapar?",
+          "options": [
+            "Değişiklikleri uygular ve sonrasında bir fark (diff) yazdırır",
+            "Cihazları değiştirmeden, neyin değişeceğini ve desteklenen yerlerde önce/sonra ayrıntılarını bildirir",
+            "Yalnızca YAML sözdizimini denetler",
+            "Playbook'u şifreler"
+          ],
+          "answer": 1,
+          "explanation": "--check bir deneme çalıştırmasıdır (dry run) ve --diff, bunu destekleyen modüller için önce/sonra ayrıntıları ekler. Hiçbir şey yapılandırılmaz."
+        },
+        {
+          "question": "Otomasyon hesabının parolası nerede saklanmalıdır?",
+          "options": [
+            "inventory.yml içinde düz metin olarak",
+            "Playbook'un vars bölümünde",
+            "Ansible Vault ile şifrelenmiş ve bir değişkenle başvurulan bir dosyada",
+            "Her anahtarın arayüz açıklamasında"
+          ],
+          "answer": 2,
+          "explanation": "Gizli bilgiler, değişkenlerle başvurulan, Vault ile şifrelenmiş bir dosyada yer almalıdır. Düz metin gizli bilgiler Git geçmişinde ve yedeklerde son bulur."
+        },
+        {
+          "question": "Hangi ifadeler Ansible, Puppet ve Chef'i doğru biçimde karşılaştırır? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "Puppet ve Chef genellikle yapılandırmayı bir sunucudan çeken ajanlar kullanır",
+            "Chef recipe'leri Ruby tabanlı bir DSL kullanır",
+            "Puppet manifest'leri YAML ile yazılır",
+            "Ansible ajansız olduğu için ağ cihazlarında benimsenmesi genellikle daha kolaydır"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Puppet ve Chef ajanları sunucularından çeker, Chef Ruby kullanır ve Ansible'ın ajansız modeli anahtarlara ve yönlendiricilere uygundur. Puppet, YAML'ı değil kendi bildirimsel DSL'ini kullanır."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- **Yapılandırma yönetimi** istenen durumu bir kez tanımlar ve tutarlı biçimde uygular; böylece yapılandırma kaymasını önler.\n- **Ansible** ajansız ve push tabanlıdır; ağ modülleri kontrol düğümünde çalışır ve Cisco IOS ile IOS XE cihazlarına SSH (`network_cli`) kullanır.\n- **Envanter** cihazları gruplar ve bağlantı değişkenlerini tutar; **playbook'lar**, `ios_facts`, `ios_config` ve `ios_vlans` gibi **modülleri** çağıran **görevleri** çalıştırır.\n- Modüller **idempotenttir**: `ok` veya `changed` bildirir ve yalnızca eksik olanı gönderir. Her gerçek çalıştırmadan önce `--check --diff`, `--limit` ve `-v` kullanın.\n- Gizli bilgileri **Ansible Vault**'ta tutun ve en az ayrıcalıklı bir otomasyon hesabı kullanın.\n- **Puppet** ve **Chef**, bir sunucudan çeken ajanlar ve kendi DSL'lerini (Puppet DSL, Ruby) kullanır; Ansible YAML kullanır ve ajan gerektirmez.\n\nYapay zekâ ajanlarının, Ansible gibi araçların ardından uygulayacağı değişiklikleri nasıl önerebileceğine bakmak için [Ağ Operasyonlarında Yapay Zekâ ve Ajan Tabanlı Yapay Zekâ](/learn/networking-foundations-ccna/ai-and-agentic-ai-in-network-operations) dersine yeniden göz atın."
+    }
+  ]
+}
