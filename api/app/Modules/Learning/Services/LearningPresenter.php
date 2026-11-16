@@ -349,10 +349,31 @@ class LearningPresenter
                     'objectives' => $lesson->objectives_ar ?? [],
                     'blocks' => $lesson->blocks_ar ?? [],
                 ],
-            ] + $data;
+            ] + $this->adminTranslations($lesson) + $data;
         }
 
         return $data;
+    }
+
+    /** Every extra locale of a lesson for the editor, empty when not translated yet. */
+    private function adminTranslations(LearningLesson $lesson): array
+    {
+        $rows = LearningTranslation::query()
+            ->where('model_type', 'lesson')->where('model_id', $lesson->id)
+            ->get()->keyBy('locale');
+
+        $out = [];
+        foreach (LearningTranslation::LOCALES as $locale) {
+            $row = $rows[$locale] ?? null;
+            $out[$locale] = [
+                'title' => $row?->fields['title'] ?? null,
+                'summary' => $row?->fields['summary'] ?? null,
+                'objectives' => $row?->fields['objectives'] ?? [],
+                'blocks' => $row?->blocks ?? [],
+            ];
+        }
+
+        return $out;
     }
 
     /** Fill in the url of image/video blocks that point at an uploaded file. */

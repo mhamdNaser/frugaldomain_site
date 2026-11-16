@@ -8,6 +8,7 @@ use App\Modules\Learning\Models\LearningCourse;
 use App\Modules\Learning\Models\LearningLesson;
 use App\Modules\Learning\Models\LearningMedia;
 use App\Modules\Learning\Models\LearningStage;
+use App\Modules\Learning\Models\LearningTranslation;
 use App\Modules\Learning\Models\LearningUnit;
 use App\Modules\Learning\Services\CourseTransfer;
 use App\Modules\Learning\Services\LearningPresenter;
@@ -366,9 +367,63 @@ class LearningAdminController extends Controller
             }
         }
 
-        $lesson->update($data);
+        $translations = $this->lessonTranslations($request);
+
+        DB::transaction(function () use ($lesson, $data, $translations) {
+            $lesson->update($data);
+            foreach ($translations as $locale => $t) {
+                $this->saveTranslation($lesson->id, $locale, $t);
+            }
+        });
 
         return response()->json(['data' => $this->presenter->lesson($lesson->fresh(), $lesson->course, true)]);
+    }
+
+    /** The hi/zh/tr sides sent by the lesson editor, validated and sanitised. */
+    private function lessonTranslations(Request $request): array
+    {
+        $request->validate([
+            'translations' => ['nullable', 'array'],
+            'translations.*' => ['array'],
+            'translations.*.title' => ['nullable', 'string', 'max:255'],
+            'translations.*.summary' => ['nullable', 'string', 'max:5000'],
+            'translations.*.objectives' => ['nullable', 'array', 'max:30'],
+            'translations.*.objectives.*' => ['nullable', 'string', 'max:500'],
+            'translations.*.blocks' => ['nullable', 'array', 'max:400'],
+        ]);
+
+        $out = [];
+        foreach ((array) $request->input('translations', []) as $locale => $t) {
+            if (! in_array($locale, LearningTranslation::LOCALES, true)) {
+                throw ValidationException::withMessages(['translations' => ["Unknown language: {$locale}."]]);
+            }
+            $out[$locale] = [
+                'title' => trim((string) ($t['title'] ?? '')),
+                'summary' => trim((string) ($t['summary'] ?? '')),
+                'objectives' => array_values(array_filter(array_map('trim', $t['objectives'] ?? []), 'strlen')),
+                'blocks' => LessonBlocks::sanitize($t['blocks'] ?? [], "translations.{$locale}.blocks"),
+            ];
+        }
+
+        return $out;
+    }
+
+    /** The editor's copy of one language is authoritative: it replaces the stored row, and an empty one removes it. */
+    private function saveTranslation(int $lessonId, string $locale, array $t): void
+    {
+        $key = ['model_type' => 'lesson', 'model_id' => $lessonId, 'locale' => $locale];
+        $fields = array_filter(
+            ['title' => $t['title'], 'summary' => $t['summary'], 'objectives' => $t['objectives']],
+            fn ($v) => $v !== '' && $v !== []
+        );
+
+        if (! $fields && ! $t['blocks']) {
+            LearningTranslation::where($key)->delete();
+
+            return;
+        }
+
+        LearningTranslation::updateOrCreate($key, ['fields' => $fields, 'blocks' => $t['blocks'] ?: null]);
     }
 
     public function duplicateLesson(int $id)
