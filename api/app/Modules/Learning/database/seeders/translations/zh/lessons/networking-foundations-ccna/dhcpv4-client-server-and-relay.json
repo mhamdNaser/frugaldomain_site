@@ -1,0 +1,370 @@
+{
+  "title": "DHCPv4 客户端、服务器与中继",
+  "summary": "跟踪 DHCPv4 的 DORA 交互过程,将 Cisco IOS 路由器配置为 DHCP 服务器、中继代理和客户端,并排查出现 169.254 地址背后的故障。",
+  "objectives": [
+    "解释 DHCP、DNS 和 NAT 如何协同工作,使主机获得网络连通性",
+    "描述 DORA 交互、租约续订和重新绑定",
+    "使用地址池和排除地址配置 IOS DHCP 服务器",
+    "使用 ip helper-address 配置 DHCP 中继,并将路由器接口配置为 DHCP 客户端",
+    "使用 show ip dhcp binding、show ip dhcp conflict 和 ipconfig 验证并排查 DHCP"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "周一早上,销售团队的新 VLAN 20 上线了。上面每台笔记本电脑都显示类似 `169.254.83.17` 的地址,没人能工作。同一台路由器上的 VLAN 10 却一切正常。DHCP 服务器在运行,地址池里还有空闲地址,交换机端口也都是绿灯。问题出在面向 VLAN 20 的路由器接口上少了一行配置。\n\n**动态主机配置协议 (DHCP)** 自动分发 IP 设置,因此一旦它出故障,整层楼的设备会同时断网。在本课中,你将逐个数据包地跟踪 DORA 交互,把 IOS 路由器配置为 DHCP 服务器、中继代理和客户端,并使用 `show` 命令找出这些 169.254 地址背后的故障。"
+    },
+    {
+      "id": "orient",
+      "type": "text",
+      "markdown": "## DHCP、DNS 和 NAT 如何协同工作\n\n三种服务共同让主机在现代网络中真正可用,每一种回答不同的问题:\n\n| 服务 | 它回答的问题 | 运行位置 | 传输层 |\n|:--|:--|:--|:--|\n| **DHCP** | “我的 IP 地址、掩码、网关和 DNS 服务器是什么?” | LAN 上的服务器或路由器,或通过中继访问 | UDP 67(服务器)、68(客户端) |\n| **DNS** | “`www.example.com` 对应哪个 IP 地址?” | 解析器和权威服务器 | UDP/TCP 53 |\n| **NAT/PAT** | “私有地址如何访问互联网?” | 边缘路由器或防火墙 | 在经过的数据包中转换地址 |\n\n排障时顺序很重要。主机首先需要 **DHCP** 来获得地址并得知 DNS 服务器,之后 **DNS** 才能解析名称,最后前往互联网的流量在边缘由 **NAT** 转换。如果 DHCP 失败,DNS 和 NAT 就根本没有机会工作。本课讲解 DHCPv4;另外两项请参阅 [DNS Record Diagnostics](/learn/networking-foundations-ccna/dns-record-diagnostics) 和 [NAT and PAT on IOS XE](/learn/networking-foundations-ccna/nat-and-pat-on-ios-xe),以安全为重点的概述请参阅 [Network Basics: IP Addressing and DNS](/learn/cisco-security-certification-track/network-basics-ip-addressing-and-dns)。"
+    },
+    {
+      "id": "dora",
+      "type": "text",
+      "markdown": "## DORA:四条消息的交互\n\n没有地址的客户端无法向它不认识的服务器发送单播,因此 DHCPv4 以**广播**开始(UDP 为何适合此场景,请参阅 [TCP, UDP, ICMP and ARP](/learn/networking-foundations-ccna/tcp-udp-icmp-and-arp)):\n\n1. **Discover(发现)**:客户端从 `0.0.0.0:68` 向 `255.255.255.255:67` 广播:“有 DHCP 服务器吗?”\n2. **Offer(提供)**:服务器提议一个地址 (`yiaddr`) 以及各种选项:掩码、默认路由器、DNS 服务器、域名和租约时间。\n3. **Request(请求)**:客户端**广播**接受其中一个 Offer,并指明所选服务器。该广播同时告知其他服务器它们的 Offer 已被拒绝。\n4. **Acknowledge(确认,ACK)**:服务器确认。客户端可能发送免费 ARP 来检查是否有其他设备使用该地址,然后完成自身配置。\n\n如果所请求的地址已不再有效(例如笔记本电脑移到了另一个子网),服务器会回复 **DHCPNAK**,客户端从 Discover 重新开始。不再需要该地址的客户端发送 **DHCPRELEASE**;发现该地址已被占用的客户端发送 **DHCPDECLINE**。\n\n### 租约与续订\n\n地址是**租用**的,而不是白送的。在 **T1(租约的 50%)**时,客户端向服务器单播一个 Request 来**续订**。如果没有应答,则在 **T2(87.5%)**时向任意服务器广播以**重新绑定**。如果租约到期,客户端必须停止使用该地址,并从 Discover 重新开始。"
+    },
+    {
+      "id": "dora-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "通过中继代理的 DORA",
+      "caption": "R1 把客户端的广播转换为发往服务器的单播,并在其中加上 giaddr,使服务器知道该使用哪个地址池。",
+      "data": {
+        "actors": [
+          {
+            "id": "pc",
+            "label": "笔记本电脑",
+            "sub": "VLAN 20,0.0.0.0",
+            "icon": "laptop"
+          },
+          {
+            "id": "r1",
+            "label": "R1 中继",
+            "sub": "Gi0/0/1 192.168.20.1",
+            "icon": "router"
+          },
+          {
+            "id": "srv",
+            "label": "DHCP 服务器",
+            "sub": "192.168.100.10",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "pc",
+            "to": "r1",
+            "label": "DHCPDISCOVER",
+            "detail": "0.0.0.0:68 → 255.255.255.255:67",
+            "note": "笔记本电脑还没有地址,所以它发送广播。路由器不转发广播,因此没有中继的话,流程到这里就会中断。"
+          },
+          {
+            "from": "r1",
+            "to": "srv",
+            "label": "被中继的 Discover",
+            "detail": "单播,giaddr=192.168.20.1",
+            "note": "ip helper-address 使 R1 将该消息以单播转发,并把 giaddr 设置为接收接口的地址。"
+          },
+          {
+            "from": "srv",
+            "to": "srv",
+            "label": "为 192.168.20.0/24 选择地址池",
+            "note": "服务器将 giaddr 与其 VLAN 20 作用域匹配,并选择一个空闲地址 192.168.20.11。"
+          },
+          {
+            "from": "srv",
+            "to": "r1",
+            "label": "DHCPOFFER",
+            "detail": "yiaddr=192.168.20.11",
+            "note": "Offer 返回给中继地址,而不是客户端。"
+          },
+          {
+            "from": "r1",
+            "to": "pc",
+            "label": "DHCPOFFER",
+            "detail": "掩码 /24,路由器 .1,DNS 192.168.100.53",
+            "note": "R1 在 VLAN 20 上递送该 Offer,其中包含掩码、网关、DNS 服务器和租约时间。"
+          },
+          {
+            "from": "pc",
+            "to": "r1",
+            "label": "DHCPREQUEST",
+            "detail": "广播,server-id 192.168.100.10",
+            "note": "笔记本电脑广播声明,它接受来自该服务器的这个 Offer。"
+          },
+          {
+            "from": "r1",
+            "to": "srv",
+            "label": "被中继的 Request",
+            "detail": "giaddr=192.168.20.1",
+            "note": "中继转发 Request 的方式与转发 Discover 完全相同。"
+          },
+          {
+            "from": "srv",
+            "to": "r1",
+            "label": "DHCPACK",
+            "detail": "租约 86400 秒",
+            "tone": "success",
+            "note": "服务器记录该绑定,并确认一天的租约。"
+          },
+          {
+            "from": "r1",
+            "to": "pc",
+            "label": "DHCPACK",
+            "tone": "success",
+            "note": "ACK 经中继到达笔记本电脑。"
+          },
+          {
+            "from": "pc",
+            "to": "pc",
+            "label": "已配置:192.168.20.11/24",
+            "tone": "success",
+            "note": "笔记本电脑应用该地址、网关 192.168.20.1 和 DNS 服务器。T1 续订将在 12 小时后到期。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lease-anim",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "DHCP 租约生命周期",
+      "data": {
+        "center": "租约:24 小时",
+        "items": [
+          {
+            "label": "已绑定",
+            "sub": "收到 ACK 后,客户端使用该地址。"
+          },
+          {
+            "label": "续订中(T1,12 小时)",
+            "sub": "在 50% 时,客户端向其服务器单播一个 Request;收到 ACK 即重置租约。"
+          },
+          {
+            "label": "重新绑定中(T2,21 小时)",
+            "sub": "在 87.5% 时仍无应答,客户端向任意服务器广播一个 Request。"
+          },
+          {
+            "label": "已过期或已释放",
+            "sub": "客户端停止使用该地址,并从 Discover 重新开始。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "server",
+      "type": "text",
+      "markdown": "## 将 IOS 路由器配置为 DHCP 服务器\n\n小型站点常让路由器自己分发地址。在 R1 上,VLAN 10(`192.168.10.0/24`,网关 `192.168.10.1`,位于 Gi0/0/0)从本地地址池获取地址:\n\n- **`ip dhcp excluded-address`** 是全局命令,使地址不出现在任何地址池中。要在客户端接入**之前**排除网关和所有静态设备,否则它们的地址可能被租出去。\n- **`ip dhcp pool`** 定义作用域。**`network`** 语句必须与接收请求的接口所在子网(或中继的 giaddr)一致;IOS 就是据此选择地址池的。\n- **`default-router`**、**`dns-server`** 和 **`domain-name`** 成为 DHCP 选项。**`lease`** 以天、小时和分钟为单位(默认为一天)。\n\n在租出地址之前,IOS 服务器会先 ping 该地址。如果有设备应答,该地址会被移入**冲突**列表,在你清除之前不会再被提供。"
+    },
+    {
+      "id": "server-config",
+      "type": "code",
+      "language": "cisco",
+      "filename": "R1 - DHCP server for VLAN 10, relay for VLAN 20",
+      "code": "service dhcp\nip dhcp excluded-address 192.168.10.1 192.168.10.10\n!\nip dhcp pool VLAN10-USERS\n network 192.168.10.0 255.255.255.0\n default-router 192.168.10.1\n dns-server 192.168.100.53\n domain-name example.com\n lease 1\n!\ninterface GigabitEthernet0/0/0\n description VLAN 10 users (served by R1)\n ip address 192.168.10.1 255.255.255.0\n!\ninterface GigabitEthernet0/0/1\n description VLAN 20 users (relay to central server)\n ip address 192.168.20.1 255.255.255.0\n ip helper-address 192.168.100.10\n!\ninterface GigabitEthernet0/0/2\n description Server subnet\n ip address 192.168.100.1 255.255.255.0",
+      "highlight": [
+        2,
+        5,
+        18
+      ],
+      "caption": "service dhcp 默认开启;之所以列出它,是因为 `no service dhcp` 会悄无声息地同时禁用服务器和中继。"
+    },
+    {
+      "id": "relay",
+      "type": "text",
+      "markdown": "## DHCP 中继与作为客户端的路由器\n\n### 使用 ip helper-address 的中继\n\n大型网络用一台中心 DHCP 服务器服务多个子网。由于路由器会丢弃广播,每个面向客户端的三层接口都需要 **`ip helper-address <server>`**。中继把 **giaddr** 设置为自己的接口地址,以告诉服务器使用哪个作用域以及把应答发往何处。有两条规则容易让人踩坑:\n\n- helper 要配置在**面向客户端**的接口(或 SVI)上,而不是朝向服务器的接口。\n- 服务器必须有通往 giaddr 子网的**回程路由**,中间的任何防火墙都必须放行 UDP 67。\n\n默认情况下,`ip helper-address` 还会转发其他一些 UDP 广播(TFTP、DNS、Time、NetBIOS 名称和数据报、TACACS)。用 `no ip forward-protocol udp <port>` 去掉不需要的那些。\n\n### 作为 DHCP 客户端的路由器\n\n边缘路由器的面向互联网的地址通常来自运营商。在接口上配置 `ip address dhcp` 会使 IOS 成为 DHCP 客户端;它还会安装一条指向所提供网关、管理距离为 254 的默认路由。用 `show ip interface brief`(Method 为 `DHCP`)和 `show dhcp lease` 检查结果。"
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "在 R1、边缘路由器和客户端上验证 DHCP",
+      "prompt": "R1#",
+      "lines": [
+        {
+          "cmd": "show ip dhcp pool",
+          "output": "Pool VLAN10-USERS :\n Utilization mark (high/low)    : 100 / 0\n Subnet size (first/next)       : 0 / 0\n Total addresses                : 254\n Leased addresses               : 2\n Pending event                  : none\n 1 subnet is currently in the pool :\n Current index        IP address range                    Leased addresses\n 192.168.10.14        192.168.10.1     - 192.168.10.254    2"
+        },
+        {
+          "comment": "总地址数和已租用地址数:如果 Leased 接近 Total,说明地址池已耗尽。"
+        },
+        {
+          "cmd": "show ip dhcp binding",
+          "output": "Bindings from all pools not associated with VRF:\nIP address      Client-ID/              Lease expiration        Type       State      Interface\n                Hardware address/\n                User name\n192.168.10.11   0100.5056.a10b.22       Nov 09 2026 09:14 AM    Automatic  Active     GigabitEthernet0/0/0\n192.168.10.12   0100.5056.a10c.47       Nov 09 2026 09:20 AM    Automatic  Active     GigabitEthernet0/0/0"
+        },
+        {
+          "comment": "谁拥有哪个地址。Client-ID 是 01(以太网)后接 MAC 地址。"
+        },
+        {
+          "cmd": "show ip dhcp conflict",
+          "output": "IP address        Detection method   Detection time          VRF\n192.168.10.13     Ping               Nov 08 2026 09:31 AM"
+        },
+        {
+          "comment": "已经有设备对 .13 作出应答,很可能是地址池内某台使用静态地址的设备。将其排除,然后运行 clear ip dhcp conflict *。"
+        },
+        {
+          "cmd": "show dhcp lease",
+          "prompt": "EDGE#",
+          "output": "Temp IP addr: 203.0.113.45  for peer on Interface: GigabitEthernet0/0/0\nTemp  sub net mask: 255.255.255.0\n   DHCP Lease server: 203.0.113.1, state: 5 Bound\n   DHCP transaction id: 1F3C\n   Lease: 86400 secs,  Renewal: 43200 secs,  Rebind: 75600 secs\nTemp default-gateway addr: 203.0.113.1\n   Next timer fires after: 11:58:21\n   Retry count: 0   Client-ID: cisco-00a3.d14f.2a00-Gi0/0/0"
+        },
+        {
+          "comment": "作为 DHCP 客户端的边缘路由器:Renewal 是 86,400 秒租约的 T1(50%),Rebind 是 T2(87.5%)。"
+        },
+        {
+          "cmd": "ipconfig /all",
+          "prompt": "C:\\>",
+          "output": "   DHCP Enabled. . . . . . . . . . . : Yes\n   Autoconfiguration Enabled . . . . : Yes\n   Autoconfiguration IPv4 Address. . : 169.254.83.17(Preferred)\n   Subnet Mask . . . . . . . . . . . : 255.255.0.0\n   Default Gateway . . . . . . . . . :"
+        },
+        {
+          "comment": "修复前的 VLAN 20 笔记本电脑:APIPA 地址,没有网关,也没有 DHCP Server 行。它的 Discover 从未到达服务器。"
+        },
+        {
+          "cmd": "ipconfig /renew",
+          "prompt": "C:\\>",
+          "output": "   IPv4 Address. . . . . . . . . . . : 192.168.20.11\n   Subnet Mask . . . . . . . . . . . : 255.255.255.0\n   Default Gateway . . . . . . . . . : 192.168.20.1"
+        },
+        {
+          "comment": "在 Gi0/0/1 上添加 ip helper-address 192.168.100.10 后,续订成功。"
+        }
+      ],
+      "caption": "并排检查服务器端(地址池、绑定、冲突)和客户端(ipconfig)。"
+    },
+    {
+      "id": "trouble",
+      "type": "text",
+      "markdown": "## DHCPv4 故障排查\n\n`169.254.x.x` 地址意味着“没有任何服务器应答”。沿着 Discover 所经的路径逐段检查:\n\n| 检查项 | 典型故障 | 命令 |\n|:--|:--|:--|\n| 客户端链路和 VLAN | 端口关闭、接入 VLAN 错误 | 在交换机上使用 `show interfaces status`;参阅 [Interface and Cable Diagnostics](/learn/networking-foundations-ccna/interface-and-cable-diagnostics) |\n| 中继 | 缺少 `ip helper-address`、配置在错误的接口上,或指向错误的 IP | `show running-config interface`、`show ip interface \\| include Helper` |\n| 到服务器的路径 | 没有通往 giaddr 子网的回程路由,ACL 或防火墙阻止了 UDP 67/68 | `ping 192.168.100.10 source 192.168.20.1` |\n| 服务器作用域 | 该子网没有地址池或 `network` 语句 | `show ip dhcp pool` |\n| 地址池耗尽 | 所有地址都已租出,或排除范围过宽 | `show ip dhcp pool`、`show ip dhcp binding` |\n| 冲突 | 地址池内存在静态设备 | `show ip dhcp conflict` |\n| 服务被禁用 | `no service dhcp` | `show running-config \\| include dhcp` |\n\n如果客户端获得了地址却无法上网,说明 DHCP 已经工作:检查它收到的选项(网关或 DNS 服务器是否有误),并向上一层排查 DNS。\n\n### 保护 DHCP\n\n任何设备都可以应答 Discover,因此**非法 DHCP 服务器**(无论是误接入的家用路由器还是攻击者)都可能下发虚假网关。接入交换机上的 **DHCP 监听 (DHCP snooping)** 只允许来自受信任端口的服务器消息,并建立供 DAI 和 IP Source Guard 使用的绑定表。启用时,要把朝向中继或服务器的上行链路标记为受信任,否则合法的 Offer 会被丢弃。详情请参阅 [Layer 2 Security: DHCP Snooping, DAI and Port Security](/learn/networking-foundations-ccna/layer-2-security-dhcp-snooping-dai-and-port-security)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "学习者常犯的错误",
+      "markdown": "- **把 helper 配在服务器一侧。** `ip helper-address` 应配置在**客户端**广播到达的接口上。\n- **在地址池内排除地址。** `ip dhcp excluded-address` 是全局命令,不是地址池子命令。\n- **地址池的 `network` 与接口不匹配。** IOS 按接收子网或 giaddr 选择地址池;写错意味着“没有地址池”,并且毫无动静。\n- **认为 Request 是单播。** 在最初的 DORA 交互中 Request 是广播;只有 T1 时的续订才是单播。\n- **把每次故障都怪到 DHCP 头上。** 主机若有有效的地址、掩码和网关,说明它的 DHCP 已经成功。接下来应检查 DNS、路由或 NAT。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "在 Packet Tracer 中,搭建一台带两个 LAN 接口的路由器,以及位于第三个子网的一台服务器:\n\n1. 为 LAN 1 配置 IOS DHCP 地址池,排除地址 `.1`–`.10`。将一台 PC 设为 DHCP,并用 `show ip dhcp binding` 确认。\n2. 在 Packet Tracer 服务器上为 LAN 2 的子网启用 DHCP 服务。将一台 LAN 2 的 PC 设为 DHCP,并记下其 169.254 地址。\n3. 在 LAN 2 接口上添加 `ip helper-address` 并续订。检查服务器的租约显示的是正确的子网。\n4. 给一台打印机分配 LAN 1 地址池内的静态地址,然后反复释放并续订各 PC,直到 `show ip dhcp conflict` 显示该冲突。\n5. 用 `ip address dhcp` 配置另一台路由器的接口,并查看 `show dhcp lease`。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "DHCP",
+          "definition": "动态主机配置协议 (Dynamic Host Configuration Protocol):通过 UDP 67/68 向客户端租用 IP 地址以及网关、DNS 等选项。"
+        },
+        {
+          "term": "DORA",
+          "definition": "Discover、Offer、Request、Acknowledge:分配 DHCPv4 租约的四条消息。"
+        },
+        {
+          "term": "租约 (Lease)",
+          "definition": "客户端可以使用某地址的时间;在 T1(50%)续订,在 T2(87.5%)重新绑定。"
+        },
+        {
+          "term": "DHCP 地址池 (DHCP pool)",
+          "definition": "服务器为一个子网分发的地址和选项的作用域。"
+        },
+        {
+          "term": "排除地址 (Excluded address)",
+          "definition": "IOS DHCP 服务器永不租出的地址,例如网关或打印机。"
+        },
+        {
+          "term": "中继代理 (Relay agent)",
+          "definition": "将客户端广播转发给另一子网上 DHCP 服务器的路由器,通过 ip helper-address 配置。"
+        },
+        {
+          "term": "giaddr",
+          "definition": "由中继设置的网关地址字段;服务器用它来选择地址池并发送应答。"
+        },
+        {
+          "term": "DHCP 冲突 (DHCP conflict)",
+          "definition": "服务器发现已被使用(通过 ping 或客户端拒绝)的地址,在清除之前会被从地址池中移除。"
+        },
+        {
+          "term": "非法 DHCP 服务器 (Rogue DHCP server)",
+          "definition": "未经授权的 DHCP 服务器;可由接入交换机上的 DHCP 监听阻止。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "DHCPv4 租约交互的正确顺序是什么?",
+          "options": [
+            "Request, Offer, Discover, ACK",
+            "Discover, Request, Offer, ACK",
+            "Discover, Offer, Request, ACK",
+            "Offer, Discover, ACK, Request"
+          ],
+          "answer": 2,
+          "explanation": "DORA:客户端发现,服务器提供,客户端请求该 Offer,服务器确认。"
+        },
+        {
+          "question": "VLAN 20 上的客户端获得 169.254 地址。DHCP 服务器位于另一个子网,而 VLAN 10 正常。ip helper-address 应配置在哪里?",
+          "options": [
+            "在面向 DHCP 服务器的路由器接口上",
+            "在面向 VLAN 20 的路由器接口或 SVI 上",
+            "在 DHCP 服务器的网卡上",
+            "在全局配置模式下"
+          ],
+          "answer": 1,
+          "explanation": "中继必须接收到客户端的广播,所以 helper 要配置在面向客户端的接口上。它随后将广播以单播转发,并设置 giaddr。"
+        },
+        {
+          "question": "关于 IOS DHCP 服务器,下列哪些说法正确?(选择所有适用项。)",
+          "options": [
+            "ip dhcp excluded-address 是全局配置命令",
+            "通过匹配接收子网或 giaddr 来选择地址池",
+            "服务器在提供地址之前会先 ping 该地址",
+            "默认租约时间为八小时"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "排除是全局的,地址池按子网匹配,而 ping 检查会写入冲突表。IOS 默认租约为一天。"
+        },
+        {
+          "question": "客户端的租约为 24 小时。它何时首次尝试向其服务器续订?",
+          "options": [
+            "6 小时后",
+            "12 小时后",
+            "21 小时后",
+            "仅在租约到期时"
+          ],
+          "answer": 1,
+          "explanation": "T1 是租约的 50%,所以客户端在 12 小时后单播一个续订 Request。T2(重新绑定广播)在 87.5%(21 小时)。"
+        },
+        {
+          "question": "show ip dhcp conflict 列出了 192.168.10.13。你应该怎么做?(选择所有适用项。)",
+          "options": [
+            "找出使用 192.168.10.13 的设备",
+            "如果该地址属于静态设备,则将其排除",
+            "用 clear ip dhcp conflict 清除该冲突",
+            "禁用 DHCP 服务"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "冲突意味着有设备对 ping 检查作出了应答。找出它,排除静态地址,然后清除该条目,这样如果地址空闲,服务器就能再次使用它。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- DHCP 为主机提供地址、掩码、网关和 DNS 服务器;随后 DNS 解析名称,NAT 在边缘进行转换。如果 DHCP 失败,其他服务根本无法启动。\n- **DORA**:Discover 和 Request 是广播;Offer 和 ACK 返回租约。租约在 **T1(50%)**续订,在 **T2(87.5%)**重新绑定。\n- IOS 服务器需要 **`ip dhcp excluded-address`**(全局)和一个 **`ip dhcp pool`**,其 `network` 须与客户端子网一致。\n- 在面向客户端的接口上配置 **`ip helper-address`**,可将广播中继到远程服务器并设置 **giaddr**。**`ip address dhcp`** 使路由器成为客户端。\n- 使用 `show ip dhcp pool`、`show ip dhcp binding`、`show ip dhcp conflict`、`show dhcp lease` 和 `ipconfig /all` 验证。169.254 地址意味着没有服务器应答。\n- 用 **DHCP 监听 (DHCP snooping)** 保护 DHCP 免受非法服务器的危害。\n\n继续学习 [NAT and PAT on IOS XE](/learn/networking-foundations-ccna/nat-and-pat-on-ios-xe),了解这些私有地址如何访问互联网。"
+    }
+  ]
+}
