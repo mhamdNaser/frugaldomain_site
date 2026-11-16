@@ -55,7 +55,7 @@ second model review pass. Sonnet translators, 8 in parallel, 3-4 lessons each.
 | Phase | Content | Size | State |
 |:--|:--|:--|:--|
 | 0 | Table, API, seeder, tools; Arabic mechanical audit and fixes; all 10 syllabi in hi/zh/tr | - | done 2026-11-14 |
-| 1 | networking-foundations-ccna | 41 lessons x 3 | |
+| 1 | networking-foundations-ccna | 41 lessons x 3 | round 1 done 2026-11-16 (first 10 in course order, computer-systems-fundamentals .. vlans-and-trunking); next: ssh-rdp-and-remote-administration onward |
 | 2 | hands-on-security-labs + ot-ics-security | 44 x 3 | |
 | 3 | network-automation-devops | 49 x 3 | |
 | 4 | security-operations-dfir | 50 x 3 | |
