@@ -1,0 +1,301 @@
+{
+  "title": "安全自动化实验",
+  "summary": "自动化一项安全的响应任务：一个 Python 脚本将 SIEM 的暴力破解告警转换为会过期的 nftables 封禁，并带有允许列表、试运行、熔断器和审计日志。",
+  "objectives": [
+    "选择可以安全自动化的任务",
+    "设计防护措施：试运行、允许列表、过期、熔断器",
+    "为 nftables 编写经过输入验证的 Python 封禁脚本",
+    "使用 systemd 定时器进行调度并设置紧急停止开关",
+    "有意测试失败路径"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "安全团队整天都在重复同样的小任务：查看告警、查询地址、封禁它、写工单。每个任务都很简单，但累加起来令人疲惫。**自动化**把重复的部分交给脚本，让人把时间花在判断上。它也有阴暗的一面：一个在凌晨 3 点封禁了错误地址的脚本，造成故障的速度可能比任何攻击者都快。\n\n在这个实验中，你将在 [集中式 SIEM 实验](/learn/hands-on-security-labs/centralized-siem-lab) 中的 SIEM 上构建一个小型而安全的自动化：Python 脚本读取暴力破解告警，验证源地址，并将其加入一个会自动过期的防火墙集合。你将先设计防护措施，因为防护措施才是本课的重点。请仅在你自己拥有的虚拟机上运行。"
+    },
+    {
+      "id": "choose",
+      "type": "text",
+      "markdown": "## 步骤 1：选择要自动化的内容\n\n并非每个任务都值得写脚本。适合自动化的任务应当频繁、基于规则、风险低且易于撤销。不适合的任务需要判断，或者失败代价高昂。\n\n| 任务 | 是否自动化？ | 原因 |\n|:--|:--|:--|\n| 用 whois 和信誉数据丰富告警信息 | 是 | 只读，每条告警可节省数分钟 |\n| 将暴力破解来源封禁一小时 | 是，需带防护措施 | 可逆，会过期 |\n| 创建包含告警详情的工单 | 是 | 不影响生产环境 |\n| 禁用用户账户 | 仅在获批后 | 可能把真实用户锁在门外 |\n| 删除文件或隔离服务器 | 由人决定 | 影响大，难以撤销 |\n\n一个有用的阶梯是**通知，然后建议，然后经批准后执行，然后自行执行**。从阶梯的最底层开始，只有当脚本在日志中赢得信任后才向上攀升。"
+    },
+    {
+      "id": "guard",
+      "type": "text",
+      "markdown": "## 步骤 2：先构建防护措施\n\n在脚本接触防火墙之前，先决定它如何安全地失败。\n\n- **默认试运行。**脚本只打印它将要做的事。单独的 `--apply` 标志才会真正执行。\n- **允许列表。**绝不要封禁你的管理网络、自己的跳板机或监控探针。\n- **验证输入。**使用 `ipaddress` 解析地址。绝不要把日志文本粘贴进 shell 命令。\n- **过期。**每个封禁都会超时。被遗忘的永久封禁就是未来的故障。\n- **熔断器。**如果一次运行想要封禁的地址超过设定数量，说明出了问题。应停止并通知人工。\n- **审计日志。**记录每个操作及其时间戳，以便日后有人能够解释。\n- **最小权限。**以专用用户运行，该用户只能修改封禁列表集合。\n\n日志行是受攻击者影响的数据。失败的 SSH 登录可以带有攻击者输入的任意用户名，因此要把每个字段都当作不可信输入。"
+    },
+    {
+      "id": "flow-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从告警到会过期的封禁",
+      "caption": "每个阶段都是脚本可以拒绝执行的检查点。",
+      "data": {
+        "token": "告警",
+        "nodes": [
+          {
+            "id": "siem",
+            "label": "SIEM 告警",
+            "sub": "规则 5712",
+            "icon": "log"
+          },
+          {
+            "id": "parse",
+            "label": "解析并验证",
+            "sub": "ipaddress",
+            "icon": "cpu"
+          },
+          {
+            "id": "allow",
+            "label": "允许列表检查",
+            "sub": "10.10.0.0/16",
+            "icon": "shield"
+          },
+          {
+            "id": "breaker",
+            "label": "熔断器",
+            "sub": "最多 20 个",
+            "icon": "alert"
+          },
+          {
+            "id": "fw",
+            "label": "防火墙集合",
+            "sub": "超时 1h",
+            "icon": "firewall"
+          },
+          {
+            "id": "audit",
+            "label": "审计日志",
+            "sub": "auto-block.log",
+            "icon": "file"
+          }
+        ],
+        "steps": [
+          {
+            "at": "siem",
+            "caption": "规则 5712 因来自 198.51.100.23 的重复 SSH 失败而触发。"
+          },
+          {
+            "at": "parse",
+            "caption": "脚本解析该地址；格式错误的值会被跳过。",
+            "tone": "secure"
+          },
+          {
+            "at": "allow",
+            "caption": "该地址不在允许列表中，因此可以被封禁。",
+            "tone": "success"
+          },
+          {
+            "at": "allow",
+            "token": "告警",
+            "caption": "位于 10.10.0.0/16 内的地址会在这里停止，永远不会被封禁。",
+            "tone": "blocked"
+          },
+          {
+            "at": "breaker",
+            "caption": "本次运行中的来源少于 20 个，因此这一批属于正常。",
+            "tone": "warning"
+          },
+          {
+            "at": "fw",
+            "caption": "使用 --apply 时，nft 会把该地址加入集合，并设置一小时的超时。",
+            "tone": "danger"
+          },
+          {
+            "at": "audit",
+            "caption": "带时间戳的一行记录了谁、做了什么以及原因。",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "script",
+      "type": "code",
+      "language": "python",
+      "filename": "/opt/auto-block/auto_block.py",
+      "caption": "一个内置防护措施的最小自动封禁脚本。它以专用用户身份运行，默认为试运行。",
+      "code": "#!/usr/bin/env python3\n\"\"\"Block brute-force sources found in Wazuh alerts. Dry-run unless --apply.\"\"\"\nimport ipaddress, json, subprocess, sys, logging\n\nALERTS = \"/var/ossec/logs/alerts/alerts.json\"\nALLOW = [ipaddress.ip_network(n) for n in (\"10.10.0.0/16\", \"192.0.2.0/24\")]\nRULES = {\"5712\"}          # sshd brute force (built-in correlation)\nMAX_BLOCKS = 20           # circuit breaker per run\nAPPLY = \"--apply\" in sys.argv\nlogging.basicConfig(filename=\"/var/log/auto-block.log\", level=logging.INFO,\n                    format=\"%(asctime)s %(message)s\")\n\ndef sources():\n    seen = set()\n    for line in open(ALERTS):\n        try:\n            a = json.loads(line)\n            ip = ipaddress.ip_address(a[\"data\"][\"srcip\"])\n        except (ValueError, KeyError):\n            continue\n        if a[\"rule\"][\"id\"] in RULES and not any(ip in n for n in ALLOW):\n            seen.add(str(ip))\n    return sorted(seen)\n\ntodo = sources()\nif len(todo) > MAX_BLOCKS:\n    logging.error(\"refusing %d blocks (limit %d)\", len(todo), MAX_BLOCKS)\n    sys.exit(2)\nfor ip in todo:\n    cmd = [\"nft\", \"add\", \"element\", \"inet\", \"filter\", \"blocklist\",\n           \"{ \" + ip + \" timeout 1h }\"]\n    logging.info(\"%s %s\", \"BLOCK\" if APPLY else \"DRY-RUN\", ip)\n    if APPLY:\n        subprocess.run(cmd, check=True)\n",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        30,
+        31,
+        32
+      ]
+    },
+    {
+      "id": "deploy",
+      "type": "text",
+      "markdown": "## 步骤 3：准备防火墙并在试运行模式下测试\n\n脚本需要一个带超时的 nftables 集合，以及一条丢弃来自该集合流量的规则。两者只需创建一次，然后先用示例告警测试，再信任真实告警。请保留你在 [防火墙规则测试实验](/learn/hands-on-security-labs/firewall-rule-testing-lab) 中验证过的防火墙规则，并把集合规则加在通用放行规则的上方。\n\n第一次运行必须是试运行。阅读输出并自问：每一行是否都能得到人工认可？"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "gw-01",
+      "prompt": "$",
+      "caption": "创建集合、试运行、应用并检查。198.51.100.23 是代表攻击者的文档专用地址。",
+      "lines": [
+        {
+          "cmd": "sudo nft add set inet filter blocklist '{ type ipv4_addr; flags timeout; }' && sudo nft insert rule inet filter input ip saddr @blocklist drop",
+          "output": "",
+          "comment": "一次性设置。insert 会把丢弃规则放在 input 链的最前面。"
+        },
+        {
+          "cmd": "sudo -u autoblock python3 /opt/auto-block/auto_block.py && tail -n 2 /var/log/auto-block.log",
+          "output": "2026-11-12 10:30:01,114 DRY-RUN 198.51.100.23\n2026-11-12 10:30:01,115 DRY-RUN 198.51.100.77",
+          "comment": "试运行：没有任何更改。应用之前请手动检查每个地址。"
+        },
+        {
+          "cmd": "sudo -u autoblock python3 /opt/auto-block/auto_block.py --apply && sudo nft list set inet filter blocklist",
+          "output": "table inet filter {\n\tset blocklist {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t\telements = { 198.51.100.23 timeout 1h expires 59m58s,\n\t\t\t     198.51.100.77 timeout 1h expires 59m58s }\n\t}\n}",
+          "comment": "封禁条目已存在，一小时后会自动过期，无需任何清理任务。"
+        }
+      ]
+    },
+    {
+      "id": "schedule",
+      "type": "text",
+      "markdown": "## 步骤 4：调度并测试失败路径\n\n使用 **systemd 定时器**每分钟运行一次脚本，而不是使用长期运行的循环。定时器很容易用 `systemctl list-timers` 检查，崩溃也不会留下僵尸进程。为该服务设置 `User=autoblock`、`NoNewPrivileges=yes` 和 `ProtectSystem=strict`，并且只授予该用户所需的 `CAP_NET_ADMIN` 能力。\n\n然后有意测试各种异常情况：\n\n1. 把你自己的管理地址加入一条伪造的告警，确认它被跳过。\n2. 提供一行带有垃圾 `srcip` 的内容，确认脚本不会崩溃。\n3. 生成 25 个不同的伪造来源，确认熔断器拒绝执行并记录错误。\n\n只在正常路径上测试过的自动化等于没有测试。还要注意这种设计的局限：基于单条规则的封禁比较粗糙，而攻击者会轮换地址。它能减少噪声，但并不是完整的防御。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "自动化会放大错误",
+      "markdown": "手动应用的错误规则只会伤害一个系统。由脚本应用的同一条规则会每分钟伤害每一个系统。没有允许列表、过期机制和紧急停止开关，绝不要授予自动化对生产环境的写权限，紧急停止开关例如用 `systemctl stop auto-block.timer` 禁用定时器。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "不要把机密放进脚本",
+      "markdown": "当你的自动化扩展到调用工单系统或信誉服务的 API 时，请从归服务用户所有、权限为 600 的环境文件中加载令牌。绝不要硬编码，也不要提交到 git。在文档和示例中，只显示占位符，例如 `API_TOKEN=<your-token>`。"
+    },
+    {
+      "id": "measure",
+      "type": "text",
+      "markdown": "## 步骤 5：审查、度量并谨慎扩展\n\n一周后，阅读审计日志。统计封禁数量、误报数量和节省的分钟数。将其与你构建和维护脚本所花的时间进行比较。如果某个封禁曾影响到合法用户，请把该地址加入允许列表并记下原因。\n\n当你准备好进入下一步时，把这一模式与 [Wazuh 与 Suricata 集成实验](/learn/hands-on-security-labs/wazuh-and-suricata-integration-lab) 中的检测结果连接起来，然后进入 [攻击检测与修复实验](/learn/hands-on-security-labs/attack-detection-and-remediation-lab)，在那里检测与响应一起运行。在作品集中，要描述防护措施和失败测试，而不仅仅是脚本。这才能体现工程成熟度。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你**自己拥有**的网关虚拟机和 SIEM 虚拟机上：\n\n1. 在 nftables 中创建 `blocklist` 集合和丢弃规则，然后用 `nft list ruleset` 确认。\n2. 保存脚本，创建用户 `autoblock`，并针对真实或示例告警以试运行模式运行它。\n3. 从你拥有的第二台虚拟机发起五次失败的 SSH 登录，等待规则 5712 触发，然后使用 `--apply` 运行脚本。\n4. 确认第二台虚拟机无法再连接，然后等待超时，或运行 `nft delete element` 撤销。\n5. 把你的管理地址加入一条测试告警，并证明它没有被封禁。\n6. 编写 systemd 定时器和服务，运行 `systemctl list-timers`，并测试紧急停止开关。\n7. 用简短的笔记记录你接下来会增加哪项防护措施。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "自动化 (Automation)",
+          "definition": "使用软件一致地执行重复任务，减少人工工作量。"
+        },
+        {
+          "term": "试运行 (Dry-run)",
+          "definition": "一种只报告将会发生什么而不做任何更改的模式。"
+        },
+        {
+          "term": "允许列表 (Allowlist)",
+          "definition": "自动化绝不能对其采取行动的地址或条目的列表。"
+        },
+        {
+          "term": "熔断器 (Circuit breaker)",
+          "definition": "在自动化行为异常（例如一次运行中操作过多）时将其停止的限制机制。"
+        },
+        {
+          "term": "nftables 集合 (nftables set)",
+          "definition": "防火墙规则可以匹配的命名地址集合，可为每个元素设置超时。"
+        },
+        {
+          "term": "审计日志 (Audit log)",
+          "definition": "记录每个自动化操作及其时间和原因的记录。"
+        },
+        {
+          "term": "systemd 定时器 (systemd timer)",
+          "definition": "按设定间隔启动服务的调度单元。"
+        },
+        {
+          "term": "紧急停止开关 (Kill switch)",
+          "definition": "一种快速、有文档说明的关闭自动化的方法。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "为什么自动化脚本应默认为试运行？",
+          "options": [
+            "运行更快",
+            "错误只会表现为输出，而不是对生产环境的更改",
+            "它会隐藏日志",
+            "它需要的权限更少"
+          ],
+          "answer": 1,
+          "explanation": "试运行让人在任何内容改变之前审查决策。"
+        },
+        {
+          "question": "自动封禁脚本应包含哪些防护措施？（选择所有适用项。）",
+          "options": [
+            "管理地址的允许列表",
+            "每个封禁都有过期时间",
+            "为简单起见使用永久封禁",
+            "每次运行的封禁数量上限"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "允许列表、过期和熔断器限制了错误决定造成的损害。永久封禁会把错误变成持久的故障。"
+        },
+        {
+          "question": "为什么要用 ipaddress 模块解析源地址，而不是直接使用日志文本？",
+          "options": [
+            "日志字段可能包含攻击者选择的文本",
+            "这是 nftables 的要求",
+            "它会加密地址",
+            "日志中从不包含地址"
+          ],
+          "answer": 0,
+          "explanation": "日志数据是不可信输入。验证以及使用列表形式的子进程调用可以防止命令注入。"
+        },
+        {
+          "question": "新脚本应从自动化阶梯的哪一级开始？",
+          "options": [
+            "立即自行执行",
+            "通知或建议，然后赢得信任",
+            "禁用日志",
+            "以 root 身份无限制运行"
+          ],
+          "answer": 1,
+          "explanation": "只有当日志表明决策正确时，才从通知逐步升级到自行执行。"
+        },
+        {
+          "question": "为 nftables 集合元素设置超时有什么作用？",
+          "options": [
+            "封禁会自行移除，因此不需要清理任务",
+            "它加快数据包速度",
+            "它加密流量",
+            "它永久禁止该地址"
+          ],
+          "answer": 0,
+          "explanation": "会过期的封禁限制了误报和陈旧条目带来的危害。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你选择了一项可以安全自动化的任务，在编写代码之前先写下防护措施，并构建了一个 Python 脚本：它验证告警、遵守允许列表、在熔断器处停止、记录每个操作，并把会过期的封禁加入 nftables 集合。你在试运行模式下进行了测试，用 systemd 定时器进行了调度，并演练了失败路径。好的自动化平淡无奇且可逆。请把这一模式带入 [攻击检测与修复实验](/learn/hands-on-security-labs/attack-detection-and-remediation-lab)。"
+    }
+  ]
+}

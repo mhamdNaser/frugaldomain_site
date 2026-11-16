@@ -1,0 +1,331 @@
+{
+  "title": "Wazuh 与 Suricata 集成实验",
+  "summary": "通过代理将 Suricata 告警送入 Wazuh，用 wazuh-logtest 验证解码，编写自定义规则，并将网络告警与主机证据关联起来。",
+  "objectives": [
+    "描述 eve.json 如何到达 Wazuh 管理器",
+    "在代理上配置 JSON localfile 条目",
+    "使用 wazuh-logtest 测试解码和规则",
+    "编写 ID 大于 100000 的自定义子规则",
+    "将网络告警与主机事件关联起来"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Suricata 能看到网络，Wazuh 能看到主机，但各自只能讲述故事的一半。Suricata 可以报告某台 Web 服务器收到了可疑请求；Wazuh 可以报告同一台服务器随后启动了意外进程或修改了文件。只有两者汇集到同一处，分析人员才能把这两个事件联系起来。\n\n在本实验中，你将把 Suricata 传感器连接到你自己拥有的 Wazuh 管理器。你会通过 Wazuh 代理发送 `eve.json`，确认内置的 Suricata 规则会触发，添加一条自定义规则，并关联网络与主机证据。本实验以 [IDS/IPS 部署实验](/learn/hands-on-security-labs/ids-ips-deployment-lab) 为基础（传感器及其测试规则在该实验中创建），同时也为 [集中式 SIEM 实验](/learn/hands-on-security-labs/centralized-siem-lab) 中更完整的流水线提供输入。"
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## 步骤 1：理解架构\n\nWazuh 由三部分组成。**代理 (agent)** 运行在被监控的机器上并转发日志；**管理器 (manager)** 对事件解码并应用规则；**索引器和仪表板 (indexer and dashboard)** 存储告警并让你可以搜索它们。Suricata 不直接与 Wazuh 通信，它把 JSON 行写入 `eve.json`，传感器上的 Wazuh 代理像读取其他日志一样读取该文件。\n\n| 组件 | 作用 | 运行位置 |\n|:--|:--|:--|\n| Suricata | 检查数据包，写入 `eve.json` | 传感器虚拟机 |\n| Wazuh 代理 | 读取文件，发送事件 | 传感器虚拟机 |\n| Wazuh 管理器 | 解码事件，匹配规则 | 管理器虚拟机 |\n| 索引器和仪表板 | 存储并显示告警 | 管理器虚拟机或单独部署 |\n\n安装在传感器上的代理也为传感器自身提供主机监控，例如文件完整性和登录失败。这一点很重要，因为传感器是高价值目标，同样应当受到监视。"
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从 eve.json 到 Wazuh 告警",
+      "caption": "每一跳都可能让流水线悄无声息地中断，因此你需要逐一测试。",
+      "data": {
+        "token": "事件",
+        "nodes": [
+          {
+            "id": "net",
+            "label": "网络流量",
+            "sub": "203.0.113.40",
+            "icon": "globe"
+          },
+          {
+            "id": "sur",
+            "label": "Suricata",
+            "sub": "传感器虚拟机",
+            "icon": "eye"
+          },
+          {
+            "id": "eve",
+            "label": "eve.json",
+            "sub": "/var/log/suricata",
+            "icon": "log"
+          },
+          {
+            "id": "ag",
+            "label": "Wazuh 代理",
+            "sub": "传感器虚拟机",
+            "icon": "cpu"
+          },
+          {
+            "id": "mgr",
+            "label": "Wazuh 管理器",
+            "sub": "解码器和规则",
+            "icon": "server"
+          },
+          {
+            "id": "dash",
+            "label": "仪表板",
+            "sub": "分析人员",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "net",
+            "caption": "携带实验标记的请求穿过被监控的网段。"
+          },
+          {
+            "at": "sur",
+            "caption": "Suricata 匹配规则 sid 1000001 并产生告警。",
+            "tone": "warning"
+          },
+          {
+            "at": "eve",
+            "caption": "告警作为一行 JSON 被追加到文件中。"
+          },
+          {
+            "at": "ag",
+            "caption": "代理通过其 localfile 条目发现新行，并将其加密转发给管理器。"
+          },
+          {
+            "at": "mgr",
+            "caption": "JSON 解码器提取字段，内置的 Suricata 规则匹配成功。"
+          },
+          {
+            "at": "mgr",
+            "caption": "由于该签名在你的关注列表上，你的自定义规则提高了告警级别。",
+            "tone": "warning"
+          },
+          {
+            "at": "dash",
+            "caption": "分析人员看到一条可搜索的告警，其中包含网络和主机上下文。",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "agent",
+      "type": "text",
+      "markdown": "## 步骤 2：让代理指向 eve.json\n\n在传感器上安装 Wazuh 代理，并将其注册到你的管理器。然后在代理的 `ossec.conf` 中添加一个 `localfile` 条目。关键细节是 `log_format`：`json` 告诉代理把每一行当作结构化数据来解析，而不是自由文本，这样每个字段都可以被搜索。\n\n大多数故障由两个权限问题引起。`wazuh` 用户必须能够读取 `/var/log/suricata/eve.json`，并且文件被轮转后代理不能毫无察觉。Suricata 默认的日志轮转可以处理这一点，但重启后务必进行验证。\n\n还要检查时钟。Suricata、代理和管理器必须通过 NTP 保持时间一致，否则来自三台机器的事件会乱序出现，你的关联分析就会产生误导。即使相差一分钟，也可能让一个主机事件看起来先于引发它的网络告警。"
+    },
+    {
+      "id": "conf",
+      "type": "code",
+      "language": "plain",
+      "filename": "/var/ossec/etc/ossec.conf",
+      "caption": "代理配置（节选）。添加到 ossec_config 元素内部。",
+      "highlight": [
+        1,
+        2,
+        3
+      ],
+      "code": "<localfile>\n  <log_format>json</log_format>\n  <location>/var/log/suricata/eve.json</location>\n</localfile>\n"
+    },
+    {
+      "id": "term1",
+      "type": "terminal",
+      "title": "传感器",
+      "prompt": "$",
+      "caption": "重启代理，确认它已打开该文件，并检查与管理器的连接。",
+      "lines": [
+        {
+          "cmd": "sudo systemctl restart wazuh-agent",
+          "output": "",
+          "comment": "应用新的 localfile 条目。"
+        },
+        {
+          "cmd": "sudo grep -E 'eve.json|Connected' /var/ossec/logs/ossec.log | tail -n 2",
+          "output": "2026/03/10 09:14:02 wazuh-logcollector: INFO: (1950): Analyzing file: '/var/log/suricata/eve.json'.\n2026/03/10 09:14:03 wazuh-agentd: INFO: (4102): Connected to the server ([192.0.2.20]:1514/tcp).",
+          "comment": "两行都必须出现。第一行证明文件正在被监控，第二行证明到管理器的通道正常。"
+        },
+        {
+          "prompt": "client$",
+          "cmd": "curl -s -o /dev/null -A 'lab-ids-test' http://10.10.20.10/",
+          "output": "",
+          "comment": "从你拥有的实验客户端发送无害的标记请求。"
+        }
+      ]
+    },
+    {
+      "id": "rules",
+      "type": "text",
+      "markdown": "## 步骤 3：验证解码并编写自定义规则\n\nWazuh 自带针对 Suricata 告警的规则，归入 `suricata` 规则组，因此无需任何自定义工作就应该出现告警。在管理器上用 `wazuh-logtest` 进行测试：它会让粘贴的日志行依次经过解码器和规则，并显示哪些规则被触发。这是调试规则最快的方法，因为你不需要真实流量。\n\n然后添加你自己的规则。自定义规则存放在 `/var/ossec/etc/rules/local_rules.xml` 中，ID 必须从 100000 起。子规则使用 `if_sid` 建立在父规则之上。这里的父规则是通用的 Suricata 告警规则，子规则只对你的实验签名触发，并提高级别使其更醒目。"
+    },
+    {
+      "id": "rule",
+      "type": "code",
+      "language": "plain",
+      "filename": "/var/ossec/etc/rules/local_rules.xml",
+      "caption": "针对实验签名的子规则。请在你所用版本的规则集中核对父规则 ID。",
+      "highlight": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "code": "<group name=\"local,suricata,\">\n  <rule id=\"100100\" level=\"10\">\n    <if_sid>86601</if_sid>\n    <field name=\"alert.signature_id\">^1000001$</field>\n    <description>LAB: Suricata marker signature matched on $(dest_ip)</description>\n    <mitre><id>T1071</id></mitre>\n  </rule>\n</group>\n"
+    },
+    {
+      "id": "term2",
+      "type": "terminal",
+      "title": "管理器",
+      "prompt": "$",
+      "caption": "先用 wazuh-logtest 测试，然后重新加载并从告警文件中读取告警。",
+      "lines": [
+        {
+          "cmd": "sudo /var/ossec/bin/wazuh-logtest -q",
+          "output": "Type one log per line\n> {\"event_type\":\"alert\",\"src_ip\":\"10.10.10.15\",\"dest_ip\":\"10.10.20.10\",\"alert\":{\"signature_id\":1000001,\"signature\":\"LAB User-Agent marker seen\"}}\n\n**Phase 2: Completed decoding.\n    name: 'json'\n**Phase 3: Completed filtering (rules).\n    id: '100100'\n    level: '10'\n    description: 'LAB: Suricata marker signature matched on 10.10.20.10'",
+          "comment": "第 2 阶段证明 JSON 解码器正常工作。第 3 阶段显示你的规则优先于父规则。"
+        },
+        {
+          "cmd": "sudo systemctl restart wazuh-manager && sudo jq -c 'select(.rule.id==\"100100\") | {t:.timestamp, agent:.agent.name, lvl:.rule.level, sig:.data.alert.signature}' /var/ossec/logs/alerts/alerts.json | tail -n 1",
+          "output": "{\"t\":\"2026-03-10T09:15:41.220+0000\",\"agent\":\"sensor01\",\"lvl\":10,\"sig\":\"LAB User-Agent marker seen\"}",
+          "comment": "实时告警已端到端到达，并带有代理名称。"
+        }
+      ]
+    },
+    {
+      "id": "correlate",
+      "type": "text",
+      "markdown": "## 步骤 4：关联网络与主机证据\n\n当一条告警引出下一个问题时，真正的价值才会显现。假设 Suricata 在 09:15 标记了一个发往你的 Web 服务器的请求。在 Wazuh 仪表板中，按该服务器的代理名称过滤随后十分钟的数据，并查找：\n\n- Web 服务账户新启动的进程；\n- Web 根目录中的文件完整性变化；\n- 失败或异常的身份验证事件；\n- 此前并不存在的出站连接。\n\n如果网络告警之后没有出现上述任何一项，那么很可能只是被拦截或无关的尝试。如果网络告警之后出现了文件变更，那就是一起安全事件。Wazuh 自己的规则组也有帮助：主动响应、文件完整性监控和安全配置评估 (Security Configuration Assessment) 模块都会把主机侧证据添加到同一个可搜索的索引中。\n\n用一张小表记录你的发现：时间、来源、签名、主机证据、结论。这个习惯能把原始告警变成站得住脚的分诊记录，[事件响应模拟实验](/learn/hands-on-security-labs/incident-response-simulation-lab) 中使用的正是同样的技能。"
+    },
+    {
+      "id": "levels",
+      "type": "text",
+      "markdown": "### 选择值得关注的内容\n\nSuricata 写入的不只是告警。`eve.json` 还包含 `dns`、`http`、`tls` 和 `flow` 事件。把它们全部发送能提供丰富的上下文，但会消耗存储，所以要有意识地取舍。告警体积小而价值高；流 (flow) 和 DNS 记录体积庞大，但当你从某台可疑主机回溯追查时却不可或缺。\n\n下表给出小型实验环境的一个实用起步策略，请根据你对噪声的容忍度调整级别。\n\n| 事件类型 | 是否发送 | 建议的 Wazuh 级别 | 原因 |\n|:--|:--|:--|:--|\n| `alert` | 始终发送 | 5 到 10 | 直接的检测输出 |\n| `dns` | 是，保留期短 | 3 | 显示主机尝试解析了什么 |\n| `tls` | 是 | 3 | SNI 和证书在加密后仍可见 |\n| `http` | 可选 | 3 | 有用，但在繁忙站点上体积很大 |\n| `flow` | 可选 | 0 到 3 | 最适合事后调查 |\n\n请记住，在生产环境中，12 级及以上通常会触发通知。把这些级别留给你愿意为之半夜叫醒别人的签名，其余的保持可搜索但安静。"
+    },
+    {
+      "id": "tuning",
+      "type": "text",
+      "markdown": "## 步骤 5：保持流水线健康\n\n第一条告警出现并不意味着集成已经完成。要为三个长期存在的问题做好准备。\n\n1. **数量。** 社区规则集每天可能产生数千条告警。决定哪些签名值得在仪表板上告警，哪些只需可搜索即可，并用规则级别加以区分。\n2. **重复。** 如果 Suricata 和主机代理都报告了同一活动，你会看到它出现两次。这对相互印证很有用，但需要一套命名约定，方便分析人员将它们归组。\n3. **沉默。** 损坏的流水线看起来与安静的网络毫无区别。要对事件的缺失发出告警，例如传感器代理十五分钟没有发送数据时。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "保护流水线本身",
+      "markdown": "`eve.json` 可能包含来自不受信任客户端的 URL、主机名和 User-Agent 字符串。要把它当作数据，绝不能当作命令。限制谁可以读取它，让代理到管理器的通道位于管理网络上，并且绝不要把管理器端口暴露到互联网。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "按顺序调试",
+      "markdown": "当没有告警出现时，依次测试每一跳：`eve.json` 中是否包含该事件，`ossec.log` 是否显示文件正在被分析，`wazuh-logtest` 是否匹配该行，`alerts.json` 是否包含结果？第一个失败的环节就是问题所在。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自动手试试",
+      "markdown": "在**你自己拥有的**虚拟机上：\n\n1. 在一台虚拟机上安装 Wazuh 管理器，在你的 Suricata 传感器上安装代理。\n2. 添加 `localfile` 条目，重启代理，并确认那两行日志。\n3. 发送标记请求，并在 `alerts.json` 和仪表板中找到该告警。\n4. 添加规则 100100，先用 `wazuh-logtest` 测试，然后重新加载管理器。\n5. 创建一条规则或仪表板过滤器，同时显示该 Web 服务器的 Suricata 告警和文件完整性事件。\n6. 停止代理二十分钟，并写下你将如何检测这种沉默。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "Wazuh 代理 (Wazuh agent)",
+          "definition": "运行在被监控主机上的软件，负责收集日志和事件并发送给管理器。"
+        },
+        {
+          "term": "Wazuh 管理器 (Wazuh manager)",
+          "definition": "对事件解码、应用规则并生成告警的服务器。"
+        },
+        {
+          "term": "localfile",
+          "definition": "代理配置中的一个条目，指定要读取的日志文件及其格式。"
+        },
+        {
+          "term": "解码器 (Decoder)",
+          "definition": "将原始日志行转换为命名字段的解析器。"
+        },
+        {
+          "term": "规则 ID (Rule id)",
+          "definition": "标识规则的数字；自定义规则使用 100000 及以上。"
+        },
+        {
+          "term": "wazuh-logtest",
+          "definition": "管理器上的工具，显示粘贴的日志行触发了哪些解码器和规则。"
+        },
+        {
+          "term": "文件完整性监控 (File integrity monitoring)",
+          "definition": "检测被监视文件和目录的变化。"
+        },
+        {
+          "term": "关联分析 (Correlation)",
+          "definition": "将来自不同来源的事件串联成一个完整的故事。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "Suricata 告警如何到达 Wazuh 管理器？",
+          "options": [
+            "代理读取 eve.json 并转发事件",
+            "Suricata 通过 SSH 登录管理器",
+            "管理器扫描传感器",
+            "通过电子邮件"
+          ],
+          "answer": 0,
+          "explanation": "Suricata 只是写入一个文件。传感器上的 Wazuh 代理通过 localfile 条目收集该文件。"
+        },
+        {
+          "question": "为什么要将 log_format 设置为 json？",
+          "options": [
+            "使每个字段都可被搜索",
+            "压缩文件",
+            "加密日志",
+            "禁用规则"
+          ],
+          "answer": 0,
+          "explanation": "JSON 格式让解码器能够提取结构化字段，例如签名 ID 和目的 IP。"
+        },
+        {
+          "question": "当没有告警出现时，哪些是合理的首批检查？（选择所有适用项。）",
+          "options": [
+            "检查 eve.json 是否包含该事件",
+            "检查 ossec.log 中文件是否正在被分析",
+            "用该日志行运行 wazuh-logtest",
+            "重新安装操作系统"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "按顺序测试每一跳。重新安装绝不是第一步。"
+        },
+        {
+          "question": "自定义 Wazuh 规则应使用哪个 ID 范围？",
+          "options": [
+            "1 到 999",
+            "100000 及以上",
+            "任意，因为它们会覆盖默认规则",
+            "恰好 86601"
+          ],
+          "answer": 1,
+          "explanation": "100000 以上的 ID 保留给本地规则，可避免与自带规则冲突。"
+        },
+        {
+          "question": "为什么要对传感器事件的缺失发出告警？",
+          "options": [
+            "损坏的流水线看起来像安静的网络",
+            "沉默总是意味着攻击",
+            "可以节省磁盘空间",
+            "代理要求这样做"
+          ],
+          "answer": 0,
+          "explanation": "没有心跳检查，你就无法区分是没有流量还是没有可见性。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你通过 JSON `localfile` 条目读取 `eve.json`，将 Suricata 传感器连接到了 Wazuh；用 `wazuh-logtest` 验证了解码，并在内置 Suricata 规则之上编写了自定义规则。你练习了把网络告警与主机证据关联起来，并为数量、重复和沉默问题做好了规划。接下来，请在 [网络流量分析实验](/learn/hands-on-security-labs/network-traffic-analysis-lab) 中查看这些告警背后的数据包。"
+    }
+  ]
+}

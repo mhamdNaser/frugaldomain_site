@@ -1,0 +1,311 @@
+{
+  "title": "勒索软件恢复模拟实验",
+  "summary": "在一次性虚拟机上练习勒索软件恢复：设定 RPO 和 RTO，无害地模拟其影响，隔离、检查备份、从首次更改之前的时间点恢复并验证。",
+  "objectives": [
+    "为实验系统定义 RPO 和 RTO",
+    "解释 3-2-1-1 备份模式和不可变性",
+    "隔离、保护备份并找到最早的安全恢复点",
+    "使用 restic 恢复并验证结果",
+    "衡量恢复时间并列出改进措施"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "勒索软件是组织演练最少、却最为恐惧的事件。文件变得无法读取，一张勒索信要求付款，业务随之停摆。恢复需要数小时还是数周，取决于攻击发生很久之前所做的决定：是否存在备份，备份是否与攻击者控制的网络分离，以及是否有人测试过恢复。\n\n本实验练习的是恢复，而不是攻击。你将在自己拥有的一次性虚拟机上模拟勒索软件的*效果*，仅仅是对虚拟文件做一次无害的重命名。然后你要依次完成检测、遏制、备份完整性检查、恢复和验证，并测量实际耗时。目的是在你真正需要备份之前，先弄清它们是否可用，这一关注点始于 [备份与灾难恢复实验](/learn/hands-on-security-labs/backup-and-disaster-recovery-lab)。"
+    },
+    {
+      "id": "goals",
+      "type": "text",
+      "markdown": "## 步骤 1：首先设定恢复目标\n\n有两个数字决定每一个恢复计划。**恢复点目标 (recovery point objective，RPO)** 是你能承受丢失多少数据，以时间衡量：如果备份每晚运行，你的 RPO 最长可达 24 小时。**恢复时间目标 (recovery time objective，RTO)** 是服务可以停机多长时间。演练之前为每个系统写下这两个数字，并与你实际测得的数据比较。\n\n| 系统 | RPO | RTO | 备份方式 |\n|:--|:--|:--|:--|\n| 实验文件共享 | 24 小时 | 4 小时 | 每晚加密快照 |\n| Web 应用 | 24 小时 | 2 小时 | 镜像加数据库转储 |\n| Wazuh 管理器 | 7 天 | 8 小时 | 每周配置备份 |\n\n最重要的设计规则是 **3-2-1-1** 模式：三份数据副本，存放在两种介质上，一份位于异地，另有一份处于离线状态或**不可变 (immutable)**。勒索软件操作者会有意搜索并删除备份。被已失陷账户能够修改的备份算不上保护，它只是另一个目标。"
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从被加密的文件到经过验证的服务",
+      "caption": "请注意，恢复发生在遏制和完整性检查之后，绝不在其之前。",
+      "data": {
+        "token": "服务",
+        "nodes": [
+          {
+            "id": "det",
+            "label": "检测",
+            "sub": "告警或用户报告",
+            "icon": "alert"
+          },
+          {
+            "id": "iso",
+            "label": "隔离",
+            "sub": "切断网络",
+            "icon": "firewall"
+          },
+          {
+            "id": "bk",
+            "label": "评估备份",
+            "sub": "完整性检查",
+            "icon": "database"
+          },
+          {
+            "id": "rb",
+            "label": "重建",
+            "sub": "干净主机",
+            "icon": "server"
+          },
+          {
+            "id": "rs",
+            "label": "恢复数据",
+            "sub": "最后一个良好快照",
+            "icon": "file"
+          },
+          {
+            "id": "ver",
+            "label": "验证",
+            "sub": "哈希和测试",
+            "icon": "shield"
+          },
+          {
+            "id": "mon",
+            "label": "监控",
+            "sub": "留意再次入侵",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "at": "det",
+            "caption": "用户报告文件无法读取并出现一张勒索信。SIEM 显示文件重命名激增。",
+            "tone": "warning"
+          },
+          {
+            "at": "iso",
+            "caption": "断开主机连接并封锁其共享。暂时不要关机。",
+            "tone": "danger"
+          },
+          {
+            "at": "bk",
+            "caption": "检查备份仓库是否完好，以及是否未被攻击者触碰。",
+            "tone": "warning"
+          },
+          {
+            "at": "rb",
+            "caption": "用已知良好的镜像构建一台干净的主机。不要恢复到旧系统上。"
+          },
+          {
+            "at": "rs",
+            "caption": "恢复首次出现入侵迹象之前的最后一个快照。"
+          },
+          {
+            "at": "ver",
+            "caption": "比对哈希，打开示例文件，并运行应用程序的测试。",
+            "tone": "success"
+          },
+          {
+            "at": "mon",
+            "caption": "重置所有凭据，然后密切关注同一攻击者是否卷土重来。",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "simulate",
+      "type": "text",
+      "markdown": "## 步骤 2：安全地模拟其影响\n\n使用支持快照、且仅存放虚拟数据的虚拟机。先做一次备份，这样才有东西可以恢复，并对虚拟机创建快照，以便可以回退整个演练。下面的模拟不会加密任何内容。它只是重命名虚拟文件并留下一张勒索信，这足以触发文件完整性监控，并产生一个真实的恢复任务。\n\n不要编写或运行真正加密文件的代码，也绝不要在真实数据或你不拥有的机器上测试。这里的学习重点在于响应，而不在于攻击机制。"
+    },
+    {
+      "id": "term1",
+      "type": "terminal",
+      "title": "labfile",
+      "prompt": "$",
+      "caption": "白队步骤：先做备份，然后仅在虚拟数据上模拟其影响。",
+      "lines": [
+        {
+          "cmd": "restic -r /mnt/backup/lab-repo backup /srv/labshare",
+          "output": "Files:         1200 new,     0 changed,     0 unmodified\nsnapshot 4f8e1a2c saved",
+          "comment": "先备份。仓库密码来自受保护的环境变量，绝不通过命令行传入。"
+        },
+        {
+          "cmd": "cd /srv/labshare && for f in docs/*.txt; do mv \"$f\" \"$f.locked\"; done && echo 'LAB EXERCISE: files renamed for recovery practice' > READ_ME_LAB.txt && ls docs | head -n 3",
+          "output": "report1.txt.locked\nreport2.txt.locked\nreport3.txt.locked",
+          "comment": "一次无害的重命名，模仿可见的影响。真正的勒索软件还会销毁原始文件并试图触及备份。"
+        }
+      ]
+    },
+    {
+      "id": "detect",
+      "type": "text",
+      "markdown": "## 步骤 3：检测、遏制并保护备份\n\n在真实攻击中，最先出现的线索往往是数量：几分钟内数千个文件被更改、出现新的扩展名，或者每个文件夹中都出现一张勒索信。文件完整性监控和终端日志可以对此告警。在你的 SIEM 中，查询每台主机每分钟的大量文件修改，是一种简单有效的检测方式，你可以用 [集中式 SIEM 实验](/learn/hands-on-security-labs/centralized-siem-lab) 中的工具构建它。\n\n然后按以下顺序行动：\n\n1. **将受影响的主机与网络隔离**，最好是禁用交换机端口或虚拟网卡。如果可以，请保持它们开机，因为内存中可能保留有用的证据。\n2. **保护备份。** 将备份仓库与网络断开，轮换其凭据，并确认没有快照被删除。\n3. **确定范围。** 哪些主机、哪些共享、哪些账户？找到第一个被更改的文件，因为它的时间标志着可以恢复的最早时间点。\n4. **重置凭据**：在你确信范围之后，重置受影响系统能够触及的凭据，包括服务账户和域账户。"
+    },
+    {
+      "id": "term2",
+      "type": "terminal",
+      "title": "recovery",
+      "prompt": "$",
+      "caption": "先检查仓库，然后恢复到干净的位置并验证。",
+      "lines": [
+        {
+          "cmd": "restic -r /mnt/backup/lab-repo check",
+          "output": "using temporary cache in /tmp/restic-check-cache-31842\ncreate exclusive lock for repository\nload indexes\ncheck all packs\ncheck snapshots, trees and blobs\nno errors were found",
+          "comment": "在信任仓库之前先运行完整性检查。"
+        },
+        {
+          "cmd": "restic -r /mnt/backup/lab-repo snapshots",
+          "output": "ID        Time                 Host     Paths\n4f8e1a2c  2026-03-10 02:00:03  labfile  /srv/labshare\n9d02b7e1  2026-03-09 02:00:02  labfile  /srv/labshare",
+          "comment": "选择在第一个被更改文件之前创建的最新快照。这里是 02:00，早于 10:21 的事件。"
+        },
+        {
+          "cmd": "time restic -r /mnt/backup/lab-repo restore 4f8e1a2c --target /srv/restore-test",
+          "output": "restoring <Snapshot 4f8e1a2c of [/srv/labshare]> to /srv/restore-test\nSummary: Restored 1210 files/dirs (38.2 MiB) in 0:04\n\nreal    0m5.412s",
+          "comment": "这是你测得的恢复时间。将它与你写下的 RTO 比较，然后加上重建和验证所需的时间。"
+        },
+        {
+          "cmd": "diff <(cd /srv/restore-test/srv/labshare && find . -type f | sort) <(cd /srv/labshare && find . -type f -not -name '*.locked' -not -name 'READ_ME_LAB.txt' | sort) | head -n 3",
+          "output": "",
+          "comment": "空的差异表示恢复后的目录树符合预期。务必通过打开文件进行抽查，而不仅仅是统计数量。"
+        }
+      ]
+    },
+    {
+      "id": "lessons",
+      "type": "text",
+      "markdown": "## 步骤 4：验证、加固并总结经验\n\n恢复文件并不是终点。要验证数据完整可用、应用程序能够启动，以及恢复后的主机是干净的。如果原系统已被入侵，请用可信镜像重建，而不是在其上覆盖恢复，否则可能重新引入攻击者的立足点。\n\n然后追问为什么会发生，以及如何缩短下一次恢复的时间：\n\n- 攻击者获得的凭据是否也能访问备份？把备份移到单独的身份或不可变存储中。\n- 是否有人知道谁有权批准隔离某个系统？把它写下来。\n- 恢复耗时是否超过了 RTO？把缓慢的步骤自动化。\n- 检测是否足够快？添加数量告警并测试它。\n\n请注意，支付赎金是法律、财务和执法层面的问题，而不是技术上的捷径。它并不保证能得到可用的解密工具，也不会消除攻击者的访问权限。请尽早让管理层、法律顾问和相关主管部门介入，并把工程精力集中在你能掌控的恢复能力上。"
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## 步骤 5：设计能抵御攻击者的备份\n\n把备份设计想象成攻击者会提出的一系列问题。我能从一台被入侵的工作站访问备份服务器吗？我能用窃取的管理员密码删除快照吗？备份代理是否持有对仓库有写权限的凭据？每一个“是”都是你可以消除的弱点。\n\n| 弱点 | 更强的设计 |\n|:--|:--|\n| 备份共享以读写方式挂载在生产主机上 | 基于拉取的备份：备份服务器主动连出，主机无法访问它 |\n| 同一管理员账户管理生产环境和备份 | 使用启用多因素认证的独立身份 |\n| 仓库位于同一网络和同一域 | 独立的网段，不建立域信任 |\n| 删除操作立即生效 | 在固定期限内使用保留锁或对象锁 |\n| 只备份数据 | 同时备份配置、密钥和重建运行手册 |\n\n最后一行常常被遗忘。把数据恢复到一台无法重建的服务器上毫无用处，所以要把基础设施定义，例如你的 Proxmox 模板和配置管理文件，与数据一起保存。至少每年练习一次依据它们进行重建，并保留一份打印版或离线版的恢复联系人和步骤，因为存放数字副本的系统本身可能就是瘫痪的那些系统。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "未经测试的备份只是希望，而不是控制措施",
+      "markdown": "许多组织在事件期间才发现备份不完整、使用了找不到密钥的加密，或者已经悄悄失败了好几个月。请按计划测试恢复，记录它们耗时多久以及你抽查了哪些文件，并把仓库密码和恢复文档存放在不依赖于被恢复系统的地方。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "练习完整的链条",
+      "markdown": "把本练习与 [事件响应模拟实验](/learn/hands-on-security-labs/incident-response-simulation-lab) 结合起来。先进行检测、证据处理和沟通，然后再恢复。真正的恢复同时需要这两套技能，而两者之间的交接正是大多数延误隐藏的地方。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自动手试试",
+      "markdown": "在**你自己拥有的**一次性虚拟机上，仅存放虚拟数据：\n\n1. 写下该虚拟机的 RPO 和 RTO，并为其创建快照。\n2. 在单独的磁盘上创建 restic 仓库，备份虚拟共享，并运行 `restic check`。\n3. 运行重命名模拟，并记下你察觉到的时间。\n4. 隔离虚拟机，检查仓库，选择正确的快照，并使用 `time` 恢复到新目录。\n5. 比较文件列表，并打开三个恢复出来的文件。\n6. 将你测得的总时间与你的 RTO 比较，并写下三项改进，其中一项与备份保护有关。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "RPO",
+          "definition": "恢复点目标：可接受的最大数据丢失量，以时间衡量。"
+        },
+        {
+          "term": "RTO",
+          "definition": "恢复时间目标：可接受的最长停机时间。"
+        },
+        {
+          "term": "3-2-1-1",
+          "definition": "三份副本、两种介质、一份异地、一份离线或不可变。"
+        },
+        {
+          "term": "不可变备份 (Immutable backup)",
+          "definition": "在设定期限内无法被更改或删除的备份。"
+        },
+        {
+          "term": "隔离 (Isolation)",
+          "definition": "将系统与网络断开以阻止扩散。"
+        },
+        {
+          "term": "恢复测试 (Restore test)",
+          "definition": "按计划进行的演练，用于证明备份可以被恢复。"
+        },
+        {
+          "term": "重建 (Rebuild)",
+          "definition": "用可信镜像创建一个干净的系统，而不是清理旧系统。"
+        },
+        {
+          "term": "完整性检查 (Integrity check)",
+          "definition": "检验备份数据是否完整且未损坏的测试。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "RPO 描述的是什么？",
+          "options": [
+            "可接受的数据丢失量，以时间衡量",
+            "恢复需要多长时间",
+            "备份副本的数量",
+            "仓库的大小"
+          ],
+          "answer": 0,
+          "explanation": "RPO 关乎数据丢失，RTO 关乎停机时间。"
+        },
+        {
+          "question": "为什么至少要有一份备份副本处于离线或不可变状态？",
+          "options": [
+            "攻击者会针对可访问的备份，以阻止恢复",
+            "它使备份更快",
+            "restic 要求如此",
+            "它降低存储成本"
+          ],
+          "answer": 0,
+          "explanation": "如果被入侵的账户能够删除备份，这些备份就无法抵御勒索软件。"
+        },
+        {
+          "question": "哪些是正确的恢复步骤？（选择所有适用项。）",
+          "options": [
+            "在恢复之前隔离受影响的主机",
+            "在信任仓库之前检查其完整性",
+            "从第一个被更改文件之前创建的快照恢复",
+            "立即覆盖恢复到已被入侵的系统上"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "先遏制，不信任任何未经检查的内容，并从入侵之前恢复。覆盖恢复到已被入侵的主机上，可能保留攻击者的立足点。"
+        },
+        {
+          "question": "找到最早安全恢复点的最佳方式是什么？",
+          "options": [
+            "找到第一个被更改的文件，并从其时间之前恢复",
+            "使用曾经创建的最旧快照",
+            "使用最大的快照",
+            "询问攻击者"
+          ],
+          "answer": 0,
+          "explanation": "第一次修改标志着影响的开始。在它之前的快照是候选项，但仍需检查是否存在更早的入侵。"
+        },
+        {
+          "question": "为什么要在演练中测量恢复时间？",
+          "options": [
+            "把实际情况与 RTO 比较并找出缓慢的步骤",
+            "仅仅为了给审计人员留下好印象",
+            "因为 restic 要求如此",
+            "计时没有价值"
+          ],
+          "answer": 0,
+          "explanation": "在实测恢复证明其可实现之前，RTO 只是一种愿望。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你设定了 RPO 和 RTO 目标，通过无害的重命名模拟了勒索软件的可见影响，并按正确的顺序练习了恢复：隔离、保护并验证备份、干净重建、从首次更改之前恢复，并验证结果。你将恢复情况与目标进行了对照，并列出了改进措施，尤其是不可变备份。这完成了本组中的动手实验。要把检测、响应和恢复整合在一起，请构建压轴项目 [端到端安全监控项目](/learn/hands-on-security-labs/end-to-end-security-monitoring-project)。"
+    }
+  ]
+}

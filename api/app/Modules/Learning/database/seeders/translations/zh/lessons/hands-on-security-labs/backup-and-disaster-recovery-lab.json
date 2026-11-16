@@ -1,0 +1,279 @@
+{
+  "title": "备份与灾难恢复实验",
+  "summary": "设定 RPO 和 RTO 目标，使用 restic 将 Web 服务器和 PostgreSQL 备份到仅追加的仓库，增加一份离线副本，并为完整重建计时。",
+  "objectives": [
+    "为每个系统定义 RPO 和 RTO 目标",
+    "构建带有仅追加仓库的 3-2-1 布局",
+    "使用 restic 备份文件和 PostgreSQL",
+    "在三个层面验证备份",
+    "在恢复演练中度量真实的恢复时间"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "从未恢复过的备份只是一种希望，而不是一种控制措施。勒索软件、一次错误的 `DROP TABLE`、磁盘故障或误敲的 `rm -rf`，最终都归结为同一个问题：我们丢失了多少数据，以及多久才能恢复工作？在灾难发生之前用数字回答这个问题，正是本实验的目的。\n\n你将使用 **restic** 把一台 Linux Web 服务器及其 PostgreSQL 数据库备份到单独的备份虚拟机，增加一份离线副本，有意销毁服务器，然后恢复它，并为整个过程计时。在此过程中，你将应用 [3-2-1 备份策略](/learn/security-architecture-resilience/the-3-2-1-backup-strategy) 中的理念，并为 [勒索软件恢复模拟实验](/learn/hands-on-security-labs/ransomware-recovery-simulation-lab) 做准备。这里的一切都在你自己拥有的虚拟机上运行。"
+    },
+    {
+      "id": "targets",
+      "type": "text",
+      "markdown": "## 步骤 1：先设定恢复目标\n\n在选择工具之前，先确定“已恢复”意味着什么。两个数字决定了每一个备份设计。\n\n- **恢复点目标 (RPO)**：你能承受丢失的最大数据量，以时间衡量。每晚备份意味着 RPO 最长可达 24 小时。\n- **恢复时间目标 (RTO)**：服务恢复之前你能容忍的最长中断时间。\n\n在本实验中，假设 Web 服务器和数据库的 RPO 为 4 小时，RTO 为 60 分钟。请把它们写下来，因为实验结束时会检验你是否达到了目标。\n\n| 系统 | 数据 | RPO | RTO | 方法 |\n|:--|:--|:--|:--|:--|\n| web-01 | `/etc`、`/var/www` | 24 h | 60 min | restic 文件备份 |\n| db-01 | PostgreSQL | 4 h | 60 min | `pg_dump` 加 restic |\n| siem-01 | 仅配置 | 24 h | 4 h | restic，使用安装程序重建 |\n\n并非所有系统都需要相同的目标。严格的目标成本更高，因此要把它们用在业务影响最大的地方。"
+    },
+    {
+      "id": "layout",
+      "type": "text",
+      "markdown": "## 步骤 2：设计 3-2-1 布局\n\n经典规则是数据保留**三份副本**，存放在**两种不同的介质**上，并且**一份副本位于异地或离线**。在家庭实验环境中，这可以自然地对应为：\n\n1. `web-01` 和 `db-01` 上的实时数据。\n2. 位于专用备份虚拟机 `bkp-01`（本实验中为 192.0.2.50）上、使用其自己磁盘的 restic 仓库。\n3. 一份离线副本，存放在仅在复制期间才连接的外置 USB 磁盘上，或存放在你自己拥有的云账户中启用了对象锁的存储桶里。\n\n备份虚拟机是最重要的设计决策。把它放在管理网络上，只允许来自服务器的 SSH，并给服务器一把可以**追加**但不能删除的密钥。如果勒索软件加密了 `web-01`，而相同的凭据可以清空仓库，那么你只有一份副本，而不是三份。网络方面请参见 [多 VLAN 网络安全实验](/learn/hands-on-security-labs/multi-vlan-network-security-lab)。"
+    },
+    {
+      "id": "append",
+      "type": "code",
+      "language": "bash",
+      "filename": "bkp-01: ~/.ssh/authorized_keys",
+      "caption": "限制备份密钥，使其只能以仅追加模式运行 restic（所示密钥为占位符）。",
+      "code": "command=\"restic serve --stdio --append-only /srv/restic-repo\",restrict,no-port-forwarding ssh-ed25519 AAAA...PLACEHOLDER backup@web-01\n",
+      "highlight": [
+        1
+      ]
+    },
+    {
+      "id": "cycle-anim",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "备份与恢复循环",
+      "caption": "备份体系是一个循环。每个阶段都可能悄然失败，因此每个阶段都需要检查。",
+      "data": {
+        "center": "备份体系",
+        "items": [
+          {
+            "label": "定义 RPO 和 RTO",
+            "sub": "由业务决定目标"
+          },
+          {
+            "label": "备份",
+            "sub": "加密、定时、仅追加"
+          },
+          {
+            "label": "验证",
+            "sub": "完整性检查和抽样恢复"
+          },
+          {
+            "label": "离线复制",
+            "sub": "网络之外的第三份副本"
+          },
+          {
+            "label": "恢复演练",
+            "sub": "度量真实的 RTO"
+          },
+          {
+            "label": "改进",
+            "sub": "修复缺口，更新运行手册"
+          }
+        ]
+      }
+    },
+    {
+      "id": "backup",
+      "type": "text",
+      "markdown": "## 步骤 3：备份文件和数据库\n\n在每台服务器上安装 restic，创建仅 root 可读的仓库密码文件，并初始化仓库。restic 在数据离开主机之前就在客户端对所有内容加密，因此仓库服务器永远看不到明文数据。\n\n对于 PostgreSQL，不要复制正在运行的数据目录。请以自定义格式创建逻辑转储，这种格式经过压缩，并且可以逐表恢复，然后把转储文件包含在 restic 的运行中。把仓库密码保存在它所保护的服务器之外的地方，例如密码管理器和一份密封的打印副本。没有它，任何人（包括你）都无法读取这些备份。"
+    },
+    {
+      "id": "term-backup",
+      "type": "terminal",
+      "title": "db-01",
+      "prompt": "$",
+      "caption": "初始化仓库、转储数据库并备份。密码从仅 root 可读的文件中读取。",
+      "lines": [
+        {
+          "cmd": "export RESTIC_REPOSITORY=sftp:backup@192.0.2.50:/srv/restic-repo RESTIC_PASSWORD_FILE=/root/.restic-pass",
+          "output": "",
+          "comment": "仓库位置和密码文件；命令行上不出现任何机密。"
+        },
+        {
+          "cmd": "sudo -E restic init",
+          "output": "created restic repository 5f3a1c2e9b at sftp:backup@192.0.2.50:/srv/restic-repo\n\nPlease note that knowledge of your password is required to access the repository.",
+          "comment": "仓库是加密的。丢失密码，数据就永远丢失了。"
+        },
+        {
+          "cmd": "sudo -u postgres pg_dump -Fc appdb > /var/backups/appdb.dump",
+          "output": "",
+          "comment": "应用程序数据库的自定义格式逻辑转储。"
+        },
+        {
+          "cmd": "sudo -E restic backup /etc /var/www /var/backups/appdb.dump --tag nightly",
+          "output": "Files:          412 new,     0 changed,     0 unmodified\nDirs:            58 new\nAdded to the repository: 38.214 MiB (11.902 MiB stored)\nsnapshot 8c1d4e7a saved",
+          "comment": "去重和压缩：38 MiB 的数据只占用 12 MiB 的存储空间。"
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "type": "text",
+      "markdown": "## 步骤 4：验证，然后恢复\n\n备份成功的消息只能证明程序运行完毕。验证有三个层面。\n\n- **仓库完整性**：`restic check` 确认结构一致。每周添加 `--read-data-subset=10%` 以读取一部分实际数据作为样本。\n- **抽样恢复**：将少量文件和数据库转储恢复到临时目录，并比较校验和。\n- **完整重建**：在全新的虚拟机上恢复整个系统。这是唯一能度量 RTO 的测试。\n\n对于重建，请在虚拟机管理程序中删除 `web-01`，从基础模板创建新的虚拟机，安装 restic，然后恢复。开始时启动秒表，网页再次加载时停止。先用 `pg_restore` 把数据库恢复到一个新数据库中，并在让应用程序指向它之前检查行数。"
+    },
+    {
+      "id": "term-restore",
+      "type": "terminal",
+      "title": "web-01 (rebuilt)",
+      "prompt": "$",
+      "caption": "检查完整性、列出快照、恢复 Web 根目录和转储文件。",
+      "lines": [
+        {
+          "cmd": "sudo -E restic check --read-data-subset=10%",
+          "output": "using temporary cache in /tmp/restic-check-cache-4417\nload indexes\ncheck all packs\ncheck snapshots, trees and blobs\nread 10.0% of data packs\nno errors were found",
+          "comment": "仓库结构和抽样的数据完好无损。"
+        },
+        {
+          "cmd": "sudo -E restic snapshots --tag nightly",
+          "output": "ID        Time                 Host    Tags     Paths\n8c1d4e7a  2026-11-12 02:00:04  db-01   nightly  /etc, /var/www, /var/backups/appdb.dump\n1fa9b320  2026-11-13 02:00:03  db-01   nightly  /etc, /var/www, /var/backups/appdb.dump\n2 snapshots",
+          "comment": "选择早于事件发生时间的最新快照，不一定是最后一个快照。"
+        },
+        {
+          "cmd": "sudo -E restic restore 8c1d4e7a --target /restore --include /var/www",
+          "output": "restoring <Snapshot 8c1d4e7a of [/etc /var/www /var/backups/appdb.dump] at 2026-11-12 02:00:04 by root@db-01> to /restore\nSummary: Restored 311 files/dirs (31.4 MiB) in 0:02",
+          "comment": "先恢复到临时路径，然后在覆盖任何内容之前进行比较。"
+        },
+        {
+          "cmd": "sudo -E restic restore 8c1d4e7a --target /restore --include /var/backups/appdb.dump && sudo -u postgres pg_restore -d appdb_restored --no-owner /restore/var/backups/appdb.dump && sudo -u postgres psql -d appdb_restored -c 'SELECT count(*) FROM orders;'",
+          "output": "restoring <Snapshot 8c1d4e7a ...> to /restore\n count\n-------\n 18422\n(1 row)",
+          "comment": "行数与灾难发生前记录的数字一致（空数据库 appdb_restored 是预先创建的）。"
+        }
+      ]
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "备份也可能被销毁",
+      "markdown": "现代勒索软件在加密之前会寻找备份代理、已挂载的共享和存储的凭据。让备份服务器脱离域，使用无法删除的凭据，优先为其打补丁，并保留一份断开连接的副本。测试被入侵的 `web-01` 确实无法从 `bkp-01` 删除快照。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "趁冷静时编写运行手册",
+      "markdown": "在真实的故障期间，没有人能清晰地思考。保留一页运行手册，包括恢复顺序、仓库密码的存放位置、你测试过的命令，以及该联系谁。每次演练后都要更新它，并保存一份打印的或离线的副本，因为维基也可能宕机。"
+    },
+    {
+      "id": "measure",
+      "type": "text",
+      "markdown": "## 步骤 5：度量，然后与你的目标比较\n\n重建之后，填写真实的数字。典型的首次结果令人汗颜：数据恢复只花了两分钟，但找密码、构建虚拟机和重新安装软件包花了五十分钟。\n\n| 步骤 | 计划 | 实测 |\n|:--|:--|:--|\n| 从模板创建虚拟机 | 5 min | 8 min |\n| 安装 restic 并恢复文件 | 10 min | 22 min |\n| 恢复数据库并验证行数 | 10 min | 14 min |\n| 应用程序测试 | 5 min | 6 min |\n| **总 RTO** | 30 min | 50 min |\n\n将总时间与 60 分钟的目标比较。如果接近上限，请使用已包含 restic 的虚拟机模板，把缓慢的步骤自动化。同时检查 RPO：最新的快照应不到四小时。使用 systemd 定时器调度备份，并在运行失败或最新快照过旧时告警，就像 [集中式 SIEM 实验](/learn/hands-on-security-labs/centralized-siem-lab) 中那样。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在**你自己拥有**的虚拟机上（一台 Web 虚拟机、一台数据库虚拟机和一台备份虚拟机）：\n\n1. 在表格中写出每个系统的 RPO 和 RTO。\n2. 安装 restic，在备份虚拟机上初始化仓库，并对 `/etc`、`/var/www` 和一个 `pg_dump` 文件进行首次备份。\n3. 将备份密钥限制为仅追加模式，并确认从 Web 虚拟机尝试删除会失败。\n4. 运行 `restic check`，然后恢复一个文件，并将其 `sha256sum` 与原文件比较。\n5. 将仓库复制到 USB 磁盘或启用对象锁的存储桶，然后断开连接。\n6. 删除 Web 虚拟机，从模板重建，恢复，并将秒表时间与你的 RTO 对照记录。\n7. 编写一页运行手册，包括密码的保管位置。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "RPO",
+          "definition": "恢复点目标 (Recovery point objective)：可接受的最大数据丢失量，以时间衡量。"
+        },
+        {
+          "term": "RTO",
+          "definition": "恢复时间目标 (Recovery time objective)：恢复服务可接受的最长时间。"
+        },
+        {
+          "term": "3-2-1 规则 (3-2-1 rule)",
+          "definition": "三份副本、两种介质类型、一份副本位于异地或离线。"
+        },
+        {
+          "term": "仅追加 (Append-only)",
+          "definition": "一种仓库模式，接受新的备份，但拒绝删除或修改。"
+        },
+        {
+          "term": "快照 (Snapshot)",
+          "definition": "已备份数据在某一时间点的记录，可以据此恢复。"
+        },
+        {
+          "term": "不可变备份 (Immutable backup)",
+          "definition": "在设定期限内，即使管理员也无法更改或删除的副本。"
+        },
+        {
+          "term": "恢复演练 (Restore drill)",
+          "definition": "一次有计划的测试，从备份重建系统并度量真实的恢复时间。"
+        },
+        {
+          "term": "运行手册 (Runbook)",
+          "definition": "一份简短且经过测试的流程，告诉响应人员做什么以及按什么顺序做。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "某团队每晚备份。最坏情况下的 RPO 是多少？",
+          "options": [
+            "大约 24 小时的数据",
+            "零",
+            "一小时",
+            "取决于 RTO"
+          ],
+          "answer": 0,
+          "explanation": "如果故障恰好发生在下一次运行之前，自上次夜间备份以来的所有数据都会丢失。"
+        },
+        {
+          "question": "哪些措施可以保护备份免受勒索软件侵害？（选择所有适用项。）",
+          "options": [
+            "仅追加的凭据",
+            "离线或启用对象锁的副本",
+            "在每台服务器上将仓库挂载为可写共享",
+            "让备份服务器脱离域"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "无法删除的凭据、断开连接的副本以及与域的分离，都限制了攻击者能够销毁的内容。在每台服务器上提供可写共享等于把备份交给了攻击者。"
+        },
+        {
+          "question": "哪项测试是唯一能度量你真实 RTO 的测试？",
+          "options": [
+            "restic check",
+            "阅读备份日志",
+            "使用秒表从备份进行完整重建",
+            "统计快照数量"
+          ],
+          "answer": 2,
+          "explanation": "完整性检查证明数据可读，但只有计时的重建才包含资源准备、查找凭据和应用程序测试。"
+        },
+        {
+          "question": "为什么使用 pg_dump 而不是复制正在运行的 PostgreSQL 数据目录？",
+          "options": [
+            "它在数据库运行时提供一致且可恢复的副本",
+            "它总是更快",
+            "它消除了对密码的需求",
+            "它会加密数据"
+          ],
+          "answer": 0,
+          "explanation": "对运行中数据库的文件复制可能不一致。逻辑转储是一致的快照，可以逐表恢复。"
+        },
+        {
+          "question": "仓库密码应存放在哪里？",
+          "options": [
+            "仅存放在被备份的服务器上",
+            "与受保护的服务器分开存放，例如密码管理器加一份密封副本",
+            "存放在公开的维基中",
+            "存放在备份文件名中"
+          ],
+          "answer": 1,
+          "explanation": "如果密码只存在于已故障的服务器上，那么在需要时就无法解密备份。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你先设定了 RPO 和 RTO，构建了带有仅追加仓库的 3-2-1 布局，用 restic 备份了文件和数据库，在三个层面进行了验证，并从零重建了一台服务器且为之计时。实测的 RTO 是对“我们会停机多久？”的诚实回答，演练也显示了哪些步骤需要自动化。让备份远离它们所保护的系统，保留一份断开连接的副本，并按计划重复演练。接下来，请把同样的纪律应用到 [勒索软件恢复模拟实验](/learn/hands-on-security-labs/ransomware-recovery-simulation-lab)。"
+    }
+  ]
+}

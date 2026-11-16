@@ -1,0 +1,298 @@
+{
+  "title": "网络流量分析实验",
+  "summary": "捕获你自己拥有的流量，用 tshark 和 Zeek 进行汇总，并采用先建立基线的方法发现异常的会话、域名和规律的时间间隔。",
+  "objectives": [
+    "在你自己拥有的网络上用 tcpdump 安全地捕获流量",
+    "用 tshark 汇总会话、DNS 和 TLS",
+    "使用 Zeek 日志发现周期性连接",
+    "应用先建立基线的分析方法",
+    "用证据和结论记录发现"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "告警告诉你某些东西看起来不对劲，而数据包告诉你究竟发生了什么。当 Suricata 或 Wazuh 的告警含糊不清，或者根本没有告警触发时，网络分析人员就会回到流量本身。这项技能也是向雇主证明你懂网络如何运作的最可靠方式之一，因为阅读数据包捕获是无法伪装的。\n\n在本实验中，你将在自己拥有的网段上捕获流量，用 `tshark` 和 Zeek 进行汇总，并学习一种可重复的方法：先建立基线，再寻找异常。你将找出谁与谁通信、解析了哪些域名、TLS 在不解密的情况下会暴露什么，以及规律的时间间隔如何指向自动化的回连。许多此类调查的起点告警来自 [IDS/IPS 部署实验](/learn/hands-on-security-labs/ids-ips-deployment-lab)。"
+    },
+    {
+      "id": "capture",
+      "type": "text",
+      "markdown": "## 步骤 1：捕获你被允许捕获的流量\n\n只在你拥有或已获得书面许可进行监控的网络上捕获。在家庭实验环境中，这意味着镜像端口、启用混杂模式的虚拟交换机，或前面实验中的传感器。捕获他人的流量可能违反法律和隐私规定。\n\n在服务器上使用 `tcpdump` 进行简单、低开销的捕获，并写入文件，而不是盯着屏幕读取。有两个习惯很重要：\n\n- 使用**捕获过滤器 (capture filter)** 在源头减少数据量。它在内核中运行，开销很小。\n- 当你只需要元数据时，使用**截断长度 (snap length)**，保留报头而不保留完整载荷。这能降低存储量和隐私暴露。\n\n保持捕获时间短，并进行轮转。繁忙的网段几小时就能填满磁盘，而且 pcap 可能包含密码和个人数据，所以要以受限权限存放，并在练习结束时将其删除。"
+    },
+    {
+      "id": "term1",
+      "type": "terminal",
+      "title": "传感器",
+      "prompt": "$",
+      "caption": "捕获十分钟的实验流量，然后确认该文件。",
+      "lines": [
+        {
+          "cmd": "sudo tcpdump -i eth1 -s 128 -G 600 -W 1 -w /srv/pcap/lab-%H%M.pcap 'not port 22'",
+          "output": "tcpdump: listening on eth1, link-type EN10MB (Ethernet), snapshot length 128 bytes\nMaximum file limit reached: 1",
+          "comment": "每个数据包只捕获 128 字节，600 秒后停止，并排除你正在使用的 SSH 会话。"
+        },
+        {
+          "cmd": "capinfos -c -u /srv/pcap/lab-0915.pcap",
+          "output": "File name:           /srv/pcap/lab-0915.pcap\nNumber of packets:   48211\nCapture duration:    600 seconds",
+          "comment": "在分析之前确认数据包数量和持续时间。"
+        }
+      ]
+    },
+    {
+      "id": "method",
+      "type": "text",
+      "markdown": "## 步骤 2：遵循方法，而非凭直觉\n\n打开捕获文件然后滚动浏览，是学到东西最慢的方式。每次都按相同的问题，从宽到窄逐步推进。\n\n1. **谁在通信？** 按流量和数量列出会话。Web 服务器应当与客户端通信，也许还有数据库。一台打印机与十几个国家通信就是一个发现项。\n2. **请求了哪些名称？** DNS 在连接发生之前就显示了意图。\n3. **什么被加密了，发给了谁？** TLS 隐藏内容，但会暴露服务器名称、证书和时间。\n4. **有什么过于规律吗？** 人是不规律的。每 60 秒联络一次的软件则不然。\n5. **端点怎么说？** 在做出判断之前，用主机日志加以确认。\n\n首先确定你的基线。捕获一小时安静且已知良好的流量，对其汇总并保存。只有相对于你网络中正常情况的样子，异常才有意义。\n\n在过滤之前先写下你的假设。这听起来像是走形式，但它能防止分析人员最常见的错误：因为你去找了某种模式，所以就看到了它。如果过滤结果否定了你的想法，那同样是一个结果。请记录下来，因为被排除的解释能让下一个人免于追查同一条线索，而一份简短的已排除原因清单，往往能让最终结论对评审者更有说服力。"
+    },
+    {
+      "id": "cycle",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "流量分析循环",
+      "caption": "每一轮都会缩小问题范围，直到你能提出一个发现或将其排除。",
+      "data": {
+        "center": "分析",
+        "items": [
+          {
+            "label": "基线",
+            "sub": "捕获已知良好的流量"
+          },
+          {
+            "label": "汇总",
+            "sub": "会话、协议、主要通信方"
+          },
+          {
+            "label": "提出假设",
+            "sub": "说明什么可以解释这一异常"
+          },
+          {
+            "label": "过滤",
+            "sub": "分离出用于检验它的数据包"
+          },
+          {
+            "label": "转向",
+            "sub": "检查主机日志和其他传感器"
+          },
+          {
+            "label": "记录",
+            "sub": "记录证据和结论"
+          }
+        ],
+        "steps": [
+          {
+            "item": 0,
+            "caption": "捕获一段安静时期已知良好的流量，并将其作为参照保存。"
+          },
+          {
+            "item": 1,
+            "caption": "汇总会话、DNS 名称和 TLS 服务器，并与参照对比。"
+          },
+          {
+            "item": 2,
+            "caption": "写出一个可检验的解释，例如：这台主机按定时器联络。"
+          },
+          {
+            "item": 3,
+            "caption": "应用一个能够证实或证伪它的显示过滤器。"
+          },
+          {
+            "item": 4,
+            "caption": "询问端点：是哪个进程打开了该连接？在 SIEM 中查看同一时间的情况。"
+          },
+          {
+            "item": 5,
+            "caption": "写下发现、证据，以及下一步调优应是规则、封锁还是无需操作。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tshark",
+      "type": "text",
+      "markdown": "## 步骤 3：用 tshark 汇总\n\n`tshark` 是 Wireshark 的命令行版本。它非常适合做汇总，因为它输出的文本可以排序和比较。使用 `-Y` 指定**显示过滤器 (display filter)**，使用 `-z` 获取统计信息。请注意其区别：捕获过滤器使用 BPF 语法，在记录时生效；而显示过滤器使用 Wireshark 自己的语法，在读取时生效。\n\n先看会话表，再看 DNS 查询，然后看 TLS 服务器名称。每一项都回答步骤 2 中的一个问题，而且只需一条命令。"
+    },
+    {
+      "id": "term2",
+      "type": "terminal",
+      "title": "分析人员",
+      "prompt": "$",
+      "caption": "三项汇总，分别回答谁在通信、哪些名称以及哪些 TLS 服务器。",
+      "lines": [
+        {
+          "cmd": "tshark -r lab-0915.pcap -q -z conv,ip | head -n 7",
+          "output": "IPv4 Conversations\n                   |  <-  | |  ->  | |  Total  |\n10.10.10.25  <-> 198.51.100.77   410 bytes   9 kB   ...\n10.10.10.15  <-> 10.10.20.10     2 MB  180 kB   ...",
+          "comment": "按流量排序。要问每一对通信是否符合这些主机的角色。"
+        },
+        {
+          "cmd": "tshark -r lab-0915.pcap -Y 'dns.flags.response==0' -T fields -e ip.src -e dns.qry.name | sort | uniq -c | sort -rn | head -n 4",
+          "output": "  58 10.10.10.25   updates.example.net\n  12 10.10.10.15   www.example.com\n   3 10.10.10.31   pool.ntp.example.org",
+          "comment": "一台主机在十分钟内请求了同一个名称 58 次，值得仔细查看。"
+        },
+        {
+          "cmd": "tshark -r lab-0915.pcap -Y 'tls.handshake.type==1' -T fields -e ip.src -e tls.handshake.extensions_server_name | sort | uniq -c",
+          "output": "  57 10.10.10.25   updates.example.net\n   9 10.10.10.15   www.example.com",
+          "comment": "即使内容已加密，服务器名称在 TLS ClientHello 中仍然可见。"
+        }
+      ]
+    },
+    {
+      "id": "timing",
+      "type": "text",
+      "markdown": "## 步骤 4：用 Zeek 发现规律的时间间隔\n\nZeek 把捕获文件转换为结构化日志，例如 `conn.log`、`dns.log` 和 `ssl.log`。这些日志很紧凑，适合长期保留。一个强大的用法是检查**周期性连接 (periodic connections)**。按定时器轮询服务器的软件，会产生几乎相等的连接间隔，而人浏览网页永远不会这样。\n\n仅有规律性并不意味着恶意。更新检查程序、监控代理和 NTP 都有这种行为。问题在于你能否说出该进程及其原因。如果不能，就将其标记为无法解释，并调查该端点。这种方法是高级网络流量分析中信标分析的基础，届时你将接触到抖动和统计评分。"
+    },
+    {
+      "id": "term3",
+      "type": "terminal",
+      "title": "分析人员",
+      "prompt": "$",
+      "caption": "计算从一台主机到一个目的地的连接之间的间隔。",
+      "lines": [
+        {
+          "cmd": "zeek-cut ts id.orig_h id.resp_h id.resp_p < conn.log | awk '$2==\"10.10.10.25\" && $3==\"198.51.100.77\" {print $1}' | awk 'NR>1 {printf \"%.0f\\n\", $1-p} {p=$1}' | sort -n | uniq -c",
+          "output": "      1 59\n     47 60\n      1 61",
+          "comment": "四十七个间隔恰好都是 60 秒。人不会这样浏览，所以去查找 10.10.10.25 上的进程。"
+        }
+      ]
+    },
+    {
+      "id": "health",
+      "type": "text",
+      "markdown": "## 步骤 5：解读连接的健康状况\n\n数据包分析不仅仅用于安全。同样的捕获可以解释应用变慢和神秘的故障，许多学习者正是在这里第一次建立起信心。观察 TCP 行为来判断连接是否健康。\n\n| 捕获中的症状 | 可能的含义 | 接下来检查什么 |\n|:--|:--|:--|\n| 大量 SYN 数据包而没有 SYN-ACK | 端口关闭、被过滤或主机宕机 | 防火墙规则和正在监听的服务 |\n| 频繁重传 | 丢包或拥塞 | 链路、双工设置、镜像端口 |\n| 握手后立即出现 RST | 服务拒绝或设备重置了连接 | 应用日志和任何串联的 IPS |\n| 零窗口通告 | 接收方太慢 | 主机负载和缓冲区设置 |\n\n在 Wireshark 中，过滤器 `tcp.analysis.retransmission` 和 `tcp.analysis.zero_window` 可以快速找到这些情况。在传感器上进行的捕获显示的是传感器所看到的，它可能与端点所看到的不同，所以要记住你的观察位置在哪里。这与你在 [防火墙规则测试实验](/learn/hands-on-security-labs/firewall-rule-testing-lab) 中测试规则时所用的推理相同。"
+    },
+    {
+      "id": "detect",
+      "type": "text",
+      "markdown": "## 步骤 6：把发现转化为检测\n\n只有当调查改进了你的防御时，它才算完成。在识别出某种模式之后，决定以下哪一项适合：\n\n- **规则或告警**，例如 Suricata 签名，或针对同一目的地和间隔的 SIEM 查询。\n- **封锁**，如果该目的地显然不被需要，并且你控制出站防火墙。\n- **基线更新**，如果你证明该行为是合法的。请将其记录下来，免得下一位分析人员重复你的工作。\n- **可见性修复**，如果你因缺少日志或传感器而无法回答该问题。\n\n最后一项往往最有价值。许多真实的调查都以这样一句话结束：“我们无法判断，因为没有记录”，而补上这条记录就是实实在在的进步。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "数据包是证据，要按证据对待",
+      "markdown": "捕获文件可能包含凭据、会话 Cookie 和个人数据。限制访问，记录它的来源和时间，并且绝不要公开分享原始 pcap。如果需要发布示例，请先对地址做匿名化并去除载荷。还要记住，加密意味着你常常会触及数据包所能说明的极限，所以要用端点日志来确认，而不是靠猜测。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "你每天都会用到的过滤器",
+      "markdown": "熟练掌握五个显示过滤器：`ip.addr == 10.10.10.25`、`tcp.flags.syn==1 && tcp.flags.ack==0`、`dns`、`http.request` 和 `tls.handshake.type==1`。有了它们，你就能回答大多数初步问题。在 Wireshark 图形界面中，使用“统计”(Statistics)，然后选择“会话”(Conversations) 和“协议分级”(Protocol Hierarchy)，在阅读任何一个数据包之前先看清捕获的整体形态。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自动手试试",
+      "markdown": "在**你自己拥有的**网络上：\n\n1. 用 `tcpdump` 捕获十分钟的正常流量，截断长度设为 128，并将其保存为你的基线。\n2. 用 `tshark` 生成会话、DNS 和 TLS 汇总，并记下前三名通信方。\n3. 用 `zeek -r lab.pcap` 对捕获文件运行 Zeek，并打开 `conn.log` 和 `dns.log`。\n4. 找出以几乎相等的间隔连接同一目的地的任何主机。使用该主机自带的工具说出其背后的进程。\n5. 写一份三行的发现：你看到了什么、证据以及你的结论。\n6. 完成后删除或加密该 pcap。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "pcap",
+          "definition": "存储已捕获数据包的文件格式。"
+        },
+        {
+          "term": "捕获过滤器 (Capture filter)",
+          "definition": "在捕获时限制记录内容的 BPF 表达式。"
+        },
+        {
+          "term": "显示过滤器 (Display filter)",
+          "definition": "在读取捕获文件时选择数据包的 Wireshark 表达式。"
+        },
+        {
+          "term": "截断长度 (Snap length)",
+          "definition": "从每个数据包中保留的字节数。"
+        },
+        {
+          "term": "基线 (Baseline)",
+          "definition": "用于比较的正常行为记录。"
+        },
+        {
+          "term": "Zeek",
+          "definition": "一个把流量转换为结构化日志的网络分析框架。"
+        },
+        {
+          "term": "SNI",
+          "definition": "在 TLS ClientHello 中以明文发送的服务器名称。"
+        },
+        {
+          "term": "信标通信 (Beaconing)",
+          "definition": "软件按定时器规律性地连接服务器。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "捕获过滤器和显示过滤器有什么区别？",
+          "options": [
+            "捕获过滤器限制记录的内容；显示过滤器选择显示的内容",
+            "它们完全相同",
+            "显示过滤器在内核中运行",
+            "捕获过滤器只对 UDP 有效"
+          ],
+          "answer": 0,
+          "explanation": "捕获过滤器使用 BPF，在保存之前丢弃数据包。显示过滤器只是在视图中隐藏数据包。"
+        },
+        {
+          "question": "在不解密的情况下，你仍能从 TLS 流量中了解到什么？",
+          "options": [
+            "服务器名称、证书详情和时间",
+            "完整的页面内容",
+            "用户的密码",
+            "什么都看不到"
+          ],
+          "answer": 0,
+          "explanation": "SNI、证书字段、大小和时间等元数据仍然可见，而载荷是加密的。"
+        },
+        {
+          "question": "处理 pcap 时哪些是良好做法？（选择所有适用项。）",
+          "options": [
+            "只在你拥有或获授权监控的网络上捕获",
+            "限制文件权限",
+            "将原始文件发布到公开论坛求助",
+            "完成后将其删除或加密"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "pcap 可能包含凭据和个人数据，因此必须受到管控，绝不能原样发布。"
+        },
+        {
+          "question": "为什么规律的 60 秒连接模式值得注意？",
+          "options": [
+            "人浏览网页是不规律的，因此这表明是按定时器运行的软件",
+            "它总是证明存在恶意软件",
+            "它意味着网络出了故障",
+            "它只发生在 DNS 上"
+          ],
+          "answer": 0,
+          "explanation": "规律性是线索，而不是结论。许多合法工具也会轮询，所以在判断之前要先识别进程。"
+        },
+        {
+          "question": "为什么要先捕获基线？",
+          "options": [
+            "异常只有相对于正常行为才有意义",
+            "它能加快网络速度",
+            "Zeek 要求如此",
+            "它使日志变得不再必要"
+          ],
+          "answer": 0,
+          "explanation": "没有参照，你就无法在自己的网络上区分异常与寻常。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n你在注重隐私的前提下捕获了实验流量，遵循从基线到有文档记录的发现这一可重复的方法，并用 `tshark` 和 Zeek 回答了谁在通信、解析了哪些名称、TLS 暴露了什么，以及哪些连接过于规律。数据包是告警背后的事实依据，但必须用端点证据加以确认。接下来，请在 [漏洞管理实验](/learn/hands-on-security-labs/vulnerability-management-lab) 中练习发现并修复主机本身的弱点。"
+    }
+  ]
+}
