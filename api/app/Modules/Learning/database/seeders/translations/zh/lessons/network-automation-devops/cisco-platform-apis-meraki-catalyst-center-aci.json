@@ -1,0 +1,337 @@
+{
+  "title": "Cisco 平台 API：Meraki、Catalyst Center、ACI",
+  "summary": "了解 Meraki Dashboard API、Catalyst Center Intent API 和 ACI APIC REST API 的组织方式、各自的身份验证方法，以及如何通过 Python 和 curl 列出设备和对象。",
+  "objectives": [
+    "描述 Meraki Dashboard API 的层级结构、身份验证、速率限制和分页",
+    "获取 Catalyst Center 令牌，并通过 Intent API 查询网络设备",
+    "解释 ACI 管理信息树 (Management Information Tree)、类和可分辨名称",
+    "登录 APIC 并执行类级别和 DN 级别的查询",
+    "比较这三个平台的身份验证和数据模型"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一家零售公司在 300 个分支机构部署了 Meraki，在总部使用由 **Catalyst Center** 管理的 Catalyst 交换机，并在数据中心使用 **Cisco ACI**。运维团队希望每晚生成一份报告，列出每台设备、其软件版本以及是否可达。三个平台、三种 API、一个 Python 脚本。\n\n这些平台中的每一个都是**控制器 (controller)**：你只需询问一次，它就能代表数百台设备作答。本课介绍每种 API 的组织方式、如何向其进行身份验证，以及如何列出设备或对象，这正是 CCNA Automation 考试要求你阅读和完成的任务类型。关于控制器为何会改变你的自动化方式，请参阅[控制器级与设备级管理](/learn/network-automation-devops/controller-level-vs-device-level-management)。"
+    },
+    {
+      "id": "meraki",
+      "type": "text",
+      "markdown": "## Meraki Dashboard API\n\nMeraki 完全通过云端管理，因此其 API 也在云端：位于 `api.meraki.com/api/v1` 的 **Dashboard API v1**。它是返回 JSON 的 REST API。\n\n### 身份验证\n\n管理员为组织启用 API 访问，并在其个人资料中生成个人 **API 密钥 (API key)**。每个请求都在标头中携带它，格式为 `Authorization: Bearer <api-key>`，或较旧的 `X-Cisco-Meraki-API-Key: <api-key>`。该密钥拥有与创建它的管理员相同的权限，因此请像对待密码一样对待它。\n\n### 对象层级\n\n- **组织 (Organization)**：最顶层，通常对应一个客户。`GET /organizations`\n- **网络 (Network)**：组织内的站点或设备组。`GET /organizations/{organizationId}/networks`\n- **设备 (Device)**：由其**序列号 (serial number)** 标识。`GET /organizations/{organizationId}/devices` 或 `GET /networks/{networkId}/devices`\n\n几乎每个调用都需要父对象的 ID，因此脚本通常从顶层开始逐级遍历层级结构。\n\n### 限制与附加功能\n\nDashboard API 允许每个组织每秒约 **10 个请求**。超过该限制时，它会返回带有 `Retry-After` 标头的 `429 Too Many Requests`。大型列表使用 `perPage` 和 `startingAfter` 进行**分页**，下一页会在 `Link` 标头中给出。Meraki 还提供用于批量变更的**操作批处理 (action batches)** 和用于告警的 **Webhook**。官方的 `meraki` Python 库会为你处理重试和分页。"
+    },
+    {
+      "id": "meraki-code",
+      "type": "code",
+      "language": "python",
+      "filename": "meraki_inventory.py",
+      "caption": "使用官方 SDK 遍历 Meraki 层级结构。API 密钥来自环境变量，绝不写入源代码。",
+      "code": "import os\nimport meraki\n\n# The SDK reads the key from MERAKI_DASHBOARD_API_KEY if api_key is omitted.\ndashboard = meraki.DashboardAPI(\n    api_key=os.environ[\"MERAKI_DASHBOARD_API_KEY\"],\n    suppress_logging=True,\n    maximum_retries=3,              # retries 429 responses using Retry-After\n)\n\norgs = dashboard.organizations.getOrganizations()\norg_id = orgs[0][\"id\"]\nprint(\"Organization:\", orgs[0][\"name\"], org_id)\n\nfor net in dashboard.organizations.getOrganizationNetworks(org_id):\n    print(\"Network:\", net[\"id\"], net[\"name\"], net[\"productTypes\"])\n\n# total_pages=\"all\" follows the Link headers and returns every page\ndevices = dashboard.organizations.getOrganizationDevices(org_id, total_pages=\"all\")\nfor d in devices:\n    print(f\"{d['name']:<14} {d['model']:<10} {d['serial']}  {d['networkId']}\")",
+      "highlight": [
+        5,
+        19
+      ]
+    },
+    {
+      "id": "catalyst",
+      "type": "text",
+      "markdown": "## Catalyst Center API\n\n**Cisco Catalyst Center**（前身为 DNA Center）是面向园区和分支网络的本地部署控制器。其可编程能力分为四个领域：\n\n| 领域 | 方向 | 用途 |\n|:--|:--|:--|\n| **Intent API** | 北向 (Northbound) | 用于资产清单、站点、拓扑、模板、保障 (assurance) 和软件镜像的 REST API |\n| **Integration API** | 西向 (Westbound) | 连接 ServiceNow 等 IT 服务管理工具 |\n| **Multivendor SDK** | 南向 (Southbound) | 使控制器能够管理第三方设备 |\n| **事件和通知** | 东向 (Eastbound) | 以 Webhook、电子邮件或 syslog 的形式将事件推送到外部系统 |\n\n### 身份验证和请求\n\n1. 使用 **HTTP Basic** 凭据发送 `POST /dna/system/api/v1/auth/token`。响应中包含 `Token`。\n2. 在之后的每个请求中添加 `X-Auth-Token: <token>`。该令牌约一小时后过期。\n3. 调用 `/dna/intent/api/v1/` 下的 Intent API 资源，例如 `network-device`、`site` 或 `topology/physical-topology`。\n\n读取请求是同步的。大多数变更（例如添加设备或部署模板）是**异步**的：控制器返回带有 `taskId` 的 `202 Accepted`，你需要轮询 `/dna/intent/api/v1/task/{taskId}`。参见 [API 风格：REST、RPC、同步与异步](/learn/network-automation-devops/api-styles-rest-rpc-synchronous-and-asynchronous)。`dnacentersdk` Python 库封装了这些调用。"
+    },
+    {
+      "id": "cc-term",
+      "type": "terminal",
+      "title": "使用 curl 从 Catalyst Center 列出交换机",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -X POST -u devnetuser:<password-placeholder> https://catalyst.example.com/dna/system/api/v1/auth/token",
+          "output": "{\"Token\":\"eyJ0eXAiOiJKV1QiLCJhbGciOi...<truncated>\"}"
+        },
+        {
+          "comment": "只进行一次 Basic 身份验证来获取令牌。该令牌约一小时内有效。"
+        },
+        {
+          "cmd": "export CC_TOKEN=\"<token-placeholder>\"",
+          "output": ""
+        },
+        {
+          "cmd": "curl -s -H \"X-Auth-Token: $CC_TOKEN\" \"https://catalyst.example.com/dna/intent/api/v1/network-device?family=Switches%20and%20Hubs\" | jq '.response[] | {hostname, managementIpAddress, platformId, softwareVersion, reachabilityStatus}'",
+          "output": "{\n  \"hostname\": \"access-sw1.example.com\",\n  \"managementIpAddress\": \"10.10.20.81\",\n  \"platformId\": \"C9300-48U\",\n  \"softwareVersion\": \"17.9.4\",\n  \"reachabilityStatus\": \"Reachable\"\n}\n{\n  \"hostname\": \"access-sw2.example.com\",\n  \"managementIpAddress\": \"10.10.20.82\",\n  \"platformId\": \"C9300-48U\",\n  \"softwareVersion\": \"17.9.4\",\n  \"reachabilityStatus\": \"Unreachable\"\n}"
+        },
+        {
+          "comment": "每个 Intent API 响应都将数据包装在“response”键中。family 查询参数在服务器端过滤资产清单。"
+        }
+      ],
+      "caption": "实验环境输出。在生产环境中，请验证控制器证书，而不是禁用检查。"
+    },
+    {
+      "id": "aci",
+      "type": "text",
+      "markdown": "## Cisco ACI 与 APIC REST API\n\n在 **Cisco ACI**（以应用为中心的基础设施，Application Centric Infrastructure）中，**APIC** 集群是脊叶 (leaf-and-spine) 数据中心网络架构的控制器。网络架构中的一切，从租户到单个接口计数器，都是**管理信息树 (Management Information Tree, MIT)** 中的对象。图形界面、命令行和 REST API 读写的都是同一棵树。\n\n### 对象、类和 DN\n\n- 每个对象都是一个**受管对象 (managed object, MO)**，并属于某个**类 (class)**，例如 `fvTenant`（租户）、`fvCtx`（VRF）、`fvBD`（网桥域）、`fvAp`（应用配置文件）或 `fvAEPg`（端点组）。\n- 每个 MO 都有一个唯一的**可分辨名称 (distinguished name, DN)**，用于显示其在树中的位置，例如 `uni/tn-Prod/ap-Web/epg-Frontend`。\n- **相对名称 (relative name, RN)** 是 DN 中的一段，例如 `tn-Prod`。\n\n### 查询和修改树\n\n| 目标 | 请求 |\n|:--|:--|\n| 登录 | `POST /api/aaaLogin.json` 返回令牌和 `APIC-cookie` |\n| 某个类的所有对象 | `GET /api/class/fvTenant.json` |\n| 按 DN 获取单个对象 | `GET /api/mo/uni/tn-Prod.json` |\n| 其子对象 | `GET /api/mo/uni/tn-Prod.json?query-target=children` |\n| 创建或更新 | `POST /api/mo/uni.json`，正文为 `{\"fvTenant\": {\"attributes\": {\"name\": \"Prod\"}}}` |\n\n`.json` 或 `.xml` 后缀用于选择数据格式。每个响应都包含 `totalCount` 和 `imdata` 列表。登录令牌会过期（默认 600 秒），并通过 `GET /api/aaaRefresh.json` 续期。APIC 图形界面中的 **API Inspector** 会显示每次点击背后的 REST 调用，**Visore** 则用于浏览对象树。在 Python 中，可以使用 **Cobra SDK**（`acicobra`）或直接使用 `requests`。"
+    },
+    {
+      "id": "aci-code",
+      "type": "code",
+      "language": "http",
+      "filename": "apic-login-and-query.http",
+      "caption": "先登录 APIC，再进行类查询。登录时获得的 Cookie 用于对第二个请求进行身份验证。",
+      "code": "POST /api/aaaLogin.json HTTP/1.1\nHost: apic.example.com\nContent-Type: application/json\n\n{\"aaaUser\": {\"attributes\": {\"name\": \"automation\", \"pwd\": \"<password-placeholder>\"}}}\n\nHTTP/1.1 200 OK\nSet-Cookie: APIC-cookie=<token-placeholder>; path=/; HttpOnly; Secure\n\n{\"totalCount\": \"1\", \"imdata\": [{\"aaaLogin\": {\"attributes\": {\n  \"token\": \"<token-placeholder>\", \"refreshTimeoutSeconds\": \"600\"}}}]}\n\nGET /api/class/fvTenant.json HTTP/1.1\nHost: apic.example.com\nCookie: APIC-cookie=<token-placeholder>\n\nHTTP/1.1 200 OK\n\n{\"totalCount\": \"3\", \"imdata\": [\n  {\"fvTenant\": {\"attributes\": {\"dn\": \"uni/tn-common\", \"name\": \"common\"}}},\n  {\"fvTenant\": {\"attributes\": {\"dn\": \"uni/tn-mgmt\",   \"name\": \"mgmt\"}}},\n  {\"fvTenant\": {\"attributes\": {\"dn\": \"uni/tn-Prod\",   \"name\": \"Prod\"}}}]}",
+      "highlight": [
+        1,
+        13
+      ]
+    },
+    {
+      "id": "auth-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "在三个平台上进行身份验证并列出设备",
+      "caption": "Meraki 使用长期有效的 API 密钥；Catalyst Center 和 APIC 则用凭据换取短期令牌。",
+      "data": {
+        "actors": [
+          {
+            "id": "s",
+            "label": "报告脚本",
+            "sub": "Python",
+            "icon": "laptop"
+          },
+          {
+            "id": "m",
+            "label": "Meraki 云",
+            "sub": "Dashboard API v1",
+            "icon": "cloud"
+          },
+          {
+            "id": "c",
+            "label": "Catalyst Center",
+            "sub": "catalyst.example.com",
+            "icon": "server"
+          },
+          {
+            "id": "a",
+            "label": "APIC",
+            "sub": "apic.example.com",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "s",
+            "to": "m",
+            "label": "GET /organizations/{id}/devices",
+            "detail": "Authorization: Bearer <key>",
+            "note": "Meraki 不需要登录调用：API 密钥随每个请求一起传送。"
+          },
+          {
+            "from": "m",
+            "to": "s",
+            "label": "200 OK",
+            "detail": "JSON 列表 + Link 标头",
+            "tone": "success",
+            "note": "设备列表一次返回一页；Link 标头指向下一页。"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "POST /auth/token",
+            "detail": "Basic 身份验证",
+            "tone": "secure",
+            "note": "Catalyst Center 用用户名和密码换取令牌。"
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "200 OK",
+            "detail": "{\"Token\": ...}",
+            "tone": "secure",
+            "note": "该令牌约一小时内有效。"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "GET /network-device",
+            "detail": "X-Auth-Token",
+            "note": "令牌放在 X-Auth-Token 标头中。"
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "200 OK",
+            "detail": "{\"response\": [...]}",
+            "tone": "success",
+            "note": "资产清单在 response 键中返回。"
+          },
+          {
+            "from": "s",
+            "to": "a",
+            "label": "POST /api/aaaLogin.json",
+            "detail": "aaaUser name/pwd",
+            "tone": "secure",
+            "note": "APIC 登录使用 JSON 正文，而不是 Basic 身份验证。"
+          },
+          {
+            "from": "a",
+            "to": "s",
+            "label": "200 OK",
+            "detail": "令牌 + APIC-cookie",
+            "tone": "secure",
+            "note": "脚本保存该 Cookie，并在后续请求中一并发送。"
+          },
+          {
+            "from": "s",
+            "to": "a",
+            "label": "GET /api/class/fabricNode.json",
+            "detail": "Cookie: APIC-cookie",
+            "note": "类查询会返回网络架构中的每台叶交换机、脊交换机和控制器。"
+          },
+          {
+            "from": "a",
+            "to": "s",
+            "label": "200 OK",
+            "detail": "totalCount + imdata",
+            "tone": "success",
+            "note": "脚本将三份资产清单合并为一份报告。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "compare",
+      "type": "text",
+      "markdown": "## 三种 API 的比较\n\n| | Meraki Dashboard | Catalyst Center | ACI APIC |\n|:--|:--|:--|:--|\n| 运行位置 | Cisco 云 | 本地部署的设备或集群 | 本地部署的 APIC 集群 |\n| 基础路径 | `/api/v1` | `/dna/intent/api/v1` | `/api/mo`、`/api/class` |\n| 身份验证 | 标头中的 API 密钥 | Basic 身份验证，然后使用 `X-Auth-Token` | `aaaLogin`，然后使用 `APIC-cookie` |\n| 数据模型 | 组织、网络、设备 | 站点、设备、模板 | 由类和 DN 组成的 MIT |\n| 格式 | JSON | JSON | JSON 或 XML |\n| Python 库 | `meraki` | `dnacentersdk` | Cobra SDK (`acicobra`) |\n| 显著特点 | 速率限制和分页 | 异步任务 | API Inspector 显示图形界面的调用 |\n\n同样的模式也适用于考试大纲中的其他 Cisco 控制器，例如 **Catalyst SD-WAN Manager** 和 **Cisco NSO**，后者在 [Ansible、Terraform 和 Cisco NSO](/learn/network-automation-devops/ansible-terraform-and-cisco-nso) 中介绍。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "学习者常犯的错误",
+      "markdown": "- **硬编码密钥和密码。** 请从环境变量或密钥保管库中加载它们。泄露的 Meraki 密钥会授予完整的管理员权限。\n- **忘记父级 ID。** Meraki 的设备和网络调用需要先提供 `organizationId` 或 `networkId`。\n- **使用错误的标头。** Catalyst Center 需要 `X-Auth-Token`，而不是 `Authorization: Bearer`。APIC 需要 `APIC-cookie`。\n- **只读取第一页。** 不处理分页的话，拥有 2,000 台设备的组织看起来就像只有 1,000 台设备。\n- **在生产环境中禁用 TLS 验证。** `curl -k` 或 `verify=False` 仅可在隔离的实验环境中使用。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "仅使用你被授权使用的沙盒或实验控制器，例如适用于 Meraki、Catalyst Center 和 ACI 的 Cisco DevNet Sandbox。\n\n1. **Meraki：** 将你的沙盒密钥导出为 `MERAKI_DASHBOARD_API_KEY`，并运行 `meraki_inventory.py`。记下组织、网络和设备的 ID。\n2. **Catalyst Center：** 请求令牌，然后使用 `?family=Switches%20and%20Hubs` 列出设备。统计有多少台处于 `Unreachable` 状态。\n3. **ACI：** 使用 `aaaLogin` 登录，然后运行 `GET /api/class/fvTenant.json` 和 `GET /api/mo/uni/tn-common.json?query-target=children`。识别各子对象所属的类。\n4. 在 APIC 图形界面中，打开 **API Inspector**，创建一个测试租户，并将捕获的 `POST` 与上表进行比较。之后删除该租户。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "Meraki Dashboard API",
+          "definition": "用于 Meraki 组织、网络和设备的云托管 REST API (v1)，使用每位管理员专属的 API 密钥进行身份验证。"
+        },
+        {
+          "term": "组织 ID (Organization ID)",
+          "definition": "Meraki 组织的标识符；大多数网络和设备调用都从它开始。"
+        },
+        {
+          "term": "Catalyst Center Intent API",
+          "definition": "Catalyst Center 的北向 REST API，位于 /dna/intent/api/v1 下，用于资产清单、站点、模板和保障。"
+        },
+        {
+          "term": "X-Auth-Token",
+          "definition": "携带从 /dna/system/api/v1/auth/token 获取的 Catalyst Center 令牌的 HTTP 标头。"
+        },
+        {
+          "term": "APIC",
+          "definition": "应用策略基础设施控制器 (Application Policy Infrastructure Controller)：Cisco ACI 网络架构的集群控制器，也是其 REST API 的目标。"
+        },
+        {
+          "term": "管理信息树 (Management Information Tree, MIT)",
+          "definition": "ACI 的分层对象模型，其中每一项配置和状态都是一个受管对象。"
+        },
+        {
+          "term": "可分辨名称 (Distinguished name, DN)",
+          "definition": "ACI 受管对象在 MIT 中的唯一路径，例如 uni/tn-Prod/ap-Web。"
+        },
+        {
+          "term": "分页 (Pagination)",
+          "definition": "将大型结果拆分为多个页面；Meraki API 使用 perPage、startingAfter 和 Link 标头。"
+        },
+        {
+          "term": "API Inspector",
+          "definition": "APIC 图形界面中的一种工具，用于显示界面中每个操作所生成的 REST 调用。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "获取令牌后，哪个标头用于对 Catalyst Center 的 Intent API 请求进行身份验证？",
+          "options": [
+            "Authorization: Basic",
+            "X-Auth-Token",
+            "X-Cisco-Meraki-API-Key",
+            "Cookie: APIC-cookie"
+          ],
+          "answer": 1,
+          "explanation": "Catalyst Center 通过 /dna/system/api/v1/auth/token 返回令牌，之后的每个请求都在 X-Auth-Token 标头中发送该令牌。"
+        },
+        {
+          "question": "关于 Meraki Dashboard API，下列哪些说法是正确的？（选择所有适用项。）",
+          "options": [
+            "它托管在 Cisco 云中",
+            "它使用与管理员绑定的 API 密钥进行身份验证",
+            "它需要一个返回 Cookie 的登录调用",
+            "超出速率限制时它会返回 429",
+            "它通过序列号标识设备"
+          ],
+          "answer": [
+            0,
+            1,
+            3,
+            4
+          ],
+          "explanation": "Dashboard API 由云托管，在每个请求中使用 API 密钥，通过 429 响应强制执行每个组织的速率限制，并通过序列号标识设备。它没有单独的登录调用。"
+        },
+        {
+          "question": "哪个 APIC 请求会返回网络架构中的所有租户？",
+          "options": [
+            "GET /api/mo/uni/tn-Prod.json",
+            "GET /api/class/fvTenant.json",
+            "POST /api/aaaLogin.json",
+            "GET /dna/intent/api/v1/site"
+          ],
+          "answer": 1,
+          "explanation": "类查询 (/api/class/<class>.json) 会返回该类的所有对象。/api/mo/ 返回由其 DN 标识的单个对象。"
+        },
+        {
+          "question": "在 ACI 中，uni/tn-Prod/ap-Web/epg-Frontend 是什么？",
+          "options": [
+            "类名",
+            "相对名称",
+            "可分辨名称",
+            "API 密钥"
+          ],
+          "answer": 2,
+          "explanation": "它是受管对象在 MIT 中的完整路径，即其可分辨名称 (DN)。单独的 tn-Prod 才是相对名称。"
+        },
+        {
+          "question": "哪些做法能让多平台资产清单脚本更安全、更可靠？（选择所有适用项。）",
+          "options": [
+            "从环境变量加载凭据",
+            "持续跟随分页直到最后一页",
+            "在生产环境中禁用证书检查",
+            "在收到 429 响应时遵守 Retry-After"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "让机密信息远离代码，读取每一页，并在被限速时退避。在生产环境中禁用 TLS 验证会使凭据面临被截获的风险。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n- **Meraki Dashboard API**：云端 REST API，每个请求都携带 API 密钥，层级为组织、网络和设备，速率限制约为每秒 10 个请求，并支持分页。\n- **Catalyst Center**：Intent、Integration、Multivendor SDK 和事件 API；先用 Basic 身份验证获取令牌，然后使用 `X-Auth-Token`；变更以异步任务的方式运行。\n- **ACI APIC**：一切都是 MIT 中具有类和 DN 的对象；使用 `aaaLogin` 登录，按类或按 DN 查询，并使用 API Inspector 学习调用方式。\n- 保护凭据、跟随分页并验证 TLS。\n\n请继续学习 [Cisco 安全平台 API：XDR、Firepower 和 ISE](/learn/network-automation-devops/cisco-security-platform-apis-xdr-firepower-and-ise)。"
+    }
+  ]
+}
