@@ -78,26 +78,36 @@ class AnalyticsController extends Controller
         // counting even while signed out.
         $this->recorder->rememberStaffRequest($request);
 
-        return response()->json([
-            'status' => 'success',
-            'data' => [
-                'overview' => $this->statistics->overview($days),
-                'timeline' => $this->statistics->visitsTimeline($days),
-                'top_pages' => $this->statistics->topPages($days, 15),
-                'sections' => $this->statistics->sections($days),
-                'engagement' => $this->statistics->engagement($days),
-                'traffic_sources' => $this->statistics->trafficSources($days),
-                'entry_exit_pages' => $this->statistics->entryExitPages($days, 8),
-                'learning' => $this->statistics->learning($days, 8),
-                'downloads' => $this->statistics->downloads($days),
-                'tool_usage' => $this->statistics->toolUsage($days),
-                'audience' => $this->statistics->audience($days),
-                // The statistics page shows only the top three; the dedicated
-                // icon page asks for the full list.
-                'top_icons' => $this->statistics->iconEngagement($days, 3),
-                'longest_stay_pages' => $this->statistics->longestStayPages($days, 5),
-            ],
-        ]);
+        // Each section on its own: one failing query is logged and named in
+        // `errors` while every other section is still returned. Top pages,
+        // learning and downloads have their own endpoints, so they are not here.
+        $errors = [];
+        $sections = [
+            'overview' => fn () => $this->statistics->overview($days),
+            'timeline' => fn () => $this->statistics->visitsTimeline($days),
+            'sections' => fn () => $this->statistics->sections($days),
+            'engagement' => fn () => $this->statistics->engagement($days),
+            'traffic_sources' => fn () => $this->statistics->trafficSources($days),
+            'entry_exit_pages' => fn () => $this->statistics->entryExitPages($days, 8),
+            'tool_usage' => fn () => $this->statistics->toolUsage($days),
+            'audience' => fn () => $this->statistics->audience($days),
+            'top_icons' => fn () => $this->statistics->iconEngagement($days, 3),
+            'longest_stay_pages' => fn () => $this->statistics->longestStayPages($days, 5),
+        ];
+
+        $data = [];
+        foreach ($sections as $name => $compute) {
+            try {
+                $data[$name] = $compute();
+            } catch (\Throwable $e) {
+                report($e);
+                $data[$name] = null;
+                $errors[$name] = mb_strimwidth($e->getMessage(), 0, 300, '…');
+            }
+        }
+        $data['errors'] = $errors;
+
+        return response()->json(['status' => 'success', 'data' => $data]);
     }
 
     public function downloads(Request $request): JsonResponse

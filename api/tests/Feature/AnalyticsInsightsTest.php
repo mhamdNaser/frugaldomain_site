@@ -98,7 +98,7 @@ class AnalyticsInsightsTest extends TestCase
 
         $this->assertSame(3, $data['engagement']['visitors']);
         $this->assertSame(3, $data['engagement']['new_visitors']);
-        $this->assertSame('networking-foundations-ccna', $data['learning']['courses'][0]['course']);
+        $this->assertSame([], $data['errors']);
         $this->assertContains('/learn/networking-foundations-ccna/cdp-and-lldp', collect($data['entry_exit_pages']['entry'])->pluck('path')->all());
         $this->assertContains('/learn/networking-foundations-ccna', collect($data['entry_exit_pages']['exit'])->pluck('path')->all());
 
