@@ -55,6 +55,7 @@ Route::prefix('admin')->group(function () {
             Route::get('overview', 'overview');
             Route::get('icons', 'icons');
             Route::get('downloads', 'downloads');
+            Route::get('learning', 'learning');
             Route::get('logins', 'logins');
             Route::get('active-users', 'activeUsers');
             Route::get('pages', 'pages');

@@ -164,6 +164,15 @@ class AnalyticsController extends Controller
         ]);
     }
 
+    /** Most visited courses and lessons, for the dashboard. */
+    public function learning(Request $request): JsonResponse
+    {
+        return response()->json([
+            'status' => 'success',
+            'data' => $this->statistics->learning($this->days($request), (int) $request->input('limit', 8)),
+        ]);
+    }
+
     /** Clamp the window so a hand-edited query string cannot scan the whole table. */
     private function days(Request $request): int
     {

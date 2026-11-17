@@ -321,6 +321,17 @@ class LearningPresenter
             'blocks' => $this->resolveMedia($blocks ?? []),
             'content_language' => $contentLanguage,
             'has_ar' => $this->hasArabicContent($lesson),
+            // The languages this lesson's body is written in: the ones its page is indexed in.
+            'locales' => array_values(array_merge(
+                ['en'],
+                $this->hasArabicContent($lesson) ? ['ar'] : [],
+                LearningTranslation::query()
+                    ->where('model_type', 'lesson')->where('model_id', $lesson->id)->whereNotNull('blocks')
+                    ->pluck('locale')->intersect(LearningTranslation::LOCALES)->sort()->values()->all(),
+            )),
+            // A review topic only points at the lesson that teaches it. Sent as a flag
+            // because its blocks are withheld from guests, search engines included.
+            'review' => str_starts_with((string) $lesson->summary, 'A review topic:'),
             'updated_at' => $lesson->updated_at?->toIso8601String(),
             'course' => [
                 'slug' => $course->slug,

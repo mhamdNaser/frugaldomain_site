@@ -294,6 +294,15 @@ class LearningApiTest extends TestCase
             ->assertJsonPath('data.title', 'Üçüncü ders')
             ->assertJsonPath('data.content_language', 'en');
 
+        // Only a translated body makes a language one the lesson is written (and indexed) in.
+        $this->assertContains('tr', $this->getJson('/api/learn/courses/demo/lessons/first')->json('data.locales'));
+        $this->assertNotContains('tr', $this->getJson('/api/learn/courses/demo/lessons/third')->json('data.locales'));
+        $sitemap = $this->get('/api/learn/sitemap.xml')->getContent();
+        $this->assertStringContainsString('<loc>https://frugaldomain.site/tr/learn/demo</loc>', $sitemap);
+        $this->assertStringContainsString('<loc>https://frugaldomain.site/tr/learn/demo/first</loc>', $sitemap);
+        $this->assertStringNotContainsString('/tr/learn/demo/third<', $sitemap);
+        $this->assertStringNotContainsString('/hi/learn/demo/first<', $sitemap);
+
         $this->getJson('/api/learn/courses/demo', ['X-Language' => 'tr'])
             ->assertJsonPath('data.title', 'Demo kurs')
             ->assertJsonPath('data.stages.0.title', 'Stage one')

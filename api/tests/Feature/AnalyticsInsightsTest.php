@@ -102,6 +102,10 @@ class AnalyticsInsightsTest extends TestCase
         $this->assertContains('/learn/networking-foundations-ccna/cdp-and-lldp', collect($data['entry_exit_pages']['entry'])->pluck('path')->all());
         $this->assertContains('/learn/networking-foundations-ccna', collect($data['entry_exit_pages']['exit'])->pluck('path')->all());
 
+        // The dashboard reads each panel on its own, so one failing query cannot blank the rest.
+        $this->assertSame('networking-foundations-ccna', $this->getJson('/api/admin/analytics/learning')->assertOk()->json('data.courses.0.course'));
+        $this->assertCount(4, $this->getJson('/api/admin/analytics/pages?limit=5')->assertOk()->json('data'));
+
         // The dashboard's own browser is now known as staff.
         $this->assertTrue(DB::table('analytics_excluded_sessions')->where('session_id', 'dash-browser')->exists());
     }

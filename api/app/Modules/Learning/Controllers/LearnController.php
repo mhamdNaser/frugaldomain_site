@@ -7,6 +7,7 @@ use App\Modules\Learning\Models\LearningCategory;
 use App\Modules\Learning\Models\LearningCourse;
 use App\Modules\Learning\Models\LearningLesson;
 use App\Modules\Learning\Models\LearningMedia;
+use App\Modules\Learning\Models\LearningTranslation;
 use App\Modules\Learning\Services\LearningPresenter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -173,7 +174,7 @@ class LearnController extends Controller
     }
 
     /**
-     * A sitemap of every public course and written lesson, in both languages,
+     * A sitemap of every public course and written lesson, in every language it is written in,
      * with the hreflang pairs. It is built from the database, so a new batch
      * of lessons is listed as soon as the seeder runs, with no frontend
      * build. robots.txt on the main site points crawlers here; a sitemap on
@@ -194,36 +195,49 @@ class LearnController extends Controller
                 ->whereIn('course_id', $courses->pluck('id'))
                 ->where('status', 'published')
                 ->where(fn ($q) => $q->whereNull('summary')->orWhere('summary', 'not like', 'A review topic:%'))
-                ->get(['course_id', 'slug', 'summary_ar', 'updated_at']);
+                ->get(['id', 'course_id', 'slug', 'summary_ar', 'updated_at']);
             $slugOf = $courses->pluck('slug', 'id');
+
+            // Extra languages (hi, zh, tr) each course and lesson is written in.
+            // A course counts once its syllabus is translated, a lesson once its body is.
+            $extra = LearningTranslation::query()
+                ->whereIn('locale', LearningTranslation::LOCALES)
+                ->where(fn ($q) => $q->where('model_type', 'course')
+                    ->orWhere(fn ($q) => $q->where('model_type', 'lesson')->whereNotNull('blocks')))
+                ->get(['model_type', 'model_id', 'locale'])
+                ->groupBy(fn ($row) => $row->model_type.':'.$row->model_id)
+                ->map(fn ($rows) => $rows->pluck('locale')->sort()->values()->all());
 
             $entries = [];
             foreach ($courses as $course) {
-                $entries[] = ["/learn/{$course->slug}", $course->updated_at, true, '0.8'];
+                $entries[] = ["/learn/{$course->slug}", $course->updated_at,
+                    ['en', 'ar', ...($extra["course:{$course->id}"] ?? [])], '0.8'];
             }
             foreach ($lessons as $lesson) {
                 $entries[] = [
                     "/learn/{$slugOf[$lesson->course_id]}/{$lesson->slug}",
                     $lesson->updated_at,
-                    filled($lesson->summary_ar),
+                    ['en', ...(filled($lesson->summary_ar) ? ['ar'] : []), ...($extra["lesson:{$lesson->id}"] ?? [])],
                     '0.7',
                 ];
             }
 
+            $hreflang = ['en' => 'en', 'ar' => 'ar', 'hi' => 'hi', 'zh' => 'zh-Hans', 'tr' => 'tr'];
+            $urlOf = fn (string $locale, string $path) => $origin.($locale === 'en' ? '' : '/'.$locale).$path;
             $e = fn (string $s) => htmlspecialchars($s, ENT_XML1 | ENT_QUOTES, 'UTF-8');
             $out = '<?xml version="1.0" encoding="UTF-8"?>'."\n"
                 .'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">'."\n";
-            foreach ($entries as [$path, $updated, $bilingual, $priority]) {
-                $en = $origin.$path;
-                $ar = $origin.'/ar'.$path;
-                $links = $bilingual
-                    ? '<xhtml:link rel="alternate" hreflang="en" href="'.$e($en).'"/>'
-                        .'<xhtml:link rel="alternate" hreflang="ar" href="'.$e($ar).'"/>'
-                        .'<xhtml:link rel="alternate" hreflang="x-default" href="'.$e($en).'"/>'
-                    : '';
+            foreach ($entries as [$path, $updated, $locales, $priority]) {
+                $links = '';
+                if (count($locales) > 1) {
+                    foreach ($locales as $locale) {
+                        $links .= '<xhtml:link rel="alternate" hreflang="'.$hreflang[$locale].'" href="'.$e($urlOf($locale, $path)).'"/>';
+                    }
+                    $links .= '<xhtml:link rel="alternate" hreflang="x-default" href="'.$e($urlOf('en', $path)).'"/>';
+                }
                 $lastmod = $updated ? '<lastmod>'.$updated->toDateString().'</lastmod>' : '';
-                foreach ($bilingual ? [$en, $ar] : [$en] as $loc) {
-                    $out .= '<url><loc>'.$e($loc).'</loc>'.$lastmod.'<priority>'.$priority.'</priority>'.$links.'</url>'."\n";
+                foreach ($locales as $locale) {
+                    $out .= '<url><loc>'.$e($urlOf($locale, $path)).'</loc>'.$lastmod.'<priority>'.$priority.'</priority>'.$links.'</url>'."\n";
                 }
             }
 
