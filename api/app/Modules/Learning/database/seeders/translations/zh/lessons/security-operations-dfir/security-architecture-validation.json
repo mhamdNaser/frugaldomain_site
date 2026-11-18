@@ -1,0 +1,277 @@
+{
+  "title": "安全架构验证（Security Architecture Validation）",
+  "summary": "检查你画出的架构就是你实际运行的架构：对信任边界建模，测试网络分段与身份路径，并用证据确认日志记录与故障行为。",
+  "objectives": [
+    "将架构图转化为可测试的安全主张",
+    "使用 STRIDE 对信任边界和数据流建模",
+    "通过允许与拒绝流量测试来验证网络分段",
+    "验证设计中的身份、日志记录和故障行为",
+    "将发现记录为架构漂移并跟踪整改"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "架构图上写着，用户网络无法访问数据库层。该图两年前获得批准。此后，一名外包人员开通了一条临时规则，云团队增加了一条对等连接链路，一次防火墙变更又被回滚了一半。没有人检查过这张图是否仍然成立。\n\n安全架构验证（security architecture validation）把设计中的每一项主张都变成一个测试，并将结果与实际情况对比。它与[安全控制有效性测试（Security Control Effectiveness Testing）](/learn/security-operations-dfir/security-control-effectiveness-testing)相辅相成：那一课证明单个控制措施有效，而本课证明整体设计能够自洽。只探测你自己拥有或已获授权测试的网络。"
+    },
+    {
+      "id": "claims",
+      "type": "text",
+      "markdown": "## 将设计写成主张\n\n架构图只是一幅图画，而主张是可以被证伪的陈述。把每一条箭头以及每一处缺失的箭头都转换为带有明确通过条件的句子。\n\n| 主张 | 测试 | 通过条件 |\n|:--|:--|:--|\n| 用户 VLAN 无法访问数据库层 | 从用户主机连接 TCP/5432 | 连接超时或被拒绝 |\n| 只有应用层可以访问数据库 | 从应用主机连接 TCP/5432 | 连接成功，需要登录 |\n| 管理访问需经过跳板机 | 尝试从笔记本电脑直接 SSH | 被阻止；仅允许通过跳板机 |\n| 每一层都将日志发送到 SIEM | 在每一层生成一个事件 | 事件在 5 分钟内出现在 SIEM 中 |\n| 丢失一台防火墙不会使该区域开放 | 使防火墙对中的一个节点故障 | 流量持续转发，策略不变 |\n\n也要写出否定性主张。大多数架构失效源于缺失的拒绝规则，因此只包含允许路径的测试套件无法说明任何暴露面情况。"
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## 使用 STRIDE 对信任边界建模\n\n信任边界（trust boundary）是数据在不同权限的区域之间传递的地方：互联网到 DMZ、用户 VLAN 到服务器 VLAN、租户到租户、本地到云。在数据流图上标出每一条边界，然后对每一条跨越边界的数据流提出 STRIDE 问题。\n\n- **仿冒（Spoofing）。** 调用方能否冒充他人？检查该数据流上的身份认证。\n- **篡改（Tampering）。** 数据能否在传输或存储中被更改？检查 TLS 和完整性控制。\n- **抵赖（Repudiation）。** 行为人能否否认自己的操作？检查日志记录和时间同步。\n- **信息泄露（Information disclosure）。** 数据能否泄漏？检查加密和访问控制。\n- **拒绝服务（Denial of service）。** 该数据流能否被耗尽？检查速率限制和容量。\n- **权限提升（Elevation of privilege）。** 调用方能否获得更多权限？检查授权和角色设计。\n\n每个答案要么成为带有测试的现有控制措施，要么成为有责任人的缺口。这与设计[企业安全工程（enterprise security engineering）](/learn/security-operations-dfir/enterprise-security-engineering)所用的方法相同，只是现在倒过来作为评审来运行。"
+    },
+    {
+      "id": "flows-yaml",
+      "type": "code",
+      "language": "yaml",
+      "code": "# intended-flows.yaml: the design, written as testable claims\nzones:\n  user:  { cidr: 10.10.0.0/16 }\n  app:   { cidr: 10.20.0.0/24 }\n  db:    { cidr: 10.30.0.0/24 }\ntests:\n  - { id: F1, from: user, to: db,  port: 5432, expect: blocked }\n  - { id: F2, from: app,  to: db,  port: 5432, expect: open }\n  - { id: F3, from: user, to: app, port: 443,  expect: open }\n  - { id: F4, from: user, to: db,  port: 22,   expect: blocked }",
+      "filename": "intended-flows.yaml",
+      "caption": "每个预期结果都源自已批准的架构图，包括拒绝项。"
+    },
+    {
+      "id": "probe",
+      "type": "terminal",
+      "title": "测试被拒绝和被允许的流量",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "nc -zv -w 3 10.30.0.15 5432",
+          "output": "nc: connect to 10.30.0.15 port 5432 (tcp) timed out: Operation now in progress",
+          "comment": "从用户区的一台主机运行。F1 预期被阻止，因此超时即为通过。"
+        },
+        {
+          "cmd": "nc -zv -w 3 10.30.0.15 22",
+          "output": "Connection to 10.30.0.15 22 port [tcp/ssh] succeeded!",
+          "comment": "F4 预期被阻止，但 SSH 是开放的：架构漂移。"
+        },
+        {
+          "cmd": "sudo nmap -Pn -p 22,5432 10.30.0.15",
+          "output": "PORT     STATE    SERVICE\n22/tcp   open     ssh\n5432/tcp filtered postgresql",
+          "comment": "对你自己的子网进行授权扫描。“filtered”表示被静默丢弃。"
+        }
+      ],
+      "caption": "仅从实验室主机运行，或在获得书面批准后运行。地址为私有示例地址段。"
+    },
+    {
+      "id": "findings",
+      "type": "text",
+      "markdown": "## 将结果解读为漂移\n\n测试 F4 失败：用户区可以通过 SSH 访问数据库层。这不是测试的缺陷，而是一项架构漂移（architecture drift）发现，即已批准的设计与运行中的系统之间存在差异。\n\n在报告之前先对每项发现分类：\n\n- **未记录的例外（Undocumented exception）。** 存在一条规则，但没有工单或责任人。查明是谁提出的申请。\n- **已接受的风险（Accepted risk）。** 存在一条规则，并有工单和到期日期。确认到期日期得到遵守。\n- **设计缺陷（Design flaw）。** 架构图本身就允许一条不安全的路径。需要修改设计。\n\n沿防火墙策略和变更记录回溯这条规则。防火墙规则的命中次数在 90 天内为零，通常意味着可以安全地删除该规则。命中次数很高则意味着有人依赖它，因此在关闭该路径之前要与责任人协调。无论结果如何，变更之后都要重新测试，并保留变更前后的结果作为证据。从未重新测试的修复只是一种寄望，下一次架构评审会再次发现同样的漏洞。将测试输出与变更工单一起保存，以便审计人员能够追溯完整的来龙去脉。"
+    },
+    {
+      "id": "wf",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从设计主张到发现",
+      "caption": "每一项失败的主张都会成为有责任人的整改项。",
+      "data": {
+        "token": "探测",
+        "nodes": [
+          {
+            "id": "diag",
+            "label": "设计",
+            "sub": "已批准的架构图",
+            "icon": "file"
+          },
+          {
+            "id": "claims",
+            "label": "主张",
+            "sub": "intended-flows.yaml",
+            "icon": "log"
+          },
+          {
+            "id": "test",
+            "label": "测试主机",
+            "sub": "用户区",
+            "icon": "laptop"
+          },
+          {
+            "id": "fw",
+            "label": "防火墙",
+            "sub": "生效中的策略",
+            "icon": "firewall"
+          },
+          {
+            "id": "db",
+            "label": "数据库层",
+            "sub": "10.30.0.0/24",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "diag",
+            "caption": "已批准的架构图规定，用户不得访问数据库层。",
+            "tone": "default"
+          },
+          {
+            "at": "claims",
+            "caption": "每一条箭头和每一项拒绝都被写成带有预期结果的测试。",
+            "tone": "default"
+          },
+          {
+            "at": "test",
+            "caption": "测试人员从用户区探测 TCP/5432 和 TCP/22。",
+            "tone": "warning"
+          },
+          {
+            "at": "fw",
+            "caption": "TCP/5432 被策略丢弃：该主张成立。",
+            "tone": "success"
+          },
+          {
+            "at": "db",
+            "caption": "TCP/22 到达了数据库主机：检测到漂移。",
+            "tone": "danger"
+          },
+          {
+            "at": "diag",
+            "caption": "该发现被记录、分类并分派给责任人整改。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "beyond",
+      "type": "text",
+      "markdown": "## 在网络之外进行验证\n\n网络分段只是其中一层。还要验证另外三个方面。\n\n**身份。** 确认条件访问和 MFA 适用于每一条路径，包括旧版协议和服务账号。使用一个应当被拒绝的实验室用户进行测试，并检查登录日志是否记录了该失败。\n\n**日志记录。** 在每一层生成一个已知事件，并测量它出现在 SIEM 中需要多长时间。保持沉默的层就是盲区，详见[安全监控架构（Security Monitoring Architecture）](/learn/security-operations-dfir/security-monitoring-architecture)。\n\n**故障行为。** 在维护窗口内使某个组件故障：防火墙节点、日志转发器、身份提供商。事先确定设计应当故障关闭（fail closed）还是故障开放（fail open），然后检查它的行为是否与设计所述一致。许多中断和入侵都源于未经规划的默认行为。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "只扫描你拥有的资产",
+      "markdown": "端口扫描和故障切换测试可能触发告警、锁定账号并造成中断。要获得书面批准，向 SOC 通告测试窗口，并且只在有回滚计划的维护窗口内运行故障测试。未经许可，切勿扫描第三方或云服务提供商的基础设施。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "将测试套件自动化",
+      "markdown": "每次网络变更之后运行主张测试套件，其余时间每周运行一次，由定时流水线触发。测试失败会自动创建工单，因此漂移能在数日内被发现，而不是等到下一次审计。将 intended-flows 文件与防火墙配置一起放入版本控制，并要求通过拉取请求（pull request）同时修改两者。这样就不会出现只给其中一方添加例外的情况，评审历史也能解释每条路径存在的原因。将通过率以趋势线的形式报告：变更之后通过率下降，是漂移的早期预警。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "画出一个你自己拥有的三区实验室网络（用户、应用、数据），例如位于不同虚拟交换机上的三台虚拟机。写出五条主张，其中包含两条拒绝，然后在合适的主机上用 `nc -zv -w 3` 或 `nmap -Pn -p` 进行测试。记录每一条的通过或失败，将任何失败归类为未记录的例外、已接受的风险或设计缺陷，并修复一条失败的规则。"
+    },
+    {
+      "id": "kt",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "架构漂移（Architecture drift）",
+          "definition": "已批准的设计与运行中系统之间的差异。"
+        },
+        {
+          "term": "信任边界（Trust boundary）",
+          "definition": "数据跨越不同权限区域的位置。"
+        },
+        {
+          "term": "数据流图（Data flow diagram）",
+          "definition": "展示数据如何在组件之间流动的图。"
+        },
+        {
+          "term": "STRIDE",
+          "definition": "一种威胁模型：仿冒、篡改、抵赖、信息泄露、拒绝服务、权限提升。"
+        },
+        {
+          "term": "分段（Segmentation）",
+          "definition": "将网络隔离开，使只有预期的流量被允许。"
+        },
+        {
+          "term": "否定测试（Negative test）",
+          "definition": "证明某事物被阻止的测试。"
+        },
+        {
+          "term": "故障关闭（Fail closed）",
+          "definition": "发生故障时，默认拒绝流量或访问。"
+        },
+        {
+          "term": "命中次数（Hit count）",
+          "definition": "防火墙规则匹配流量的次数。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "为什么验证套件应当包含被拒绝的流量？",
+          "options": [
+            "被允许的流量从不被测试",
+            "大多数架构失效源于缺失的拒绝规则",
+            "被拒绝的流量运行得更快",
+            "审计人员更喜欢它们"
+          ],
+          "answer": 1,
+          "explanation": "只包含允许路径的套件无法揭示意外的暴露面。"
+        },
+        {
+          "question": "从用户区到数据库的 TCP/22 探测成功了，但设计禁止这样做。这被称为什么？",
+          "options": [
+            "架构漂移",
+            "误报",
+            "正常行为",
+            "扫描器缺陷"
+          ],
+          "answer": 0,
+          "explanation": "运行中的系统与已批准的设计不一致。"
+        },
+        {
+          "question": "以下哪些 STRIDE 类别与日志记录和时间同步有关？（选择所有适用项）",
+          "options": [
+            "抵赖",
+            "仿冒",
+            "篡改",
+            "拒绝服务"
+          ],
+          "answer": [
+            0
+          ],
+          "explanation": "抵赖指行为人否认自己的操作；可靠的日志和同步的时钟可以对抗抵赖。"
+        },
+        {
+          "question": "nmap 的“filtered”状态通常意味着什么？",
+          "options": [
+            "端口是开放的",
+            "数据包被过滤器丢弃，没有响应",
+            "服务崩溃了",
+            "主机已离线"
+          ],
+          "answer": 1,
+          "explanation": "filtered 表示防火墙或 ACL 静默丢弃了探测包，这正是预期的拒绝。"
+        },
+        {
+          "question": "除网络分段之外，还应验证以下哪些方面？（选择所有适用项）",
+          "options": [
+            "身份和 MFA 覆盖范围",
+            "日志是否到达 SIEM",
+            "组件的故障行为",
+            "架构图的颜色"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "身份、日志记录和故障模式都是需要测试的设计主张。"
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## 总结\n\n- 将架构图转换为主张，包括拒绝项，并为每一项设定通过条件。\n- 对每一条跨越信任边界的数据流使用 STRIDE。\n- 从正确的区域发出允许和拒绝探测来测试网络分段，并将失败归类为漂移。\n- 验证身份、日志记录和故障行为，而不仅仅是网络。\n- 将测试套件自动化，使漂移在数日内被发现。继续学习[持续安全改进（Continuous Security Improvement）](/learn/security-operations-dfir/continuous-security-improvement)。"
+    }
+  ]
+}

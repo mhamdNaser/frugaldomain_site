@@ -1,0 +1,273 @@
+{
+  "title": "Günlük Korelasyonu ve Olay Zenginleştirme",
+  "summary": "Farklı günlük (log) kaynaklarındaki olayları nasıl birleştireceğinizi ve bunları varlık, kimlik, konum ve tehdit bağlamıyla nasıl zenginleştireceğinizi SPL ve KQL örnekleriyle öğrenin.",
+  "objectives": [
+    "Korelasyonu ve zenginleştirmeyi ve neden önemli olduklarını açıklamak",
+    "Birleştirmelerin güvenilir olması için zamanı, alanları ve kimlikleri hazırlamak",
+    "SPL ve KQL ile çok kaynaklı bir korelasyon sorgusu yazmak",
+    "Alım zamanı (ingest-time) ve arama zamanı (search-time) zenginleştirme arasında seçim yapmak",
+    "Yaygın korelasyon tuzaklarından kaçınmak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Saat 02:14'te bir güvenlik duvarı 203.0.113.77 adresinden gelen reddedilmiş bir bağlantıyı günlüğe kaydeder. 02:16'da bir VPN ağ geçidi `jdoe` hesabı için başarısız bir oturum açmayı kaydeder. 02:19'da bir etki alanı denetleyicisi (domain controller) aynı hesap için yeni bir ülkeden başarılı bir oturum açmayı günlüğe yazar. Her olay tek başına sıradan bir gürültüdür. Birlikte ise olası bir hesap ele geçirmedir.\n\nHiçbir tekil günlük kaynağı bu hikâyeyi anlatmaz. **Korelasyon (correlation)**, farklı kaynaklardaki olayları ortak alanlar ve zaman üzerinden bağlama uygulamasıdır; **zenginleştirme (enrichment)** ise bir sunucunun sahibinin kim olduğu veya bir adresin düşmanca olarak bilinip bilinmediği gibi bağlam eklemektir. Birlikte, bir yığın satırı analistin harekete geçebileceği kanıta dönüştürürler. Bu ders, Splunk, Elastic ve Microsoft Sentinel için eşit derecede geçerli kavramları kullanarak ikisini de nasıl kuracağınızı gösterir. Ham veri [Merkezi Günlük Yönetimi](/learn/security-operations-dfir/centralized-log-management) ve [Syslog Mimarisi](/learn/security-operations-dfir/syslog-architecture) derslerinden gelir."
+    },
+    {
+      "id": "prereq",
+      "type": "text",
+      "markdown": "## Korelasyonun dayandığı üç şey\n\nTemelleri zayıfsa korelasyon sessizce başarısız olur. Tek bir kural yazmadan önce bunları kontrol edin.\n\n1. **Eşzamanlı zaman.** Güvenlik duvarı saati etki alanı denetleyicisinden altı dakika ileriyse sıralamanız yanlış olur. Her yerde NTP kullanın, zaman damgalarını UTC olarak saklayın ve hem olay zamanını hem de alım zamanını kaydedin.\n2. **Normalleştirilmiş alanlar.** Bir kaynak adrese `src`, bir diğeri `SourceIp`, üçüncüsü `client_ip` der. Tek bir sorgunun hepsi için çalışması amacıyla bunları Elastic Common Schema (ECS), Splunk CIM veya Microsoft ASIM gibi ortak bir şemaya eşleyin.\n3. **Kararlı kimlikler.** Birleştirme anahtarları kaynaklar arasında aynı anlama gelmelidir. `jdoe`, `JDOE` ve `jdoe@example.com` tek bir kişidir. Büyük/küçük harfi ve etki alanı soneklerini alım sırasında normalleştirin.\n\nFaydalı bir alışkanlık, kısa bir **birleştirme anahtarı (join key)** listesi tutmaktır: kullanıcı, sunucu, kaynak IP, hedef IP, süreç kimliği, oturum kimliği ve ağ sensörleri için Zeek'in kullandığı bağlantı uid'si ([Zeek Ağ Güvenliği İzleme](/learn/security-operations-dfir/zeek-network-security-monitoring) dersine bakın)."
+    },
+    {
+      "id": "enrich",
+      "type": "text",
+      "markdown": "## Zenginleştirme kaynakları\n\nZenginleştirme, analistin aksi halde elle soracağı ilk soruları yanıtlar. Her kaynak olaya alanlar ekler.\n\n| Kaynak | Eklenen alanlar | Yanıtladığı soru |\n|:--|:--|:--|\n| Varlık envanteri / CMDB | sahip, kritiklik, iş birimi | \"Bu sunucu ne kadar önemli?\" |\n| Kimlik dizini | departman, yönetici, ayrıcalıklı bayrağı | \"Bu normal bir kullanıcı mı, yoksa etki alanı yöneticisi mi?\" |\n| GeoIP veritabanı | ülke, ASN | \"Bu oturum açma konumu makul mü?\" |\n| Tehdit istihbaratı (Threat intelligence) | gösterge eşleşmesi, besleme, güven düzeyi | \"Bu adresin düşmanca olduğu biliniyor mu?\" |\n| Zafiyet tarayıcısı | sunucudaki açık CVE'ler | \"Bu istismar edilebilir mi?\" |\n| DHCP / VPN günlükleri | IP'den cihaza ve kullanıcıya eşleme | \"Bu adresi 02:19'da kim kullanıyordu?\" |\n\nİki pratik kural geçerlidir. Birincisi, zenginleştirmeyi doğru zamanda yapın. **Alım zamanı (ingest-time)** zenginleştirme aramada hızlıdır ama donmuştur: bir sunucunun sahibi değişirse eski olaylar eski değeri korur. **Arama zamanı (search-time)** zenginleştirme (arama tabloları, birleştirmeler) her zaman günceldir ancak sorgu süresine mal olur. İkincisi, tek bir göstergeye asla güvenmeyin. Bir besleme eşleşmesi önceliği yükseltir, ancak eski veya paylaşılan adresler yanlış pozitiflere yol açar; bu yüzden besleme adını ve güven düzeyini eşleşmenin yanında kaydedin."
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "correlation_account_takeover.spl",
+      "caption": "VPN, etki alanı denetleyicisi ve CMDB verilerini kullanıcıya göre birleştiren, ardından bir arama tablosuyla (lookup) zenginleştiren bir Splunk araması. Dizin ve alan adları örnektir.",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "code": "index=vpn OR index=wineventlog earliest=-30m\n| eval user=lower(coalesce(user, Account_Name))\n| eval stage=case(sourcetype==\"vpn:auth\" AND action==\"failure\",\"vpn_fail\",\n                  EventCode==4624 AND Logon_Type IN (3,10),\"dc_success\")\n| where isnotnull(stage)\n| stats earliest(_time) AS first_seen values(stage) AS stages\n        dc(src_ip) AS src_count values(src_ip) AS src_ips BY user\n| where mvcount(stages)=2 AND src_count>=1\n| lookup asset_cmdb user OUTPUT owner_dept criticality\n| lookup geoip src_ips OUTPUT country\n| table user stages src_ips country owner_dept criticality"
+    },
+    {
+      "id": "kql",
+      "type": "text",
+      "markdown": "## Aynı fikir KQL'de\n\nKavramlar taşınabilirdir. Microsoft Sentinel'de oturum açma tablosunu, varlık verilerinizi tutan bir izleme listesiyle (watchlist) birleştirirsiniz. Aşağıdaki sorgu, 15 dakika içinde birkaç başarısız oturum açmanın ardından başarılı bir oturum açma yapan kullanıcıları bulur.\n\nSorgunun neyi yapmadığına dikkat edin: kullanıcının ele geçirildiğine karar vermez. Analistin karar verebilmesi için kısa, zenginleştirilmiş bir liste üretir. Her zaman dar bir zaman penceresini ve açıklayabileceğiniz bir eşiği tercih edin. \"Beşten fazla başarısızlık\" diyen bir kural savunması ve ayarlanması kolaydır; kimsenin tarif edemediği bir kural ise değildir."
+    },
+    {
+      "id": "kqlcode",
+      "type": "code",
+      "language": "plain",
+      "filename": "failed_then_success.kql",
+      "caption": "Başarısızlıkları izleyen bir başarı, AssetOwners adlı bir izleme listesinden zenginleştirilmiş.",
+      "highlight": [
+        10,
+        11
+      ],
+      "code": "let window = 15m;\nlet fails = SigninLogs\n    | where TimeGenerated > ago(1h) and ResultType != 0\n    | summarize FailCount = count(), FirstFail = min(TimeGenerated) by UserPrincipalName, IPAddress;\nSigninLogs\n| where TimeGenerated > ago(1h) and ResultType == 0\n| join kind=inner fails on UserPrincipalName\n| where TimeGenerated between (FirstFail .. FirstFail + window) and FailCount >= 5\n| extend Country = tostring(LocationDetails.countryOrRegion)\n| join kind=leftouter (_GetWatchlist('AssetOwners')) on $left.UserPrincipalName == $right.SearchKey\n| project TimeGenerated, UserPrincipalName, IPAddress, Country, FailCount, Department, Criticality"
+    },
+    {
+      "id": "seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Üç kaynağı tek bir uyarıda ilişkilendirme",
+      "caption": "Her kaynak tek başına zararsızdır; SIEM bunları kullanıcı anahtarı üzerinden birleştirir.",
+      "data": {
+        "actors": [
+          {
+            "id": "vpn",
+            "label": "VPN ağ geçidi",
+            "sub": "vpn01",
+            "icon": "globe"
+          },
+          {
+            "id": "dc",
+            "label": "Etki alanı denetleyicisi",
+            "sub": "dc01",
+            "icon": "server"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "Korelasyon motoru",
+            "icon": "database"
+          },
+          {
+            "id": "an",
+            "label": "Analist",
+            "sub": "SOC",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "from": "vpn",
+            "to": "siem",
+            "label": "5 başarısız oturum açma",
+            "detail": "user=jdoe src=203.0.113.77",
+            "note": "VPN, kimlik doğrulama başarısızlıklarını normalleştirilmiş bir kullanıcı alanıyla gönderir."
+          },
+          {
+            "from": "dc",
+            "to": "siem",
+            "label": "Başarı 4624",
+            "detail": "user=jdoe type=10",
+            "note": "Dakikalar sonra etki alanı denetleyicisi başarılı bir uzaktan oturum açmayı kaydeder."
+          },
+          {
+            "from": "siem",
+            "to": "siem",
+            "label": "Kullanıcıya göre birleştir",
+            "note": "Kural, 15 dakikalık pencere içinde her iki aşamayı da eşleştirir.",
+            "tone": "warning"
+          },
+          {
+            "from": "siem",
+            "to": "siem",
+            "label": "Zenginleştir",
+            "detail": "GeoIP, CMDB, TI",
+            "note": "Arama tabloları ülke, departman, kritiklik ve besleme güven düzeyini ekler."
+          },
+          {
+            "from": "siem",
+            "to": "an",
+            "label": "Uyarı: olası hesap ele geçirme",
+            "tone": "danger",
+            "note": "Analist, ilgisiz üç satır yerine zenginleştirilmiş tek bir uyarı alır."
+          },
+          {
+            "from": "an",
+            "to": "an",
+            "label": "Doğrula ve müdahale et",
+            "tone": "success",
+            "note": "Kullanıcıyla iletişime geçin, kimlik bilgilerini sıfırlayın ve oturumu inceleyin."
+          }
+        ]
+      }
+    },
+    {
+      "id": "patterns",
+      "type": "text",
+      "markdown": "## Bilinmeye değer dört korelasyon deseni\n\nEn kullanışlı kuralların çoğu dört biçimden birine uyar.\n\n- **Sıralama (Sequence).** A olayını, bir pencere içinde B olayı izler; örneğin başarısız oturum açmaları bir başarının izlemesi. Yukarıdaki sorgulardaki desen budur.\n- **Eşik (Threshold).** Varlık başına pencere başına bir şeyi sayın; örneğin bir sunucudan beş dakikada 100'den fazla farklı hedef bağlantı noktası.\n- **Nadirlik (Rarity).** Varlığın daha önce hiç üretmediği bir değeri işaretleyin; örneğin yeni bir ülkeden ilk oturum açma veya bir sunucuda bir aracın ilk çalıştırılması.\n- **Kaynaklar arası doğrulama (Cross-source confirmation).** İki bağımsız kaynağın hemfikir olmasını isteyin. Şüpheli bir alan adına yapılan DNS sorgusu zayıf bir sinyaldir; aynı sorguyu aynı sunucudan bir proxy bağlantısının izlemesi daha güçlüdür.\n\nBir kural gürültülü olduğunda hangi dört biçimi kullandığını ve başka bir biçimden gelecek ek bir koşulun onu daraltıp daraltamayacağını sorun. Bir eşiği nadirlik kontrolüyle birleştirmek, yanlış pozitifleri yarıya indirmeye çoğunlukla yeter."
+    },
+    {
+      "id": "pitfalls",
+      "type": "text",
+      "markdown": "## Yaygın tuzaklar\n\n- **Aşırı birleştirme.** Ham ve yüksek hacimli günlükleri birleştirmek yavaş ve pahalıdır. Önce her tarafı filtreleyin ve toplulaştırın, ardından küçük sonuçları birleştirin.\n- **Çok geniş zaman pencereleri.** 24 saatlik bir pencere ilgisiz olayları ilişkilendirir. Davranışı yine de yakalayan en kısa pencereyi seçin.\n- **Eskimiş referans verisi.** Geçen çeyreğe ait bir CMDB dışa aktarımı sunucuları yanlış etiketler. Arama tablolarını bir zamanlamayla yenileyin ve yenileme zamanını kaydedin.\n- **Eksik veri.** Bir kaynak veri göndermeyi bırakırsa kural sessizleşir ve sağlıklı görünür. Her kaynak için bir sağlık kontrolü ekleyin; beklenen hacim düştüğünde uyarı verin.\n- **Paylaşılan adresler.** NAT ağ geçitleri ve proxy'ler gerçek istemciyi gizler. Mümkün olduğunda IP yerine kullanıcı veya cihaz anahtarını tercih edin.\n\nKorelasyon kurallarını küçük, yeniden kullanılabilir adımlar olarak oluşturun ve beklenen sonucu kural açıklamasına yazın. Bu şekilde yazılan kurallar, [Sigma Tespit Kuralları](/learn/security-operations-dfir/sigma-detection-rules) dersinde ele alındığı gibi daha sonra taşınabilir bir biçime aktarılabilir."
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Bir olayın neden zenginleştirildiğini kaydedin",
+      "markdown": "Zenginleştirme kaynağını ve sürümünü, eklenen her alanın yanında saklayın; örneğin `enrich.geoip.db=2026-11-01`. Bir analist bir sonucu sorguladığında, onu tam olarak hangi verinin ürettiğini gösterebilirsiniz."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Kendi oluşturduğunuz örnek günlükleri veya bir laboratuvar sanal makinesindeki ücretsiz bir Elastic ya da Splunk örneğini kullanın.\n\n1. İki küçük CSV dosyası oluşturun: `vpn.csv` (time, user, result, src_ip) ve `assets.csv` (user, department, criticality). `192.0.2.x` adreslerini ve sahte kullanıcıları kullanın.\n2. Bunları iki kaynak olarak içeri alın veya bir elektronik tabloya ya da SQLite'a yükleyin.\n3. 15 dakika içinde üç veya daha fazla başarısızlığı bir başarının izlediği kullanıcıları bulan bir sorgu yazın.\n4. `assets.csv` dosyasındaki departmanı ve kritikliği zenginleştirme olarak ekleyin.\n5. Pencereyi 15 dakikadan 24 saate çıkarın ve kaç tane ek, ilgisiz sonucun ortaya çıktığını not edin. Neyi seçeceğinizi ve nedenini tek cümleyle yazın."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Korelasyon (Correlation)",
+          "definition": "Farklı kaynaklardaki olayları ortak alanlar ve zaman üzerinden bağlamak."
+        },
+        {
+          "term": "Zenginleştirme (Enrichment)",
+          "definition": "Bir olaya sahip, konum veya itibar gibi bağlam eklemek."
+        },
+        {
+          "term": "Normalleştirme (Normalization)",
+          "definition": "Kaynağa özgü alan adlarını ortak bir şemaya eşlemek."
+        },
+        {
+          "term": "Birleştirme anahtarı (Join key)",
+          "definition": "Olayları kaynaklar arasında eşleştirmek için kullanılan, kullanıcı veya sunucu gibi bir alan."
+        },
+        {
+          "term": "Arama tablosu (Lookup)",
+          "definition": "Arama zamanında alan ekleyen bir referans tablosu."
+        },
+        {
+          "term": "ECS / CIM / ASIM",
+          "definition": "Elastic, Splunk ve Microsoft Sentinel tarafından kullanılan ortak şemalar."
+        },
+        {
+          "term": "Zaman penceresi (Time window)",
+          "definition": "İlişkili olayların içinde gerçekleşmesi gereken en uzun aralık."
+        },
+        {
+          "term": "Tehdit istihbaratı (Threat intelligence)",
+          "definition": "Bilinen düşmanca altyapı hakkındaki göstergeler ve bağlam."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı kontrol edin",
+      "questions": [
+        {
+          "question": "Günlük kaynakları arasındaki saat kayması korelasyonu neden bozar?",
+          "options": [
+            "Depolama kullanımını artırır",
+            "Olaylar yanlış sırada veya pencerenin dışında görünür",
+            "Arama tablolarını devre dışı bırakır",
+            "Kullanıcı adını değiştirir"
+          ],
+          "answer": 1,
+          "explanation": "Korelasyon, sıraya ve zaman pencerelerine dayanır. Saatler farklıysa ilişkili olaylar pencerenin dışına düşebilir veya sırası tersine dönebilir."
+        },
+        {
+          "question": "Arama zamanı zenginleştirmenin, alım zamanı zenginleştirmeye göre ana avantajı nedir?",
+          "options": [
+            "Her zaman daha hızlıdır",
+            "Her zaman güncel referans verisini kullanır",
+            "Hiç referans verisi gerektirmez",
+            "Yinelenenleri kaldırır"
+          ],
+          "answer": 1,
+          "explanation": "Arama zamanı sorguları, ek sorgu süresi karşılığında en güncel tabloyu yansıtır. Alım zamanı değerleri ise toplama anında donar."
+        },
+        {
+          "question": "İyi bir birleştirme anahtarı listesinde hangileri yer alır? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "Normalleştirilmiş kullanıcı adı",
+            "Sunucu adı",
+            "Oturum veya bağlantı kimliği",
+            "Panonun rengi"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Kullanıcı, sunucu ve oturum tanımlayıcıları normalleştirildiğinde kaynaklar arasında kararlıdır. Pano rengi ilgisizdir."
+        },
+        {
+          "question": "Bir günlük kaynağı çevrimdışı olduktan sonra bir korelasyon kuralı tetiklenmeyi bırakıyor. Hangi kontrol bunu yakalardı?",
+          "options": [
+            "Daha geniş bir zaman penceresi",
+            "Kaynak sağlığı veya hacim düşüşü uyarısı",
+            "Daha büyük bir pano",
+            "Daha fazla tehdit beslemesi"
+          ],
+          "answer": 1,
+          "explanation": "Sessiz kaynaklar, kurallar kör olduğu hâlde sağlıklı görünmesine yol açar. Kaynak başına beklenen hacmi izleyin."
+        },
+        {
+          "question": "Yalnızca bir tehdit istihbaratı eşleşmesi bir olayı kötü amaçlı olarak nitelemek için neden yeterli değildir?",
+          "options": [
+            "Beslemeler her zaman yanlıştır",
+            "Adresler eski, paylaşılan veya düşük güvenilirlikli olabilir",
+            "Eşleşmeler saklanamaz",
+            "Beslemeler yalnızca iç IP'leri kapsar"
+          ],
+          "answer": 1,
+          "explanation": "Bir eşleşme önceliği yükseltir ancak bağlama ihtiyaç duyar. Besleme adını ve güven düzeyini kaydedin ve diğer kanıtlarla doğrulayın."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- Korelasyon olayları kaynaklar arasında bağlar; zenginleştirme ise analistin aksi halde elle arayacağı bağlamı ekler.\n- Güvenilir korelasyon; eşzamanlı zaman, normalleştirilmiş alanlar ve kararlı kimlikler gerektirir.\n- Alım zamanı veya arama zamanı zenginleştirmeyi bilinçli seçin ve zenginleştirilmiş alanların kaynağını her zaman kaydedin.\n- Pencereleri dar, eşikleri açıklanabilir tutun ve kaynakları sessizliğe karşı izleyin.\n- İyi korelasyonun çıktısı, [Güvenlik Uyarısı Triyajı](/learn/security-operations-dfir/security-alert-triage) dersine girdi olan zenginleştirilmiş bir uyarıdır."
+    }
+  ]
+}

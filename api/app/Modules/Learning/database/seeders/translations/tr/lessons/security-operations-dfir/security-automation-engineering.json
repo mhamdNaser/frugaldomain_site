@@ -1,0 +1,316 @@
+{
+  "title": "Güvenlik Otomasyonu Mühendisliği (Security Automation Engineering)",
+  "summary": "Hangi güvenlik görevlerinin otomatikleştirileceğini, oyun kitaplarına (playbook) ve betiklere nasıl koruyucu sınırlar (guardrail) yerleştirileceğini ve insanların döngüde nerede kalması gerektiğini öğrenin.",
+  "objectives": [
+    "Güvenlik görevlerini otomasyona uygunluk açısından puanlamak",
+    "SOAR platformlarını betikle yapılan otomasyonla karşılaştırmak",
+    "Koruyucu sınırlar oluşturmak: kuru çalıştırma (dry run), idempotentlik (idempotency), hız sınırları ve denetim günlükleri",
+    "İnsan onay kapısı olan bir iş akışı tasarlamak",
+    "Yaygın otomasyon hata modlarını belirlemek ve hafifletmek"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "SOC'unuz günde 600 alarmı kapatıyor. Yüzde kırkı aynı üç zararsız örüntüdür ve her biri bir analistin dört dakikasını alır: ana bilgisayarın sahibini bul, son alarmlara bak, kullanıcının son oturum açışını bul, bileti kapat. Bu, 16 analist-saatlik tekrarlayan iştir ve yığındaki tek gerçek saldırı, diğerleriyle aynı yorgun dikkati alır.\n\n**Güvenlik otomasyonu mühendisliği (security automation engineering)** bu işi yazılım olarak ele alır. Bağlam toplayan, düşük riskli kararları kendi başına veren ve zor kararları kanıtlar zaten eklenmiş hâlde insanlara devreden iş akışları tasarlarsınız. Bu ders [Kurumsal Güvenlik Mühendisliği](/learn/security-operations-dfir/enterprise-security-engineering) dersinin üzerine kurulur ve [Sürekli Güvenlik İyileştirme](/learn/security-operations-dfir/continuous-security-improvement) dersine açılır."
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## Adım 1: Neyin otomasyonu hak ettiğine karar verin\n\nHer görev otomatikleştirilmemelidir. Her adayı üç soruyla puanlayın: ne sıklıkla oluyor, doğru yanıt ne kadar öngörülebilir ve yanlış bir eylem ne kadar kötü?\n\n| Görev | Sıklık | Öngörülebilir mi? | Hata maliyeti | Karar |\n|:--|:--|:--|:--|:--|\n| Ana bilgisayar sahibini ve kritikliğini sorgula | Çok yüksek | Evet | Yok | Tamamen otomatikleştir |\n| URL ve hash itibarını kontrol et | Çok yüksek | Çoğunlukla | Düşük | Tamamen otomatikleştir |\n| Bilinen zararsız tarayıcı alarmlarını kapat | Yüksek | Evet | Düşük, geri alınabilir | Günlük kaydıyla otomatikleştir |\n| Bir kullanıcı hesabını devre dışı bırak | Orta | Duruma bağlı | Yüksek | İnsan onayıyla otomatikleştir |\n| Bir üretim sunucusunu izole et | Düşük | Hayır | Çok yüksek | Yalnızca öner |\n\nTablonun en üstünden başlayın. Zenginleştirme (enrichment) yalnızca veri okuduğu için en güvenli ilk hedeftir. Yalnızca önceki adımlar haftalarca güvenilir şekilde çalıştıktan sonra aşağı inin."
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## Adım 2: Doğru aracı seçin\n\nBir **SOAR** platformu (Security Orchestration, Automation and Response; Güvenlik Orkestrasyonu, Otomasyonu ve Müdahalesi) size bağlayıcılar, görsel bir tasarımcı, vaka yönetimi ve denetim izleri sağlar. Düz betikler size esneklik ve kolay sürüm kontrolü sağlar. Birçok ekip ikisini de kullanır: iş akışı ve onaylar için SOAR, özel mantık için küçük, test edilmiş işlevler.\n\nHangisini seçerseniz seçin, yazılım mühendisliği kurallarını uygulayın: iş akışlarını Git'te tutun, değişiklikleri inceleyin, kaydedilmiş örnek alarmlarla testler yazın ve entegrasyonların sürümlerini sabitleyin. [İleri Düzey Tespit Mühendisliği](/learn/security-operations-dfir/advanced-detection-engineering) dersinde anlatıldığı gibi tespitleri yayına alan aynı işlem hattı (pipeline) otomasyonu da yayına almalıdır."
+    },
+    {
+      "id": "code-intro",
+      "type": "text",
+      "markdown": "## Adım 3: Koruyucu sınırları koda yerleştirin\n\nAşağıdaki betik bir alarmı zenginleştirir ve ardından üç sonuçtan birini seçer. Onu yalnızca yararlı yapan şeye değil, güvenli yapan şeye bakın: varsayılan olarak kuru çalıştırma (dry-run) kipinde çalışır, belirtecini (token) ortamdan okur, daha önce işlediği alarmları atlar, kritik varlıklara dokunan her şeyi yükseltir (escalate) ve her kararı yapılandırılmış JSON olarak kaydeder."
+    },
+    {
+      "id": "triage-code",
+      "type": "code",
+      "language": "python",
+      "code": "#!/usr/bin/env python3\n\"\"\"Enrich a SIEM alert, then decide: auto-close, ask a human, or contain.\"\"\"\nimport json, os, sys, time, requests\n\nSIEM = \"https://siem.example.com/api\"\nTOKEN = os.environ[\"SIEM_API_TOKEN\"]          # never hard-code secrets\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"1\") == \"1\"  # safe by default\nMAX_ISOLATIONS_PER_HOUR = 3                   # guardrail against runaway loops\n\ndef api(method, path, **kw):\n    r = requests.request(method, f\"{SIEM}{path}\", timeout=10,\n                         headers={\"Authorization\": f\"Bearer {TOKEN}\"}, **kw)\n    r.raise_for_status()\n    return r.json()\n\ndef audit(alert_id, action, detail):\n    # every decision is written down, including \"did nothing\"\n    print(json.dumps({\"ts\": int(time.time()), \"alert\": alert_id,\n                      \"action\": action, \"detail\": detail}))\n\ndef handle(alert_id):\n    a = api(\"GET\", f\"/alerts/{alert_id}\")\n    if a.get(\"handled_by\"):                    # idempotent: skip repeated runs\n        return audit(alert_id, \"skip\", \"already handled\")\n    host = a[\"host\"]\n    ctx = api(\"GET\", f\"/assets/{host}\")        # owner, criticality, tags\n    seen = api(\"GET\", f\"/alerts?host={host}&window=24h\")[\"count\"]\n\n    if ctx[\"criticality\"] == \"high\" or ctx[\"tags\"].count(\"server\"):\n        return audit(alert_id, \"escalate\", f\"{host} is critical, human decides\")\n    if seen >= 3 and a[\"severity\"] >= 7:\n        if DRY_RUN:\n            return audit(alert_id, \"would-isolate\", host)\n        api(\"POST\", f\"/hosts/{host}/isolate\", json={\"reason\": alert_id})\n        return audit(alert_id, \"isolated\", host)\n    api(\"POST\", f\"/alerts/{alert_id}/close\", json={\"verdict\": \"benign-known\"})\n    audit(alert_id, \"closed\", \"low severity, no repeats\")\n\nif __name__ == \"__main__\":\n    handle(sys.argv[1])",
+      "filename": "triage.py",
+      "caption": "Kuru çalıştırma, idempotentlik, yükseltme ve denetim günlüğü içeren bir alarm triyaj betiği."
+    },
+    {
+      "id": "run",
+      "type": "text",
+      "markdown": "## Adım 4: Önce kuru çalıştırmada test edin\n\nBetiği gerçek alarmlara karşı `DRY_RUN=1` ile çalıştırın ve denetim günlüğünü okuyun. İlk çalıştırma betiğin bir iş istasyonunu izole edeceğini, ikincisi bir üretim veritabanına dokunmak yerine onu yükselteceğini, üçüncüsü ise yinelenen bir tetiklemenin hiçbir şey yapmadığını gösterir. Bu üç özellik (güvenli önizleme, kritik varlık dışlaması, idempotentlik) gerçek eylemleri etkinleştirmeden önce kontrol ettiğiniz şeylerdir."
+    },
+    {
+      "id": "run-term",
+      "type": "terminal",
+      "title": "Kuru çalıştırma sonuçları",
+      "lines": [
+        {
+          "cmd": "DRY_RUN=1 python triage.py ALRT-5521"
+        },
+        {
+          "output": "{\"ts\": 1767225600, \"alert\": \"ALRT-5521\", \"action\": \"would-isolate\", \"detail\": \"ws-0412.example.com\"}",
+          "comment": "kuru çalıştırma: hiçbir şey değişmedi, karar kaydedildi"
+        },
+        {
+          "cmd": "DRY_RUN=1 python triage.py ALRT-5522"
+        },
+        {
+          "output": "{\"ts\": 1767225604, \"alert\": \"ALRT-5522\", \"action\": \"escalate\", \"detail\": \"db-prod-01.example.com is critical, human decides\"}"
+        },
+        {
+          "cmd": "python triage.py ALRT-5521"
+        },
+        {
+          "output": "{\"ts\": 1767225610, \"alert\": \"ALRT-5521\", \"action\": \"skip\", \"detail\": \"already handled\"}",
+          "comment": "idempotentlik: yinelenen bir tetikleme zararsızdır"
+        }
+      ],
+      "caption": "Üç çalıştırma: bir önizleme, bir yükseltme ve yinelenen bir tetikleme."
+    },
+    {
+      "id": "flow",
+      "type": "text",
+      "markdown": "## Adım 5: İnsanları yargı gereken yerlere koyun\n\nİyi iş akışları tahmin yürütmek yerine onay için duraklar. Sıra diyagramı, sistemin ayak işini yaptığı ve bir kişinin tek riskli eylemi onayladığı otomatik bir müdahaleyi gösterir."
+    },
+    {
+      "id": "auto-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "İnsan onay kapısı olan otomatik müdahale",
+      "caption": "Sistem ayak işini yapar; riskli adımı bir kişi onaylar.",
+      "data": {
+        "actors": [
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "Alarm kaynağı",
+            "icon": "log"
+          },
+          {
+            "id": "soar",
+            "label": "SOAR",
+            "sub": "Oyun kitabı (playbook) çalıştırıcısı",
+            "icon": "cpu"
+          },
+          {
+            "id": "ti",
+            "label": "Tehdit istihbaratı + CMDB",
+            "sub": "Bağlam",
+            "icon": "database"
+          },
+          {
+            "id": "an",
+            "label": "Analist",
+            "sub": "Onaylayan",
+            "icon": "user"
+          },
+          {
+            "id": "edr",
+            "label": "EDR",
+            "sub": "Sınırlama (containment)",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "from": "siem",
+            "to": "soar",
+            "label": "Alarm ALRT-5521",
+            "detail": "Web kancası (webhook)",
+            "note": "SIEM yüksek önem dereceli bir alarm gönderir ve oyun kitabı başlar."
+          },
+          {
+            "from": "soar",
+            "to": "ti",
+            "label": "Zenginleştir",
+            "detail": "ana bilgisayar, kullanıcı, hash",
+            "note": "Oyun kitabı sahibi, kritikliği ve itibarı toplar."
+          },
+          {
+            "from": "ti",
+            "to": "soar",
+            "label": "Bağlam döndü",
+            "detail": "iş istasyonu, finans",
+            "note": "Salt okunur adımlar yan etkisiz tamamlandı.",
+            "tone": "secure"
+          },
+          {
+            "from": "soar",
+            "to": "an",
+            "label": "Onay isteği",
+            "detail": "özet + kanıt",
+            "note": "Bir sohbet mesajı kanıtı gösterir ve izolasyon için onay ister.",
+            "tone": "warning"
+          },
+          {
+            "from": "an",
+            "to": "soar",
+            "label": "Onaylandı",
+            "detail": "analist tarafından",
+            "note": "Bir kişi riskli eylemin sorumluluğunu üstlenir.",
+            "tone": "success"
+          },
+          {
+            "from": "soar",
+            "to": "edr",
+            "label": "Ana bilgisayarı izole et",
+            "detail": "ws-0412",
+            "note": "EDR API çağrısı, gerekçe olarak bilet kimliğiyle çalışır.",
+            "tone": "blocked"
+          },
+          {
+            "from": "soar",
+            "to": "soar",
+            "label": "Denetim girdisi yazıldı",
+            "detail": "kim, ne, ne zaman",
+            "note": "Vaka, karar izini ve bir geri alma komutunu kaydeder.",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "fail",
+      "type": "text",
+      "markdown": "## Karşı tasarım yapılması gereken hata modları\n\nOtomasyon, elle yapılan işin başarısız olmadığı şekillerde başarısız olur, çünkü hızlı ve ölçekli başarısız olur.\n\n- **Kontrolden çıkan döngüler.** Kendi eyleminin yarattığı bir alarmla tetiklenen bir izolasyon oyun kitabı. Saatte üç izolasyon gibi hız sınırları ve genel bir duraklatma anahtarı ekleyin.\n- **Eskimiş kimlik bilgileri.** Bir hizmet hesabı belirtecinin süresi dolar ve oyun kitabı sessizce durur. Oyun kitabı hatalarında alarm üretin ve günlük bir kalp atışı (heartbeat) testi çalıştırın.\n- **İncelenmemiş dışlamalar.** Gürültülü bir haftada eklenen bir izin listesi sonsuza dek yaşar. Her dışlamaya bir sahip ve son kullanma tarihi verin.\n- **Aşırı güven.** Analistler otomatik kararları kontrol etmeyi bırakır. Her hafta otomatik kapatılan alarmların %5'ini insan incelemesi için örnekleyin.\n- **Gizli bağımlılıklar.** Üçüncü taraf bir API yanıt biçimini değiştirir. Sürümleri sabitleyin ve entegrasyonları zamanlanmış olarak test edin."
+    },
+    {
+      "id": "warn-auto",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Otomatik sınırlama, kendi ağınıza doğrultulmuş bir silahtır",
+      "markdown": "Bir hata, sahte bir alarm veya kötü bir izin listesi, oyun kitabınızın yanlış makineleri ölçekli olarak izole etmesine yol açabilir. Geri alınması zor her şey için onay isteyin, kritik varlıkları varsayılan olarak dışlayın ve her eylem için test edilmiş bir geri alma yöntemi bulundurun."
+    },
+    {
+      "id": "tip-measure",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Geri verdiğiniz zamanı ölçün",
+      "markdown": "Alarm türü başına kazanılan dakikaları, otomasyonla tamamen işlenen alarmların oranını ve yanlış eylem oranını izleyin. SOC yöneticisine bir sayı gösteremezseniz, bir sonraki otomasyon projesi fon bulamaz."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "1. Bir laboratuvarda betiği kopyalayın ve SIEM çağrılarını üç sahte alarm ve varlık içeren yerel bir JSON dosyasıyla değiştirin.\n2. Betiği `DRY_RUN=1` ile çalıştırın ve her alarmın beklenen eylemi aldığını doğrulayın.\n3. Bir koruyucu sınır ekleyin: adı `dc-` ile başlayan hiçbir ana bilgisayar üzerinde işlem yapmayı reddedin.\n4. Aynı alarmı iki kez çalıştıran ve ikinci çalıştırmanın `skip` kaydettiğini doğrulayan bir test yazın.\n5. Bir hız sınırı ekleyin ve on ana bilgisayar için on alarm vererek çalıştığını kanıtlayın."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "SOAR",
+          "definition": "Araçları orkestre eden ve müdahale adımlarını vaka yönetimi ve denetim izleriyle otomatikleştiren bir platform."
+        },
+        {
+          "term": "Zenginleştirme (Enrichment)",
+          "definition": "Bir alarma sahibi, kritiklik ve itibar gibi bağlam ekleme."
+        },
+        {
+          "term": "İdempotentlik (Idempotency)",
+          "definition": "Bir eylemi iki kez çalıştırmanın, bir kez çalıştırmakla aynı etkiye sahip olması özelliği."
+        },
+        {
+          "term": "Kuru çalıştırma (Dry run)",
+          "definition": "Bir iş akışını, değişiklik yapmadan kararları raporlayacak şekilde yürütme."
+        },
+        {
+          "term": "Koruyucu sınır (Guardrail)",
+          "definition": "Otomasyonun zarar vermesini önleyen, hız sınırı veya dışlama listesi gibi yerleşik bir sınır."
+        },
+        {
+          "term": "Döngüde insan (Human in the loop)",
+          "definition": "Riskli bir eylemden önce bir kişinin onayını gerektiren iş akışı adımı."
+        },
+        {
+          "term": "Denetim izi (Audit trail)",
+          "definition": "Neyin, kim tarafından ve ne zaman kararlaştırıldığını gösteren, kurcalamaya dayanıklı kayıt."
+        },
+        {
+          "term": "Geri alma (Rollback)",
+          "definition": "Otomatik bir eylemi tersine çeviren, test edilmiş bir prosedür."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı kontrol edin",
+      "questions": [
+        {
+          "question": "Tam otomasyon için en güvenli ilk aday hangi görevdir?",
+          "options": [
+            "Üretim sunucularını izole etmek",
+            "Ana bilgisayar sahibini ve kritikliğini sorgulamak",
+            "Kullanıcı hesaplarını silmek",
+            "Güvenlik duvarı kurallarını değiştirmek"
+          ],
+          "answer": 1,
+          "explanation": "Zenginleştirme salt okunurdur, sık yapılır ve öngörülebilirdir, bu yüzden hataların maliyeti neredeyse yoktur."
+        },
+        {
+          "question": "İdempotentlik (idempotency) neye karşı korur?",
+          "options": [
+            "Yavaş API çağrılarına",
+            "Yinelenen tetiklemelerin tekrarlanan eylemlere yol açmasına",
+            "Zayıf parolalara",
+            "Eksik günlüklere"
+          ],
+          "answer": 1,
+          "explanation": "Aynı alarm iki kez tetiklenirse, idempotent bir iş akışı bunu tanır ve yeniden işlem yapmaz."
+        },
+        {
+          "question": "Bir izolasyon oyun kitabı için hangileri iyi koruyucu sınırlardır? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "Saatlik bir hız sınırı",
+            "Etki alanı denetleyicilerini varsayılan olarak dışlamak",
+            "API belirtecini betiğe sabit olarak yazmak",
+            "Genel bir duraklatma anahtarı"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Hız sınırları, dışlamalar ve bir acil durdurma anahtarı zararı sınırlar. Koda gömülü gizli bilgiler bir koruyucu sınır değil, bir güvenlik açığıdır."
+        },
+        {
+          "question": "Her izin listesi girdisinin neden bir sahibi ve bir son kullanma tarihi olmalıdır?",
+          "options": [
+            "Listeyi uzatmak için",
+            "Dışlamalar sonsuza dek yaşamak yerine incelensin diye",
+            "SOAR bunu gerektirdiği için",
+            "Lisans maliyetlerini düşürmek için"
+          ],
+          "answer": 1,
+          "explanation": "İncelenmemiş dışlamalar sessizce kör noktalara dönüşür."
+        },
+        {
+          "question": "Hangi uygulamalar analistlerin otomasyona aşırı güvenmesini önler? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "Otomatik kapatılan alarmları inceleme için örneklemek",
+            "Her otomatik kararı kaydetmek",
+            "Otomatik kararları biletten gizlemek",
+            "Yanlış eylem oranını izlemek"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Örnekleme, günlük kaydı ve hataları ölçmek otomasyonu hesap verebilir tutar. Kararları gizlemek, inceleyenlerin ihtiyaç duyduğu kanıtı ortadan kaldırır."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- Otomasyon hedeflerini sıklık, öngörülebilirlik ve hata maliyetine göre seçin; salt okunur zenginleştirmeyle başlayın.\n- İş akışı ve onaylar için SOAR kullanın, mantığı testlerle birlikte sürüm kontrolünde tutun.\n- Koruyucu sınırlar oluşturun: kuru çalıştırma, idempotentlik, hız sınırları, dışlamalar, denetim günlüğü ve geri alma.\n- Geri alınması zor eylemlerde insanları döngüde tutun.\n- Kazanılan zamanı ve hata oranlarını ölçün, otomatik kararları inceleme için örnekleyin.\n\nBu dersteki ölçümler doğrudan [Sürekli Güvenlik İyileştirme](/learn/security-operations-dfir/continuous-security-improvement) dersine girdi olur."
+    }
+  ]
+}

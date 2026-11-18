@@ -1,0 +1,299 @@
+{
+  "title": "İleri Düzey Linux Çekirdek Güvenliği",
+  "summary": "Linux çekirdeğinin yerleşik korumalarını, bunları nasıl sıkılaştırıp denetleyeceğinizi ve şüpheli bir ana makinede çekirdek düzeyinde kurcalama olup olmadığını nasıl doğrulayacağınızı öğrenin.",
+  "objectives": [
+    "Başlıca Linux çekirdek korumalarını ve her birinin neyi engellediğini açıklamak",
+    "sysctl ve önyükleme parametresi sıkılaştırma tabanı uygulamak",
+    "Çekirdek düzeyindeki olaylar için auditd kuralları yapılandırmak",
+    "Kirlenme bayrakları (taint flags), modül görünümleri ve eBPF listeleriyle şüpheli bir ana makineyi doğrulamak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Bir müdahaleci, \"yavaş hissettiren\" bir web sunucusuna çağrılır. EDR hiçbir şey göstermiyor, `ps` normal görünüyor ve uygulama günlükleri temiz. Yine de nadir bir hedefe giden dış trafik birkaç dakikada bir sürüyor. Süreç listesine güvenilemediğinde soru bir katman aşağı iner: **çekirdek ne yapıyor?**\n\nLinux çekirdeği, ana makinedeki en yetkili koddur. Günlük toplama aracınız dâhil her şey, gerçeği bildirmesi için ona güvenir. Bu yüzden çekirdek güvenliği bir savunucu için iki kez önemlidir: saldırganın çekirdeği kolayca kurcalayamaması için onu **sıkılaştırmalı** ve bir ana makine şüpheli olduğunda onu nasıl **doğrulayacağınızı** bilmelisiniz. Bu ders savunma odaklı kalır. Çekirdeğin sunduğu korumaları, bunları nasıl yapılandırıp denetleyeceğinizi ve sahip olduğunuz sistemlerde çekirdek düzeyinde kurcalama belirtilerini nasıl fark edeceğinizi öğreneceksiniz. Ders, [Hipervizör ve Sanallaştırma İç Yapısı](/learn/security-operations-dfir/hypervisor-and-virtualization-internals) dersinin üzerine kurulur ve [Bellek Adli Bilişimi ve Kötü Amaçlı Yazılım Analizi](/learn/security-operations-dfir/memory-forensics-and-malware-analysis) dersine temel oluşturur."
+    },
+    {
+      "id": "protections",
+      "type": "text",
+      "markdown": "## Çekirdeğin yerleşik korumaları\n\nModern çekirdekler birçok katmanla gelir. Her birinin neyi durdurduğunu bilin, çünkü eksik bir katman soruşturma biçiminizi şekillendirir.\n\n| Koruma | Ne yapar | Nerede kontrol edilir |\n|:--|:--|:--|\n| **KASLR** | Çekirdeğin yüklenme adresini rastgeleleştirir; böylece sabit adresler varsayılamaz | `dmesg`, `/proc/kallsyms` (root olmayanlar için sıfırlar) |\n| **SMEP / SMAP** | Çekirdeğin yanlışlıkla kullanıcı alanı belleğini çalıştırmasını veya okumasını engelleyen CPU özellikleri | `grep -o 'smep' /proc/cpuinfo` |\n| **Modül imzalama (Module signing)** | İmzasız çekirdek modüllerini reddeder | `/proc/sys/kernel/modules_disabled`, çekirdek yapılandırması |\n| **Kilitleme modu (Lockdown mode)** | Root'un çalışan çekirdeği değiştirmesini engeller (`/dev/mem`, imzasız modüller, kexec) | `/sys/kernel/security/lockdown` |\n| **Seccomp** | Bir sürecin hangi sistem çağrılarını kullanabileceğini filtreler | `grep Seccomp /proc/<pid>/status` |\n| **LSM'ler** (SELinux, AppArmor) | Dosya izinlerinin üzerine zorunlu erişim denetimi getirir | `getenforce`, `aa-status` |\n| **Güvenli Önyükleme (Secure Boot)** | Başlangıçta önyükleyici ve çekirdek imzasını doğrular | `mokutil --sb-state` |\n\nTek bir denetim yeterli değildir. Secure Boot önyükleme zincirini korur, kilitleme modu çalışan çekirdeği root'tan korur ve bir LSM, ele geçirilmiş bir hizmetin ilk etapta nelere erişebileceğini sınırlar. Birlikte, \"makinede root olmak\" durumunu \"oyun bitti\" olmaktan çıkarıp saldırgan için çok daha zor bir konuma dönüştürürler."
+    },
+    {
+      "id": "syscall-anim",
+      "type": "animation",
+      "kind": "layers",
+      "title": "Bir sistem çağrısının geçtiği katmanlar",
+      "caption": "Her katman isteği durdurabilir; birden çok katmanda günlük tutmak size kanıt sağlar.",
+      "data": {
+        "layers": [
+          {
+            "label": "Süreç",
+            "sub": "kullanıcı alanı"
+          },
+          {
+            "label": "Seccomp filtresi",
+            "sub": "sistem çağrısı izin listesi"
+          },
+          {
+            "label": "LSM kancası",
+            "sub": "SELinux / AppArmor"
+          },
+          {
+            "label": "Denetim alt sistemi",
+            "sub": "auditd kuralları"
+          },
+          {
+            "label": "Çekirdek",
+            "sub": "ring 0"
+          }
+        ],
+        "steps": [
+          {
+            "layer": 0,
+            "packet": [
+              "open()"
+            ],
+            "caption": "Bir web hizmeti bir dosya üzerinde open() çağırır."
+          },
+          {
+            "layer": 1,
+            "packet": [
+              "open()",
+              "seccomp"
+            ],
+            "caption": "Seccomp profili open() çağrısına izin verir, bu yüzden çağrı devam eder. Yasaklı bir çağrı burada sonlandırılırdı."
+          },
+          {
+            "layer": 2,
+            "packet": [
+              "open()",
+              "etiket"
+            ],
+            "caption": "LSM, süreç etiketini dosya etiketiyle karşılaştırır ve /etc/shadow dosyasına erişimi reddeder."
+          },
+          {
+            "layer": 3,
+            "packet": [
+              "open()",
+              "reddedildi"
+            ],
+            "caption": "Ret, SIEM'inizin uyarı verebileceği bir AVC kaydı olarak yazılır."
+          },
+          {
+            "layer": 4,
+            "packet": [
+              "EACCES"
+            ],
+            "caption": "Çekirdek sürece bir hata döndürür; dosya hiçbir zaman okunmadı."
+          }
+        ]
+      }
+    },
+    {
+      "id": "sysctl",
+      "type": "text",
+      "markdown": "## sysctl ve önyükleme parametreleriyle sıkılaştırma\n\nÇekirdek savunmalarının çoğu ayarlanabilir değerlerdir. Yeniden başlatmalardan sonra da korunmaları ve sürüm kontrolünde gözden geçirilebilmeleri için bunları bir drop-in dosyasına yerleştirin."
+    },
+    {
+      "id": "sysctl-code",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/sysctl.d/90-hardening.conf",
+      "caption": "Çekirdek sıkılaştırma tabanı",
+      "highlight": [
+        2,
+        5,
+        8
+      ],
+      "code": "# Hide kernel pointers and dmesg from unprivileged users\nkernel.kptr_restrict = 2\nkernel.dmesg_restrict = 1\n# Block unprivileged eBPF and restrict ptrace to parent processes\nkernel.unprivileged_bpf_disabled = 1\nkernel.yama.ptrace_scope = 1\n# Do not allow core dumps from setuid programs; limit perf use\nfs.suid_dumpable = 0\nkernel.perf_event_paranoid = 3\n# Network hygiene frequently checked in audits\nnet.ipv4.conf.all.rp_filter = 1\nnet.ipv4.conf.all.accept_redirects = 0"
+    },
+    {
+      "id": "sysctl-explain",
+      "type": "text",
+      "markdown": "`kptr_restrict = 2` çekirdek adreslerini herkesten gizler; bu da adres sızdırma tekniklerini zayıflatır. `unprivileged_bpf_disabled = 1` iyi bilinen bir saldırı yüzeyini kapatır, çünkü eBPF çekirdek içinde kod çalıştırır. `ptrace_scope = 1` bir sürecin ilgisiz bir sürecin belleğini okumasını engeller; bu da bellekten kimlik bilgisi hırsızlığını köreltir.\n\nÖnyükleme parametreleri daha fazlasını ekler. `lockdown=integrity` kilitleme modunu etkinleştirir, `module.sig_enforce=1` imzalı modülleri zorunlu kılar ve `init_on_alloc=1` bellek ayrılırken belleği sıfırlar. Bunları ayarladıktan sonra `cat /proc/cmdline` ile doğrulayın. Üretim ortamında, bazı sürücüler ve izleme araçları eBPF veya ptrace gerektirdiğinden, her değişikliği önce bir hazırlık (staging) ana makinesinde test edin."
+    },
+    {
+      "id": "audit",
+      "type": "text",
+      "markdown": "## Çekirdek düzeyindeki olayları denetleme\n\nHiç kaydedilmemiş bir şeyi soruşturamazsınız. `auditd` çekirdeğe kanca atar ve güvenlikle ilgili olayları kaydeder. Çekirdeğin kendisini değiştiren eylemlere odaklanın: modül yükleme, saati değiştirme, `ptrace` kullanma ve denetim kurallarını değiştirme."
+    },
+    {
+      "id": "audit-term",
+      "type": "terminal",
+      "title": "auditd kuralları ve bir modül yükleme olayı",
+      "prompt": "root@host:~#",
+      "lines": [
+        {
+          "cmd": "cat /etc/audit/rules.d/kernel.rules",
+          "output": "-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k kmod\n-a always,exit -F arch=b64 -S ptrace -k ptrace_use\n-w /etc/audit/ -p wa -k audit_config\n-e 2",
+          "comment": "Sondaki -e 2, kuralları yeniden başlatmaya kadar kilitler"
+        },
+        {
+          "cmd": "augenrules --load && auditctl -s | head -3",
+          "output": "enabled 2\nfailure 1\npid 812"
+        },
+        {
+          "cmd": "ausearch -k kmod -i --start today",
+          "output": "type=SYSCALL msg=audit(11/11/2026 09:14:02.113:5521) : arch=x86_64 syscall=finit_module success=yes exit=0 auid=admin uid=root exe=/usr/sbin/modprobe comm=modprobe key=kmod\ntype=PATH ... name=/lib/modules/6.8.0/extra/diag_helper.ko",
+          "comment": "'extra' klasöründen beklenmeyen bir modül: onu kimin yüklediğini araştırın"
+        }
+      ]
+    },
+    {
+      "id": "rootkit",
+      "type": "text",
+      "markdown": "## Şüpheli bir ana makineyi doğrulama\n\nÇekirdek düzeyinde bir ele geçirme şüphesi olduğunda dıştan içe doğru çalışın ve ana makinenin size söylediği hiçbir şeye ikinci bir kaynak olmadan güvenmeyin.\n\n1. **Kirlenme bayraklarını kontrol edin.** `cat /proc/sys/kernel/tainted` bir bit maskesi döndürür. Sıfırdan farklı bir değer, ağaç dışı (out-of-tree), imzasız veya zorla yüklenmiş bir modülün yüklendiğini gösterir.\n2. **Görünümleri karşılaştırın.** Modülleri `lsmod` ile listeleyin, ardından `/sys/module/` ve çekirdek günlüğüyle karşılaştırın. Bir görünümde olup diğerinde olmayan bir modül güçlü bir ipucudur.\n3. **eBPF'yi inceleyin.** Yüklü programları görmek için `bpftool prog show` ve `bpftool net` çalıştırın. Ağ veya izleme kancalarına bağlı bilinmeyen programlar dikkat gerektirir.\n4. **Paketleri doğrulayın.** RPM sistemlerinde `rpm -Va`, Debian'da `debsums -c` kullanın. Değiştirilmiş sistem ikili dosyaları burada ortaya çıkar.\n5. **Belleği ve diski yakalayın, sonra çevrimdışı analiz edin.** Belleği güvenilir bir araçla edinin ve daha sonra [Bellek Adli Bilişimi ve Kötü Amaçlı Yazılım Analizi](/learn/security-operations-dfir/memory-forensics-and-malware-analysis) dersinde ele alındığı gibi Volatility ile inceleyin.\n\nAna makine bir üretim sistemiyse, kapatmak uçucu kanıtı yok edeceğinden, gücü kesmeden önce müdahaleyi [İleri Düzey Olay Müdahalesi](/learn/security-operations-dfir/advanced-incident-response) sürecinizle koordine edin."
+    },
+    {
+      "id": "verify-term",
+      "type": "terminal",
+      "title": "Hızlı bütünlük kontrolleri",
+      "prompt": "root@host:~#",
+      "lines": [
+        {
+          "cmd": "cat /proc/sys/kernel/tainted",
+          "output": "12288",
+          "comment": "12288 = 12. ve 13. bitler: ağaç dışı (out-of-tree) ve imzasız modül"
+        },
+        {
+          "cmd": "cat /sys/kernel/security/lockdown",
+          "output": "none [integrity] confidentiality"
+        },
+        {
+          "cmd": "bpftool prog show | head -4",
+          "output": "41: kprobe  name trace_exec  tag 6b1c...  gpl\n        loaded_at 2026-11-10T22:01:44+0000  uid 0\n        xlated 312B  jited 201B  memlock 4096B",
+          "comment": "Bu program onaylı izleme yığınınızın bir parçası mı?"
+        }
+      ]
+    },
+    {
+      "id": "mistakes",
+      "type": "text",
+      "markdown": "## Yaygın hatalar ve ödünleşimler\n\nSıkılaştırma, güvenlik ile işletilebilirlik arasında bir dengedir. Ekipler en sık dört şekilde hata yapar:\n\n- **Değerleri kalıcı yapmadan ayarlamak.** `sysctl -w` ile değiştirilen bir değer yeniden başlatmada kaybolur; bu yüzden denetim bugün geçer, bir sonraki yama penceresinden sonra başarısız olur.\n- **Denetimi çok erken kilitlemek.** `-e 2` ile her kural değişikliği yeniden başlatma gerektirir. Önce kuralları iyice test edin, sonra kilitleyin.\n- **Konteynerleri göz ardı etmek.** Konteynerler ana makinenin çekirdeğini paylaşır, bu yüzden tek bir çekirdek açığı her konteyneri etkiler. Konteynerlere de seccomp ve bir LSM profili uygulayın ve çekirdeği yamalı tutun.\n- **Yamalamayı isteğe bağlı saymak.** Çekirdek savunmalarının çoğu bir açığın etkisini azaltır; onu ortadan kaldırmaz. Çekirdek duyurularını izleyin ve yeniden başlatmaların zamanlanmasının zor olduğu yerlerde canlı yamalama (live patching) kullanın.\n\nTaban çizgisinden her sapmayı bir sahip ve bir son kullanma tarihiyle kaydedin. Bu liste, [Güvenlik Kontrolü Etkinlik Testi](/learn/security-operations-dfir/security-control-effectiveness-testing) için yararlı bir girdi olur."
+    },
+    {
+      "id": "tips",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Ele geçirilmiş bir ana makinenin kendi araçlarına güvenmeyin",
+      "markdown": "Çekirdeğin kendisi kurcalanmışsa `ps`, `ls` ve `lsmod` hepsi yalan söyleyecek şekilde değiştirilebilir. Salt okunur ortamdan bilinen iyi ikili dosyalar kullanın, bellek veya disk analizi gibi ikinci bir görünümle karşılaştırın ve ele geçirilmiş ana makineden gelen temiz bir sonucun kanıt değil, belirsiz bir sonuç olduğunu unutmayın."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Sahip olduğunuz bir Linux sanal makinesinde, yukarıdaki tabanla `/etc/sysctl.d/90-hardening.conf` dosyasını oluşturun ve `sudo sysctl --system` çalıştırın. Ardından:\n\n1. Her değeri `sysctl kernel.kptr_restrict kernel.yama.ptrace_scope` ile doğrulayın.\n2. Terminal örneğindeki üç denetim kuralını ekleyin, yükleyin, sonra `sudo modprobe dummy` çalıştırın ve olayı `ausearch -k kmod -i` ile bulun.\n3. `/proc/sys/kernel/tainted` ve `/sys/kernel/security/lockdown` değerlerini kaydedin ve her sonucun size ne söylediğini tek cümleyle yazın.\n4. Modülü `sudo modprobe -r dummy` ile kaldırın ve ikinci denetim olayını not edin."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "KASLR",
+          "definition": "Önyükleme sırasında çekirdeğin bellek düzenini rastgeleleştirir."
+        },
+        {
+          "term": "Kilitleme modu (Lockdown)",
+          "definition": "Root'un çalışan çekirdeği değiştirmesini engelleyen bir çekirdek modu."
+        },
+        {
+          "term": "Seccomp",
+          "definition": "Bir sürecin yapabileceği sistem çağrılarını sınırlayan bir filtre."
+        },
+        {
+          "term": "LSM",
+          "definition": "Linux Güvenlik Modülü (Linux Security Module); SELinux ve AppArmor'un arkasındaki çerçeve."
+        },
+        {
+          "term": "Kirlenme bayrağı (Taint flag)",
+          "definition": "Çekirdeğin olağandışı veya desteklenmeyen kod yüklediğini gösteren bir bit maskesi."
+        },
+        {
+          "term": "eBPF",
+          "definition": "Çekirdek içinde yalıtılmış (sandbox) programlar çalıştırma mekanizması."
+        },
+        {
+          "term": "auditd",
+          "definition": "Çekirdek olaylarını kaydeden Linux denetim hizmeti (daemon)."
+        },
+        {
+          "term": "Güvenli Önyükleme (Secure Boot)",
+          "definition": "Önyükleyici ve çekirdek imzalarının bellenim (firmware) tarafından doğrulanması."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı kontrol edin",
+      "questions": [
+        {
+          "question": "Hangi ayar bir sürecin ilgisiz bir sürecin belleğini okumasını engeller?",
+          "options": [
+            "kernel.yama.ptrace_scope = 1",
+            "kernel.dmesg_restrict = 1",
+            "fs.suid_dumpable = 0",
+            "net.ipv4.conf.all.rp_filter = 1"
+          ],
+          "answer": 0,
+          "explanation": "Yama ptrace_scope, ptrace'i üst-alt süreç ilişkileriyle sınırlar."
+        },
+        {
+          "question": "Hangileri çekirdek düzeyinde korumalardır? Uygun olanların tümünü seçin.",
+          "options": [
+            "Modül imzalama",
+            "Kilitleme modu",
+            "Seccomp",
+            "Tarayıcı açılır pencere engelleyicisi"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "İlk üçü çekirdek özellikleridir; açılır pencere engelleyicisinin bunlarla ilgisi yoktur."
+        },
+        {
+          "question": "Sıfırdan farklı bir /proc/sys/kernel/tainted büyük olasılıkla ne anlama gelir?",
+          "options": [
+            "Disk dolu",
+            "Olağandışı veya imzasız bir modül yüklendi",
+            "Güvenlik duvarı kapalı",
+            "Saat senkronize değil"
+          ],
+          "answer": 1,
+          "explanation": "Kirlenme bitleri, ağaç dışı (out-of-tree), imzasız veya zorla yüklenmiş modül yüklemelerini kaydeder."
+        },
+        {
+          "question": "lsmod neden /sys/module ve bellek analiziyle karşılaştırılır?",
+          "options": [
+            "Kurcalanmış araçlar veriyi tek bir görünümde gizleyebilir",
+            "Daha hızlıdır",
+            "auditd bunu zorunlu kılar",
+            "Çıktıyı şifreler"
+          ],
+          "answer": 0,
+          "explanation": "Bağımsız görünümler arasındaki bir tutarsızlık gizlenmeyi ortaya çıkarır."
+        },
+        {
+          "question": "-e 2 denetim kuralı seçeneği ne yapar?",
+          "options": [
+            "Denetimi devre dışı bırakır",
+            "Kuralları yeniden başlatmaya kadar kilitler",
+            "Eski günlükleri siler",
+            "Günlük boyutunu ikiye katlar"
+          ],
+          "answer": 1,
+          "explanation": "Değiştirilemez mod (immutable mode), bir saldırganın kuralları sessizce kaldırmasını engeller."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- Çekirdek güvenin temelidir; bu yüzden onu sıkılaştırın ve doğrulayın.\n- Denetimleri katmanlayın: Secure Boot, kilitleme modu, modül imzalama, seccomp ve bir LSM.\n- Gözden geçirilmiş, tekrarlanabilir bir taban için `sysctl` ve önyükleme parametrelerini kullanın.\n- Modül yüklemelerini, `ptrace`'i ve kural değişikliklerini `auditd` ile denetleyin ve kuralları kilitleyin.\n- Şüpheli bir ana makinede bağımsız görünümleri karşılaştırın ve belleği çevrimdışı analiz edin.\n- İlgili okuma: [İleri Düzey Tehdit Avcılığı](/learn/security-operations-dfir/advanced-threat-hunting)."
+    }
+  ]
+}

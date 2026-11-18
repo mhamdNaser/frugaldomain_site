@@ -1,0 +1,316 @@
+{
+  "title": "安全自动化工程（Security Automation Engineering）",
+  "summary": "了解哪些安全任务值得自动化，如何在剧本和脚本中内置护栏，以及哪些环节必须保留人工参与。",
+  "objectives": [
+    "为安全任务的自动化适用性打分",
+    "比较 SOAR 平台与脚本化自动化",
+    "构建护栏：试运行、幂等性、速率限制和审计日志",
+    "设计带有人工审批关卡的工作流",
+    "识别并缓解常见的自动化失败模式"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "你的 SOC 每天关闭 600 条告警。其中百分之四十是同样的三种良性模式，每条都要占用分析师四分钟：查询主机责任人、查看近期告警、找到用户最近一次登录、关闭工单。这相当于 16 个分析师工时的重复劳动，而堆积如山的告警中那一次真正的攻击，得到的却是与其余告警一样疲惫的关注。\n\n**安全自动化工程（security automation engineering）**把这类工作当作软件来对待。你设计的工作流可以收集上下文、自行做出低风险决策，并把困难的决策连同已附好的证据交给人来处理。本课以[企业安全工程（Enterprise Security Engineering）](/learn/security-operations-dfir/enterprise-security-engineering)为基础，并引向[持续安全改进（Continuous Security Improvement）](/learn/security-operations-dfir/continuous-security-improvement)。"
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## 第 1 步：决定什么值得自动化\n\n并非所有任务都应该自动化。针对每个候选任务回答三个问题：它多久发生一次，正确答案有多可预测，错误操作的后果有多严重？\n\n| 任务 | 频率 | 可预测？ | 出错代价 | 结论 |\n|:--|:--|:--|:--|:--|\n| 查询主机责任人和重要程度 | 非常高 | 是 | 无 | 完全自动化 |\n| 检查 URL 和哈希的信誉 | 非常高 | 大体可以 | 低 | 完全自动化 |\n| 关闭已知良性的扫描器告警 | 高 | 是 | 低，可逆 | 自动化并记录日志 |\n| 禁用用户账号 | 中 | 视情况而定 | 高 | 自动化并需人工批准 |\n| 隔离生产服务器 | 低 | 否 | 非常高 | 仅提供建议 |\n\n从表格顶部开始。信息富化（enrichment）是最安全的首个目标，因为它只读取数据。只有在前面的步骤已经稳定运行数周之后，才继续向下推进。"
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## 第 2 步：选择合适的工具\n\n**SOAR** 平台（安全编排、自动化与响应，Security Orchestration, Automation and Response）提供连接器、可视化设计器、案件管理和审计跟踪。普通脚本则提供灵活性和便捷的版本控制。许多团队两者并用：用 SOAR 处理工作流和审批，用经过测试的小函数处理自定义逻辑。\n\n无论你选择哪种方式，都要遵循软件工程规则：将工作流放在 Git 中，评审变更，用录制的样本告警编写测试，并固定集成组件的版本。发布检测的同一条流水线（参见[高级检测工程（Advanced Detection Engineering）](/learn/security-operations-dfir/advanced-detection-engineering)）也应当用来发布自动化。"
+    },
+    {
+      "id": "code-intro",
+      "type": "text",
+      "markdown": "## 第 3 步：把护栏内置到代码中\n\n下面的脚本先对告警做信息富化，然后在三种结果之间做出选择。请留意是什么让它安全，而不只是什么让它有用：它默认以试运行（dry-run）模式运行，从环境变量读取令牌，跳过已处理过的告警，将涉及关键资产的一切升级给人处理，并把每个决策记录为结构化 JSON。"
+    },
+    {
+      "id": "triage-code",
+      "type": "code",
+      "language": "python",
+      "code": "#!/usr/bin/env python3\n\"\"\"Enrich a SIEM alert, then decide: auto-close, ask a human, or contain.\"\"\"\nimport json, os, sys, time, requests\n\nSIEM = \"https://siem.example.com/api\"\nTOKEN = os.environ[\"SIEM_API_TOKEN\"]          # never hard-code secrets\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"1\") == \"1\"  # safe by default\nMAX_ISOLATIONS_PER_HOUR = 3                   # guardrail against runaway loops\n\ndef api(method, path, **kw):\n    r = requests.request(method, f\"{SIEM}{path}\", timeout=10,\n                         headers={\"Authorization\": f\"Bearer {TOKEN}\"}, **kw)\n    r.raise_for_status()\n    return r.json()\n\ndef audit(alert_id, action, detail):\n    # every decision is written down, including \"did nothing\"\n    print(json.dumps({\"ts\": int(time.time()), \"alert\": alert_id,\n                      \"action\": action, \"detail\": detail}))\n\ndef handle(alert_id):\n    a = api(\"GET\", f\"/alerts/{alert_id}\")\n    if a.get(\"handled_by\"):                    # idempotent: skip repeated runs\n        return audit(alert_id, \"skip\", \"already handled\")\n    host = a[\"host\"]\n    ctx = api(\"GET\", f\"/assets/{host}\")        # owner, criticality, tags\n    seen = api(\"GET\", f\"/alerts?host={host}&window=24h\")[\"count\"]\n\n    if ctx[\"criticality\"] == \"high\" or ctx[\"tags\"].count(\"server\"):\n        return audit(alert_id, \"escalate\", f\"{host} is critical, human decides\")\n    if seen >= 3 and a[\"severity\"] >= 7:\n        if DRY_RUN:\n            return audit(alert_id, \"would-isolate\", host)\n        api(\"POST\", f\"/hosts/{host}/isolate\", json={\"reason\": alert_id})\n        return audit(alert_id, \"isolated\", host)\n    api(\"POST\", f\"/alerts/{alert_id}/close\", json={\"verdict\": \"benign-known\"})\n    audit(alert_id, \"closed\", \"low severity, no repeats\")\n\nif __name__ == \"__main__\":\n    handle(sys.argv[1])",
+      "filename": "triage.py",
+      "caption": "一个带有试运行、幂等性、升级和审计日志的告警分诊脚本。"
+    },
+    {
+      "id": "run",
+      "type": "text",
+      "markdown": "## 第 4 步：先试运行再测试\n\n用 `DRY_RUN=1` 针对真实告警运行脚本并阅读审计日志。第一次运行显示脚本会隔离一台工作站，第二次显示它会把生产数据库升级处理而不是动手操作，第三次显示重复触发什么也不会做。这三项特性（安全预览、排除关键资产、幂等性）是你在启用真实动作之前要检查的内容。"
+    },
+    {
+      "id": "run-term",
+      "type": "terminal",
+      "title": "试运行结果",
+      "lines": [
+        {
+          "cmd": "DRY_RUN=1 python triage.py ALRT-5521"
+        },
+        {
+          "output": "{\"ts\": 1767225600, \"alert\": \"ALRT-5521\", \"action\": \"would-isolate\", \"detail\": \"ws-0412.example.com\"}",
+          "comment": "试运行：未做任何更改，决策已记录"
+        },
+        {
+          "cmd": "DRY_RUN=1 python triage.py ALRT-5522"
+        },
+        {
+          "output": "{\"ts\": 1767225604, \"alert\": \"ALRT-5522\", \"action\": \"escalate\", \"detail\": \"db-prod-01.example.com is critical, human decides\"}"
+        },
+        {
+          "cmd": "python triage.py ALRT-5521"
+        },
+        {
+          "output": "{\"ts\": 1767225610, \"alert\": \"ALRT-5521\", \"action\": \"skip\", \"detail\": \"already handled\"}",
+          "comment": "幂等性：重复触发是无害的"
+        }
+      ],
+      "caption": "三次运行：一次预览、一次升级和一次重复触发。"
+    },
+    {
+      "id": "flow",
+      "type": "text",
+      "markdown": "## 第 5 步：把人放在需要判断的地方\n\n好的工作流会暂停等待批准，而不是靠猜测。下面的时序图展示了一次自动化响应：系统负责跑腿，由人批准那一个有风险的动作。"
+    },
+    {
+      "id": "auto-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "带有人工审批关卡的自动化响应",
+      "caption": "系统负责跑腿；由人批准有风险的步骤。",
+      "data": {
+        "actors": [
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "告警来源",
+            "icon": "log"
+          },
+          {
+            "id": "soar",
+            "label": "SOAR",
+            "sub": "剧本运行器",
+            "icon": "cpu"
+          },
+          {
+            "id": "ti",
+            "label": "威胁情报 + CMDB",
+            "sub": "上下文",
+            "icon": "database"
+          },
+          {
+            "id": "an",
+            "label": "分析师",
+            "sub": "审批人",
+            "icon": "user"
+          },
+          {
+            "id": "edr",
+            "label": "EDR",
+            "sub": "遏制",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "from": "siem",
+            "to": "soar",
+            "label": "告警 ALRT-5521",
+            "detail": "Webhook",
+            "note": "SIEM 发送一条高严重性告警，剧本随即启动。"
+          },
+          {
+            "from": "soar",
+            "to": "ti",
+            "label": "信息富化",
+            "detail": "主机、用户、哈希",
+            "note": "剧本收集责任人、重要程度和信誉信息。"
+          },
+          {
+            "from": "ti",
+            "to": "soar",
+            "label": "返回上下文",
+            "detail": "工作站，财务部",
+            "note": "只读步骤已完成，没有副作用。",
+            "tone": "secure"
+          },
+          {
+            "from": "soar",
+            "to": "an",
+            "label": "审批请求",
+            "detail": "摘要 + 证据",
+            "note": "一条聊天消息展示证据，并请求批准隔离。",
+            "tone": "warning"
+          },
+          {
+            "from": "an",
+            "to": "soar",
+            "label": "已批准",
+            "detail": "由分析师批准",
+            "note": "由一个人为这一有风险的动作承担责任。",
+            "tone": "success"
+          },
+          {
+            "from": "soar",
+            "to": "edr",
+            "label": "隔离主机",
+            "detail": "ws-0412",
+            "note": "EDR API 调用运行，并以工单 ID 作为原因。",
+            "tone": "blocked"
+          },
+          {
+            "from": "soar",
+            "to": "soar",
+            "label": "已写入审计条目",
+            "detail": "谁、做了什么、何时",
+            "note": "案件记录了决策轨迹和一条回滚命令。",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "fail",
+      "type": "text",
+      "markdown": "## 需要针对性设计的失败模式\n\n自动化的失败方式是手工工作所没有的，因为它失败得又快又大规模。\n\n- **失控循环。** 隔离剧本被其自身动作所产生的告警触发。添加速率限制（例如每小时三次隔离）和全局暂停开关。\n- **过期凭据。** 服务账号令牌过期，剧本悄无声息地停止运行。对剧本失败发出告警，并每天运行一次心跳测试。\n- **未经评审的排除项。** 在告警嘈杂的一周中添加的允许列表会永远存在。为每个排除项指定责任人和到期日期。\n- **过度信任。** 分析师不再检查自动化的结论。每周抽取 5% 自动关闭的告警进行人工复核。\n- **隐藏的依赖。** 第三方 API 更改了响应格式。固定版本并定期测试集成。"
+    },
+    {
+      "id": "warn-auto",
+      "type": "callout",
+      "variant": "warning",
+      "title": "自动化遏制是一把指向你自己网络的武器",
+      "markdown": "一个缺陷、一条伪造的告警或一份糟糕的允许列表，都可能让你的剧本大规模隔离错误的机器。对任何难以撤销的操作都要求审批，默认排除关键资产，并为每个动作保留经过测试的回滚方案。"
+    },
+    {
+      "id": "tip-measure",
+      "type": "callout",
+      "variant": "tip",
+      "title": "衡量你换回的时间",
+      "markdown": "按告警类型跟踪节省的分钟数、完全由自动化处理的告警占比以及错误动作率。如果你无法向 SOC 经理展示一个数字，下一个自动化项目就得不到经费。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "1. 在实验室中复制该脚本，并把 SIEM 调用替换为包含三条虚构告警和资产的本地 JSON 文件。\n2. 用 `DRY_RUN=1` 运行它，确认每条告警都得到预期的动作。\n3. 添加一道护栏：拒绝对任何名称以 `dc-` 开头的主机采取动作。\n4. 编写一个测试，对同一条告警运行两次，并断言第二次运行记录了 `skip`。\n5. 添加速率限制，并通过为十台主机输入十条告警来证明它有效。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "SOAR",
+          "definition": "一种编排各类工具并自动化响应步骤的平台，带有案件管理和审计跟踪。"
+        },
+        {
+          "term": "信息富化（Enrichment）",
+          "definition": "为告警添加责任人、重要程度和信誉等上下文。"
+        },
+        {
+          "term": "幂等性（Idempotency）",
+          "definition": "一个动作执行两次与执行一次效果相同的特性。"
+        },
+        {
+          "term": "试运行（Dry run）",
+          "definition": "执行工作流，使其只报告决策而不做任何更改。"
+        },
+        {
+          "term": "护栏（Guardrail）",
+          "definition": "防止自动化造成危害的内置限制，例如速率限制或排除列表。"
+        },
+        {
+          "term": "人工参与（Human in the loop）",
+          "definition": "在执行有风险的动作之前，需要人批准的工作流步骤。"
+        },
+        {
+          "term": "审计跟踪（Audit trail）",
+          "definition": "一份防篡改的记录，说明做出了什么决策、由谁做出以及何时做出。"
+        },
+        {
+          "term": "回滚（Rollback）",
+          "definition": "一套经过测试的、能够撤销自动化动作的流程。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪项任务最适合作为完全自动化的首个候选？",
+          "options": [
+            "隔离生产服务器",
+            "查询主机责任人和重要程度",
+            "删除用户账号",
+            "更改防火墙规则"
+          ],
+          "answer": 1,
+          "explanation": "信息富化是只读、频繁且可预测的，因此出错几乎没有代价。"
+        },
+        {
+          "question": "幂等性可以防范什么？",
+          "options": [
+            "缓慢的 API 调用",
+            "重复触发导致动作被重复执行",
+            "弱口令",
+            "缺失的日志"
+          ],
+          "answer": 1,
+          "explanation": "如果同一条告警触发两次，幂等的工作流会识别出来，不再重复执行动作。"
+        },
+        {
+          "question": "以下哪些是隔离剧本的良好护栏？（选择所有适用项。）",
+          "options": [
+            "每小时的速率限制",
+            "默认排除域控制器",
+            "在脚本中硬编码 API 令牌",
+            "全局暂停开关"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "速率限制、排除项和紧急停止开关可以限制损害。硬编码的密钥是漏洞，而不是护栏。"
+        },
+        {
+          "question": "为什么每个允许列表条目都应有责任人和到期日期？",
+          "options": [
+            "为了让列表更长",
+            "使排除项得到评审，而不是永远存在",
+            "因为 SOAR 要求这样做",
+            "为了降低许可成本"
+          ],
+          "answer": 1,
+          "explanation": "未经评审的排除项会悄无声息地变成盲区。"
+        },
+        {
+          "question": "哪些做法可以防止分析师过度信任自动化？（选择所有适用项。）",
+          "options": [
+            "抽样复核自动关闭的告警",
+            "记录每一个自动化决策",
+            "在工单中隐藏自动化的结论",
+            "跟踪错误动作率"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "抽样、日志记录和衡量错误可使自动化有据可查。隐藏结论会移除复核人员所需的证据。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n- 按频率、可预测性和出错代价选择自动化目标；从只读的信息富化开始。\n- 用 SOAR 处理工作流和审批，并将逻辑与测试一起放在版本控制中。\n- 构建护栏：试运行、幂等性、速率限制、排除项、审计日志和回滚。\n- 对难以撤销的动作保留人工参与。\n- 衡量节省的时间和错误率，并抽样复核自动化决策。\n\n本课的度量结果将直接汇入[持续安全改进（Continuous Security Improvement）](/learn/security-operations-dfir/continuous-security-improvement)。"
+    }
+  ]
+}

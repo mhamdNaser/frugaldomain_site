@@ -1,0 +1,299 @@
+{
+  "title": "高级 Linux 内核安全（Advanced Linux Kernel Security）",
+  "summary": "了解 Linux 内核内置的防护机制，如何加固和审计它们，以及如何验证可疑主机是否遭到内核级篡改。",
+  "objectives": [
+    "描述 Linux 内核的主要防护机制及其各自阻止的行为",
+    "应用 sysctl 和启动参数加固基线",
+    "为内核级事件配置 auditd 规则",
+    "使用污染标志（taint flag）、模块视图和 eBPF 列表验证可疑主机"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一名响应人员被叫去处理一台“感觉很慢”的 Web 服务器。EDR 没有显示任何异常，`ps` 看起来正常，应用日志也很干净。然而，每隔几分钟仍会有出站流量发往一个罕见的目的地。当进程列表不可信时，问题就下移了一层：**内核在做什么？**\n\nLinux 内核是主机上权限最高的代码。包括日志代理在内的其他一切都信任它会如实报告。这就是为什么内核安全对防御者而言具有双重意义：你必须**加固（harden）**内核，使攻击者难以篡改它；同时当主机可疑时，你必须知道如何**验证（verify）**它。本课始终保持防御视角。你将学习内核提供的防护机制、如何配置和审计它们，以及如何在你拥有的系统上发现内核级篡改的迹象。本课以 [虚拟机监控程序与虚拟化内部机制](/learn/security-operations-dfir/hypervisor-and-virtualization-internals) 为基础，并为 [内存取证与恶意软件分析](/learn/security-operations-dfir/memory-forensics-and-malware-analysis) 做铺垫。"
+    },
+    {
+      "id": "protections",
+      "type": "text",
+      "markdown": "## 内核的内置防护机制\n\n现代内核自带多层防护。要清楚每一层能阻止什么，因为缺少某一层会影响你的调查方式。\n\n| 防护机制 | 作用 | 检查位置 |\n|:--|:--|:--|\n| **KASLR** | 随机化内核的加载地址，使攻击者无法假定固定地址 | `dmesg`、`/proc/kallsyms`（非 root 用户看到的是零） |\n| **SMEP / SMAP** | CPU 特性，阻止内核误执行或误读用户空间内存 | `grep -o 'smep' /proc/cpuinfo` |\n| **模块签名（Module signing）** | 拒绝加载未签名的内核模块 | `/proc/sys/kernel/modules_disabled`、内核配置 |\n| **锁定模式（Lockdown mode）** | 阻止 root 修改正在运行的内核（`/dev/mem`、未签名模块、kexec） | `/sys/kernel/security/lockdown` |\n| **Seccomp** | 过滤进程可以使用哪些系统调用 | `grep Seccomp /proc/<pid>/status` |\n| **LSM**（SELinux、AppArmor） | 在文件权限之上提供强制访问控制 | `getenforce`、`aa-status` |\n| **安全启动（Secure Boot）** | 在启动时验证引导加载程序和内核的签名 | `mokutil --sb-state` |\n\n单一控制措施是不够的。安全启动保护启动链，锁定模式保护运行中的内核不受 root 影响，而 LSM 则从一开始就限制被攻陷的服务能够触及的范围。这些措施结合起来，使“获得主机 root 权限”从“大势已去”变成对攻击者而言困难得多的局面。"
+    },
+    {
+      "id": "syscall-anim",
+      "type": "animation",
+      "kind": "layers",
+      "title": "系统调用经过的层次",
+      "caption": "每一层都可以拦截请求；在多个层次记录日志可为你提供证据。",
+      "data": {
+        "layers": [
+          {
+            "label": "进程",
+            "sub": "用户空间"
+          },
+          {
+            "label": "Seccomp 过滤器",
+            "sub": "系统调用允许列表"
+          },
+          {
+            "label": "LSM 钩子",
+            "sub": "SELinux / AppArmor"
+          },
+          {
+            "label": "审计子系统",
+            "sub": "auditd 规则"
+          },
+          {
+            "label": "内核",
+            "sub": "ring 0"
+          }
+        ],
+        "steps": [
+          {
+            "layer": 0,
+            "packet": [
+              "open()"
+            ],
+            "caption": "某个 Web 服务对一个文件调用 open()。"
+          },
+          {
+            "layer": 1,
+            "packet": [
+              "open()",
+              "seccomp"
+            ],
+            "caption": "seccomp 配置文件允许 open()，因此调用继续。被禁止的调用会在此处被终止。"
+          },
+          {
+            "layer": 2,
+            "packet": [
+              "open()",
+              "标签"
+            ],
+            "caption": "LSM 将进程标签与文件标签进行比较，并拒绝对 /etc/shadow 的访问。"
+          },
+          {
+            "layer": 3,
+            "packet": [
+              "open()",
+              "已拒绝"
+            ],
+            "caption": "该拒绝事件被写成一条 AVC 记录，你的 SIEM 可以对其告警。"
+          },
+          {
+            "layer": 4,
+            "packet": [
+              "EACCES"
+            ],
+            "caption": "内核向进程返回错误；该文件从未被读取。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sysctl",
+      "type": "text",
+      "markdown": "## 使用 sysctl 和启动参数进行加固\n\n许多内核防御是可调参数。把它们放在一个 drop-in 文件中，这样它们在重启后依然有效，并且可以在版本控制中审查。"
+    },
+    {
+      "id": "sysctl-code",
+      "type": "code",
+      "language": "ini",
+      "filename": "/etc/sysctl.d/90-hardening.conf",
+      "caption": "内核加固基线",
+      "highlight": [
+        2,
+        5,
+        8
+      ],
+      "code": "# Hide kernel pointers and dmesg from unprivileged users\nkernel.kptr_restrict = 2\nkernel.dmesg_restrict = 1\n# Block unprivileged eBPF and restrict ptrace to parent processes\nkernel.unprivileged_bpf_disabled = 1\nkernel.yama.ptrace_scope = 1\n# Do not allow core dumps from setuid programs; limit perf use\nfs.suid_dumpable = 0\nkernel.perf_event_paranoid = 3\n# Network hygiene frequently checked in audits\nnet.ipv4.conf.all.rp_filter = 1\nnet.ipv4.conf.all.accept_redirects = 0"
+    },
+    {
+      "id": "sysctl-explain",
+      "type": "text",
+      "markdown": "`kptr_restrict = 2` 对所有人隐藏内核地址，从而削弱地址泄露类技术。`unprivileged_bpf_disabled = 1` 关闭了一个众所周知的攻击面，因为 eBPF 会在内核内部运行代码。`ptrace_scope = 1` 阻止一个进程读取无关进程的内存，从而削弱从内存中窃取凭据的手段。\n\n启动参数还能提供更多防护。`lockdown=integrity` 启用锁定模式，`module.sig_enforce=1` 强制使用已签名模块，`init_on_alloc=1` 在分配时将内存清零。设置之后，用 `cat /proc/cmdline` 确认。对于生产环境，应先在预发布主机上测试每一项更改，因为某些驱动和监控工具需要 eBPF 或 ptrace。"
+    },
+    {
+      "id": "audit",
+      "type": "text",
+      "markdown": "## 审计内核级事件\n\n你无法调查从未被记录的内容。`auditd` 挂钩内核并记录与安全相关的事件。重点关注改变内核本身的操作：加载模块、更改时间、使用 `ptrace`，以及修改审计规则。"
+    },
+    {
+      "id": "audit-term",
+      "type": "terminal",
+      "title": "auditd 规则与一次模块加载事件",
+      "prompt": "root@host:~#",
+      "lines": [
+        {
+          "cmd": "cat /etc/audit/rules.d/kernel.rules",
+          "output": "-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k kmod\n-a always,exit -F arch=b64 -S ptrace -k ptrace_use\n-w /etc/audit/ -p wa -k audit_config\n-e 2",
+          "comment": "最后的 -e 2 将规则锁定直到重启"
+        },
+        {
+          "cmd": "augenrules --load && auditctl -s | head -3",
+          "output": "enabled 2\nfailure 1\npid 812"
+        },
+        {
+          "cmd": "ausearch -k kmod -i --start today",
+          "output": "type=SYSCALL msg=audit(11/11/2026 09:14:02.113:5521) : arch=x86_64 syscall=finit_module success=yes exit=0 auid=admin uid=root exe=/usr/sbin/modprobe comm=modprobe key=kmod\ntype=PATH ... name=/lib/modules/6.8.0/extra/diag_helper.ko",
+          "comment": "来自“extra”文件夹的意外模块：调查是谁加载了它"
+        }
+      ]
+    },
+    {
+      "id": "rootkit",
+      "type": "text",
+      "markdown": "## 验证可疑主机\n\n当怀疑存在内核级入侵时，应由外向内开展工作，且在没有第二个来源佐证之前，不要相信主机告诉你的任何内容。\n\n1. **检查污染标志（taint flag）。**`cat /proc/sys/kernel/tainted` 返回一个位掩码。非零值表明加载过树外（out-of-tree）模块、未签名模块或被强制加载的模块。\n2. **比较不同视图。**用 `lsmod` 列出模块，然后与 `/sys/module/` 和内核日志对比。在一个视图中出现而在另一个视图中缺失的模块是很强的线索。\n3. **检查 eBPF。**运行 `bpftool prog show` 和 `bpftool net` 查看已加载的程序。附加在网络或跟踪钩子上的未知程序值得关注。\n4. **验证软件包。**在 RPM 系统上使用 `rpm -Va`；在 Debian 上使用 `debsums -c`。被篡改的系统二进制文件会在这里显现。\n5. **获取内存和磁盘，然后离线分析。**使用可信工具获取内存，之后用 Volatility 进行检查，详见 [内存取证与恶意软件分析](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)。\n\n如果主机是生产系统，请在关机之前通过你的 [高级事件响应](/learn/security-operations-dfir/advanced-incident-response) 流程协调响应，因为关机会破坏易失性证据。"
+    },
+    {
+      "id": "verify-term",
+      "type": "terminal",
+      "title": "快速完整性检查",
+      "prompt": "root@host:~#",
+      "lines": [
+        {
+          "cmd": "cat /proc/sys/kernel/tainted",
+          "output": "12288",
+          "comment": "12288 = 第 12 位和第 13 位：树外模块和未签名模块"
+        },
+        {
+          "cmd": "cat /sys/kernel/security/lockdown",
+          "output": "none [integrity] confidentiality"
+        },
+        {
+          "cmd": "bpftool prog show | head -4",
+          "output": "41: kprobe  name trace_exec  tag 6b1c...  gpl\n        loaded_at 2026-11-10T22:01:44+0000  uid 0\n        xlated 312B  jited 201B  memlock 4096B",
+          "comment": "这个程序是否属于你批准的监控体系？"
+        }
+      ]
+    },
+    {
+      "id": "mistakes",
+      "type": "text",
+      "markdown": "## 常见错误与权衡\n\n加固是在安全性与可运维性之间取得平衡。团队最常在四个方面出错：\n\n- **设置了值却没有持久化。**用 `sysctl -w` 修改的值会在重启后消失，因此审计今天通过，在下一个补丁窗口之后却会失败。\n- **过早锁定审计。**使用 `-e 2` 后，任何规则更改都需要重启。应先彻底测试规则，然后再锁定。\n- **忽视容器。**容器共享主机内核，因此一个内核漏洞会影响每一个容器。也要为容器应用 seccomp 和 LSM 配置文件，并保持内核已打补丁。\n- **把打补丁当作可选项。**大多数内核防御只是降低漏洞的影响，并不能消除漏洞。要跟踪内核安全公告，并在难以安排重启的地方使用热补丁（live patching）。\n\n请为每一项偏离基线的情况记录负责人和到期日期。这份清单将成为 [安全控制有效性测试](/learn/security-operations-dfir/security-control-effectiveness-testing) 的有用输入。"
+    },
+    {
+      "id": "tips",
+      "type": "callout",
+      "variant": "warning",
+      "title": "不要信任已被攻陷主机自带的工具",
+      "markdown": "如果内核本身被篡改，`ps`、`ls` 和 `lsmod` 都可能被迫说谎。请使用来自只读介质的已知良好二进制文件，与内存或磁盘分析等第二种视图进行比较，并把主机给出的“干净”结果视为无定论，而不是证明。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你自己拥有的 Linux 虚拟机上，用上述基线创建 `/etc/sysctl.d/90-hardening.conf`，并运行 `sudo sysctl --system`。然后：\n\n1. 用 `sysctl kernel.kptr_restrict kernel.yama.ptrace_scope` 确认每个值。\n2. 添加终端示例中的三条审计规则并加载它们，然后运行 `sudo modprobe dummy`，并用 `ausearch -k kmod -i` 找到该事件。\n3. 记录 `/proc/sys/kernel/tainted` 和 `/sys/kernel/security/lockdown`，并用一句话写出每个结果告诉你什么。\n4. 用 `sudo modprobe -r dummy` 移除该模块，并记下第二条审计事件。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "KASLR",
+          "definition": "在启动时随机化内核的内存布局。"
+        },
+        {
+          "term": "锁定模式（Lockdown）",
+          "definition": "一种内核模式，阻止 root 修改正在运行的内核。"
+        },
+        {
+          "term": "Seccomp",
+          "definition": "限制进程可以发起哪些系统调用的过滤器。"
+        },
+        {
+          "term": "LSM",
+          "definition": "Linux 安全模块（Linux Security Module），是 SELinux 和 AppArmor 背后的框架。"
+        },
+        {
+          "term": "污染标志（Taint flag）",
+          "definition": "一个位掩码，显示内核加载了不寻常或不受支持的代码。"
+        },
+        {
+          "term": "eBPF",
+          "definition": "一种在内核内部运行沙箱化程序的机制。"
+        },
+        {
+          "term": "auditd",
+          "definition": "记录内核事件的 Linux 审计守护进程。"
+        },
+        {
+          "term": "安全启动（Secure Boot）",
+          "definition": "由固件对引导加载程序和内核签名进行验证。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "哪个设置可以阻止进程读取无关进程的内存？",
+          "options": [
+            "kernel.yama.ptrace_scope = 1",
+            "kernel.dmesg_restrict = 1",
+            "fs.suid_dumpable = 0",
+            "net.ipv4.conf.all.rp_filter = 1"
+          ],
+          "answer": 0,
+          "explanation": "Yama 的 ptrace_scope 将 ptrace 限制在父子进程关系内。"
+        },
+        {
+          "question": "哪些属于内核级防护机制？选择所有适用项。",
+          "options": [
+            "模块签名",
+            "锁定模式",
+            "Seccomp",
+            "浏览器弹窗拦截器"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "前三项是内核特性；弹窗拦截器与此无关。"
+        },
+        {
+          "question": "非零的 /proc/sys/kernel/tainted 最可能意味着：",
+          "options": [
+            "磁盘已满",
+            "加载过不寻常或未签名的模块",
+            "防火墙已关闭",
+            "时间不同步"
+          ],
+          "answer": 1,
+          "explanation": "污染位记录了树外模块、未签名模块或被强制加载模块的加载情况。"
+        },
+        {
+          "question": "为什么要将 lsmod 与 /sys/module 以及内存分析进行比较？",
+          "options": [
+            "被篡改的工具可能在某一个视图中隐藏数据",
+            "这样更快",
+            "auditd 要求这样做",
+            "它会加密输出"
+          ],
+          "answer": 0,
+          "explanation": "相互独立的视图之间的差异会暴露隐藏行为。"
+        },
+        {
+          "question": "审计规则选项 -e 2 的作用是什么？",
+          "options": [
+            "禁用审计",
+            "将规则锁定直到重启",
+            "删除旧日志",
+            "使日志大小加倍"
+          ],
+          "answer": 1,
+          "explanation": "不可变模式可防止攻击者悄悄删除规则。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 内核是信任的基础，因此要加固它并验证它。\n- 分层部署控制措施：安全启动、锁定模式、模块签名、seccomp 和 LSM。\n- 使用 `sysctl` 和启动参数建立经过审查、可重复的基线。\n- 使用 `auditd` 审计模块加载、`ptrace` 和规则更改，并锁定规则。\n- 在可疑主机上，比较相互独立的视图，并离线分析内存。\n- 相关阅读：[高级威胁狩猎](/learn/security-operations-dfir/advanced-threat-hunting)。"
+    }
+  ]
+}

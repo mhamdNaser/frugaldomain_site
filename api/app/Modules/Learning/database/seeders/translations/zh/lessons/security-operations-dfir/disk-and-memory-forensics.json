@@ -1,0 +1,315 @@
+{
+  "title": "磁盘与内存取证（Disk and Memory Forensics）",
+  "summary": "学习按正确顺序保全并检查被攻陷的系统：捕获 RAM，使用 Volatility 分析，使用经验证的哈希对磁盘制作镜像，读取关键取证痕迹，并用 Plaso 构建时间线。",
+  "objectives": [
+    "在收集证据时应用易失性顺序（order of volatility）",
+    "使用 Volatility 3 的进程、网络和命令行插件分析内存镜像",
+    "创建并用哈希验证取证磁盘镜像",
+    "将调查问题与 Windows 磁盘取证痕迹对应起来",
+    "构建并解读 Plaso 超级时间线，区分事实与推断"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一台网络传感器指向了文件服务器 FS01，而你在[网络取证](/learn/security-operations-dfir/network-forensics)中的分析给出了一个可能的时间窗口：今天 08:58 至 09:41。现在你需要查看这台机器的内部。接下来十分钟你的所作所为，将决定你的证据能否站得住脚。重启服务器，你就会丢失正在运行的恶意软件的内存。随意复制文件，你就会覆盖时间戳。\n\n**磁盘与内存取证（Disk and memory forensics）**检查系统的存储和 RAM，以确定运行过什么、改变了什么以及是谁所为。本课展示顺序、工具以及每种取证痕迹所能回答的问题。"
+    },
+    {
+      "id": "volatility",
+      "type": "text",
+      "markdown": "## 易失性顺序\n\n证据消失的速度各不相同。先收集最脆弱的。\n\n| 顺序 | 证据 | 生命周期 |\n|:--|:--|:--|\n| 1 | CPU 寄存器和缓存 | 纳秒 |\n| 2 | **RAM**：进程、连接、密钥、命令行 | 直到断电 |\n| 3 | 网络状态和 ARP 缓存 | 直到发生变化 |\n| 4 | **磁盘**：文件、注册表、日志、休眠文件 | 直到被覆盖 |\n| 5 | 远程日志和备份 | 保留期 |\n\n实际操作中这意味着：隔离、捕获 RAM、对磁盘制作镜像或进行分类取证，然后收集日志。尽可能不要从嫌疑主机自己的磁盘上运行工具，并在笔记中记录每个操作及其时间。"
+    },
+    {
+      "id": "memory",
+      "type": "text",
+      "markdown": "## 内存获取与分析\n\n使用适合该平台的工具获取内存：Windows 上用 WinPmem 或厂商代理，Linux 上用 AVML 或 LiME，虚拟机则用虚拟机监控程序快照。保存到外部驱动器，计算哈希并记录工具版本。获取过程会轻微改变内存，你的笔记应当说明这一点。\n\n**Volatility 3** 离线解析镜像。四个插件可回答大多数最初的问题：`windows.pstree`（谁启动了什么）、`windows.netscan`（网络连接）、`windows.cmdline`（进程是如何启动的）和 `windows.malfind`（既可执行又可写的内存区域，合法代码很少需要这样）。\n\n终端带你从进程树出发，追踪一个可疑进程直至其连接。"
+    },
+    {
+      "id": "term-vol",
+      "type": "terminal",
+      "title": "对内存镜像使用 Volatility 3",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.info",
+          "comment": "在信任任何插件输出之前，先确认操作系统版本和捕获时间"
+        },
+        {
+          "output": "Kernel Base     0xf80123400000\nIs64Bit         True\nSystemTime      2026-11-12 09:41:07\nNTBuildLab      19041.1.amd64fre.vb_release.191206-1406",
+          "comment": "捕获时间为随后的每个时间戳提供锚点"
+        },
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.pstree",
+          "comment": "显示进程树以查看父子关系"
+        },
+        {
+          "output": "PID   PPID  ImageFileName   CreateTime\n624   4     smss.exe        2026-11-12 06:02:11\n* 756  624   services.exe    2026-11-12 06:02:14\n** 1032 756  svchost.exe     2026-11-12 06:02:15\n2760  2744  explorer.exe    2026-11-12 06:05:40\n* 3188 2760  WINWORD.EXE     2026-11-12 08:58:02\n** 4412 3188 svchost.exe     2026-11-12 08:58:31",
+          "comment": "真正的 svchost.exe 由 services.exe 启动。而这个的父进程是 WINWORD.EXE。"
+        },
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.netscan | grep 4412",
+          "comment": "查找该异常进程的网络连接"
+        },
+        {
+          "output": "TCPv4  192.0.2.10:49822  203.0.113.50:443  ESTABLISHED  4412  svchost.exe",
+          "comment": "它持有一个到网络证据中所见地址的已建立的 HTTPS 会话"
+        },
+        {
+          "cmd": "vol -f /evidence/FS01.mem windows.cmdline --pid 4412",
+          "comment": "检查它是如何启动的"
+        },
+        {
+          "output": "4412  svchost.exe  C:\\Users\\Public\\Libraries\\svchost.exe",
+          "comment": "该二进制文件从用户可写的文件夹而不是 System32 运行：不是真正的 svchost"
+        }
+      ],
+      "caption": "来自实验室镜像的带注释输出。仅凭名称无法证明任何事：父进程、路径和连接才决定结论。"
+    },
+    {
+      "id": "disk",
+      "type": "text",
+      "markdown": "## 磁盘获取\n\n取证镜像是磁盘的逐位副本，因此已删除的数据和未分配空间得以保留。规则很简单：\n\n- **绝不写入源盘。** 使用硬件写保护器，或从快照或以只读方式挂载的可启动取证环境中制作镜像。\n- **前后都计算哈希，** 并将镜像与源哈希进行验证。\n- **保持原件封存，** 分析工作副本。\n- **处理加密。** 如果启用了 BitLocker 或 LUKS，则关机状态下的镜像在没有密钥的情况下无法读取。先捕获内存或获取恢复密钥。\n\n对于云和虚拟机，通过平台对磁盘制作快照，然后将快照复制到你的证据存储中并在那里计算哈希。"
+    },
+    {
+      "id": "acq",
+      "type": "code",
+      "language": "bash",
+      "filename": "acquire-and-timeline.sh",
+      "caption": "针对授权检验的镜像制作、验证和时间线创建。哈希行是没有任何内容被更改的证明。",
+      "code": "# 1. Hash the source first, through a write blocker, then image it (a disk you are authorized to examine).\nsudo sha256sum /dev/sdb > /evidence/FS01-source.sha256\nsudo ewfacquire -u -t /evidence/FS01 -f encase6 -c fast -C CASE-2026-114 -D \"FS01 system disk\" -e \"A. Examiner\" /dev/sdb\n\n# 2. Verify that the image matches what was read.\newfverify /evidence/FS01.E01\n#   MD5 hash calculated over data:   <hash>   ... ewfverify: SUCCESS\n\n# 3. Build a timeline from a read-only copy of the image.\nlog2timeline.py --storage-file /cases/fs01.plaso /evidence/FS01.E01\npsort.py -o l2tcsv -w /cases/fs01-timeline.csv /cases/fs01.plaso \\\n  \"date > '2026-11-10 00:00:00' AND date < '2026-11-12 12:00:00'\"\ngrep -i \"Public\\\\\\\\Libraries\" /cases/fs01-timeline.csv | head\n",
+      "highlight": [
+        2,
+        3,
+        6,
+        7,
+        10,
+        11,
+        12
+      ]
+    },
+    {
+      "id": "artifacts",
+      "type": "text",
+      "markdown": "## 磁盘取证痕迹及其所回答的问题\n\n不要逐个文件地阅读磁盘。先提出问题，再去找能回答它的取证痕迹。\n\n| 问题 | 取证痕迹 |\n|:--|:--|\n| 这个程序运行过吗，何时运行？ | Prefetch、Amcache、ShimCache、UserAssist |\n| 文件何时被创建、更改或删除？ | `$MFT`、`$UsnJrnl` |\n| 什么被设置为在重启后继续存在？ | 注册表配置单元、计划任务、服务（参见[持久化机制检测](/learn/security-operations-dfir/persistence-mechanism-detection)） |\n| 谁登录过？ | Security 事件日志 4624、4625 |\n| 用户打开或下载了什么？ | LNK 文件、跳转列表（Jump Lists）、浏览器历史记录 |\n| 什么被删除了？ | 回收站、未分配空间、VSS 快照 |\n\n**MFT** 保存两组时间戳：`$STANDARD_INFORMATION` 和 `$FILE_NAME`。攻击者可以用工具改动前者；后者则难以更改得多。二者不一致是时间戳篡改的典型迹象。"
+    },
+    {
+      "id": "kape",
+      "type": "code",
+      "language": "powershell",
+      "filename": "kape-triage.ps1",
+      "caption": "KAPE 可快速收集并解析高价值取证痕迹。请在你获授权检验的系统上使用它。",
+      "code": "# Triage collection from a live Windows system you are authorized to examine.\n.\\kape.exe --tsource C: --tdest E:\\evidence\\FS01\\collected --target !SANS_Triage --vss\n# Parse the collected artifacts into CSV files on the analysis workstation.\n.\\kape.exe --msource E:\\evidence\\FS01\\collected --mdest E:\\evidence\\FS01\\parsed --module !EZParser\n# Expected output folders include: Amcache, AppCompatCache (ShimCache), MFT, Prefetch, EventLogs, RegistryHives\n"
+    },
+    {
+      "id": "process",
+      "type": "text",
+      "markdown": "## 可重复的流程\n\n动画将整个检验过程展示为一个循环。之所以是循环，是因为分析中的发现会让你回到前面：出现新的账户名意味着你要收集更多日志，出现新的 IP 地址意味着你要再次搜索网络证据。\n\n对于 Linux 主机，使用相同的顺序，配合 `LiME` 或 `AVML` 以及 Volatility 的 Linux 符号表，如在 [Linux 事件响应](/learn/security-operations-dfir/linux-incident-response)中所实践的那样。"
+    },
+    {
+      "id": "dfir-cycle",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "取证检验循环",
+      "caption": "先隔离并保全，按易失性顺序获取，分析副本，并在报告中说明局限。",
+      "data": {
+        "center": "取证检验",
+        "items": [
+          {
+            "label": "识别",
+            "sub": "范围与授权"
+          },
+          {
+            "label": "保全",
+            "sub": "隔离，不要关机"
+          },
+          {
+            "label": "获取内存",
+            "sub": "先取最易失的"
+          },
+          {
+            "label": "获取磁盘",
+            "sub": "计算哈希并验证"
+          },
+          {
+            "label": "分析",
+            "sub": "进程、取证痕迹、时间线"
+          },
+          {
+            "label": "报告",
+            "sub": "发现与局限"
+          }
+        ],
+        "steps": [
+          {
+            "item": 0,
+            "caption": "确认书面授权、系统，以及检验必须回答的问题。"
+          },
+          {
+            "item": 1,
+            "caption": "将主机与网络隔离，但保持开机。关机会破坏内存，并可能触发磁盘加密。"
+          },
+          {
+            "item": 2,
+            "caption": "首先捕获 RAM，因为进程、连接和密钥会在关机时消失。立即对文件计算哈希。"
+          },
+          {
+            "item": 3,
+            "caption": "通过写保护器或从关机后的快照对磁盘制作镜像，然后验证哈希。"
+          },
+          {
+            "item": 4,
+            "caption": "先分析内存中的进程树和连接，再分析磁盘中的文件、注册表和时间线。仅在副本上工作。"
+          },
+          {
+            "item": 5,
+            "caption": "报告你发现了什么、无法确定什么，以及每个事实如何能够被复现。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "timeline",
+      "type": "text",
+      "markdown": "## 构建并解读时间线\n\n**超级时间线（super-timeline）**将文件系统时间、注册表变更、事件日志、浏览器访问等合并为一个排序后的列表。Plaso 使用 `log2timeline.py` 构建它，`psort.py` 按日期对其进行过滤。从一个已知点开始，例如 08:58 的进程创建，并向前后各读 10 分钟。\n\n寻找聚集：打开了一份文档、在 `Public\\Libraries` 中写入了一个新的可执行文件、创建了一个 Prefetch 文件、设置了一个注册表值、记录了一个连接。每一个聚集都是故事中的一个事件。将故事写成带时间戳的事实列表，并将每一项标记为*观察到*或*推断*。由多个独立来源构建的时间线，远比由单一取证痕迹构建的更有力。\n\n这些发现会直接用于[服务器入侵调查](/learn/security-operations-dfir/server-compromise-investigation)，并在你确定范围后，用于[事件恢复与系统重建](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding)。"
+    },
+    {
+      "id": "warn-power",
+      "type": "callout",
+      "variant": "warning",
+      "title": "不要为了“安全”而关机",
+      "markdown": "许多分析人员会下意识地拔掉电源。这会破坏正在运行的进程、网络连接和解密密钥，还可能使休眠文件或页面文件变得陈旧。请改为隔离网络、捕获内存，只有在经过深思熟虑并有文档记录的决定下才关闭系统。"
+    },
+    {
+      "id": "tip-copy",
+      "type": "callout",
+      "variant": "tip",
+      "title": "在副本上工作，并记录你的哈希",
+      "markdown": "以只读方式挂载工作镜像，并在案件结束时重新计算原件的哈希。当两个哈希一致时，你就可以声明你的分析没有改动证据。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自试一试",
+      "markdown": "使用**你自己拥有的虚拟机**。\n\n1. 启动一台 Windows 或 Linux 实验室虚拟机，打开几个程序，然后挂起它。你的虚拟机监控程序会将内存写入文件，如 `.vmem`。\n2. 将该文件复制到案件文件夹，并记录其 `sha256sum` 和时间。\n3. 安装 Volatility 3，并对你的副本运行 `windows.info` 和 `windows.pstree`（或 Linux 对应插件）。\n4. 选择一个进程，找出它的父进程、命令行和网络连接。\n5. 写一份四行的笔记：你提出的问题、你使用的插件、你看到的内容以及你的置信度。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "易失性顺序（Order of volatility）",
+          "definition": "收集证据的顺序，从最短暂的（RAM）到最持久的（备份）。"
+        },
+        {
+          "term": "取证镜像（Forensic image）",
+          "definition": "存储设备的逐位副本，包括已删除和未分配的数据。"
+        },
+        {
+          "term": "写保护器（Write blocker）",
+          "definition": "一种设备或设置，让你读取磁盘而绝不向其写入。"
+        },
+        {
+          "term": "Volatility",
+          "definition": "一个离线分析内存镜像的开源框架。"
+        },
+        {
+          "term": "$MFT",
+          "definition": "NTFS 主文件表，记录每个文件及其时间戳。"
+        },
+        {
+          "term": "Prefetch",
+          "definition": "Windows 文件，记录程序何时运行以及加载了哪些文件。"
+        },
+        {
+          "term": "KAPE",
+          "definition": "一款可快速收集并解析取证痕迹的分类取证工具。"
+        },
+        {
+          "term": "Plaso",
+          "definition": "一套工具集（log2timeline、psort），可从多种来源构建超级时间线。"
+        },
+        {
+          "term": "哈希（Hash）",
+          "definition": "数据的固定长度指纹，用于证明数据未发生变化。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "从一台正在运行的被攻陷服务器上，通常应首先收集哪种证据？",
+          "options": [
+            "磁盘镜像",
+            "RAM",
+            "备份",
+            "远程日志归档"
+          ],
+          "answer": 1,
+          "explanation": "RAM 是其中最易失的，关机时就会丢失，因此首先收集。"
+        },
+        {
+          "question": "在进程树中，svchost.exe 的父进程是 WINWORD.EXE，且从 C:\\Users\\Public\\Libraries 运行。这说明什么？",
+          "options": [
+            "一个正常的 Windows 服务",
+            "一个伪装进程",
+            "一次 Windows 更新",
+            "一个损坏的内存镜像"
+          ],
+          "answer": 1,
+          "explanation": "真正的 svchost.exe 由 services.exe 启动并从 System32 运行。不同的父进程和路径表明存在伪装。"
+        },
+        {
+          "question": "哪些做法能保护磁盘镜像的完整性？（选择所有适用项。）",
+          "options": [
+            "使用写保护器",
+            "制作镜像前后都计算哈希",
+            "直接分析原始磁盘",
+            "将镜像与源哈希进行验证"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "写保护器、一致的哈希和验证表明镜像是忠实的。分析原件则有改动它的风险。"
+        },
+        {
+          "question": "为什么 $FILE_NAME 时间戳有助于检测篡改？",
+          "options": [
+            "它们存储在注册表中",
+            "攻击者比修改 $STANDARD_INFORMATION 更难修改它们",
+            "它们始终与创建时间相同",
+            "它们只用于已删除的文件"
+          ],
+          "answer": 1,
+          "explanation": "常见工具会改动 $STANDARD_INFORMATION 的时间，但 $FILE_NAME 由内核更新，因此两者不一致会暴露篡改。"
+        },
+        {
+          "question": "为什么对嫌疑系统关机通常是糟糕的第一步？（选择所有适用项。）",
+          "options": [
+            "它会破坏正在运行的进程和连接",
+            "它可能丢失保存在内存中的加密密钥",
+            "它使磁盘无法制作镜像",
+            "它使你失去捕获 RAM 的机会"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "关机会抹去易失性证据。之后仍可对磁盘制作镜像，不过它可能已被加密。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 按**易失性顺序**收集：隔离、捕获 RAM，然后是磁盘，再是日志。\n- **Volatility 3** 揭示进程树、命令行、连接和被注入的代码；根据父进程、路径和行为来判断，而不是根据名称。\n- **取证镜像**需要写保护器、前后哈希以及封存的原件。\n- 先提出问题，再使用能回答它的取证痕迹：Prefetch、Amcache、`$MFT`、`$UsnJrnl`、事件日志。\n- **Plaso 时间线**整合多种来源；区分观察到的事实与推断，并说明你的局限。\n\n当检验以勒索软件告终时，请继续学习[勒索软件检测与响应](/learn/security-operations-dfir/ransomware-detection-and-response)。"
+    }
+  ]
+}

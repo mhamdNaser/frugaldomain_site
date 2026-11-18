@@ -1,0 +1,287 @@
+{
+  "title": "横向移动检测（Lateral Movement Detection）",
+  "summary": "检测攻击者如何在系统之间移动：了解常见的远程执行路径，在 Windows、Linux 和网络日志中找到它们，使用扇出查询和 Sigma 规则进行威胁搜寻，并通过网络分段和凭据卫生来阻止移动。",
+  "objectives": [
+    "说明攻击者为何进行横向移动，以及他们常用哪些远程执行路径",
+    "将每条路径对应到它在源端和目标端留下的日志证据",
+    "搜寻扇出、异常登录类型和远程服务创建",
+    "为工作站访问大量服务器的行为编写检测规则",
+    "应用预防性控制，使移动更困难、动静更大"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "攻击者控制的第一台机器很少是他们想要的那台。被钓鱼的笔记本电脑只是一道门；真正的目标是文件服务器、数据库或域控制器。从一个系统移动到另一个系统称为**横向移动（Lateral Movement）**，也是小事件演变为数据泄露的阶段。\n\n这同时也是攻击者最容易暴露的阶段。他们必须向新系统认证、运行远程命令，并跨越他们从未用过的网段进行通信。本课展示这在日志中是什么样子、如何搜寻，以及如何增加其难度。本课建立在[认证日志调查](/learn/security-operations-dfir/authentication-log-investigation)之上，并为[高级威胁搜寻](/learn/security-operations-dfir/advanced-threat-hunting)提供输入。"
+    },
+    {
+      "id": "paths",
+      "type": "text",
+      "markdown": "## 了解常见路径\n\n攻击者偏爱内置功能，因为它们看起来像日常管理。每条路径留下的证据不同，因此知道路径就知道该去哪里查看。\n\n| 路径 | 端口 | 目标端证据 | 源端证据 |\n|:--|:--|:--|:--|\n| **远程桌面（Remote Desktop）** | 3389 | 4624 类型 10，4778/4779 | 使用 `mstsc`，Sysmon 3 |\n| **SMB 和管理共享** | 445 | 4624 类型 3，5140/5145 | 到许多主机的网络连接 |\n| **远程服务创建** | 445 | System 7045，4697 | `sc.exe` 或服务工具 |\n| **计划任务创建** | 445/135 | 4698，`System32\\Tasks` 中的任务文件 | 带 `/s` 的 `schtasks` |\n| **WMI** | 135 + 高位端口 | 4624 类型 3，`WmiPrvSE.exe` 的子进程 | `wmic` 或 WMI 脚本 |\n| **WinRM / PowerShell 远程处理** | 5985/5986 | 4624 类型 3，`wsmprovhost.exe` | `Enter-PSSession` |\n| **SSH** | 22 | auth.log 中的 `Accepted` | Shell 历史记录中的 `ssh` |\n\n其中许多路径可以使用被盗的密码哈希或 Kerberos 票据而不是明文密码，因此凭据类型并不总会出现在日志中。请检测其周围的行为。"
+    },
+    {
+      "id": "lat-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从工作站到域控制器的移动链",
+      "caption": "每一跳都会增加一个新的登录事件，以及一批必须检查的新主机。",
+      "data": {
+        "token": "访问权限",
+        "nodes": [
+          {
+            "id": "ws",
+            "icon": "laptop",
+            "label": "WS-114",
+            "sub": "被钓鱼的笔记本电脑"
+          },
+          {
+            "id": "app",
+            "icon": "server",
+            "label": "APP-02",
+            "sub": "应用服务器"
+          },
+          {
+            "id": "file",
+            "icon": "database",
+            "label": "FS-01",
+            "sub": "文件服务器"
+          },
+          {
+            "id": "dc",
+            "icon": "key",
+            "label": "DC-01",
+            "sub": "域控制器"
+          },
+          {
+            "id": "siem",
+            "icon": "log",
+            "label": "SIEM",
+            "sub": "检测"
+          }
+        ],
+        "steps": [
+          {
+            "at": "ws",
+            "caption": "攻击者在 WS-114 上持有一个标准用户会话，并发现了本地管理员凭据。",
+            "tone": "warning"
+          },
+          {
+            "at": "app",
+            "caption": "两分钟内，出现了到 APP-02 的网络登录（类型 3）和一个新服务。",
+            "tone": "danger"
+          },
+          {
+            "at": "file",
+            "caption": "同一账户通过 SMB 访问 FS-01，并以异常的顺序读取了许多共享。",
+            "tone": "danger"
+          },
+          {
+            "at": "dc",
+            "caption": "一个特权账户从 APP-02 登录到 DC-01，而它以前从未这样做过。",
+            "tone": "danger"
+          },
+          {
+            "at": "siem",
+            "caption": "扇出规则和首次出现的源到目标规则同时触发。",
+            "tone": "warning"
+          },
+          {
+            "at": "ws",
+            "caption": "遏制措施隔离了 WS-114 和 APP-02，并禁用了该账户。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "hunt",
+      "type": "text",
+      "markdown": "## 搜寻这些行为\n\n特征码会变，行为不会变。三种搜寻就能发现大部分移动。\n\n1. **扇出（Fan-out）。**一个来源在短时间内向许多不同主机认证。正常用户只会接触少数几个系统，而扫描器和攻击者会接触几十个。\n2. **首次出现的配对。**从未通信过的源和目标，尤其是通过 SMB、RDP 或 WinRM 等管理协议。\n3. **登录类型不匹配。**通常只在本地登录的账户出现远程交互式或网络登录，以及在网络登录之后不久出现服务创建（7045 或 4697）。\n\n先建立基线。IT 管理员账户合法地接触许多主机，因此应按角色将其排除，并单独对其进行监视。无法区分管理员和攻击者的检测规则会被忽视。"
+    },
+    {
+      "id": "fanout-kql",
+      "type": "code",
+      "language": "plain",
+      "code": "SecurityEvent\n| where TimeGenerated > ago(1h)\n| where EventID == 4624 and LogonType in (3, 10)\n| where AccountType == \"User\" and TargetUserName !endswith \"$\"\n| summarize Targets = dcount(Computer), TargetList = make_set(Computer, 20) by IpAddress, TargetUserName\n| where Targets >= 8\n| order by Targets desc",
+      "filename": "lateral_fanout.kql",
+      "caption": "面向 Microsoft Sentinel 的 KQL：一小时内，同一账户和来源通过网络或远程交互式登录访问八台或更多主机。请根据你的环境规模调优阈值。"
+    },
+    {
+      "id": "svc-sigma",
+      "type": "code",
+      "language": "yaml",
+      "code": "title: Service Installed Shortly After Network Logon\nid: 5c1e3a10-0000-4000-8000-00000000a002\nstatus: experimental\nlogsource:\n  product: windows\n  service: system\ndetection:\n  selection:\n    EventID: 7045\n  filter_known:\n    ImagePath|contains:\n      - 'C:\\Program Files\\'\n      - 'C:\\Windows\\System32\\svchost.exe'\n  condition: selection and not filter_known\nfields:\n  - ServiceName\n  - ImagePath\n  - AccountName\nlevel: high\ntags:\n  - attack.lateral_movement\n  - attack.t1021.002",
+      "filename": "service_install_outside_standard_paths.yml",
+      "caption": "一条针对新服务的 Sigma 规则，其二进制文件位于标准安装路径之外。请在你的 SIEM 中将其与之前的类型 3 登录关联起来。"
+    },
+    {
+      "id": "linux-net",
+      "type": "text",
+      "markdown": "## 同时使用网络和 Linux 证据\n\n主机日志可能被清除，因此请用网络数据加以确认。流量数据和防火墙日志会显示，从未使用过这些端口的来源发起的、指向端口 445、3389、5985 和 22 的内部东西向（east-west）连接。Zeek 的 `conn` 和 `smb_mapping` 日志显示了访问过哪些共享。查询方法请参阅[基于网络的事件调查](/learn/security-operations-dfir/network-based-incident-investigation)。\n\n在 Linux 上，请查看来自内部地址的 `Accepted publickey` 行、`known_hosts` 中的新条目、SSH 代理转发，以及登录之后立即出现的 `sudo` 使用。跳板机（Jump Host）是记录一切的高价值位置，因为大多数合法和恶意路径都会经过它。"
+    },
+    {
+      "id": "lat-term",
+      "type": "terminal",
+      "title": "Zeek SMB 与 Linux 检查（实验）",
+      "prompt": "analyst@sensor:~$",
+      "lines": [
+        {
+          "cmd": "zeek-cut ts id.orig_h id.resp_h path < smb_mapping.log | awk '$2==\"10.20.7.114\"' | head -3",
+          "output": "1731402190.4  10.20.7.114  10.20.5.14   \\\\FS-01\\C$\n1731402203.9  10.20.7.114  10.20.5.21   \\\\APP-02\\ADMIN$\n1731402221.1  10.20.7.114  10.20.5.30   \\\\DC-01\\C$",
+          "comment": "一台工作站在 30 秒内映射了三台服务器上的管理共享。"
+        },
+        {
+          "cmd": "grep 'Accepted publickey' /var/log/auth.log | awk '{print $9, $11}' | sort | uniq -c | sort -nr | head -3",
+          "output": "  14 deploy 192.0.2.10\n   6 backup 192.0.2.22\n   1 deploy 10.20.7.114",
+          "comment": "deploy 账户出现了首次出现的内部来源，十分显眼。"
+        }
+      ],
+      "caption": "使用文档用地址和私有地址的示例输出。"
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## 对移动告警进行分诊\n\n当扇出或服务规则触发时，按一份简短的清单逐项处理，使你的决策快速且一致。\n\n1. **确认两端。**哪台主机是源，哪台是目标，使用了哪个账户？通过 DHCP 记录确认源地址。\n2. **检查角色。**该账户是管理员、服务账户还是普通用户？源是否为预期会这样做的管理服务器？\n3. **阅读第一个事件。**找到链条中最早的登录。它通常最接近最初的立足点，并告诉你调查真正的起点在哪里。\n4. **查看运行了什么。**在目标上，查看登录之后紧接着的进程创建事件（4688 或 Sysmon 1）。由服务或 `WmiPrvSE.exe` 派生出的命令解释器是危险信号。\n5. **扩大范围。**在其他所有主机上搜索相同的账户、相同的源和相同的工具名称。\n6. **决策并行动。**如果在你的时间限度内无法解释该活动，就上报，并遏制源主机和该账户。\n\n这套流程也为你提供了后续撰写报告所需的时间线。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "记录路径，而不仅是主机",
+      "markdown": "将移动的发现写成一条路径：源、账户、协议、目标和时间。像 WS-114、svc-backup、SMB、FS-01、02:14 UTC 这样的四行记录，能让下一位分析师重新绘制整条链，并发现缺少证据的空缺。仅有一份主机名列表则做不到这一点。请为每一跳添加证据来源，如事件 ID 或日志文件，以便复核者能够独立且快速地验证每一项结论。"
+    },
+    {
+      "id": "prevent",
+      "type": "text",
+      "markdown": "## 让移动更困难、动静更大\n\n检测与预防结合效果最佳。\n\n- **唯一的本地管理员密码**（Windows LAPS），这样一个被盗的密码不会解锁每台机器。\n- **分层管理（Tiered Administration）：**域管理员从不登录工作站，因此他们的凭据无法在那里被窃取。\n- **网络分段（Segmentation）：**使用主机防火墙阻止工作站到工作站的 SMB、RDP 和 WinRM。工作站很少需要互相通信。\n- **限制 NTLM**，尽可能强制使用 Kerberos；在远程访问和跳板机上要求 MFA。\n- 通过即时（Just-in-Time）访问**消除常驻特权**。\n- **集中记录日志**，包括 4688 命令行、Sysmon，并转发到 SIEM。\n\n这些控制措施也能减少勒索软件的扩散，这就是它们在[勒索软件检测与响应](/learn/security-operations-dfir/ransomware-detection-and-response)中再次出现的原因。"
+    },
+    {
+      "id": "warning",
+      "type": "callout",
+      "variant": "warning",
+      "title": "管理员看起来像攻击者",
+      "markdown": "补丁工具、备份代理和漏洞扫描器会合法地登录许多主机并创建服务。不要全局屏蔽横向移动告警。请对具体的来源、账户和时间窗口设置白名单，记录责任人，并每季度复核该清单。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你自己拥有的 Windows 实验域（两台成员服务器和一台工作站）中，使用一个测试管理员账户，从工作站通过远程桌面和 `Enter-PSSession` 登录到这两台服务器。在每台服务器上，找到对应的 4624 事件，并记下登录类型和源地址。编写一个查询，返回十分钟内访问了两台或更多服务器的来源，然后提高计数，观察阈值如何影响误报。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "横向移动（Lateral movement）",
+          "definition": "从一个已被入侵的系统移动到网络中的其他系统。"
+        },
+        {
+          "term": "东西向流量（East-west traffic）",
+          "definition": "网络内部系统之间的内部流量。"
+        },
+        {
+          "term": "扇出（Fan-out）",
+          "definition": "一个来源在短时间内接触许多不同的目标。"
+        },
+        {
+          "term": "管理共享（Admin share）",
+          "definition": "用于管理的隐藏 Windows 共享，如 C$ 和 ADMIN$。"
+        },
+        {
+          "term": "WinRM",
+          "definition": "Windows 远程管理（Windows Remote Management），PowerShell 远程处理背后的协议。"
+        },
+        {
+          "term": "LAPS",
+          "definition": "为每台计算机提供唯一本地管理员密码的 Windows 工具。"
+        },
+        {
+          "term": "跳板机（Jump host）",
+          "definition": "经过加固、用作进入敏感网络的受控通道的系统。"
+        },
+        {
+          "term": "网络分段（Segmentation）",
+          "definition": "划分网络，使系统之间不能自由互访。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "哪种登录类型表示远程桌面会话？",
+          "options": [
+            "2",
+            "3",
+            "5",
+            "10"
+          ],
+          "answer": 3,
+          "explanation": "类型 10 是 RemoteInteractive，用于远程桌面。类型 3 是网络登录，类型 2 是本地交互式登录。"
+        },
+        {
+          "question": "哪些行为提示存在横向移动？请选择所有适用项。",
+          "options": [
+            "一台工作站在十分钟内向 30 台服务器认证",
+            "网络登录之后立即安装了新服务",
+            "用户打开本地电子表格",
+            "一个来源首次通过 SMB 访问某台服务器"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "扇出、远程服务创建和首次出现的管理协议连接是典型表现。打开本地文件不是横向移动。"
+        },
+        {
+          "question": "为什么仅靠基于锁定的规则很难发现横向移动？",
+          "options": [
+            "横向移动使用的是能成功的有效凭据",
+            "Windows 不记录失败",
+            "SMB 无法被记录",
+            "锁定只发生在 Linux 上"
+          ],
+          "answer": 0,
+          "explanation": "移动通常使用有效或被盗的凭据，因此几乎没有失败可供统计。行为和上下文才是关键。"
+        },
+        {
+          "question": "哪些控制措施可以减少横向移动？请选择所有适用项。",
+          "options": [
+            "使用 Windows LAPS 为每台设备设置唯一的本地管理员密码",
+            "阻止工作站到工作站的 SMB 和 RDP",
+            "使用同一个共享的本地管理员密码",
+            "分层管理"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "唯一密码、网络分段和分层管理限制了被盗凭据能够触及的范围。共用一个密码会让移动变得容易。"
+        },
+        {
+          "question": "一台补丁服务器每晚对 200 台主机呈现扇出。最佳处理方式是什么？",
+          "options": [
+            "全局禁用该检测",
+            "对该具体的来源、账户和时间窗口设置白名单，并指定责任人和复核日期",
+            "忽略所有扇出告警",
+            "删除补丁服务器的日志"
+          ],
+          "answer": 1,
+          "explanation": "有针对性的排除既能保持检测的有效性，又能去除已知的合法行为。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n横向移动会把一个被入侵的系统变成一次数据泄露，但它迫使攻击者进行认证、远程执行并跨越网络边界，所有这些都会留下证据。了解这些路径及其日志特征，搜寻扇出、首次出现的配对和登录类型不匹配，用网络数据加以确认，并精确地排除合法的管理活动。通过唯一的本地管理员密码、分层管理、网络分段和集中日志来预防。接下来，请在[勒索软件检测与响应](/learn/security-operations-dfir/ransomware-detection-and-response)中了解这些技能如何应用于破坏性攻击。"
+    }
+  ]
+}

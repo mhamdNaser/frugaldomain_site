@@ -1,0 +1,369 @@
+{
+  "title": "网络取证（Network Forensics）",
+  "summary": "学习收集并保全网络证据，将数据包转换为 Zeek 日志，从元数据中发现信标通信和 DNS 隧道，并将网络发现与主机、时间和用户关联起来。",
+  "objectives": [
+    "比较 PCAP、协议日志、流记录和 IDS 告警这几种证据来源",
+    "使用环形缓冲区收集抓包文件并记录其哈希",
+    "使用 Zeek 和 zeek-cut 发现信标通信和 DNS 隧道",
+    "应用 tshark 显示过滤器来回答调查问题",
+    "将网络发现与主机和用户关联，并说明置信度"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "09:12，一条防火墙日志显示文件服务器 FS01（192.0.2.10）在一小时内发出了 4,000 次 DNS 查询，其中许多指向一个没人认识的域名。该主机上的代理程序几周前就被禁用了，因此服务器无法告诉你它做了什么。而网络可以。保存在被攻陷机器之外的数据包和日志，是攻击者难以编辑的证据。\n\n**网络取证（Network forensics）**是对网络流量及其元数据进行收集、保全和分析，以还原所发生的事情。它是对 [基于网络的事件调查](/learn/security-operations-dfir/network-based-incident-investigation)中实时工作的补充，并建立在[高级网络流量分析](/learn/security-operations-dfir/advanced-network-traffic-analysis)的基础之上。"
+    },
+    {
+      "id": "evidence",
+      "type": "text",
+      "markdown": "## 选择合适的证据类型\n\n没有哪个组织会永久存储每一个数据包。每种来源都在细节与存储和保留期之间做权衡：\n\n| 来源 | 细节 | 典型保留期 | 最适合 |\n|:--|:--|:--|:--|\n| **全包抓取（PCAP）** | 每个字节，包括载荷 | 数小时到数天 | 还原文件和精确的协议行为 |\n| **协议日志（Zeek、代理、DNS）** | 每连接和每请求的字段 | 数月 | 狩猎、时间线、确定范围 |\n| **流记录（NetFlow、IPFIX）** | 地址、端口、字节数、时间 | 数月到一年 | 流量大小、方向以及谁与谁通信 |\n| **IDS 告警（Suricata、Snort）** | 带上下文的规则匹配 | 数月 | 已知恶意指标 |\n| **防火墙和 VPN 日志** | 允许或拒绝以及 NAT 映射 | 数月 | 边界穿越和地址转换 |\n\n大多数调查从日志和流记录开始，然后只为少数重要的会话调取 PCAP。加密降低了载荷的价值，但元数据（谁、何时、多频繁、多少、哪个名称）仍然能说明大部分故事。"
+    },
+    {
+      "id": "collect",
+      "type": "text",
+      "markdown": "## 收集并保全抓包文件\n\n只在你获授权监控的网络上抓包，并从第一个字节起就把该文件当作证据对待。\n\n1. 将**传感器部署**在 SPAN 端口或网络 TAP 上，这样抓包不会改变流量。TAP 是被动的；SPAN 端口在负载下可能丢包。\n2. 尽可能**精确过滤**，例如只针对一台主机，因为大范围抓包会收集你不需要的个人数据。\n3. **使用环形缓冲区**，避免磁盘写满而导致抓包停止。\n4. **立即计算哈希**，并记录谁在何时何地使用什么命令进行了抓包。\n5. **在副本上工作。** 绝不要分析原始文件。\n\n终端展示了针对可疑服务器的每小时环形缓冲区以及最初的完整性检查步骤。"
+    },
+    {
+      "id": "term-cap",
+      "type": "terminal",
+      "title": "抓包与完整性检查",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "sudo tcpdump -i eth1 -nn -s 0 -G 3600 -W 24 -w /evidence/cap-%Y%m%d-%H%M.pcap host 192.0.2.10",
+          "comment": "仅抓取可疑主机：24 个按小时划分的文件，完整数据包长度，不做名称解析"
+        },
+        {
+          "output": "tcpdump: listening on eth1, link-type EN10MB (Ethernet), snapshot length 262144 bytes",
+          "comment": "tcpdump 确认了接口；此处若静默失败将丢失证据"
+        },
+        {
+          "cmd": "sha256sum /evidence/cap-*.pcap | tee /evidence/SHA256SUMS",
+          "comment": "立即记录每个已关闭文件的哈希"
+        },
+        {
+          "output": "9b1f0c4e7a2d...e41  /evidence/cap-20261112-0900.pcap",
+          "comment": "将哈希列表与抓包文件分开存放"
+        },
+        {
+          "cmd": "capinfos -c -u -a -e /evidence/cap-20261112-0900.pcap",
+          "comment": "对照预期检查数据包数量和时间范围"
+        },
+        {
+          "output": "Number of packets:   1482733\nCapture duration:    3600 seconds\nFirst packet time:   2026-11-12 09:00:00\nLast packet time:    2026-11-12 09:59:59",
+          "comment": "时间范围中出现间隙意味着抓包丢失了数据"
+        }
+      ],
+      "caption": "在你管理的传感器上运行，并取得书面授权。"
+    },
+    {
+      "id": "zeek",
+      "type": "text",
+      "markdown": "## 将数据包转换为可搜索的日志\n\n**Zeek** 读取抓包文件并写出结构化日志：`conn.log`（每个连接）、`dns.log`、`http.log`、`ssl.log` 和 `files.log`。每个日志都带有共享的 `uid`，因此你可以跨日志跟踪同一个会话。搜索文本比滚动查看数据包快得多。\n\n三种模式值得投入精力：\n\n- **信标通信（Beaconing）。** 按定时器签到的恶意软件会以近乎恒定的间隔和近乎恒定的大小产生连接。人类不会这样。\n- **DNS 滥用。** 很长的标签、高熵名称、同一父域下大量唯一的子域名以及大量使用 TXT 记录，都暗示存在隧道。\n- **异常流量。** 发出的字节数远多于接收的服务器，可能正在暂存或外泄数据。\n\n下一个终端会在抓包文件中找出前两种模式。"
+    },
+    {
+      "id": "term-zeek",
+      "type": "terminal",
+      "title": "Zeek 与 zeek-cut",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "zeek -C -r /evidence/cap-20261112-0900.pcap && ls *.log",
+          "comment": "离线处理抓包文件；-C 忽略因校验和卸载造成的错误校验和"
+        },
+        {
+          "output": "conn.log  dns.log  files.log  http.log  ssl.log  weird.log",
+          "comment": "这些日志就是你新的工作数据"
+        },
+        {
+          "cmd": "zeek-cut ts < conn.log > /dev/null; zeek-cut ts id.resp_h < conn.log | awk '$2==\"203.0.113.50\"{print $1}' | awk 'NR>1{printf \"%d\\n\", $1-p} {p=$1}' | sort -n | uniq -c",
+          "comment": "计算到可疑地址的每次连接之间的间隔（秒）"
+        },
+        {
+          "output": "     46 60\n      2 61\n      1 59",
+          "comment": "49 个间隔中有 46 个是 60 秒：这是定时器，不是人"
+        },
+        {
+          "cmd": "zeek-cut query qtype_name < dns.log | awk 'length($1) > 50' | head -3",
+          "comment": "查找标签长度超过 50 个字符的 DNS 名称"
+        },
+        {
+          "output": "a8f3k2m9q1x7zb4c0d5e6h8j2l4n7p1r3t5v9w0y2.t.example.net TXT\nb9g4l3n0r2y8ac5d1e7f9i3k5m8o2q4s6u0w1x3z5.t.example.net TXT\nc0h5m4o1s3z9bd6e2f8g0j4l6n9p3r5t7v1x2y4a6.t.example.net TXT",
+          "comment": "同一父域下看起来随机的 TXT 查询：强烈的隧道指标"
+        }
+      ],
+      "caption": "来自实验室抓包的带注释输出。域名和地址均为文档用示例值。"
+    },
+    {
+      "id": "flow-intro",
+      "type": "text",
+      "markdown": "## 解读这个故事\n\n动画展示了当服务器先使用 DNS、后使用 HTTPS 时，传感器所看到的内容。请跟随各个步骤，然后注意分析人员从未解密任何东西。"
+    },
+    {
+      "id": "net-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "DNS 隧道之后是 HTTPS 信标",
+      "caption": "仅凭元数据就能揭示命令通道、涉及的主机和时间窗口。",
+      "data": {
+        "actors": [
+          {
+            "id": "fs",
+            "label": "文件服务器",
+            "sub": "192.0.2.10",
+            "icon": "server"
+          },
+          {
+            "id": "dns",
+            "label": "解析器",
+            "sub": "192.0.2.53",
+            "icon": "globe"
+          },
+          {
+            "id": "c2",
+            "label": "远程主机",
+            "sub": "t.example.net / 203.0.113.50",
+            "icon": "attacker"
+          },
+          {
+            "id": "zk",
+            "label": "Zeek 传感器",
+            "sub": "SPAN 端口",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "from": "fs",
+            "to": "dns",
+            "label": "DNS TXT 查询",
+            "detail": "a8f3k2...t.example.net",
+            "note": "服务器请求一个位于异常域名下的、很长且看起来随机的名称。",
+            "tone": "warning"
+          },
+          {
+            "from": "dns",
+            "to": "c2",
+            "label": "递归查询",
+            "detail": "TXT t.example.net",
+            "note": "解析器将查询转发给权威服务器，而该服务器由攻击者控制。",
+            "tone": "attack"
+          },
+          {
+            "from": "c2",
+            "to": "fs",
+            "label": "TXT 应答",
+            "detail": "编码后的指令",
+            "note": "应答在记录文本中携带数据。DNS 允许出站，因此防火墙并不反对。",
+            "tone": "danger"
+          },
+          {
+            "from": "fs",
+            "to": "c2",
+            "label": "HTTPS 信标",
+            "detail": "TCP/443，间隔 60 秒",
+            "note": "随后服务器每 60 秒发出一次信标，请求大小近乎恒定。",
+            "tone": "danger"
+          },
+          {
+            "from": "zk",
+            "to": "zk",
+            "label": "conn.log、dns.log、ssl.log",
+            "detail": "元数据已写入",
+            "note": "即使 HTTPS 载荷是加密的，传感器仍会记录每个连接和查询。",
+            "tone": "secure"
+          },
+          {
+            "from": "zk",
+            "to": "zk",
+            "label": "间隔分析",
+            "detail": "49 个间隔中有 46 个 = 60 秒",
+            "note": "对间隔分组后显示出机器般的规律性，而人是不会产生这种规律的。",
+            "tone": "warning"
+          },
+          {
+            "from": "zk",
+            "to": "zk",
+            "label": "主机与时间枢轴",
+            "detail": "移交给主机取证",
+            "note": "分析人员现在知道应在磁盘和内存中检查哪台主机以及哪个时间窗口。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tools",
+      "type": "text",
+      "markdown": "## Wireshark、tshark 与 Suricata\n\n**Wireshark** 最适合检查单个会话：*Follow TCP Stream*（跟踪 TCP 流）、协议层次结构和 Statistics 菜单。**tshark** 在命令行中提供相同的引擎，适合脚本和大文件。**Suricata** 增加了签名，并写出供你的 SIEM 使用的 `eve.json`，详见 [Security Onion 架构](/learn/security-operations-dfir/security-onion-architecture)。\n\n使用能回答某个问题的显示过滤器。先宽后窄（先 `dns`，再 `dns.qry.name contains \"t.example.net\"`），并且只导出对你的报告重要的数据包。"
+    },
+    {
+      "id": "tshark",
+      "type": "code",
+      "language": "bash",
+      "filename": "tshark-recipes.sh",
+      "caption": "四种 tshark 用法：DNS 名称、最大的 TCP 会话、TLS 服务器名称，以及每分钟流量概况。",
+      "code": "# Run on a copy of the capture, never on the original evidence file.\ntshark -r suspect.pcap -Y 'dns.qry.name contains \"t.example.net\"' -T fields -e frame.time -e ip.src -e dns.qry.name -e dns.qry.type\ntshark -r suspect.pcap -q -z conv,tcp | sort -k9 -n -r | head\ntshark -r suspect.pcap -Y 'tls.handshake.type==1' -T fields -e ip.dst -e tls.handshake.extensions_server_name\ntshark -r suspect.pcap -q -z io,stat,60,\"ip.dst==203.0.113.50\"\n"
+    },
+    {
+      "id": "suricata",
+      "type": "code",
+      "language": "plain",
+      "filename": "local.rules",
+      "caption": "一条标记长 DNS 标签的实验室 Suricata 规则。它需要针对你的正常流量进行调优。",
+      "code": "alert dns $HOME_NET any -> any 53 (msg:\"LAB DNS long query label\"; dns.query; content:\".\"; pcre:\"/^[a-z0-9]{40,}\\./\"; threshold:type limit, track by_src, count 1, seconds 60; classtype:bad-unknown; sid:9000001; rev:1;)\n"
+    },
+    {
+      "id": "report",
+      "type": "text",
+      "markdown": "## 从数据包到结论\n\n当网络发现与主机、时间和用户关联起来时，它才变得有用：\n\n1. 从地址**转向（Pivot）**资产清单以及 DHCP 或 VPN 日志，找出当时的真实设备。NAT 和 DHCP 会使答案随时间而变。\n2. 与主机和认证证据**关联**，例如[认证日志调查](/learn/security-operations-dfir/authentication-log-investigation)。\n3. **说明置信度。**“服务器每 60 秒联系一次该域名”是事实。“服务器受攻击者控制”则是需要主机证据支持的结论。\n4. **记录每一步**，以便另一位检验人员能用相同的文件重复你的结果。\n\n然后使用[磁盘与内存取证](/learn/security-operations-dfir/disk-and-memory-forensics)检查机器本身。"
+    },
+    {
+      "id": "warn-privacy",
+      "type": "callout",
+      "variant": "warning",
+      "title": "只抓取你获授权抓取的内容",
+      "markdown": "抓包文件可能包含密码、个人消息以及健康或支付数据。请取得书面授权，将抓包范围限定在被调查的主机，限制对文件的访问，并在保留规则要求时删除它们。即使在你雇主自己的网络上，超出权限的抓包也可能是违法的。"
+    },
+    {
+      "id": "tip-encrypted",
+      "type": "callout",
+      "variant": "tip",
+      "title": "加密不等于不可见",
+      "markdown": "使用 TLS 时，你仍然可以看到目的地、服务器名称（SNI）、证书详情、字节数、时序以及 JA3 或 JA4 等 TLS 客户端指纹。许多信标正是凭借这些数据而在完全不解密的情况下被发现的。"
+    },
+    {
+      "id": "note-time",
+      "type": "callout",
+      "variant": "note",
+      "title": "关联之前先核对时钟",
+      "markdown": "网络传感器、服务器和防火墙的时间很少精确到秒一致。在将 Zeek 记录与主机日志关联之前，将每个系统的时钟与可信时间源进行比较，并记下偏移量。两分钟的偏差可能使一个无害事件看起来像是告警的原因，或者掩盖真正的原因。同时记录每个来源的时区，因为 Zeek 存储的是 epoch 时间，而许多其他工具显示的是本地时间。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自试一试",
+      "markdown": "仅使用**你自己的计算机或实验室虚拟机**。\n\n1. 开始抓取你自己的流量：`tcpdump -i any -nn -w mine.pcap`（或使用 Wireshark），然后浏览几个网站两分钟并停止。\n2. 使用 `sha256sum mine.pcap` 计算哈希，并将该值连同时间和你的姓名记在笔记本中。\n3. 运行 `zeek -C -r mine.pcap`，并使用 `zeek-cut query < dns.log | sort | uniq -c | sort -nr | head` 打开 `dns.log`。\n4. 在 `conn.log` 中按 `orig_bytes` 找出你最长的 DNS 名称和最大的连接。\n5. 写两句话，说明你能从元数据中证明什么、不能证明什么。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "PCAP",
+          "definition": "包含已捕获数据包的文件，用作全保真的网络证据。"
+        },
+        {
+          "term": "SPAN 端口（SPAN port）",
+          "definition": "将其他端口的流量镜像到监控设备的交换机端口。"
+        },
+        {
+          "term": "网络 TAP（Network TAP）",
+          "definition": "一种被动硬件设备，可将流量复制给传感器而不影响流量。"
+        },
+        {
+          "term": "Zeek",
+          "definition": "一种网络分析框架，可将流量转换为结构化、可搜索的日志。"
+        },
+        {
+          "term": "NetFlow / IPFIX",
+          "definition": "流记录，概括了谁与谁通信、使用哪些端口、持续多久以及流量多少。"
+        },
+        {
+          "term": "信标通信（Beaconing）",
+          "definition": "恶意软件向其控制端定期、基于定时器的签到流量。"
+        },
+        {
+          "term": "DNS 隧道（DNS tunneling）",
+          "definition": "将数据隐藏在 DNS 查询和应答中，以穿越网络边界。"
+        },
+        {
+          "term": "JA3 / JA4",
+          "definition": "TLS 客户端握手的指纹，有助于在不解密的情况下识别软件。"
+        },
+        {
+          "term": "证据保管链（Chain of custody）",
+          "definition": "记录谁在何时、出于何种原因处理过证据的记录，证明证据未被篡改。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪种来源保留的细节最多，但通常保留时间最短？",
+          "options": [
+            "流记录",
+            "全包抓取",
+            "防火墙日志",
+            "Zeek dns.log"
+          ],
+          "answer": 1,
+          "explanation": "全包抓取存储每个字节，因此存储成本迫使其保留期较短。流记录和日志是概括性的，保留时间长得多。"
+        },
+        {
+          "question": "一台主机以 60、60、61、60 和 59 秒的间隔连接到同一个地址。这最可能说明什么？",
+          "options": [
+            "用户在浏览网页",
+            "基于定时器的信标通信",
+            "丢包",
+            "DHCP 续租风暴"
+          ],
+          "answer": 1,
+          "explanation": "近乎恒定的间隔表明是按定时器运行的软件。人类的活动是不规则的。"
+        },
+        {
+          "question": "以下哪些是可能存在 DNS 隧道的迹象？（选择所有适用项。）",
+          "options": [
+            "很长且看起来随机的标签",
+            "同一父域下有大量唯一的子域名",
+            "对该域名频繁的 TXT 查询",
+            "对某个热门网站的单次 A 记录查询"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "隧道将数据编码在名称和记录中，从而产生很长的标签、大量唯一的子域名和异常的记录类型。单次正常查询并不可疑。"
+        },
+        {
+          "question": "为什么应在收集后立即对抓包文件计算哈希？",
+          "options": [
+            "使文件更小",
+            "以便日后证明它未被篡改",
+            "以解密 TLS 流量",
+            "以加快 Wireshark 的速度"
+          ],
+          "answer": 1,
+          "explanation": "记录下来的哈希让任何人都能验证所分析的文件就是所收集的文件，这支持证据保管链。"
+        },
+        {
+          "question": "对于加密的 HTTPS 流量，你仍然可以了解到什么？（选择所有适用项。）",
+          "options": [
+            "目的地址和服务器名称",
+            "连接时序和字节数",
+            "确切的页面内容",
+            "TLS 客户端指纹"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "元数据仍然可见。除非你能合法解密，否则页面内容受到保护。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- **网络证据（Network evidence）**存在于被攻陷主机之外：PCAP 提供细节，Zeek 和代理日志用于搜索，流记录用于流量大小，IDS 告警用于已知恶意内容。\n- **谨慎收集**：获授权的范围、TAP 或 SPAN、环形缓冲区、立即计算哈希、使用副本分析。\n- **Zeek** 将数据包转换为日志；留意规律的间隔、长的或随机的 DNS 名称，以及不均衡的出站流量。\n- 加密流量仍会暴露**元数据**，这通常足以发现命令通道。\n- 将每个发现与主机、时间和用户关联起来，说明你的置信度，并将机器移交给主机取证。\n\n请继续学习[磁盘与内存取证](/learn/security-operations-dfir/disk-and-memory-forensics)。"
+    }
+  ]
+}

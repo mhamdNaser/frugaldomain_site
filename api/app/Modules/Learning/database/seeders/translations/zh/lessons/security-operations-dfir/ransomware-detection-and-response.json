@@ -1,0 +1,349 @@
+{
+  "title": "勒索软件检测与响应（Ransomware Detection and Response）",
+  "summary": "了解勒索软件入侵是如何展开的，可以用 KQL、SPL 和 Sigma 检测哪些早期信号，以及如何执行响应的第一个小时：遏制、保护备份、保全证据并上报。",
+  "objectives": [
+    "描述勒索软件入侵的各个阶段以及每个阶段的检测信号",
+    "用 KQL、SPL 和 Sigma 编写针对恢复抑制和大规模文件变更的检测规则",
+    "在不破坏证据的前提下执行第一个小时的响应流程",
+    "解释为什么支付赎金是领导层和法律层面的决定",
+    "判断何时可以安全地开始重建"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "周五，01:58。值班分析人员看到一台文件服务器的共享文件夹中充满了以 `.locked` 结尾的文件，以及一个名为 `README_RESTORE.txt` 的文本文件。几分钟之内，第二台服务器也出现了同样的迹象。接下来一小时（而不是下周）所做的决定，将决定这只是糟糕的一夜，还是一场足以终结业务的事件。\n\n本课涵盖**尽早检测勒索软件**，以及**以限制损害并保全证据的方式进行响应**。关于预防和架构，请参阅[勒索软件防御工程](/learn/security-operations-dfir/ransomware-defense-engineering)；关于通用流程，请参阅[事件响应基础](/learn/security-operations-dfir/incident-response-fundamentals)。"
+    },
+    {
+      "id": "stages",
+      "type": "text",
+      "markdown": "## 勒索软件入侵如何展开\n\n加密是最后一步，而不是第一步。现代攻击者会在网络内部停留数天乃至数周，每个阶段都会留下信号。\n\n| 阶段 | 攻击者的行为 | 检测信号 |\n|:--|:--|:--|\n| 初始访问 | 钓鱼、暴露的远程访问、被盗凭据 | 异常登录、新的远程工具 |\n| 发现 | 列出主机、共享和域管理员 | 突发的 LDAP 和 SMB 枚举 |\n| 凭据窃取 | 从内存中转储凭据 | LSASS 访问、新的管理员登录 |\n| 横向移动 | 使用管理共享和远程执行 | 一个账户出现在多台主机上，参见[横向移动检测](/learn/security-operations-dfir/lateral-movement-detection) |\n| 数据外泄 | 先将数据复制出去（双重勒索） | 向新目的地的大量出站传输 |\n| 抑制恢复 | 停止备份、删除卷影副本 | `vssadmin delete shadows`、服务停止 |\n| 加密 | 大规模文件重写和重命名 | 文件变更激增、创建勒索信 |\n\n最后一行之前的每一行，都是在不丢失任何数据的情况下阻止攻击的机会。请将**抑制恢复（inhibit recovery）**步骤视为几乎确定的前兆：合法软件极少会删除所有卷影副本。"
+    },
+    {
+      "id": "signals",
+      "type": "text",
+      "markdown": "## 高价值的早期信号\n\n三种检测能覆盖最大比例的真实案例：\n\n1. **恢复抑制。** 删除卷影副本、在 `bcdedit` 中禁用恢复、删除备份目录，以及停止备份或数据库服务。\n2. **大规模文件活动。** 单个进程或用户每分钟修改或重命名数百个文件，尤其是带有新的重复扩展名时。\n3. **金丝雀文件（Canary files）。** 放置在共享中并监控任何变化的诱饵文档。由于没有任何合法程序会触碰它们，单个事件就是强有力的告警。\n\n再加上登录上下文。一个服务账户在 01:40 首次以交互方式登录，值得叫醒某个人。"
+    },
+    {
+      "id": "kql",
+      "type": "code",
+      "language": "plain",
+      "filename": "ransomware-precursors.kql",
+      "caption": "用于 Microsoft Sentinel 或 Defender 的 KQL 查询，可找出抑制恢复的命令。",
+      "code": "// Microsoft Sentinel / Defender: recovery-inhibiting commands run within 10 minutes on one host\nDeviceProcessEvents\n| where Timestamp > ago(1d)\n| where (FileName =~ \"vssadmin.exe\" and ProcessCommandLine has_all (\"delete\", \"shadows\"))\n     or (FileName =~ \"wmic.exe\" and ProcessCommandLine has_all (\"shadowcopy\", \"delete\"))\n     or (FileName =~ \"bcdedit.exe\" and ProcessCommandLine has \"recoveryenabled\" and ProcessCommandLine has \"no\")\n     or (FileName =~ \"wbadmin.exe\" and ProcessCommandLine has_all (\"delete\", \"catalog\"))\n| summarize Commands = make_set(ProcessCommandLine), Count = count(), First = min(Timestamp) by DeviceName, AccountName, InitiatingProcessFileName\n| where Count >= 1\n| order by First asc\n"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "mass-file-change.spl",
+      "caption": "用于检测大规模文件变更的 Splunk SPL 搜索。阈值必须根据你的环境调整，因为备份和构建也会触碰大量文件。",
+      "code": "index=fileaudit action=rename OR action=modified\n| bin _time span=1m\n| stats dc(file_path) as files_touched dc(file_extension) as new_extensions values(file_extension) as ext by _time, host, user\n| where files_touched > 300 AND new_extensions <= 2\n| sort - files_touched"
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "shadow-copy-deletion.yml",
+      "caption": "同样的抑制恢复逻辑，以可移植的 Sigma 规则表示。",
+      "code": "title: Shadow Copy Deletion by Command Line\nid: 00000000-0000-4000-8000-000000000004   # placeholder id\nstatus: stable\nlogsource:\n  category: process_creation\n  product: windows\ndetection:\n  selection_vss:\n    Image|endswith: '\\vssadmin.exe'\n    CommandLine|contains|all:\n      - 'delete'\n      - 'shadows'\n  selection_wmic:\n    Image|endswith: '\\wmic.exe'\n    CommandLine|contains|all:\n      - 'shadowcopy'\n      - 'delete'\n  condition: selection_vss or selection_wmic\nfalsepositives:\n  - Storage administrators during planned maintenance\nlevel: high\ntags:\n  - attack.impact\n  - attack.t1490\n",
+      "highlight": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18
+      ]
+    },
+    {
+      "id": "flowintro",
+      "type": "text",
+      "markdown": "## 一个夜晚，逐步还原\n\n请跟随动画。攻击在十天前就已开始，但响应的计时只从告警时开始。请注意从告警到第一批文件被加密之间相隔多么短，以及当剧本经过演练时，在八分钟内能完成多少遏制工作。"
+    },
+    {
+      "id": "ransom-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从立足点到遏制",
+      "caption": "在加密之前检测是可能的，但响应也必须在加密开始之后仍然有效。",
+      "data": {
+        "token": "攻击者",
+        "nodes": [
+          {
+            "id": "pz",
+            "label": "零号病人",
+            "sub": "被钓鱼的笔记本电脑",
+            "icon": "laptop"
+          },
+          {
+            "id": "dc",
+            "label": "域控制器",
+            "sub": "管理员凭据",
+            "icon": "key"
+          },
+          {
+            "id": "bk",
+            "label": "备份服务器",
+            "sub": "卷影副本、作业",
+            "icon": "database"
+          },
+          {
+            "id": "fs",
+            "label": "文件服务器",
+            "sub": "SMB 共享",
+            "icon": "server"
+          },
+          {
+            "id": "edr",
+            "label": "EDR",
+            "sub": "行为告警",
+            "icon": "eye"
+          },
+          {
+            "id": "soc",
+            "label": "SOC",
+            "sub": "遏制并上报",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "pz",
+            "caption": "第 1 天：一名用户打开了钓鱼附件。加载器运行，攻击者获得立足点。",
+            "tone": "danger"
+          },
+          {
+            "at": "dc",
+            "caption": "第 2 至 9 天：攻击者绘制网络地图并窃取域管理员凭据。这个安静的阶段是检测的最佳机会。",
+            "tone": "warning"
+          },
+          {
+            "at": "bk",
+            "caption": "第 10 天，01:48：备份服务被停止，卷影副本被删除，因此恢复将更加困难。",
+            "tone": "attack"
+          },
+          {
+            "at": "edr",
+            "caption": "01:49：EDR 标记出一个服务账户在夜间运行 vssadmin delete shadows。",
+            "tone": "warning"
+          },
+          {
+            "at": "soc",
+            "caption": "01:55：分析人员将告警归类为严重，并启动勒索软件剧本。",
+            "tone": "secure"
+          },
+          {
+            "at": "fs",
+            "caption": "01:58：文件服务器上开始加密；SMB 写入速率和文件重命名激增。",
+            "tone": "danger"
+          },
+          {
+            "at": "soc",
+            "caption": "02:06：服务器网段之间的 SMB 被阻断，受影响的账户被禁用。加密在 11 台服务器中的 4 台处停止。",
+            "tone": "success"
+          },
+          {
+            "at": "bk",
+            "caption": "02:30：确认离线备份完好；在任何重建之前，开始对内存和磁盘进行取证捕获。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "respond",
+      "type": "text",
+      "markdown": "## 响应的第一个小时\n\n使用固定的顺序，这样恐慌就不会替你做决定。\n\n1. **宣告并分级。** 以最高严重级别开立事件并通知事件负责人，如[安全事件分级与优先级排序](/learn/security-operations-dfir/security-incident-classification-and-prioritization)中所述。\n2. **遏制。** 阻断扩散，而不是破坏证据：阻断网段之间的 SMB，禁用被攻陷的账户，通过 EDR 隔离受影响的主机，并暂停复制作业，以免加密文件覆盖完好的副本。**不要**关闭机器电源。\n3. **保护备份。** 确认至少有一份副本处于离线或不可变状态，如果备份服务器可从网络访问，则将其断开网络连接。\n4. **保全。** 从少数受影响的主机捕获内存，保存勒索信，并记录文件扩展名、比特币或联系方式以及加密时间戳。\n5. **确定范围。** 找出零号病人以及攻击者使用过的每一台主机。\n6. **向外上报。** 让法律顾问、保险公司、高层领导，并按法律要求让监管机构和执法部门介入。\n\n支付赎金是业务和法律决定，绝不是 IT 决定。它不能保证数据归还，并且可能带来制裁风险。"
+    },
+    {
+      "id": "term-ir",
+      "type": "terminal",
+      "title": "在获授权的服务器上进行遏制检查",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "vssadmin list shadows",
+          "comment": "检查恢复点是否仍然存在"
+        },
+        {
+          "output": "vssadmin 1.1 - Volume Shadow Copy Service administrative command-line tool\nNo items found that satisfy the query.",
+          "comment": "一个都没有了：卷影副本已被删除，这与告警相符"
+        },
+        {
+          "cmd": "Get-WinEvent -FilterHashtable @{LogName='System'; Id=7036; StartTime=(Get-Date).AddHours(-6)} | Where-Object Message -match 'Veeam|SQL|Backup' | Select-Object TimeCreated, Message | Format-Table -Wrap",
+          "comment": "查找在过去六小时内被停止的备份和数据库服务"
+        },
+        {
+          "output": "TimeCreated          Message\n-----------          -------\n11/12/2026 1:48:22   The Veeam Backup Service service entered the stopped state.\n11/12/2026 1:48:25   The SQL Server Agent (PROD) service entered the stopped state.",
+          "comment": "两个服务在告警前三分钟被停止：这证实了事件顺序"
+        },
+        {
+          "cmd": "New-NetFirewallRule -DisplayName 'IR-Block-SMB-In' -Direction Inbound -Protocol TCP -LocalPort 445 -Action Block",
+          "comment": "在调查期间阻断此主机上的入站 SMB"
+        },
+        {
+          "output": "Name        : {5f2c8a10-0b3e-4d7a-9c11-aa01b2c3d4e5}\nDisplayName : IR-Block-SMB-In\nEnabled     : True\nAction      : Block",
+          "comment": "该规则已启用。请在你的事件日志中记录此次变更的时间"
+        }
+      ],
+      "caption": "在你管理的主机上进行的带注释检查。请根据你的标准调整规则名称。"
+    },
+    {
+      "id": "eradicate",
+      "type": "text",
+      "markdown": "## 识别、根除与交接\n\n遏制阻止损害；调查找出原因。根据勒索信、扩展名和文件标记识别勒索软件家族，因为这会告诉你是否已知存在解密工具，以及预期会有哪些数据外泄习惯。像在[磁盘与内存取证](/learn/security-operations-dfir/disk-and-memory-forensics)中那样，利用内存和磁盘证据审查攻击者是如何进入的以及使用了哪些账户。\n\n只有在弄清原因并保全证据之后，才应重建。把系统恢复到一个仍被攻陷的域中，只会让攻击者再来一轮。向重建的交接在[事件恢复与系统重建](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding)中介绍。"
+    },
+    {
+      "id": "warn-evidence",
+      "type": "callout",
+      "variant": "warning",
+      "title": "速度不能以破坏证据为代价",
+      "markdown": "在急于恢复服务时，团队会在没人捕获内存或日志之前就重做服务器镜像。这会抹去密钥和入侵路径，而攻击者的后门依然存在。请先对有代表性的主机至少做一次内存捕获和磁盘快照。"
+    },
+    {
+      "id": "tip-canary",
+      "type": "callout",
+      "variant": "tip",
+      "title": "把金丝雀放在加密开始的地方",
+      "markdown": "勒索软件通常按字母顺序遍历共享。在重要共享的顶层放置一个包含不起眼文档的小型金丝雀文件夹，并对任何写入、重命名或删除告警。它几乎没有成本，却能给你最早的预警。"
+    },
+    {
+      "id": "note-comms",
+      "type": "callout",
+      "variant": "note",
+      "title": "在需要之前规划沟通",
+      "markdown": "假设一旦域被攻陷，攻击者就能读取你的电子邮件和聊天。将响应团队转移到带外渠道，例如电话会议桥或单独的消息租户，并为事件负责人、法律顾问、保险公司和你的取证合作伙伴保留一份打印的联系人名单。指定一个人向员工、客户和媒体发言，使信息保持一致。记下每个决定的时间和负责人；这些笔记将成为事后复盘以及面向监管机构的时间线。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自试一试",
+      "markdown": "使用**你自己拥有的一次性 Linux 虚拟机或文件夹**。本实验只重命名无害的测试文件；不会加密任何内容。\n\n1. 创建一个测试文件夹和 400 个空文件：`mkdir lab && cd lab && for i in $(seq 1 400); do touch doc$i.txt; done`。\n2. 开启审计：`sudo auditctl -w $(pwd) -p wa -k canary`。\n3. 模拟一次突发：`for f in *.txt; do mv \"$f\" \"$f.lab\"; done`。\n4. 统计事件数：`sudo ausearch -k canary | grep -c rename`。\n5. 写下你会使用的阈值，例如 1 分钟内 300 次重命名，并列出两项可能使其失效的正常活动。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "勒索软件（Ransomware）",
+          "definition": "一种拒绝用户访问数据（通常通过加密）直至支付赎金的恶意软件。"
+        },
+        {
+          "term": "双重勒索（Double extortion）",
+          "definition": "在加密数据之前先窃取数据，并以公开数据相威胁作为额外压力。"
+        },
+        {
+          "term": "抑制恢复（Inhibit recovery）",
+          "definition": "在加密之前销毁或禁用备份和还原点的行为。"
+        },
+        {
+          "term": "卷影副本（Shadow copy）",
+          "definition": "Windows 卷影复制（Volume Shadow Copy）快照，可用于还原文件的先前版本。"
+        },
+        {
+          "term": "金丝雀文件（Canary file）",
+          "definition": "受监控的诱饵文件，任何变化都表明存在可疑活动。"
+        },
+        {
+          "term": "零号病人（Patient zero）",
+          "definition": "事件中第一台被攻陷的主机或账户。"
+        },
+        {
+          "term": "不可变备份（Immutable backup）",
+          "definition": "在其保留期内无法被更改或删除的备份。"
+        },
+        {
+          "term": "遏制（Containment）",
+          "definition": "在保全证据的同时阻止事件扩散的行动。"
+        },
+        {
+          "term": "前兆（Precursor）",
+          "definition": "表明攻击正在进行或即将开始的迹象，在造成损害之前被观察到。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪种行为是勒索软件加密阶段即将来临的最强早期指标？",
+          "options": [
+            "用户打开一个 PDF",
+            "通过命令行删除所有卷影副本",
+            "计划中的 Windows 更新",
+            "对新闻网站的 DNS 查询"
+          ],
+          "answer": 1,
+          "explanation": "删除卷影副本会妨碍轻松恢复，且合法软件很少这样做，因此它是高置信度的前兆。"
+        },
+        {
+          "question": "在加密正在进行时，哪些第一小时的行动是恰当的？（选择所有适用项。）",
+          "options": [
+            "阻断网段之间的 SMB",
+            "禁用被攻陷的账户",
+            "立即关闭每台服务器的电源",
+            "确认离线备份完好"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "遏制和备份保护可限制损害。关闭电源会破坏内存证据和密钥。"
+        },
+        {
+          "question": "什么是金丝雀文件？",
+          "options": [
+            "离线存储的备份",
+            "受监控任何变化的诱饵文件",
+            "某个勒索软件家族使用的文件扩展名",
+            "已签名的系统文件"
+          ],
+          "answer": 1,
+          "explanation": "任何合法程序都不应触碰它，因此任何修改都是强有力且低噪声的告警。"
+        },
+        {
+          "question": "谁应当决定是否支付赎金？",
+          "options": [
+            "值班分析人员",
+            "仅 SOC 经理",
+            "高层领导，并与法律顾问和保险公司协商",
+            "IT 服务台"
+          ],
+          "answer": 2,
+          "explanation": "支付带有法律、财务和道德风险，且不能保证恢复，因此这是领导层的决定。"
+        },
+        {
+          "question": "为什么不在遏制后立即重建服务器？（选择所有适用项。）",
+          "options": [
+            "入侵和持久化的证据将会丢失",
+            "恢复到被攻陷的域中可能会再次被加密",
+            "从不需要重建",
+            "必须弄清原因才能防止再次感染"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "重建是需要的，但只能在证据已保全，并且弄清入口点和攻击者访问方式之后进行。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 勒索软件是**多阶段**入侵；加密是最后一步，早期阶段会留下可检测的信号。\n- 最佳的早期检测是**恢复抑制**、**大规模文件变更**和**金丝雀文件**。\n- 第一小时响应：**宣告、遏制、保护备份、保全、确定范围、上报**。\n- 在不关闭系统电源的情况下遏制扩散，并且绝不要让速度破坏证据。\n- 支付赎金是领导层和法律层面的决定；只有在查明原因之后才进行重建。\n\n请继续学习[事件恢复与系统重建](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding)。"
+    }
+  ]
+}

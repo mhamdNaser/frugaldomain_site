@@ -1,0 +1,309 @@
+{
+  "title": "可疑进程与服务分析（Suspicious Process and Service Analysis）",
+  "summary": "通过检查父进程、路径、签名、命令行、网络活动和服务定义，学习在 Windows 和 Linux 上区分正常与可疑的进程和服务。",
+  "objectives": [
+    "说明在特定上下文中是什么让进程或服务变得可疑",
+    "在 Windows 和 Linux 上检查进程树、路径、命令行和签名",
+    "审查服务定义，找出未经授权或异常的条目",
+    "将进程与其网络连接和文件活动关联起来",
+    "记录发现并决定是否上报"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一条 EDR 告警称 `svchost.exe` 从 `C:\\Users\\Public` 启动。在另一台主机上，一个名为 `systemd-resolver2` 的 Linux 服务已被启用，而团队中没有人创建过它。其中有恶意的吗？仅凭名称你无法判断，因为攻击者会刻意选择看起来合法的名称。\n\n**进程与服务分析（Process and Service Analysis）**是在上下文中判断一个运行中程序的技能：是谁启动的、从哪里启动、带什么参数、与什么通信，以及它是否本就不该存在。它是任何[服务器入侵调查](/learn/security-operations-dfir/server-compromise-investigation)的核心步骤，同时支撑 [Windows 事件响应](/learn/security-operations-dfir/windows-incident-response)和 [Linux 事件响应](/learn/security-operations-dfir/linux-incident-response)。"
+    },
+    {
+      "id": "baseline",
+      "type": "text",
+      "markdown": "## 第 1 步：了解正常是什么样子\n\n只有了解基线（Baseline），才能发现异常。请先学习操作系统的标准形态。\n\n| Windows 进程 | 预期父进程 | 预期路径 | 说明 |\n|:--|:--|:--|:--|\n| `smss.exe` | System | `C:\\Windows\\System32` | 一个主实例 |\n| `wininit.exe` | `smss.exe`（已退出） | `C:\\Windows\\System32` | 一个实例 |\n| `services.exe` | `wininit.exe` | `C:\\Windows\\System32` | 一个实例 |\n| `svchost.exe` | `services.exe` | `C:\\Windows\\System32` | 带 `-k` 组参数运行 |\n| `lsass.exe` | `wininit.exe` | `C:\\Windows\\System32` | 仅一个实例 |\n| `explorer.exe` | `userinit.exe`（已退出） | `C:\\Windows` | 每个交互式用户一个 |\n\n在 Linux 上，要了解哪些进程是 `systemd`（PID 1）的子进程，哪些带方括号的名称是磁盘上没有可执行文件的内核线程，以及你的发行版默认启用哪些服务。\n\n最佳实践是从已知良好的黄金镜像（Golden Image）中记录基线，并将运行中的主机与之对比。"
+    },
+    {
+      "id": "indicators",
+      "type": "text",
+      "markdown": "## 第 2 步：查找可疑属性\n\n没有任何单一属性能证明恶意。请综合多项判断：\n\n- **父进程错误**：`svchost.exe` 由 `explorer.exe` 启动，或 Web 服务器派生出 `sh` 或 `cmd.exe`。\n- **路径错误**：看似系统文件的名称出现在 `C:\\Users`、`%TEMP%`、`/tmp`、`/dev/shm` 或隐藏目录中。\n- **形似名称**：`svch0st.exe`、`scvhost.exe`，或带有异常 Unicode 字符的名称。\n- **未签名或签名不受信任**：声称来自某厂商但没有有效签名的二进制文件。\n- **异常的命令行**：很长的编码字符串、参数中包含下载操作，或解释器运行内联脚本。\n- **已删除的二进制文件**：某 Linux 进程的可执行文件显示为 `(deleted)`，意味着文件在启动后被删除。\n- **意外的网络活动**：计算器或打印服务出现出站连接。\n- **近期创建**：在告警前几小时创建、且没有变更工单的二进制文件。\n\n请将这些视为*有待验证的假设*。许多合法的管理工具在你确认是谁、为何运行它们之前，看起来都很可疑。"
+    },
+    {
+      "id": "win-term",
+      "type": "terminal",
+      "title": "Windows：检查可疑进程（PowerShell）",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "Get-CimInstance Win32_Process -Filter \"Name='svchost.exe'\" | Where-Object { $_.ExecutablePath -notlike 'C:\\Windows\\System32\\*' } | Select ProcessId,ParentProcessId,ExecutablePath,CommandLine | Format-List",
+          "output": "ProcessId       : 5120\nParentProcessId : 3344\nExecutablePath  : C:\\Users\\Public\\svchost.exe\nCommandLine     : C:\\Users\\Public\\svchost.exe -k netsvcs",
+          "comment": "真正的 svchost 位于 System32，其父进程是 services.exe。"
+        },
+        {
+          "cmd": "Get-Process -Id 3344 | Select Id,ProcessName,Path",
+          "output": "  Id ProcessName Path\n  -- ----------- ----\n3344 winword     C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+          "comment": "父进程是文字处理软件，这指向基于文档的初始访问。"
+        },
+        {
+          "cmd": "Get-AuthenticodeSignature C:\\Users\\Public\\svchost.exe | Select Status,SignerCertificate",
+          "output": "Status SignerCertificate\n------ -----------------\nNotSigned",
+          "comment": "真正的 Windows 二进制文件由 Microsoft 签名。"
+        },
+        {
+          "cmd": "Get-NetTCPConnection -OwningProcess 5120 | Select LocalPort,RemoteAddress,RemotePort,State",
+          "output": "LocalPort RemoteAddress  RemotePort State\n--------- -------------  ---------- -----\n    50822 203.0.113.80          443 Established"
+        }
+      ],
+      "caption": "来自你自己拥有的实验主机的带注释输出。"
+    },
+    {
+      "id": "proc-tree",
+      "type": "animation",
+      "kind": "flow",
+      "title": "沿着可疑进程追溯到其源头",
+      "caption": "先向上遍历进程树，再检查对外连接。",
+      "data": {
+        "token": "进程",
+        "nodes": [
+          {
+            "id": "doc",
+            "label": "用户打开文件",
+            "sub": "WINWORD.EXE",
+            "icon": "file"
+          },
+          {
+            "id": "shell",
+            "label": "子 Shell",
+            "sub": "cmd.exe",
+            "icon": "cpu"
+          },
+          {
+            "id": "drop",
+            "label": "释放的二进制文件",
+            "sub": "C:\\Users\\Public",
+            "icon": "bug"
+          },
+          {
+            "id": "svc",
+            "label": "伪造的 svchost",
+            "sub": "PID 5120",
+            "icon": "server"
+          },
+          {
+            "id": "net",
+            "label": "出站连接",
+            "sub": "203.0.113.80:443",
+            "icon": "globe"
+          },
+          {
+            "id": "edr",
+            "label": "分析师",
+            "sub": "EDR + SIEM",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "at": "doc",
+            "caption": "从邮件中打开的文档是这条链的起点。",
+            "tone": "warning"
+          },
+          {
+            "at": "shell",
+            "caption": "Word 派生出 cmd.exe，而办公应用程序几乎不应这样做。",
+            "tone": "danger"
+          },
+          {
+            "at": "drop",
+            "caption": "一个新的可执行文件出现在用户可写的文件夹中。"
+          },
+          {
+            "at": "svc",
+            "caption": "该二进制文件的名称像系统进程，但没有签名且父进程错误。",
+            "tone": "danger"
+          },
+          {
+            "at": "net",
+            "caption": "它保持着一个到未知外部地址的 TLS 会话。",
+            "tone": "warning"
+          },
+          {
+            "at": "edr",
+            "caption": "分析师隔离主机，保存该二进制文件及其哈希，并上报。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lin-term",
+      "type": "terminal",
+      "title": "Linux：检查可疑进程",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "ps -eo pid,ppid,user,lstart,cmd --forest | grep -A2 nginx",
+          "output": "  911     1 root     Sun Oct  1 08:00:11 2026 nginx: master process /usr/sbin/nginx\n  912   911 www-data Sun Oct  1 08:00:11 2026  \\_ nginx: worker process\n 7314   911 www-data Tue Nov 11 01:58:33 2026  \\_ /tmp/.cache/kworker-sync"
+        },
+        {
+          "cmd": "ls -l /proc/7314/exe",
+          "output": "lrwxrwxrwx 1 www-data www-data 0 Nov 11 02:20 /proc/7314/exe -> /tmp/.cache/kworker-sync (deleted)",
+          "comment": "该文件在启动后已被删除，但仍可从 /proc 恢复。"
+        },
+        {
+          "cmd": "sudo cp /proc/7314/exe /evidence/pid7314.bin && sha256sum /evidence/pid7314.bin",
+          "output": "9f1c...d3e2  /evidence/pid7314.bin"
+        },
+        {
+          "cmd": "systemctl list-unit-files --state=enabled | grep -v '^systemd'",
+          "output": "cron.service        enabled\nnginx.service       enabled\nsystemd-resolver2.service enabled",
+          "comment": "最后一个名称模仿了真实的单元，但并不属于该发行版。"
+        }
+      ],
+      "caption": "从 /proc 复制可执行文件可保全已删除的二进制文件。请将其存放在外部介质上。"
+    },
+    {
+      "id": "services",
+      "type": "text",
+      "markdown": "## 第 3 步：分析服务\n\n服务之所以重要，是因为它们自动启动且通常以高权限运行，这使其成为持久化的热门手段（见[持久化机制检测](/learn/security-operations-dfir/persistence-mechanism-detection)）。请审查以下字段：\n\n| 字段 | Windows（`sc qc`，事件 7045） | Linux（`systemctl cat`） |\n|:--|:--|:--|\n| **二进制文件** | `BINARY_PATH_NAME` | `ExecStart=` |\n| **账户** | `SERVICE_START_NAME` | `User=` |\n| **启动类型** | `AUTO_START` | `WantedBy=multi-user.target` |\n| **创建记录** | System 日志中的事件 ID 7045 | `/etc/systemd/system` 中该单元的文件时间 |\n\n需要问的问题：该二进制文件是否位于标准位置，是否经过签名或归属于某个软件包，谁创建了该服务，是否存在变更工单？在基于 Debian 的系统上，`dpkg -S /path`；在 RPM 系统上，`rpm -qf /path`，可以告诉你某个软件包是否拥有该文件。如果一个二进制文件不属于任何软件包，却出现在昨晚创建的服务单元中，就值得关注。"
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "code": "title: Service Binary Installed From User-Writable Path\nid: 5b1f3a7e-0000-4000-8000-000000000001\nstatus: experimental\nlogsource:\n  product: windows\n  service: system\ndetection:\n  selection:\n    EventID: 7045\n    ImagePath|contains:\n      - '\\Users\\'\n      - '\\AppData\\'\n      - '\\Temp\\'\n  condition: selection\nlevel: high\ntags:\n  - attack.persistence\n  - attack.t1543.003",
+      "filename": "service-from-user-path.yml",
+      "caption": "一条将该审查转化为检测的 Sigma 规则。部署前请根据你的基线进行调优。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "用多种工具交叉验证",
+      "markdown": "被入侵的主机可能会“说谎”。请将主机自身的报告与网络和 EDR 的记录进行交叉核对。如果某个进程在本地不可见，但防火墙每 60 秒记录一次来自该主机的连接，就应将本地工具视为不可信，并采集内存进行离线分析。"
+    },
+    {
+      "id": "enrich",
+      "type": "text",
+      "markdown": "## 丰富分诊信息\n\n一旦某个进程看起来异常，先充实信息，再做决定。\n\n1. **计算哈希。**计算 SHA-256，并在 EDR 和内部文件清单中搜索。最近一天内仅在一台主机上出现的哈希，比在 4,000 台主机上存在两年的哈希更值得关注。\n2. **谨慎核查信誉。**公共信誉服务很有用，但不要上传可能包含客户数据或内部代码的文件。请查询哈希，而不是提交文件。\n3. **检查已加载的模块。**意外的库，或从用户文件夹加载的库，暗示存在代码注入或 DLL 侧加载（DLL side-loading）。\n4. **阅读文件的元数据。**编译时间、版本信息和原始文件名往往与磁盘上的名称相矛盾。\n5. **询问所有者。**许多告警以向系统所有者发一条快速消息、对方确认某次部署而告终。请提出具体的问题：“你今天 01:58 安装了某个工具吗？”\n\n### 常见错误\n\n- 只信任名称，而不检查路径和父进程。\n- 将有效签名视为安全的证明。攻击者有时会滥用已签名的合法管理工具，因此已签名的二进制文件仍需结合上下文判断。\n- 只看进程本身，而忘记其子进程，后者往往显示了攻击者实际做了什么。\n- 忘记计划任务和容器。进程可能由调度器启动或在容器内运行，而主机视图只显示了部分情况。"
+    },
+    {
+      "id": "decision",
+      "type": "text",
+      "markdown": "## 第 4 步：决策与记录\n\n收集事实之后，对发现进行分类：\n\n- **良性（Benign）**：有文档记录的软件，所有者符合预期。请记下你这样判断的理由。\n- **未知（Unknown）**：数据不足。继续收集更多信息，例如哈希查询、内存采集或用户对事件的说明。\n- **恶意（Malicious）**：上报，保全该二进制文件及其哈希，并遵循[事件计划](/learn/security-operations-dfir/incident-response-fundamentals)中的遏制步骤。\n\n记录进程 ID、启动时间、完整路径、哈希、父进程链、命令行、网络连接以及你的推理过程。将哈希和路径添加到你的威胁搜寻（Threat Hunting）查询中，以便在所有其他主机上搜索相同的痕迹。\n\n在采集到进程的内存和可执行文件之前，避免终止该进程。终止可能会抹去内存中的配置和解密后的字符串，而这些恰恰能告诉你攻击者的意图。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你自己拥有的实验虚拟机上，将 `notepad.exe`（Windows）或 `/bin/sleep`（Linux）复制到用户可写的文件夹，并将其重命名为 `svchost.exe` 或 `systemd-resolver2`。运行它。然后以防御者的身份展开调查：找到它的父进程和路径，检查其签名或软件包所有者，列出它的连接，并写下三条它可疑的理由。最后，创建一份 Sigma 风格的说明，描述你将如何大规模检测这种模式。事后请删除该副本。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "父进程（Parent process）",
+          "definition": "创建另一个进程的进程；父进程关系不匹配是一个强信号。"
+        },
+        {
+          "term": "进程树（Process tree）",
+          "definition": "由父进程和子进程构成的层级结构，显示程序是如何被启动的。"
+        },
+        {
+          "term": "命令行（Command line）",
+          "definition": "用于启动进程的完整文本，包括参数。"
+        },
+        {
+          "term": "伪装（Masquerading）",
+          "definition": "通过命名或放置恶意文件，使其看起来像合法文件。"
+        },
+        {
+          "term": "代码签名（Code signing）",
+          "definition": "用于标识二进制文件发布者的数字签名。"
+        },
+        {
+          "term": "服务（Service）",
+          "definition": "由操作系统管理的后台程序，通常在开机时启动。"
+        },
+        {
+          "term": "基线（Baseline）",
+          "definition": "对正常进程、服务和设置的记录性快照。"
+        },
+        {
+          "term": "事件 ID 7045（Event ID 7045）",
+          "definition": "记录新服务已安装的 Windows System 日志事件。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "哪项发现最能说明某个 `svchost.exe` 并非真品？",
+          "options": [
+            "它只占用几 MB 内存",
+            "它从 C:\\Users\\Public 运行，且父进程是 explorer.exe",
+            "它带有 -k 参数",
+            "它以 SYSTEM 身份运行"
+          ],
+          "answer": 1,
+          "explanation": "真正的 svchost.exe 从 System32 运行，并由 services.exe 启动。"
+        },
+        {
+          "question": "某 Linux 进程的可执行文件显示为 `/tmp/x (deleted)`。最佳的下一步是什么？",
+          "options": [
+            "因为文件已不存在而忽略它",
+            "从 /proc/PID/exe 复制该二进制文件并计算哈希",
+            "立即重启",
+            "删除 /tmp"
+          ],
+          "answer": 1,
+          "explanation": "正在运行的映像仍可从 /proc 读取，从而保全了证据。"
+        },
+        {
+          "question": "选择所有会让人对某个服务产生怀疑的属性。",
+          "options": [
+            "二进制文件位于用户配置文件夹中",
+            "不属于任何软件包",
+            "创建时没有变更工单",
+            "由操作系统厂商签名"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "厂商签名和软件包归属是合法性的标志，而不是可疑之处。"
+        },
+        {
+          "question": "为什么要避免立即终止可疑进程？",
+          "options": [
+            "这是违法的",
+            "这可能破坏内存中的证据",
+            "这会让 CPU 发烫",
+            "这会启动第二个副本"
+          ],
+          "answer": 1,
+          "explanation": "先采集内存和可执行文件，然后再遏制。"
+        },
+        {
+          "question": "哪个事件记录了新的 Windows 服务安装？",
+          "options": [
+            "4624",
+            "7045",
+            "4688",
+            "1102"
+          ],
+          "answer": 1,
+          "explanation": "安装服务时，System 日志中会写入事件 7045。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 根据上下文判断进程：父进程、路径、签名、命令行、网络活动和存在时长。\n- 了解你所用操作系统的基线，并与之对比。\n- 审查服务中的异常二进制文件、账户和创建记录。\n- 在终止任何进程之前，先保全可执行文件和内存。\n- 记录你的推理过程，并在所有主机上搜索相同的入侵指标。\n\n请继续学习以账户为中心的分析：[认证日志调查](/learn/security-operations-dfir/authentication-log-investigation)。"
+    }
+  ]
+}

@@ -1,0 +1,288 @@
+{
+  "title": "Grafana ve Prometheus ile Altyapı İzleme",
+  "summary": "Prometheus'un metrikleri nasıl topladığını, PromQL ve uyarı kurallarının davranıştaki şüpheli değişiklikleri nasıl ortaya çıkardığını ve Grafana panolarının güvenlik triyajını nasıl desteklediğini öğrenin.",
+  "objectives": [
+    "Prometheus çekme (pull) modelini ve ana bileşenlerini açıklamak",
+    "Güncel davranışı bir referans düzeyiyle (baseline) karşılaştıran PromQL sorguları yazmak",
+    "Yanıt vermeyen hedefler ve anormal trafik için uyarı kuralları oluşturmak",
+    "Güvenli ve odaklı Grafana panoları tasarlamak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Saat 02:10'da bir dosya sunucusu yavaş çalışmaya başlar. Disk yazmaları üç katına çıkar, CPU yükselir ve normalde bir saatte biten bir yedekleme işi şafakta hâlâ sürmektedir. SIEM'de hiçbir şey tetiklenmedi, çünkü kimse oturum açmadı ve hiçbir kural eşleşmedi. İlk belirti **metriklerdeydi**: kaynak kullanımında ani bir değişiklik. Bir şifreleme işi, bir kripto madencisi veya bir veri hazırlama (staging) süreci, henüz hiçbir imza yokken bu tür bir iz bırakır.\n\n**Prometheus** bu sayıları toplar ve saklar, **Grafana** ise onları panolara ve uyarılara dönüştürür. Güvenlik ekipleri bunları erişilebilirlik, kapasite ve ikinci bir kanıt kaynağı olarak kullanır. Bu ders nasıl çalıştıklarını, nasıl sorgulandıklarını ve güvenliği etkileyen davranışlar için nasıl uyarı kurulacağını gösterir. Ders, [Elastic Security ve SIEM](/learn/security-operations-dfir/elastic-security-and-siem) dersindeki günlük (log) tabanlı bakış açısını tamamlar."
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## Prometheus nasıl çalışır\n\nPrometheus bir **çekme modeli (pull model)** kullanır. Sunucu yaklaşık her 15 saniyede bir yapılandırılmış her **hedefe (target)** HTTP isteği gönderir ve hedefin `/metrics` adresinde sunduğu düz metin metrikleri okur. Her örnek, zaman damgasıyla birlikte bir zaman serisi veritabanında saklanır.\n\n| Bileşen | Ne yapar |\n|:--|:--|\n| **Dışa aktarıcı (Exporter)** | Bir sistem için metrikleri sunar. `node_exporter` Linux sunucularını, `windows_exporter` Windows sunucularını kapsar |\n| **Prometheus sunucusu** | Hedefleri tarar (scrape), zaman serilerini saklar, kuralları değerlendirir |\n| **Alertmanager** | Uyarıları gruplar, tekilleştirir, susturur ve yönlendirir |\n| **Grafana** | Panolar, keşif ve kendi uyarı mekanizması |\n\nHer seri, bir metrik adı ile **etiketlerden (labels)** oluşur; örneğin `node_cpu_seconds_total{instance=\"fs01\", mode=\"idle\"}`. Filtrelemeyi ve gruplamayı etiketlerle yaparsınız. Dört metrik türü vardır: **sayaç (counter)** yalnızca artar (gönderilen bayt), **gösterge (gauge)** hem artar hem azalır (kullanılan bellek), **histogramlar** ve **özetler (summaries)** ise istek gecikmesi gibi dağılımları kaydeder.\n\nÇekme modelinin bir güvenlik avantajı vardır. Hedeflerin izleme sunucusuna giden (outbound) erişime ihtiyacı yoktur ve bir hedef yanıt vermeyi bıraktığında `up` metriği 0 olduğu için Prometheus bunu fark eder. İzlemeden sessizce kaybolan bir sunucu başlı başına bir bulgudur."
+    },
+    {
+      "id": "cfg",
+      "type": "code",
+      "language": "yaml",
+      "filename": "prometheus.yml",
+      "caption": "Asgari bir tarama (scrape) yapılandırması. Hedefler example.com adlarını ve bir özel adresi kullanır; vurgulanan satırlar Windows dışa aktarıcısı için TLS'i ve bir kimlik bilgisi yer tutucusunu gösterir.",
+      "highlight": [
+        12,
+        13,
+        14,
+        15
+      ],
+      "code": "global:\n  scrape_interval: 15s\n  evaluation_interval: 15s\n\nrule_files:\n  - /etc/prometheus/rules/*.yml\n\nscrape_configs:\n  - job_name: linux-hosts\n    static_configs:\n      - targets: ['fs01.example.com:9100', '10.20.0.15:9100']\n        labels: {env: prod, owner: infra}\n  - job_name: windows-hosts\n    scheme: https\n    tls_config:\n      ca_file: /etc/prometheus/ca.pem\n    basic_auth:\n      username: prometheus\n      password_file: /etc/prometheus/secrets/win_exporter.pass\n    static_configs:\n      - targets: ['dc01.example.com:9182']\n\nalerting:\n  alertmanagers:\n    - static_configs:\n        - targets: ['alertmanager.example.com:9093']"
+    },
+    {
+      "id": "promql",
+      "type": "text",
+      "markdown": "## PromQL ile sorgulama\n\n**PromQL** sorgu dilidir. Yalın bir metrik adı, eşleşen her seri için en son değeri döndürür. En kullanışlı sorgular bir **aralık seçicisini (range selector)**, bir **fonksiyonu** ve bir **toplulaştırmayı (aggregation)** birleştirir.\n\n- `rate(node_network_transmit_bytes_total[5m])` bir sayacı beş dakika boyunca saniye başına bayta çevirir. Sayaçları her zaman `rate()` veya `increase()` içine alın, çünkü ham değer yalnızca büyür.\n- `sum by (instance) (...)` serileri sunucu başına bire indirir.\n- `avg_over_time`, `max_over_time` ve `quantile_over_time` bir zaman penceresini özetler.\n- `... > 0.9` sonuçları filtreler; böylece bir sorgu uyarı koşulu olarak da kullanılabilir.\n\nGüvenlikle ilgili sorular **değişim** üzerinedir. `fs01` geceleri normalde ne kadar giden trafik gönderir? Disk yazma hızı geçen haftanın aynı saatine göre sıçradı mı? PromQL bunu `offset` değiştiricisiyle yanıtlar, örneğin `rate(...[5m]) / rate(...[5m] offset 1w)`. 3'ün üzerindeki bir oran, sunucunun olağandan üç kat daha yoğun davrandığı anlamına gelir.\n\nEtiket kardinalitesini (cardinality) düşük tutun. Yüksek hacimli bir metrikte etiket olarak asla kullanıcı adı, IP adresi veya URL kullanmayın; çünkü her benzersiz değer yeni bir seri oluşturur ve belleği tüketebilir."
+    },
+    {
+      "id": "rules",
+      "type": "code",
+      "language": "yaml",
+      "filename": "rules/security-behavior.yml",
+      "caption": "İki uyarı kuralı: yanıt vermeyi bırakan bir dışa aktarıcı ve geçen haftanın aynı saatinin çok üzerindeki giden trafik. İkisi de birer soruşturma başlangıç noktasıdır, hüküm değildir.",
+      "highlight": [
+        5,
+        13,
+        14
+      ],
+      "code": "groups:\n  - name: security-behavior\n    rules:\n      - alert: MonitoringTargetDown\n        expr: up{env=\"prod\"} == 0\n        for: 5m\n        labels: {severity: high}\n        annotations:\n          summary: \"{{ $labels.instance }} stopped answering scrapes\"\n      - alert: OutboundTrafficSpike\n        expr: |\n          sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m]))\n            > 3 * sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m] offset 1w))\n            and sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m])) > 5e6\n        for: 15m\n        labels: {severity: medium}\n        annotations:\n          summary: \"{{ $labels.instance }} sends 3x its usual outbound traffic\""
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Metrikten bildirime",
+      "caption": "Bir dosya sunucusundaki giden trafik sıçramasının bir analiste nasıl ulaştığı.",
+      "data": {
+        "token": "Örnek",
+        "nodes": [
+          {
+            "id": "host",
+            "label": "Dosya sunucusu",
+            "sub": "node_exporter :9100",
+            "icon": "server"
+          },
+          {
+            "id": "prom",
+            "label": "Prometheus",
+            "sub": "Her 15 sn'de tarama",
+            "icon": "database"
+          },
+          {
+            "id": "rule",
+            "label": "Uyarı kuralı",
+            "sub": "OutboundTrafficSpike",
+            "icon": "eye"
+          },
+          {
+            "id": "am",
+            "label": "Alertmanager",
+            "sub": "Gruplama ve yönlendirme",
+            "icon": "cpu"
+          },
+          {
+            "id": "graf",
+            "label": "Grafana",
+            "sub": "Pano",
+            "icon": "globe"
+          },
+          {
+            "id": "soc",
+            "label": "Analist",
+            "sub": "Çağrı cihazı ve bilet",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "host",
+            "caption": "Dışa aktarıcı, güncel ağ gönderim sayacını /metrics adresinde sunar."
+          },
+          {
+            "at": "prom",
+            "caption": "Prometheus sayacı tarar ve her 15 saniyede bir örnek saklar."
+          },
+          {
+            "at": "rule",
+            "caption": "Kural, güncel hızı geçen haftanın aynı zamanıyla karşılaştırır ve oranı 4,2 bulur.",
+            "tone": "warning"
+          },
+          {
+            "at": "rule",
+            "caption": "Koşul 15 dakika boyunca sürdüğü için uyarı beklemede (pending) durumundan tetiklenmiş (firing) duruma geçer.",
+            "tone": "danger"
+          },
+          {
+            "at": "am",
+            "caption": "Alertmanager uyarıyı tekilleştirir ve nöbetçi kanalına yönlendirir."
+          },
+          {
+            "at": "graf",
+            "caption": "Analist, artışın ne zaman başladığını ve hangi arayüzden geçtiğini görmek için Grafana panelini açar."
+          },
+          {
+            "at": "soc",
+            "caption": "Bir bilet açılır ve analist zaman penceresini SIEM ve proxy günlükleriyle ilişkilendirir.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "grafana",
+      "type": "text",
+      "markdown": "## Güvenlik iş akışında Grafana\n\nGrafana birçok **veri kaynağına (data source)** bağlanır: Prometheus, günlükler için Loki, Elasticsearch, SQL veritabanları ve bulut izleme API'leri. Tek bir pano, bir metrik panelini aynı dakikaya ait günlük satırlarının yanında gösterebilir; bu da triyajı hızlandırır.\n\nİyi güvenlik panoları birkaç alışkanlığı paylaşır:\n\n1. **Pano başına tek soru.** \"Kimlik doğrulama katmanı sağlıklı mı?\" sorusu, birbiriyle ilgisiz grafiklerden oluşan bir duvardan iyidir.\n2. **Değişkenleri kullanın.** `instance` veya `env` için bir açılır liste, aynı panelin düzinelerce kopyasının yerini alır.\n3. **Eşikleri ve referans düzeylerini gösterin.** \"Normal\" için çizilen bir çizgi, izleyene neyi yok sayacağını söyler.\n4. **Çalışma kılavuzlarına (runbook) bağlantı verin.** Bunu panel açıklamalarından yapın; böylece sonraki adım tek tık uzaklıkta olur.\n\nGrafana kendi uyarı kurallarını da değerlendirebilir ve bunları e-posta, sohbet ve webhook gibi iletişim noktaları (contact points) üzerinden gönderebilir. Uyarıların tarama yapılandırmasının yanında kod olarak saklanmasını istiyorsanız Prometheus kurallarını kullanın. Kurallar birden fazla veri kaynağını kapsıyorsa, örneğin bir Prometheus metriği ile bir Loki günlük sayısı, Grafana uyarılarını kullanın.\n\nYığının kendisini de sağlamlaştırın. İzleme sistemi altyapınızın haritasını tutar. Grafana'yı SSO ve TLS arkasına alın, anonim erişimi kapatın, görüntüleyenlere yalnızca Viewer rolünü verin ve `/metrics` uç noktalarını bir güvenlik duvarı kuralıyla yalnızca Prometheus sunucusunun adresine kısıtlayın."
+    },
+    {
+      "id": "tbl",
+      "type": "text",
+      "markdown": "## Metrikler, günlükler ve izler karşılaştırması\n\nMetrikler üç gözlemlenebilirlik (observability) sinyalinden biridir. Her biri farklı bir soruyu yanıtlar ve bir güvenlik ekibinin hepsine ihtiyacı vardır.\n\n| Sinyal | Güçlü yön | Zayıf yön | Güvenlik örneği |\n|:--|:--|:--|:--|\n| **Metrikler** | Ucuz, hızlı, eğilimler ve eşikler için ideal | Tek tek olaylar hakkında ayrıntı vermez | Giden bayt gece boyunca üç katına çıktı |\n| **Günlükler (Logs)** | Tek bir olay hakkında zengin ayrıntı | Daha büyük ve aranması daha yavaş | Aktarımı hangi hesabın başlattığı |\n| **İzler (Traces)** | Tek bir isteği hizmetler arasında izler | Uygulama enstrümantasyonu gerektirir | Veritabanını hangi mikro hizmetin çağırdığı |\n\nMetrikleri **fark etmek**, günlükleri **açıklamak** için kullanın. En güçlü uygulama, bir metrik uyarısından aynı sunucunun ve aynı dakikanın günlüklerine geçmektir. Bu iş akışının günlük tarafı için [Günlük Korelasyonu ve Olay Zenginleştirme](/learn/security-operations-dfir/log-correlation-and-event-enrichment) ve [Sürekli Güvenlik İzleme](/learn/security-operations-dfir/continuous-security-monitoring) derslerine bakın."
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "Hedefleri denetleme ve sorgu çalıştırma",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s 'http://prometheus.example.com:9090/api/v1/query?query=up==0' | jq '.data.result[].metric.instance'",
+          "output": "\"dc02.example.com:9182\"",
+          "comment": "Bir hedef kapalı. Raporlamayı bırakan bir etki alanı denetleyicisi (domain controller) yalnızca bilet değil, bir telefon aramasını da hak eder."
+        },
+        {
+          "cmd": "promtool check rules /etc/prometheus/rules/security-behavior.yml",
+          "output": "Checking /etc/prometheus/rules/security-behavior.yml\n  SUCCESS: 2 rules found",
+          "comment": "Sunucuyu yeniden yüklemeden önce kural sözdizimini her zaman doğrulayın."
+        }
+      ],
+      "caption": "HTTP API üzerinden yanıt vermeyen hedefleri bulma ve promtool ile bir kural dosyasını doğrulama."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Bir sıçrama saldırının kanıtı değildir",
+      "markdown": "Yedeklemeler, yama pencereleri, çeyrek sonu raporları ve yazılım sürümleri büyük trafik ve CPU değişikliklerine yol açar. Bu olayları içeren bir referans düzeyiyle karşılaştırın, bunları uyarının danışabileceği bir takvime kaydedin ve bir metrik uyarısını sonuç olarak değil, günlüklere bakmak için bir neden olarak görün. Ayrıca yönetici haklarına sahip bir saldırganın bir dışa aktarıcıyı durdurabileceğini unutmayın; bu nedenle metrik izlemeyi yukarıdaki `up == 0` kuralıyla birleştirin."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Sahibi olduğunuz bir laboratuvar Linux sanal makinesinde:\n\n1. `node_exporter` ve Prometheus'u kurun, ardından sanal makineyi yukarıda gösterildiği gibi `scrape_configs` içine ekleyin.\n2. Prometheus ifade tarayıcısında `rate(node_cpu_seconds_total{mode!=\"idle\"}[5m])` sorgusunu çalıştırın ve en yoğun modu belirleyin.\n3. `MonitoringTargetDown` kuralını yazın, üzerinde `promtool check rules` çalıştırın ve Prometheus'u yeniden yükleyin.\n4. Sanal makinede `node_exporter`'ı durdurun ve uyarının beklemeden tetiklenmiş duruma geçişini izleyin.\n5. Grafana'da Prometheus'u veri kaynağı olarak ekleyin ve saniye başına giden baytı gösteren bir panel oluşturun. \"Normal\" durumun neye benzediğini belirten bir metin notu ekleyin."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Dışa aktarıcı (Exporter)",
+          "definition": "Bir sistemin metriklerini, Prometheus'un tarayabilmesi için HTTP üzerinden sunan süreç."
+        },
+        {
+          "term": "Tarama (Scrape)",
+          "definition": "Prometheus'un bir hedeften metrikleri okuduğu çekme isteği."
+        },
+        {
+          "term": "Etiket (Label)",
+          "definition": "Bir seriye eklenen, filtreleme ve gruplama için kullanılan anahtar-değer çifti."
+        },
+        {
+          "term": "Sayaç (Counter)",
+          "definition": "Yalnızca artan, rate() veya increase() ile kullanılan bir metrik."
+        },
+        {
+          "term": "PromQL",
+          "definition": "Zaman serilerini seçmek ve üzerlerinde hesaplama yapmak için kullanılan Prometheus sorgu dili."
+        },
+        {
+          "term": "Alertmanager",
+          "definition": "Prometheus uyarılarını gruplayan, tekilleştiren, susturan ve yönlendiren hizmet."
+        },
+        {
+          "term": "Kardinalite (Cardinality)",
+          "definition": "Bellek kullanımını belirleyen, benzersiz etiket kombinasyonlarının sayısı."
+        },
+        {
+          "term": "Veri kaynağı (Data source)",
+          "definition": "Grafana'nın sorguladığı, Prometheus veya Loki gibi bir arka uç."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı kontrol edin",
+      "questions": [
+        {
+          "question": "Prometheus metrikleri normalde nasıl toplar?",
+          "options": [
+            "Hedefler veriyi syslog üzerinden ona iter",
+            "Her hedefin /metrics uç noktasını belirli aralıklarla çeker (tarar)",
+            "Grafana panolarını ona iletir",
+            "Alertmanager veriyi SIEM'den kopyalar"
+          ],
+          "answer": 1,
+          "explanation": "Prometheus bir çekme modeli kullanır; bu, yanıt vermeyen bir hedefi up metriği aracılığıyla tespit etmesini de sağlar."
+        },
+        {
+          "question": "node_network_transmit_bytes_total gibi bir sayaç neden rate() içine alınmalıdır?",
+          "options": [
+            "Ham sayaç şifrelidir",
+            "Ham değer yalnızca büyür, bu yüzden güncel hızı göstermez",
+            "rate() eski örnekleri siler",
+            "Sayaçların grafiği çizilemez"
+          ],
+          "answer": 1,
+          "explanation": "rate(), büyüyen bir toplamı saniye başına hıza çevirir; karşılaştırma ve uyarı için kullandığınız değer budur."
+        },
+        {
+          "question": "Altyapınızın haritasını tutan bir izleme yığını için hangileri iyi uygulamalardır? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "Grafana'yı SSO ve TLS arkasına almak",
+            "/metrics erişimini Prometheus sunucusunun adresine kısıtlamak",
+            "Kolaylık için anonim Admin erişimini etkinleştirmek",
+            "Üretim hedefleri yanıt vermeyi bıraktığında uyarı vermek"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Anonim yönetici erişimi tüm ortamı açığa çıkarır; diğer seçenekler maruz kalmayı azaltır veya kurcalamayı tespit eder."
+        },
+        {
+          "question": "Bir uyarı tetikleniyor: giden trafik saat 02:00'de geçen haftanın 4 katı. En iyi sonraki adım nedir?",
+          "options": [
+            "Kontrol etmeden sunucuyu hemen izole etmek",
+            "Metriklerde ayrıntı olmadığı için yok saymak",
+            "Zamanlanmış işleri kontrol etmek, ardından zaman penceresini günlüklerle ilişkilendirmek",
+            "Kuralı silmek"
+          ],
+          "answer": 2,
+          "explanation": "Metrikler bir şeyin değiştiğini söyler; günlükler ve değişiklik takvimleri nedenini söyler."
+        },
+        {
+          "question": "Yoğun bir metrikte etiket olarak istemci IP adresi kullanmaktan neden kaçınmalısınız?",
+          "options": [
+            "TLS'i bozar",
+            "Her benzersiz değer yeni bir seri oluşturur ve belleği tüketebilir",
+            "Etiketler rakam içeremez",
+            "Alertmanager'ı devre dışı bırakır"
+          ],
+          "answer": 1,
+          "explanation": "Yüksek kardinalite, Prometheus bellek sorunlarının en yaygın nedenidir. IP başına ayrıntıyı bunun yerine günlüklere koyun."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- Prometheus metrikleri dışa aktarıcılardan çeker, etiketli zaman serileri olarak saklar ve uyarı kurallarını değerlendirir.\n- PromQL, güncel davranışı bir referans düzeyiyle karşılaştırmak için `rate()`, toplulaştırma ve `offset` kullanır.\n- Alertmanager uyarıları yönlendirir; Grafana görselleştirir ve metrikleri ile günlükleri birleştirebilir.\n- Bir değişimi fark etmek için metrikleri, açıklamak için günlükleri kullanın.\n- İzleme yığınını koruyun ve hedefler sessizleştiğinde uyarı verin.\n\nSıradaki derste farklı kaynaklardaki olayları nasıl birleştireceğinizi [Günlük Korelasyonu ve Olay Zenginleştirme](/learn/security-operations-dfir/log-correlation-and-event-enrichment) dersinde öğrenin."
+    }
+  ]
+}

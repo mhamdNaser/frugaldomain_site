@@ -1,0 +1,348 @@
+{
+  "title": "持久化机制检测（Persistence Mechanism Detection）",
+  "summary": "学习如何在 Windows 和 Linux 上发现攻击者用来在重启和清理后继续存活的机制，收集正确的遥测数据，编写 Sigma 规则和狩猎查询，并在不破坏证据的前提下对持久化进行分诊和清除。",
+  "objectives": [
+    "将持久化（Persistence）分为六大类，并映射到 MITRE ATT&CK",
+    "在自己拥有的系统上枚举 Windows 和 Linux 的自启动位置",
+    "识别能暴露持久化的遥测数据（Sysmon、Security 事件、auditd）",
+    "针对可疑的 Run 键值编写并调优 Sigma 规则和 SPL 狩猎查询",
+    "分诊持久化告警，并在清除前保全证据"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "上周，工作站 WS-0142 在一次钓鱼事件后被清理并重启。今天 02:10，EDR 显示它再次发出信标（beacon）。没有投递任何新东西：攻击者只是留下了一扇门。这就是**持久化（Persistence）**，也是删除一个恶意文件从来不意味着调查结束的原因。\n\n持久化检测意味着找出所有在重启、注销或清理后重新启动攻击者代码的机制，并建立告警，使新的机制在几分钟内浮出水面。它支撑 [Windows 事件响应](/learn/security-operations-dfir/windows-incident-response)和 [Linux 事件响应](/learn/security-operations-dfir/linux-incident-response)中的主机工作。"
+    },
+    {
+      "id": "categories",
+      "type": "text",
+      "markdown": "## 六大类持久化\n\n攻击者根据自己掌握的权限以及防御者检查的可能性来选择持久化方式。将这些机制分成几类，可使你的检查清单更系统：\n\n| 类别 | 示例 | ATT&CK |\n|:--|:--|:--|\n| **自启动项（Autostart entries）** | Run 和 RunOnce 键、启动文件夹、Shell 配置文件 | T1547 |\n| **计划执行（Scheduled execution）** | Windows 计划任务、cron、systemd 定时器 | T1053 |\n| **服务与守护进程（Services and daemons）** | 新的 Windows 服务、systemd 单元、init 脚本 | T1543 |\n| **事件触发（Event-triggered）** | WMI 订阅、IFEO 调试器、`LD_PRELOAD` | T1546 |\n| **账户与访问（Account and access）** | 新的本地用户、SSH `authorized_keys`、新增的 OAuth 应用 | T1136, T1098 |\n| **引导与固件（Boot and firmware）** | Bootkit、被修改的引导配置 | T1542 |\n\n前四类占了大多数真实案例。第五类很容易被遗忘，因为主机上没有任何东西在执行：攻击者只是保留了一把有效的密钥。"
+    },
+    {
+      "id": "windows",
+      "type": "text",
+      "markdown": "## Windows 上的检查位置\n\n按顺序逐一检查这些位置。每处只需一分钟，而且每一处都曾在真实入侵中被利用。\n\n1. **Run 键。** `Software\\Microsoft\\Windows\\CurrentVersion\\Run` 和 `RunOnce` 下的 `HKLM` 与 `HKCU`。`HKCU` 副本不需要管理员权限，因此攻击者很喜欢用它。\n2. **启动文件夹。** 每用户和所有用户的 `Startup` 目录会在登录时执行放入其中的任何内容。\n3. **计划任务。** 查看触发器（登录、开机、每五分钟）、操作以及运行它的账户。使用编码参数运行 `powershell.exe` 或 `cmd.exe` 的任务是可疑的。\n4. **服务。** 二进制文件位于 `ProgramData`、`Temp` 或用户配置文件中的服务几乎从不是合法的。\n5. **WMI 事件订阅。** 存储在 WMI 存储库中的筛选器（filter）、使用者（consumer）和绑定（binding）完全不会在启动文件夹中留下任何文件。\n6. **Winlogon 与 IFEO。** `Userinit`、`Shell` 等值以及 `Image File Execution Options` 调试器会重定向正常的程序启动。\n\n下面的终端在你自己的机器上检查其中三项。请阅读注释：每一行输出都是根据其路径和父级来判断的，而不仅仅看名称。"
+    },
+    {
+      "id": "term-win",
+      "type": "terminal",
+      "title": "在你自己拥有的主机上使用 PowerShell",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' | Format-List",
+          "comment": "机器级和当前用户的自启动注册表键"
+        },
+        {
+          "output": "SecurityHealth : %windir%\\system32\\SecurityHealthSystray.exe\nOneDrive       : \"C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe\" /background\nUpdaterSvc     : C:\\Users\\Public\\Libraries\\upd.exe -q",
+          "comment": "前两项是正常的。位于 Public\\Libraries 中的二进制文件则不正常。"
+        },
+        {
+          "cmd": "Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.State -ne 'Disabled' } | Select-Object TaskName, @{n='Run';e={$_.Actions.Execute}}",
+          "comment": "根级任务是手工创建的任务通常所在的位置"
+        },
+        {
+          "output": "TaskName            Run\n--------            ---\nGoogleUpdateTaskX   C:\\ProgramData\\GoogleUpdate\\gu.exe\nSystemHealthCheck   powershell.exe",
+          "comment": "直接启动 powershell.exe 的任务值得查看其参数"
+        },
+        {
+          "cmd": "Get-CimInstance -Namespace root\\subscription -ClassName __EventConsumer | Select-Object Name, __CLASS",
+          "comment": "WMI 事件订阅：常见的无文件持久化位置"
+        },
+        {
+          "output": "Name        __CLASS\n----        -------\nBVTConsumer CommandLineEventConsumer",
+          "comment": "BVTConsumer 是某些系统上已知的内置名称；在下结论之前先核实其命令行"
+        }
+      ],
+      "caption": "枚举常见的自启动位置。仅在你管理的系统上运行。"
+    },
+    {
+      "id": "linux",
+      "type": "text",
+      "markdown": "## Linux 上的检查位置\n\nLinux 持久化大多是文本文件，因此易于比对（diff）也易于监控。\n\n- **Cron。** `/etc/crontab`、`/etc/cron.d/`、`/var/spool/cron/` 中的每用户文件，以及 anacron 目录。\n- **systemd。** `/etc/systemd/system/` 或用户的 `~/.config/systemd/user/` 中新的 `.service` 和 `.timer` 单元。检查 `ExecStart` 和 `WantedBy` 目标。\n- **Shell 与登录文件。** `.bashrc`、`.profile` 和 `/etc/profile.d/*.sh` 在每次登录时运行。\n- **SSH。** 追加到 `~/.ssh/authorized_keys` 的密钥可提供无声的、免密码的访问。\n- **预加载与模块。** `/etc/ld.so.preload` 和可加载内核模块会将代码加载到每个进程或内核中。\n- **账户。** 新的 UID 0 用户或被修改的 sudoers 文件。\n\n由于这些都是文件，`auditd` 可以直接监视它们。关于如何判断你的发现，请参阅[可疑进程与服务分析](/learn/security-operations-dfir/suspicious-process-and-service-analysis)。"
+    },
+    {
+      "id": "auditd",
+      "type": "code",
+      "language": "bash",
+      "filename": "/etc/audit/rules.d/persistence.rules",
+      "caption": "auditd 在你管理的主机上监视 Linux 持久化位置。这些键让你可以用 `ausearch -k persist` 进行搜索。",
+      "code": "-w /etc/crontab -p wa -k persist\n-w /etc/cron.d/ -p wa -k persist\n-w /var/spool/cron/ -p wa -k persist\n-w /etc/systemd/system/ -p wa -k persist\n-w /usr/lib/systemd/system/ -p wa -k persist\n-w /etc/rc.local -p wa -k persist\n-w /root/.ssh/authorized_keys -p wa -k persist_ssh\n-w /etc/ld.so.preload -p wa -k persist_preload\n"
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## 能捕获持久化的遥测数据\n\n检测需要在事件发生之前就开启正确的日志。下表列出了你应确认已被收集的来源。\n\n| 来源 | 事件 | 显示的内容 |\n|:--|:--|:--|\n| Sysmon | 12, 13, 14 | 注册表键和值被创建、设置或重命名 |\n| Sysmon | 19, 20, 21 | WMI 筛选器、使用者和绑定被创建 |\n| Windows Security | 4698 | 创建了一个计划任务 |\n| Windows System | 7045 | 安装了一个新服务 |\n| Windows Security | 4720, 4732 | 创建了本地账户或将其加入某个组 |\n| auditd | `PATH`, `SYSCALL` | 对被监视文件和目录的写入 |\n| EDR | 自启动遥测 | 进程谱系以及被投放的文件 |\n\n收集原始事件，而不是摘要。注册表值数据（二进制文件的路径）是你将用来告警的字段。"
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "run-key-user-writable.yml",
+      "caption": "针对可疑 Run 键值的 Sigma 规则。同样的逻辑随后以 Splunk SPL 给出。",
+      "highlight": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "code": "title: Run Key Persistence Pointing to a User-Writable Path\nid: 00000000-0000-4000-8000-000000000001   # placeholder id\nstatus: experimental\ndescription: A Run or RunOnce value was set to a binary in a folder that ordinary users can write to.\nlogsource:\n  category: registry_set\n  product: windows\ndetection:\n  selection_key:\n    TargetObject|contains:\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\'\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\'\n  selection_path:\n    Details|contains:\n      - '\\AppData\\'\n      - '\\Users\\Public\\'\n      - '\\ProgramData\\'\n      - '\\Temp\\'\n  filter_known:\n    Image|endswith: '\\OneDriveSetup.exe'\n  condition: selection_key and selection_path and not filter_known\nfalsepositives:\n  - Per-user installers that register themselves in AppData\nlevel: medium\ntags:\n  - attack.persistence\n  - attack.t1547.001\n"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "run-key-hunt.spl",
+      "caption": "狩猎查询：每台主机的首次出现时间为你提供了时间线的锚点。",
+      "code": "index=sysmon EventCode=13 TargetObject=\"*\\\\CurrentVersion\\\\Run*\" (Details=\"*\\\\AppData\\\\*\" OR Details=\"*\\\\Users\\\\Public\\\\*\")\n| stats count min(_time) as first_seen by host, Image, TargetObject, Details\n| sort first_seen"
+    },
+    {
+      "id": "flow-intro",
+      "type": "text",
+      "markdown": "## 跟踪一次入侵\n\n动画展示了两种持久化机制和一条部署得当的规则如何协同工作。请注意，分析人员的第一个发现并不是终点：第二种机制之所以被发现，只是因为围绕第一个事件构建了时间线。"
+    },
+    {
+      "id": "persist-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "持久化的植入与检测",
+      "caption": "冗余的持久化会使针对单一项目的清理失效，因此检测必须覆盖每一类。",
+      "data": {
+        "token": "事件",
+        "nodes": [
+          {
+            "id": "init",
+            "label": "初始访问",
+            "sub": "钓鱼立足点",
+            "icon": "attacker"
+          },
+          {
+            "id": "reg",
+            "label": "Run 键",
+            "sub": "HKCU 自启动值",
+            "icon": "key"
+          },
+          {
+            "id": "task",
+            "label": "计划任务",
+            "sub": "登录触发器",
+            "icon": "cpu"
+          },
+          {
+            "id": "sysmon",
+            "label": "Sysmon + EDR",
+            "sub": "事件 12、13、1",
+            "icon": "eye"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM 规则",
+            "sub": "Sigma 转换为 SPL",
+            "icon": "log"
+          },
+          {
+            "id": "ir",
+            "label": "分析人员",
+            "sub": "分诊与确定范围",
+            "icon": "user"
+          },
+          {
+            "id": "clean",
+            "label": "根除",
+            "sub": "镜像取证后再清除",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "init",
+            "caption": "攻击者通过钓鱼附件在 WS-0142 上运行代码。该载荷自身无法在重启后存活。",
+            "tone": "danger"
+          },
+          {
+            "at": "reg",
+            "caption": "攻击者写入一个名为 UpdaterSvc 的 HKCU Run 值，指向 C:\\Users\\Public\\Libraries\\upd.exe。",
+            "tone": "attack"
+          },
+          {
+            "at": "task",
+            "caption": "作为备份，创建了一个带有登录触发器、名为 SystemHealthCheck 的任务，因此仅移除一种机制是不够的。",
+            "tone": "attack"
+          },
+          {
+            "at": "sysmon",
+            "caption": "Sysmon 记录了注册表值设置（事件 13）和任务创建；EDR 传感器在几秒内转发了这两者。",
+            "tone": "warning"
+          },
+          {
+            "at": "siem",
+            "caption": "由于值数据包含 \\Users\\Public\\，Sigma 规则触发。系统生成一条带有主机、用户和进程信息的告警。",
+            "tone": "warning"
+          },
+          {
+            "at": "ir",
+            "caption": "分析人员围绕第一个事件构建时间线，发现了第二种机制，并在整个终端群中搜索相同的值名称。"
+          },
+          {
+            "at": "clean",
+            "caption": "在将注册表键、任务和二进制文件作为证据收集之后，才将它们清除，并监视该主机是否再次出现。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## 分诊工作流程\n\n告警触发时，每次都以相同的方式处理：\n\n1. **以时间为锚点。** 取第一个持久化事件的时间戳，列出该主机在前后五分钟内所做的一切：进程创建、网络连接、文件写入。\n2. **判断目标。** 二进制文件在哪里？它是否已签名，由谁签名？该文件相对于注册表变更有多旧？被用作启动器的已签名 Microsoft 二进制文件（即就地取材二进制文件，living-off-the-land binary）仍需阅读其参数。\n3. **寻找同类。** 攻击者很少只植入一种机制。检查主机上的每一类，然后在整个终端群中搜索相同的值名称、任务名称、文件哈希和路径。\n4. **先保全，再清除。** 在更改任何内容之前，先导出注册表键、复制任务 XML 并对二进制文件制作镜像。\n5. **验证。** 清理后，在受监控的状态下重启，确认没有任何东西重新出现。如果出现，说明你遗漏了某种机制，或者攻击者仍然拥有访问权限。\n\n如果账户本身被滥用，请继续阅读[横向移动检测](/learn/security-operations-dfir/lateral-movement-detection)。"
+    },
+    {
+      "id": "warn-delete",
+      "type": "callout",
+      "variant": "warning",
+      "title": "不要先删除",
+      "markdown": "在复制之前就删除 Run 值或任务，会破坏那些能告诉你持久化是何时、由谁植入的证据。使用 `reg export` 导出注册表键，用 `schtasks /query /xml` 保存任务，并对二进制文件计算哈希。然后再清除。"
+    },
+    {
+      "id": "tip-baseline",
+      "type": "callout",
+      "variant": "tip",
+      "title": "基线胜过记忆",
+      "markdown": "没有人能记住服务器上每个自启动项应该是什么。为每个黄金镜像捕获一份 Autoruns 或 osquery 快照，并与之比较。判断十个新增项的差异，要比判断三百项的列表快得多，这也是 [高级威胁狩猎](/learn/security-operations-dfir/advanced-threat-hunting)的有力起点。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自试一试",
+      "markdown": "请使用**你自己拥有的虚拟机**，绝不要使用生产系统。\n\n1. 创建一个无害的 Run 值：`reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v LabTest /d \"C:\\Windows\\System32\\notepad.exe\"`。\n2. 使用常见配置安装 Sysmon，重复该命令，并在事件查看器中找到事件 13。记下 `Image`、`TargetObject` 和 `Details` 字段。\n3. 运行本课中的 PowerShell 命令，确认你的值出现。\n4. 修改 Sigma 规则，使其仅匹配 `\\Temp\\`，然后测试它不会匹配你的 notepad 值。\n5. 使用 `reg delete` 删除该值，并写三句话描述你将如何在一百台主机上检测同一个值。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "持久化（Persistence）",
+          "definition": "任何使攻击者代码能够在重启、注销或部分清理后继续存活的技术。"
+        },
+        {
+          "term": "Run 键（Run key）",
+          "definition": "一个注册表位置，其值会在用户登录或系统启动时被执行。"
+        },
+        {
+          "term": "计划任务（Scheduled task）",
+          "definition": "在触发条件下运行的 Windows 或 cron 作业，常被滥用于定时或登录持久化。"
+        },
+        {
+          "term": "WMI 订阅（WMI subscription）",
+          "definition": "存储在 WMI 存储库中的筛选器、使用者和绑定，在事件发生时运行一条命令。"
+        },
+        {
+          "term": "Autoruns",
+          "definition": "一款 Sysinternals 工具，可列出 Windows 主机上几乎所有的自启动位置。"
+        },
+        {
+          "term": "Sysmon",
+          "definition": "一种 Windows 服务，可详细记录进程、注册表、文件和 WMI 活动。"
+        },
+        {
+          "term": "Sigma",
+          "definition": "一种与厂商无关的日志检测规则格式，可转换为多种 SIEM 查询语言。"
+        },
+        {
+          "term": "就地取材（Living off the land）",
+          "definition": "滥用合法的系统二进制文件（如 PowerShell），以避免投放自定义工具。"
+        },
+        {
+          "term": "基线（Baseline）",
+          "definition": "记录下来的已知良好状态，用于快速发现差异。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪个 Sysmon 事件 ID 记录注册表值被设置？",
+          "options": [
+            "1",
+            "3",
+            "13",
+            "22"
+          ],
+          "answer": 2,
+          "explanation": "事件 13 是 RegistryEvent（Value Set，值设置）。事件 1 是进程创建，3 是网络连接，22 是 DNS 查询。"
+        },
+        {
+          "question": "为什么攻击者经常使用 HKCU Run 键而不是 HKLM？",
+          "options": [
+            "HKCU 条目在内核加载之前运行",
+            "HKCU 不需要管理员权限",
+            "HKLM 键不会被记录",
+            "HKCU 条目无法被导出"
+          ],
+          "answer": 1,
+          "explanation": "写入当前用户的配置单元（hive）对标准用户有效，因此不需要权限提升。"
+        },
+        {
+          "question": "以下哪些是值得检查的持久化位置？（选择所有适用项。）",
+          "options": [
+            "带有登录触发器的计划任务",
+            "Linux 服务器上的 `~/.ssh/authorized_keys`",
+            "浏览器历史记录文件",
+            "`/etc/systemd/system/` 单元文件"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "任务、SSH 密钥和 systemd 单元都会重新启动或重新启用攻击者的访问。浏览器历史记录不是执行或访问机制。"
+        },
+        {
+          "question": "你在一台主机上发现了一个恶意计划任务。最佳的下一步是什么？",
+          "options": [
+            "删除它并关闭工单",
+            "在该主机和整个终端群中搜索所有持久化类别，查找同类项",
+            "重新安装浏览器",
+            "禁用 Sysmon 以减少噪声"
+          ],
+          "answer": 1,
+          "explanation": "攻击者通常会植入冗余机制，因此只移除一个而不查找其他的，会招致攻击者卷土重来。"
+        },
+        {
+          "question": "在移除 Run 值之前应保全哪些证据？（选择所有适用项。）",
+          "options": [
+            "注册表键的导出文件",
+            "所引用二进制文件的哈希和副本",
+            "注册表变更的时间戳",
+            "什么都不用，因为检测之后不再需要证据"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "注册表键、二进制文件和变更时间能显示植入了什么、何时植入以及由哪个进程植入。它们也有助于在整个终端群中确定范围。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- **持久化（Persistence）**使攻击者代码能够在重启和清理后存活，因此检测必须找出每一种机制，而不仅仅是第一个。\n- 检查六大类：自启动项、计划执行、服务、事件触发机制、账户与访问以及引导组件。\n- Windows 的位置包括 Run 键、启动文件夹、任务、服务、WMI 订阅和 Winlogon 值；Linux 的位置包括 cron、systemd、Shell 文件、SSH 密钥和预加载。\n- Sysmon 事件 12、13、14 和 19 至 21、Security 4698 和 7045，以及 `auditd` 监视提供遥测数据；Sigma 规则将其转化为告警。\n- 以时间为锚点、判断目标、寻找同类、**先保全再清除**，并在受监控的重启后验证。\n\n接下来，在[网络取证](/learn/security-operations-dfir/network-forensics)中，把你的可见性从主机扩展到网络链路。"
+    }
+  ]
+}

@@ -1,0 +1,285 @@
+{
+  "title": "基于网络的事件调查（Network-Based Incident Investigation）",
+  "summary": "学习如何从网络证据调查事件：选择合适的数据源，在 Zeek 和 SIEM 数据中发现信标通信和异常传输，界定受影响的主机并安全地进行遏制。",
+  "objectives": [
+    "针对具体问题，在流量记录、DNS、代理、防火墙和数据包证据之间做出选择",
+    "查询 Zeek 日志，发现信标通信和异常大量的出站传输",
+    "通过从一个指标出发进行关联查询（pivot），界定所有受影响的主机",
+    "识别基于 DNS 的数据转移并说明如何检测",
+    "在不破坏证据的前提下遏制网络威胁"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "凌晨 02:10，一条监控告警显示，财务子网中的一台文件服务器向一个无人认识的地址发送了 4 GB 数据。该服务器上的终端代理没有报告任何异常。此时网络证据最为重要：它由攻击者无法控制的设备记录，显示了谁在何时与谁通信，以及通信量有多大。\n\n基于网络的调查回答四个问题。可疑主机与什么通信？这种模式正常吗？还有哪些主机做了同样的事？我们应该封禁什么？本课建立在[事件响应基础（Incident Response Fundamentals）](/learn/security-operations-dfir/incident-response-fundamentals)之上，并为你在[网络取证（Network Forensics）](/learn/security-operations-dfir/network-forensics)中进行更深入的数据包分析做好准备。"
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## 选择合适的证据\n\n没有任何单一数据源能回答所有问题。请选择能回答你的问题且成本最低的那个，只有在需要时才深入下去。\n\n| 数据源 | 显示内容 | 优势 | 局限 |\n|:--|:--|:--|:--|\n| **流量记录**（NetFlow、IPFIX） | 地址、端口、字节数、持续时间 | 成本低，可保留数月 | 没有内容 |\n| **Zeek 日志**（`conn`、`dns`、`http`、`ssl`） | 已解析的会话和元数据 | 内容丰富，可搜索 | 需要在链路上部署传感器 |\n| **DNS 日志** | 请求的域名和应答 | 揭示 IP 背后的域名 | 无法发现硬编码的 IP |\n| **代理日志** | URL、User-Agent、用户 | 将流量与身份关联 | 仅限经过代理的流量 |\n| **防火墙日志** | 被允许和被拒绝的会话 | 显示被阻止的尝试 | 上下文较少 |\n| **完整数据包捕获** | 每一个字节 | 事实依据 | 成本高，保留时间短 |\n\n先用流量记录或 Zeek 找出活动的大致形态。用 DNS 和代理日志给它命名。用数据包捕获来证明它，详见[高级网络流量分析（Advanced Network Traffic Analysis）](/learn/security-operations-dfir/advanced-network-traffic-analysis)。"
+    },
+    {
+      "id": "inv-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从告警到遏制",
+      "caption": "每个阶段都会缩小问题范围，并为下一阶段生成一份指标清单。",
+      "data": {
+        "token": "证据",
+        "nodes": [
+          {
+            "id": "alert",
+            "icon": "alert",
+            "label": "告警",
+            "sub": "4 GB 出站"
+          },
+          {
+            "id": "conn",
+            "icon": "log",
+            "label": "连接",
+            "sub": "Zeek conn.log"
+          },
+          {
+            "id": "dns",
+            "icon": "globe",
+            "label": "名称",
+            "sub": "DNS 与代理"
+          },
+          {
+            "id": "scope",
+            "icon": "eye",
+            "label": "界定范围",
+            "sub": "其他主机"
+          },
+          {
+            "id": "pcap",
+            "icon": "file",
+            "label": "证明",
+            "sub": "数据包捕获"
+          },
+          {
+            "id": "block",
+            "icon": "firewall",
+            "label": "遏制",
+            "sub": "封禁并隔离"
+          }
+        ],
+        "steps": [
+          {
+            "at": "alert",
+            "caption": "告警触发：203.0.113.50 从该文件服务器收到了 4 GB 数据。",
+            "tone": "warning"
+          },
+          {
+            "at": "conn",
+            "caption": "Zeek 显示，九天内向该地址发起了 3,100 次会话，每次间隔约 60 秒。",
+            "tone": "danger"
+          },
+          {
+            "at": "dns",
+            "caption": "该地址解析到一个 12 天前注册的域名；代理显示出一个罕见的 User-Agent。",
+            "tone": "warning"
+          },
+          {
+            "at": "scope",
+            "caption": "搜索同一域名又发现了两台主机，其中一台是域控制器。",
+            "tone": "danger"
+          },
+          {
+            "at": "pcap",
+            "caption": "数据包捕获确认夜间存在大量加密上传，没有任何业务目的。"
+          },
+          {
+            "at": "block",
+            "caption": "在防火墙和代理上封禁该域名和 IP；三台主机被隔离。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "zeek",
+      "type": "text",
+      "markdown": "## 查询 Zeek 了解流量形态\n\nZeek 每个连接写入一行以制表符分隔的记录。`zeek-cut` 工具用于选择列，因此你可以用普通的 shell 工具进行排序和计数。始终在日志副本上工作，切勿在传感器的实时文件上操作。\n\n第一个有用的问题是：哪台内部主机向外发送的字节最多，发往谁？对可疑主机按目的地汇总 `orig_bytes`。第二个问题是，是否有任何目的地以稳定的节奏被联系，而这是人工浏览绝不会产生的。"
+    },
+    {
+      "id": "zeek-term",
+      "type": "terminal",
+      "title": "Zeek conn.log 分析",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "zeek-cut id.orig_h id.resp_h orig_bytes < conn.log | awk '$1==\"10.20.5.14\"{b[$2]+=$3} END{for(i in b) print b[i], i}' | sort -nr | head -3",
+          "output": "4187402112 203.0.113.50\n  1204881 198.51.100.77\n    88213 10.20.1.10",
+          "comment": "按文件服务器（10.20.5.14）发送字节数排序的主要目的地。"
+        },
+        {
+          "cmd": "zeek-cut ts id.orig_h id.resp_h < conn.log | awk '$2==\"10.20.5.14\" && $3==\"203.0.113.50\"{print $1}' | head -4",
+          "output": "1731376805.12\n1731376865.31\n1731376925.09\n1731376985.40",
+          "comment": "时间戳相差约 60 秒：固定的信标间隔。"
+        },
+        {
+          "cmd": "zeek-cut query answers < dns.log | grep 203.0.113.50 | head -1",
+          "output": "cdn-sync.example.net\t203.0.113.50",
+          "comment": "该 IP 对应一个名称，可以在整个环境中搜索。"
+        }
+      ],
+      "caption": "输出仅为示意，使用的是文档专用地址。请对你自己的传感器日志副本运行。"
+    },
+    {
+      "id": "beacon",
+      "type": "text",
+      "markdown": "## 识别信标通信\n\n等待指令的恶意软件通常会按固定间隔回连。这称为**信标通信（beaconing）**。优秀的植入程序会添加随机延迟（抖动），因此应寻找低方差，而不是完全相等。\n\n一种实用方法：\n\n1. 按源、目的地和端口对连接分组。\n2. 计算相邻连接之间的间隔。\n3. 标记连接数量多且标准差相对于平均间隔很小的分组。\n\n同样的思路也适用于 SIEM。请把结果当作线索，而不是定论：软件更新程序、监控代理和聊天客户端同样会合法地发出信标。请结合目的地的存在时长、它在你的各主机中的罕见程度以及拥有该连接的进程来确认。"
+    },
+    {
+      "id": "beacon-spl",
+      "type": "code",
+      "language": "plain",
+      "code": "index=zeek sourcetype=zeek:conn id.orig_h=10.20.5.14 earliest=-9d\n| sort 0 _time\n| streamstats current=f last(_time) AS prev BY id.orig_h id.resp_h id.resp_p\n| eval gap=_time-prev\n| stats count avg(gap) AS avg_gap stdev(gap) AS sd_gap sum(orig_bytes) AS bytes BY id.orig_h id.resp_h id.resp_p\n| where count>100 AND sd_gap<(avg_gap*0.2)\n| sort - count",
+      "filename": "beacon_candidates.spl",
+      "caption": "用于查找低方差重复连接的 Splunk SPL 搜索。0.2 这一阈值只是起点，需要根据你自己的流量进行调优。"
+    },
+    {
+      "id": "dns",
+      "type": "text",
+      "markdown": "## 通过 DNS 发现隐蔽的数据转移\n\nDNS 几乎在所有地方都被允许，因此是缓慢数据转移的首选通道。主机可以把少量数据编码进攻击者控制的域名下那些看似随机的长子域名，例如 `a9f3k2x7q1.t.example.org`。每一次查询都会经过你的解析器并出现在你的 DNS 日志中。\n\n需要审查的指标：\n\n- 同一主机在同一个父域名下产生大量唯一的子域名。\n- 查询名称比正常情况长得多，且随机性很高。\n- 大量使用 `TXT` 或 `NULL` 记录类型。\n- 查询量远高于该主机的基线。\n\n通常只需按主机、按父域名统计不同子域名的数量就能发现这一点。请与基线比较，因为 CDN 和杀毒软件的云查询也会产生大量唯一名称。"
+    },
+    {
+      "id": "scope",
+      "type": "text",
+      "markdown": "## 通过关联查询界定范围\n\n单个指标很少构成整个事件。**关联查询（Pivoting）** 是指拿着你已有的值，到其他所有地方去搜索它。\n\n| 起点 | 关联到 | 你能了解到 |\n|:--|:--|:--|\n| 目的 IP | 其他内部源 | 哪些主机受到影响 |\n| 域名 | 解析出的 IP 和子域名 | 攻击者基础设施 |\n| User-Agent 或 JA3 哈希 | 使用它的其他主机 | 其他机器上的同一工具 |\n| 源主机 | 它的所有目的地 | 横向移动和其他 C2 |\n| 时间窗口 | 相邻主机的日志 | 原因和先后顺序 |\n\n记录每个指标的首次和最近出现时间以及发现来源。维护一条持续更新的时间线。如果关联查询触及域控制器或跳板机，请将其视为更大的事件，并按照[服务器入侵调查（Server Compromise Investigation）](/learn/security-operations-dfir/server-compromise-investigation)中的升级路径处理。"
+    },
+    {
+      "id": "contain",
+      "type": "text",
+      "markdown": "## 遏制而不丢失证据\n\n网络层面的遏制很快，但草率的封禁可能掩盖攻击者的反应，或破坏易失性数据。\n\n1. **先保全。** 保存相关的流量记录、Zeek 日志和代理日志；如果尚未运行，请在可疑主机的交换机端口或 SPAN 会话上启动数据包捕获。\n2. 在防火墙、代理和 DNS 黑洞处**封禁指标**：IP、域名及其子域名。\n3. 使用 EDR 网络遏制功能或隔离 VLAN **隔离主机**，而不是关机，这样内存仍可用于检查。\n4. **留意重试。** 被封禁的信标转移到新地址，说明攻击者仍在活动，也表明还存在其他基础设施。\n5. **记录**每项操作的时间、分析人员和工单。\n\n仅封禁单个 IP 是较弱的控制，因为基础设施变化很快。按域名、证书或行为封禁的效果更持久。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "不要只相信一个数据源",
+      "markdown": "NAT 网关、代理或 VPN 集中器可能把真实的内部源隐藏在一个地址之后。务必以 UTC 关联时间戳，并在隔离主机之前使用 DHCP 或 NAT 日志确认当时是哪台设备拥有该地址。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你拥有的实验室网络中，对来自测试机器的抓包运行 Zeek（或 Security Onion，参见 [Security Onion 架构（Security Onion Architecture）](/learn/security-operations-dfir/security-onion-architecture)）。在该机器上添加一个计划任务，在十分钟内每 60 秒请求一次 `http://lab.example.com/ping`。然后使用 `zeek-cut` 列出连接时间戳，计算间隔并确认其间隔稳定。最后写一句话，说明哪些证据能让你把这个无害任务与真正的信标区分开来。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "信标通信（Beaconing）",
+          "definition": "主机向控制端发出的有规律的重复回连。"
+        },
+        {
+          "term": "抖动（Jitter）",
+          "definition": "为隐藏规律而添加到间隔上的随机变化。"
+        },
+        {
+          "term": "流量记录（Flow record）",
+          "definition": "对一次连接的摘要：地址、端口、字节数和时间。"
+        },
+        {
+          "term": "Zeek",
+          "definition": "一种将流量转换为结构化日志的网络分析器。"
+        },
+        {
+          "term": "关联查询（Pivoting）",
+          "definition": "在其他数据中搜索已知指标，以发现相关活动。"
+        },
+        {
+          "term": "DNS 隧道（DNS tunneling）",
+          "definition": "将数据编码在 DNS 查询和应答中，以绕过控制措施传输数据。"
+        },
+        {
+          "term": "SPAN 端口（SPAN port）",
+          "definition": "将流量镜像到监控设备的交换机端口。"
+        },
+        {
+          "term": "黑洞（Sinkhole）",
+          "definition": "将恶意流量重定向到无害位置的 DNS 或路由条目。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "你需要知道过去六个月内哪些主机联系过某个可疑域名，而存储空间有限。哪个数据源最合适？",
+          "options": [
+            "完整数据包捕获",
+            "DNS 日志或流量记录",
+            "磁盘镜像",
+            "内存转储"
+          ],
+          "answer": 1,
+          "explanation": "DNS 日志和流量记录体积小，可保留数月。完整数据包捕获很少能保留这么久。"
+        },
+        {
+          "question": "哪些发现提示存在信标通信？选择所有适用项。",
+          "options": [
+            "每 60 秒一次且变化很小的连接",
+            "从软件厂商的一次大文件下载",
+            "向一个罕见域名发起的数千次会话",
+            "仅被某个用户使用过一次的目的地"
+          ],
+          "answer": [
+            0,
+            2
+          ],
+          "explanation": "规律的时间间隔以及向罕见目的地的大量连接是典型的信标通信指标。单次下载或一次性访问则不是。"
+        },
+        {
+          "question": "对于一台正在发出信标且内存中可能存有攻击者工具的主机，最好的第一个遏制步骤是什么？",
+          "options": [
+            "立即关机",
+            "将其与网络隔离并保持运行",
+            "删除可疑文件",
+            "重装操作系统"
+          ],
+          "answer": 1,
+          "explanation": "网络隔离能阻断通信，同时保留内存和运行状态以供检查。关机或重装会破坏证据。"
+        },
+        {
+          "question": "哪些 DNS 模式指向可能的数据转移？选择所有适用项。",
+          "options": [
+            "同一父域名下有数百个唯一的长子域名",
+            "对同一个热门站点的大量查询",
+            "某台工作站频繁发起 TXT 查询",
+            "对公司网站的一次 A 记录查询"
+          ],
+          "answer": [
+            0,
+            2
+          ],
+          "explanation": "来自同一主机的大量唯一编码子域名和异常的 TXT 使用是典型迹象。对热门名称的重复查询则是正常的。"
+        },
+        {
+          "question": "为什么在隔离主机之前要与 DHCP 或 NAT 日志做关联？",
+          "options": [
+            "为了减小日志体积",
+            "因为告警中的 IP 当时可能属于另一台设备",
+            "因为 Zeek 无法读取 IP 地址",
+            "为了更改防火墙规则"
+          ],
+          "answer": 1,
+          "explanation": "地址会被重新分配，NAT 会隐藏源地址，因此不做这一检查就可能隔离错误的机器。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n网络证据记录在可疑主机之外，因此是可靠的。先从流量记录、Zeek 和 DNS 等低成本数据源入手，找出活动的大致形态，再用数据包捕获加以证明。寻找稳定的间隔、罕见的目的地和异常的流量。从每个指标出发进行关联查询，找出所有受影响的主机，将发现记录在时间线中，并通过先保全证据、隔离而非关机的方式进行遏制。接下来，请在[持久化机制检测（Persistence Mechanism Detection）](/learn/security-operations-dfir/persistence-mechanism-detection)中学习持久化。"
+    }
+  ]
+}

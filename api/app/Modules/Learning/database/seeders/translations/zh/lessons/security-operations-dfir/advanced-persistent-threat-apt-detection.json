@@ -1,0 +1,287 @@
+{
+  "title": "高级持续性威胁（APT）检测",
+  "summary": "学习如何检测耐心十足、资源充足的攻击者：在 MITRE ATT&CK 中为其建模，狩猎信标通信，捕获持久化与凭据窃取行为，并将弱信号综合评分。",
+  "objectives": [
+    "解释为什么 APT 活动能够规避基于特征签名的检测",
+    "根据攻击者技术和日志源构建 ATT&CK 覆盖图",
+    "编写信标通信狩猎查询和针对 LSASS 访问的 Sigma 规则",
+    "将弱信号合并为按实体计算的风险评分"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一家 40 人的工程公司数月来没有发现任何异常。后来，一次对 DNS 日志的例行审查显示，有一台工作站每隔 55 到 65 分钟就会联系一个罕见域名，数据量大小始终相近，昼夜不停。没有触发任何告警，因为每一个单独的事件看起来都无害。这就是**高级持续性威胁（Advanced Persistent Threat，APT）**的典型形态：资源充足的攻击者追求长期访问权限，行动缓慢，并混入正常活动之中。\n\nAPT 检测并不是要找到某一个确凿的证据，而是要在数周时间里，对照此类攻击者的行为模型，把许多弱信号组合起来。本课展示如何构建这个模型，并把它转化为可在您自有日志上运行的查询。本课以[高级威胁狩猎](/learn/security-operations-dfir/advanced-threat-hunting)和[高级检测工程](/learn/security-operations-dfir/advanced-detection-engineering)为基础。"
+    },
+    {
+      "id": "what-makes",
+      "type": "text",
+      "markdown": "## 什么使威胁具有“持续性”\n\n商品化攻击者追求快速获利，因此动静很大。APT 攻击者追求的是访问权限，因此非常有耐心。防御者需要关注四个特征：\n\n- **目标明确。** 窃取数据、间谍活动或在特定行业中预先布设。\n- **低频缓慢。** 传输量小、休眠间隔长、工作时间与受害者一致。\n- **就地取材（Living off the land）。** 使用 `powershell.exe`、`wmic.exe`、`schtasks.exe` 和 `certutil.exe` 等内置工具，而不是自定义二进制文件。\n- **多层持久化。** 设置多个立足点，因此清除其中一个并不会终结入侵。\n\n| 特征 | 为什么特征签名检测会失效 | 仍然有效的方法 |\n|:--|:--|:--|\n| 低频缓慢 | 不会触及任何阈值 | 长时间窗口统计、信标通信分析 |\n| 就地取材 | 二进制文件本身是合法的 | 父子进程及命令行上下文 |\n| 有效账号 | 登录能够成功 | 针对每个用户和主机的行为基线 |\n| 自定义工具 | 没有已知哈希 | 关注行为，而非指标 |\n\n因此，检测的问题从“这个文件是否有害？”转变为“这个行为对该资产来说是否异常，是否符合某种已知的攻击者技术？”"
+    },
+    {
+      "id": "attack-model",
+      "type": "text",
+      "markdown": "## 第 1 步：用 MITRE ATT&CK 为攻击者建模\n\n您无法检测所有内容，因此要从可能针对您的攻击者入手。从威胁情报中挑选两三个相关组织，在 **MITRE ATT&CK** 矩阵中列出它们的技术，并标记出哪些是您已经能够看到的。\n\n1. 从 ATT&CK Navigator 导出每个组织的技术。\n2. 将每项技术映射到您所采集的日志源：Sysmon、Windows 安全日志、DNS、代理、EDR。\n3. 为矩阵着色：已覆盖、部分覆盖、盲区。\n4. 按使用该盲区的重点组织数量对盲区排序。\n\n最终得到的就是一张**覆盖图（coverage map）**。它会告诉您，在编写任何规则之前，应该把日志建设的投入放在哪里。例如，如果凭据转储（T1003）出现在每个重点组织中，而您没有记录对 `lsass.exe` 的进程访问，这就是您的首要缺口。"
+    },
+    {
+      "id": "kill-chain",
+      "type": "animation",
+      "kind": "flow",
+      "title": "跨越数月的 APT 入侵",
+      "caption": "每个阶段都会留下不同的细微痕迹。检测需要将其中多个痕迹结合起来。",
+      "data": {
+        "token": "入侵者",
+        "nodes": [
+          {
+            "id": "mail",
+            "label": "初始访问",
+            "sub": "鱼叉式网络钓鱼",
+            "icon": "mail"
+          },
+          {
+            "id": "ws",
+            "label": "工作站",
+            "sub": "立足点",
+            "icon": "laptop"
+          },
+          {
+            "id": "dc",
+            "label": "域控制器",
+            "sub": "凭据访问",
+            "icon": "server"
+          },
+          {
+            "id": "fs",
+            "label": "文件服务器",
+            "sub": "数据收集",
+            "icon": "database"
+          },
+          {
+            "id": "c2",
+            "label": "外部主机",
+            "sub": "203.0.113.50",
+            "icon": "cloud"
+          }
+        ],
+        "steps": [
+          {
+            "at": "mail",
+            "caption": "第 1 周：一封针对性邮件投递了第一阶段工具。痕迹：邮件网关日志，以及一个罕见的 Office 子进程。",
+            "tone": "attack"
+          },
+          {
+            "at": "ws",
+            "caption": "第 1 周：通过计划任务实现持久化。痕迹：事件 ID 4698 和 Sysmon 进程创建。",
+            "tone": "warning"
+          },
+          {
+            "at": "c2",
+            "caption": "第 1-6 周：每小时一次的信标通信。痕迹：DNS 和代理日志中规律的时间间隔。",
+            "tone": "warning"
+          },
+          {
+            "at": "dc",
+            "caption": "第 3 周：入侵者使用了有效的管理员账号。痕迹：来自一台从未有过此类行为的工作站的登录类型 3。",
+            "tone": "danger"
+          },
+          {
+            "at": "fs",
+            "caption": "第 5 周：压缩包在文件服务器上暂存。痕迹：非工作时间的大量读取。",
+            "tone": "danger"
+          },
+          {
+            "at": "c2",
+            "caption": "第 6 周：以小块方式缓慢外泄数据。痕迹：每台主机每天的出站字节数。",
+            "tone": "attack"
+          }
+        ]
+      }
+    },
+    {
+      "id": "beacon",
+      "type": "text",
+      "markdown": "## 第 2 步：狩猎信标通信\n\n按定时器回连的恶意软件会产生节奏规律的连接。人的浏览行为是不规则的，因此低变化度值得怀疑。现代植入程序会加入**抖动（jitter）**（随机变化），所以您要寻找的是较低的变异系数，而不是完全相等。\n\n下面这条 Splunk SPL 查询按源和目的对代理事件分组，然后衡量间隔的规律程度。请在您自己 14 天的数据上运行。"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "beacon-hunt.spl",
+      "code": "index=proxy earliest=-14d\n| sort 0 src_ip dest_host _time\n| streamstats current=f last(_time) AS prev BY src_ip dest_host\n| eval gap=_time-prev\n| stats count AS conns avg(gap) AS avg_gap stdev(gap) AS sd_gap\n        dc(date_mday) AS days BY src_ip dest_host\n| eval cv=round(sd_gap/avg_gap,2)\n| where conns>100 AND days>=7 AND cv<0.3 AND avg_gap>30\n| lookup top_domains.csv dest_host OUTPUT rank\n| where isnull(rank)\n| sort cv",
+      "highlight": [
+        7,
+        8,
+        9
+      ],
+      "caption": "信标通信狩猎查询。在多天内 cv（变异系数）较低，且目的主机不在常见域名白名单中的连接，值得审查。"
+    },
+    {
+      "id": "beacon-out",
+      "type": "terminal",
+      "title": "示例结果",
+      "prompt": "$",
+      "lines": [
+        {
+          "output": "src_ip=192.0.2.44  dest_host=cdn-sync.example.net  conns=312  avg_gap=3584  sd_gap=412  days=13  cv=0.11",
+          "comment": "强候选项：大约每小时一次连接，非常规律。"
+        },
+        {
+          "output": "src_ip=192.0.2.71  dest_host=updates.example.org  conns=1440  avg_gap=60  sd_gap=2  days=14  cv=0.03",
+          "comment": "非常规律，但很可能是软件更新程序。升级处置之前，先核实其所有者。"
+        }
+      ],
+      "caption": "输出只是线索，而非定论。请对照资产归属和发起连接的进程来验证每一行。"
+    },
+    {
+      "id": "persist",
+      "type": "text",
+      "markdown": "## 第 3 步：检测持久化和凭据窃取\n\n持久化和凭据访问是 APT 攻击者无法完全隐藏的环节，因为他们必须修改系统。请重点关注几类高价值事件：\n\n- **计划任务和服务**由非管理工具创建：Security 4698、System 7045。\n- **注册表运行键**和 WMI 事件订阅：Sysmon 事件 12、13 以及 19-21。\n- **异常进程访问 LSASS 内存**：Sysmon 事件 10，且 `TargetImage` 以 `lsass.exe` 结尾。\n- **新的登录模式：**服务账号进行交互式登录，或管理员登录了它从未接触过的服务器。\n\n将它们编写为 Sigma 规则，以便在 Splunk、Sentinel 和 Elastic 之间移植。下面的规则用于标记对 LSASS 内存的可疑访问。"
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "lsass-access.yml",
+      "code": "title: Suspicious Process Access to LSASS\nid: 7c1d9a52-0000-4000-8000-000000000001\nstatus: experimental\ndescription: Non-system process opens LSASS with memory-read rights\nlogsource:\n  product: windows\n  category: process_access\ndetection:\n  selection:\n    TargetImage|endswith: '\\lsass.exe'\n    GrantedAccess|contains:\n      - '0x1010'\n      - '0x1410'\n      - '0x1fffff'\n  filter_known:\n    SourceImage|startswith:\n      - 'C:\\Windows\\System32\\'\n      - 'C:\\Program Files\\Windows Defender\\'\n  condition: selection and not filter_known\nlevel: high\ntags:\n  - attack.credential_access\n  - attack.t1003.001",
+      "highlight": [
+        10,
+        11,
+        12,
+        13
+      ],
+      "caption": "针对 T1003.001 的 Sigma 规则。启用告警之前，请先根据您的 EDR 和备份代理调整 filter_known。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "不要对每个弱信号都发出告警",
+      "markdown": "信标通信和罕见进程的狩猎会产生大量误报。请将它们连同风险评分一起送入**狩猎队列（hunting queue）**，而不要直接送入告警队列。只有当多个独立信号在一个时间窗口内落在同一台主机或账号上时，才升级为事件，例如信标通信加上新的计划任务，再加上一次 LSASS 访问。"
+    },
+    {
+      "id": "correlate",
+      "type": "text",
+      "markdown": "## 第 4 步：关联并计算风险评分\n\n基于风险的告警（risk-based alerting）为每个弱信号分配分值，并在总分超过阈值时告警。请根据信号的罕见程度及其匹配的 ATT&CK 战术给每个信号打分，并按实体（主机或用户）在七天内累加。一台主机的信标通信得 30 分、新服务得 20 分、异常管理员登录得 40 分，合计 90 分，就会创建工单，而其中任何一项单独出现都不会触发。\n\n请每月审查这些评分。如果分析师将大多数工单作为良性关闭，就降低噪声信号的权重，或添加带有负责人和到期日期的排除项。如果发现某起事件没有被任何评分捕获，则补充缺失的信号。"
+    },
+    {
+      "id": "tip-baseline",
+      "type": "callout",
+      "variant": "tip",
+      "title": "狩猎之前先建立基线",
+      "markdown": "狩猎的质量取决于您对“正常”的认识。对于任何新数据源，请用第一周来建立基线：哪些主机会访问哪些域名、哪些账号会登录哪些服务器，以及每个部门一个典型工作日的出站字节量是多少。将基线保存为查找表，并每月刷新。没有基线，每个罕见事件看起来都很可疑，分析师很快就会不再信任狩猎结果。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "1. 在实验环境或您自己拥有的日志中，导出 14 天的 DNS 或代理日志。\n2. 改写该 SPL（或使用 `statistics.stdev` 的 Python 脚本），按源和目的计算间隔、均值和变异系数。\n3. 列出 `cv` 最低的前五对，并逐一说明它是已知的更新服务，还是需要调查。\n4. 将 Sigma 规则导入您的 SIEM 测试实例，在实验机器上使用获批的安全工具安全地触发它，并记下必须过滤哪些误报。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "APT",
+          "definition": "拥有资源和耐心、寻求对特定目标长期访问的攻击者。"
+        },
+        {
+          "term": "信标通信（Beaconing）",
+          "definition": "植入程序向其控制端发起的周期性出站连接。"
+        },
+        {
+          "term": "抖动（Jitter）",
+          "definition": "加入信标间隔的随机变化，以避免出现完全规律的间隔。"
+        },
+        {
+          "term": "就地取材（Living off the land）",
+          "definition": "滥用操作系统内置工具，而不是使用自定义恶意软件。"
+        },
+        {
+          "term": "覆盖图（Coverage map）",
+          "definition": "显示您的日志和检测能够覆盖哪些 ATT&CK 技术的矩阵。"
+        },
+        {
+          "term": "基于风险的告警（Risk-based alerting）",
+          "definition": "按实体对弱信号评分，并在总分超过阈值时告警。"
+        },
+        {
+          "term": "Sigma",
+          "definition": "一种与厂商无关、用于描述日志检测的 YAML 格式。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验您的理解",
+      "questions": [
+        {
+          "question": "为什么基于特征签名的工具常常会漏掉 APT 活动？",
+          "options": [
+            "攻击者只使用零日漏洞利用",
+            "其技术使用合法工具和有效账号，因此不存在已知恶意指标",
+            "APT 流量总是加密的",
+            "SIEM 无法保存超过一天的日志"
+          ],
+          "answer": 1,
+          "explanation": "就地取材和有效账号不会留下可供匹配的恶意哈希或域名，因此需要基于行为的检测。"
+        },
+        {
+          "question": "下列哪些是良好的信标通信指标？（多选）",
+          "options": [
+            "连接间隔的变异系数较低",
+            "在工作时间之外仍持续连接",
+            "在您的环境中罕见的目的地",
+            "从软件厂商处进行的一次大文件下载"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "规律的时间间隔、夜间活动和罕见目的地合在一起表明存在自动化行为；单次厂商下载则很普通。"
+        },
+        {
+          "question": "用 ATT&CK 为攻击者建模后，首先得到的产出是什么？",
+          "options": [
+            "一份 IP 地址段列表",
+            "显示盲区的覆盖图",
+            "一个恶意软件样本",
+            "一套防火墙规则"
+          ],
+          "answer": 1,
+          "explanation": "将技术映射到您的日志源，可以看出哪些能够检测、哪些不能，从而指导日志建设的投入。"
+        },
+        {
+          "question": "哪个 Sysmon 事件记录一个进程打开另一个进程，可用于发现 LSASS 访问？",
+          "options": [
+            "事件 ID 1",
+            "事件 ID 3",
+            "事件 ID 10",
+            "事件 ID 22"
+          ],
+          "answer": 2,
+          "explanation": "事件 10 是 ProcessAccess（进程访问）。事件 1 是进程创建，事件 3 是网络连接，事件 22 是 DNS 查询。"
+        },
+        {
+          "question": "为什么要先将信标通信的命中结果送入狩猎队列？",
+          "options": [
+            "它们总是恶意的",
+            "它们的误报率高，需要其他证据佐证",
+            "不允许分析师查看它们",
+            "它们无法被评分"
+          ],
+          "answer": 1,
+          "explanation": "规律的流量很常见（更新程序、监控代理），因此信号需要其他证据佐证，才能升级为事件。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\nAPT 检测意味着发现行为，而不是发现文件。首先在 ATT&CK 中为可能的攻击者建模，并将覆盖情况映射到您的日志源。通过长时间窗口的统计来狩猎信标通信，用可移植的 Sigma 规则检测持久化和凭据访问，并将弱信号合并为每台主机和每个用户的风险评分。将每个狩猎结果都视为线索，对照资产归属进行验证，并把所学反馈到您的检测中。请继续学习[勒索软件防御工程](/learn/security-operations-dfir/ransomware-defense-engineering)。"
+    }
+  ]
+}

@@ -1,0 +1,288 @@
+{
+  "title": "Grafana 与 Prometheus 基础设施监控",
+  "summary": "了解 Prometheus 如何采集指标，PromQL 与告警规则如何发现可疑的行为变化，以及 Grafana 仪表盘如何支持安全分诊。",
+  "objectives": [
+    "解释 Prometheus 拉取模型及其主要组件",
+    "编写将当前行为与基线进行比较的 PromQL 查询",
+    "为失联目标和异常流量创建告警规则",
+    "设计安全且重点突出的 Grafana 仪表盘"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "凌晨 02:10，一台文件服务器开始变慢。磁盘写入量增至三倍，CPU 持续攀升，平时一小时就能完成的备份任务到天亮还在运行。SIEM 没有任何告警，因为没有人登录，也没有规则命中。最初的迹象出现在**指标（metrics）**中：资源使用量突然变化。加密任务、挖矿程序或数据暂存进程，都会在特征码出现之前留下这样的痕迹。\n\n**Prometheus** 负责采集并存储这些数字，**Grafana** 则把它们变成仪表盘和告警。安全团队用它们来保障可用性、做容量规划，并将其作为第二证据来源。本课将介绍它们的工作原理、如何查询，以及如何针对影响安全的行为设置告警。本课是基于日志的视角的补充，参见 [Elastic Security 与 SIEM](/learn/security-operations-dfir/elastic-security-and-siem)。"
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## Prometheus 的工作原理\n\nPrometheus 采用**拉取模型（pull model）**。服务器大约每 15 秒向每个已配置的**目标（target）**发起一次 HTTP 请求，读取其在 `/metrics` 暴露的纯文本指标。每个样本都会连同时间戳存入时间序列数据库。\n\n| 组件 | 作用 |\n|:--|:--|\n| **导出器（Exporter）** | 为某个系统暴露指标。`node_exporter` 用于 Linux 主机，`windows_exporter` 用于 Windows |\n| **Prometheus 服务器** | 抓取目标、存储时间序列、评估规则 |\n| **Alertmanager** | 对告警进行分组、去重、静默和路由 |\n| **Grafana** | 仪表盘、数据探索以及自带的告警功能 |\n\n每条序列由指标名称加上**标签（labels）**构成，例如 `node_cpu_seconds_total{instance=\"fs01\", mode=\"idle\"}`。标签是用来过滤和分组的依据。指标有四种类型：**计数器（counter）**只增不减（已发送字节数），**仪表（gauge）**可增可减（内存使用量），**直方图（histogram）**和**摘要（summary）**记录请求延迟等分布情况。\n\n拉取模型具有安全优势。目标无需向监控服务器发起出站访问，而且当目标停止响应时，`up` 指标会变为 0，Prometheus 因此能察觉。一台悄无声息地从监控中消失的主机，本身就是一个发现。"
+    },
+    {
+      "id": "cfg",
+      "type": "code",
+      "language": "yaml",
+      "filename": "prometheus.yml",
+      "caption": "一份最小化的抓取配置。目标使用 example.com 域名和私有地址；高亮行显示了 TLS 以及 Windows 导出器的凭据占位符。",
+      "highlight": [
+        12,
+        13,
+        14,
+        15
+      ],
+      "code": "global:\n  scrape_interval: 15s\n  evaluation_interval: 15s\n\nrule_files:\n  - /etc/prometheus/rules/*.yml\n\nscrape_configs:\n  - job_name: linux-hosts\n    static_configs:\n      - targets: ['fs01.example.com:9100', '10.20.0.15:9100']\n        labels: {env: prod, owner: infra}\n  - job_name: windows-hosts\n    scheme: https\n    tls_config:\n      ca_file: /etc/prometheus/ca.pem\n    basic_auth:\n      username: prometheus\n      password_file: /etc/prometheus/secrets/win_exporter.pass\n    static_configs:\n      - targets: ['dc01.example.com:9182']\n\nalerting:\n  alertmanagers:\n    - static_configs:\n        - targets: ['alertmanager.example.com:9093']"
+    },
+    {
+      "id": "promql",
+      "type": "text",
+      "markdown": "## 使用 PromQL 查询\n\n**PromQL** 是查询语言。只写一个指标名称，会返回所有匹配序列的最新值。大多数有用的查询会组合**范围选择器（range selector）**、**函数**和**聚合**。\n\n- `rate(node_network_transmit_bytes_total[5m])` 将计数器转换为五分钟内每秒的字节数。计数器务必用 `rate()` 或 `increase()` 包裹，因为原始值只会不断增长。\n- `sum by (instance) (...)` 将序列合并为每台主机一条。\n- `avg_over_time`、`max_over_time` 和 `quantile_over_time` 对一个时间窗口进行汇总。\n- `... > 0.9` 用于过滤结果，因此一条查询也可以直接作为告警条件。\n\n与安全相关的问题都围绕**变化**。`fs01` 夜间正常的出站流量是多少？磁盘写入速率与上周同一小时相比是否突增？PromQL 用 `offset` 修饰符来回答，例如 `rate(...[5m]) / rate(...[5m] offset 1w)`。比值大于 3，说明该主机比平时繁忙三倍。\n\n要保持较低的标签基数。不要在高流量指标的标签中放入用户名、IP 地址或 URL，因为每个唯一值都会产生一条新序列，可能耗尽内存。"
+    },
+    {
+      "id": "rules",
+      "type": "code",
+      "language": "yaml",
+      "filename": "rules/security-behavior.yml",
+      "caption": "两条告警规则：导出器停止响应，以及出站流量远高于上周同一小时。两者都只是调查的起点，而非定论。",
+      "highlight": [
+        5,
+        13,
+        14
+      ],
+      "code": "groups:\n  - name: security-behavior\n    rules:\n      - alert: MonitoringTargetDown\n        expr: up{env=\"prod\"} == 0\n        for: 5m\n        labels: {severity: high}\n        annotations:\n          summary: \"{{ $labels.instance }} stopped answering scrapes\"\n      - alert: OutboundTrafficSpike\n        expr: |\n          sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m]))\n            > 3 * sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m] offset 1w))\n            and sum by (instance) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[10m])) > 5e6\n        for: 15m\n        labels: {severity: medium}\n        annotations:\n          summary: \"{{ $labels.instance }} sends 3x its usual outbound traffic\""
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从指标到通知",
+      "caption": "文件服务器上的出站流量激增如何传达到分析师。",
+      "data": {
+        "token": "样本",
+        "nodes": [
+          {
+            "id": "host",
+            "label": "文件服务器",
+            "sub": "node_exporter :9100",
+            "icon": "server"
+          },
+          {
+            "id": "prom",
+            "label": "Prometheus",
+            "sub": "每 15 秒抓取一次",
+            "icon": "database"
+          },
+          {
+            "id": "rule",
+            "label": "告警规则",
+            "sub": "OutboundTrafficSpike",
+            "icon": "eye"
+          },
+          {
+            "id": "am",
+            "label": "Alertmanager",
+            "sub": "分组与路由",
+            "icon": "cpu"
+          },
+          {
+            "id": "graf",
+            "label": "Grafana",
+            "sub": "仪表盘",
+            "icon": "globe"
+          },
+          {
+            "id": "soc",
+            "label": "分析师",
+            "sub": "呼叫与工单",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "host",
+            "caption": "导出器在 /metrics 暴露当前的网络发送计数器。"
+          },
+          {
+            "at": "prom",
+            "caption": "Prometheus 抓取该计数器，每 15 秒存储一个样本。"
+          },
+          {
+            "at": "rule",
+            "caption": "规则将当前速率与上周同一时间比较，得出比值为 4.2。",
+            "tone": "warning"
+          },
+          {
+            "at": "rule",
+            "caption": "该条件持续 15 分钟成立，因此告警由待定（pending）转为触发（firing）。",
+            "tone": "danger"
+          },
+          {
+            "at": "am",
+            "caption": "Alertmanager 对其去重，并路由到值班渠道。"
+          },
+          {
+            "at": "graf",
+            "caption": "分析师打开 Grafana 面板，查看增长从何时开始，以及由哪个网络接口承载。"
+          },
+          {
+            "at": "soc",
+            "caption": "工单被创建，分析师将该时间窗口与 SIEM 和代理日志进行关联分析。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "grafana",
+      "type": "text",
+      "markdown": "## 安全工作流中的 Grafana\n\nGrafana 可连接多种**数据源（data source）**：Prometheus、用于日志的 Loki、Elasticsearch、SQL 数据库和云监控 API。同一个仪表盘可以把指标面板与同一分钟的日志行并排显示，从而加快分诊。\n\n好的安全仪表盘有几个共同习惯：\n\n1. **每个仪表盘只回答一个问题。**“认证层是否健康？”胜过一堆互不相关的图表。\n2. **使用变量。**用 `instance` 或 `env` 的下拉菜单，代替同一面板的十几份副本。\n3. **显示阈值和基线。**一条“正常”参考线能告诉查看者哪些可以忽略。\n4. **在面板描述中链接到运行手册（runbook）**，让下一步操作一键可达。\n\nGrafana 也可以评估自己的告警规则，并通过邮件、聊天工具和 webhook 等联络点（contact point）发送。若希望告警与抓取配置一同以代码形式存放，请使用 Prometheus 规则；若规则跨越多个数据源，例如同时涉及 Prometheus 指标和 Loki 日志计数，则使用 Grafana 告警。\n\n要加固这套监控栈本身。监控系统掌握着你的基础设施地图。将 Grafana 置于 SSO 和 TLS 之后，禁用匿名访问，只给查看者 Viewer 角色，并用防火墙规则把 `/metrics` 端点限制为只允许 Prometheus 服务器的地址访问。"
+    },
+    {
+      "id": "tbl",
+      "type": "text",
+      "markdown": "## 指标、日志与追踪的比较\n\n指标是三种可观测性信号之一。每种信号回答不同的问题，安全团队三者都需要。\n\n| 信号 | 优势 | 劣势 | 安全示例 |\n|:--|:--|:--|:--|\n| **指标（Metrics）** | 成本低、速度快，适合趋势和阈值 | 不含单个事件的细节 | 出站字节数一夜之间增至三倍 |\n| **日志（Logs）** | 单个事件的细节丰富 | 体量更大，搜索更慢 | 是哪个账户发起了传输 |\n| **追踪（Traces）** | 跟踪一次请求在各服务间的流转 | 需要对应用进行埋点 | 是哪个微服务调用了数据库 |\n\n用指标来**发现**，用日志来**解释**。最有效的做法是从指标告警跳转到同一主机、同一分钟的日志。关于这一工作流中日志部分，参见[日志关联与事件富化](/learn/security-operations-dfir/log-correlation-and-event-enrichment)和[持续安全监控](/learn/security-operations-dfir/continuous-security-monitoring)。"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "检查目标并运行查询",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s 'http://prometheus.example.com:9090/api/v1/query?query=up==0' | jq '.data.result[].metric.instance'",
+          "output": "\"dc02.example.com:9182\"",
+          "comment": "有一个目标已宕机。停止上报的域控制器应当立即打电话处理，而不只是开个工单。"
+        },
+        {
+          "cmd": "promtool check rules /etc/prometheus/rules/security-behavior.yml",
+          "output": "Checking /etc/prometheus/rules/security-behavior.yml\n  SUCCESS: 2 rules found",
+          "comment": "重新加载服务器之前，务必先验证规则语法。"
+        }
+      ],
+      "caption": "通过 HTTP API 找出失联目标，并用 promtool 验证规则文件。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "流量激增并不等于遭受攻击",
+      "markdown": "备份、补丁窗口、季度末报表和软件发布，都会造成流量和 CPU 的大幅变化。应与包含这些事件的基线进行比较，把它们记录在告警可以查询的日历中，并把指标告警当作查看日志的理由，而不是结论。还要记住，拥有管理员权限的攻击者可以停掉导出器，所以要把指标监控与上文的 `up == 0` 规则结合使用。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你自己拥有的实验用 Linux 虚拟机上：\n\n1. 安装 `node_exporter` 和 Prometheus，然后按上文所示把虚拟机加入 `scrape_configs`。\n2. 在 Prometheus 表达式浏览器中运行 `rate(node_cpu_seconds_total{mode!=\"idle\"}[5m])`，找出最繁忙的模式。\n3. 编写 `MonitoringTargetDown` 规则，对其运行 `promtool check rules`，然后重新加载 Prometheus。\n4. 在虚拟机上停止 `node_exporter`，观察告警从待定变为触发。\n5. 在 Grafana 中添加 Prometheus 作为数据源，并创建一个显示每秒出站字节数的面板。再添加一条文字说明，写明“正常”是什么样子。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "导出器（Exporter）",
+          "definition": "通过 HTTP 暴露系统指标，供 Prometheus 抓取的进程。"
+        },
+        {
+          "term": "抓取（Scrape）",
+          "definition": "Prometheus 从目标读取指标的一次拉取请求。"
+        },
+        {
+          "term": "标签（Label）",
+          "definition": "附加在序列上的键值对，用于过滤和分组。"
+        },
+        {
+          "term": "计数器（Counter）",
+          "definition": "只增不减的指标，需配合 rate() 或 increase() 使用。"
+        },
+        {
+          "term": "PromQL",
+          "definition": "Prometheus 的查询语言，用于选取时间序列并对其进行计算。"
+        },
+        {
+          "term": "Alertmanager",
+          "definition": "对 Prometheus 告警进行分组、去重、静默和路由的服务。"
+        },
+        {
+          "term": "基数（Cardinality）",
+          "definition": "唯一标签组合的数量，决定内存占用。"
+        },
+        {
+          "term": "数据源（Data source）",
+          "definition": "Grafana 所查询的后端，例如 Prometheus 或 Loki。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "Prometheus 通常如何采集指标？",
+          "options": [
+            "目标通过 syslog 向它推送数据",
+            "它按计划拉取（抓取）每个目标的 /metrics 端点",
+            "Grafana 将其仪表盘转发给它",
+            "Alertmanager 从 SIEM 复制数据"
+          ],
+          "answer": 1,
+          "explanation": "Prometheus 使用拉取模型，这也使它能通过 up 指标发现失联的目标。"
+        },
+        {
+          "question": "为什么 node_network_transmit_bytes_total 这样的计数器必须用 rate() 包裹？",
+          "options": [
+            "原始计数器是加密的",
+            "原始值只会增长，因此无法体现当前速度",
+            "rate() 会删除旧样本",
+            "计数器无法绘制成图"
+          ],
+          "answer": 1,
+          "explanation": "rate() 将不断增长的总量转换为每秒速度，这才是可以比较和设置告警的值。"
+        },
+        {
+          "question": "对于掌握着你基础设施地图的监控栈，哪些是良好做法？（选择所有适用项。）",
+          "options": [
+            "将 Grafana 置于 SSO 和 TLS 之后",
+            "将 /metrics 限制为只允许 Prometheus 服务器地址访问",
+            "为方便起见启用匿名 Admin 访问",
+            "当生产环境目标停止响应时发出告警"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "匿名管理员访问会暴露整个环境；其他选项则能减少暴露面或发现篡改。"
+        },
+        {
+          "question": "告警触发：02:00 的出站流量是上周的 4 倍。最佳的下一步是什么？",
+          "options": [
+            "不做检查，立即隔离该主机",
+            "因为指标没有细节而忽略它",
+            "检查计划任务，然后将该时间窗口与日志进行关联分析",
+            "删除该规则"
+          ],
+          "answer": 2,
+          "explanation": "指标告诉你有事情发生了变化；日志和变更日历告诉你原因。"
+        },
+        {
+          "question": "为什么应避免在高流量指标的标签中放入客户端 IP 地址？",
+          "options": [
+            "它会破坏 TLS",
+            "每个唯一值都会产生新序列，可能耗尽内存",
+            "标签不能包含数字",
+            "它会禁用 Alertmanager"
+          ],
+          "answer": 1,
+          "explanation": "高基数是 Prometheus 内存问题最常见的原因。请把按 IP 的细节放到日志中。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- Prometheus 从导出器拉取指标，将其存储为带标签的时间序列，并评估告警规则。\n- PromQL 使用 `rate()`、聚合和 `offset` 将当前行为与基线进行比较。\n- Alertmanager 负责路由告警；Grafana 负责可视化，并能把指标与日志结合起来。\n- 用指标发现变化，用日志解释原因。\n- 保护好监控栈本身，并在目标失联时发出告警。\n\n接下来，学习如何在[日志关联与事件富化](/learn/security-operations-dfir/log-correlation-and-event-enrichment)中把来自不同来源的事件关联起来。"
+    }
+  ]
+}

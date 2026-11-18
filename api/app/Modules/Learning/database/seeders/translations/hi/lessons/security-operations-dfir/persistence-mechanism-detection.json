@@ -1,0 +1,348 @@
+{
+  "title": "परसिस्टेंस मैकेनिज़्म डिटेक्शन (Persistence Mechanism Detection)",
+  "summary": "जानें कि हमलावर Windows और Linux पर रीबूट और सफ़ाई के बाद भी टिके रहने के लिए कौन-से तंत्र इस्तेमाल करते हैं, सही टेलीमेट्री कैसे इकट्ठा करें, Sigma नियम और हंट क्वेरी कैसे लिखें, और सबूत नष्ट किए बिना परसिस्टेंस की ट्रायाज और सफ़ाई कैसे करें।",
+  "objectives": [
+    "परसिस्टेंस को छह परिवारों में वर्गीकृत करना और उन्हें MITRE ATT&CK से मैप करना",
+    "अपने स्वामित्व वाले सिस्टम पर Windows और Linux के ऑटोस्टार्ट स्थानों की गणना करना",
+    "परसिस्टेंस को उजागर करने वाली टेलीमेट्री (Sysmon, Security इवेंट, auditd) पहचानना",
+    "संदिग्ध Run key मानों के लिए Sigma नियम और SPL हंट लिखना और ट्यून करना",
+    "परसिस्टेंस अलर्ट की ट्रायाज करना और हटाने से पहले सबूत सुरक्षित रखना"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "पिछले सप्ताह फ़िशिंग घटना के बाद वर्कस्टेशन WS-0142 को साफ़ करके रीबूट किया गया था। आज 02:10 बजे EDR में दिख रहा है कि वह फिर से बीकन कर रहा है। कुछ भी नया डिलीवर नहीं किया गया: हमलावर ने बस एक दरवाज़ा खुला छोड़ दिया था। यही **परसिस्टेंस (persistence)** है, और इसीलिए एक दुर्भावनापूर्ण फ़ाइल हटाना किसी जाँच का अंत कभी नहीं होता।\n\nपरसिस्टेंस डिटेक्शन का अर्थ है हर उस तंत्र को ढूँढना जो रीबूट, लॉगऑफ़ या सफ़ाई के बाद हमलावर का कोड फिर चालू कर देता है, और ऐसे अलर्ट बनाना कि नए तंत्र मिनटों में सामने आ जाएँ। यह [Windows Incident Response](/learn/security-operations-dfir/windows-incident-response) और [Linux Incident Response](/learn/security-operations-dfir/linux-incident-response) में किए गए होस्ट कार्य का समर्थन करता है।"
+    },
+    {
+      "id": "categories",
+      "type": "text",
+      "markdown": "## छह परिवारों में परसिस्टेंस\n\nहमलावर अपने पास मौजूद विशेषाधिकारों और इस संभावना के आधार पर परसिस्टेंस चुनते हैं कि रक्षक वहाँ देखेगा या नहीं। तंत्रों को परिवारों में बाँटें ताकि आपकी चेकलिस्ट व्यवस्थित रहे:\n\n| परिवार | उदाहरण | ATT&CK |\n|:--|:--|:--|\n| **ऑटोस्टार्ट एंट्री** | Run और RunOnce कुंजियाँ, Startup फ़ोल्डर, शेल प्रोफ़ाइल | T1547 |\n| **निर्धारित निष्पादन** | Windows शेड्यूल्ड टास्क, cron, systemd टाइमर | T1053 |\n| **सेवाएँ और डेमन** | नई Windows सेवा, systemd यूनिट, init स्क्रिप्ट | T1543 |\n| **इवेंट-ट्रिगर्ड** | WMI सब्सक्रिप्शन, IFEO डीबगर, `LD_PRELOAD` | T1546 |\n| **अकाउंट और एक्सेस** | नया लोकल यूज़र, SSH `authorized_keys`, जोड़ा गया OAuth ऐप | T1136, T1098 |\n| **बूट और फ़र्मवेयर** | बूटकिट, बदली हुई बूट कॉन्फ़िगरेशन | T1542 |\n\nअधिकांश वास्तविक मामले पहले चार परिवारों में आते हैं। पाँचवें को भूलना आसान है क्योंकि होस्ट पर कुछ चलता ही नहीं: हमलावर बस एक वैध कुंजी अपने पास रखता है।"
+    },
+    {
+      "id": "windows",
+      "type": "text",
+      "markdown": "## Windows पर कहाँ देखें\n\nइन स्थानों को क्रम से जाँचें। हर एक को जाँचने में एक मिनट लगता है और हर एक असली घुसपैठों में इस्तेमाल हो चुका है।\n\n1. **Run कुंजियाँ (Run keys)।** `Software\\Microsoft\\Windows\\CurrentVersion\\Run` और `RunOnce` के अंतर्गत `HKLM` और `HKCU`। `HKCU` वाली प्रति के लिए एडमिनिस्ट्रेटर अधिकार नहीं चाहिए, इसलिए हमलावर इसे पसंद करते हैं।\n2. **Startup फ़ोल्डर।** प्रति-यूज़र और सभी-यूज़र `Startup` डायरेक्टरी में रखी गई हर चीज़ लॉगऑन पर चल जाती है।\n3. **शेड्यूल्ड टास्क।** ट्रिगर (लॉगऑन, बूट, हर पाँच मिनट), एक्शन और जिस अकाउंट के तहत वह चलता है, उसे देखें। एन्कोडेड आर्गुमेंट के साथ `powershell.exe` या `cmd.exe` चलाने वाले टास्क संदिग्ध होते हैं।\n4. **सेवाएँ (Services)।** जिस सेवा की बाइनरी `ProgramData`, `Temp` या यूज़र प्रोफ़ाइल में हो, वह लगभग कभी वैध नहीं होती।\n5. **WMI इवेंट सब्सक्रिप्शन।** WMI रिपॉज़िटरी में संग्रहीत फ़िल्टर, कंज्यूमर और बाइंडिंग Startup फ़ोल्डर में कोई फ़ाइल नहीं छोड़ते।\n6. **Winlogon और IFEO।** `Userinit`, `Shell` और `Image File Execution Options` डीबगर जैसे मान सामान्य प्रोग्राम लॉन्च को किसी और दिशा में मोड़ देते हैं।\n\nनीचे का टर्मिनल आपकी अपनी मशीन पर इनमें से तीन की जाँच करता है। कमेंट पढ़ें: हर आउटपुट लाइन को उसके पाथ और पैरेंट से परखा जाता है, केवल नाम से नहीं।"
+    },
+    {
+      "id": "term-win",
+      "type": "terminal",
+      "title": "आपके अपने होस्ट पर PowerShell",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' | Format-List",
+          "comment": "मशीन और वर्तमान यूज़र की ऑटोस्टार्ट रजिस्ट्री कुंजियाँ"
+        },
+        {
+          "output": "SecurityHealth : %windir%\\system32\\SecurityHealthSystray.exe\nOneDrive       : \"C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe\" /background\nUpdaterSvc     : C:\\Users\\Public\\Libraries\\upd.exe -q",
+          "comment": "पहली दो सामान्य हैं। Public\\Libraries में कोई बाइनरी सामान्य नहीं है।"
+        },
+        {
+          "cmd": "Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.State -ne 'Disabled' } | Select-Object TaskName, @{n='Run';e={$_.Actions.Execute}}",
+          "comment": "हाथ से बनाए गए टास्क आमतौर पर रूट-लेवल पर ही मिलते हैं"
+        },
+        {
+          "output": "TaskName            Run\n--------            ---\nGoogleUpdateTaskX   C:\\ProgramData\\GoogleUpdate\\gu.exe\nSystemHealthCheck   powershell.exe",
+          "comment": "जो टास्क सीधे powershell.exe लॉन्च करता है, उसके आर्गुमेंट देखना ज़रूरी है"
+        },
+        {
+          "cmd": "Get-CimInstance -Namespace root\\subscription -ClassName __EventConsumer | Select-Object Name, __CLASS",
+          "comment": "WMI इवेंट सब्सक्रिप्शन: फ़ाइललेस परसिस्टेंस की एक आम जगह"
+        },
+        {
+          "output": "Name        __CLASS\n----        -------\nBVTConsumer CommandLineEventConsumer",
+          "comment": "BVTConsumer कुछ सिस्टम पर एक ज्ञात बिल्ट-इन नाम है; निष्कर्ष निकालने से पहले उसकी कमांड लाइन जाँचें"
+        }
+      ],
+      "caption": "सामान्य ऑटोस्टार्ट स्थानों की गणना। इसे केवल उन्हीं सिस्टम पर चलाएँ जिन्हें आप प्रशासित करते हैं।"
+    },
+    {
+      "id": "linux",
+      "type": "text",
+      "markdown": "## Linux पर कहाँ देखें\n\nLinux में परसिस्टेंस ज़्यादातर टेक्स्ट फ़ाइलें होती हैं, जिससे उनकी तुलना (diff) और निगरानी आसान हो जाती है।\n\n- **Cron।** `/etc/crontab`, `/etc/cron.d/`, `/var/spool/cron/` में प्रति-यूज़र फ़ाइलें, और anacron डायरेक्टरी।\n- **systemd।** `/etc/systemd/system/` या यूज़र की `~/.config/systemd/user/` में नई `.service` और `.timer` यूनिट। `ExecStart` और `WantedBy` टारगेट जाँचें।\n- **शेल और लॉगिन फ़ाइलें।** `.bashrc`, `.profile` और `/etc/profile.d/*.sh` हर लॉगिन पर चलती हैं।\n- **SSH।** `~/.ssh/authorized_keys` में जोड़ी गई कुंजी बिना पासवर्ड के चुपचाप एक्सेस देती है।\n- **प्रीलोड और मॉड्यूल।** `/etc/ld.so.preload` और लोड होने योग्य कर्नेल मॉड्यूल हर प्रोसेस या कर्नेल में कोड लोड करते हैं।\n- **अकाउंट।** UID 0 वाला नया यूज़र या बदली हुई sudoers फ़ाइल।\n\nचूँकि ये फ़ाइलें हैं, `auditd` इन पर सीधे नज़र रख सकता है। जो मिले उसका मूल्यांकन करने के लिए [संदिग्ध Process और Service का विश्लेषण](/learn/security-operations-dfir/suspicious-process-and-service-analysis) देखें।"
+    },
+    {
+      "id": "auditd",
+      "type": "code",
+      "language": "bash",
+      "filename": "/etc/audit/rules.d/persistence.rules",
+      "caption": "auditd आपके प्रबंधित होस्ट पर Linux परसिस्टेंस स्थानों की निगरानी करता है। कुंजियों (keys) की मदद से आप `ausearch -k persist` से खोज सकते हैं।",
+      "code": "-w /etc/crontab -p wa -k persist\n-w /etc/cron.d/ -p wa -k persist\n-w /var/spool/cron/ -p wa -k persist\n-w /etc/systemd/system/ -p wa -k persist\n-w /usr/lib/systemd/system/ -p wa -k persist\n-w /etc/rc.local -p wa -k persist\n-w /root/.ssh/authorized_keys -p wa -k persist_ssh\n-w /etc/ld.so.preload -p wa -k persist_preload\n"
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## वह टेलीमेट्री जो परसिस्टेंस पकड़ती है\n\nडिटेक्शन के लिए सही लॉग घटना से पहले ही चालू होने चाहिए। तालिका उन स्रोतों को सूचीबद्ध करती है जिनके संग्रहण की आपको पुष्टि करनी चाहिए।\n\n| स्रोत | इवेंट | यह क्या दिखाता है |\n|:--|:--|:--|\n| Sysmon | 12, 13, 14 | रजिस्ट्री कुंजी और मान बनाया गया, सेट किया गया या नाम बदला गया |\n| Sysmon | 19, 20, 21 | WMI फ़िल्टर, कंज्यूमर और बाइंडिंग बनाई गई |\n| Windows Security | 4698 | शेड्यूल्ड टास्क बनाया गया |\n| Windows System | 7045 | नई सेवा इंस्टॉल की गई |\n| Windows Security | 4720, 4732 | लोकल अकाउंट बनाया गया या ग्रुप में जोड़ा गया |\n| auditd | `PATH`, `SYSCALL` | निगरानी वाली फ़ाइलों और डायरेक्टरी में लिखना |\n| EDR | ऑटोस्टार्ट टेलीमेट्री | प्रोसेस वंशावली और डाली गई फ़ाइल |\n\nसारांश नहीं, कच्चा इवेंट इकट्ठा करें। रजिस्ट्री मान डेटा (बाइनरी का पाथ) वही फ़ील्ड है जिस पर आप अलर्ट बनाएँगे।"
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "run-key-user-writable.yml",
+      "caption": "संदिग्ध Run key मानों के लिए एक Sigma नियम। वही तर्क आगे Splunk SPL के रूप में दिया गया है।",
+      "highlight": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "code": "title: Run Key Persistence Pointing to a User-Writable Path\nid: 00000000-0000-4000-8000-000000000001   # placeholder id\nstatus: experimental\ndescription: A Run or RunOnce value was set to a binary in a folder that ordinary users can write to.\nlogsource:\n  category: registry_set\n  product: windows\ndetection:\n  selection_key:\n    TargetObject|contains:\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\'\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\'\n  selection_path:\n    Details|contains:\n      - '\\AppData\\'\n      - '\\Users\\Public\\'\n      - '\\ProgramData\\'\n      - '\\Temp\\'\n  filter_known:\n    Image|endswith: '\\OneDriveSetup.exe'\n  condition: selection_key and selection_path and not filter_known\nfalsepositives:\n  - Per-user installers that register themselves in AppData\nlevel: medium\ntags:\n  - attack.persistence\n  - attack.t1547.001\n"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "run-key-hunt.spl",
+      "caption": "हंट क्वेरी: प्रति होस्ट पहली बार देखे जाने का समय टाइमलाइन के लिए आपका आधार बिंदु देता है।",
+      "code": "index=sysmon EventCode=13 TargetObject=\"*\\\\CurrentVersion\\\\Run*\" (Details=\"*\\\\AppData\\\\*\" OR Details=\"*\\\\Users\\\\Public\\\\*\")\n| stats count min(_time) as first_seen by host, Image, TargetObject, Details\n| sort first_seen"
+    },
+    {
+      "id": "flow-intro",
+      "type": "text",
+      "markdown": "## एक घुसपैठ का अनुसरण\n\nएनिमेशन दिखाता है कि दो परसिस्टेंस तंत्र और एक सही जगह लगा नियम कैसे साथ काम करते हैं। ध्यान दें कि विश्लेषक की पहली खोज अंत नहीं है: दूसरा तंत्र इसीलिए मिला क्योंकि टाइमलाइन पहले इवेंट के आसपास बनाई गई थी।"
+    },
+    {
+      "id": "persist-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "परसिस्टेंस लगाया गया और पकड़ा गया",
+      "caption": "अनावश्यक (redundant) परसिस्टेंस एकल-आइटम सफ़ाई को विफल कर देता है, इसलिए डिटेक्शन को हर परिवार को कवर करना होगा।",
+      "data": {
+        "token": "इवेंट",
+        "nodes": [
+          {
+            "id": "init",
+            "label": "प्रारंभिक एक्सेस",
+            "sub": "फ़िशिंग से पैर जमाना",
+            "icon": "attacker"
+          },
+          {
+            "id": "reg",
+            "label": "Run key",
+            "sub": "HKCU ऑटोस्टार्ट मान",
+            "icon": "key"
+          },
+          {
+            "id": "task",
+            "label": "शेड्यूल्ड टास्क",
+            "sub": "लॉगऑन ट्रिगर",
+            "icon": "cpu"
+          },
+          {
+            "id": "sysmon",
+            "label": "Sysmon + EDR",
+            "sub": "इवेंट 12, 13, 1",
+            "icon": "eye"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM नियम",
+            "sub": "Sigma से SPL में बदला गया",
+            "icon": "log"
+          },
+          {
+            "id": "ir",
+            "label": "विश्लेषक",
+            "sub": "ट्रायाज और दायरा निर्धारण",
+            "icon": "user"
+          },
+          {
+            "id": "clean",
+            "label": "उन्मूलन",
+            "sub": "इमेज बनाने के बाद हटाएँ",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "init",
+            "caption": "हमलावर फ़िशिंग अटैचमेंट के ज़रिए WS-0142 पर कोड चलाता है। यह पेलोड अपने आप रीबूट के बाद नहीं टिकेगा।",
+            "tone": "danger"
+          },
+          {
+            "at": "reg",
+            "caption": "हमलावर UpdaterSvc नाम का एक HKCU Run मान लिखता है जो C:\\Users\\Public\\Libraries\\upd.exe की ओर इशारा करता है।",
+            "tone": "attack"
+          },
+          {
+            "at": "task",
+            "caption": "बैकअप के तौर पर लॉगऑन ट्रिगर वाला SystemHealthCheck नाम का टास्क बनाया जाता है, इसलिए एक तंत्र हटाना काफ़ी नहीं है।",
+            "tone": "attack"
+          },
+          {
+            "at": "sysmon",
+            "caption": "Sysmon रजिस्ट्री मान सेट होना (इवेंट 13) और टास्क निर्माण दर्ज करता है; EDR सेंसर दोनों को कुछ सेकंड में फ़ॉरवर्ड कर देता है।",
+            "tone": "warning"
+          },
+          {
+            "at": "siem",
+            "caption": "Sigma नियम इसलिए ट्रिगर होता है क्योंकि मान डेटा में \\Users\\Public\\ है। होस्ट, यूज़र और प्रोसेस के साथ एक अलर्ट खुलता है।",
+            "tone": "warning"
+          },
+          {
+            "at": "ir",
+            "caption": "विश्लेषक पहले इवेंट के आसपास टाइमलाइन बनाता है, दूसरा तंत्र ढूँढता है, और उसी मान नाम के लिए पूरे बेड़े (fleet) में खोज करता है।"
+          },
+          {
+            "at": "clean",
+            "caption": "कुंजी, टास्क और बाइनरी को सबूत के रूप में इकट्ठा करने के बाद उन्हें हटा दिया जाता है और होस्ट पर वापसी के लिए नज़र रखी जाती है।",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## ट्रायाज वर्कफ़्लो\n\nजब अलर्ट आए, हर बार एक ही तरीके से काम करें:\n\n1. **समय पर लंगर डालें।** पहले परसिस्टेंस इवेंट का टाइमस्टैम्प लें और उसके आसपास के पाँच मिनट में उस होस्ट ने जो कुछ किया उसे सूचीबद्ध करें: प्रोसेस निर्माण, नेटवर्क कनेक्शन, फ़ाइल राइट।\n2. **लक्ष्य का आकलन करें।** बाइनरी कहाँ है? क्या वह साइन की हुई है, और किसने की? रजिस्ट्री बदलाव की तुलना में फ़ाइल कितनी पुरानी है? लॉन्चर के रूप में इस्तेमाल हुई साइन की हुई Microsoft बाइनरी (living-off-the-land बाइनरी) के भी आर्गुमेंट पढ़ने पड़ते हैं।\n3. **सहोदर तंत्र खोजें।** हमलावर शायद ही कभी एक ही तंत्र लगाते हैं। होस्ट पर हर परिवार जाँचें, फिर पूरे बेड़े में वही मान नाम, टास्क नाम, फ़ाइल हैश और पाथ खोजें।\n4. **पहले सुरक्षित रखें, फिर हटाएँ।** कुछ भी बदलने से पहले कुंजी एक्सपोर्ट करें, टास्क XML कॉपी करें और बाइनरी की इमेज बनाएँ।\n5. **सत्यापित करें।** सफ़ाई के बाद निगरानी की स्थिति में रीबूट करें और पुष्टि करें कि कुछ वापस नहीं आया। अगर आया, तो या तो आपसे कोई तंत्र छूट गया या हमलावर के पास अब भी एक्सेस है।\n\nअगर अकाउंट का ही दुरुपयोग हुआ था, तो [Lateral Movement Detection](/learn/security-operations-dfir/lateral-movement-detection) के साथ आगे बढ़ें।"
+    },
+    {
+      "id": "warn-delete",
+      "type": "callout",
+      "variant": "warning",
+      "title": "पहले मत हटाएँ",
+      "markdown": "Run मान या टास्क को कॉपी करने से पहले हटाना उस सबूत को नष्ट कर देता है जो बताता है कि परसिस्टेंस कब और किसने लगाया। `reg export` से कुंजी एक्सपोर्ट करें, `schtasks /query /xml` से टास्क सहेजें, और बाइनरी का हैश बनाएँ। उसके बाद हटाएँ।"
+    },
+    {
+      "id": "tip-baseline",
+      "type": "callout",
+      "variant": "tip",
+      "title": "बेसलाइन याददाश्त से बेहतर है",
+      "markdown": "सर्वर पर हर ऑटोस्टार्ट एंट्री कैसी होनी चाहिए, यह किसी को याद नहीं रह सकता। हर गोल्ड इमेज का Autoruns या osquery स्नैपशॉट लें और उससे तुलना करें। दस नई एंट्री का अंतर (diff) तीन सौ की सूची को परखने से कहीं तेज़ है, और यह [Advanced Threat Hunting](/learn/security-operations-dfir/advanced-threat-hunting) के लिए एक मज़बूत शुरुआती बिंदु है।"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "खुद आज़माएँ",
+      "markdown": "**अपनी वर्चुअल मशीन** का उपयोग करें, कभी प्रोडक्शन सिस्टम का नहीं।\n\n1. एक हानिरहित Run मान बनाएँ: `reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v LabTest /d \"C:\\Windows\\System32\\notepad.exe\"`।\n2. सामान्य कॉन्फ़िगरेशन के साथ Sysmon इंस्टॉल करें, कमांड दोहराएँ और Event Viewer में इवेंट 13 खोजें। `Image`, `TargetObject` और `Details` फ़ील्ड नोट करें।\n3. इस पाठ की PowerShell कमांड चलाएँ और पुष्टि करें कि आपका मान दिखता है।\n4. Sigma नियम को ऐसे बदलें कि वह केवल `\\Temp\\` से मेल खाए, फिर परखें कि वह आपके notepad मान से मेल नहीं खाता।\n5. `reg delete` से मान हटाएँ और तीन वाक्यों में लिखें कि आप सौ होस्ट पर वही मान कैसे पकड़ेंगे।"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "मुख्य शब्द",
+      "items": [
+        {
+          "term": "परसिस्टेंस (Persistence)",
+          "definition": "कोई भी तकनीक जो हमलावर के कोड को रीबूट, लॉगऑफ़ या आंशिक सफ़ाई के बाद भी बचाए रखती है।"
+        },
+        {
+          "term": "Run कुंजी (Run key)",
+          "definition": "एक रजिस्ट्री स्थान जिसके मान यूज़र लॉगऑन या सिस्टम स्टार्ट पर निष्पादित होते हैं।"
+        },
+        {
+          "term": "शेड्यूल्ड टास्क (Scheduled task)",
+          "definition": "ट्रिगर पर चलने वाला Windows या cron जॉब, जिसका अक्सर समयबद्ध या लॉगऑन परसिस्टेंस के लिए दुरुपयोग होता है।"
+        },
+        {
+          "term": "WMI सब्सक्रिप्शन (WMI subscription)",
+          "definition": "WMI रिपॉज़िटरी में संग्रहीत फ़िल्टर, कंज्यूमर और बाइंडिंग, जो कोई इवेंट होने पर कमांड चलाती है।"
+        },
+        {
+          "term": "Autoruns",
+          "definition": "एक Sysinternals टूल जो Windows होस्ट के लगभग हर ऑटोस्टार्ट स्थान को सूचीबद्ध करता है।"
+        },
+        {
+          "term": "Sysmon",
+          "definition": "एक Windows सेवा जो प्रोसेस, रजिस्ट्री, फ़ाइल और WMI गतिविधि को विस्तार से लॉग करती है।"
+        },
+        {
+          "term": "Sigma",
+          "definition": "लॉग डिटेक्शन के लिए विक्रेता-निरपेक्ष नियम प्रारूप जो कई SIEM क्वेरी भाषाओं में बदल जाता है।"
+        },
+        {
+          "term": "लिविंग ऑफ़ द लैंड (Living off the land)",
+          "definition": "कस्टम टूल डालने से बचने के लिए PowerShell जैसी वैध सिस्टम बाइनरी का दुरुपयोग करना।"
+        },
+        {
+          "term": "बेसलाइन (Baseline)",
+          "definition": "दर्ज की गई ज्ञात-सुरक्षित अवस्था, जिसका उपयोग अंतर जल्दी पहचानने के लिए होता है।"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "अपनी समझ जाँचें",
+      "questions": [
+        {
+          "question": "कौन-सा Sysmon इवेंट ID रजिस्ट्री मान सेट होना दर्ज करता है?",
+          "options": [
+            "1",
+            "3",
+            "13",
+            "22"
+          ],
+          "answer": 2,
+          "explanation": "इवेंट 13 RegistryEvent (Value Set) है। इवेंट 1 प्रोसेस निर्माण, 3 नेटवर्क कनेक्शन और 22 DNS क्वेरी है।"
+        },
+        {
+          "question": "हमलावर अक्सर HKLM की जगह HKCU Run कुंजी क्यों इस्तेमाल करते हैं?",
+          "options": [
+            "HKCU एंट्री कर्नेल लोड होने से पहले चलती हैं",
+            "HKCU के लिए एडमिनिस्ट्रेटर अधिकार नहीं चाहिए",
+            "HKLM कुंजियाँ लॉग नहीं होतीं",
+            "HKCU एंट्री एक्सपोर्ट नहीं हो सकतीं"
+          ],
+          "answer": 1,
+          "explanation": "वर्तमान यूज़र के हाइव में लिखना सामान्य यूज़र के लिए भी काम करता है, इसलिए इसमें विशेषाधिकार वृद्धि (privilege escalation) की ज़रूरत नहीं पड़ती।"
+        },
+        {
+          "question": "कौन-से आइटम जाँचने योग्य परसिस्टेंस स्थान हैं? (जो लागू हों वे सब चुनें।)",
+          "options": [
+            "लॉगऑन ट्रिगर वाले शेड्यूल्ड टास्क",
+            "Linux सर्वर पर `~/.ssh/authorized_keys`",
+            "ब्राउज़र हिस्ट्री फ़ाइल",
+            "`/etc/systemd/system/` यूनिट फ़ाइलें"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "टास्क, SSH कुंजियाँ और systemd यूनिट सभी हमलावर के एक्सेस को फिर चालू या बहाल करती हैं। ब्राउज़र हिस्ट्री निष्पादन या एक्सेस का तंत्र नहीं है।"
+        },
+        {
+          "question": "आपको किसी होस्ट पर एक दुर्भावनापूर्ण शेड्यूल्ड टास्क मिला। अगला सबसे अच्छा कदम क्या है?",
+          "options": [
+            "उसे हटाकर टिकट बंद कर दें",
+            "सहोदर तंत्रों के लिए होस्ट और पूरे बेड़े में सभी परसिस्टेंस परिवारों में खोजें",
+            "ब्राउज़र दोबारा इंस्टॉल करें",
+            "शोर घटाने के लिए Sysmon बंद कर दें"
+          ],
+          "answer": 1,
+          "explanation": "हमलावर आमतौर पर अनावश्यक (redundant) तंत्र लगाते हैं, इसलिए दूसरों को खोजे बिना एक को हटाना उनकी वापसी को न्योता देना है।"
+        },
+        {
+          "question": "Run मान हटाने से पहले कौन-सा सबूत सुरक्षित रखना चाहिए? (जो लागू हों वे सब चुनें।)",
+          "options": [
+            "कुंजी का एक्सपोर्ट",
+            "संदर्भित बाइनरी का हैश और एक प्रति",
+            "रजिस्ट्री बदलाव का टाइमस्टैम्प",
+            "कुछ नहीं, क्योंकि डिटेक्शन के बाद सबूत की ज़रूरत नहीं होती"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "कुंजी, बाइनरी और बदलाव का समय दिखाते हैं कि क्या लगाया गया, कब और किस प्रोसेस ने। ये पूरे बेड़े में दायरा तय करने में भी सहायक होते हैं।"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## सारांश\n\n- **परसिस्टेंस (persistence)** हमलावर के कोड को रीबूट और सफ़ाई के बाद भी बचाए रखता है, इसलिए डिटेक्शन को हर तंत्र खोजना होगा, केवल पहला नहीं।\n- छह परिवार जाँचें: ऑटोस्टार्ट एंट्री, निर्धारित निष्पादन, सेवाएँ, इवेंट-ट्रिगर्ड तंत्र, अकाउंट और एक्सेस, तथा बूट घटक।\n- Windows के स्थानों में Run कुंजियाँ, Startup फ़ोल्डर, टास्क, सेवाएँ, WMI सब्सक्रिप्शन और Winlogon मान शामिल हैं; Linux के स्थानों में cron, systemd, शेल फ़ाइलें, SSH कुंजियाँ और preload शामिल हैं।\n- Sysmon इवेंट 12, 13, 14 और 19 से 21, Security 4698 और 7045, तथा `auditd` वॉच टेलीमेट्री देते हैं; Sigma नियम उसे अलर्ट में बदलते हैं।\n- समय पर लंगर डालें, लक्ष्य का आकलन करें, सहोदर तंत्र खोजें, **हटाने से पहले सुरक्षित रखें**, और निगरानी वाले रीबूट के बाद सत्यापित करें।\n\nअगला, अपनी दृश्यता को होस्ट से नेटवर्क तार तक बढ़ाएँ: [Network Forensics](/learn/security-operations-dfir/network-forensics)।"
+    }
+  ]
+}

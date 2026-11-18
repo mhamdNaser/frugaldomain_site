@@ -1,0 +1,349 @@
+{
+  "title": "Fidye Yazılımı Tespiti ve Müdahalesi (Ransomware Detection and Response)",
+  "summary": "Bir fidye yazılımı saldırısının nasıl geliştiğini, KQL, SPL ve Sigma ile hangi erken sinyallerin tespit edileceğini ve müdahalenin ilk saatinin nasıl yürütüleceğini öğrenin: sınırlandırma, yedekleri koruma, delilleri muhafaza etme ve yükseltme.",
+  "objectives": [
+    "Bir fidye yazılımı saldırısının aşamalarını ve her aşamadaki tespit sinyalini açıklamak",
+    "Kurtarmanın engellenmesi ve toplu dosya değişikliği için KQL, SPL ve Sigma tespitleri yazmak",
+    "İlk saat müdahale sırasını delilleri yok etmeden yürütmek",
+    "Fidye ödemesinin neden bir liderlik ve hukuk kararı olduğunu açıklamak",
+    "Yeniden kurulumun ne zaman başlatılmasının güvenli olduğuna karar vermek"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Cuma, 01:58. Nöbetçi analist, paylaşılan klasörleri `.locked` ile biten dosyalarla dolan bir dosya sunucusu ve `README_RESTORE.txt` adlı bir metin dosyası görüyor. Dakikalar içinde ikinci bir sunucu da aynı belirtileri gösteriyor. Önümüzdeki hafta değil, önümüzdeki saatte alınan kararlar, bunun kötü bir gece mi yoksa işi bitiren bir olay mı olacağını belirler.\n\nBu ders **fidye yazılımını erken tespit etmeyi (detecting ransomware early)** ve **hasarı sınırlayan ve delilleri koruyan bir biçimde müdahale etmeyi** kapsar. Önleme ve mimari için [Fidye Yazılımı Savunma Mühendisliği](/learn/security-operations-dfir/ransomware-defense-engineering) dersine, genel süreç için [Olay Müdahalesi Temelleri](/learn/security-operations-dfir/incident-response-fundamentals) dersine bakın."
+    },
+    {
+      "id": "stages",
+      "type": "text",
+      "markdown": "## Bir fidye yazılımı saldırısı nasıl gelişir\n\nŞifreleme ilk değil, son adımdır. Modern operatörler ağın içinde günler veya haftalar geçirir ve her aşama bir sinyal bırakır.\n\n| Aşama | Saldırgan ne yapar | Tespit sinyali |\n|:--|:--|:--|\n| İlk erişim | Kimlik avı, açıkta kalan uzaktan erişim, çalınmış kimlik bilgileri | Olağandışı oturum açma, yeni uzaktan araç |\n| Keşif | Ana bilgisayarları, paylaşımları ve etki alanı yöneticilerini listeler | LDAP ve SMB numaralandırma patlamaları |\n| Kimlik bilgisi hırsızlığı | Kimlik bilgilerini bellekten döker | LSASS erişimi, yeni yönetici oturumları |\n| Yanal hareket | Yönetici paylaşımlarını ve uzaktan yürütmeyi kullanır | Birçok ana bilgisayarda tek hesap, bkz. [Yanal Hareket Tespiti](/learn/security-operations-dfir/lateral-movement-detection) |\n| Veri sızdırma | Önce verileri dışarı kopyalar (çift haraç, double extortion) | Yeni bir hedefe büyük giden aktarım |\n| Kurtarmayı engelleme | Yedekleri durdurur, gölge kopyaları siler | `vssadmin delete shadows`, hizmet durdurmaları |\n| Şifreleme | Toplu dosya yeniden yazma ve yeniden adlandırma | Dosya değişikliği sıçramaları, fidye notu oluşturma |\n\nSonuncusundan önceki her satır, hiç veri kaybetmeden saldırıyı durdurma fırsatıdır. **Kurtarmayı engelleme** adımını neredeyse kesin bir öncül (precursor) olarak değerlendirin: meşru yazılımlar tüm gölge kopyaları çok nadiren siler."
+    },
+    {
+      "id": "signals",
+      "type": "text",
+      "markdown": "## Yüksek değerli erken sinyaller\n\nÜç tespit, gerçek vakaların en büyük bölümünü yakalar:\n\n1. **Kurtarmanın engellenmesi.** Gölge kopya silme, `bcdedit` içinde kurtarmanın devre dışı bırakılması, silinen yedek katalogları ve durdurulan yedekleme veya veritabanı hizmetleri.\n2. **Toplu dosya etkinliği.** Dakikada yüzlerce dosyayı değiştiren veya yeniden adlandıran tek bir süreç veya kullanıcı; özellikle yeni, tekrarlanan bir uzantıyla.\n3. **Kanarya dosyaları (Canary files).** Paylaşımlara yerleştirilen ve herhangi bir değişiklik için izlenen tuzak belgeler. Meşru hiçbir şey onlara dokunmadığı için tek bir olay güçlü bir uyarıdır.\n\nOturum açma bağlamını ekleyin. Bir hizmet hesabının saat 01:40'ta ilk kez etkileşimli olarak oturum açması, birini uyandırmaya değer."
+    },
+    {
+      "id": "kql",
+      "type": "code",
+      "language": "plain",
+      "filename": "ransomware-precursors.kql",
+      "caption": "Kurtarmayı engelleyen komutları bulan, Microsoft Sentinel veya Defender için bir KQL sorgusu.",
+      "code": "// Microsoft Sentinel / Defender: recovery-inhibiting commands run within 10 minutes on one host\nDeviceProcessEvents\n| where Timestamp > ago(1d)\n| where (FileName =~ \"vssadmin.exe\" and ProcessCommandLine has_all (\"delete\", \"shadows\"))\n     or (FileName =~ \"wmic.exe\" and ProcessCommandLine has_all (\"shadowcopy\", \"delete\"))\n     or (FileName =~ \"bcdedit.exe\" and ProcessCommandLine has \"recoveryenabled\" and ProcessCommandLine has \"no\")\n     or (FileName =~ \"wbadmin.exe\" and ProcessCommandLine has_all (\"delete\", \"catalog\"))\n| summarize Commands = make_set(ProcessCommandLine), Count = count(), First = min(Timestamp) by DeviceName, AccountName, InitiatingProcessFileName\n| where Count >= 1\n| order by First asc\n"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "mass-file-change.spl",
+      "caption": "Toplu dosya değişiklikleri için bir Splunk SPL araması. Yedeklemeler ve derlemeler de çok sayıda dosyaya dokunduğundan eşikler ortamınıza göre ayarlanmalıdır.",
+      "code": "index=fileaudit action=rename OR action=modified\n| bin _time span=1m\n| stats dc(file_path) as files_touched dc(file_extension) as new_extensions values(file_extension) as ext by _time, host, user\n| where files_touched > 300 AND new_extensions <= 2\n| sort - files_touched"
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "shadow-copy-deletion.yml",
+      "caption": "Aynı kurtarma engelleme mantığı, taşınabilir bir Sigma kuralı olarak.",
+      "code": "title: Shadow Copy Deletion by Command Line\nid: 00000000-0000-4000-8000-000000000004   # placeholder id\nstatus: stable\nlogsource:\n  category: process_creation\n  product: windows\ndetection:\n  selection_vss:\n    Image|endswith: '\\vssadmin.exe'\n    CommandLine|contains|all:\n      - 'delete'\n      - 'shadows'\n  selection_wmic:\n    Image|endswith: '\\wmic.exe'\n    CommandLine|contains|all:\n      - 'shadowcopy'\n      - 'delete'\n  condition: selection_vss or selection_wmic\nfalsepositives:\n  - Storage administrators during planned maintenance\nlevel: high\ntags:\n  - attack.impact\n  - attack.t1490\n",
+      "highlight": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18
+      ]
+    },
+    {
+      "id": "flowintro",
+      "type": "text",
+      "markdown": "## Tek bir gece, adım adım\n\nAnimasyonu izleyin. Saldırı on gün önce başladı, ancak müdahale saati yalnızca uyarıyla başlar. Uyarı ile ilk şifrelenen dosyalar arasında ne kadar az zaman olduğuna ve oyun kitabı (playbook) prova edilmişse sekiz dakikada ne kadar çok sınırlandırma yapıldığına dikkat edin."
+    },
+    {
+      "id": "ransom-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Dayanak noktasından sınırlandırmaya",
+      "caption": "Şifrelemeden önce tespit mümkündür, ancak müdahale şifreleme başladıktan sonra da işlemelidir.",
+      "data": {
+        "token": "Saldırgan",
+        "nodes": [
+          {
+            "id": "pz",
+            "label": "Sıfır numaralı hasta (Patient zero)",
+            "sub": "Kimlik avına düşen dizüstü bilgisayar",
+            "icon": "laptop"
+          },
+          {
+            "id": "dc",
+            "label": "Etki alanı denetleyicisi",
+            "sub": "Yönetici kimlik bilgileri",
+            "icon": "key"
+          },
+          {
+            "id": "bk",
+            "label": "Yedekleme sunucusu",
+            "sub": "Gölge kopyalar, işler",
+            "icon": "database"
+          },
+          {
+            "id": "fs",
+            "label": "Dosya sunucuları",
+            "sub": "SMB paylaşımları",
+            "icon": "server"
+          },
+          {
+            "id": "edr",
+            "label": "EDR",
+            "sub": "Davranış uyarısı",
+            "icon": "eye"
+          },
+          {
+            "id": "soc",
+            "label": "SOC",
+            "sub": "Sınırlandır ve yükselt",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "pz",
+            "caption": "1. gün: bir kullanıcı kimlik avı ekini açar. Bir yükleyici çalışır ve saldırgan bir dayanak noktası elde eder.",
+            "tone": "danger"
+          },
+          {
+            "at": "dc",
+            "caption": "2. ile 9. günler: saldırgan ağı haritalar ve etki alanı yöneticisi kimlik bilgilerini çalar. Bu sessiz aşama, tespit için en iyi fırsattır.",
+            "tone": "warning"
+          },
+          {
+            "at": "bk",
+            "caption": "10. gün, 01:48: yedekleme hizmetleri durdurulur ve gölge kopyalar silinir; böylece kurtarma zorlaşır.",
+            "tone": "attack"
+          },
+          {
+            "at": "edr",
+            "caption": "01:49: EDR, bir hizmet hesabı tarafından geceleyin çalıştırılan vssadmin delete shadows komutunu işaretler.",
+            "tone": "warning"
+          },
+          {
+            "at": "soc",
+            "caption": "01:55: analist uyarıyı kritik olarak sınıflandırır ve fidye yazılımı oyun kitabını devreye alır.",
+            "tone": "secure"
+          },
+          {
+            "at": "fs",
+            "caption": "01:58: şifreleme dosya sunucularında başlar; SMB yazma oranları ve dosya yeniden adlandırmaları sıçrar.",
+            "tone": "danger"
+          },
+          {
+            "at": "soc",
+            "caption": "02:06: sunucu segmentleri arasında SMB engellenir ve etkilenen hesaplar devre dışı bırakılır. Şifreleme 11 sunucudan 4'ünde durur.",
+            "tone": "success"
+          },
+          {
+            "at": "bk",
+            "caption": "02:30: çevrimdışı yedeklerin sağlam olduğu doğrulanır; herhangi bir yeniden kurulumdan önce bellek ve disklerin adli yakalaması başlar.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "respond",
+      "type": "text",
+      "markdown": "## Müdahalenin ilk saati\n\nPaniğin sizin yerinize seçim yapmaması için sabit bir sıra kullanın.\n\n1. **İlan edin ve sınıflandırın.** Olayı en yüksek önem derecesinde açın ve olay liderini bilgilendirin; bu, [Güvenlik Olayı Sınıflandırma ve Önceliklendirme](/learn/security-operations-dfir/security-incident-classification-and-prioritization) dersinde anlatıldığı gibidir.\n2. **Sınırlandırın.** Delili değil, yayılmayı kesin: segmentler arasında SMB'yi engelleyin, ele geçirilen hesapları devre dışı bırakın, etkilenen ana bilgisayarları EDR üzerinden yalıtın ve şifrelenmiş dosyaların sağlam kopyaların üzerine yazmaması için çoğaltma işlerini duraklatın. Makineleri **kapatmayın**.\n3. **Yedekleri koruyun.** En az bir kopyanın çevrimdışı veya değiştirilemez olduğunu doğrulayın ve erişilebiliyorsa yedekleme sunucusunun ağ bağlantısını kesin.\n4. **Koruyun.** Etkilenen birkaç ana bilgisayardan bellek yakalayın, fidye notunu kaydedin ve dosya uzantısını, Bitcoin veya iletişim bilgilerini ve şifreleme zaman damgalarını not edin.\n5. **Kapsamı belirleyin.** Sıfır numaralı hastayı ve saldırganın kullandığı her ana bilgisayarı bulun.\n6. **Dışarıya yükseltin.** Hukuk müşavirini, sigortacıyı, üst yönetimi ve yasanın gerektirdiği ölçüde düzenleyicileri ve kolluk kuvvetlerini sürece dahil edin.\n\nÖdeme bir iş ve hukuk kararıdır, asla bir BT kararı değildir. Verilerin geri dönmesini garanti etmez ve yaptırım riski taşıyabilir."
+    },
+    {
+      "id": "term-ir",
+      "type": "terminal",
+      "title": "Yetkili bir sunucuda sınırlandırma kontrolleri",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "vssadmin list shadows",
+          "comment": "Kurtarma noktalarının hâlâ var olup olmadığını kontrol edin"
+        },
+        {
+          "output": "vssadmin 1.1 - Volume Shadow Copy Service administrative command-line tool\nNo items found that satisfy the query.",
+          "comment": "Hiçbiri kalmamış: gölge kopyalar silinmiş, bu da uyarıyla örtüşüyor"
+        },
+        {
+          "cmd": "Get-WinEvent -FilterHashtable @{LogName='System'; Id=7036; StartTime=(Get-Date).AddHours(-6)} | Where-Object Message -match 'Veeam|SQL|Backup' | Select-Object TimeCreated, Message | Format-Table -Wrap",
+          "comment": "Son altı saatte durdurulan yedekleme ve veritabanı hizmetlerini arayın"
+        },
+        {
+          "output": "TimeCreated          Message\n-----------          -------\n11/12/2026 1:48:22   The Veeam Backup Service service entered the stopped state.\n11/12/2026 1:48:25   The SQL Server Agent (PROD) service entered the stopped state.",
+          "comment": "İki hizmet uyarıdan üç dakika önce durdurulmuş: bu, sıralamayı doğrular"
+        },
+        {
+          "cmd": "New-NetFirewallRule -DisplayName 'IR-Block-SMB-In' -Direction Inbound -Protocol TCP -LocalPort 445 -Action Block",
+          "comment": "Soruşturma sürerken bu ana bilgisayarda gelen SMB'yi engelleyin"
+        },
+        {
+          "output": "Name        : {5f2c8a10-0b3e-4d7a-9c11-aa01b2c3d4e5}\nDisplayName : IR-Block-SMB-In\nEnabled     : True\nAction      : Block",
+          "comment": "Kural etkin. Bu değişikliğin zamanını olay günlüğünüze kaydedin"
+        }
+      ],
+      "caption": "Yönettiğiniz bir ana bilgisayarda açıklamalı kontroller. Kural adlarını kendi standartlarınıza uyarlayın."
+    },
+    {
+      "id": "eradicate",
+      "type": "text",
+      "markdown": "## Tanımlayın, ortadan kaldırın ve devredin\n\nSınırlandırma hasarı durdurur; soruşturma nedeni bulur. Notu, uzantıyı ve dosya işaretlerini kullanarak türü (strain) belirleyin; çünkü bu, bilinen bir şifre çözücü olup olmadığını ve hangi veri sızdırma alışkanlıklarının beklenmesi gerektiğini söyler. Saldırganın nasıl girdiğini ve hangi hesapların kullanıldığını, [Disk ve Bellek Adli Bilişimi](/learn/security-operations-dfir/disk-and-memory-forensics) dersindeki gibi bellek ve disk delilleriyle inceleyin.\n\nYalnızca neden anlaşıldıktan ve deliller korunduktan sonra yeniden kurun. Hâlâ ele geçirilmiş bir etki alanına geri yükleme yapmak, saldırgana ikinci bir tur sunmaktan başka bir şey değildir. Yeniden kurulumla ilgili devir, [Olay Sonrası Kurtarma ve Sistem Yeniden Kurulumu](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding) dersinde ele alınır."
+    },
+    {
+      "id": "warn-evidence",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Hız, delilleri yok etmemelidir",
+      "markdown": "Hizmeti geri getirme telaşıyla ekipler, kimse bellek veya günlükleri yakalamadan önce sunucuları yeniden imajlar. Bu, anahtarı ve giriş yolunu siler ve saldırganın arka kapısı kalır. Önce temsili ana bilgisayarların en az bir bellek yakalamasını ve bir disk anlık görüntüsünü alın."
+    },
+    {
+      "id": "tip-canary",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Kanaryaları şifrelemenin başladığı yere koyun",
+      "markdown": "Fidye yazılımı çoğu zaman paylaşımları alfabetik sırayla dolaşır. Önemli paylaşımların en üstüne göze çarpmayan belgelerle küçük bir kanarya klasörü yerleştirin ve herhangi bir yazma, yeniden adlandırma veya silme için uyarı verin. Maliyeti neredeyse sıfırdır ve size mümkün olan en erken uyarıyı sağlar."
+    },
+    {
+      "id": "note-comms",
+      "type": "callout",
+      "variant": "note",
+      "title": "İletişimi ihtiyaç duymadan önce planlayın",
+      "markdown": "Etki alanı ele geçirilmişse saldırganın e-postanızı ve sohbetinizi okuyabileceğini varsayın. Müdahale ekibini bir telefon köprüsü veya ayrı bir mesajlaşma kiracısı gibi bant dışı bir kanala taşıyın ve olay lideri, hukuk müşaviri, sigortacı ve adli bilişim ortağınız için basılı bir iletişim listesi bulundurun. Mesajların tutarlı kalması için personele, müşterilere ve basına tek bir kişinin konuşmasını belirleyin. Her kararı bir zaman ve bir sahiple yazın; bu notlar olay sonrası inceleme ve düzenleyiciler için zaman çizelgesi olur."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "**Sahibi olduğunuz, at-kullan bir Linux sanal makinesi veya klasörü** kullanın. Bu laboratuvar yalnızca zararsız test dosyalarını yeniden adlandırır; hiçbir şeyi şifrelemez.\n\n1. Bir test klasörü ve 400 boş dosya oluşturun: `mkdir lab && cd lab && for i in $(seq 1 400); do touch doc$i.txt; done`.\n2. Denetimi açın: `sudo auditctl -w $(pwd) -p wa -k canary`.\n3. Bir patlama simüle edin: `for f in *.txt; do mv \"$f\" \"$f.lab\"; done`.\n4. Olayları sayın: `sudo ausearch -k canary | grep -c rename`.\n5. Kullanacağınız eşiği yazın, örneğin 1 dakikada 300 yeniden adlandırma, ve onu bozabilecek iki normal etkinliği sıralayın."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Fidye yazılımı (Ransomware)",
+          "definition": "Fidye ödenene kadar, genellikle şifreleme yoluyla verilere erişimi engelleyen kötü amaçlı yazılım."
+        },
+        {
+          "term": "Çift haraç (Double extortion)",
+          "definition": "Verileri şifrelemeden önce çalmak ve ek baskı olarak yayımlamakla tehdit etmek."
+        },
+        {
+          "term": "Kurtarmayı engelleme (Inhibit recovery)",
+          "definition": "Şifrelemeden önce yedekleri ve geri yükleme noktalarını yok eden veya devre dışı bırakan eylemler."
+        },
+        {
+          "term": "Gölge kopya (Shadow copy)",
+          "definition": "Dosyaların önceki sürümlerinin geri yüklenmesine olanak tanıyan bir Windows Birim Gölge Kopyası (Volume Shadow Copy) anlık görüntüsü."
+        },
+        {
+          "term": "Kanarya dosyası (Canary file)",
+          "definition": "Herhangi bir değişikliğin şüpheli etkinliğe işaret etmesi için izlenen tuzak dosya."
+        },
+        {
+          "term": "Sıfır numaralı hasta (Patient zero)",
+          "definition": "Olayda ele geçirilen ilk ana bilgisayar veya hesap."
+        },
+        {
+          "term": "Değiştirilemez yedek (Immutable backup)",
+          "definition": "Saklama süresi boyunca değiştirilemeyen veya silinemeyen yedek."
+        },
+        {
+          "term": "Sınırlandırma (Containment)",
+          "definition": "Delilleri korurken bir olayın yayılmasını durduran eylemler."
+        },
+        {
+          "term": "Öncül (Precursor)",
+          "definition": "Hasardan önce gözlemlenen, bir saldırının sürdüğünü veya başlamak üzere olduğunu gösteren işaret."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı sınayın",
+      "questions": [
+        {
+          "question": "Hangi eylem, fidye yazılımı şifreleme aşamasının yaklaştığının en güçlü erken göstergesidir?",
+          "options": [
+            "Bir kullanıcının bir PDF açması",
+            "Tüm gölge kopyaların komut satırıyla silinmesi",
+            "Zamanlanmış bir Windows güncellemesi",
+            "Bir haber sitesi için DNS sorgusu"
+          ],
+          "answer": 1,
+          "explanation": "Gölge kopyaları silmek kolay kurtarmayı engeller ve meşru yazılımlar tarafından nadiren yapılır; bu yüzden yüksek güvenilirlikli bir öncüldür."
+        },
+        {
+          "question": "Etkin şifreleme sırasında hangi ilk saat eylemleri uygundur? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "Segmentler arasında SMB'yi engellemek",
+            "Ele geçirilen hesapları devre dışı bırakmak",
+            "Her sunucuyu hemen kapatmak",
+            "Çevrimdışı yedeklerin sağlam olduğunu doğrulamak"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Sınırlandırma ve yedek koruma hasarı sınırlar. Kapatmak bellek delilini ve anahtarları yok eder."
+        },
+        {
+          "question": "Kanarya dosyası nedir?",
+          "options": [
+            "Çevrimdışı saklanan bir yedek",
+            "Herhangi bir değişiklik için izlenen tuzak dosya",
+            "Bir fidye yazılımı ailesinin kullandığı dosya uzantısı",
+            "İmzalı bir sistem dosyası"
+          ],
+          "answer": 1,
+          "explanation": "Meşru hiçbir şeyin ona dokunmaması gerekir; bu yüzden herhangi bir değişiklik, güçlü ve düşük gürültülü bir uyarıdır."
+        },
+        {
+          "question": "Fidye ödenip ödenmeyeceğine kim karar vermelidir?",
+          "options": [
+            "Nöbetçi analist",
+            "Yalnızca SOC yöneticisi",
+            "Hukuk müşaviri ve sigortacıyla birlikte üst yönetim",
+            "BT yardım masası"
+          ],
+          "answer": 2,
+          "explanation": "Ödeme hukuki, mali ve etik risk taşır ve kurtarmayı garanti etmez; bu yüzden bir liderlik kararıdır."
+        },
+        {
+          "question": "Sunucular sınırlandırmanın hemen ardından neden yeniden kurulmamalıdır? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "Giriş ve kalıcılık delilleri kaybolur",
+            "Ele geçirilmiş bir etki alanına geri yükleme yapılması yeniden şifrelenebilir",
+            "Yeniden kurulum asla gerekmez",
+            "Yeniden bulaşmayı önlemek için nedenin anlaşılması gerekir"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Yeniden kurulumlar gereklidir, ancak yalnızca deliller korunduktan ve giriş noktası ile saldırgan erişimi anlaşıldıktan sonra."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- Fidye yazılımı **çok aşamalı** bir saldırıdır; şifreleme son adımdır ve önceki aşamalar tespit edilebilir sinyaller bırakır.\n- En iyi erken tespitler **kurtarmanın engellenmesi**, **toplu dosya değişikliği** ve **kanarya dosyalarıdır**.\n- İlk saat müdahalesi: **ilan et, sınırlandır, yedekleri koru, muhafaza et, kapsamı belirle, yükselt**.\n- Sistemleri kapatmadan yayılmayı sınırlandırın ve hızın asla delilleri yok etmesine izin vermeyin.\n- Ödeme bir liderlik ve hukuk kararıdır; yalnızca neden bilindikten sonra yeniden kurun.\n\n[Olay Sonrası Kurtarma ve Sistem Yeniden Kurulumu](/learn/security-operations-dfir/incident-recovery-and-system-rebuilding) ile devam edin."
+    }
+  ]
+}

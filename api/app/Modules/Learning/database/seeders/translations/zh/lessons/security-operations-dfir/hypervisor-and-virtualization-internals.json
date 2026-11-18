@@ -1,0 +1,272 @@
+{
+  "title": "虚拟机监控程序与虚拟化内部机制（Hypervisor and Virtualization Internals）",
+  "summary": "了解虚拟机监控程序如何创建并隔离虚拟机，隔离可能在哪里失效，以及如何对你所管理的主机进行监控并获取证据。",
+  "objectives": [
+    "比较 Type 1 和 Type 2 虚拟机监控程序，并说出其关键组件",
+    "解释客户机隔离是如何实施的，以及各类弱点的类别",
+    "监控虚拟化管理平面中的高风险操作",
+    "从宿主机获取客户机的内存和磁盘，并保持证据保管链"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "你的公司在由八台主机组成的集群上运行着 400 台虚拟机。一条告警到来：财务网络中的一台虚拟机正在与访客 Wi-Fi 网络中的一台虚拟机通信，尽管两者之间并不存在路由。要么网络设计存在漏洞，要么有什么东西正在跨越网络图上没有画出的边界：**虚拟机监控程序（Hypervisor）**。\n\n虚拟机监控程序是在一台计算机上制造出多台计算机假象的那一层。谁控制了它，谁就控制了每一个客户机，因此它既是高价值目标，也是丰富的证据来源。对 SOC 分析师或取证人员来说，理解它的工作原理，就能解释隔离如何失效、应当在哪里收集日志，以及如何在完全不触碰客户机的情况下获取虚拟机的内存和磁盘。本课涵盖其架构、隔离边界、管理平面，以及在你所管理的主机上进行监控和取证的实用方法。相关课程：[高级 Linux 内核安全](/learn/security-operations-dfir/advanced-linux-kernel-security) 和 [内存取证与恶意软件分析](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)。"
+    },
+    {
+      "id": "types",
+      "type": "text",
+      "markdown": "## 虚拟机监控程序的类型与组件\n\n虚拟机监控程序在客户机之间共享 CPU、内存、存储和网络。常见的设计有两种：\n\n| 设计 | 示例 | 说明 |\n|:--|:--|:--|\n| **Type 1（裸金属）** | VMware ESXi、Hyper-V、Xen、Proxmox VE（Linux 上的 KVM） | 直接运行在硬件上；用于数据中心 |\n| **Type 2（宿主型）** | VirtualBox、VMware Workstation | 作为应用程序运行在普通操作系统上；常见于分析师笔记本电脑 |\n\nKVM 模糊了这一界线：它把 Linux 内核本身变成虚拟机监控程序，而 QEMU 为每个客户机提供模拟设备。\n\n你应当能说出的关键组件：\n\n- **CPU 虚拟化扩展**（Intel VT-x、AMD-V）让客户机代码原生运行，同时由虚拟机监控程序捕获敏感操作。\n- **内存虚拟化**使用第二级地址转换表（EPT 或 NPT），使每个客户机看到各自独立的地址空间。\n- **虚拟设备**（网卡、磁盘、USB）由软件模拟，通常由 QEMU 之类的用户空间进程完成。它们是最大的攻击面，因为它们是解析客户机可控数据的复杂代码。\n- **半虚拟化驱动**（virtio、VMware Tools）以严格模拟换取速度，并需要宿主端的支持。"
+    },
+    {
+      "id": "boundary-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "隔离位于客户机与宿主机之间的何处",
+      "caption": "客户机的请求会跨越多个边界；任何一个模拟设备中的缺陷都可能削弱最后一道边界。",
+      "data": {
+        "token": "I/O 请求",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "客户机应用",
+            "sub": "ring 3",
+            "icon": "laptop"
+          },
+          {
+            "id": "gk",
+            "label": "客户机内核",
+            "sub": "ring 0（客户机）",
+            "icon": "cpu"
+          },
+          {
+            "id": "hv",
+            "label": "虚拟机监控程序",
+            "sub": "VM exit 陷入",
+            "icon": "shield"
+          },
+          {
+            "id": "dev",
+            "label": "设备模型",
+            "sub": "QEMU / vmx 进程",
+            "icon": "bug"
+          },
+          {
+            "id": "host",
+            "label": "宿主机内核",
+            "sub": "真实磁盘和网卡",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "一个客户机应用向其虚拟磁盘写入数据。"
+          },
+          {
+            "at": "gk",
+            "caption": "客户机内核把请求发送给它以为是真实硬件的设备。"
+          },
+          {
+            "at": "hv",
+            "caption": "CPU 捕获该特权操作（一次 VM exit），并把控制权交给虚拟机监控程序。"
+          },
+          {
+            "at": "dev",
+            "caption": "设备模型解析客户机可控的数据。这是整个技术栈中暴露程度最高的代码。",
+            "tone": "warning"
+          },
+          {
+            "at": "host",
+            "caption": "宿主机内核执行真实的 I/O 并返回结果。此处的日志显示每个客户机的活动。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "escape",
+      "type": "text",
+      "markdown": "## 隔离如何失效（概念层面）\n\n虚拟机隔离很强，但并非绝对。防御者应当了解各类弱点的类别，而无需了解漏洞利用细节：\n\n- **设备模型缺陷。**模拟设备（如虚拟网卡或软盘控制器）中的缺陷可能让客户机破坏为其提供服务的进程。缓解措施：移除未使用的虚拟设备，并保持虚拟机监控程序已打补丁。\n- **共享资源侧信道。**同驻的客户机共享缓存和 CPU，可能通过时序泄露信息。缓解措施：为敏感工作负载使用专用主机、厂商微码和缓解措施。\n- **管理平面被攻陷。**被窃取的 vCenter、Proxmox 或 Hyper-V 管理员凭据会赋予对每个客户机的合法控制权，无需任何漏洞。这是现实中最常见的途径。\n- **配置错误。**共享剪贴板、共享文件夹、直通设备、暴露的管理接口，以及包含明文机密的快照。\n\n在实践中，到达虚拟机监控程序主机的攻击者通常是通过身份和管理访问进来的。因此，检测工作主要应放在管理平面，如 [勒索软件防御工程](/learn/security-operations-dfir/ransomware-defense-engineering) 中所讨论的那样，其中虚拟机监控程序加密是一种已知的战术。"
+    },
+    {
+      "id": "mgmt",
+      "type": "text",
+      "markdown": "## 监控管理平面\n\n集中收集这些来源，并对高风险操作告警：\n\n| 来源 | 值得告警的事件 |\n|:--|:--|\n| ESXi `hostd.log`、`shell.log`、`auth.log` | 启用 SSH、打开 shell、root 登录、锁定模式被禁用 |\n| vCenter 事件 | 新建管理员角色、虚拟机导出、对域控制器创建快照 |\n| Proxmox `/var/log/pve/tasks`、认证日志 | 创建 API 令牌、打开控制台、备份作业被更改 |\n| Hyper-V 事件 ID（Operational 日志） | 创建或导出虚拟机、虚拟交换机被更改 |\n\n一个有用的 SIEM 查询会查找变更窗口之外的管理操作。下面的示例是针对 ESXi 日志的 Splunk SPL。"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "esxi-after-hours-admin.spl",
+      "caption": "检测变更窗口之外启用 ESXi shell 或 SSH 的行为",
+      "highlight": [
+        2,
+        3,
+        5
+      ],
+      "code": "index=esxi sourcetype=vmware:esxlog:hostd\n  (\"SSH access has been enabled\" OR \"ESXi Shell for the host has been enabled\" OR \"Lockdown mode disabled\")\n| eval hour=strftime(_time,\"%H\")\n| where hour<6 OR hour>20\n| stats count min(_time) AS first_seen values(user) AS users by host\n| convert ctime(first_seen)"
+    },
+    {
+      "id": "forensics",
+      "type": "text",
+      "markdown": "## 从虚拟机监控程序一侧进行取证\n\n虚拟化为响应人员带来一项重大优势：你可以**从外部**获取客户机，因此内部的恶意软件无法干扰获取过程。\n\n1. **带内存的快照。**包含内存的快照会把 RAM 保存到文件中（VMware 上为 `.vmsn`/`.vmem`，KVM 上为状态文件）。将该快照视为证据，并立即计算哈希值。\n2. **复制磁盘文件**（`.vmdk`、`.qcow2`、`.vhdx`）并计算哈希值。只在副本上工作。\n3. **转换以便分析。**用 `qemu-nbd` 以只读方式挂载磁盘，或将其转换为 raw 格式，然后使用你常用的磁盘工具进行检查。\n4. **分析内存。**把 `.vmem` 或 KVM 转储交给 Volatility。\n5. **记录宿主机上下文**：虚拟机监控程序日志、谁创建了快照以及时间，以保持证据保管链。"
+    },
+    {
+      "id": "kvm-term",
+      "type": "terminal",
+      "title": "从宿主机获取 KVM 客户机（你拥有的实验宿主机）",
+      "prompt": "admin@kvm01:~$",
+      "lines": [
+        {
+          "cmd": "virsh list --all",
+          "output": " Id   Name        State\n--------------------------\n 4    finance-vm  running"
+        },
+        {
+          "cmd": "virsh dump finance-vm /evidence/finance-vm.mem --memory-only --format=elf",
+          "output": "Domain 'finance-vm' dumped to /evidence/finance-vm.mem",
+          "comment": "内存是从客户机外部获取的"
+        },
+        {
+          "cmd": "virsh snapshot-create-as finance-vm ir-0001 --disk-only --atomic",
+          "output": "Domain snapshot ir-0001 created",
+          "comment": "仅磁盘快照冻结基础镜像以便复制"
+        },
+        {
+          "cmd": "sha256sum /evidence/finance-vm.mem | tee /evidence/finance-vm.mem.sha256",
+          "output": "9f3a6c1e0b7d...  /evidence/finance-vm.mem",
+          "comment": "立即计算哈希并记录在案件记录中"
+        }
+      ]
+    },
+    {
+      "id": "harden",
+      "type": "text",
+      "markdown": "## 实用的加固检查清单\n\n审查虚拟化集群时可使用这份简短清单：\n\n- 除获批的维护期间外，在各主机上禁用 SSH 和本地 shell，并强制启用锁定模式。\n- 每个管理控制台都要求 MFA 和具名账户；取消共享的 `root` 使用。\n- 移除任何工作负载都不需要的虚拟设备，并禁用客户机与宿主机之间的剪贴板和拖放功能。\n- 按既定计划为虚拟机监控程序和固件打补丁，并订阅厂商安全公告。\n- 将管理、存储、迁移和客户机网络彼此分段隔离。\n- 加密虚拟机磁盘和备份，并至少保留一份离线或不可变的备份副本。\n- 在事件发生之前，而不是事件发生期间，就把所有管理日志转发到 SIEM。\n\n每一项都消除了攻击者在真实事件中使用过的一条路径，而且每一项都容易验证，这使该清单适合用于定期审计。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "首先保护虚拟机监控程序",
+      "markdown": "没有 MFA 和独立的管理员层级，切勿将虚拟机监控程序的管理接口加入生产域。一个被窃取的管理员密码就可能加密或导出每一个客户机。让管理流量保持在隔离的网络上，在集群之外做备份，并测试恢复。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你拥有的 KVM 或 VirtualBox 实验宿主机上，创建一个不含敏感数据的小型 Linux 客户机。\n\n1. 列出你的虚拟设备（`virsh dumpxml <vm>` 或虚拟机设置），并写下你不需要的任何设备，例如软盘、声卡或共享文件夹。\n2. 创建一个包含内存的快照，然后计算其 SHA-256 哈希值。\n3. 在客户机内部运行 `sleep 600 &`。从宿主机获取内存，并用 `strings` 在转储中确认字符串 `sleep` 出现。\n4. 写一份三行的证据保管链说明：是什么、何时、哈希值。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "虚拟机监控程序（Hypervisor）",
+          "definition": "创建并运行虚拟机的软件。"
+        },
+        {
+          "term": "VM exit",
+          "definition": "把控制权从客户机转移到虚拟机监控程序的一种陷入。"
+        },
+        {
+          "term": "EPT / NPT",
+          "definition": "转换客户机内存地址的硬件表。"
+        },
+        {
+          "term": "设备模型（Device model）",
+          "definition": "为客户机模拟网卡和磁盘等硬件的软件。"
+        },
+        {
+          "term": "管理平面（Management plane）",
+          "definition": "用于控制宿主机和客户机的控制台与 API。"
+        },
+        {
+          "term": "快照（Snapshot）",
+          "definition": "虚拟机磁盘（以及可选的内存）在某一时间点的已保存状态。"
+        },
+        {
+          "term": "VMI",
+          "definition": "虚拟机自省（Virtual Machine Introspection）：从虚拟机监控程序检查客户机。"
+        },
+        {
+          "term": "virtio",
+          "definition": "为提升速度而设的一套标准半虚拟化驱动。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "虚拟机监控程序的哪个组件通常是最大的攻击面？",
+          "options": [
+            "模拟的虚拟设备",
+            "CPU 的 VT-x 特性",
+            "许可证文件",
+            "启动徽标"
+          ],
+          "answer": 0,
+          "explanation": "设备模型是解析客户机可控输入的复杂代码。"
+        },
+        {
+          "question": "在现实中，控制多个客户机最常见的途径是什么？",
+          "options": [
+            "被窃取的管理凭据",
+            "CPU 设计缺陷",
+            "断掉的网线",
+            "DNS 缓存"
+          ],
+          "answer": 0,
+          "explanation": "管理访问权限无需任何漏洞利用即可提供合法控制权。"
+        },
+        {
+          "question": "为什么要从虚拟机监控程序获取内存？选择所有适用项。",
+          "options": [
+            "客户机中的恶意软件无法干扰",
+            "无需在客户机中安装任何代理",
+            "客户机继续运行，受到的干扰很小",
+            "它消除了计算哈希的必要性"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "为保证证据完整性，始终需要计算哈希。"
+        },
+        {
+          "question": "下列哪一个是 Type 1 虚拟机监控程序？",
+          "options": [
+            "VMware ESXi",
+            "Windows 上的 VirtualBox",
+            "VMware Workstation",
+            "浏览器沙箱"
+          ],
+          "answer": 0,
+          "explanation": "ESXi 直接运行在硬件上。"
+        },
+        {
+          "question": "哪个日志事件值得告警？",
+          "options": [
+            "凌晨 03:00 启用了 ESXi SSH",
+            "打补丁期间开启了一台虚拟机",
+            "NTP 同步成功",
+            "备份已完成"
+          ],
+          "answer": 0,
+          "explanation": "在非工作时间启用远程 shell 访问，是滥用行为的典型前兆。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 虚拟机监控程序通过捕获特权操作并模拟设备来创建客户机。\n- 模拟设备是最大的代码攻击面；管理凭据是现实中最常见的攻击途径。\n- 收集虚拟机监控程序的管理日志并对其告警，尤其是非工作时间的 shell 和 SSH 变更。\n- 从宿主机一侧获取内存和磁盘，立即计算哈希值，并保持证据保管链。\n- 保持管理网络隔离，并在集群之外保存备份。\n- 相关阅读：[安全监控架构](/learn/security-operations-dfir/security-monitoring-architecture)。"
+    }
+  ]
+}

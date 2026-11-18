@@ -1,0 +1,284 @@
+{
+  "title": "高级网络取证（Advanced Network Forensics）",
+  "summary": "还原网络线路上发生的一切：保全数据包证据，提取会话和文件，基于 PCAP 与流数据重建时间线，并撰写经得起审查的调查结论。",
+  "objectives": [
+    "通过哈希计算和证据保管链（Chain of Custody）保全网络证据",
+    "使用 tshark 过滤并切分 PCAP，隔离可疑会话",
+    "重建通信会话并恢复传输的对象",
+    "将数据包、流记录和日志关联为同一条时间线",
+    "撰写能够区分观察事实与推断结论的调查结果"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一台位于 10.20.30.15 的数据库服务器在夜间向一个未知地址发送了 2 GB 数据。告警在 03:12 触发，分析师将其当作备份流量关闭，两周后法务部门提出了一个问题：到底有什么数据离开了公司？\n\n网络取证就是在事后回答这类问题。与实时监控不同，它基于已存储的证据开展工作，因此证据必须完整、未被篡改且记录详尽。本课在[高级网络流量分析](/learn/security-operations-dfir/advanced-network-traffic-analysis)的基础上，把工作从检测推进到取证证明。请仅对您自己拥有或已获授权检查的网络的捕获数据使用这些技术。"
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## 了解您手上有哪些证据\n\n网络证据分为多个层次，每一层回答不同的问题。请始终从成本最低的一层开始，仅在必要时再向下深入。\n\n| 来源 | 包含内容 | 最适用于 | 局限 |\n|:--|:--|:--|:--|\n| 完整数据包捕获（PCAP） | 数据包头和载荷 | 证明内容、提取文件 | 体积巨大，保留时间短 |\n| 流记录（NetFlow/IPFIX） | 谁与谁通信、通信量多少 | 确定范围、流量规模、时间 | 无内容 |\n| 协议日志（Zeek、代理、DNS） | 已解析的事务 | 快速检索 | 仅限解析器记录的内容 |\n| 设备日志（防火墙、VPN） | 允许/拒绝决策 | 确认策略执行结果 | 无数据包细节 |\n\n保留期限决定一切。如果完整数据包只保留 48 小时，而事件已过去两周，那么您手上就只有流数据和日志。请在报告中如实说明，而不要凭空猜测。"
+    },
+    {
+      "id": "preserve",
+      "type": "text",
+      "markdown": "## 先保全，再分析\n\n可能被质疑的证据价值很低。请像对待其他取证物证一样对待捕获文件。\n\n1. 将 PCAP 从传感器复制到只读的证据共享目录。\n2. 立即计算 SHA-256 哈希并记录下来。\n3. 只在副本上工作。结束时重新计算原件的哈希，以证明其未发生变化。\n4. 记录谁在何时、出于何种原因接触过该证据（证据保管链）。\n\n同时要记录时钟情况。捕获的时间戳来自传感器，如果传感器与防火墙存在 40 秒的时钟漂移，就会破坏您的时间线。请记下 NTP 时间源以及已知的偏移量。"
+    },
+    {
+      "id": "hash",
+      "type": "terminal",
+      "title": "计算哈希、切分与过滤",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "sha256sum case042.pcap | tee case042.sha256",
+          "output": "9f2c1a7e04b5d3c8e61f0a9b72d4c3e18a5f6b0d9c7e24a13b8f05d6c9e1a77  case042.pcap",
+          "comment": "在任何分析之前先记录哈希值。"
+        },
+        {
+          "cmd": "capinfos -aeuc case042.pcap",
+          "output": "First packet time: 2026-10-28 02:58:41\nLast packet time:  2026-10-28 04:07:19\nCapture duration:  4118 seconds\nNumber of packets: 1873342",
+          "comment": "确认捕获文件覆盖了 03:12 的告警时间窗口。"
+        },
+        {
+          "cmd": "tshark -r case042.pcap -q -z conv,tcp | sort -k9 -nr | head -3",
+          "output": "10.20.30.15:50712 <-> 203.0.113.77:443   1210 2040 MB ... 4118 s\n10.20.30.15:41876 <-> 10.20.30.8:5432    9120   31 MB ...\n10.20.30.15:39022 <-> 10.20.30.2:53       311    41 kB ...",
+          "comment": "一个会话占据了几乎全部字节数：这就是切入点。"
+        },
+        {
+          "cmd": "editcap -A '2026-10-28 03:10:00' -B '2026-10-28 03:20:00' case042.pcap slice.pcap",
+          "output": "",
+          "comment": "切出 10 分钟的片段；原始文件保持不动。"
+        }
+      ],
+      "caption": "在实验环境的捕获文件上运行；203.0.113.77 是文档示例地址。"
+    },
+    {
+      "id": "reconstruct",
+      "type": "text",
+      "markdown": "## 重建会话\n\n隔离出某个会话后，就要将其重建。对于 TCP，使用跟踪流功能按顺序查看字节交换过程。对于 HTTP，导出所传输的对象并计算其哈希。对于 TLS，没有密钥就无法读取内容，但握手过程仍能说明很多问题：SNI 名称、证书主体、JA3 指纹，以及各记录的大小和时间。\n\n一套实用的提问顺序如下：\n\n- 是谁发起了连接？如果有终端日志，是哪个进程或用户发起的？\n- 前 10 个数据包揭示了什么（协议、名称、证书）？\n- 字节流向哪个方向？服务器向外发送 2 GB 属于数据外泄；服务器接收 2 GB 则属于下载。\n- 数据包大小和间隔看起来像是人工操作、脚本还是批量复制？\n\n请为每个答案记录数据包编号或流索引，以便其他取证人员能够复现。"
+    },
+    {
+      "id": "zeek-q",
+      "type": "code",
+      "language": "bash",
+      "code": "# Pivot from the suspect IP into Zeek logs for the same window\nzeek-cut ts uid id.orig_h id.resp_h id.resp_p service orig_bytes < conn.log \\\n  | awk '$3==\"10.20.30.15\" && $4==\"203.0.113.77\"'\n# 1793000000.12  CxY2a91  10.20.30.15  203.0.113.77  443  ssl  2139095040\n\n# Which name did the client ask for, and what certificate answered?\nzeek-cut ts uid server_name subject ja3 < ssl.log | grep CxY2a91\n# 1793000000.31  CxY2a91  files.example.net  CN=files.example.net  a0e9f5d64349fb13191bc781f81f42e1",
+      "filename": "zeek-pivot.sh",
+      "caption": "uid 将同一个连接关联到 conn.log、ssl.log 和 files.log。"
+    },
+    {
+      "id": "carve",
+      "type": "text",
+      "markdown": "## 恢复传输的文件\n\n当协议为明文（如 HTTP、SMB 或 FTP）时，可以从捕获数据中恢复文件本身。Wireshark 提供“文件 > 导出对象”功能，启用提取脚本后，Zeek 也会写出提取的文件。Zeek 的 files.log 会为其看到的每个文件记录哈希，因此您无需打开文件，就能在威胁情报源中检索。\n\n请将每个恢复出的文件都视为潜在的恶意文件。只能在无网络的隔离分析虚拟机中打开，记录其 SHA-256，并且绝不要双击运行。在判断其性质之前，先将哈希与已知良性软件及情报来源进行比对。\n\n几乎每个新手案例都会遇到三个陷阱：\n\n- **丢包。** SPAN 端口在高负载下丢弃流量会产生空缺，因此恢复出的文件可能不完整。在信任提取结果之前，请先查看捕获统计中的丢包情况。\n- **卸载（Offloading）。** 校验和卸载会使本地捕获的数据包显示校验和错误。这是捕获过程产生的假象，并非攻击。\n- **NAT 与代理。** 您看到的内部地址可能是代理，而不是真实用户。请将数据包与代理或 NAT 日志配对，以找出真正的来源。"
+    },
+    {
+      "id": "timeline",
+      "type": "text",
+      "markdown": "## 构建统一的时间线\n\n没有任何单一来源能讲述完整的故事。请将它们合并到同一个 UTC 时钟下。\n\n| 时间（UTC） | 来源 | 事件 |\n|:--|:--|:--|\n| 03:09:50 | 认证日志 | 服务账号登录 10.20.30.15 |\n| 03:11:58 | DNS 日志 | 查询 files.example.net |\n| 03:12:04 | 防火墙 | 允许 TCP/443 访问 203.0.113.77 |\n| 03:12:05 | PCAP | TLS 握手，已记录 JA3 |\n| 03:12-04:06 | 流数据 | 出站 2,139 MB |\n\n将每一行标记为“已观察”或“推断”。“2,139 MB 通过 TCP/443 流出”是观察到的事实。“客户数据被窃取”在您能把这些字节与某个文件或数据表对应起来之前，只是一种推断。请将时间线链接到您的[事件记录](/learn/security-operations-dfir/advanced-incident-response)，使遏制决策基于同一套事实。"
+    },
+    {
+      "id": "wf",
+      "type": "animation",
+      "kind": "flow",
+      "title": "网络取证工作流程",
+      "caption": "每个阶段都会缩小范围并增加证明力度。",
+      "data": {
+        "token": "证据",
+        "nodes": [
+          {
+            "id": "pres",
+            "label": "保全",
+            "sub": "哈希与复制",
+            "icon": "lock"
+          },
+          {
+            "id": "scope",
+            "label": "划定范围",
+            "sub": "流数据与日志",
+            "icon": "log"
+          },
+          {
+            "id": "slice",
+            "label": "切分",
+            "sub": "隔离会话",
+            "icon": "file"
+          },
+          {
+            "id": "recon",
+            "label": "重建",
+            "sub": "数据流与对象",
+            "icon": "eye"
+          },
+          {
+            "id": "rep",
+            "label": "报告",
+            "sub": "事实与推断",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "pres",
+            "caption": "计算 PCAP 的哈希，并将其复制到只读存储。",
+            "tone": "secure"
+          },
+          {
+            "at": "scope",
+            "caption": "流数据显示存在一个来自 10.20.30.15 的 2 GB 会话。",
+            "tone": "warning"
+          },
+          {
+            "at": "slice",
+            "caption": "tshark 和 editcap 切出围绕该会话的 10 分钟窗口。",
+            "tone": "default"
+          },
+          {
+            "at": "recon",
+            "caption": "TLS 握手指向 files.example.net；字节方向为出站。",
+            "tone": "warning"
+          },
+          {
+            "at": "rep",
+            "caption": "报告列出已观察的事实、推断和证据缺口，并附上数据包引用。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "不要超越授权范围解密或捕获",
+      "markdown": "数据包捕获中包含密码、个人数据和私人消息。仅在获得书面授权的情况下捕获和打开它们，限制访问权限，并在案件结案时删除工作副本。如果必须解密 TLS，请使用您自己拥有的系统的密钥，并遵守您所适用的法律和隐私政策。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "说明证据缺口",
+      "markdown": "缺失的证据本身就是一项发现。请写明“由于传感器环形缓冲区已被覆盖，UTC 02:58 之前不存在完整数据包”，而不要让读者自行假设。评审者会信任一份说明自身局限的报告。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "在您自己拥有的实验虚拟机中，使用 `tcpdump -i eth0 -w lab.pcap` 捕获十分钟的自身浏览流量。然后：（1）计算该文件的哈希；（2）使用 `tshark -r lab.pcap -q -z conv,tcp` 列出前三个 TCP 会话；（3）选择其中一个，写出三行时间线，并将每一行标记为已观察或推断。最后，重新计算原始文件的哈希，确认它没有发生变化。"
+    },
+    {
+      "id": "kt",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "证据保管链（Chain of custody）",
+          "definition": "记录谁在何时持有证据的档案。"
+        },
+        {
+          "term": "PCAP",
+          "definition": "包含载荷的已捕获数据包文件。"
+        },
+        {
+          "term": "流记录（Flow record）",
+          "definition": "不含内容的单次会话摘要。"
+        },
+        {
+          "term": "跟踪流（Follow stream）",
+          "definition": "按顺序重组一次 TCP 会话。"
+        },
+        {
+          "term": "SNI",
+          "definition": "客户端在 TLS 握手中发送的服务器名称。"
+        },
+        {
+          "term": "JA3",
+          "definition": "客户端 TLS 握手的指纹。"
+        },
+        {
+          "term": "哈希（Hash）",
+          "definition": "用于证明文件未被改动的固定长度摘要。"
+        },
+        {
+          "term": "观察与推断（Observation vs inference）",
+          "definition": "在数据中看到的事实，与由此得出的结论。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验您的理解",
+      "questions": [
+        {
+          "question": "收到作为证据的 PCAP 时，首先应该做什么？",
+          "options": [
+            "在 Wireshark 中打开并开始过滤",
+            "计算哈希并在副本上工作",
+            "删除不相关的数据包",
+            "将其转换为文本"
+          ],
+          "answer": 1,
+          "explanation": "哈希可在日后证明证据未被改动，而副本可保护原件。"
+        },
+        {
+          "question": "当完整数据包已过期时，哪些来源有助于确定事件范围？（多选）",
+          "options": [
+            "流记录",
+            "防火墙日志",
+            "Zeek 协议日志",
+            "载荷内容"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "流数据、防火墙日志和已解析的协议日志的保留时间比数据包更长。载荷内容则需要数据包。"
+        },
+        {
+          "question": "为什么传感器 40 秒的时钟漂移会毁掉一次调查？",
+          "options": [
+            "它会损坏 PCAP 文件",
+            "来自不同来源的事件在时间线中无法对齐",
+            "它会禁用 TLS",
+            "它会改变哈希值"
+          ],
+          "answer": 1,
+          "explanation": "关联分析依赖共同的时钟；存在偏移会使因果事件的先后顺序出错。"
+        },
+        {
+          "question": "一台服务器通过 TCP/443 向外部主机发送了 2 GB 数据。下列哪项陈述属于观察事实？",
+          "options": [
+            "客户记录被窃取",
+            "2 GB 数据通过 TCP/443 离开了服务器",
+            "攻击者使用了自定义工具",
+            "这些数据是勒索软件的暂存数据"
+          ],
+          "answer": 1,
+          "explanation": "只有字节数和端口是可以直接看到的。其他都是需要更多证据支撑的推断。"
+        },
+        {
+          "question": "即使 TLS 载荷已加密，哪些字段仍然有用？（多选）",
+          "options": [
+            "SNI",
+            "证书主体",
+            "JA3 指纹",
+            "HTTP 请求正文"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "握手元数据以明文可见；HTTP 正文位于加密通道之内。"
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## 小结\n\n- 网络取证基于已存储的证据证明事件经过，因此保全优先：计算哈希、复制、记录保管链并注明时钟。\n- 分层使用证据：用流数据和日志划定范围，用数据包提供证明。保留期限限制了您能够主张的内容。\n- 切分 PCAP、重建数据流，并在载荷加密时利用握手元数据。\n- 将各来源合并为一条 UTC 时间线，并将每一行标记为已观察或推断。\n- 继续学习[内存取证与恶意软件分析](/learn/security-operations-dfir/memory-forensics-and-malware-analysis)，将网络层面的情况与主机关联起来。"
+    }
+  ]
+}

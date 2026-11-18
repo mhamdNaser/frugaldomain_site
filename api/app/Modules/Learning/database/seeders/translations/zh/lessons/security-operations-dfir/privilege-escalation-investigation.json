@@ -1,0 +1,283 @@
+{
+  "title": "权限提升调查（Privilege Escalation Investigation）",
+  "summary": "学习利用组变更事件、进程创建、sudo 和 auditd 证据，识别并还原 Windows 和 Linux 上的权限提升，并编写针对权限变更告警的检测规则。",
+  "objectives": [
+    "区分纵向提权与横向提权",
+    "识别能揭示权限变更的 Windows 事件",
+    "在 Linux 上使用 sudo、SUID 和 auditd 证据",
+    "针对特权组变更编写 SPL、KQL 和 Sigma 检测规则",
+    "分诊一次变更是否属于合法的管理操作"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一个服务台账户在 02:10 登录到文件服务器，运行了几条命令，到 02:25 同一个会话已经成为 Domain Admins 的成员。没有任何东西被戏剧性地“利用”。有人只是找到了一条从低权限身份通向强大身份的路径。这条路径就是**权限提升（Privilege Escalation）**，也是把一个小小的立足点变成严重事件的那一步。\n\n在本课中，你将学习如何在日志中识别权限提升，如何将其与正常管理操作区分开，以及如何还原该账户用其新权力做了什么。这里的一切都是防御性的，仅适用于你获授权调查的系统。更全面的背景请参阅 [Windows 事件响应](/learn/security-operations-dfir/windows-incident-response)和 [Linux 事件响应](/learn/security-operations-dfir/linux-incident-response)。"
+    },
+    {
+      "id": "types",
+      "type": "text",
+      "markdown": "## 纵向提权与横向提权\n\n调查人员会区分两个经常被混淆的概念：\n\n| 类型 | 含义 | 示例 |\n|:--|:--|:--|\n| **纵向（Vertical）** | 在同一系统或域中获得更高的权限级别 | 标准用户成为本地 Administrator 或 `root` |\n| **横向（Horizontal）** | 获得对同级别另一个账户的访问 | 使用一名员工的会话令牌读取同事的邮箱 |\n\n本课侧重于纵向提权。机器之间的横向移动在[横向移动检测](/learn/security-operations-dfir/lateral-movement-detection)中讲解。\n\n大多数真实的提权并不高明。它们依赖**错误配置**：以 SYSTEM 运行且路径可写的服务、位于错误组中的用户、允许使用编辑器的 `sudo` 规则、运行任何人都可修改的脚本的计划任务，或遗留在共享中的凭据。因此，你的检测应关注*权限的变化*，而不是任何单一技术。"
+    },
+    {
+      "id": "windows",
+      "type": "text",
+      "markdown": "## Windows 证据：权限变化时发生了什么变化\n\nWindows 在 Security 日志中记录与权限相关的事件。需要了解的有：\n\n| 事件 ID | 含义 | 重要原因 |\n|:--|:--|:--|\n| 4672 | 为新登录分配了特殊权限 | 每次管理员登录都会触发；关键线索是*账户* |\n| 4673 / 4674 | 使用了特权服务或操作 | 敏感权限，如 `SeDebugPrivilege` |\n| 4728, 4732, 4756 | 成员被添加到全局、本地或通用安全组 | 基于组的提权的直接证据 |\n| 4720 / 4738 | 用户账户被创建或更改 | 特权 OU 中新建或被修改的账户 |\n| 4688 | 进程被创建（若启用，则包含命令行） | 显示 `net localgroup administrators` 及类似命令 |\n| 7045 / 4697 | 安装了新服务 | 服务是获取 SYSTEM 的常见途径 |\n| 4698 | 创建了计划任务 | 稍后以更高权限运行代码 |\n\n单独一条 4672 事件只是噪声，因为管理员会产生成千上万条。真正的信号是：一个从未拥有管理员权限的账户出现 4672，或者一条组添加事件（4732）的主体不在你的变更审批名单上。\n\n### 用户账户控制与令牌提升\n\n本地管理员运行大多数进程时使用的是经过筛选的令牌。进程创建事件（4688）会记录 `TokenElevationType`：**%%1936** 表示完整令牌，**%%1937** 表示已提升，**%%1938** 表示受限。由 Office 应用程序或脚本宿主启动的意外提升进程值得进一步检查。"
+    },
+    {
+      "id": "linux",
+      "type": "text",
+      "markdown": "## Linux 证据：sudo、SUID 与审计轨迹\n\n在 Linux 上，对应的问题是：*谁成为了 root、如何成为的，以及他们运行了什么？*\n\n- **`/var/log/auth.log`**（Debian 系）或 **`/var/log/secure`**（RHEL 系）记录 `sudo` 的使用、`su` 会话和失败的尝试。每条 `sudo` 记录包含用户、工作目录和完整命令。\n- 如果你配置了规则，**`auditd`** 会记录执行和文件变更。至少要监视 `/etc/sudoers`、`/etc/passwd` 和 `/etc/shadow`。\n- **SUID 和 SGID 二进制文件**以其所有者的权限运行。使用 `find / -perm -4000 -type f` 建立该列表的基线，并在之后进行比较。位于 `/tmp` 或主目录中的新 SUID 文件几乎从不是合法的。\n- `/etc/group` 中的**组成员**变更，尤其是 `sudo`、`wheel`、`docker` 和 `lxd`，等同于授予 root 权限。\n\n一个突然出现的 `uid=0` 进程，其父进程是 Web 服务器，或者由 `sudo` 从异常 TTY 启动的 shell，就是需要追查的模式。"
+    },
+    {
+      "id": "esc-flow",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "从日志还原一次权限提升",
+      "caption": "每一步都对应一个你可以查询的日志来源。",
+      "data": {
+        "actors": [
+          {
+            "id": "u",
+            "label": "账户 svc-print",
+            "sub": "198.51.100.20",
+            "icon": "user"
+          },
+          {
+            "id": "h",
+            "label": "文件服务器",
+            "sub": "FS01",
+            "icon": "server"
+          },
+          {
+            "id": "dc",
+            "label": "域控制器",
+            "sub": "DC01",
+            "icon": "database"
+          },
+          {
+            "id": "s",
+            "label": "SIEM",
+            "sub": "Splunk",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "from": "u",
+            "to": "h",
+            "label": "登录类型 3",
+            "detail": "4624",
+            "note": "一个低权限服务账户通过网络登录。",
+            "tone": "default"
+          },
+          {
+            "from": "u",
+            "to": "h",
+            "label": "whoami /priv",
+            "detail": "4688",
+            "note": "该账户检查自己已拥有哪些权限，这是常见的侦察步骤。"
+          },
+          {
+            "from": "u",
+            "to": "h",
+            "label": "新服务",
+            "detail": "7045",
+            "note": "安装了一个指向可写路径、以 SYSTEM 运行的服务。",
+            "tone": "warning"
+          },
+          {
+            "from": "h",
+            "to": "h",
+            "label": "SYSTEM 进程",
+            "detail": "4688",
+            "note": "该服务启动了一个拥有完整本地权限的命令 shell。",
+            "tone": "danger"
+          },
+          {
+            "from": "u",
+            "to": "dc",
+            "label": "加入 Domain Admins",
+            "detail": "4728",
+            "note": "域控制器上的组添加事件是决定性证据。",
+            "tone": "attack"
+          },
+          {
+            "from": "dc",
+            "to": "s",
+            "label": "告警触发",
+            "detail": "Sigma 规则",
+            "note": "针对变更窗口之外的 4728 的规则触发了高严重性告警。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "detect",
+      "type": "text",
+      "markdown": "## 编写能经受真实环境考验的检测规则\n\n一条好的权限提升检测规则回答一个问题：*权限边界是否在未经批准的流程之外发生了变化？* 三条实用原则：\n\n1. **针对结果告警，而不是针对工具。** 工具的名称会变；而 `Domain Admins` 中出现新成员则不会变。\n2. **用上下文进行丰富。** 将事件与资产清单、值班变更日历以及该账户的正常行为关联起来。\n3. **追踪罕见事件。** 账户 X 在 90 天内第一次使用 `SeDebugPrivilege`，比一千名已知管理员每天使用它更有价值。\n\n下面的查询用于发现特权组中的意外新增成员。在部署之前，请与你的检测团队一起审阅，并根据你自己的命名约定调整排除项。"
+    },
+    {
+      "id": "queries",
+      "type": "code",
+      "language": "plain",
+      "filename": "group-add-detections.txt",
+      "caption": "同样的逻辑分别用 SPL（Splunk）、KQL（Sentinel）和 Sigma 表示。",
+      "code": "# SPL (Splunk)\nindex=wineventlog EventCode IN (4728,4732,4756)\n  (TargetUserName=\"Domain Admins\" OR TargetUserName=\"Administrators\" OR TargetUserName=\"Enterprise Admins\")\n| stats count min(_time) as first by SubjectUserName, MemberSid, TargetUserName, host\n| where SubjectUserName!=\"svc-iam-approved\"\n\n# KQL (Microsoft Sentinel)\nSecurityEvent\n| where EventID in (4728, 4732, 4756)\n| where TargetUserName in (\"Domain Admins\", \"Administrators\", \"Enterprise Admins\")\n| where SubjectUserName != \"svc-iam-approved\"\n| project TimeGenerated, Computer, SubjectUserName, MemberSid, TargetUserName\n\n# Sigma (core of the rule)\ntitle: Member Added To Privileged Group\nlogsource: {product: windows, service: security}\ndetection:\n  selection:\n    EventID: [4728, 4732, 4756]\n    TargetUserName: ['Domain Admins', 'Administrators', 'Enterprise Admins']\n  filter:\n    SubjectUserName: 'svc-iam-approved'\n  condition: selection and not filter\nlevel: high"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "你自己拥有的 Linux 主机上的 auditd 证据",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "sudo ausearch -k priv-change -ts today -i",
+          "output": "type=SYSCALL msg=audit(11/11/2026 02:14:09.221:884) : arch=x86_64 syscall=openat success=yes exit=3 auid=jdoe uid=root comm=vim exe=/usr/bin/vim key=priv-change\ntype=PATH name=/etc/sudoers.d/90-jdoe nametype=CREATE",
+          "comment": "auid 是原始登录用户；uid=root 是有效用户。两者不一致表明发生了权限变更。"
+        },
+        {
+          "cmd": "grep 'sudo:' /var/log/auth.log | tail -n 2",
+          "output": "Nov 11 02:13:55 web01 sudo: jdoe : TTY=pts/2 ; PWD=/home/jdoe ; USER=root ; COMMAND=/usr/bin/vim /etc/sudoers.d/90-jdoe\nNov 11 02:14:30 web01 sudo: jdoe : TTY=pts/2 ; PWD=/home/jdoe ; USER=root ; COMMAND=/bin/bash",
+          "comment": "jdoe 编辑了 sudoers 文件，随后在一分钟内打开了 root shell。"
+        },
+        {
+          "cmd": "find / -xdev -perm -4000 -type f -newermt 2026-11-10 2>/dev/null",
+          "output": "/tmp/.cache/helper",
+          "comment": "/tmp 中新增的 SUID 文件是强有力的线索。在触碰它之前先保全。"
+        }
+      ]
+    },
+    {
+      "id": "pitfall",
+      "type": "callout",
+      "variant": "warning",
+      "title": "避免破坏证据",
+      "markdown": "在捕获之前，不要删除可疑的 SUID 文件，也不要将账户从组中移除。先记录所有者、权限、时间戳和哈希，将其复制到你的证据存储中，然后才进行遏制。请记住，域控制器上的组添加事件是*原始*记录；请将这些日志复制到你的 SIEM，这样拥有管理员权限的攻击者就无法悄悄地将其抹除。"
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## 分诊：这是合法的管理员吗？\n\n大多数组添加告警都是真实的管理操作。用以下问题快速判断：\n\n- **谁**执行了这次变更，此人或服务是否在已批准名单上？\n- **何时**发生的？它是否落在变更窗口或某个未关闭的工单之内？\n- 会话**来自哪里**？管理员从跳板机操作是正常的；同样的变更若来自销售部门的工作站则不正常。\n- **随后发生了什么？** 合法的变更之后是目标用户预期的工作。恶意的变更之后则是凭据转储尝试、新服务、日志清除（事件 1102）或大规模文件访问。\n\n如果答案相互矛盾，就将该账户视为已被攻陷：按照你的[认证日志调查](/learn/security-operations-dfir/authentication-log-investigation)步骤操作，禁用新的成员资格，重置凭据，并使用[持久化机制检测](/learn/security-operations-dfir/persistence-mechanism-detection)审查持久化。"
+    },
+    {
+      "id": "prevent",
+      "type": "text",
+      "markdown": "## 加固，使下一次提权更困难\n\n调查为预防提供依据。事件之后，封堵你发现的路径：\n\n- 应用**最小权限（least privilege）**：将用户从本地 Administrators 中移除，并对管理任务使用即时（just-in-time）提升。\n- 分离**层级（tiers）**：域管理员凭据绝不登录到工作站或成员服务器。\n- 修复**服务和任务权限**：未加引号的路径、可写的服务文件夹，以及由特权作业运行的全局可写脚本。\n- 启用**命令行审计**（事件 4688）和 PowerShell 脚本块日志，使下一次调查有证据可依。\n- 在 Linux 上，将 `sudo` 规则限制为特定命令，避免通配符条目，并定期审计 SUID 文件。\n- 将特权组成员变更的告警作为一项长期检测。\n\n这些控制措施成本很低，却能消除最廉价的提权选项。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自试一试",
+      "markdown": "在你自己拥有的实验室虚拟机（例如 Windows 评估版机器或 Ubuntu 虚拟机）中，创建一个名为 `labuser` 的测试用户。使用 `net localgroup administrators labuser /add`（Windows）或 `sudo usermod -aG sudo labuser`（Linux）将其加入本地 Administrators 组。然后寻找证据：在事件查看器中查找事件 4732，或在 `/var/log/auth.log` 中查找 `usermod` 记录。编写一条能对该变更告警的单行查询，然后删除该测试用户，并确认删除操作同样被记录。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "权限提升（Privilege escalation）",
+          "definition": "获得比最初授予的更高的访问权限。"
+        },
+        {
+          "term": "纵向提权（Vertical escalation）",
+          "definition": "移动到更高的权限级别。"
+        },
+        {
+          "term": "事件 4732（Event 4732）",
+          "definition": "成员被添加到本地安全组。"
+        },
+        {
+          "term": "SUID",
+          "definition": "一种 Linux 权限，使文件以其所有者的权限运行。"
+        },
+        {
+          "term": "auditd",
+          "definition": "记录系统调用和文件变更的 Linux 审计框架。"
+        },
+        {
+          "term": "令牌提升（Token elevation）",
+          "definition": "使用完整的管理员令牌运行进程。"
+        },
+        {
+          "term": "最小权限（Least privilege）",
+          "definition": "只授予身份所需的访问权限。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪个事件 ID 记录成员被添加到本地安全组？",
+          "options": [
+            "4624",
+            "4732",
+            "7045",
+            "1102"
+          ],
+          "answer": 1,
+          "explanation": "4732 是本地组成员添加事件。4624 是登录，7045 是新服务，1102 是日志被清除。"
+        },
+        {
+          "question": "为什么单独的事件 4672 是较弱的检测？",
+          "options": [
+            "管理员会不断产生它",
+            "它从不写入磁盘",
+            "它只出现在 Linux 上",
+            "它不包含账户名"
+          ],
+          "answer": 0,
+          "explanation": "每次管理员登录都会产生它，因此有用的信号是从未拥有过管理员权限的账户。"
+        },
+        {
+          "question": "选择可能的 Linux 权限提升的所有指标。",
+          "options": [
+            "/tmp 中新增的 SUID 文件",
+            "由非管理员在 /etc/sudoers.d 下创建的新文件",
+            "用户被添加到 docker 组",
+            "例行的日志轮转"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "前三项授予或启用了等同于 root 的访问。日志轮转是正常的日常维护。"
+        },
+        {
+          "question": "在移除可疑的 SUID 文件之前，你应该做什么？",
+          "options": [
+            "捕获其元数据、哈希和副本",
+            "重启服务器",
+            "对其运行 chmod 777",
+            "删除审计日志"
+          ],
+          "answer": 0,
+          "explanation": "证据必须在遏制之前保全，以便调查可以被复现。"
+        },
+        {
+          "question": "哪种方法能提供最持久的检测？",
+          "options": [
+            "针对特定工具名称告警",
+            "针对未经批准的特权组成员变更告警",
+            "针对每次登录告警",
+            "禁用 UAC"
+          ],
+          "answer": 1,
+          "explanation": "工具名称会变，但权限边界的变化才是需要持续关注的长久结果。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n权限提升把一个小小的立足点变成重大入侵，而且它通常利用的是错误配置，而非高明的技巧。调查时要问：权限发生了什么变化、谁改变了它、来自哪里、随后发生了什么。在 Windows 上，重点关注事件 4728、4732、4688 和 7045；在 Linux 上，重点关注 `sudo`、SUID 文件和 `auditd`。针对结果告警，在遏制之前保全证据，并封堵你发现的路径。接下来，继续学习[网络取证](/learn/security-operations-dfir/network-forensics)。"
+    }
+  ]
+}

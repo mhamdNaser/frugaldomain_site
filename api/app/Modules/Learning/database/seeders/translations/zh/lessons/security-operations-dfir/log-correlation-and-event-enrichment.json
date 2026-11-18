@@ -1,0 +1,273 @@
+{
+  "title": "日志关联与事件富化",
+  "summary": "学习如何将来自不同日志源的事件关联起来，并用资产、身份、位置和威胁情报上下文对其进行富化，附 SPL 和 KQL 示例。",
+  "objectives": [
+    "解释关联分析与事件富化及其重要性",
+    "准备好时间、字段和身份，使关联可靠",
+    "用 SPL 和 KQL 编写多源关联查询",
+    "在摄取时富化与搜索时富化之间做出选择",
+    "避免常见的关联分析陷阱"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "02:14，防火墙记录了一条来自 203.0.113.77 的被拒绝连接。02:16，VPN 网关记录了账户 `jdoe` 的一次登录失败。02:19，域控制器记录了同一账户从一个新国家成功登录。单独来看，每个事件都只是普通噪声；放在一起，就是一次疑似账户接管。\n\n没有任何单一日志源能讲出这个故事。**关联分析（correlation）**是指通过共享字段和时间把来自不同来源的事件联系起来，**事件富化（enrichment）**则是添加上下文，例如主机属于谁、某个地址是否已知有敌意。二者结合，才能把一堆日志行变成分析师可以据以行动的证据。本课介绍如何构建这两者，所用概念同样适用于 Splunk、Elastic 和 Microsoft Sentinel。原始素材来自[集中式日志管理](/learn/security-operations-dfir/centralized-log-management)和 [Syslog 架构](/learn/security-operations-dfir/syslog-architecture)。"
+    },
+    {
+      "id": "prereq",
+      "type": "text",
+      "markdown": "## 关联分析依赖的三个条件\n\n基础薄弱时，关联分析会悄无声息地失效。在写任何规则之前，先检查这三点。\n\n1. **时间同步。**如果防火墙的时钟比域控制器快六分钟，事件顺序就是错的。到处使用 NTP，以 UTC 存储时间戳，并同时记录事件时间和摄取时间。\n2. **字段规范化。**一个来源把地址叫 `src`，另一个叫 `SourceIp`，第三个叫 `client_ip`。把它们映射到通用模式，例如 Elastic 通用模式（Elastic Common Schema，ECS）、Splunk CIM 或 Microsoft ASIM，这样一条查询就能适用于所有来源。\n3. **身份稳定。**连接键在各来源之间的含义必须一致。`jdoe`、`JDOE` 和 `jdoe@example.com` 是同一个人。要在摄取时统一大小写和域后缀。\n\n一个有用的习惯是维护一份简短的**连接键（join key）**清单：用户、主机、源 IP、目的 IP、进程 ID、会话 ID，以及对网络传感器而言 Zeek 使用的连接 uid（参见 [Zeek 网络安全监控](/learn/security-operations-dfir/zeek-network-security-monitoring)）。"
+    },
+    {
+      "id": "enrich",
+      "type": "text",
+      "markdown": "## 富化来源\n\n富化回答的是分析师原本需要手动查询的第一批问题。每个来源都会为事件添加字段。\n\n| 来源 | 添加的字段 | 回答的问题 |\n|:--|:--|:--|\n| 资产清单 / CMDB | 所有者、重要性、业务部门 | “这台主机有多重要？” |\n| 身份目录 | 部门、上级、特权标记 | “这是普通用户还是域管理员？” |\n| GeoIP 数据库 | 国家、ASN | “这个登录位置合理吗？” |\n| 威胁情报 | 指标匹配、情报源、置信度 | “这个地址是否已知有敌意？” |\n| 漏洞扫描器 | 主机上未修复的 CVE | “它可能被利用吗？” |\n| DHCP / VPN 日志 | IP 到设备和用户的映射 | “02:19 时谁持有这个地址？” |\n\n有两条实用规则。第一，选对富化时机。**摄取时（ingest-time）**富化搜索速度快，但数据是固化的：如果主机更换了所有者，旧事件仍保留旧值。**搜索时（search-time）**富化（查找表、连接）始终是最新的，但会增加查询耗时。第二，永远不要只信任单一指标。情报源匹配会提高优先级，但陈旧或共享的地址会产生误报，因此要把情报源名称和置信度与匹配结果一并记录。"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "correlation_account_takeover.spl",
+      "caption": "一条 Splunk 搜索：按用户连接 VPN、域控制器和 CMDB 数据，然后用查找表进行富化。索引和字段名均为示例。",
+      "highlight": [
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "code": "index=vpn OR index=wineventlog earliest=-30m\n| eval user=lower(coalesce(user, Account_Name))\n| eval stage=case(sourcetype==\"vpn:auth\" AND action==\"failure\",\"vpn_fail\",\n                  EventCode==4624 AND Logon_Type IN (3,10),\"dc_success\")\n| where isnotnull(stage)\n| stats earliest(_time) AS first_seen values(stage) AS stages\n        dc(src_ip) AS src_count values(src_ip) AS src_ips BY user\n| where mvcount(stages)=2 AND src_count>=1\n| lookup asset_cmdb user OUTPUT owner_dept criticality\n| lookup geoip src_ips OUTPUT country\n| table user stages src_ips country owner_dept criticality"
+    },
+    {
+      "id": "kql",
+      "type": "text",
+      "markdown": "## KQL 中的同一思路\n\n这些概念是可移植的。在 Microsoft Sentinel 中，你把登录表与保存资产数据的监视列表（watchlist）连接起来。下面的查询找出在 15 分钟内先出现多次登录失败、随后成功登录的用户。\n\n请注意这条查询没有做什么：它并不判定该用户已被入侵。它只是生成一份简短的、经过富化的列表，由分析师来判断。始终优先选择较窄的时间窗口和你能解释清楚的阈值。“失败超过五次”这样的规则容易说明、也容易调优；没人说得清的规则则不然。"
+    },
+    {
+      "id": "kqlcode",
+      "type": "code",
+      "language": "plain",
+      "filename": "failed_then_success.kql",
+      "caption": "失败之后紧跟成功，并使用名为 AssetOwners 的监视列表进行富化。",
+      "highlight": [
+        10,
+        11
+      ],
+      "code": "let window = 15m;\nlet fails = SigninLogs\n    | where TimeGenerated > ago(1h) and ResultType != 0\n    | summarize FailCount = count(), FirstFail = min(TimeGenerated) by UserPrincipalName, IPAddress;\nSigninLogs\n| where TimeGenerated > ago(1h) and ResultType == 0\n| join kind=inner fails on UserPrincipalName\n| where TimeGenerated between (FirstFail .. FirstFail + window) and FailCount >= 5\n| extend Country = tostring(LocationDetails.countryOrRegion)\n| join kind=leftouter (_GetWatchlist('AssetOwners')) on $left.UserPrincipalName == $right.SearchKey\n| project TimeGenerated, UserPrincipalName, IPAddress, Country, FailCount, Department, Criticality"
+    },
+    {
+      "id": "seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "将三个来源关联为一条告警",
+      "caption": "每个来源单独看都无害；SIEM 通过用户键将它们连接起来。",
+      "data": {
+        "actors": [
+          {
+            "id": "vpn",
+            "label": "VPN 网关",
+            "sub": "vpn01",
+            "icon": "globe"
+          },
+          {
+            "id": "dc",
+            "label": "域控制器",
+            "sub": "dc01",
+            "icon": "server"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "关联引擎",
+            "icon": "database"
+          },
+          {
+            "id": "an",
+            "label": "分析师",
+            "sub": "SOC",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "from": "vpn",
+            "to": "siem",
+            "label": "5 次登录失败",
+            "detail": "user=jdoe src=203.0.113.77",
+            "note": "VPN 发送认证失败事件，其中包含规范化的用户字段。"
+          },
+          {
+            "from": "dc",
+            "to": "siem",
+            "label": "成功登录 4624",
+            "detail": "user=jdoe type=10",
+            "note": "几分钟后，域控制器记录了一次成功的远程登录。"
+          },
+          {
+            "from": "siem",
+            "to": "siem",
+            "label": "按用户连接",
+            "note": "规则在 15 分钟窗口内匹配了两个阶段。",
+            "tone": "warning"
+          },
+          {
+            "from": "siem",
+            "to": "siem",
+            "label": "富化",
+            "detail": "GeoIP、CMDB、威胁情报",
+            "note": "查找表添加了国家、部门、重要性和情报源置信度。"
+          },
+          {
+            "from": "siem",
+            "to": "an",
+            "label": "告警：疑似账户接管",
+            "tone": "danger",
+            "note": "分析师收到的是一条经过富化的告警，而不是三条互不相关的日志行。"
+          },
+          {
+            "from": "an",
+            "to": "an",
+            "label": "核实并响应",
+            "tone": "success",
+            "note": "联系用户、重置凭据并审查会话。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "patterns",
+      "type": "text",
+      "markdown": "## 值得了解的四种关联模式\n\n大多数有用的规则都属于以下四种形态之一。\n\n- **序列（Sequence）。**事件 A 在窗口内被事件 B 跟随，例如登录失败之后紧跟成功。上面的查询就是这种模式。\n- **阈值（Threshold）。**按实体、按窗口计数，例如一台主机在五分钟内访问了超过 100 个不同的目的端口。\n- **罕见性（Rarity）。**标记该实体从未出现过的值，例如首次从新国家登录，或首次在服务器上运行某个工具。\n- **跨源确认（Cross-source confirmation）。**要求两个独立来源相互印证。对可疑域名的 DNS 查询是弱信号；同一主机随后又发起代理连接，则信号更强。\n\n当规则噪声很大时，先问它用了这四种形态中的哪一种，以及再叠加另一种形态的条件能否缩小范围。把阈值与罕见性检查结合起来，通常足以将误报减少一半。"
+    },
+    {
+      "id": "pitfalls",
+      "type": "text",
+      "markdown": "## 常见陷阱\n\n- **过度连接。**连接原始的大流量日志既慢又昂贵。先对每一侧进行过滤和聚合，再连接体量小的结果。\n- **时间窗口过宽。**24 小时的窗口会把互不相关的事件关联在一起。选择仍能捕获该行为的最短窗口。\n- **参考数据过时。**上个季度导出的 CMDB 会给主机贴错标签。按计划刷新查找表，并记录刷新时间。\n- **数据缺失。**如果某个来源停止发送，规则就会静默，看上去却一切正常。为每个来源添加健康检查，并在预期数据量下降时告警。\n- **共享地址。**NAT 网关和代理会隐藏真实客户端。条件允许时，优先使用用户或设备键，而不是 IP。\n\n把关联规则构建为小而可复用的步骤，并在规则描述中写明预期结果。这样编写的规则以后可以导出为可移植格式，详见 [Sigma 检测规则](/learn/security-operations-dfir/sigma-detection-rules)。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "记录事件为何被富化",
+      "markdown": "在每个新增字段旁存储富化来源及其版本，例如 `enrich.geoip.db=2026-11-01`。当分析师对某个结果有疑问时，你就能准确展示是哪份数据产生了它。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "使用你自己创建的示例日志，或实验虚拟机中免费的 Elastic 或 Splunk 实例。\n\n1. 创建两个小型 CSV 文件：`vpn.csv`（时间、用户、结果、src_ip）和 `assets.csv`（用户、部门、重要性）。使用 `192.0.2.x` 地址和虚构用户。\n2. 将它们作为两个来源摄取，或加载到电子表格或 SQLite 中。\n3. 编写一条查询，找出在 15 分钟内出现三次或更多失败、随后成功的用户。\n4. 把 `assets.csv` 中的部门和重要性作为富化信息添加进来。\n5. 把窗口从 15 分钟改为 24 小时，记录多出了多少不相关的结果。用一句话写下你会选择哪一个以及原因。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "关联分析（Correlation）",
+          "definition": "通过共享字段和时间，把来自不同来源的事件联系起来。"
+        },
+        {
+          "term": "事件富化（Enrichment）",
+          "definition": "为事件添加所有者、位置或信誉等上下文。"
+        },
+        {
+          "term": "规范化（Normalization）",
+          "definition": "把各来源特有的字段名映射到通用模式。"
+        },
+        {
+          "term": "连接键（Join key）",
+          "definition": "用于跨来源匹配事件的字段，例如用户或主机。"
+        },
+        {
+          "term": "查找表（Lookup）",
+          "definition": "在搜索时添加字段的参考表。"
+        },
+        {
+          "term": "ECS / CIM / ASIM",
+          "definition": "Elastic、Splunk 和 Microsoft Sentinel 各自使用的通用模式。"
+        },
+        {
+          "term": "时间窗口（Time window）",
+          "definition": "相关事件必须发生在其中的最大时间间隔。"
+        },
+        {
+          "term": "威胁情报（Threat intelligence）",
+          "definition": "关于已知敌对基础设施的指标和上下文。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "为什么日志源之间的时钟偏差会破坏关联分析？",
+          "options": [
+            "它会增加存储占用",
+            "事件顺序错乱，或落在窗口之外",
+            "它会禁用查找表",
+            "它会改变用户名"
+          ],
+          "answer": 1,
+          "explanation": "关联分析依赖顺序和时间窗口。如果时钟不一致，相关事件可能落在窗口之外或顺序颠倒。"
+        },
+        {
+          "question": "与摄取时富化相比，搜索时富化的主要优势是什么？",
+          "options": [
+            "它总是更快",
+            "它始终使用最新的参考数据",
+            "它不需要参考数据",
+            "它能去除重复项"
+          ],
+          "answer": 1,
+          "explanation": "搜索时的查找反映最新的表，代价是额外的查询耗时。摄取时的值在采集那一刻就已固化。"
+        },
+        {
+          "question": "哪些应列入一份好的连接键清单？（选择所有适用项。）",
+          "options": [
+            "规范化的用户名",
+            "主机名",
+            "会话或连接 ID",
+            "仪表盘的颜色"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "用户、主机和会话标识符经规范化后在各来源间是稳定的。仪表盘颜色与此无关。"
+        },
+        {
+          "question": "某个日志源离线后，关联规则不再触发。哪种控制措施本可以发现这个问题？",
+          "options": [
+            "更大的时间窗口",
+            "来源健康度或数据量下降告警",
+            "更大的仪表盘",
+            "更多威胁情报源"
+          ],
+          "answer": 1,
+          "explanation": "静默的来源会让规则看似健康，实则失明。要监控每个来源的预期数据量。"
+        },
+        {
+          "question": "为什么仅凭威胁情报匹配不足以断定事件是恶意的？",
+          "options": [
+            "情报源总是错的",
+            "地址可能陈旧、共享或置信度低",
+            "匹配结果无法存储",
+            "情报源只覆盖内部 IP"
+          ],
+          "answer": 1,
+          "explanation": "匹配会提高优先级，但仍需结合上下文。要记录情报源名称和置信度，并用其他证据加以验证。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 关联分析把跨来源的事件联系起来；事件富化则添加分析师原本需要手动查询的上下文。\n- 可靠的关联分析需要时间同步、字段规范化和稳定的身份。\n- 有意识地选择摄取时富化或搜索时富化，并始终记录富化字段的来源。\n- 保持窗口较窄、阈值可解释，并监控来源是否静默。\n- 良好关联分析的产出，是一条经过富化的告警，它将进入[安全告警分诊](/learn/security-operations-dfir/security-alert-triage)。"
+    }
+  ]
+}

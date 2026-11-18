@@ -1,0 +1,277 @@
+{
+  "title": "高级网络流量分析（Advanced Network Traffic Analysis）",
+  "summary": "学习大规模分析网络流量：在完整数据包、流记录和协议日志之间做出选择，读懂 Zeek 日志，根据行为发现信标（beaconing）和 DNS 隧道，并利用元数据处理加密流量。",
+  "objectives": [
+    "比较完整数据包捕获、流记录和协议日志",
+    "阅读 Zeek 的 conn.log 和 dns.log 来回答调查问题",
+    "根据行为统计数据检测信标和 DNS 隧道",
+    "使用 TLS 元数据和 JA3/JA4 指纹分析加密流量",
+    "在你有权检查的流量上应用可重复的网络分析工作流"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "分析师收到一条告警：财务 VLAN 中的一台工作站在 02:00 联系了一个陌生的外部主机。EDR 没有显示任何异常，而且用户当时正在睡觉。唯一的目击者是网络。终端可能被篡改，但穿过你传感器的数据包确实被发送过，这使网络数据成为第二个可靠的事实来源。\n\n本课建立在[安全监控架构](/learn/security-operations-dfir/security-monitoring-architecture)的基础之上，从阅读单个数据包，转向分析数百万个连接中的行为。请只对你拥有或有权检查的网络流量进行分析。"
+    },
+    {
+      "id": "data",
+      "type": "text",
+      "markdown": "## 三类网络证据\n\n没有哪个团队能永久保存每一个数据包，所以你需要选择一种组合。每种来源以不同的成本回答不同的问题。\n\n| 来源 | 包含内容 | 存储成本 | 最适合 |\n|:--|:--|:--|:--|\n| **完整数据包捕获（Full packet capture，PCAP）** | 每一个字节，包括载荷 | 非常高 | 深入分析、文件提取、取证证明 |\n| **流记录（Flow records，NetFlow/IPFIX）** | 谁与谁通信、端口、字节数、持续时间 | 非常低 | 长期保留、流量和范围类问题 |\n| **协议日志（Protocol logs，Zeek、Suricata EVE）** | 已解析的元数据：DNS 名称、HTTP 主机、TLS 详情 | 低到中等 | 狩猎、富化、SIEM 搜索 |\n\n常见的设计是将协议日志保留 12 个月，流记录保留相近的时间，而 PCAP 只滚动保留几天，或只针对 DMZ 等选定网段保留。告警触发时，可以用一次简短的按需捕获来补充日志。\n\n传感器应放在流量集中的位置：互联网边界、数据中心入口，以及敏感区域之间。网络内部的东西向流量与边界同样重要，因为攻击者大部分时间都花在横向移动上。"
+    },
+    {
+      "id": "zeek",
+      "type": "text",
+      "markdown": "## 阅读 Zeek 日志\n\nZeek 将原始数据包转换为结构化日志。两个文件就能回答大多数问题。`conn.log` 每个连接一行（地址、端口、持续时间、字节数、状态）。`dns.log` 每次查询一行，包含所查询的名称和返回的应答。每一行都带有 `uid`，把同一个连接的所有日志关联在一起。\n\n应从问题出发，而不是从工具出发。“昨晚哪些内部主机向外发送了超过 100 MB？”是对 `conn.log` 的聚合。“有人解析过这个域名吗？”是对 `dns.log` 的过滤。下面的终端使用 `zeek-cut` 从实验网络的日志中提取列。"
+    },
+    {
+      "id": "zeek-term",
+      "type": "terminal",
+      "title": "出站流量最大的主机",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "cat conn.log | zeek-cut id.orig_h id.resp_h id.resp_p orig_bytes | awk '$4>100000000' | sort -k4 -nr | head -3",
+          "output": "192.168.20.14  203.0.113.50  443  412883201\n192.168.20.77  198.51.100.9  22   180442910\n192.168.20.14  203.0.113.50  8443 15002211",
+          "comment": "提取四列，保留发送量超过 100 MB 的行，按字节数排序。"
+        },
+        {
+          "cmd": "cat dns.log | zeek-cut id.orig_h query answers | grep update-check.example.net",
+          "output": "192.168.20.14  update-check.example.net  203.0.113.50",
+          "comment": "主机 192.168.20.14 解析过同一个目标，这是用于确定范围的关联线索。"
+        }
+      ],
+      "caption": "输出来自使用文档示例地址的实验网络。"
+    },
+    {
+      "id": "behavior",
+      "type": "text",
+      "markdown": "## 发现信标（Beaconing）\n\n与服务器保持联络的恶意软件必须反复“回连”。即使带有随机抖动，人也很少会在 12 小时内每隔 60 秒连接同一个主机。信标检测衡量的是**规律性**。\n\n对每一对源和目的，收集连接的时间戳，计算相邻时间间隔，并观察其离散程度。相对于平均间隔，标准差很低，连接次数很多，且字节数小而相近，就值得怀疑。更新代理和 NTP 等合法软件也会产生信标，因此务必与已知服务的允许列表进行比对。\n\n### DNS 隧道（DNS tunneling）\n\n隐藏在 DNS 中的数据表现为：同一个父域下有大量很长、熵很高的子域名，TXT 查询占比很高，或者某台主机发出数千个互不相同的名称。统计每台主机、每小时、每个父域下的唯一子域名数量，然后检查离群值。\n\n这两种检测都不能证明主机已被入侵。每种检测给出的是一份按优先级排序的嫌疑清单，需要结合上下文判断：目的地是新的吗？进程是已知的吗？主机是敏感主机吗？"
+    },
+    {
+      "id": "beacon-py",
+      "type": "code",
+      "language": "python",
+      "code": "import statistics as st\nfrom collections import defaultdict\n\npairs = defaultdict(list)\nfor ts, src, dst in rows:          # rows parsed from conn.log\n    pairs[(src, dst)].append(ts)\n\nfor (src, dst), t in pairs.items():\n    if len(t) < 30:\n        continue                   # too few samples to judge\n    t.sort()\n    gaps = [b - a for a, b in zip(t, t[1:])]\n    cv = st.pstdev(gaps) / st.mean(gaps)   # coefficient of variation\n    if cv < 0.15:                  # very regular\n        print(f\"{src} -> {dst} n={len(t)} mean_gap={st.mean(gaps):.0f}s cv={cv:.2f}\")",
+      "filename": "beacon_score.py",
+      "caption": "一个简单的规律性评分。请根据你自己的基线调整阈值。"
+    },
+    {
+      "id": "tls",
+      "type": "text",
+      "markdown": "## 加密流量\n\n现在大部分流量都是 TLS，所以载荷是隐藏的。元数据仍然可见且有用：\n\n- **SNI 和证书字段**：所请求的服务器名称、颁发者、有效期，以及证书是否为自签名。\n- **JA3/JA4 指纹**：客户端构造 TLS 握手方式的哈希值。不同的软件会产生不同的指纹，因此，一台通常只运行浏览器的服务器出现了不寻常的指纹，值得一看。\n- **时间与大小模式**：连接持续时间、字节比例和数据包大小，可以揭示上传或交互式会话等行为。\n\n在代理上解密流量是可行的，但会带来隐私、法律和运维方面的责任。元数据分析不需要这些成本就能带来检测价值，所以应优先使用。"
+    },
+    {
+      "id": "pairing",
+      "type": "text",
+      "markdown": "## 将 Zeek 与 Suricata 配合使用\n\nZeek 和 Suricata 相辅相成。Suricata 匹配已知特征并将告警写入 `eve.json`。Zeek 描述发生过的一切，包括没有触发告警的流量。告警告诉你该看哪里，Zeek 告诉你同一台主机在此前后还做了什么。\n\n一个实用的做法是：从 Suricata 告警中取出 `community_id`，在 Zeek 日志和流记录中搜索它，并建立一条简短的时间线：首次联系、流量规模、使用的协议和最后一次联系。在这条时间线上花十分钟，通常就能判定这条告警是噪声，还是一次事件的开端。\n\n### 常见陷阱\n\n- **盲区**：传感器接在错误的镜像（span）端口上，或者分路器（tap）在负载下丢包，都会悄悄地隐藏流量。每周检查传感器的丢包计数器。\n- **时钟漂移**：来自时钟不同步的设备的日志无法关联。所有设备都应使用 NTP。\n- **NAT 和代理**：在代理之后，许多用户共用同一个源地址。需要关联代理日志才能识别真实的客户端。\n- **过度相信单一数字**：长连接可能是视频通话，也可能是远程 shell。要结合方向、比例和目的地一起看。"
+    },
+    {
+      "id": "wf",
+      "type": "animation",
+      "kind": "flow",
+      "title": "网络调查工作流",
+      "caption": "每一步都在缩小问题范围，同时扩大证据范围。",
+      "data": {
+        "token": "发现",
+        "nodes": [
+          {
+            "id": "alert",
+            "label": "告警",
+            "sub": "IDS 或 SIEM",
+            "icon": "alert"
+          },
+          {
+            "id": "flows",
+            "label": "流记录",
+            "sub": "范围与流量规模",
+            "icon": "log"
+          },
+          {
+            "id": "zeek",
+            "label": "Zeek 日志",
+            "sub": "DNS、TLS、HTTP",
+            "icon": "eye"
+          },
+          {
+            "id": "pcap",
+            "label": "数据包",
+            "sub": "定向捕获",
+            "icon": "file"
+          },
+          {
+            "id": "verdict",
+            "label": "结论",
+            "sub": "良性或事件",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "alert",
+            "caption": "Suricata 标记出来自 192.168.20.14 的周期性连接。",
+            "tone": "warning"
+          },
+          {
+            "at": "flows",
+            "caption": "流数据显示一夜之间向 203.0.113.50 发送了 412 MB，这是最大的一次出站传输。",
+            "tone": "warning"
+          },
+          {
+            "at": "zeek",
+            "caption": "dns.log 和 ssl.log 显示一个新域名、一个自签名证书和一个不寻常的 JA3。",
+            "tone": "danger"
+          },
+          {
+            "at": "pcap",
+            "caption": "定向捕获确认了 60 秒的节奏，且每次请求大小相等。",
+            "tone": "danger"
+          },
+          {
+            "at": "verdict",
+            "caption": "作为事件上报，并将该主机移交给响应人员。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "note",
+      "type": "callout",
+      "variant": "note",
+      "title": "为什么数据包没了，流记录还在",
+      "markdown": "入侵发生六个月后，数据包早已不复存在，但流记录仍然能显示某台服务器每晚都与一个未知地址通信。即使只保留精简的流数据，团队也能回答“持续了多久”和“涉及多少数据”，这正是泄露事件之后管理层最先问的两个问题。请保留它，防止其被篡改，并为其建立索引，使搜索只需几秒而不是几小时。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "先建立基线",
+      "markdown": "在编写阈值之前，先花一周时间了解每个区域的正常情况。按别人的网络调出来的信标规则，用在你的网络上只会产生噪声。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "把捕获文件当作证据处理",
+      "markdown": "PCAP 文件包含用户数据。要限制访问，在捕获时对每个文件计算哈希，并记录谁访问过它。只在你有权监控的网络上进行捕获。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在实验虚拟机中安装 Zeek，或使用公开训练数据集中的示例 PCAP。运行 `zeek -r sample.pcap`，然后回答：哪台内部主机发送的字节最多，哪个目的地的连接间隔最均匀，哪个 DNS 父域的唯一子域名最多？写下你使用的三条命令。"
+    },
+    {
+      "id": "kt",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "PCAP",
+          "definition": "保存已捕获数据包（包括载荷）的文件。"
+        },
+        {
+          "term": "NetFlow/IPFIX",
+          "definition": "对每次会话进行汇总、不含载荷的记录。"
+        },
+        {
+          "term": "Zeek",
+          "definition": "一种将流量转换为结构化协议日志的网络监控工具。"
+        },
+        {
+          "term": "uid",
+          "definition": "Zeek 的标识符，用于关联同一个连接的所有日志。"
+        },
+        {
+          "term": "信标（Beaconing）",
+          "definition": "恶意软件向控制端发出的规律性回连。"
+        },
+        {
+          "term": "DNS 隧道（DNS tunneling）",
+          "definition": "把数据隐藏在 DNS 查询和应答中。"
+        },
+        {
+          "term": "JA3/JA4",
+          "definition": "客户端 TLS 握手的指纹。"
+        },
+        {
+          "term": "SNI",
+          "definition": "客户端在 TLS 握手期间请求的服务器名称。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪种来源保存一年的成本最低？",
+          "options": [
+            "完整数据包捕获",
+            "流记录",
+            "内存镜像",
+            "磁盘镜像"
+          ],
+          "answer": 1,
+          "explanation": "流记录只存储摘要字段，所以体积足够小，适合长期保留。"
+        },
+        {
+          "question": "Zeek 的 uid 有什么作用？",
+          "options": [
+            "标识分析师",
+            "关联属于同一个连接的日志",
+            "加密日志",
+            "统计字节数"
+          ],
+          "answer": 1,
+          "explanation": "uid 是在 conn、dns、ssl 等日志之间进行关联跳转的键。"
+        },
+        {
+          "question": "哪些信号表明存在信标？选择所有适用项。",
+          "options": [
+            "连接之间的时间间隔变化很小",
+            "大量连接的大小小而相近",
+            "一次很大的下载",
+            "数小时内始终是固定的目的地"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "规律性、相近的大小和持续不变的目的地定义了信标。单次大型下载则不是。"
+        },
+        {
+          "question": "为什么在解密流量之前先使用 TLS 元数据？",
+          "options": [
+            "它更容易伪造",
+            "它提供检测价值，而没有隐私和法律负担",
+            "它会暴露密码",
+            "解密是不可能的"
+          ],
+          "answer": 1,
+          "explanation": "SNI、证书和 JA3 等元数据无需破解加密就能看到。"
+        },
+        {
+          "question": "哪种 DNS 模式表明存在隧道？",
+          "options": [
+            "每天一次查询",
+            "同一个域下有数千个唯一的长子域名",
+            "只有 A 记录",
+            "对内部解析器的查询"
+          ],
+          "answer": 1,
+          "explanation": "把数据编码进子域名，会在同一个父域下产生大量唯一且熵很高的名称。"
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## 小结\n\n网络数据让你能够核实终端所报告的内容。混合使用 PCAP、流记录和协议日志，在深度与成本之间取得平衡。使用 Zeek 的 `conn.log` 和 `dns.log` 并借助 `uid` 进行关联跳转，通过衡量规律性来发现信标，通过统计唯一子域名来发现隧道，并在载荷被隐藏时使用 TLS 元数据。接下来，请看这些发现如何为[高级威胁狩猎](/learn/security-operations-dfir/advanced-threat-hunting)提供输入。"
+    }
+  ]
+}

@@ -1,0 +1,348 @@
+{
+  "title": "Kalıcılık Mekanizması Tespiti (Persistence Mechanism Detection)",
+  "summary": "Saldırganların Windows ve Linux üzerinde yeniden başlatmalardan ve temizlikten sağ çıkmak için kullandığı mekanizmaları bulmayı, doğru telemetriyi toplamayı, bir Sigma kuralı ve bir avlanma sorgusu yazmayı, ayrıca kalıcılığı delilleri yok etmeden önceliklendirip kaldırmayı öğrenin.",
+  "objectives": [
+    "Kalıcılığı altı aileye ayırmak ve MITRE ATT&CK ile eşleştirmek",
+    "Sahibi olduğunuz bir sistemde Windows ve Linux otomatik başlatma konumlarını listelemek",
+    "Kalıcılığı ortaya çıkaran telemetriyi (Sysmon, Güvenlik olayları, auditd) belirlemek",
+    "Şüpheli Run anahtarı değerleri için bir Sigma kuralı ve bir SPL avı yazıp ayarlamak",
+    "Bir kalıcılık uyarısını önceliklendirmek ve kaldırmadan önce delilleri korumak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Geçen hafta WS-0142 iş istasyonu, bir kimlik avı olayının ardından temizlendi ve yeniden başlatıldı. Bugün saat 02:10'da EDR, sistemin yeniden beacon (sinyal) gönderdiğini gösteriyor. Yeni bir şey teslim edilmedi: saldırgan sadece bir kapıyı açık bıraktı. Buna **kalıcılık (persistence)** denir ve bu yüzden tek bir kötü amaçlı dosyayı silmek bir soruşturmanın sonu değildir.\n\nKalıcılık tespiti, saldırgan kodunu yeniden başlatma, oturum kapatma veya temizlik sonrasında yeniden çalıştıran her mekanizmayı bulmak ve yeni mekanizmaların dakikalar içinde ortaya çıkması için uyarılar oluşturmak demektir. [Windows Olay Müdahalesi](/learn/security-operations-dfir/windows-incident-response) ve [Linux Olay Müdahalesi](/learn/security-operations-dfir/linux-incident-response) derslerindeki ana bilgisayar çalışmalarını destekler."
+    },
+    {
+      "id": "categories",
+      "type": "text",
+      "markdown": "## Altı ailede kalıcılık\n\nSaldırganlar kalıcılığı sahip oldukları yetkilere ve bir savunmacının bakma olasılığına göre seçer. Kontrol listenizin sistematik olması için mekanizmaları ailelere ayırın:\n\n| Aile | Örnekler | ATT&CK |\n|:--|:--|:--|\n| **Otomatik başlatma girdileri** | Run ve RunOnce anahtarları, Başlangıç (Startup) klasörü, kabuk profilleri | T1547 |\n| **Zamanlanmış çalıştırma** | Windows zamanlanmış görevleri, cron, systemd zamanlayıcıları | T1053 |\n| **Hizmetler ve arka plan süreçleri (daemon)** | Yeni Windows hizmeti, systemd birimi, init betiği | T1543 |\n| **Olay tetiklemeli** | WMI abonelikleri, IFEO hata ayıklayıcısı, `LD_PRELOAD` | T1546 |\n| **Hesap ve erişim** | Yeni yerel kullanıcı, SSH `authorized_keys`, eklenen OAuth uygulaması | T1136, T1098 |\n| **Önyükleme ve üretici yazılımı (firmware)** | Bootkit'ler, değiştirilmiş önyükleme yapılandırması | T1542 |\n\nİlk dördü gerçek vakaların çoğunu oluşturur. Beşincisi kolay unutulur, çünkü ana bilgisayarda hiçbir şey çalışmaz: saldırgan yalnızca geçerli bir anahtarı elinde tutar."
+    },
+    {
+      "id": "windows",
+      "type": "text",
+      "markdown": "## Windows'ta nereye bakılır\n\nBu konumları sırayla gözden geçirin. Her birini kontrol etmek bir dakika sürer ve her biri gerçek saldırılarda kullanılmıştır.\n\n1. **Run anahtarları.** `Software\\Microsoft\\Windows\\CurrentVersion\\Run` ve `RunOnce` altındaki `HKLM` ve `HKCU`. `HKCU` kopyası yönetici hakları gerektirmez, bu yüzden saldırganlar onu sever.\n2. **Başlangıç (Startup) klasörleri.** Kullanıcıya özel ve tüm kullanıcılar için olan `Startup` dizinleri, içine konan her şeyi oturum açılışında çalıştırır.\n3. **Zamanlanmış görevler.** Tetikleyiciye (oturum açma, önyükleme, her beş dakikada bir), eyleme ve çalıştığı hesaba bakın. Kodlanmış bağımsız değişkenlerle `powershell.exe` veya `cmd.exe` çalıştıran görevler şüphelidir.\n4. **Hizmetler.** İkili dosyası `ProgramData`, `Temp` veya bir kullanıcı profilinde bulunan bir hizmet neredeyse hiçbir zaman meşru değildir.\n5. **WMI olay abonelikleri.** WMI deposunda saklanan bir filtre, bir tüketici ve bir bağlama, Başlangıç klasöründe hiçbir dosya bırakmaz.\n6. **Winlogon ve IFEO.** `Userinit`, `Shell` gibi değerler ve `Image File Execution Options` hata ayıklayıcıları, normal program başlatmalarını yönlendirir.\n\nAşağıdaki terminal, sahibi olduğunuz bir makinede bunlardan üçünü inceler. Yorumları okuyun: her çıktı satırı yalnızca adına göre değil, yoluna ve üst sürecine göre değerlendirilir."
+    },
+    {
+      "id": "term-win",
+      "type": "terminal",
+      "title": "Sahibi olduğunuz bir ana bilgisayarda PowerShell",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' | Format-List",
+          "comment": "Makine ve geçerli kullanıcı için otomatik başlatma kayıt defteri anahtarları"
+        },
+        {
+          "output": "SecurityHealth : %windir%\\system32\\SecurityHealthSystray.exe\nOneDrive       : \"C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe\" /background\nUpdaterSvc     : C:\\Users\\Public\\Libraries\\upd.exe -q",
+          "comment": "İlk ikisi normaldir. Public\\Libraries içindeki bir ikili dosya normal değildir."
+        },
+        {
+          "cmd": "Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.State -ne 'Disabled' } | Select-Object TaskName, @{n='Run';e={$_.Actions.Execute}}",
+          "comment": "El yapımı görevler genellikle kök düzeyde bulunur"
+        },
+        {
+          "output": "TaskName            Run\n--------            ---\nGoogleUpdateTaskX   C:\\ProgramData\\GoogleUpdate\\gu.exe\nSystemHealthCheck   powershell.exe",
+          "comment": "Doğrudan powershell.exe başlatan bir görevin bağımsız değişkenlerine bakmak gerekir"
+        },
+        {
+          "cmd": "Get-CimInstance -Namespace root\\subscription -ClassName __EventConsumer | Select-Object Name, __CLASS",
+          "comment": "WMI olay abonelikleri: dosyasız kalıcılık için yaygın bir yer"
+        },
+        {
+          "output": "Name        __CLASS\n----        -------\nBVTConsumer CommandLineEventConsumer",
+          "comment": "BVTConsumer bazı sistemlerde bilinen yerleşik bir addır; karar vermeden önce komut satırını doğrulayın"
+        }
+      ],
+      "caption": "Yaygın otomatik başlatma konumlarının listelenmesi. Bunu yalnızca yönettiğiniz sistemlerde çalıştırın."
+    },
+    {
+      "id": "linux",
+      "type": "text",
+      "markdown": "## Linux'ta nereye bakılır\n\nLinux kalıcılığı çoğunlukla metin dosyalarından oluşur; bu da karşılaştırmayı (diff) ve izlemeyi kolaylaştırır.\n\n- **Cron.** `/etc/crontab`, `/etc/cron.d/`, `/var/spool/cron/` içindeki kullanıcıya özel dosyalar ve anacron dizinleri.\n- **systemd.** `/etc/systemd/system/` veya bir kullanıcının `~/.config/systemd/user/` dizinindeki yeni `.service` ve `.timer` birimleri. `ExecStart` ve `WantedBy` hedefini kontrol edin.\n- **Kabuk ve oturum açma dosyaları.** `.bashrc`, `.profile` ve `/etc/profile.d/*.sh` her oturum açılışında çalışır.\n- **SSH.** `~/.ssh/authorized_keys` dosyasına eklenen bir anahtar, sessiz ve parolasız erişim sağlar.\n- **Ön yükleme ve modüller.** `/etc/ld.so.preload` ve yüklenebilir çekirdek modülleri, kodu her sürece veya çekirdeğe yükler.\n- **Hesaplar.** UID 0 olan yeni bir kullanıcı veya değiştirilmiş bir sudoers dosyası.\n\nBunlar dosya olduğu için `auditd` onları doğrudan izleyebilir. Bulduklarınızı değerlendirmek için [Şüpheli Süreç ve Hizmet Analizi](/learn/security-operations-dfir/suspicious-process-and-service-analysis) dersine bakın."
+    },
+    {
+      "id": "auditd",
+      "type": "code",
+      "language": "bash",
+      "filename": "/etc/audit/rules.d/persistence.rules",
+      "caption": "auditd, yönettiğiniz bir ana bilgisayarda Linux kalıcılık konumlarını izler. Anahtarlar (key) `ausearch -k persist` ile arama yapmanızı sağlar.",
+      "code": "-w /etc/crontab -p wa -k persist\n-w /etc/cron.d/ -p wa -k persist\n-w /var/spool/cron/ -p wa -k persist\n-w /etc/systemd/system/ -p wa -k persist\n-w /usr/lib/systemd/system/ -p wa -k persist\n-w /etc/rc.local -p wa -k persist\n-w /root/.ssh/authorized_keys -p wa -k persist_ssh\n-w /etc/ld.so.preload -p wa -k persist_preload\n"
+    },
+    {
+      "id": "sources",
+      "type": "text",
+      "markdown": "## Kalıcılığı yakalayan telemetri\n\nTespit, olaydan önce doğru günlüklerin açılmış olmasını gerektirir. Tablo, toplandığından emin olmanız gereken kaynakları listeler.\n\n| Kaynak | Olay | Ne gösterir |\n|:--|:--|:--|\n| Sysmon | 12, 13, 14 | Kayıt defteri anahtarı ve değerinin oluşturulması, ayarlanması veya yeniden adlandırılması |\n| Sysmon | 19, 20, 21 | WMI filtresi, tüketicisi ve bağlamasının oluşturulması |\n| Windows Güvenlik | 4698 | Bir zamanlanmış görev oluşturuldu |\n| Windows Sistem | 7045 | Yeni bir hizmet yüklendi |\n| Windows Güvenlik | 4720, 4732 | Bir yerel hesap oluşturuldu veya bir gruba eklendi |\n| auditd | `PATH`, `SYSCALL` | İzlenen dosya ve dizinlere yazmalar |\n| EDR | Otomatik başlatma telemetrisi | Süreç soy ağacı ve bırakılan dosya |\n\nÖzet değil, ham olayı toplayın. Kayıt defteri değer verisi (ikili dosyanın yolu), üzerinde uyarı oluşturacağınız alandır."
+    },
+    {
+      "id": "sigma",
+      "type": "code",
+      "language": "yaml",
+      "filename": "run-key-user-writable.yml",
+      "caption": "Şüpheli Run anahtarı değerleri için bir Sigma kuralı. Aynı mantık aşağıda Splunk SPL olarak devam eder.",
+      "highlight": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "code": "title: Run Key Persistence Pointing to a User-Writable Path\nid: 00000000-0000-4000-8000-000000000001   # placeholder id\nstatus: experimental\ndescription: A Run or RunOnce value was set to a binary in a folder that ordinary users can write to.\nlogsource:\n  category: registry_set\n  product: windows\ndetection:\n  selection_key:\n    TargetObject|contains:\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\'\n      - '\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\'\n  selection_path:\n    Details|contains:\n      - '\\AppData\\'\n      - '\\Users\\Public\\'\n      - '\\ProgramData\\'\n      - '\\Temp\\'\n  filter_known:\n    Image|endswith: '\\OneDriveSetup.exe'\n  condition: selection_key and selection_path and not filter_known\nfalsepositives:\n  - Per-user installers that register themselves in AppData\nlevel: medium\ntags:\n  - attack.persistence\n  - attack.t1547.001\n"
+    },
+    {
+      "id": "spl",
+      "type": "code",
+      "language": "plain",
+      "filename": "run-key-hunt.spl",
+      "caption": "Avlanma sorgusu: ana bilgisayar başına ilk görülme zamanı, zaman çizelgesi için size bir dayanak noktası verir.",
+      "code": "index=sysmon EventCode=13 TargetObject=\"*\\\\CurrentVersion\\\\Run*\" (Details=\"*\\\\AppData\\\\*\" OR Details=\"*\\\\Users\\\\Public\\\\*\")\n| stats count min(_time) as first_seen by host, Image, TargetObject, Details\n| sort first_seen"
+    },
+    {
+      "id": "flow-intro",
+      "type": "text",
+      "markdown": "## Tek bir saldırıyı izlemek\n\nAnimasyon, iki kalıcılık mekanizmasının ve iyi yerleştirilmiş bir kuralın nasıl birlikte çalıştığını gösterir. Analistin ilk keşfinin sonun olmadığına dikkat edin: ikinci mekanizma yalnızca zaman çizelgesi ilk olay etrafında kurulduğu için bulundu."
+    },
+    {
+      "id": "persist-flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Kalıcılığın yerleştirilmesi ve tespiti",
+      "caption": "Yedekli kalıcılık, tek öğelik temizliği boşa çıkarır; bu nedenle tespit her aileyi kapsamalıdır.",
+      "data": {
+        "token": "Olay",
+        "nodes": [
+          {
+            "id": "init",
+            "label": "İlk erişim",
+            "sub": "Kimlik avı ile edinilen dayanak noktası",
+            "icon": "attacker"
+          },
+          {
+            "id": "reg",
+            "label": "Run anahtarı",
+            "sub": "HKCU otomatik başlatma değeri",
+            "icon": "key"
+          },
+          {
+            "id": "task",
+            "label": "Zamanlanmış görev",
+            "sub": "Oturum açma tetikleyicisi",
+            "icon": "cpu"
+          },
+          {
+            "id": "sysmon",
+            "label": "Sysmon + EDR",
+            "sub": "12, 13, 1 numaralı olaylar",
+            "icon": "eye"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM kuralı",
+            "sub": "SPL'e dönüştürülen Sigma",
+            "icon": "log"
+          },
+          {
+            "id": "ir",
+            "label": "Analist",
+            "sub": "Önceliklendirme ve kapsam belirleme",
+            "icon": "user"
+          },
+          {
+            "id": "clean",
+            "label": "Temizleme (eradication)",
+            "sub": "İmaj alındıktan sonra kaldırma",
+            "icon": "shield"
+          }
+        ],
+        "steps": [
+          {
+            "at": "init",
+            "caption": "Bir saldırgan, kimlik avı ekiyle WS-0142 üzerinde kod çalıştırır. Yük (payload) tek başına yeniden başlatmadan sağ çıkamaz.",
+            "tone": "danger"
+          },
+          {
+            "at": "reg",
+            "caption": "Saldırgan, C:\\Users\\Public\\Libraries\\upd.exe dosyasına işaret eden, UpdaterSvc adlı bir HKCU Run değeri yazar.",
+            "tone": "attack"
+          },
+          {
+            "at": "task",
+            "caption": "Yedek olarak, oturum açma tetikleyicili SystemHealthCheck adlı bir görev oluşturulur; böylece tek bir mekanizmayı kaldırmak yeterli olmaz.",
+            "tone": "attack"
+          },
+          {
+            "at": "sysmon",
+            "caption": "Sysmon bir kayıt defteri değeri ayarlamasını (olay 13) ve görev oluşturmayı kaydeder; EDR sensörü ikisini de saniyeler içinde iletir.",
+            "tone": "warning"
+          },
+          {
+            "at": "siem",
+            "caption": "Değer verisi \\Users\\Public\\ içerdiği için Sigma kuralı tetiklenir. Ana bilgisayar, kullanıcı ve süreç bilgisiyle bir uyarı açılır.",
+            "tone": "warning"
+          },
+          {
+            "at": "ir",
+            "caption": "Analist ilk olay etrafında bir zaman çizelgesi oluşturur, ikinci mekanizmayı bulur ve tüm filoda aynı değer adını arar."
+          },
+          {
+            "at": "clean",
+            "caption": "Anahtar, görev ve ikili dosya delil olarak toplandıktan sonra kaldırılır ve ana bilgisayar geri dönüş için izlenir.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "triage",
+      "type": "text",
+      "markdown": "## Önceliklendirme iş akışı\n\nUyarı tetiklendiğinde her seferinde aynı şekilde çalışın:\n\n1. **Zamana dayanın.** İlk kalıcılık olayının zaman damgasını alın ve o ana bilgisayarın çevresindeki beş dakikada yaptığı her şeyi listeleyin: süreç oluşturma, ağ bağlantıları, dosya yazmaları.\n2. **Hedefi değerlendirin.** İkili dosya nerede? İmzalı mı ve kim tarafından? Dosya, kayıt defteri değişikliğine kıyasla ne kadar eski? Başlatıcı olarak kullanılan imzalı bir Microsoft ikili dosyasının (living-off-the-land binary) bile bağımsız değişkenleri okunmalıdır.\n3. **Kardeş mekanizmaları arayın.** Saldırganlar nadiren tek mekanizma yerleştirir. Ana bilgisayardaki her aileyi kontrol edin, ardından tüm filoda aynı değer adını, görev adını, dosya karmasını (hash) ve yolu arayın.\n4. **Önce koruyun, sonra kaldırın.** Herhangi bir şeyi değiştirmeden önce anahtarı dışa aktarın, görev XML'ini kopyalayın ve ikili dosyanın imajını alın.\n5. **Doğrulayın.** Temizlikten sonra izlenen bir durumda yeniden başlatın ve hiçbir şeyin geri gelmediğini doğrulayın. Gelirse, bir mekanizmayı kaçırmışsınızdır veya saldırgan hâlâ erişime sahiptir.\n\nHesabın kendisi kötüye kullanıldıysa [Yanal Hareket Tespiti](/learn/security-operations-dfir/lateral-movement-detection) dersiyle devam edin."
+    },
+    {
+      "id": "warn-delete",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Önce silmeyin",
+      "markdown": "Bir Run değerini veya görevi kopyalamadan silmek, kalıcılığın ne zaman ve kim tarafından yerleştirildiğini söyleyen delili yok eder. Anahtarı `reg export` ile dışa aktarın, görevi `schtasks /query /xml` ile kaydedin ve ikili dosyanın karmasını alın. Sonra kaldırın."
+    },
+    {
+      "id": "tip-baseline",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Taban çizgisi hafızadan üstündür",
+      "markdown": "Bir sunucudaki her otomatik başlatma girdisinin ne olması gerektiğini kimse hatırlayamaz. Her altın imaj (gold image) için bir Autoruns veya osquery anlık görüntüsü alın ve onunla karşılaştırın. On yeni girdilik bir fark, üç yüzlük bir listeden çok daha hızlı değerlendirilir ve [İleri Düzey Tehdit Avcılığı](/learn/security-operations-dfir/advanced-threat-hunting) için güçlü bir başlangıç noktasıdır."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "**Sahibi olduğunuz bir sanal makine** kullanın, asla bir üretim sistemi kullanmayın.\n\n1. Zararsız bir Run değeri oluşturun: `reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v LabTest /d \"C:\\Windows\\System32\\notepad.exe\"`.\n2. Yaygın bir yapılandırmayla Sysmon'u kurun, komutu tekrarlayın ve Olay Görüntüleyici'de olay 13'ü bulun. `Image`, `TargetObject` ve `Details` alanlarına dikkat edin.\n3. Bu dersteki PowerShell komutlarını çalıştırın ve değerinizin göründüğünü doğrulayın.\n4. Sigma kuralını yalnızca `\\Temp\\` ile eşleşecek şekilde uyarlayın, ardından notepad değerinizle eşleşmediğini test edin.\n5. Değeri `reg delete` ile kaldırın ve aynı değeri yüz ana bilgisayarda nasıl tespit edeceğinizi anlatan üç cümle yazın."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Kalıcılık (Persistence)",
+          "definition": "Saldırgan kodunun yeniden başlatma, oturum kapatma veya kısmi temizlikten sağ çıkmasını sağlayan her teknik."
+        },
+        {
+          "term": "Run anahtarı (Run key)",
+          "definition": "Değerleri kullanıcı oturum açılışında veya sistem başlangıcında çalıştırılan bir kayıt defteri konumu."
+        },
+        {
+          "term": "Zamanlanmış görev (Scheduled task)",
+          "definition": "Bir tetikleyiciyle çalışan bir Windows veya cron işi; zamanlanmış ya da oturum açma kalıcılığı için sıkça kötüye kullanılır."
+        },
+        {
+          "term": "WMI aboneliği (WMI subscription)",
+          "definition": "WMI deposunda saklanan ve bir olay gerçekleştiğinde komut çalıştıran bir filtre, tüketici ve bağlama bütünü."
+        },
+        {
+          "term": "Autoruns",
+          "definition": "Bir Windows ana bilgisayarındaki neredeyse tüm otomatik başlatma konumlarını listeleyen bir Sysinternals aracı."
+        },
+        {
+          "term": "Sysmon",
+          "definition": "Süreç, kayıt defteri, dosya ve WMI etkinliğini ayrıntılı olarak kaydeden bir Windows hizmeti."
+        },
+        {
+          "term": "Sigma",
+          "definition": "Birçok SIEM sorgu diline dönüştürülebilen, satıcıdan bağımsız bir günlük tespit kuralı biçimi."
+        },
+        {
+          "term": "Yerel araçlarla saldırı (Living off the land)",
+          "definition": "Özel araç bırakmaktan kaçınmak için PowerShell gibi meşru sistem ikili dosyalarının kötüye kullanılması."
+        },
+        {
+          "term": "Taban çizgisi (Baseline)",
+          "definition": "Farklılıkları hızla fark etmek için kullanılan, kaydedilmiş bilinen iyi durum."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı sınayın",
+      "questions": [
+        {
+          "question": "Hangi Sysmon olay kimliği bir kayıt defteri değerinin ayarlanmasını kaydeder?",
+          "options": [
+            "1",
+            "3",
+            "13",
+            "22"
+          ],
+          "answer": 2,
+          "explanation": "Olay 13, RegistryEvent'tir (Value Set). Olay 1 süreç oluşturma, 3 ağ bağlantısı ve 22 DNS sorgusudur."
+        },
+        {
+          "question": "Saldırganlar neden HKLM yerine sıklıkla HKCU Run anahtarını kullanır?",
+          "options": [
+            "HKCU girdileri çekirdek yüklenmeden önce çalışır",
+            "HKCU yönetici hakları gerektirmez",
+            "HKLM anahtarları günlüğe kaydedilmez",
+            "HKCU girdileri dışa aktarılamaz"
+          ],
+          "answer": 1,
+          "explanation": "Geçerli kullanıcının kovanına (hive) yazmak standart bir kullanıcı için de çalışır; bu nedenle yetki yükseltme gerektirmez."
+        },
+        {
+          "question": "Hangi öğeler kontrol edilmeye değer kalıcılık konumlarıdır? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "Oturum açma tetikleyicili zamanlanmış görevler",
+            "Bir Linux sunucusunda `~/.ssh/authorized_keys`",
+            "Tarayıcı geçmişi dosyası",
+            "`/etc/systemd/system/` birim dosyaları"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Görevler, SSH anahtarları ve systemd birimlerinin tümü saldırgan erişimini yeniden başlatır veya yeniden etkinleştirir. Tarayıcı geçmişi bir yürütme veya erişim mekanizması değildir."
+        },
+        {
+          "question": "Bir ana bilgisayarda kötü amaçlı bir zamanlanmış görev buldunuz. En iyi sonraki adım nedir?",
+          "options": [
+            "Silip kaydı kapatmak",
+            "Ana bilgisayardaki ve filodaki tüm kalıcılık ailelerinde kardeş mekanizmaları aramak",
+            "Tarayıcıyı yeniden yüklemek",
+            "Gürültüyü azaltmak için Sysmon'u devre dışı bırakmak"
+          ],
+          "answer": 1,
+          "explanation": "Saldırganlar sıklıkla yedekli mekanizmalar yerleştirir; bu nedenle diğerlerini aramadan birini kaldırmak geri dönüşe davetiye çıkarır."
+        },
+        {
+          "question": "Bir Run değeri kaldırılmadan önce hangi deliller korunmalıdır? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "Anahtarın bir dışa aktarımı",
+            "Başvurulan ikili dosyanın karması ve bir kopyası",
+            "Kayıt defteri değişikliğinin zaman damgası",
+            "Hiçbiri, çünkü tespitten sonra delile gerek yoktur"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Anahtar, ikili dosya ve değişiklik zamanı, neyin, ne zaman ve hangi süreç tarafından yerleştirildiğini gösterir. Ayrıca filo genelinde kapsam belirlemeyi de destekler."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- **Kalıcılık (persistence)**, saldırgan kodunun yeniden başlatmalardan ve temizlikten sağ çıkmasını sağlar; bu nedenle tespit yalnızca ilkini değil, her mekanizmayı bulmalıdır.\n- Altı aileyi kontrol edin: otomatik başlatma girdileri, zamanlanmış çalıştırma, hizmetler, olay tetiklemeli mekanizmalar, hesaplar ve erişim, ayrıca önyükleme bileşenleri.\n- Windows konumları arasında Run anahtarları, Başlangıç klasörleri, görevler, hizmetler, WMI abonelikleri ve Winlogon değerleri bulunur; Linux konumları arasında cron, systemd, kabuk dosyaları, SSH anahtarları ve preload yer alır.\n- Sysmon olayları 12, 13, 14 ve 19 ile 21, Güvenlik 4698 ve 7045 ile `auditd` izlemeleri telemetriyi sağlar; Sigma kuralları bunu uyarılara dönüştürür.\n- Zamana dayanın, hedefi değerlendirin, kardeş mekanizmaları arayın, **kaldırmadan önce koruyun** ve izlenen bir yeniden başlatmadan sonra doğrulayın.\n\nSırada, görünürlüğünüzü ana bilgisayardan ağ hattına genişletmek için [Ağ Adli Bilişimi](/learn/security-operations-dfir/network-forensics) var."
+    }
+  ]
+}

@@ -1,0 +1,311 @@
+{
+  "title": "Windows 事件响应（Incident Response）",
+  "summary": "对可疑 Windows 主机进行分诊（Triage）：利用事件日志、进程与持久化检查、Prefetch 和 Amcache 等执行痕迹，以及 KAPE 和 Velociraptor 等采集工具，界定入侵范围。",
+  "objectives": [
+    "按安全的顺序采集 Windows 的易失性和持久性证据",
+    "利用关键的 Security、System 和 PowerShell 事件 ID 还原攻击活动",
+    "检查进程、服务、计划任务和 Run 注册表项中的持久化（Persistence）迹象",
+    "说明 Prefetch、Amcache 和 Shimcache 能够证明哪些程序执行信息",
+    "使用 KAPE 和 Velociraptor 大规模采集取证痕迹（Artifact）"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一位用户反映笔记本电脑变慢，并出现了奇怪的弹窗。EDR 显示周二有一个 Word 文档启动了 `powershell.exe`，之后便没有任何其他记录。它是被拦截了，还是悄悄执行成功了？在 Windows 上，答案分散在事件日志、注册表、文件系统和内存之中。\n\nWindows 留下的证据十分丰富：几乎每个操作都会在某处留下痕迹。关键技能在于知道先看哪里，以及如何在不改变所发现内容的前提下进行采集。本课为防御者提供一套针对已获授权检查的主机的工作流程，并与[可疑进程与服务分析](/learn/security-operations-dfir/suspicious-process-and-service-analysis)和[磁盘与内存取证](/learn/security-operations-dfir/disk-and-memory-forensics)相衔接。"
+    },
+    {
+      "id": "events",
+      "type": "text",
+      "markdown": "## 从事件日志入手\n\n事件日志是最快的证据来源，而且通常会转发到 SIEM，因此攻击者在本地清除日志会留下你能看到的空缺。请记住一小批事件 ID。\n\n| 日志 | 事件 ID | 含义 |\n|:--|:--|:--|\n| Security | 4624 / 4625 | 登录成功 / 失败（注意登录类型） |\n| Security | 4688 | 进程已创建（若已启用则包含命令行） |\n| Security | 4720 / 4732 | 账户已创建 / 已添加到组 |\n| Security | 1102 | 审计日志已清除 |\n| System | 7045 | 新服务已安装 |\n| Security | 4698 | 计划任务已创建 |\n| PowerShell | 4104 | 已记录脚本块 |\n| Sysmon | 1 / 3 / 11 | 进程、网络连接、文件创建 |\n\n登录类型很重要：类型 2 是交互式登录，类型 3 是网络登录，类型 10 是远程桌面登录。同一台工作站向众多服务器发起的大量类型 3 登录，会在[横向移动检测](/learn/security-operations-dfir/lateral-movement-detection)中讲解。"
+    },
+    {
+      "id": "win-seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Word 文档启动 PowerShell",
+      "caption": "父子进程关系是 Windows 响应中最强的信号之一。",
+      "data": {
+        "actors": [
+          {
+            "id": "user",
+            "icon": "user",
+            "label": "用户",
+            "sub": "jsmith"
+          },
+          {
+            "id": "word",
+            "icon": "file",
+            "label": "WINWORD",
+            "sub": "Office"
+          },
+          {
+            "id": "ps",
+            "icon": "cpu",
+            "label": "PowerShell",
+            "sub": "子进程"
+          },
+          {
+            "id": "sys",
+            "icon": "log",
+            "label": "事件日志",
+            "sub": "4688, 4104"
+          },
+          {
+            "id": "net",
+            "icon": "globe",
+            "label": "远程主机",
+            "sub": "203.0.113.80"
+          }
+        ],
+        "steps": [
+          {
+            "from": "user",
+            "to": "word",
+            "label": "打开 invoice.docm",
+            "detail": "已启用宏",
+            "note": "用户打开附件并启用了宏。",
+            "tone": "warning"
+          },
+          {
+            "from": "word",
+            "to": "ps",
+            "label": "生成子进程",
+            "detail": "powershell.exe -enc ...",
+            "note": "Word 使用编码命令启动 PowerShell，这在正常文档中十分罕见。",
+            "tone": "danger"
+          },
+          {
+            "from": "ps",
+            "to": "sys",
+            "label": "事件 4688",
+            "detail": "ParentImage=WINWORD.EXE",
+            "note": "进程创建事件记录了异常的父进程和命令行。"
+          },
+          {
+            "from": "ps",
+            "to": "sys",
+            "label": "事件 4104",
+            "detail": "脚本块",
+            "note": "脚本块日志记录（Script Block Logging）保存了解码后的脚本文本。",
+            "tone": "secure"
+          },
+          {
+            "from": "ps",
+            "to": "net",
+            "label": "HTTPS 请求",
+            "detail": "Sysmon 3",
+            "note": "PowerShell 向外连接到一个罕见的地址。",
+            "tone": "danger"
+          },
+          {
+            "from": "sys",
+            "to": "user",
+            "label": "分析师转向调查",
+            "detail": "EDR + SIEM",
+            "note": "分析师利用父进程、命令行和地址来界定其他受影响主机的范围。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "live",
+      "type": "text",
+      "markdown": "## 检查进程、服务和持久化\n\n在运行中的主机上，查找父进程不合常理的进程（如 `winword.exe` 启动 `powershell.exe`，或 `svchost.exe` 并非由 `services.exe` 启动），从 `%TEMP%` 和 `%APPDATA%` 等用户可写路径运行的进程，以及名称模仿系统文件的进程。\n\n然后检查常见的持久化位置：`Run` 和 `RunOnce` 注册表项、计划任务、新服务、启动文件夹和 WMI 事件订阅。如果有已知良好的基线（Baseline），请将所发现的内容与之对比。以只读方式采集证据，并将输出连同哈希值保存到外部介质。以下命令为 PowerShell，需在已获授权的主机上以管理员身份运行。"
+    },
+    {
+      "id": "ps-term",
+      "type": "terminal",
+      "title": "在 PowerShell 中进行实时检查",
+      "prompt": "PS C:\\>",
+      "lines": [
+        {
+          "cmd": "Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId,Name,CommandLine | Where-Object Name -eq 'powershell.exe' | Format-List",
+          "output": "ProcessId       : 7312\nParentProcessId : 5540\nName            : powershell.exe\nCommandLine     : powershell.exe -nop -w hidden -enc <BASE64-PLACEHOLDER>",
+          "comment": "隐藏窗口和编码命令：请在沙箱中解码，切勿运行。"
+        },
+        {
+          "cmd": "Get-CimInstance Win32_Process -Filter 'ProcessId=5540' | Select Name,ExecutablePath",
+          "output": "Name        ExecutablePath\n----        --------------\nWINWORD.EXE C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+          "comment": "父进程是 Word，证实了文档来源。"
+        },
+        {
+          "cmd": "Get-ScheduledTask | Where-Object {$_.Date -gt (Get-Date).AddDays(-7)} | Select TaskName,TaskPath,Date",
+          "output": "TaskName         TaskPath  Date\n--------         --------  ----\nOneDriveSyncChk  \\         11/10/2026 14:22:05",
+          "comment": "新任务的名称模仿真实产品。"
+        },
+        {
+          "cmd": "Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'",
+          "output": "OneDriveSyncChk : C:\\Users\\jsmith\\AppData\\Roaming\\onesync\\chk.exe",
+          "comment": "Run 键指向用户可写路径。"
+        }
+      ],
+      "caption": "示例输出。编码后的载荷仅以占位符显示。"
+    },
+    {
+      "id": "accounts",
+      "type": "text",
+      "markdown": "## 审查账户、会话和网络状态\n\n攻击者需要身份。使用 `net localgroup administrators` 审查本地管理员，查看最近创建的账户（事件 4720）以及加入特权组的记录（4732）。使用 `query user` 和 `net session` 检查活动会话，并在每个用户的 `Terminal Server Client` 注册表项中列出远程桌面历史记录。\n\n然后查看网络。将 `Get-NetTCPConnection -State Established` 与所属进程关联，可以看出谁在向外通信。位于 `AppData` 中的未签名二进制文件如果与罕见地址保持连接，应立即关注。如果主机是服务器，还应使用 `net share` 检查共享，并检查最近的 SMB 访问，因为被盗数据往往最先从文件共享流出。\n\n最后，测试安全工具是否被篡改。查找被停止的杀毒软件服务、Defender 配置中新增的排除路径以及审计策略的变更。禁用防御措施本身就是一种入侵指标（Indicator），而且通常发生在早期。"
+    },
+    {
+      "id": "logging",
+      "type": "callout",
+      "variant": "note",
+      "title": "你会后悔没有启用的日志",
+      "markdown": "事件 4688 的命令行审计、PowerShell 脚本块日志记录和 Sysmon 默认都未启用。请在事件发生之前在整个设备群中启用它们，因为对于从未被记录的事件，事后无法恢复任何内容。同时要为 Security 日志设置足够大的容量，因为繁忙的服务器可能在几小时内覆盖一周的历史记录。将日志实时转发到中央收集器，这样即使攻击者清除了本地副本，也无法抹去记录；并定期测试转发功能在更新和策略变更之后是否仍然正常。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "时区与时钟",
+      "markdown": "Windows 事件日志以 UTC 存储时间，但事件查看器显示的是本地时间。Prefetch 和许多注册表值也使用 UTC。构建时间线之前，请将所有时间统一转换为 UTC，并将主机时钟与可信时间源比对，以便校正时钟漂移。"
+    },
+    {
+      "id": "artifacts",
+      "type": "text",
+      "markdown": "## 用痕迹证明程序执行\n\n即使攻击者删除了某个程序，Windows 仍会记得它曾运行过。要了解每种痕迹能证明什么，因为它们的证明力并不相同。\n\n| 痕迹 | 位置 | 能说明什么 |\n|:--|:--|:--|\n| **Prefetch** | `C:\\Windows\\Prefetch\\*.pf` | 程序运行过；运行次数和最近 8 次运行时间 |\n| **Amcache** | `Amcache.hve` | 程序存在或运行过；文件的 SHA-1 |\n| **Shimcache** | `SYSTEM` 配置单元 | 程序曾存在；不一定能证明已执行 |\n| **UserAssist** | `NTUSER.DAT` | 用户启动的图形界面程序 |\n| **跳转列表、LNK** | 用户配置文件 | 用户打开过的文件 |\n\n部分服务器版本会禁用 Prefetch，SSD 的情况也可能不同，因此它的缺失并不能说明太多问题。在断言某程序运行过之前，至少要结合两种痕迹。[磁盘与内存取证](/learn/security-operations-dfir/disk-and-memory-forensics)中的时间线工具可将这些痕迹合并为一个视图。"
+    },
+    {
+      "id": "collect",
+      "type": "text",
+      "markdown": "## 使用 KAPE 和 Velociraptor 大规模采集\n\n手动输入命令无法扩展到多台主机。有两款工具可为防御者解决这个问题。\n\n**KAPE**（Kroll Artifact Parser and Extractor）使用*目标（targets）*快速复制取证痕迹，然后使用*模块（modules）*运行解析器。它非常适合你能够直接接触的单台主机。\n\n**Velociraptor** 在整个环境中运行代理。你用 VQL（Velociraptor Query Language）编写一个痕迹采集项，即可从数百台主机采集，或在各处搜寻某个指标。两者都会写入外部存储并保留时间戳。\n\n采用能回答问题的最小范围采集：先分诊，只对确实需要的主机制作完整镜像。"
+    },
+    {
+      "id": "kape",
+      "type": "code",
+      "language": "powershell",
+      "code": "# Run from external media on an authorized host. Output goes to the same media.\n.\\kape.exe --tsource C: --tdest E:\\case042\\HOST07\\targets `\n  --target !SANS_Triage --vss `\n  --module !EZParser --mdest E:\\case042\\HOST07\\modules\n\n# Hash everything collected for the chain of custody\nGet-ChildItem E:\\case042\\HOST07 -Recurse -File |\n  Get-FileHash -Algorithm SHA256 |\n  Export-Csv E:\\case042\\HOST07\\hashes.csv -NoTypeInformation",
+      "filename": "kape_triage.ps1",
+      "caption": "采集一组分诊用的痕迹，解析它们并对输出计算哈希。请核对你所用 KAPE 版本中的目标和模块名称。"
+    },
+    {
+      "id": "warning",
+      "type": "callout",
+      "variant": "warning",
+      "title": "保护你正在接触的证据",
+      "markdown": "不要从可疑磁盘运行采集工具，不要用普通用户会话浏览主机，也绝不要执行可疑文件来查看它做了什么。只在你自己控制的隔离沙箱中分析样本。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你自己拥有的 Windows 虚拟机中，启用带命令行记录的进程创建审计（组策略：审核进程创建，以及在进程创建事件中包含命令行）。打开记事本和一个 PowerShell 窗口，然后使用事件查看器或 `Get-WinEvent -FilterHashtable @{LogName='Security';Id=4688}` 找到它们。记下每个进程的父进程，再在 Prefetch 文件夹中找到 `NOTEPAD.EXE-*.pf`，将其最近运行时间与该事件进行比较。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "事件 ID 4688（Event ID 4688）",
+          "definition": "记录进程已被创建的 Security 事件。"
+        },
+        {
+          "term": "登录类型（Logon type）",
+          "definition": "表示用户登录方式的代码：交互式、网络或远程。"
+        },
+        {
+          "term": "Prefetch（预读取文件）",
+          "definition": "记录程序执行情况以加快后续启动速度的文件。"
+        },
+        {
+          "term": "Amcache",
+          "definition": "存储已执行程序的详细信息和哈希值的注册表配置单元（Hive）。"
+        },
+        {
+          "term": "Shimcache（应用兼容性缓存）",
+          "definition": "列出系统所见程序的兼容性缓存。"
+        },
+        {
+          "term": "KAPE",
+          "definition": "可快速采集并解析取证痕迹的工具。"
+        },
+        {
+          "term": "Velociraptor",
+          "definition": "用于采集痕迹并通过 VQL 进行威胁搜寻的终端代理。"
+        },
+        {
+          "term": "Sysmon",
+          "definition": "微软 Sysinternals 提供的服务，可记录详细的进程和网络事件。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "哪个事件 ID 表示 Windows 主机上安装了新服务？",
+          "options": [
+            "4624",
+            "7045",
+            "1102",
+            "4104"
+          ],
+          "answer": 1,
+          "explanation": "System 事件 7045 记录服务安装，这是一种常见的持久化方法。"
+        },
+        {
+          "question": "哪些发现属于可疑的进程关系？请选择所有适用项。",
+          "options": [
+            "winword.exe 启动 powershell.exe",
+            "explorer.exe 启动 notepad.exe",
+            "services.exe 启动 svchost.exe",
+            "excel.exe 启动带有一长串编码字符串的 cmd.exe"
+          ],
+          "answer": [
+            0,
+            3
+          ],
+          "explanation": "Office 应用程序生成命令解释器是一个强信号。Explorer 启动记事本以及 services.exe 启动 svchost.exe 都是正常现象。"
+        },
+        {
+          "question": "仅凭 Shimcache 能证明什么？",
+          "options": [
+            "程序一定运行过",
+            "程序曾存在于系统中，但不能保证已执行",
+            "程序已被签名",
+            "程序已被用户删除"
+          ],
+          "answer": 1,
+          "explanation": "Shimcache 可能记录仅被浏览过或仅存在的文件，因此要与 Prefetch 或 Amcache 配合使用。"
+        },
+        {
+          "question": "从可疑 Windows 主机采集时，哪些是良好做法？请选择所有适用项。",
+          "options": [
+            "从外部介质运行工具",
+            "将输出写入外部存储并计算哈希",
+            "在主机上执行可疑文件以观察其行为",
+            "记录时区和 UTC 时间"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "在主机上执行会污染证据并带来扩散风险。其他做法则有助于保护完整性。"
+        },
+        {
+          "question": "什么情况下 Velociraptor 比 KAPE 更合适？",
+          "options": [
+            "需要在多台主机上采集或搜寻时",
+            "磁盘已加密时",
+            "只有一份离线镜像时",
+            "不存在任何日志时"
+          ],
+          "answer": 0,
+          "explanation": "Velociraptor 代理可让你在多个终端上运行同一查询，而 KAPE 一次只针对一台主机。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n在 Windows 上，先从事件日志和父子进程关系入手，再检查服务、计划任务和 Run 键。用多种痕迹而非单一痕迹证明执行：Prefetch、Amcache、Shimcache 和 UserAssist 各自回答不同的问题。单台主机用 KAPE，多台主机用 Velociraptor，并始终写入外部存储且对结果计算哈希。下一步，请学习攻击者如何在机器之间移动：[横向移动检测](/learn/security-operations-dfir/lateral-movement-detection)。"
+    }
+  ]
+}
