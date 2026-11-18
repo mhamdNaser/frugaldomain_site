@@ -1,0 +1,287 @@
+{
+  "title": "Windows 事件转发 (Windows Event Forwarding)",
+  "summary": "了解 Windows 事件转发如何在不安装代理的情况下从域内机器收集安全事件，以及如何构建并验证订阅。",
+  "objectives": [
+    "解释 Windows 事件转发 (WEF) 和 Windows 事件收集器 (WEC) 的工作原理",
+    "比较收集器发起 (collector-initiated) 和源发起 (source-initiated) 的订阅",
+    "使用 GPO 配置源发起的订阅",
+    "选择高价值的事件 ID 并验证送达"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一个域中有 3,000 台工作站。每台都在本地写入自己的 Security 日志，而日志每隔几小时就会回绕覆盖。当一条关于某台笔记本电脑可疑活动的告警到来时，上周二的证据早已消失。\n\n你可以在所有机器上部署代理，但 Windows 已经内置了答案：**Windows 事件转发 (Windows Event Forwarding, WEF)**。机器通过基于 HTTPS 的 WinRM 把选定的事件发送给少数几台 **Windows 事件收集器 (Windows Event Collector, WEC)** 服务器，然后 SIEM 只需从那里读取一次。终端上不运行任何第三方代理。在本课中，你将在自己拥有的域中构建订阅并验证它。"
+    },
+    {
+      "id": "arch",
+      "type": "text",
+      "markdown": "## WEF 如何工作\n\n共有三个角色参与：\n\n- **源计算机 (Source computers)** 保存事件，并运行 Windows 远程管理 (Windows Remote Management, WinRM) 服务。\n- **收集器 (collector, WEC)** 运行 Windows 事件收集器服务，并把转发来的事件存储在它的 `ForwardedEvents` 日志中。\n- **订阅 (subscription)** 定义转发哪些事件、来自哪些计算机，以及转发的频率。\n\n订阅有两种类型：\n\n| 类型 | 谁发起连接 | 最适合 |\n|:--|:--|:--|\n| 收集器发起 (Collector-initiated) | 收集器连接到列出的每个源 | 小型、固定的服务器组 |\n| 源发起 (Source-initiated) | 每个源通过组策略找到收集器并连接 | 数千台工作站、漫游的笔记本电脑 |\n\n源发起是大型环境的标准做法，因为你无需列出单台计算机。成员资格由安全组控制，例如 `Domain Computers`，身份验证使用 Kerberos，因此事件按计算机签名，且通道是加密的。"
+    },
+    {
+      "id": "wef-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "源发起的转发",
+      "caption": "工作站从组策略获知收集器地址，然后通过 WinRM 推送事件。",
+      "data": {
+        "actors": [
+          {
+            "id": "dc",
+            "label": "域控制器 (Domain controller)",
+            "sub": "GPO + Kerberos",
+            "icon": "server"
+          },
+          {
+            "id": "ws",
+            "label": "工作站 (Workstation)",
+            "sub": "WS-0142",
+            "icon": "laptop"
+          },
+          {
+            "id": "wec",
+            "label": "收集器 (Collector, WEC)",
+            "sub": "wec01.example.com",
+            "icon": "log"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "读取 ForwardedEvents",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "from": "dc",
+            "to": "ws",
+            "label": "应用 GPO",
+            "detail": "SubscriptionManager",
+            "note": "组策略告知工作站收集器的 URL 和刷新间隔。",
+            "tone": "secure"
+          },
+          {
+            "from": "ws",
+            "to": "dc",
+            "label": "Kerberos 票据",
+            "detail": "HTTP/wec01",
+            "note": "工作站为收集器请求服务票据。"
+          },
+          {
+            "from": "ws",
+            "to": "wec",
+            "label": "连接 (5985)",
+            "detail": "WinRM, Kerberos",
+            "note": "它建立一个经过认证且加密的 WinRM 会话，并请求订阅。"
+          },
+          {
+            "from": "wec",
+            "to": "ws",
+            "label": "订阅",
+            "detail": "查询：ID 4624, 4688 ...",
+            "note": "收集器返回适用于这台计算机的事件查询。"
+          },
+          {
+            "from": "ws",
+            "to": "wec",
+            "label": "事件（批量）",
+            "detail": "每 30 秒",
+            "note": "匹配的事件会成批发送到 ForwardedEvents 日志中。",
+            "tone": "success"
+          },
+          {
+            "from": "siem",
+            "to": "wec",
+            "label": "读取日志",
+            "detail": "一个连接",
+            "note": "SIEM 从一个地方读取，而不是从 3,000 个终端读取。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "setup",
+      "type": "text",
+      "markdown": "## 构建管道\n\n请在你自己拥有的实验域中按以下步骤操作。\n\n1. **准备收集器。**在 `wec01.example.com` 上运行 `winrm quickconfig` 和 `wecutil qc`，以启用 WinRM 和收集器服务。\n2. **授予对 Security 日志的读取权限。**把收集器的计算机账户添加到各个源上的 *Event Log Readers* 组，或者在通道访问字符串中使用 `Network Service` 的 ACL。\n3. **创建订阅。**定义一个查询，将其设置为 *Source computer initiated*（源计算机发起），并添加计算机组。\n4. **用 GPO 让源指向收集器。**在 *Computer Configuration, Administrative Templates, Windows Components, Event Forwarding* 下，把 *Configure target Subscription Manager* 设置为下面所示的字符串。\n5. **放行流量。**允许从工作站到收集器的 TCP 5985。尽管传输层是 HTTP，Kerberos 仍会加密负载。\n\n订阅 XML 示例："
+    },
+    {
+      "id": "sub-xml",
+      "type": "code",
+      "language": "plain",
+      "code": "<Subscription xmlns=\"http://schemas.microsoft.com/2006/03/windows/events/subscription\">\n  <SubscriptionId>HighValueSecurity</SubscriptionId>\n  <SubscriptionType>SourceInitiated</SubscriptionType>\n  <Description>Logons, process creation, log clearing</Description>\n  <Enabled>true</Enabled>\n  <ConfigurationMode>Custom</ConfigurationMode>\n  <Delivery Mode=\"Push\">\n    <Batching>\n      <MaxItems>50</MaxItems>\n      <MaxLatencyTime>30000</MaxLatencyTime>\n    </Batching>\n  </Delivery>\n  <Query><![CDATA[\n    <QueryList><Query Id=\"0\">\n      <Select Path=\"Security\">*[System[(EventID=4624 or EventID=4625 or EventID=4672 or EventID=4688 or EventID=1102)]]</Select>\n    </Query></QueryList>]]></Query>\n  <ReadExistingEvents>false</ReadExistingEvents>\n  <ContentFormat>RenderedText</ContentFormat>\n  <AllowedSourceDomainComputers>O:NSG:BAD:P(A;;GA;;;DC)S:</AllowedSourceDomainComputers>\n</Subscription>\n",
+      "filename": "HighValueSecurity.xml",
+      "caption": "一个源发起的订阅。批处理最多发送 50 个事件，或等待 30 秒，SDDL 将其限制为 Domain Computers。"
+    },
+    {
+      "id": "gpo-ps",
+      "type": "code",
+      "language": "powershell",
+      "code": "wecutil cs C:\\wef\\HighValueSecurity.xml\nwecutil gs HighValueSecurity\nwecutil gr HighValueSecurity\n\n# GPO value for 'Configure target Subscription Manager':\n# Server=http://wec01.example.com:5985/wsman/SubscriptionManager/WEC,Refresh=60\n\n# On a workstation: confirm the policy arrived\ngpresult /r /scope computer | Select-String \"Event Forwarding\"\n",
+      "caption": "在收集器上从提升权限的提示符中创建并检查订阅，然后在客户端上确认 GPO 字符串。"
+    },
+    {
+      "id": "ids",
+      "type": "text",
+      "markdown": "## 选择要转发什么\n\n转发所有事件违背了初衷。应从一个小而高价值的集合开始，再逐步扩大。\n\n| 事件 ID | 日志 | 含义 | 用途 |\n|:--|:--|:--|:--|\n| 4624 / 4625 | Security | 登录成功 / 失败 | 暴力破解、横向移动 |\n| 4672 | Security | 分配了特殊权限 | 管理员登录 |\n| 4688 | Security | 创建了进程（需启用命令行审核） | 执行跟踪 |\n| 4720 / 4732 | Security | 创建账户 / 添加到组 | 持久化 |\n| 1102 | Security | 审核日志被清除 | 反取证 |\n| 4104 | PowerShell | 记录了脚本块 | 脚本分析 |\n\n4688 中的命令行捕获默认是关闭的。请使用策略 *Include command line in process creation events* 将其开启。Sysmon 提供更丰富的进程和网络事件，并且可以用同样的方式转发。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "使用多个收集器扩展规模",
+      "markdown": "一台收集器可以轻松处理约 4,000 个源。超过这个数量，就要增加收集器，并使用 GPO 中的订阅管理器列表来分摊负载。把它们放在 DNS 别名之后，这样你替换服务器时就无需改动每一个客户端。"
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "wec01",
+      "prompt": "$",
+      "caption": "检查各个源是否处于活动状态，以及事件是否正在到达。名称为实验示例。",
+      "lines": [
+        {
+          "cmd": "wecutil gr HighValueSecurity",
+          "output": "Subscription: HighValueSecurity\n    RunTimeStatus: Active\n    LastError: 0\n    EventSources:\n        WS-0142.example.com\n            RunTimeStatus: Active\n            LastHeartbeatTime: 2026-11-12T09:41:07.000\n        WS-0377.example.com\n            RunTimeStatus: Disconnected\n            LastError: 0x5",
+          "comment": "Active 表示事件正在流动。错误 0x5 表示访问被拒绝：请检查 Event Log Readers 的成员资格"
+        },
+        {
+          "cmd": "powershell -c \"Get-WinEvent -LogName ForwardedEvents -MaxEvents 1 | Format-List TimeCreated,MachineName,Id\"",
+          "output": "TimeCreated : 11/12/2026 9:41:02 AM\nMachineName : WS-0142.example.com\nId          : 4688",
+          "comment": "MachineName 显示的是原始计算机，而不是收集器"
+        }
+      ]
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你自己拥有的实验域中，用一台 Windows Server 作为收集器，再用一台 Windows 客户端，构建上面的订阅。应用 GPO，在客户端上运行 `gpupdate /force`，并等待约一分钟。然后在客户端上打开记事本，在收集器上运行 `wecutil gr HighValueSecurity`，并在 `ForwardedEvents` 中找到新的 4688 事件。最后，把客户端从计算机组中移除，观察其状态的变化。未经批准，切勿在生产机器上测试。"
+    },
+    {
+      "id": "tune",
+      "type": "text",
+      "markdown": "## 调优数据量与成本\n\n繁忙的域控制器每分钟可能产生数千条登录事件。应在事件到达 SIEM 之前减少数据量：\n\n- **在查询中过滤。**用 XPath 条件排除计算机账户（名称以 `$` 结尾）和已知的服务账户。\n- **使用独立的订阅。**把域控制器放在一个订阅中，工作站放在另一个订阅中，这样各自可以有自己的批处理和查询。\n- **优先选择有意义的登录类型。**类型 3（网络）、10（远程交互式）和 2（交互式）对调查最为重要。\n\n以收集器上的每秒事件数来衡量结果，并每季度审查一次查询，因为新的检测需要新的字段。"
+    },
+    {
+      "id": "trouble",
+      "type": "text",
+      "markdown": "## 故障排查流程\n\n当事件没有到达时，从源向收集器的方向逐步排查。\n\n1. **事件到底有没有被记录？**在源上用 `Get-WinEvent -LogName Security -MaxEvents 5` 检查。如果审核策略是关闭的，就没有什么可转发的。\n2. **策略是否已应用？**运行 `gpresult` 并确认 Subscription Manager 字符串。检查 `Windows Remote Management` 服务是否正在运行。\n3. **源能否到达收集器？**用 `Test-NetConnection wec01.example.com -Port 5985` 测试。防火墙和代理是最常见的阻碍。\n4. **Kerberos 是否正常？**超过五分钟的时钟偏差或缺失 SPN 会破坏身份验证。源上的 `Microsoft-Windows-Eventlog-ForwardingPlugin/Operational` 日志会记录确切的失败原因。\n5. **订阅查询是否有效？**XPath 中的拼写错误会返回零事件，也不会报错。请先在事件查看器中测试同样的查询。\n\n保持订阅精简，并在应用到整个域之前，先在试点组中测试更改。"
+    },
+    {
+      "id": "limits",
+      "type": "text",
+      "markdown": "## 局限与良好实践\n\nWEF 免费且无需代理，但它并不是一个完整的解决方案。它只转发 Windows 事件日志，没有内置的解析功能，而且在订阅悄然停滞时几乎不会报告。当你需要文件完整性监控或非 Windows 来源时，请将它与 [Wazuh](/learn/security-operations-dfir/wazuh-security-monitoring) 这样基于代理的工具结合使用。\n\n要像保护域控制器一样保护收集器：它集中了整个环境的安全历史。监控心跳时间，对静默超过一小时的源发出告警，并设置 `ForwardedEvents` 日志的大小（例如 4 GB），使其在 SIEM 读取之前不会回绕。关于更广泛的管道，请参见 [集中式日志管理](/learn/security-operations-dfir/centralized-log-management)。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "WEF",
+          "definition": "Windows 事件转发 (Windows Event Forwarding)，用于把事件发送到收集器的内置机制。"
+        },
+        {
+          "term": "WEC",
+          "definition": "存储转发事件的 Windows 事件收集器 (Windows Event Collector) 服务器。"
+        },
+        {
+          "term": "订阅 (Subscription)",
+          "definition": "对转发哪些事件、来自哪些计算机的定义。"
+        },
+        {
+          "term": "源发起 (Source-initiated)",
+          "definition": "客户端通过组策略找到收集器并连接到它。"
+        },
+        {
+          "term": "WinRM",
+          "definition": "Windows 远程管理 (Windows Remote Management)，WEF 使用的传输机制。"
+        },
+        {
+          "term": "ForwardedEvents",
+          "definition": "收集器上用于保存来自各个源的事件的默认日志。"
+        },
+        {
+          "term": "事件 ID 4688 (Event ID 4688)",
+          "definition": "创建了进程；需要启用命令行审核才能发挥全部价值。"
+        },
+        {
+          "term": "事件 ID 1102 (Event ID 1102)",
+          "definition": "安全审核日志被清除。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "为什么源发起是大型环境的标准做法？",
+          "options": [
+            "它使用 UDP",
+            "客户端通过 GPO 找到收集器，因此无需列出每台计算机",
+            "它不需要身份验证",
+            "它转发每一个事件"
+          ],
+          "answer": 1,
+          "explanation": "组策略告诉每个客户端该连接到哪里，因此订阅可以扩展。"
+        },
+        {
+          "question": "哪些事件 ID 对检测活动具有高价值？选择所有适用项。",
+          "options": [
+            "4625 登录失败",
+            "1102 日志被清除",
+            "4688 创建进程",
+            "7036 打印机上的服务状态变化"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "登录失败、日志清除和进程创建是核心检测对象。打印机服务变化大多是噪声。"
+        },
+        {
+          "question": "某个源显示 RunTimeStatus Disconnected 且 LastError 为 0x5。最可能的原因是什么？",
+          "options": [
+            "磁盘已满",
+            "对 Security 日志的访问被拒绝",
+            "时区错误",
+            "DNS 记录过期"
+          ],
+          "answer": 1,
+          "explanation": "0x5 表示访问被拒绝；请把收集器账户添加到 Event Log Readers。"
+        },
+        {
+          "question": "为什么事件 ID 4688 往往没有预期的那么有用？",
+          "options": [
+            "它从不被记录",
+            "命令行审核默认是关闭的",
+            "它只在 Linux 上有效",
+            "它是加密的"
+          ],
+          "answer": 1,
+          "explanation": "启用相应策略，使进程创建事件包含命令行。"
+        },
+        {
+          "question": "WEF 使用哪种传输方式和保护？",
+          "options": [
+            "WinRM，负载受 Kerberos 保护",
+            "基于 UDP 的明文 syslog",
+            "未签名的 SMB",
+            "FTP"
+          ],
+          "answer": 0,
+          "explanation": "WEF 使用 WinRM；Kerberos 对消息进行认证和加密。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\nWindows 事件转发无需额外的代理，就能把选定的事件从终端转移到少数几台收集器。优先使用由组策略驱动的源发起订阅，转发一小部分高价值的事件 ID，启用命令行审核，并用 `wecutil gr` 验证送达。保护并监控收集器，然后让 SIEM 读取它。接下来，请在 [Wazuh 安全监控](/learn/security-operations-dfir/wazuh-security-monitoring) 中继续学习基于代理的监控。"
+    }
+  ]
+}

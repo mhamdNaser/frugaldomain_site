@@ -1,0 +1,259 @@
+{
+  "title": "自动化方案的日志记录 (Logging for Automation Solutions)",
+  "summary": "为网络自动化设计日志记录：日志级别、带关联 ID 的结构化 JSON、集中收集以及对机密信息的安全处理。",
+  "objectives": [
+    "为每个事件选择合适的日志级别",
+    "编写带有关联 ID (correlation ID) 的结构化日志",
+    "对机密信息进行脱敏，避免记录敏感数据",
+    "为 CI 和容器收集并轮转日志",
+    "使用日志排查并审计自动化运行"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "凌晨 02:10，一条流水线向 60 台交换机推送了变更。02:14，监控系统告警，其中六台交换机的上行链路中断。值班工程师打开作业日志，只看到一行：`Error`。是哪台设备？哪个任务？哪个请求？没有有用的日志，唯一的办法就是猜测，或者把所有改动全部回滚。\n\n日志记录是自动化方案自我说明的方式。好的日志能回答四个问题：**发生了什么**、**在哪里**（哪台设备和哪个任务）、**何时**，以及**为什么**失败。糟糕的日志要么什么都不说，要么更糟，泄露了它所使用的密码。"
+    },
+    {
+      "id": "levels",
+      "type": "text",
+      "markdown": "## 日志级别及各自适用的内容\n\n| 级别 | 适用于 | 示例 |\n|:--|:--|:--|\n| `DEBUG` | 面向开发者的细节：负载大小、耗时 | `GET /restconf/data/... took 0.42s` |\n| `INFO` | 正常的里程碑事件 | `R1 ntp changed` |\n| `WARNING` | 出现意外但已被处理的情况 | `retry 2/3 after 503` |\n| `ERROR` | 某个任务失败；运行继续 | `R2 patch failed: 401` |\n| `CRITICAL` | 整个运行无法继续 | `inventory file missing` |\n\n生产环境以 `INFO` 级别运行，仅在排查故障时切换到 `DEBUG`，最好通过环境变量针对单次运行切换。记录事件，而不是闲聊：每台设备每个动作一行，比 500 行进度小圆点更有用。\n\n同时还要记录**带堆栈跟踪的异常**（在 `except` 内使用 `log.exception(...)`）以及每个任务的**结果**（已变更、未变更、失败）。审计跟踪需要回答\"谁在哪台设备上运行了什么，结果如何\"。"
+    },
+    {
+      "id": "struct",
+      "type": "text",
+      "markdown": "## 结构化日志与关联\n\n自由文本容易写，却难以搜索。**结构化日志 (Structured logging)** 将每个事件写成带固定字段的 JSON，这样 Splunk、Elastic 或 Loki 等日志平台无需正则表达式就能按 `device=\"R2\"` 或 `level=\"ERROR\"` 进行过滤。\n\n为同一次运行的每一行都加上**关联 ID (correlation ID)**（`run_id`）。这样，一次搜索就能返回一个流水线作业跨越脚本、API 调用和设备的完整经过。在所有工具中使用相同的字段名，并以带偏移量的 UTC 记录时间戳，使来自不同时区的日志能够对齐。\n\n将日志发送到集中位置。本地文件会随临时的 CI 运行器或容器一起消失，因此应写入 **stdout** 并让平台收集，或通过 syslog 或代理 (agent) 转发。使用轮转（`RotatingFileHandler`）限制本地文件大小，以免繁忙的夜晚把磁盘写满。另见 [模型驱动遥测](/learn/network-automation-devops/model-driven-telemetry)，了解这类数据在设备侧的对应物。"
+    },
+    {
+      "id": "code",
+      "type": "code",
+      "language": "python",
+      "filename": "logsetup.py",
+      "code": "import json\nimport logging\nimport logging.handlers\nimport re\nimport sys\nimport uuid\n\nSECRET = re.compile(r\"(password|token|secret|api[_-]?key)(\\\"?\\s*[:=]\\s*\\\"?)[^\\s\\\",}]+\", re.I)\n\n\nclass RedactFilter(logging.Filter):\n    def filter(self, record):\n        record.msg = SECRET.sub(r\"\\1\\2***\", str(record.msg))   # mask before output\n        return True\n\n\nclass JsonFormatter(logging.Formatter):\n    def format(self, record):\n        entry = {\n            \"ts\": self.formatTime(record, \"%Y-%m-%dT%H:%M:%S%z\"),\n            \"level\": record.levelname,\n            \"logger\": record.name,\n            \"msg\": record.getMessage(),\n            \"run_id\": getattr(record, \"run_id\", None),\n            \"device\": getattr(record, \"device\", None),\n        }\n        if record.exc_info:\n            entry[\"exc\"] = self.formatException(record.exc_info)\n        return json.dumps(entry)\n\n\ndef setup(level=logging.INFO):\n    root = logging.getLogger()\n    root.setLevel(level)\n    console = logging.StreamHandler(sys.stdout)                     # CI and containers read stdout\n    console.setFormatter(JsonFormatter())\n    console.addFilter(RedactFilter())\n    root.addHandler(console)\n    rotating = logging.handlers.RotatingFileHandler(\"automation.log\", maxBytes=5_000_000, backupCount=5)\n    rotating.setFormatter(JsonFormatter())\n    rotating.addFilter(RedactFilter())\n    root.addHandler(rotating)\n\n\nif __name__ == \"__main__\":\n    setup()\n    log = logging.LoggerAdapter(logging.getLogger(\"ntp-sync\"), {\"run_id\": uuid.uuid4().hex[:8], \"device\": \"198.51.100.11\"})\n    log.info(\"change applied\")\n    log.warning(\"login retry password=Sup3rSecret\")\n    try:\n        1 / 0\n    except ZeroDivisionError:\n        log.exception(\"unexpected error\")\n",
+      "caption": "带关联 ID 的结构化 JSON 日志、机密信息脱敏、stdout 输出和文件轮转。",
+      "highlight": [
+        10,
+        11,
+        12,
+        30,
+        31,
+        32,
+        36
+      ]
+    },
+    {
+      "id": "out",
+      "type": "terminal",
+      "title": "python logsetup.py",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "python logsetup.py",
+          "output": "{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"INFO\", \"logger\": \"ntp-sync\", \"msg\": \"change applied\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"WARNING\", \"logger\": \"ntp-sync\", \"msg\": \"login retry password=***\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"ERROR\", \"logger\": \"ntp-sync\", \"msg\": \"unexpected error\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\", \"exc\": \"Traceback ... ZeroDivisionError: division by zero\"}",
+          "comment": "密码值在该行写入之前就已被屏蔽。"
+        }
+      ],
+      "caption": "每个事件一个 JSON 对象，全部共享同一个 run_id。"
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从事件到洞察",
+      "caption": "日志行只有到达可搜索且受保护的位置才有用。",
+      "data": {
+        "token": "日志事件",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "自动化作业",
+            "sub": "Python / Ansible",
+            "icon": "cpu"
+          },
+          {
+            "id": "flt",
+            "label": "脱敏",
+            "sub": "屏蔽机密信息",
+            "icon": "shield"
+          },
+          {
+            "id": "col",
+            "label": "收集器",
+            "sub": "stdout / syslog",
+            "icon": "server"
+          },
+          {
+            "id": "sto",
+            "label": "日志平台",
+            "sub": "Splunk / Elastic",
+            "icon": "database"
+          },
+          {
+            "id": "eng",
+            "label": "工程师",
+            "sub": "按 run_id 搜索",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "作业为每台设备的每个动作发出一个结构化事件。"
+          },
+          {
+            "at": "flt",
+            "caption": "在写入任何内容之前，过滤器会屏蔽密码和令牌。",
+            "tone": "success"
+          },
+          {
+            "at": "col",
+            "caption": "CI 运行器或容器平台收集 stdout。"
+          },
+          {
+            "at": "sto",
+            "caption": "事件按时间、级别、设备和 run_id 建立索引，并带有保留策略。"
+          },
+          {
+            "at": "eng",
+            "caption": "按单个 run_id 搜索即可按顺序重建整个作业。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sec",
+      "type": "text",
+      "markdown": "## 保护日志\n\n日志同样是数据。它们往往包含主机名、用户名、IP 地址和 API 响应，因此应将其视为敏感信息。\n\n- **绝不记录机密信息。** 包括密码、令牌、API 密钥、SNMP 团体字符串、预共享密钥和 `Authorization` 头。可以按模式脱敏作为兜底，但不要依赖它：从一开始就避免把机密信息放进消息里。参见 [Secure Coding](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)。\n- **当心完整的响应。** API 返回的设备配置可能包含经过哈希或可逆的密码。记录状态码和大小，不要记录响应体。\n- **限制访问并保持完整性。** 仅向需要的人员授予只读访问权限，将日志写入自动化账户无法删除的存储，并按照你的策略要求的期限保留。\n- **记录用户输入之前先做清理。** 包含换行符的值可以伪造一行假日志（日志注入）。结构化 JSON 会替你转义它。\n- **不要使用 `print()`。** 它没有级别、没有时间戳，也无法控制处理器。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "生产环境中的调试日志",
+      "markdown": "HTTP 库的 `DEBUG` 输出可能包含带有凭据的请求头。切勿在生产运行中保持调试日志开启，并且在启用之前先检查库会记录哪些内容。"
+    },
+    {
+      "id": "ops",
+      "type": "text",
+      "markdown": "## 使用日志排查故障\n\n当 02:14 的告警触发时，好的日志能让你按固定顺序工作。\n\n1. **找到这次运行。** 搜索作业的 `run_id`，或者时间窗口和设备名称。\n2. **先看第一个错误，而不是最后一个。** 后面的错误往往是第一个故障造成的后果。\n3. **检查上下文。** 查看错误之前的几行：哪个请求、哪次重试、什么响应码。\n4. **与正常的运行对比。** 昨天运行中的同一台设备能显示出发生了什么变化。\n\n普通的日志行也可以驱动**告警**。统计每次运行的 `ERROR` 事件数量，如果比率超过阈值，或者某次运行根本没有产生 `INFO` 完成行（这表明它悄无声息地崩溃了），就通知团队。\n\n### 保留期限与成本\n\n详细日志保留较短时间，摘要或审计事件保留更长时间。常见的划分是完整日志保留 30 天，\"谁改了什么\"的记录保留一年或更久，具体遵循你的合规策略。避免在 `INFO` 级别记录完整负载：在集中式平台上数据量意味着成本，还会淹没有用的信号。\n\n### Ansible 和其他工具\n\n相同的原则同样适用于 Python 之外。Ansible 可以通过 `log_path` 设置写入日志文件，并使用 `-v` 详细级别显示任务结果，但更高的级别会打印模块参数，因此在生产环境中应关闭它们，并对处理机密信息的任务使用 `no_log: true`。\n\n### 把审查日志作为变更的一部分\n\n每次重要运行之后，快速浏览摘要：有多少设备已变更、未变更和失败。将 `run_id` 记录在变更工单中，以便审计人员日后能够找到证据。把没有人能据以采取行动的日志消息视为缺陷并改进其措辞，因为深夜阅读它的工程师没有其他上下文可用。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "1. 保存 `logsetup.py` 并运行它。确认密码在控制台和 `automation.log` 中都被替换为 `***`。\n2. 通过对三个文档地址（198.51.100.11 到 .13）的循环添加 `device` 值，并让其中一台出现失败。\n3. 使用 `jq` 只列出错误：`jq 'select(.level==\"ERROR\")' automation.log`。\n4. 使用 `jq 'select(.run_id==\"<id>\")' automation.log` 对同一次运行的行进行分组。然后添加对 `Authorization` 头的脱敏并进行测试。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "日志级别 (Log level)",
+          "definition": "控制记录多少内容的严重程度标签（从 DEBUG 到 CRITICAL）。"
+        },
+        {
+          "term": "结构化日志 (Structured logging)",
+          "definition": "将事件写成 JSON 等键值数据，而不是自由文本。"
+        },
+        {
+          "term": "关联 ID (Correlation ID)",
+          "definition": "附加到单次运行或请求的每一行日志上的唯一值。"
+        },
+        {
+          "term": "脱敏 (Redaction)",
+          "definition": "在敏感值写入日志之前将其屏蔽。"
+        },
+        {
+          "term": "日志轮转 (Log rotation)",
+          "definition": "当前日志文件达到大小或时间上限时，开始写入新的日志文件。"
+        },
+        {
+          "term": "日志注入 (Log injection)",
+          "definition": "通过插入换行符等控制字符来伪造日志条目。"
+        },
+        {
+          "term": "审计跟踪 (Audit trail)",
+          "definition": "防篡改的记录，说明谁在何时何地做了什么。"
+        },
+        {
+          "term": "Syslog",
+          "definition": "将日志消息发送到集中收集器的标准协议。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "run_id 之类的关联 ID 的主要好处是什么？",
+          "options": [
+            "它让你可以跨工具和设备检索一次运行的所有日志行",
+            "它对日志文件加密",
+            "它提高设备 CPU 的速度",
+            "它取代日志级别"
+          ],
+          "answer": 0,
+          "explanation": "对该 ID 做一次搜索即可按顺序重建整个运行。"
+        },
+        {
+          "question": "以下哪些内容绝不应出现在日志中？选择所有适用项。",
+          "options": [
+            "API 令牌",
+            "Authorization 头",
+            "设备主机名",
+            "SNMP 团体字符串"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "主机名属于正常的上下文。令牌、认证头和团体字符串都是机密信息。"
+        },
+        {
+          "question": "已处理的意外重试应记录在哪个级别？",
+          "options": [
+            "DEBUG",
+            "WARNING",
+            "CRITICAL",
+            "都不记录，重试应当保持静默"
+          ],
+          "answer": 1,
+          "explanation": "WARNING 用来标记不寻常但没有中断工作的情况。"
+        },
+        {
+          "question": "为什么在容器化的 CI 作业中把日志写入 stdout？",
+          "options": [
+            "本地文件会随容器一起消失，而平台会收集 stdout",
+            "stdout 默认是加密的",
+            "文件无法轮转",
+            "它避免使用时间戳"
+          ],
+          "answer": 0,
+          "explanation": "集中收集可以在运行器消失之后依然保留证据。"
+        },
+        {
+          "question": "哪种做法能让排查失败的运行更快？",
+          "options": [
+            "先读最后一行错误",
+            "读第一个错误及其之前的几行",
+            "删除日志并在生产环境以 DEBUG 重新运行",
+            "忽略警告"
+          ],
+          "answer": 1,
+          "explanation": "后面的错误往往是第一个故障造成的后果，而它之前的几行能显示上下文。"
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## 小结\n\n- 日志必须说明发生了什么、在哪里、何时以及为什么，并为每台设备和每个任务给出结果。\n- 正确使用级别：INFO 用于里程碑事件，WARNING 用于已处理的意外情况，ERROR 用于失败的任务。\n- 优先使用带关联 ID、UTC 时间戳和一致字段名的结构化 JSON。\n- 将日志发送到受访问控制的集中位置，并对本地文件进行轮转。\n- 绝不记录机密信息或完整的设备配置，并在生产环境中保持调试日志关闭。"
+    }
+  ]
+}

@@ -1,0 +1,297 @@
+{
+  "title": "权威数据源集成",
+  "summary": "将 NetBox 等权威数据源 (source of truth) 用作自动化的权威意图：查询其 API，驱动动态清单和事件驱动的流水线，并检测配置漂移。",
+  "objectives": [
+    "解释预期状态与实际状态，以及权威数据源的作用",
+    "通过 NetBox REST API 进行查询和分配，涉及分页和令牌认证",
+    "将 NetBox 用作 Ansible 动态清单，并作为 Jinja2 渲染的输入",
+    "设计从权威数据源变更到经过测试的部署的事件驱动工作流",
+    "检测并解决配置漂移，并保护权威数据源的数据质量"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "你的自动化仓库会渲染 400 台交换机的配置。VLAN ID、IP 地址和设备角色从哪里来？如果答案是“一张电子表格、三个 YAML 文件，再加上设备上已有的内容”，那么每次运行都是一次猜测。\n\n**权威数据源 (source of truth, SoT)** 是关于网络*应当*是什么样子的权威记录。自动化从中读取意图、渲染配置、部署配置，然后将实际网络与之比较。AUTOCOR 蓝图要求你把 SoT 集成到自动化工作流中：通过其 API 查询它，将其用作动态清单，响应其变更，并检测配置漂移。"
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## 权威数据源存放什么\n\nSoT 存储**预期状态 (intended state)**：你应当拥有的设备、它们如何连接、使用哪些地址以及运行哪些服务。网络本身持有**实际状态 (actual state)**。自动化的存在就是为了让两者保持一致。\n\n| 数据领域 | 典型的权威系统 | 示例数据 |\n|:--|:--|:--|\n| 清单与 DCIM | NetBox、Nautobot | 站点、机架、设备、角色、平台、线缆 |\n| IPAM | NetBox、Infoblox | 前缀、IP 地址、VLAN、VRF |\n| 配置变量 | NetBox 配置上下文 (config context)、Git (YAML) | NTP 服务器、syslog 主机、横幅 |\n| 密钥 | HashiCorp Vault、CyberArk | 凭据、API 令牌（绝不放在 SoT 中） |\n\n### 让 SoT 保持可信的规则\n\n- **每个数据项只有一个所有者。**“单一事实来源”很少意味着只有一个产品，而是意味着每个字段都有且仅有一个权威系统。当多个系统组合在一起时，由聚合层（例如 Nautobot SSoT 应用或你自己的同步作业）来决定以谁为准。\n- **网络本身不是权威数据源。**发现机制可以一次性地为 SoT 提供初始数据。此后，意图只能从 SoT 流向设备，绝不能反过来。\n- **变更通过 SoT 进行。**工程师通过 CLI 直接修改设备会产生漂移，下一次运行要么覆盖它，要么报告它。"
+    },
+    {
+      "id": "netbox",
+      "type": "text",
+      "markdown": "## 以 NetBox 作为参考 SoT\n\nNetBox 是与 Cisco 自动化搭配最常用的开源 SoT。它的数据模型涵盖 DCIM 和 IPAM，你还可以用**自定义字段 (custom fields)**、**标签 (tags)** 和**配置上下文 (config contexts)**（按站点、角色或平台合并并附加到每台设备的 JSON 数据）来扩展它。\n\n一切都可以通过 `/api/` 下的 **REST API** 以及 `/graphql/` 下的只读 **GraphQL** 端点获得：\n\n- **认证：**在 `Authorization: Token <token>` 头中携带 API 令牌。只读的自动化应使用只读令牌。\n- **过滤：**使用查询参数，如 `?site=dc1&role=leaf&status=active`。\n- **分页：**使用 `limit` 和 `offset`，在到达最后一页之前会有 `next` URL。参见[高级 REST API：分页、认证与速率限制](/learn/network-automation-devops/advanced-rest-apis-pagination-auth-and-rate-limits)。\n- **分配：**向 `/api/ipam/prefixes/<id>/available-ips/` 发送 `POST` 会以原子方式预留下一个空闲地址，因此两个流水线永远不会选中同一个 IP。"
+    },
+    {
+      "id": "api-term",
+      "type": "terminal",
+      "title": "通过 NetBox REST API 查询和分配",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -H \"Authorization: Token $NETBOX_TOKEN\" -H \"Accept: application/json\" \"https://netbox.example.com/api/dcim/devices/?site=dc1&role=leaf&status=active&limit=2\"",
+          "output": "{\n  \"count\": 12,\n  \"next\": \"https://netbox.example.com/api/dcim/devices/?limit=2&offset=2&role=leaf&site=dc1&status=active\",\n  \"previous\": null,\n  \"results\": [\n    {\n      \"id\": 41,\n      \"name\": \"dc1-leaf-01\",\n      \"role\": { \"id\": 3, \"name\": \"Leaf\", \"slug\": \"leaf\" },\n      \"platform\": { \"id\": 2, \"name\": \"Cisco IOS XE\", \"slug\": \"ios-xe\" },\n      \"site\": { \"id\": 1, \"name\": \"DC1\", \"slug\": \"dc1\" },\n      \"status\": { \"value\": \"active\", \"label\": \"Active\" },\n      \"primary_ip4\": { \"id\": 310, \"address\": \"192.0.2.11/24\" },\n      \"custom_fields\": { \"change_window\": \"sun-0200\" },\n      \"config_context\": { \"ntp_servers\": [\"192.0.2.123\"], \"syslog_host\": \"198.51.100.20\" }\n    },\n    \"... one more device ...\"\n  ]\n}"
+        },
+        {
+          "comment": "count 是匹配项的总数；沿着 next 一直取到其为 null。config_context 是该设备的合并数据。"
+        },
+        {
+          "cmd": "curl -s -X POST -H \"Authorization: Token $NETBOX_TOKEN\" -H \"Content-Type: application/json\" -d '{\"description\": \"Loopback0 dc1-leaf-13\", \"status\": \"reserved\"}' https://netbox.example.com/api/ipam/prefixes/27/available-ips/",
+          "output": "{\n  \"id\": 355,\n  \"address\": \"198.51.100.13/32\",\n  \"status\": { \"value\": \"reserved\", \"label\": \"Reserved\" },\n  \"description\": \"Loopback0 dc1-leaf-13\"\n}"
+        },
+        {
+          "comment": "NetBox 选取前缀 27 中的下一个空闲地址并立即记录。自动化随后使用它，而不是猜测。"
+        }
+      ],
+      "caption": "实验环境输出，已精简。令牌从环境变量读取，绝不在命令行中输入。"
+    },
+    {
+      "id": "patterns",
+      "type": "text",
+      "markdown": "## 集成模式\n\n| 模式 | 工作方式 | 典型工具 |\n|:--|:--|:--|\n| **清单 (Inventory)** | SoT 告诉工具存在哪些设备以及如何分组 | Ansible `netbox.netbox.nb_inventory`、Nornir NetBox 插件 |\n| **拉取并渲染 (Pull and render)** | 脚本读取意图并根据模板渲染配置 | `pynetbox` + Jinja2 |\n| **事件驱动 (Event-driven)** | 对象变更时 SoT 调用 webhook，webhook 启动流水线 | NetBox 事件规则、GitLab 流水线触发器 |\n| **回写 (Write-back)** | 自动化记录它所分配或发现的内容 | `available-ips`、日志条目 |\n| **漂移检查 (Drift check)** | 在部署之后（或部署之间）将实际状态与 SoT 比较 | pyATS、Batfish、自定义比较 |\n\n在**清单**模式中，Ansible 从不保留静态的主机文件。站点、角色和平台等分组直接来自 NetBox，配置上下文则成为主机变量。参见 [Ansible 网络配置](/learn/network-automation-devops/ansible-for-network-configuration)。\n\n在**事件驱动**模式中，NetBox 事件规则会发送一个 JSON 负载，其中包含事件类型、模型、用户、请求 ID 以及变更前和变更后的快照。不要直接从 webhook 接收端部署。让它启动一个 CI 流水线，由流水线渲染、测试并通过审批关卡进行部署。参见 [GitLab CI/CD 流水线：构建、验证与部署](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)。"
+    },
+    {
+      "id": "inv",
+      "type": "code",
+      "language": "yaml",
+      "filename": "netbox_inv.yml",
+      "caption": "一个 Ansible 动态清单。使用 ansible-inventory -i netbox_inv.yml --graph 进行检查。",
+      "code": "# netbox_inv.yml - NETBOX_API and NETBOX_TOKEN come from the environment\nplugin: netbox.netbox.nb_inventory\nvalidate_certs: true\nconfig_context: true\ngroup_by:\n  - sites\n  - device_roles\n  - platforms\nquery_filters:\n  - status: active\n  - has_primary_ip: true\ncompose:\n  ansible_network_os: \"'cisco.nxos.nxos' if 'nx-os' in platforms else 'cisco.ios.ios'\"\n",
+      "highlight": [
+        2,
+        13
+      ]
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "意图变更从 SoT 流向网络",
+      "caption": "SoT 发起变更，流水线证明其正确，漂移检查则使闭环完整。",
+      "data": {
+        "token": "变更",
+        "nodes": [
+          {
+            "id": "eng",
+            "label": "工程师",
+            "sub": "更改意图",
+            "icon": "user"
+          },
+          {
+            "id": "sot",
+            "label": "NetBox",
+            "sub": "权威数据源",
+            "icon": "database"
+          },
+          {
+            "id": "ci",
+            "label": "CI 流水线",
+            "sub": "GitLab",
+            "icon": "server"
+          },
+          {
+            "id": "test",
+            "label": "测试实验环境",
+            "sub": "CML + pyATS",
+            "icon": "cpu"
+          },
+          {
+            "id": "net",
+            "label": "网络",
+            "sub": "IOS XE 叶交换机",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "at": "eng",
+            "caption": "工程师在 NetBox 中为 dc1-leaf-07 分配一个新的 VLAN。没有人登录交换机。"
+          },
+          {
+            "at": "sot",
+            "caption": "NetBox 校验数据，并记录该变更以及用户和请求 ID。"
+          },
+          {
+            "at": "ci",
+            "token": "Webhook",
+            "caption": "事件规则携带变更前和变更后的快照调用流水线触发器。"
+          },
+          {
+            "at": "ci",
+            "token": "配置",
+            "caption": "流水线使用 pynetbox 拉取意图，并根据 Jinja2 模板渲染配置。"
+          },
+          {
+            "at": "test",
+            "token": "配置",
+            "caption": "配置被应用到 CML 拓扑，并用 pyATS 检查。",
+            "tone": "success"
+          },
+          {
+            "at": "net",
+            "token": "配置",
+            "caption": "获得批准后，变更在变更窗口内部署到生产环境。",
+            "tone": "secure"
+          },
+          {
+            "at": "sot",
+            "token": "漂移报告",
+            "caption": "定时作业将实际状态与 NetBox 比较。有一台叶交换机不同：有人通过 CLI 添加了一个 VLAN。",
+            "tone": "warning"
+          },
+          {
+            "at": "eng",
+            "token": "漂移报告",
+            "caption": "工程师做出决定：修复该设备，或者如果该变更已获批准，则将其记录到 NetBox 中。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "render",
+      "type": "code",
+      "language": "python",
+      "filename": "render_from_netbox.py",
+      "caption": "使用 pynetbox 拉取并渲染。StrictUndefined 会使渲染在 SoT 缺少某个值时失败，而不是生成一份只有一半内容的配置。",
+      "code": "import os\nimport pynetbox\nfrom jinja2 import Environment, FileSystemLoader, StrictUndefined\n\nnb = pynetbox.api(\"https://netbox.example.com\", token=os.environ[\"NETBOX_TOKEN\"])\nenv = Environment(loader=FileSystemLoader(\"templates\"), undefined=StrictUndefined,\n                  trim_blocks=True, lstrip_blocks=True)\ntemplate = env.get_template(\"leaf.j2\")\n\nfor device in nb.dcim.devices.filter(site=\"dc1\", role=\"leaf\", status=\"active\"):\n    # One API call per object type; pynetbox follows the \"next\" links for you.\n    ips = {ip.assigned_object_id: ip.address\n           for ip in nb.ipam.ip_addresses.filter(device_id=device.id)}\n    interfaces = [\n        {\"name\": i.name, \"description\": i.description,\n         \"enabled\": i.enabled, \"address\": ips.get(i.id)}\n        for i in nb.dcim.interfaces.filter(device_id=device.id)\n    ]\n    config = template.render(\n        hostname=device.name,\n        context=device.config_context,   # merged NTP, syslog, AAA data\n        interfaces=interfaces,\n    )\n    with open(f\"build/{device.name}.cfg\", \"w\", encoding=\"utf-8\") as f:\n        f.write(config)\n    print(f\"rendered {device.name}: {len(interfaces)} interfaces\")\n",
+      "highlight": [
+        5,
+        21
+      ]
+    },
+    {
+      "id": "drift",
+      "type": "text",
+      "markdown": "## 闭环：漂移与数据质量\n\n部署并不是工作流的终点。**漂移 (drift)** 是 SoT 与网络之间的任何差异。请定期检测，并在每次部署之后检测：\n\n1. **配置漂移：**将渲染出的配置与运行配置比较。\n2. **运行状态漂移：**将学习到的状态（邻居、接口状态、路由）与意图比较。参见[使用 pyATS 进行变更验证](/learn/network-automation-devops/change-validation-with-pyats)。\n3. **决策：**修复设备，或者当变更合法且已获批准时更新 SoT。千万不要让漂移报告变成没人阅读的噪声。\n\n自动化的好坏取决于其数据，因此要保护数据质量：\n\n- 使用必填的自定义字段、选项集和自定义校验规则来拒绝错误输入。\n- 对大规模编辑使用 NetBox **分支 (branching)** 或变更请求，以便在生效之前进行评审。\n- 保留**变更日志 (changelog)**。它记录了谁在何时更改了什么，是你的审计线索。\n- 限定 API 令牌的范围。渲染作业只需要读取权限；IPAM 分配器只需要对 IPAM 的写入权限。将令牌存放在密钥管理器中。参见[安全编码：输入验证与密钥管理](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "工程师常犯的错误",
+      "markdown": "- **同一个字段有两个来源。**如果 VLAN 既存在于 NetBox *又*存在于 `group_vars` 中，它们就会不一致。请选定一个所有者。\n- **每次运行都把网络同步回 SoT。**这会让 SoT 变成现实的副本，连同其中的错误。\n- **忽略分页。**NetBox 默认每页返回 50 个对象。只读取 `results` 的脚本会悄悄跳过一些设备。\n- **直接从 webhook 部署。**Webhook 可能重复到达、乱序到达，或在批量导入期间到达。请触发流水线，并使部署具有幂等性。\n- **把密钥放在自定义字段或配置上下文中。**任何拥有读取权限的人以及每一行日志都能看到它们。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "使用实验环境中的 NetBox（`netbox-docker` 项目或公共演示实例），以及 Cisco Modeling Labs 中的一台实验用 IOS XE 设备。\n\n1. 创建站点 `dc1`、角色 `leaf`、平台 `ios-xe`，以及两台带有接口和 IP 地址的设备。\n2. 为该站点添加包含 `ntp_servers` 和 `syslog_host` 的配置上下文，并确认它通过 API 出现在设备的 `config_context` 中。\n3. 创建一个只读 API 令牌。用 `curl` 查询设备，再使用 `?limit=1` 查询，并沿着 `next` 链接继续获取。\n4. 使用一个采用上下文值的模板运行 `render_from_netbox.py`。在 NetBox 中删除一个必需的值，观察 `StrictUndefined` 使渲染停止。\n5. 让 `ansible-inventory --graph` 指向 `netbox_inv.yml`，并检查分组。\n6. 通过 CLI 修改实验设备上的某个描述，然后编写一个简短的检查，报告其与 NetBox 的差异。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "权威数据源 (Source of truth, SoT)",
+          "definition": "网络预期状态的权威记录，自动化从中读取数据。"
+        },
+        {
+          "term": "预期状态 (Intended state)",
+          "definition": "记录在 SoT 中的、网络应当呈现的样子。"
+        },
+        {
+          "term": "实际状态 (Actual state)",
+          "definition": "从设备读取到的、网络真实呈现的样子。"
+        },
+        {
+          "term": "漂移 (Drift)",
+          "definition": "SoT 中的预期状态与网络实际状态之间的任何差异。"
+        },
+        {
+          "term": "配置上下文 (Config context)",
+          "definition": "NetBox 中按站点、角色、平台或标签合并，并作为变量附加到每台设备的 JSON 数据。"
+        },
+        {
+          "term": "动态清单 (Dynamic inventory)",
+          "definition": "在运行时由外部系统生成的清单，例如 Ansible 的 NetBox nb_inventory 插件。"
+        },
+        {
+          "term": "事件规则 (Event rule，webhook)",
+          "definition": "NetBox 中的一条规则，在对象被创建、更新或删除时发送 HTTP 请求。"
+        },
+        {
+          "term": "pynetbox",
+          "definition": "NetBox REST API 的 Python 客户端库。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "下列哪项最能描述网络自动化中的权威数据源？",
+          "options": [
+            "每台设备运行配置的备份",
+            "网络预期状态的权威记录",
+            "存储实时接口计数器的监控系统",
+            "存放自动化脚本的 Git 仓库"
+          ],
+          "answer": 1,
+          "explanation": "SoT 记录网络应当是什么样子。备份和监控保存的是实际状态，脚本仓库保存的是代码，而不是意图。"
+        },
+        {
+          "question": "某脚本读取 /api/dcim/devices/?site=dc1 并且只处理 results 数组。该站点有 120 台设备，但脚本只配置了 50 台。最可能的原因是什么？",
+          "options": [
+            "令牌是只读的",
+            "脚本忽略了分页，从未沿着 next URL 继续获取",
+            "NetBox 过滤掉了没有平台的设备",
+            "超过 50 个对象时必须使用 GraphQL 端点"
+          ],
+          "answer": 1,
+          "explanation": "NetBox 会对结果分页（默认每页 50 个）。客户端必须沿着 next 一直获取到其为 null，或者使用 pynetbox 这类会自动处理的库。"
+        },
+        {
+          "question": "哪些做法可以保护 SoT 的数据质量？（选择所有适用项。）",
+          "options": [
+            "必填的自定义字段和校验规则",
+            "在大规模编辑生效之前，在分支或变更请求中对其进行评审",
+            "每次运行都把每台设备的运行配置导入 SoT",
+            "保留变更日志作为审计线索"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "校验、评审和变更日志使意图保持正确且可追溯。每次运行都重新导入网络，会把 SoT 变成现实的副本，连同其错误。"
+        },
+        {
+          "question": "NetBox 事件规则会在设备发生变化时触发。webhook 接收端应该做什么？",
+          "options": [
+            "立即将新配置推送到设备",
+            "启动一个 CI 流水线，由其渲染、测试并通过审批关卡进行部署",
+            "把变更写回 NetBox",
+            "忽略负载，每分钟轮询一次 NetBox"
+          ],
+          "answer": 1,
+          "explanation": "Webhook 可能重复或乱序到达。流水线提供了测试、审批和幂等部署，而不是盲目推送。"
+        },
+        {
+          "question": "漂移检查显示某台交换机上有一个不在 NetBox 中的 VLAN。哪些响应是有效的？（选择所有适用项。）",
+          "options": [
+            "从设备上删除该 VLAN，以恢复预期状态",
+            "如果该变更已获批准，则在 NetBox 中记录该 VLAN",
+            "禁用漂移检查，因为网络是正确的",
+            "从现在起把网络作为权威数据源"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "解决漂移的办法是修复设备，或通过正常流程更新 SoT。禁用检查或颠倒真实性的方向都会取消这一控制。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- **权威数据源**存储预期状态。网络持有实际状态，自动化让两者保持一致。\n- 每个数据项都需要**一个所有者**。密钥属于密钥管理器，而不是 SoT。\n- **NetBox** 通过需要令牌认证的、带分页的 REST API 和 GraphQL 提供设备、IPAM 和配置上下文。\n- 集成模式：**动态清单**、**拉取并渲染**、**事件驱动**流水线、分配结果的**回写**，以及**漂移检查**。\n- 通过校验、评审、变更日志和限定范围的令牌来保护数据质量。\n\n接下来，在 [基于 YANG 模型的 YAML / JSON 配置](/learn/network-automation-devops/yaml-json-configurations-from-yang-models)中学习如何塑造你所渲染的数据。"
+    }
+  ]
+}

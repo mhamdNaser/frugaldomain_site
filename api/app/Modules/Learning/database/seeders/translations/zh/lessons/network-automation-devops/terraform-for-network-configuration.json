@@ -1,0 +1,315 @@
+{
+  "title": "用于网络配置的 Terraform",
+  "summary": "使用 Terraform 以声明式方式管理 Cisco 网络配置：HCL、Cisco 提供程序、init-plan-apply 工作流、远程状态与锁定、漂移检测以及导入现有对象。",
+  "objectives": [
+    "解释 Terraform 的提供程序 (Provider)、资源 (Resource)、状态 (State) 和依赖关系图如何协同工作",
+    "为 CiscoDevNet/iosxe 提供程序编写 HCL，使用固定版本、敏感变量和 for_each",
+    "运行并解读 init、validate、plan 和 apply，包括计划符号",
+    "使用远程后端和锁定保护状态，并通过 state 子命令、moved 和 import 块来管理它",
+    "检测并解决配置漂移 (Drift)"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一个数据中心团队用 Terraform 管理 ACI 租户。当同一个团队接手园区网络边缘时，他们希望对 IOS XE 使用同样的工作流：每次变更都从合并请求开始，流水线会显示一份**计划 (Plan)**，准确说明将创建、更改或销毁什么，并且只有经过批准的计划才会被应用。如果有人手工修改了路由器，下一次计划就会显示漂移。\n\n这就是 **Terraform** 为网络工程师提供的能力：声明式配置，以及一个记录 Terraform 所管理内容的**状态 (State)** 文件。AUTOCOR 350-901 要求你为 Cisco 平台构建并排查 Terraform 配置，因此本课涵盖语言、工作流、Cisco 提供程序、状态和漂移。"
+    },
+    {
+      "id": "model",
+      "type": "text",
+      "markdown": "## Terraform 的工作原理\n\n你用 HashiCorp 配置语言 (HCL) 描述**最终状态**。Terraform 构建**资源**的依赖关系图，把它与自己的**状态**以及真实基础设施进行比较，并调用 API 来弥合差距。它从不发送 CLI 命令：由**提供程序 (Provider)** 把每个资源翻译为 API 调用。\n\n| Cisco 提供程序 (`source`) | 通信对象 | 示例资源 |\n|:--|:--|:--|\n| `CiscoDevNet/iosxe` | 通过 RESTCONF 访问 IOS XE 设备（较新版本可使用 NETCONF） | `iosxe_vlan`、`iosxe_interface_ethernet`、`iosxe_bgp` |\n| `CiscoDevNet/nxos` | 通过 NX-API REST 接口访问 NX-OS | `nxos_physical_interface`、`nxos_ipv4_vrf` |\n| `CiscoDevNet/aci` | APIC REST API | `aci_tenant`、`aci_bridge_domain`、`aci_application_epg` |\n| `CiscoDevNet/catalystcenter` | Catalyst Center 意图 API | 站点、模板、设备配置部署 |\n| `CiscoDevNet/meraki` | Meraki Dashboard API | 网络、SSID、VLAN |\n\n除了资源之外，你还会用到**数据源 (Data Source)**（只读查询）、**变量**（输入）、**输出**和**模块 (Module)**（可复用的资源组）。\n\n### Terraform 与 Ansible 的比较\n\n| | Terraform | Ansible |\n|:--|:--|:--|\n| 风格 | 声明式，整个配置是一张图 | 按顺序执行的过程式任务（资源模块内部是声明式的） |\n| 状态 | 保存受管对象的状态文件 | 无状态；每次运行都读取设备 |\n| 预览 | `terraform plan` 是工作流的核心 | `--check` 模式，取决于模块 |\n| 传输方式 | 仅限提供程序 API | CLI、NETCONF 或 API |\n| 删除 | 删除代码，对象就会被销毁 | 你必须编写 `deleted` 任务 |\n\n许多团队两者都用：Terraform 用于 ACI、Meraki 和云等由 API 驱动的平台，Ansible 则用于以 CLI 为主的设备和运维任务。"
+    },
+    {
+      "id": "hcl",
+      "type": "text",
+      "markdown": "## 编写配置\n\n一个工作目录通常包含 `versions.tf`（Terraform 和提供程序版本）、`providers.tf`、`variables.tf`、`main.tf` 和 `outputs.tf`。Terraform 会加载目录中的每个 `.tf` 文件，所以这种拆分纯粹是为了可读性。\n\n下面的示例声明了 IOS XE 提供程序，从变量中获取凭据，并创建两个 VLAN 和一个环回接口。请注意三个习惯：提供程序的**版本被固定**，密码变量被标记为 **`sensitive`**，这样 Terraform 会在输出中隐藏它，VLAN 来自一个映射 (map)，因此 `for_each` 为每个键创建一个稳定的实例（`iosxe_vlan.vlan[\"30\"]`）。如果使用 `count`，删除第一项会使每个索引移位，并导致不必要的更改。"
+    },
+    {
+      "id": "hcl-code",
+      "type": "code",
+      "language": "hcl",
+      "filename": "main.tf",
+      "caption": "iosxe 提供程序通过 RESTCONF 管理一台 IOS XE 交换机。必须先在设备上启用 RESTCONF。",
+      "highlight": [
+        5,
+        6,
+        9,
+        15,
+        33
+      ],
+      "code": "terraform {\n  required_version = \">= 1.6\"\n  required_providers {\n    iosxe = {\n      source  = \"CiscoDevNet/iosxe\"\n      version = \"~> 0.5\"\n    }\n  }\n  backend \"http\" {}   # GitLab-managed state; address and credentials come from CI variables\n}\n\nvariable \"iosxe_username\" { type = string }\nvariable \"iosxe_password\" {\n  type      = string\n  sensitive = true\n}\n\nvariable \"vlans\" {\n  type = map(string)\n  default = {\n    \"10\" = \"USERS\"\n    \"30\" = \"VOICE\"\n  }\n}\n\nprovider \"iosxe\" {\n  username = var.iosxe_username\n  password = var.iosxe_password\n  url      = \"https://10.20.1.11\"\n}\n\nresource \"iosxe_vlan\" \"vlan\" {\n  for_each = var.vlans\n  vlan_id  = tonumber(each.key)\n  name     = each.value\n}\n\nresource \"iosxe_interface_loopback\" \"mgmt\" {\n  name              = 100\n  description       = \"Managed by Terraform\"\n  ipv4_address      = \"192.0.2.11\"\n  ipv4_address_mask = \"255.255.255.255\"\n}"
+    },
+    {
+      "id": "flow-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从合并请求到设备",
+      "caption": "plan 读取状态和设备，由人工审查差异，apply 执行已保存的计划。",
+      "data": {
+        "token": "变更",
+        "nodes": [
+          {
+            "id": "code",
+            "label": "编写 HCL",
+            "sub": "Git 分支",
+            "icon": "file"
+          },
+          {
+            "id": "init",
+            "label": "init / validate",
+            "sub": "提供程序、语法",
+            "icon": "cpu"
+          },
+          {
+            "id": "plan",
+            "label": "plan",
+            "sub": "刷新 + 差异比较",
+            "icon": "eye"
+          },
+          {
+            "id": "review",
+            "label": "审查",
+            "sub": "合并请求",
+            "icon": "user"
+          },
+          {
+            "id": "apply",
+            "label": "apply",
+            "sub": "API 调用",
+            "icon": "router"
+          },
+          {
+            "id": "state",
+            "label": "状态",
+            "sub": "远程、已锁定",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "code",
+            "caption": "工程师在功能分支上把 VLAN 30 添加到 vlans 变量中。"
+          },
+          {
+            "at": "init",
+            "caption": "terraform init 下载固定版本的 CiscoDevNet/iosxe 提供程序并连接到远程后端；validate 检查语法和类型。"
+          },
+          {
+            "at": "state",
+            "caption": "plan 锁定状态并读取它，以了解 Terraform 已经管理了哪些对象。",
+            "tone": "secure"
+          },
+          {
+            "at": "plan",
+            "caption": "提供程序通过 RESTCONF 从设备刷新每个受管对象，然后与代码比较：1 个待添加。"
+          },
+          {
+            "at": "review",
+            "caption": "已保存的计划附加到合并请求中。审查者检查是否有意外的更改或销毁操作。",
+            "tone": "warning"
+          },
+          {
+            "at": "apply",
+            "caption": "批准后，apply 精确执行已保存的计划。依赖项按图的顺序创建，相互独立的则并行创建。",
+            "tone": "success"
+          },
+          {
+            "at": "state",
+            "caption": "新对象的 ID 和属性被写入状态，并释放锁。",
+            "tone": "success"
+          },
+          {
+            "at": "plan",
+            "token": "漂移",
+            "caption": "之后，有人手工修改了设备。下一次 plan 会显示一个原地更新，它将撤销这次手工更改。",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tf-run",
+      "type": "terminal",
+      "title": "init、plan、apply 和漂移检查",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "export TF_VAR_iosxe_username=netauto TF_VAR_iosxe_password=\"$(vault kv get -field=password secret/netauto)\"",
+          "comment": "凭据来自由 CI 或密钥管理器注入的环境变量，绝不来自 Git 中的 terraform.tfvars。"
+        },
+        {
+          "cmd": "terraform init",
+          "output": "Initializing the backend...\n\nSuccessfully configured the backend \"http\"! Terraform will automatically\nuse this backend unless the backend configuration changes.\n\nInitializing provider plugins...\n- Finding ciscodevnet/iosxe versions matching \"~> 0.5\"...\n- Installing ciscodevnet/iosxe v0.5.5...\n- Installed ciscodevnet/iosxe v0.5.5 (signed by a HashiCorp partner)\n\nTerraform has created a lock file .terraform.lock.hcl to record the provider\nselections it made above.\n\nTerraform has been successfully initialized!"
+        },
+        {
+          "cmd": "terraform fmt -check && terraform validate",
+          "output": "Success! The configuration is valid."
+        },
+        {
+          "cmd": "terraform plan -out=tfplan",
+          "output": "Terraform used the selected providers to generate the following execution\nplan. Resource actions are indicated with the following symbols:\n  + create\n\nTerraform will perform the following actions:\n\n  # iosxe_interface_loopback.mgmt will be created\n  + resource \"iosxe_interface_loopback\" \"mgmt\" {\n      + description       = \"Managed by Terraform\"\n      + id                = (known after apply)\n      + ipv4_address      = \"192.0.2.11\"\n      + ipv4_address_mask = \"255.255.255.255\"\n      + name              = 100\n    }\n\n  # iosxe_vlan.vlan[\"10\"] will be created\n  + resource \"iosxe_vlan\" \"vlan\" {\n      + id      = (known after apply)\n      + name    = \"USERS\"\n      + vlan_id = 10\n    }\n\n  # iosxe_vlan.vlan[\"30\"] will be created\n  + resource \"iosxe_vlan\" \"vlan\" {\n      + id      = (known after apply)\n      + name    = \"VOICE\"\n      + vlan_id = 30\n    }\n\nPlan: 3 to add, 0 to change, 0 to destroy.\n\nSaved the plan to: tfplan"
+        },
+        {
+          "cmd": "terraform apply tfplan",
+          "output": "iosxe_vlan.vlan[\"10\"]: Creating...\niosxe_vlan.vlan[\"30\"]: Creating...\niosxe_interface_loopback.mgmt: Creating...\niosxe_vlan.vlan[\"30\"]: Creation complete after 1s\niosxe_vlan.vlan[\"10\"]: Creation complete after 1s\niosxe_interface_loopback.mgmt: Creation complete after 2s\n\nApply complete! Resources: 3 added, 0 changed, 0 destroyed."
+        },
+        {
+          "comment": "在 apply 之后立即再次运行 terraform plan，应当报告：No changes. Your infrastructure matches the configuration.（无更改。你的基础设施与配置一致。）"
+        },
+        {
+          "cmd": "terraform plan",
+          "output": "iosxe_vlan.vlan[\"10\"]: Refreshing state... [id=Cisco-IOS-XE-native:native/vlan/Cisco-IOS-XE-vlan:vlan-list=10]\niosxe_vlan.vlan[\"30\"]: Refreshing state... [id=Cisco-IOS-XE-native:native/vlan/Cisco-IOS-XE-vlan:vlan-list=30]\niosxe_interface_loopback.mgmt: Refreshing state... [id=Cisco-IOS-XE-native:native/interface/Loopback=100]\n\nTerraform will perform the following actions:\n\n  # iosxe_interface_loopback.mgmt will be updated in-place\n  ~ resource \"iosxe_interface_loopback\" \"mgmt\" {\n      ~ description       = \"temp test - do not touch\" -> \"Managed by Terraform\"\n        id                = \"Cisco-IOS-XE-native:native/interface/Loopback=100\"\n        name              = 100\n        # (2 unchanged attributes hidden)\n    }\n\nPlan: 0 to add, 1 to change, 0 to destroy."
+        },
+        {
+          "comment": "有人手工更改了环回接口的描述。Terraform 检测到漂移，并建议把声明的值恢复回去。"
+        }
+      ],
+      "caption": "用 -out 保存计划并应用该文件，这样实际运行的更改就恰好是经过审查的更改。"
+    },
+    {
+      "id": "state",
+      "type": "text",
+      "markdown": "## 状态、锁定和漂移\n\n**状态 (State)** 文件把每个资源地址（`iosxe_vlan.vlan[\"30\"]`）映射到真实的对象 ID 及其最近已知的属性。Terraform 用它来了解自己拥有什么、检测更改并规划删除。由此得出三条规则：\n\n- **远程存储状态**，使用支持**锁定 (Locking)** 的后端：GitLab 托管的 HTTP 后端、带锁定的 S3 存储桶，或 HCP Terraform。笔记本电脑上的本地 `terraform.tfstate` 文件会导致两个人基于对网络的不同视图执行 apply。\n- **把状态当作机密。** 它可能包含明文的密码、密钥和完整配置，即使是标记为 `sensitive` 的变量也不例外。请限制访问并加密后端。\n- **绝不手工编辑状态。** 请使用 `terraform state list`、`terraform state show`、`terraform state mv`（或 `moved` 块）和 `terraform state rm`。\n\n**漂移 (Drift)** 是设备与声明的配置之间的差异。`terraform plan` 会刷新受管资源，并将其显示为更新。`terraform plan -refresh-only` 只显示漂移而不提出更改，这样你可以决定是把它接受进状态，还是将其还原。Terraform 只能看到它所管理的内容：手工创建、不在代码中的 VLAN 对它是不可见的。\n\n要在不重新创建的情况下把现有配置纳入管理，请编写一个 **`import` 块**（`import { to = iosxe_vlan.vlan[\"99\"] id = \"...\" }`），运行 plan，然后 apply。自 Terraform 1.5 起，你还可以用 `terraform plan -generate-config-out=generated.tf` 生成对应的 HCL。"
+    },
+    {
+      "id": "scale",
+      "type": "text",
+      "markdown": "## 模块、环境和流水线\n\n把重复出现的模式放进**模块**：例如一个 `access-switch` 模块，接收 VLAN 映射和接口列表，每个站点调用一次。为每个环境或站点保持独立的状态（独立的目录或工作区），这样实验环境计划中的错误绝不会触及生产环境，并且一个站点上的锁也不会阻塞其他站点。\n\n在流水线中，常见阶段是 `fmt -check` 和 `validate`，然后是 `plan -out`，把计划存为制品并显示在合并请求中，最后是对该制品进行手动或受保护分支触发的 `apply`。该流程会在 [GitLab CI/CD 流水线：构建、验证与部署](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy) 中逐步构建。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "常见的 Terraform 错误",
+      "markdown": "- **未固定提供程序版本。** 提供程序的新版本可能会重命名属性。请固定版本并提交 `.terraform.lock.hcl`。\n- **不阅读计划就 apply。** 在接口或 BGP 邻居上出现类似 `-/+ destroy and then create replacement` 的行，可能意味着服务中断。\n- **在同一对象上混用手工更改和 Terraform 更改。** 每次 apply 都会悄悄还原手工操作。请为每个对象指定唯一的负责方。\n- **在指向生产后端的目录中用 `terraform destroy` 清理实验环境。** 请先检查 `terraform workspace show` 和后端配置。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "考试提示",
+      "markdown": "要能读懂计划：`+` 表示创建，`~` 表示原地更新，`-` 表示销毁，`-/+` 表示替换。要知道 `init` 安装提供程序并配置后端，`plan` 刷新并比较差异，`apply` 更改基础设施并更新状态。关于 iosxe 提供程序所写入的 YANG 路径，请参见 [使用 YANG 模型的 RESTCONF](/learn/network-automation-devops/restconf-with-yang-models)。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "使用你自己拥有的实验 IOS XE 设备，例如 Cisco Modeling Labs 中的 Catalyst 8000V 或 DevNet 沙箱。\n\n1. 在设备上启用 RESTCONF（`ip http secure-server` 和 `restconf`），并确认你可以用权限级别为 15 的实验账户登录。\n2. 安装 Terraform，使用你的实验环境地址根据示例创建 `main.tf`，并把凭据导出为 `TF_VAR_` 环境变量。\n3. 运行 `terraform init`、`terraform plan -out=tfplan` 和 `terraform apply tfplan`。检查 `show vlan brief` 和 `show run interface Loopback100`。\n4. 在设备上手工更改环回接口的描述，然后运行 `terraform plan -refresh-only` 和 `terraform plan`。比较这两次的输出。\n5. 手工创建 VLAN 99，把它添加到 `vlans` 映射中，为它编写一个 `import` 块，并确认计划显示的是 `1 to import` 而不是 `1 to add`。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "提供程序 (Provider)",
+          "definition": "把 Terraform 资源翻译为某个平台 API 调用的插件，例如 CiscoDevNet/iosxe 或 CiscoDevNet/aci。"
+        },
+        {
+          "term": "资源 (Resource)",
+          "definition": "在 HCL 中声明的受管对象，例如 VLAN、接口或租户。"
+        },
+        {
+          "term": "数据源 (Data source)",
+          "definition": "对 Terraform 不管理的信息的只读查询。"
+        },
+        {
+          "term": "状态 (State)",
+          "definition": "Terraform 所管理对象、其 ID 及其最近已知属性的记录。"
+        },
+        {
+          "term": "后端 (Backend)",
+          "definition": "状态的存储和锁定位置，例如 GitLab HTTP 后端或 HCP Terraform。"
+        },
+        {
+          "term": "计划 (Plan)",
+          "definition": "为达到声明的配置所需的创建、更新、替换和销毁操作的计算结果列表。"
+        },
+        {
+          "term": "漂移 (Drift)",
+          "definition": "真实基础设施与配置之间的差异，通常由手工更改引起。"
+        },
+        {
+          "term": "模块 (Module)",
+          "definition": "带有输入和输出、可被其他配置调用的可复用资源组。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪条命令会为新的工作目录下载提供程序并配置状态后端？",
+          "options": [
+            "terraform plan",
+            "terraform init",
+            "terraform validate",
+            "terraform apply"
+          ],
+          "answer": 1,
+          "explanation": "terraform init 会安装 required_providers 中指定的提供程序，写入依赖锁文件并设置后端。其他命令需要先运行它。"
+        },
+        {
+          "question": "一份计划为某个在 Git 中没有人改动过的接口显示 '~ description = \"temp\" -> \"Uplink to core\"'。这说明了什么？",
+          "options": [
+            "提供程序版本发生了变化",
+            "漂移：设备在 Terraform 之外被更改，apply 会恢复声明的值",
+            "状态文件已损坏",
+            "Terraform 将替换该接口"
+          ],
+          "answer": 1,
+          "explanation": "~ 符号表示原地更新。由于代码没有改变，差异来自设备，这就是漂移。"
+        },
+        {
+          "question": "哪些做法可以保护 Terraform 状态？（选择所有适用项。）",
+          "options": [
+            "将其存储在支持锁定的远程后端中",
+            "限制访问，因为它可能包含明文的机密",
+            "把 terraform.tfstate 提交到 Git，让每个人都有一份副本",
+            "使用 terraform state mv 或 moved 块，而不是手工编辑文件"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "远程、带锁定、受访问控制的状态以及 state 子命令能保证其一致性和保密性。把状态提交到 Git 会暴露机密，并产生相互冲突的副本。"
+        },
+        {
+          "question": "对于 VLAN 列表，为什么对映射使用 for_each 通常比 count 更好？",
+          "options": [
+            "for_each 的 apply 更快",
+            "每个实例都由一个稳定的值作为键，所以删除一个 VLAN 不会使其他实例移位",
+            "Cisco 提供程序不支持 count",
+            "for_each 会隐藏敏感值"
+          ],
+          "answer": 1,
+          "explanation": "使用 count 时，实例按位置寻址。删除靠前的一项会使其余实例重新编号，并导致不必要的更新或替换。"
+        },
+        {
+          "question": "关于 Terraform 和 Ansible，以下哪些说法是正确的？（选择所有适用项。）",
+          "options": [
+            "Terraform 保存状态；Ansible 每次运行都读取设备",
+            "从 Terraform 代码中删除一个资源，会导致它在下一次 apply 时被销毁",
+            "Terraform 通过 SSH 发送 CLI 命令",
+            "两者都可以管理 ACI 和 Meraki 等 Cisco 平台"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Terraform 只通过提供程序 API 工作，而不是 CLI。它在状态中跟踪所有权，所以删除代码就意味着删除对象。两种工具都有 Cisco 的集合和提供程序。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- Terraform 是**声明式**的：HCL 描述最终状态，提供程序把资源变成 API 调用，依赖关系图决定顺序。\n- Cisco 发布了适用于 IOS XE、NX-OS、ACI、Catalyst Center 和 Meraki 的提供程序。请固定其版本并提交锁文件。\n- 工作流是 `init` → `validate` → `plan -out` → 审查 → 对已保存的计划执行 `apply`。\n- **状态**把代码映射到真实对象。请保持它远程存储、带锁定且受访问控制，并使用 `state` 子命令、`moved` 和 `import` 块，而不是直接编辑。\n- `plan` 会揭示**漂移**；`-refresh-only` 只显示漂移而不更改任何内容。让每个对象只有一个负责方。\n\n接下来，请在 [使用 YANG 模型的 RESTCONF](/learn/network-automation-devops/restconf-with-yang-models) 中了解 iosxe 提供程序底层使用的 API，并回顾 [用于网络配置的 Ansible](/learn/network-automation-devops/ansible-for-network-configuration) 这一过程式替代方案。"
+    }
+  ]
+}

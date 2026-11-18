@@ -1,0 +1,325 @@
+{
+  "title": "诊断 CI/CD 流水线故障",
+  "summary": "阅读流水线图、作业日志和退出码，找出缺失依赖、版本不兼容和测试失败等 CI/CD 故障的根本原因，并加以修复使其不再复发。",
+  "objectives": [
+    "按阶段、症状和退出码对流水线故障进行分类",
+    "诊断由缺失依赖和版本不兼容引起的故障",
+    "判断测试失败指向的是更改、测试本身还是环境",
+    "识别由受保护变量、Runner 选择和网络可达性引起的故障",
+    "应用版本固定、依赖检查和测试报告来防止故障重复出现"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一个修改 OSPF 开销的合并请求，流水线变红了。作者坚称代码在他的笔记本电脑上能用，评审者在等待，而维护窗口两小时后就要开始。重新运行流水线并寄希望于运气不是办法。\n\n失败的流水线就是证据。每次故障都会在作业日志、退出码或测试报告中留下痕迹，而且大多数故障都属于少数几种类别。本课为你提供一种可重复的方法，来阅读这些证据、找出根本原因并加以修复，使其不再复发。AUTOCOR 考试要求你诊断由**缺失依赖**、**版本不兼容**和**测试失败**引起的故障，因此这些内容最受重视。"
+    },
+    {
+      "id": "classes",
+      "type": "text",
+      "markdown": "## 流水线在哪里失败\n\n在读任何一行日志之前，先注意**哪个阶段**失败了，以及是**怎样**失败的。流水线根本没有启动、作业停留在 *pending* 状态、作业运行后以退出码 1 结束，这三者指向的问题截然不同。\n\n| 故障类别 | 典型症状 | 查看位置 |\n|:--|:--|:--|\n| 流水线配置 | 未创建流水线；“This GitLab CI configuration is invalid” | 流水线编辑器、CI Lint、`glab ci lint` |\n| Runner 或执行器 | 作业停留在 *pending*；镜像拉取错误 | Runner 标签、Runner 状态、镜像库访问 |\n| 缺失依赖 | `ModuleNotFoundError`、`command not found`（退出码 127）、“couldn't resolve module/action” | `requirements.txt`、CI 镜像、Ansible `requirements.yml` |\n| 版本不兼容 | pip 解析器冲突、“requires a different Python”、已弃用的模块 | 固定的版本、镜像标签、`pip check` |\n| 测试失败 | `pytest` 退出码 1、pyATS *failed*、代码检查错误 | 测试报告、JUnit 制品、更改的差异 |\n| 机密与访问 | HTTP 401/403、认证失败、变量为空 | CI/CD 变量、受保护分支 |\n| 环境与可达性 | 超时、连接被拒绝、pyATS *errored* | Runner 到实验室或设备的网络路径 |\n\n前四类是**流水线**的故障。只有*测试失败*通常意味着**更改**有问题，即便如此，测试本身也可能才是罪魁祸首。"
+    },
+    {
+      "id": "triage-anim",
+      "type": "animation",
+      "kind": "cycle",
+      "title": "可重复的分诊循环",
+      "caption": "你修复的每一次故障，最后都应加上一道防护，防止它再次出现。",
+      "data": {
+        "center": "流水线分诊",
+        "items": [
+          {
+            "label": "定位",
+            "sub": "失败的阶段和作业"
+          },
+          {
+            "label": "阅读",
+            "sub": "看第一个错误，而不是最后一行"
+          },
+          {
+            "label": "分类",
+            "sub": "配置、依赖、版本、测试、访问"
+          },
+          {
+            "label": "复现",
+            "sub": "相同的镜像，相同的命令"
+          },
+          {
+            "label": "修复",
+            "sub": "在根因处做最小的更改"
+          },
+          {
+            "label": "预防",
+            "sub": "固定版本、代码检查或增加检查"
+          }
+        ],
+        "steps": [
+          {
+            "item": 0,
+            "caption": "打开流水线图：测试阶段失败了，所以验证阶段通过，部署被跳过。"
+          },
+          {
+            "item": 1,
+            "caption": "从“Job failed: exit code 1”向上翻到第一条 ERROR 行。那一行就是原因；其余都是连带后果。"
+          },
+          {
+            "item": 2,
+            "caption": "分类：“No matching distribution found”是版本问题，而不是代码问题。"
+          },
+          {
+            "item": 3,
+            "caption": "用完全相同的 CI 镜像启动一个容器，并运行相同的脚本行，在本地复现。"
+          },
+          {
+            "item": 4,
+            "caption": "修复原因，例如把 Python 镜像固定到受支持的版本，然后推送。",
+            "tone": "success"
+          },
+          {
+            "item": 5,
+            "caption": "添加 pip check 或固定的镜像标签之类的防护，使同样的故障无法悄悄回归。",
+            "tone": "secure"
+          }
+        ]
+      }
+    },
+    {
+      "id": "read",
+      "type": "text",
+      "markdown": "## 阅读作业日志\n\n作业在 Runner 的 shell 中按顺序运行其 `script` 行，并**在第一条返回非零退出码的命令处停止**。随后 Runner 会打印 `ERROR: Job failed: exit code N`。这最后一行只告诉你作业*失败了*，却不会告诉你*为什么*。请向上翻到第一个错误。\n\n退出码是有含义的：\n\n- **1**：一般性失败。对 `pytest` 来说，表示至少有一个测试失败。\n- `pytest` 的 **2、4、5**：被中断、用法错误或没有收集到测试。代码 5 通常意味着路径或测试发现模式有误，而不是代码损坏。\n- `ansible-playbook` 的 **4**：在任何任务运行之前出现的解析器或模块解析错误。\n- **127**：找不到命令。镜像或 `PATH` 中缺少该工具。\n- **137**：进程被杀死 (SIGKILL)，通常是因为容器内存耗尽。\n\n同时也要阅读日志的开头部分。它记录了 Runner、执行器以及**实际使用的镜像**。如果其中写着 `python:latest`，说明作业使用的是当天最新的任何 Python 版本，这是代码没有任何更改却一夜之间出现故障的典型原因。"
+    },
+    {
+      "id": "log",
+      "type": "terminal",
+      "title": "在两个失败的作业中找到第一个真正的错误",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "glab ci status --branch feature/ospf-cost",
+          "output": "(success) lint           validate\n(failed)  unit-tests     test\n(failed)  ansible-check  test\n(skipped) deploy-lab     deploy\n\nPipeline state: failed"
+        },
+        {
+          "comment": "流水线图显示哪个阶段失败。部署被跳过，因此没有任何内容到达网络。"
+        },
+        {
+          "cmd": "glab ci trace unit-tests",
+          "output": "Running with gitlab-runner 17.5.2 (c6eae8d7)\n  on netops-docker-01 t2_xYz8, system ID: s_4f1c0a9b2e3d\nPreparing the \"docker\" executor\nUsing docker image python:latest ...\n$ pip install -r requirements.txt\nCollecting ncclient==0.6.15\nCollecting pyats[full]==24.10\nERROR: Ignored the following versions that require a different python version: 24.10 Requires-Python <3.13,>=3.8\nERROR: Could not find a version that satisfies the requirement pyats[full]==24.10\nERROR: No matching distribution found for pyats[full]==24.10\nCleaning up project directory and file based variables\nERROR: Job failed: exit code 1"
+        },
+        {
+          "comment": "根本原因：python:latest 已升级到 pyATS 24.10 不支持的 Python 版本。这是版本不兼容，而不是代码缺陷。"
+        },
+        {
+          "cmd": "glab ci trace ansible-check",
+          "output": "$ ansible-playbook -i inventory/lab.yml site.yml --check --diff\nERROR! couldn't resolve module/action 'cisco.ios.ios_ospfv2'. This often indicates a misspelling, missing collection, or incorrect module path.\n\nThe error appears to be in '/builds/netops/ospf/roles/ospf/tasks/main.yml': line 2, column 3\nERROR: Job failed: exit code 4"
+        },
+        {
+          "comment": "在任何任务运行之前就出现退出码 4：CI 镜像中没有安装 cisco.ios 集合。这是缺失依赖。"
+        }
+      ],
+      "caption": "日志输出已缩略。最后一行只说明作业失败了；原因在它上面几行。"
+    },
+    {
+      "id": "deps",
+      "type": "text",
+      "markdown": "## 缺失依赖与版本不兼容\n\n大多数“在我的笔记本电脑上能用”的故障，都源于开发者环境与 CI 镜像之间的差异。\n\n### 缺失依赖\n\n- 某个 Python 包在笔记本电脑上是全局安装的，但从未被添加到 `requirements.txt`。\n- `-slim` 镜像中缺少 `git`、`ssh` 之类的系统工具或某个 C 库。\n- 使用了 `cisco.ios` 或 `cisco.nxos` 之类的 Ansible 集合，却没有列在 `collections/requirements.yml` 中。\n\n### 版本不兼容\n\n- **浮动标签**：`python:latest` 或 `ubuntu:latest` 会在你不知情时发生变化。\n- **未固定的包**：`netmiko>=4` 会安装 API 已改变的新主版本。\n- **冲突的依赖要求**：两个包需要同一个库的不同版本，pip 的解析器会以“conflicting dependencies”终止。\n- **解释器限制**：某个包声明了 `Requires-Python`，并拒绝镜像中的解释器。\n\n解决办法是**可复现性**。把基础镜像固定到特定标签（或摘要），把每个 Python 包固定到精确版本（用 `pip freeze` 或 `pip-compile` 生成锁定文件），固定集合版本，并在安装后运行 `pip check`。更好的办法是构建专用的 **CI 工具链镜像**，其中已经包含这些工具，并通过它自己的流水线来更新。用从 `requirements.txt` 派生的键来缓存 pip 下载目录，这样文件一旦更改，缓存就会失效。"
+    },
+    {
+      "id": "ci-yaml",
+      "type": "code",
+      "language": "yaml",
+      "filename": ".gitlab-ci.yml",
+      "code": "default:\n  image: registry.example.com/netops/ci-python:3.12-2026.10   # pinned toolchain image\n  retry:\n    max: 2\n    when: [runner_system_failure, stuck_or_timeout_failure]  # never retry real test failures\n\nstages: [validate, test, deploy]\n\nvariables:\n  PIP_CACHE_DIR: \"$CI_PROJECT_DIR/.cache/pip\"\n\ncache:\n  key:\n    files: [requirements.txt, collections/requirements.yml]\n  paths: [.cache/pip]\n\nlint:\n  stage: validate\n  script:\n    - yamllint .\n    - ansible-lint\n\nunit-tests:\n  stage: test\n  script:\n    - pip install -r requirements.txt   # fully pinned versions\n    - pip check                         # fail fast on broken dependencies\n    - python -m pytest --junitxml=report.xml\n  artifacts:\n    when: always\n    reports:\n      junit: report.xml                 # failed tests appear in the merge request\n\nansible-check:\n  stage: test\n  script:\n    - ansible-galaxy collection install -r collections/requirements.yml\n    - ansible-playbook -i inventory/lab.yml site.yml --check --diff\n",
+      "highlight": [
+        2,
+        5,
+        27,
+        32
+      ],
+      "caption": "经过加固的流水线：固定的镜像、固定的依赖、依赖检查、JUnit 报告，以及仅限于基础设施故障的重试。"
+    },
+    {
+      "id": "tests",
+      "type": "text",
+      "markdown": "## 测试失败：是更改、测试还是环境的问题？\n\n测试失败时，有三种可能的解释，你必须按顺序逐一排除或确认。\n\n1. **更改有问题。**测试发现了真正的缺陷。这是流水线在发挥作用：修复代码。\n2. **测试有问题。**它写入了过时的预期、依赖测试顺序，或者字符串比较过于严格（下面示例中的双空格）。修复测试，并在合并请求中说明。\n3. **环境有问题。**实验室中的某台设备没有启动、超时设置过短，或者 Runner 无法访问管理网络。在 pyATS 中，这通常表现为 **errored** 而不是 **failed**：测试根本无法运行。\n\n把结果发布为 **JUnit XML**（`pytest --junitxml`，或 pyATS 的 `--xunit`），这样 GitLab 就能直接在合并请求中显示哪些测试失败了。把**不稳定的测试 (Flaky Test)**，即在没有任何代码更改的情况下时而通过时而失败的测试，视为缺陷。不要用笼统的 `retry` 设置来掩盖它们；把重试限制在 Runner 和超时故障上，并把不稳定的测试隔离，直到有人修复它。"
+    },
+    {
+      "id": "repro",
+      "type": "terminal",
+      "title": "在 CI 镜像中本地复现作业",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "docker run --rm -it -v \"$PWD\":/src -w /src python:3.12-slim bash",
+          "comment": "与作业使用相同的镜像，仓库挂载到 /src：环境现在与 CI 一致。"
+        },
+        {
+          "prompt": "root@ci:/src#",
+          "cmd": "pip install -q -r requirements.txt && pip install -q -r requirements-dev.txt",
+          "output": "ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. ...\nnetmiko 4.4.0 requires ntc-templates>=3.1.0, but you have ntc-templates 2.3.2 which is incompatible."
+        },
+        {
+          "prompt": "root@ci:/src#",
+          "cmd": "pip check; echo \"exit=$?\"",
+          "output": "netmiko 4.4.0 has requirement ntc-templates>=3.1.0, but you have ntc-templates 2.3.2.\nexit=1"
+        },
+        {
+          "comment": "第二次安装降级了一个包，只打印了警告（退出码 0）。pip check 会把这个冲突变成失败的退出码。"
+        },
+        {
+          "prompt": "root@ci:/src#",
+          "cmd": "python -m pytest -q -x tests/",
+          "output": "F\n=================================== FAILURES ===================================\n_____________________ test_render_ospf_cost[R1-Gi2-10] _____________________\n    def test_render_ospf_cost(host, intf, cost):\n        cfg = render(\"ospf.j2\", host=host, intf=intf, cost=cost)\n>       assert f\" ip ospf cost {cost}\" in cfg\nE       AssertionError: assert ' ip ospf cost 10' in 'interface GigabitEthernet2\\n ip ospf cost  10\\n'\n=========================== short test summary info ============================\nFAILED tests/test_render.py::test_render_ospf_cost[R1-Gi2-10] - AssertionError\n1 failed in 0.41s"
+        },
+        {
+          "comment": "模板在开销之前渲染了两个空格。测试是正确的；有缺陷的是 Jinja2 模板。"
+        },
+        {
+          "prompt": "root@ci:/src#",
+          "cmd": "echo $?",
+          "output": "1"
+        }
+      ],
+      "caption": "在完全相同的镜像中复现，可以消除“在我的笔记本电脑上能用”这个变量。"
+    },
+    {
+      "id": "access",
+      "type": "text",
+      "markdown": "## 机密、Runner 与可达性\n\n有些故障与代码或软件包毫无关系。\n\n- **受保护变量。**标记为*受保护*的 CI/CD 变量只会注入到受保护分支和标签上的流水线中。在功能分支上它是空的，因此 RESTCONF 调用会返回 **401 Unauthorized**。要有意识地决定哪些作业需要生产凭据；实验室凭据可以不受保护，生产凭据则不应如此。\n- **已屏蔽变量**会在日志中隐藏值。绝不要在处理机密的作业上启用 `CI_DEBUG_TRACE`：它会打印每条命令及展开后的变量。\n- **Runner 选择。**如果没有任何在线 Runner 带有 `tags: [lab-access]` 这个标签，带此标签的作业就会一直处于 *pending*。\n- **网络路径。**云 VPC 中的 Runner 在没有路由或跳板机的情况下，无法访问 192.0.2.0/24 的管理网络。应从 Runner 而不是你的笔记本电脑测试可达性。\n\n关于如何安全地存放这些机密，请参见 [安全编码：输入验证与密钥管理](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "学习者常犯的错误",
+      "markdown": "- **只读最后一行。**`Job failed: exit code 1` 只是症状。原因是它上面的第一个错误。\n- **一直重跑直到变绿。**如果重跑后通过了，说明你有不稳定的测试或未固定的依赖。要查明究竟是哪一个。\n- **通过编辑作业而不是解决原因来修复 CI。**给失败的测试作业加上 `allow_failure: true`，就等于撤掉了所有人的安全网。\n- **以为代码改变了。**一夜之间出现故障而没有任何提交的流水线，指向的是浮动的镜像标签或未固定的包。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "推送前先验证流水线文件",
+      "markdown": "使用 GitLab **流水线编辑器**，或运行 `glab ci lint`，在 YAML 和关键字错误造成损坏的流水线之前发现它们。通过 pre-commit 钩子在本地运行 `yamllint` 和 `ansible-lint`，使代码检查失败永远到不了 CI。流水线本身的结构请参见 [GitLab CI/CD 流水线：构建、验证与部署](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy)。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "在一个私有的测试仓库中，使用你控制的 GitLab Runner：\n\n1. 创建一个使用 `python:3.12-slim` 的作业，安装固定版本的 `requirements.txt`，并对一个简单测试运行 `pytest`。\n2. 从 `requirements.txt` 中删除代码所导入的一个包。阅读日志并找出 `ModuleNotFoundError`。\n3. 把两个包固定到相互冲突的版本，并阅读 pip 解析器的提示信息。\n4. 故意让测试失败，添加带 `junit` 报告制品的 `--junitxml=report.xml`，并在合并请求中找到该失败。\n5. 在同一镜像中用 `docker run` 在本地复现每个故障，然后修复它，并添加 `pip check` 之类的防护。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "作业日志（跟踪）(Job Log, Trace)",
+          "definition": "CI 作业的控制台输出，包括 Runner、使用的镜像以及每条命令及其输出。"
+        },
+        {
+          "term": "退出码 (Exit Code)",
+          "definition": "命令返回的数字状态；任何非零值都会使 CI 作业停止并标记为失败。"
+        },
+        {
+          "term": "缺失依赖 (Missing Dependency)",
+          "definition": "代码所需的包、工具或集合在 CI 环境中不存在。"
+        },
+        {
+          "term": "版本固定 (Version Pinning)",
+          "definition": "固定镜像、包和集合的精确版本，使每次运行都使用相同的环境。"
+        },
+        {
+          "term": "pip check",
+          "definition": "验证已安装的 Python 包的依赖是否兼容的命令。"
+        },
+        {
+          "term": "JUnit 报告 (JUnit Report)",
+          "definition": "一种 XML 测试结果格式，GitLab 会在合并请求和流水线视图中显示它。"
+        },
+        {
+          "term": "不稳定的测试 (Flaky Test)",
+          "definition": "在同一份代码上时而通过时而失败的测试，通常是由于时序或对环境的依赖。"
+        },
+        {
+          "term": "受保护变量 (Protected Variable)",
+          "definition": "只对在受保护分支或标签上运行的流水线开放的 GitLab CI/CD 变量。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "作业日志以“ERROR: Job failed: exit code 1”结尾。你应该先做什么？",
+          "options": [
+            "重新运行作业",
+            "向上翻到日志中的第一条错误信息",
+            "给作业添加 allow_failure: true",
+            "重启 Runner"
+          ],
+          "answer": 1,
+          "explanation": "最后一行只报告作业失败。它上面的第一个错误才能确定原因。"
+        },
+        {
+          "question": "昨天通过的流水线今天失败了，而且没有新的提交。可能的原因有哪些？（选择所有适用项。）",
+          "options": [
+            "作业使用 python:latest，而该标签现在指向更新的 Python",
+            "某个未固定的包发布了新的主版本",
+            "浮动的 Ansible 集合版本更改了某个模块",
+            "Git 自动改写了提交历史"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "浮动的镜像标签以及未固定的包或集合会在没有任何提交的情况下发生变化。Git 不会自行改写历史。"
+        },
+        {
+          "question": "某个作业在运行 ansible-lint 时以退出码 127 结束。最可能的原因是什么？",
+          "options": [
+            "某个测试断言失败",
+            "作业镜像中没有安装 ansible-lint 命令",
+            "Runner 内存耗尽",
+            "YAML 文件有语法错误"
+          ],
+          "answer": 1,
+          "explanation": "退出码 127 表示找不到命令：镜像或 PATH 中缺少该工具。"
+        },
+        {
+          "question": "某个 RESTCONF 测试在 main 上通过，但在功能分支上返回 401。最可能的原因是什么？",
+          "options": [
+            "设备拒绝功能分支",
+            "凭据变量是受保护的，因此在未受保护的分支上为空",
+            "JUnit 报告被禁用",
+            "pip 缓存已过期"
+          ],
+          "answer": 1,
+          "explanation": "受保护的 CI/CD 变量只会注入到受保护分支和标签的流水线中。"
+        },
+        {
+          "question": "哪些做法能降低依赖故障的可能性？（选择所有适用项。）",
+          "options": [
+            "把 CI 镜像固定到特定的标签或摘要",
+            "固定精确的包版本并运行 pip check",
+            "把每个失败的作业重试三次",
+            "使用专用的 CI 工具链镜像"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "固定版本和专用的工具链镜像使环境可复现。笼统的重试只会掩盖问题，而不是解决问题。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 从流水线图入手：哪个阶段失败了，作业是运行了、在等待，还是根本没有启动。\n- 在日志中，**第一个错误**就是原因，而退出码告诉你它的类型（1、4、5、127、137）。\n- **缺失依赖**和**版本不兼容**源于开发者机器与 CI 镜像之间的差异。固定镜像、包和集合的版本，并运行 `pip check`。\n- **测试失败**意味着更改、测试或环境有问题。按这个顺序逐一排除，并发布 JUnit 报告。\n- 受保护变量、Runner 标签和网络路径引发的故障看起来像代码缺陷，其实不是。\n- 在同一镜像中复现，修复原因，然后添加防护，使其无法复发。\n\n接下来，请在 [使用 Cisco Modeling Labs (CML) 进行测试](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing) 中为你的流水线提供一个逼真的网络来进行测试。"
+    }
+  ]
+}

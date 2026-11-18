@@ -1,0 +1,322 @@
+{
+  "title": "Gelişmiş REST API'leri: Sayfalama, Kimlik Doğrulama ve Hız Sınırları",
+  "summary": "Üretimde ayakta kalan API istemcileri yazın: offset, sayfa ve imleç (cursor) tabanlı sayfalamayı izleyin, token'ları ve OAuth akışlarını yönetin, Retry-After ve üstel geri çekilme (exponential backoff) ile hız sınırlarına uyun.",
+  "objectives": [
+    "Offset/limit, sayfa numarası ve imleç (Link başlığı) tabanlı sayfalamayı karşılaştırmak ve eksiksiz bir sonuç kümesi toplamak",
+    "Basic, API anahtarı, oturum token'ı ve OAuth 2.0 client credentials kimlik doğrulamasını seçmek ve uygulamak",
+    "Token'ları doğru biçimde önbelleğe almak ve yenilemek, gizli bilgileri koddan uzak tutmak",
+    "HTTP 429'u Retry-After, jitter'lı üstel geri çekilme ve istemci tarafı kısıtlama (throttling) ile yönetmek",
+    "Başarısız isteklerden hangilerinin yeniden denenmesinin güvenli olduğuna karar vermek"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Bir envanter betiği, Meraki kuruluşunun 40 cihazının bulunduğu laboratuvarda kusursuz çalışır. Üretimde ise kuruluşta 3.800 cihaz olmasına rağmen tam olarak 1.000 cihaz bildirir. Ertesi gece `HTTP 429 Too Many Requests` ile yarı yolda çöker ve bir hafta sonra her çalıştırma, ilk saatten sonra `401 Unauthorized` ile başarısız olur.\n\nBunların hiçbiri API'deki bir hata değildir. Bunlar, her ciddi REST API'sinin sahip olduğu üç davranıştır: **sayfalama (pagination)**, **süresi dolan kimlik bilgileriyle kimlik doğrulama** ve **hız sınırları (rate limits)**. AUTOCOR 350-901 yetkinlik haritası sizden üçünü de yöneten istemciler geliştirmenizi bekler. Bu ders, Cisco platform API'lerinde kullanılan kalıpları ve bunları yöneten Python kodunu gösterir."
+    },
+    {
+      "id": "pagination",
+      "type": "text",
+      "markdown": "## Sayfalama kalıpları\n\nAPI'ler büyük koleksiyonları **sayfalar** halinde döndürür; böylece tek bir yanıt küçük ve hızlı kalır. Koleksiyon tükenene kadar sayfa istemeye devam etmelisiniz.\n\n| Kalıp | Nasıl istenir | Daha fazlasının olduğu nasıl anlaşılır | Cisco örnekleri |\n|:--|:--|:--|:--|\n| **Offset / limit** | `?offset=501&limit=500` | Tam bir sayfa geldi; bir sayfa `limit`'ten kısa olana kadar devam edin | Catalyst Center intent API (`offset` 1'den başlar) |\n| **Sayfa numarası / boyutu** | `?page=2&size=100` | Gövde bir toplam veya bir `nextPage` bağlantısı içerir | ISE ERS API (`nextPage` içeren `SearchResult`) |\n| **İmleç (cursor) / Link başlığı** | `?perPage=1000&startingAfter=<id>` | `rel=next` içeren bir HTTP `Link` başlığı (RFC 8288) | Meraki Dashboard API, Webex API'leri |\n\n### Offset ile imleç karşılaştırması\n\nOffset tabanlı sayfalamayı akıl yürütmek kolaydır, ancak veri değişirken **kararsızdır**. 2. sayfayı okurken 10. konuma bir cihaz eklenirse sonraki her öğe bir kayar ve bir kaydı atlayabilir ya da tekrarlayabilirsiniz. Bir **imleç** belirli bir öğeyi işaret eder (\"Q2XX-AAAA-0003 cihazından sonra başla\"); bu yüzden başka yerlerdeki eklemeler onu bozmaz.\n\nLink başlığıyla **sonraki URL'yi kendiniz oluşturmamalısınız**. `next` URL'sini sunucunun gönderdiği haliyle izleyin. Python `requests` kütüphanesi başlığı sizin için ayrıştırıp `resp.links` içine koyar.\n\nHer şeyi sayfalamadan önce API'nin sunucu tarafında **filtreleme** yapıp yapamadığını kontrol edin (örneğin Catalyst Center'da `?family=Switches%20and%20Hubs` veya Meraki'de `productTypes[]=switch`). Daha az sayfa, hız sınırına karşı daha az istek demektir."
+    },
+    {
+      "id": "auth",
+      "type": "text",
+      "markdown": "## Kimlik doğrulama kalıpları\n\n| Yöntem | Nasıl çalışır | Cisco örnekleri |\n|:--|:--|:--|\n| **HTTP Basic** | Kullanıcı adı ve parola, Base64 kodlu, her istekte | IOS XE üzerinde RESTCONF, ISE ERS |\n| **API anahtarı / bearer token** | Başlıkta uzun ömürlü bir anahtar | Meraki: `Authorization: Bearer <api-key>` |\n| **Oturum token'ı** | Basic kimlik doğrulamayla bir kez oturum açıp kısa ömürlü bir token almak | Catalyst Center: `POST /dna/system/api/v1/auth/token`, ardından `X-Auth-Token`; FMC: `generatetoken`, ardından `X-auth-access-token` |\n| **OAuth 2.0 client credentials** | Bir istemci kimliği ve gizli anahtarı, bir token uç noktasında erişim token'ı ile değiştirmek | Cisco XDR ve Secure Endpoint API istemcileri |\n| **OAuth 2.0 authorization code** | Bir kullanıcı oturum açar ve onay verir; uygulama, kullanıcı adına token'ları alır | Webex entegrasyonları |\n\n### Token'ları doğru yönetmek\n\n- Token'ı tüm ömrü boyunca **yeniden kullanın**. Her istekten önce oturum açmak yavaştır ve kendisi de hız sınırına takılabilir. Örneğin Catalyst Center token'ları yaklaşık bir saat geçerlidir.\n- **Erken yenileyin.** Son kullanma zamanını izleyin (OAuth yanıtlarındaki `expires_in`) ve bitmesine kısa süre kala yenileyin.\n- **401'de bir kez yenileyin ve bir kez yeniden deneyin.** Yeniden deneme de başarısız olursa durun: kimlik bilgileri yanlıştır veya iptal edilmiştir.\n- **Gizli bilgileri asla koda gömmeyin.** Bunları ortam değişkenlerinden, bir kasadan (vault) veya CI/CD korumalı değişkenlerinden okuyun ve `Authorization` başlıklarını asla günlüğe yazmayın.\n- Her zaman sertifika doğrulamalı HTTPS kullanın. Düz HTTP üzerinden ya da doğrulamadığınız bir sunucuya gönderilen bearer token çalınabilir ve yeniden kullanılabilir."
+    },
+    {
+      "id": "api-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Sağlam bir istemci Catalyst Center ile konuşur",
+      "caption": "Token'ın yeniden kullanımı, offset sayfalaması, hız sınırı beklemesi ve token yenilemesi tek bir çalıştırmada.",
+      "data": {
+        "actors": [
+          {
+            "id": "c",
+            "label": "Envanter betiği",
+            "sub": "Python requests",
+            "icon": "laptop"
+          },
+          {
+            "id": "s",
+            "label": "Catalyst Center",
+            "sub": "catc.example.com",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "c",
+            "to": "s",
+            "label": "POST /auth/token",
+            "detail": "Basic kimlik doğrulama",
+            "note": "Betik, HTTPS üzerinden Basic kimlik doğrulamayla bir kez oturum açar.",
+            "tone": "secure"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "200 {\"Token\": ...}",
+            "detail": "yaklaşık 60 dk geçerli",
+            "note": "Token önbelleğe alınır ve her istekte X-Auth-Token olarak gönderilir.",
+            "tone": "success"
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "GET network-device",
+            "detail": "offset=1&limit=500",
+            "note": "İlk sayfa istenir."
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "200, 500 öğe",
+            "detail": "tam bir sayfa",
+            "note": "Tam bir sayfa, daha fazlasının olabileceği anlamına gelir; bu yüzden offset 501'e taşınır."
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "GET network-device",
+            "detail": "offset=501&limit=500",
+            "note": "Betik ikinci sayfayı ister."
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "429 Too Many Requests",
+            "detail": "Retry-After: 2",
+            "note": "Sunucu kendini koruyor. Betik vazgeçmemeli, yavaşlamalıdır.",
+            "tone": "warning"
+          },
+          {
+            "from": "c",
+            "to": "c",
+            "label": "2 sn + jitter bekle",
+            "note": "Betik Retry-After değerine uyar ve küçük bir rastgele gecikme ekler."
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "GET network-device",
+            "detail": "offset=501&limit=500",
+            "note": "GET'in tekrarlanması güvenlidir; bu yüzden aynı istek yeniden denenir."
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "200, 312 öğe",
+            "detail": "limit'ten kısa",
+            "note": "Kısa bir sayfa koleksiyonun tamamlandığı anlamına gelir: toplam 812 cihaz.",
+            "tone": "success"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "Sonraki bir çağrıda 401",
+            "detail": "token süresi doldu",
+            "note": "Betik token'ı bir kez yeniler ve yeniden dener; ikinci bir 401 çalıştırmayı durdurur.",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "ratelimits",
+      "type": "text",
+      "markdown": "## Hız sınırları\n\n**Hız sınırı (rate limit)**, bir istemcinin bir zaman penceresinde kaç istek gönderebileceğini sınırlar; böylece tek bir betik paylaşılan bir denetleyiciyi aşırı yükleyemez. Örneğin Meraki, kısa bir ani artış (burst) payıyla birlikte kuruluş başına saniyede yaklaşık 10 isteğe izin verir. Bir sınırı aştığınızda sunucu **`429 Too Many Requests`** ile yanıt verir; genellikle beklenecek saniye sayısını veren bir **`Retry-After`** başlığıyla birlikte. Bazı API'ler ayrıca istemcilerin sınıra ulaşmadan yavaşlayabilmesi için `X-RateLimit-Remaining` gibi başlıklar döndürür.\n\nİyi davranan bir istemci:\n\n1. Varsa **`Retry-After`** değerine uyar.\n2. Aksi halde **jitter'lı üstel geri çekilme** kullanır: 1, 2, 4, 8 saniye artı rastgele bir kesir bekler, bir üst sınıra kadar. Jitter, birçok işçinin (worker) aynı anda yeniden denemesini engeller.\n3. **Eşzamanlılığı sınırlar.** Tek bir kuruluşa yüklenen on iş parçacığının hepsi kısıtlanır. Küçük bir işçi havuzu veya bir token-bucket kısıtlayıcısı kullanın.\n4. Sunucu tarafı filtreler, toplu uç noktalar (örneğin Meraki action batch'leri) ve nadiren değişen verilerin önbelleğe alınması ile **çağrı sayısını azaltır**.\n5. Sonsuza kadar döngüye girmek yerine, sonunda net bir hatayla **vazgeçer**.\n\n### Hangi hataları yeniden denemek güvenlidir?\n\n| Yanıt | Yeniden denensin mi? |\n|:--|:--|\n| `429`, `503` | Evet, `Retry-After` veya geri çekilmeden sonra |\n| `500`, `502`, `504`, zaman aşımları | **İdempotent** yöntemler (GET, PUT, DELETE) için evet; yinelenen kayıt oluşturabilecek POST konusunda dikkatli olun |\n| `401` | Token'ı bir kez yenileyin, sonra durun |\n| `400`, `403`, `404`, `422` | Hayır: isteğin kendisi yanlıştır, bu yüzden isteği düzeltin |"
+    },
+    {
+      "id": "curl-terminal",
+      "type": "terminal",
+      "title": "curl -i ile sayfalamayı ve sınırları incelemek",
+      "prompt": "$",
+      "lines": [
+        {
+          "comment": "Catalyst Center: bir oturum token'ı alın (kimlik bilgileri ortam değişkenlerinden gelir)"
+        },
+        {
+          "cmd": "curl -s -X POST -u \"$CATC_USER:$CATC_PASS\" https://catc.example.com/dna/system/api/v1/auth/token",
+          "output": "{\"Token\":\"eyJhbGciOiJSUzI1NiIs...<redacted>\"}"
+        },
+        {
+          "comment": "Meraki: -i, Link başlığı dahil yanıt başlıklarını gösterir"
+        },
+        {
+          "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3\"",
+          "output": "HTTP/2 200\ncontent-type: application/json; charset=utf-8\nlink: <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=0000-0000-0000>; rel=first, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=Q2XX-AAAA-0003>; rel=next, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&endingBefore=zzzz-zzzz-zzzz>; rel=last\n\n[{\"serial\":\"Q2XX-AAAA-0001\",...},{\"serial\":\"Q2XX-AAAA-0002\",...},{\"serial\":\"Q2XX-AAAA-0003\",...}]"
+        },
+        {
+          "comment": "rel=next imleci taşır: bu sayfadaki son seri numarasından sonra başlayın"
+        },
+        {
+          "comment": "Sıkı bir döngüde çok fazla çağrı:"
+        },
+        {
+          "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/networks\"",
+          "output": "HTTP/2 429\nretry-after: 1\ncontent-type: application/json; charset=utf-8\n\n{\"errors\":[\"API rate limit exceeded for organization\"]}"
+        },
+        {
+          "comment": "Yeniden denemeden önce en az Retry-After değeri (saniye) kadar bekleyin"
+        }
+      ],
+      "caption": "Tam hata metni platforma göre değişir; kodunuzun işlem yapması gereken şey durum kodu ve Retry-After başlığıdır."
+    },
+    {
+      "id": "client-code",
+      "type": "code",
+      "language": "python",
+      "filename": "meraki_inventory.py",
+      "caption": "Tek bir oturum, ortamdan alınan bir bearer anahtarı, Link başlığı ile sayfalama ve Retry-After değerine uyan, jitter'lı üstel geri çekilmeli yeniden denemeler. Meraki, Retry-After'ı saniye olarak gönderir; bazı API'ler bunun yerine bir HTTP tarihi gönderir.",
+      "highlight": [
+        14,
+        15,
+        16,
+        17,
+        30
+      ],
+      "code": "import os\nimport random\nimport time\n\nimport requests\n\nBASE = \"https://api.meraki.com/api/v1\"\nsession = requests.Session()\nsession.headers.update({\n    \"Authorization\": f\"Bearer {os.environ['MERAKI_API_KEY']}\",\n    \"Accept\": \"application/json\",\n})\n\ndef get_with_retry(url, params=None, max_tries=5):\n    for attempt in range(max_tries):\n        resp = session.get(url, params=params, timeout=15)\n        if resp.status_code == 429 or resp.status_code >= 500:\n            wait = float(resp.headers.get(\"Retry-After\", 2 ** attempt))\n            time.sleep(min(wait, 60) + random.uniform(0, 0.5))\n            continue\n        resp.raise_for_status()   # 4xx errors are not retried\n        return resp\n    raise RuntimeError(f\"Gave up after {max_tries} attempts: {url}\")\n\ndef get_all(path, per_page=1000):\n    url, params, items = f\"{BASE}{path}\", {\"perPage\": per_page}, []\n    while url:\n        resp = get_with_retry(url, params)\n        items.extend(resp.json())\n        url = resp.links.get(\"next\", {}).get(\"url\")\n        params = None   # the next URL already carries the cursor\n    return items\n\ndevices = get_all(\"/organizations/123456/devices\")\nprint(f\"Collected {len(devices)} devices\")"
+    },
+    {
+      "id": "sdk-note",
+      "type": "callout",
+      "variant": "note",
+      "title": "SDK'lar bunun büyük kısmını sizin için yapar",
+      "markdown": "Resmi Meraki Python kütüphanesi (`meraki`), `total_pages='all'` ile sayfaları izleyebilir ve 429 yanıtlarını otomatik olarak yeniden dener. Catalyst Center SDK'sı (`dnacentersdk`) token'ları sizin için yeniler. SDK'ları olduğu yerde kullanın, ancak altta yatan davranışı anlayın: sınav HTTP mekaniğini sınar ve bir SDK bir uç noktayı kapsamadığında buna ihtiyaç duyacaksınız."
+    },
+    {
+      "id": "pitfall",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Laboratuvarda geçen, üretimde başarısız olan hatalar",
+      "markdown": "- Laboratuvarda hiç birden fazla sayfa olmadığı için yalnızca ilk sayfayı okumak.\n- Zaman aşımından sonra nesne oluşturan bir POST'u yeniden denemek ve yinelenen kayıtlar oluşturmak. Önce nesnenin var olup olmadığını kontrol edin veya idempotent bir PUT kullanın.\n- Sıkı bir döngüde hemen yeniden denemek; bu, tek bir 429'u yüzlercesine dönüştürür.\n- Hata ayıklama için isteğin tamamını yazdırmak ve API anahtarını CI günlüklerine sızdırmak."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "1. Cisco DevNet Meraki sandbox'ını veya kendi kuruluşunuzu kullanın ve anahtarı bir ortam değişkeninde saklayın: `export MERAKI_API_KEY=<your-key>`.\n2. `curl -i ... ?perPage=3` isteğini çalıştırın ve `link` başlığındaki `rel=next` URL'sini belirleyin.\n3. `meraki_inventory.py` dosyasını `per_page=3` ile çalıştırın ve toplamın panodaki cihaz sayısıyla eşleştiğini doğrulayın.\n4. 429 yanıtları için bir sayaç ve her bekleme süresini gösteren bir günlük satırı ekleyin. Betiğin iki kopyasını aynı anda çalıştırın ve geri çekilmenin işleyişini izleyin.\n5. İstekleri yalnızca kullanma yetkiniz olan kuruluşlara gönderin."
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Sayfalama (Pagination)",
+          "definition": "Büyük bir koleksiyonu, istemcinin sırayla istediği bir dizi daha küçük sayfa halinde döndürmek."
+        },
+        {
+          "term": "Offset / limit",
+          "definition": "Öğe konumu ve sayfa boyutuna göre sayfalama; örneğin offset=501&limit=500."
+        },
+        {
+          "term": "İmleç (Cursor)",
+          "definition": "Bir koleksiyondaki bir konuma işaret eden, başka yerlere öğe eklense bile kararlı kalan opak bir gösterici."
+        },
+        {
+          "term": "Link başlığı (Link header)",
+          "definition": "Sayfalar arasında gezinmek için rel=next ve rel=last gibi URL'ler taşıyan bir HTTP başlığı (RFC 8288)."
+        },
+        {
+          "term": "Bearer token",
+          "definition": "Authorization: Bearer <token> olarak gönderilen bir kimlik bilgisi; ona sahip olan herkes kullanabilir."
+        },
+        {
+          "term": "OAuth 2.0 client credentials",
+          "definition": "Bir uygulamanın istemci kimliğini ve gizli anahtarını kısa ömürlü bir erişim token'ı ile değiştirdiği akış."
+        },
+        {
+          "term": "Hız sınırı (Rate limit)",
+          "definition": "Bir istemcinin bir zaman penceresinde gönderebileceği istek sayısına konan üst sınır."
+        },
+        {
+          "term": "HTTP 429 ve Retry-After",
+          "definition": "Çok Fazla İstek (Too Many Requests) durum kodu ve istemciye ne kadar bekleyeceğini söyleyen başlık."
+        },
+        {
+          "term": "Jitter'lı üstel geri çekilme (Exponential backoff with jitter)",
+          "definition": "Her başarısızlıktan sonra ikiye katlanan yeniden deneme gecikmeleri ve istemcilerin eşzamanlı yeniden denememesi için eklenen rastgele bir bileşen."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı kontrol edin",
+      "questions": [
+        {
+          "question": "Bir Meraki yanıtı rel=next içeren bir Link başlığı içeriyor. İstemciniz ne yapmalıdır?",
+          "options": [
+            "Bir offset parametresini sayfa boyutu kadar artırmalı",
+            "rel=next URL'sini tam olarak verildiği gibi istemeli, rel=next dönmeyene kadar",
+            "Durmalı, çünkü ilk sayfa tüm öğeleri içerir",
+            "Öğeleri saymak için önce rel=last'ı istemeli"
+          ],
+          "answer": 1,
+          "explanation": "İmleç tabanlı sayfalama konumu URL içinde kodlar. rel=next'i gönderildiği gibi izleyin ve başlık artık onu içermediğinde durun."
+        },
+        {
+          "question": "Offset tabanlı sayfalama kayıtları neden atlayabilir veya tekrarlayabilir?",
+          "options": [
+            "Offset'ler 100 öğeyle sınırlıdır",
+            "Okuma sırasında eklenen veya kaldırılan öğeler sonraki öğelerin konumlarını kaydırır",
+            "Offset'ler OAuth gerektirir",
+            "Sunucular limit parametresini yok sayar"
+          ],
+          "answer": 1,
+          "explanation": "Offset'ler konumdur. Sayfa istekleri arasında koleksiyon değişirse öğeler sayfa sınırları boyunca hareket eder. İmleçler belirli bir öğeyi işaret eder ve bunu önler."
+        },
+        {
+          "question": "Betiğiniz Retry-After: 5 ile HTTP 429 alıyor. Doğru davranış nedir?",
+          "options": [
+            "100 defaya kadar hemen yeniden denemek",
+            "Bunu ölümcül bir hata sayıp çıkmak",
+            "En az 5 saniye beklemek, sonra yeniden denemek ve toplam deneme sayısını sınırlamak",
+            "Yeni bir token almak için yeniden oturum açmak"
+          ],
+          "answer": 2,
+          "explanation": "429 yavaşla demektir. Retry-After değerine uyun, birçok işçi çalışıyorsa jitter ekleyin ve sınırlı sayıda denemeden sonra net bir hatayla vazgeçin."
+        },
+        {
+          "question": "Catalyst Center X-Auth-Token gibi oturum token'ları için hangi uygulamalar doğrudur? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "Token'ı süresi dolmadan kısa süre öncesine kadar yeniden kullanmak",
+            "Her API çağrısından önce yeni bir token istemek",
+            "401'de token'ı bir kez yenilemek ve bir kez yeniden denemek",
+            "Kimlik bilgilerini betikte değil, ortam değişkenlerinde veya bir kasada saklamak"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "Token'lar ömürleri boyunca yeniden kullanılmak üzere tasarlanmıştır. 401'de tek bir yenileme süre dolmasını ele alır ve gizli bilgiler kodun dışında kalır. Her çağrıdan önce oturum açmak yavaştır ve kendisi de kısıtlanabilir."
+        },
+        {
+          "question": "Başarısız olan hangi istekleri otomatik olarak yeniden denemek genellikle güvenlidir? (Uygun olanların tümünü seçin.)",
+          "options": [
+            "503 döndüren bir GET",
+            "Zaman aşımına uğrayan bir PUT",
+            "400 Bad Request döndüren bir POST",
+            "429 döndüren bir GET"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "429 ve 503 geçicidir, GET ve PUT idempotenttir; bu yüzden bunları tekrarlamak güvenlidir. 400, isteğin yanlış olduğu anlamına gelir ve düzeltilene kadar yeniden başarısız olur."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- API'ler **offset/limit**, **sayfa/boyut** veya **Link başlığındaki imleçlerle** sayfalar. Koleksiyon tükenene kadar döngü kurun, `rel=next`'i gönderildiği gibi izleyin ve mümkün olduğunda sunucuda filtreleyin.\n- Kimlik doğrulama **Basic** ve **API anahtarlarından** **oturum token'larına** ve **OAuth 2.0**'a kadar uzanır. Token'ları yeniden kullanın, erken yenileyin, 401'de bir kez yenileyin ve gizli bilgileri koddan ve günlüklerden uzak tutun.\n- **429**'da **Retry-After**'a uyun, aksi halde **jitter'lı üstel geri çekilme** kullanın, eşzamanlılığı sınırlayın ve sınırlı sayıda denemeden sonra vazgeçin.\n- Yalnızca geçici hataları ve yalnızca ek kontrol gerektirmeyen **idempotent** istekleri yeniden deneyin.\n\nSırada, bu kalıpları yapılandırma API'lerine [YANG Modelleriyle RESTCONF](/learn/network-automation-devops/restconf-with-yang-models) dersinde uygulayın."
+    }
+  ]
+}

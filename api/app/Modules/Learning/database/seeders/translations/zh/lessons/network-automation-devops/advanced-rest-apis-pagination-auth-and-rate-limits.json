@@ -1,0 +1,322 @@
+{
+  "title": "高级 REST API：分页、认证与速率限制",
+  "summary": "编写能在生产环境中稳定运行的 API 客户端：遵循偏移量分页、页码分页和游标分页，管理令牌和 OAuth 流程，并通过 Retry-After 和指数退避遵守速率限制。",
+  "objectives": [
+    "比较 offset/limit、页码和游标（Link 头）三种分页方式，并收集完整的结果集",
+    "选择并实现 Basic、API 密钥、会话令牌和 OAuth 2.0 客户端凭据认证",
+    "正确缓存和刷新令牌，并让机密远离代码",
+    "使用 Retry-After、带抖动的指数退避以及客户端节流来处理 HTTP 429",
+    "判断哪些失败的请求可以安全重试"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一个库存脚本在实验环境中运行完美，那里的 Meraki 组织只有 40 台设备。在生产环境中，它却只报告恰好 1,000 台设备，而该组织实际有 3,800 台。第二天夜里，它运行到一半就因 `HTTP 429 Too Many Requests` 而崩溃，一周后，每次运行在第一个小时之后都会因 `401 Unauthorized` 而失败。\n\n这些都不是 API 的缺陷。它们是每个正规 REST API 都具备的三种行为：**分页**、**带过期时间的凭据认证**和**速率限制**。AUTOCOR 350-901 考试大纲要求你构建能处理这三者的客户端。本课介绍 Cisco 平台 API 所使用的模式，以及处理这些模式的 Python 代码。"
+    },
+    {
+      "id": "pagination",
+      "type": "text",
+      "markdown": "## 分页模式\n\nAPI 以**页**的形式返回大型集合，使单个响应保持小而快。你必须持续请求后续页面，直到集合被取完。\n\n| 模式 | 如何请求 | 如何得知还有更多数据 | Cisco 示例 |\n|:--|:--|:--|:--|\n| **偏移量 / 限制 (Offset / limit)** | `?offset=501&limit=500` | 返回了完整的一页；一直请求，直到某一页的条目数少于 `limit` | Catalyst Center 意图 API（`offset` 从 1 开始） |\n| **页码 / 页大小** | `?page=2&size=100` | 响应体中包含总数或 `nextPage` 链接 | ISE ERS API（带 `nextPage` 的 `SearchResult`） |\n| **游标 / Link 头** | `?perPage=1000&startingAfter=<id>` | 带有 `rel=next` 的 HTTP `Link` 头 (RFC 8288) | Meraki Dashboard API、Webex API |\n\n### 偏移量与游标的对比\n\n偏移量分页容易理解，但在数据变化时是**不稳定的**。如果你读取第 2 页时恰好在位置 10 添加了一台设备，之后的每个条目都会后移一位，你就可能漏掉或重复某条记录。**游标 (Cursor)** 指向某个特定条目（“从设备 Q2XX-AAAA-0003 之后开始”），因此其他位置的插入不会影响它。\n\n使用 Link 头时，你**不应该自己构造下一个 URL**。应原样跟随服务器发送的 `next` URL。Python 的 `requests` 库会替你把该头解析到 `resp.links` 中。\n\n在逐页遍历全部数据之前，先检查 API 是否支持在服务器端**过滤**（例如 Catalyst Center 上的 `?family=Switches%20and%20Hubs`，或 Meraki 上的 `productTypes[]=switch`）。页数越少，对速率限制的请求次数也越少。"
+    },
+    {
+      "id": "auth",
+      "type": "text",
+      "markdown": "## 认证模式\n\n| 方法 | 工作方式 | Cisco 示例 |\n|:--|:--|:--|\n| **HTTP Basic** | 用户名和密码经 Base64 编码，随每个请求发送 | IOS XE 上的 RESTCONF、ISE ERS |\n| **API 密钥 / 持有者令牌 (Bearer Token)** | 放在请求头中的长期有效密钥 | Meraki：`Authorization: Bearer <api-key>` |\n| **会话令牌 (Session Token)** | 使用 Basic 认证登录一次，获得短期有效的令牌 | Catalyst Center：`POST /dna/system/api/v1/auth/token`，然后使用 `X-Auth-Token`；FMC：`generatetoken`，然后使用 `X-auth-access-token` |\n| **OAuth 2.0 客户端凭据 (Client Credentials)** | 在令牌端点用客户端 ID 和密钥换取访问令牌 | Cisco XDR 和 Secure Endpoint API 客户端 |\n| **OAuth 2.0 授权码 (Authorization Code)** | 用户登录并同意授权；应用代表用户获得令牌 | Webex 集成 |\n\n### 正确处理令牌\n\n- 在令牌的整个有效期内**重复使用**它。每个请求前都登录既慢，而且登录本身也可能受到速率限制。例如，Catalyst Center 令牌的有效期约为一小时。\n- **提前刷新。**记录过期时间（OAuth 响应中的 `expires_in`），并在到期前不久续期。\n- **遇到 401 时，刷新一次并重试一次。**如果重试也失败，就停止：凭据有误或已被撤销。\n- **绝不要硬编码机密。**从环境变量、保管库 (Vault) 或 CI/CD 受保护变量中读取，并且绝不要记录 `Authorization` 头。\n- 始终使用 HTTPS 并验证证书。通过明文 HTTP，或发送到未经验证的服务器的持有者令牌，可能被窃取并被重放。"
+    },
+    {
+      "id": "api-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "一个健壮的客户端与 Catalyst Center 通信",
+      "caption": "在一次运行中完成令牌复用、偏移量分页、速率限制暂停和令牌刷新。",
+      "data": {
+        "actors": [
+          {
+            "id": "c",
+            "label": "库存脚本",
+            "sub": "Python requests",
+            "icon": "laptop"
+          },
+          {
+            "id": "s",
+            "label": "Catalyst Center",
+            "sub": "catc.example.com",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "c",
+            "to": "s",
+            "label": "POST /auth/token",
+            "detail": "Basic 认证",
+            "note": "脚本通过 HTTPS 使用 Basic 认证登录一次。",
+            "tone": "secure"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "200 {\"Token\": ...}",
+            "detail": "有效期约 60 分钟",
+            "note": "令牌被缓存，并在每个请求中以 X-Auth-Token 发送。",
+            "tone": "success"
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "GET network-device",
+            "detail": "offset=1&limit=500",
+            "note": "请求第一页。"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "200，500 个条目",
+            "detail": "完整的一页",
+            "note": "完整的一页意味着可能还有更多数据，因此偏移量移动到 501。"
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "GET network-device",
+            "detail": "offset=501&limit=500",
+            "note": "脚本请求第二页。"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "429 Too Many Requests",
+            "detail": "Retry-After: 2",
+            "note": "服务器在保护自己。脚本必须放慢速度，而不是放弃。",
+            "tone": "warning"
+          },
+          {
+            "from": "c",
+            "to": "c",
+            "label": "等待 2 秒 + 抖动",
+            "note": "脚本遵守 Retry-After，并额外加入一个很小的随机延迟。"
+          },
+          {
+            "from": "c",
+            "to": "s",
+            "label": "GET network-device",
+            "detail": "offset=501&limit=500",
+            "note": "GET 可以安全地重复，因此重试同一个请求。"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "200，312 个条目",
+            "detail": "少于 limit",
+            "note": "不满一页意味着集合已取完：共 812 台设备。",
+            "tone": "success"
+          },
+          {
+            "from": "s",
+            "to": "c",
+            "label": "后续调用返回 401",
+            "detail": "令牌已过期",
+            "note": "脚本续期令牌一次并重试；如果再次出现 401，则终止运行。",
+            "tone": "danger"
+          }
+        ]
+      }
+    },
+    {
+      "id": "ratelimits",
+      "type": "text",
+      "markdown": "## 速率限制\n\n**速率限制 (Rate Limit)** 规定客户端在一个时间窗口内最多可发送多少个请求，使一个脚本无法压垮共享的控制器。例如，Meraki 允许每个组织每秒约 10 个请求，并有短暂的突发额度。当你超过限制时，服务器会返回 **`429 Too Many Requests`**，通常还带有 **`Retry-After`** 头，给出需要等待的秒数。有些 API 还会返回 `X-RateLimit-Remaining` 之类的头，让客户端在触及限制之前就放慢速度。\n\n行为良好的客户端会：\n\n1. 当 **`Retry-After`** 存在时**遵守**它。\n2. 否则使用**带抖动的指数退避**：等待 1、2、4、8 秒再加一个随机的小数部分，直到某个上限。抖动可以避免许多工作进程在同一时刻重试。\n3. **限制并发。**十个线程同时猛攻一个组织，只会全部被限流。应使用小型工作线程池或令牌桶节流。\n4. 通过服务器端过滤器、批量端点（例如 Meraki 的动作批处理）以及对很少变化的数据进行缓存，**减少调用次数**。\n5. **最终放弃**并给出清晰的错误，而不是无限循环。\n\n### 哪些失败可以安全重试？\n\n| 响应 | 是否重试？ |\n|:--|:--|\n| `429`、`503` | 是，在 `Retry-After` 或退避时间之后 |\n| `500`、`502`、`504`、超时 | 对**幂等**方法（GET、PUT、DELETE）可以重试；对 POST 要小心，因为它可能创建重复对象 |\n| `401` | 刷新令牌一次，然后停止 |\n| `400`、`403`、`404`、`422` | 否：请求本身有问题，应修正请求 |"
+    },
+    {
+      "id": "curl-terminal",
+      "type": "terminal",
+      "title": "使用 curl -i 检查分页和限制",
+      "prompt": "$",
+      "lines": [
+        {
+          "comment": "Catalyst Center：获取会话令牌（凭据来自环境变量）"
+        },
+        {
+          "cmd": "curl -s -X POST -u \"$CATC_USER:$CATC_PASS\" https://catc.example.com/dna/system/api/v1/auth/token",
+          "output": "{\"Token\":\"eyJhbGciOiJSUzI1NiIs...<redacted>\"}"
+        },
+        {
+          "comment": "Meraki：-i 会显示响应头，包括 Link 头"
+        },
+        {
+          "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3\"",
+          "output": "HTTP/2 200\ncontent-type: application/json; charset=utf-8\nlink: <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=0000-0000-0000>; rel=first, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&startingAfter=Q2XX-AAAA-0003>; rel=next, <https://api.meraki.com/api/v1/organizations/123456/devices?perPage=3&endingBefore=zzzz-zzzz-zzzz>; rel=last\n\n[{\"serial\":\"Q2XX-AAAA-0001\",...},{\"serial\":\"Q2XX-AAAA-0002\",...},{\"serial\":\"Q2XX-AAAA-0003\",...}]"
+        },
+        {
+          "comment": "rel=next 携带游标：从本页最后一个序列号之后开始"
+        },
+        {
+          "comment": "在紧凑循环中调用过多："
+        },
+        {
+          "cmd": "curl -i -H \"Authorization: Bearer $MERAKI_API_KEY\" \"https://api.meraki.com/api/v1/organizations/123456/networks\"",
+          "output": "HTTP/2 429\nretry-after: 1\ncontent-type: application/json; charset=utf-8\n\n{\"errors\":[\"API rate limit exceeded for organization\"]}"
+        },
+        {
+          "comment": "再次尝试之前，至少等待 Retry-After 的值（秒）"
+        }
+      ],
+      "caption": "确切的错误文本因平台而异；你的代码应据以行动的是状态码和 Retry-After 头。"
+    },
+    {
+      "id": "client-code",
+      "type": "code",
+      "language": "python",
+      "filename": "meraki_inventory.py",
+      "caption": "一个会话、来自环境变量的持有者密钥、Link 头分页，以及遵守 Retry-After 并采用带抖动的指数退避的重试。Meraki 以秒为单位发送 Retry-After；有些 API 则改用 HTTP 日期。",
+      "highlight": [
+        14,
+        15,
+        16,
+        17,
+        30
+      ],
+      "code": "import os\nimport random\nimport time\n\nimport requests\n\nBASE = \"https://api.meraki.com/api/v1\"\nsession = requests.Session()\nsession.headers.update({\n    \"Authorization\": f\"Bearer {os.environ['MERAKI_API_KEY']}\",\n    \"Accept\": \"application/json\",\n})\n\ndef get_with_retry(url, params=None, max_tries=5):\n    for attempt in range(max_tries):\n        resp = session.get(url, params=params, timeout=15)\n        if resp.status_code == 429 or resp.status_code >= 500:\n            wait = float(resp.headers.get(\"Retry-After\", 2 ** attempt))\n            time.sleep(min(wait, 60) + random.uniform(0, 0.5))\n            continue\n        resp.raise_for_status()   # 4xx errors are not retried\n        return resp\n    raise RuntimeError(f\"Gave up after {max_tries} attempts: {url}\")\n\ndef get_all(path, per_page=1000):\n    url, params, items = f\"{BASE}{path}\", {\"perPage\": per_page}, []\n    while url:\n        resp = get_with_retry(url, params)\n        items.extend(resp.json())\n        url = resp.links.get(\"next\", {}).get(\"url\")\n        params = None   # the next URL already carries the cursor\n    return items\n\ndevices = get_all(\"/organizations/123456/devices\")\nprint(f\"Collected {len(devices)} devices\")"
+    },
+    {
+      "id": "sdk-note",
+      "type": "callout",
+      "variant": "note",
+      "title": "SDK 会替你完成大部分工作",
+      "markdown": "官方 Meraki Python 库 (`meraki`) 可以用 `total_pages='all'` 自动跟随分页，并自动重试 429 响应。Catalyst Center SDK (`dnacentersdk`) 会替你续期令牌。有 SDK 的地方就使用 SDK，但要理解其背后的行为：考试考查的是 HTTP 机制，而且当 SDK 未覆盖某个端点时你也会用到这些知识。"
+    },
+    {
+      "id": "pitfall",
+      "type": "callout",
+      "variant": "warning",
+      "title": "在实验环境通过、在生产环境失败的错误",
+      "markdown": "- 只读取第一页，因为实验环境从未超过一页。\n- 在超时后重试一个会创建对象的 POST，从而创建了重复对象。应先检查对象是否存在，或使用幂等的 PUT。\n- 在紧凑循环中立即重试，把一个 429 变成数百个。\n- 为了调试而打印完整的请求，把 API 密钥泄露到 CI 日志中。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "1. 使用 Cisco DevNet Meraki 沙盒或你自己的组织，并把密钥存放在环境变量中：`export MERAKI_API_KEY=<your-key>`。\n2. 运行 `curl -i ... ?perPage=3` 请求，并在 `link` 头中找出 `rel=next` URL。\n3. 以 `per_page=3` 运行 `meraki_inventory.py`，并确认总数与控制面板中的设备数量一致。\n4. 添加一个 429 响应计数器和一行显示每次等待时间的日志。同时运行两份脚本，观察退避如何起作用。\n5. 只向你有权使用的组织发送请求。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "分页 (Pagination)",
+          "definition": "把大型集合拆分成一系列较小的页面返回，由客户端依次请求。"
+        },
+        {
+          "term": "偏移量 / 限制 (Offset / limit)",
+          "definition": "按条目位置和页大小进行分页，例如 offset=501&limit=500。"
+        },
+        {
+          "term": "游标 (Cursor)",
+          "definition": "指向集合中某个位置的不透明指针，即使其他位置添加了条目也保持稳定。"
+        },
+        {
+          "term": "Link 头 (Link Header)",
+          "definition": "一种 HTTP 头 (RFC 8288)，携带 rel=next 和 rel=last 等用于页面导航的 URL。"
+        },
+        {
+          "term": "持有者令牌 (Bearer Token)",
+          "definition": "以 Authorization: Bearer <token> 形式发送的凭据；任何持有它的人都可以使用它。"
+        },
+        {
+          "term": "OAuth 2.0 客户端凭据 (Client Credentials)",
+          "definition": "应用用其客户端 ID 和密钥换取短期访问令牌的流程。"
+        },
+        {
+          "term": "速率限制 (Rate Limit)",
+          "definition": "对客户端在一个时间窗口内可发送请求数量的上限。"
+        },
+        {
+          "term": "HTTP 429 与 Retry-After",
+          "definition": "Too Many Requests 状态码，以及告诉客户端需要等待多久的头。"
+        },
+        {
+          "term": "带抖动的指数退避 (Exponential Backoff with Jitter)",
+          "definition": "每次失败后重试延迟加倍，并加入随机成分，使各客户端不会同步重试。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检验你的理解",
+      "questions": [
+        {
+          "question": "Meraki 的响应包含带有 rel=next 的 Link 头。你的客户端应该怎么做？",
+          "options": [
+            "按页大小增加 offset 参数",
+            "原样请求 rel=next URL，直到不再返回 rel=next",
+            "停止，因为第一页包含所有条目",
+            "先请求 rel=last 来统计条目数"
+          ],
+          "answer": 1,
+          "explanation": "游标分页把位置编码在 URL 中。应按原样跟随 rel=next，并在头中不再包含它时停止。"
+        },
+        {
+          "question": "为什么偏移量分页可能漏掉或重复记录？",
+          "options": [
+            "偏移量最多限制为 100 个条目",
+            "读取期间添加或删除的条目会使后面条目的位置发生移动",
+            "偏移量需要 OAuth",
+            "服务器会忽略 limit 参数"
+          ],
+          "answer": 1,
+          "explanation": "偏移量就是位置。如果集合在两次页面请求之间发生变化，条目就会跨越页面边界移动。游标指向特定条目，可以避免这一问题。"
+        },
+        {
+          "question": "你的脚本收到 HTTP 429 和 Retry-After: 5。正确的做法是什么？",
+          "options": [
+            "立即重试，最多 100 次",
+            "把它当作致命错误并退出",
+            "至少等待 5 秒后重试，并限制总的尝试次数",
+            "重新登录以获取新令牌"
+          ],
+          "answer": 2,
+          "explanation": "429 表示要放慢速度。遵守 Retry-After，在有多个工作进程时加入抖动，并在有限次数的尝试后放弃并给出清晰的错误。"
+        },
+        {
+          "question": "对于 Catalyst Center 的 X-Auth-Token 这类会话令牌，哪些做法是正确的？（选择所有适用项。）",
+          "options": [
+            "重复使用令牌，直到临近过期",
+            "在每次 API 调用之前都请求新令牌",
+            "遇到 401 时，刷新令牌一次并重试一次",
+            "把凭据存放在环境变量或保管库中，而不是脚本里"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "令牌的设计就是在其有效期内重复使用。在 401 时刷新一次即可处理过期，而机密则留在代码之外。每次调用前都登录既慢，而且本身也可能被限流。"
+        },
+        {
+          "question": "哪些失败的请求通常可以安全地自动重试？（选择所有适用项。）",
+          "options": [
+            "返回 503 的 GET",
+            "超时的 PUT",
+            "返回 400 Bad Request 的 POST",
+            "返回 429 的 GET"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "429 和 503 是临时性的，而 GET 和 PUT 是幂等的，因此重复它们是安全的。400 表示请求有误，在修正之前会再次失败。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- API 使用 **offset/limit**、**page/size** 或 **Link 头中的游标**进行分页。循环直到集合取完，按原样跟随 `rel=next`，并尽可能在服务器端过滤。\n- 认证方式从 **Basic** 和 **API 密钥**，到**会话令牌**和 **OAuth 2.0**。重复使用令牌，提前刷新，遇到 401 时只刷新一次，并让机密远离代码和日志。\n- 遇到 **429** 时，遵守 **Retry-After**，否则使用**带抖动的指数退避**，限制并发，并在有限次数的尝试后放弃。\n- 只重试临时性错误，而且无需额外检查就只重试**幂等**请求。\n\n接下来，请在 [结合 YANG 模型使用 RESTCONF](/learn/network-automation-devops/restconf-with-yang-models) 中把这些模式应用到配置 API 上。"
+    }
+  ]
+}

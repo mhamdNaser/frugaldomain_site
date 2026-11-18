@@ -1,0 +1,281 @@
+{
+  "title": "Python 网络自动化解决方案",
+  "summary": "设计一个具有幂等性、安全、并发且可测试的 Python 网络自动化解决方案，并为每种设备接口选择合适的库。",
+  "objectives": [
+    "针对给定接口，在 requests、ncclient、Netmiko 和 Nornir 之间做出选择",
+    "把解决方案构建为清单、期望状态、逻辑和报告四个部分",
+    "应用幂等性 (Idempotency)、超时、重试和按设备的错误处理",
+    "并发地运行设备任务，同时不使目标过载",
+    "使用模拟对象 (Mock) 和 CI 测试自动化代码"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "收到一个变更请求：让 40 台分支路由器指向新的 NTP 服务器。手工操作要花一个下午，而且容易出现拼写错误。一个简短的 Python 脚本一分钟就能完成，但在你笔记本电脑上能运行的脚本还不是*解决方案*。如果它把密码存在代码里，在遇到第一台不可达路由器时就崩溃，或者重复进行相同的更改，那么它带来的风险比消除的还多。\n\n本课展示了如何区分一个快速脚本与你能在生产环境中信赖的 Python 网络自动化解决方案：为每种接口选择合适的库、清晰的结构、幂等行为、错误处理、并发和测试。"
+    },
+    {
+      "id": "libs",
+      "type": "text",
+      "markdown": "## 根据接口选择库\n\n设备所提供的接口决定了所用的库。请选择设备所支持的最高层级的选项。\n\n| 接口 | 常用 Python 库 | 典型用途 |\n|:--|:--|:--|\n| SSH CLI | Netmiko、Scrapli | 旧设备、`show` 命令、文本配置 |\n| NETCONF（基于 SSH 的 XML） | ncclient | 使用 YANG 的模型驱动配置和状态 |\n| RESTCONF 或 REST (HTTPS) | requests | IOS XE、Catalyst Center、Meraki、ACI |\n| 多厂商抽象 | NAPALM、Nornir | 跨平台的统一 API、清单和多线程 |\n| CLI 解析 | Genie 解析器、TextFSM | 把 `show` 输出变成字典 |\n\nCLI 抓取是最后的手段。输出文本会随版本变化，而通过 [RESTCONF](/learn/network-automation-devops/restconf-with-yang-models) 访问的 YANG 模型能提供模式稳定的结构化数据。只有在没有 API 时才使用 CLI，并尽早把它的输出解析为数据。"
+    },
+    {
+      "id": "struct",
+      "type": "text",
+      "markdown": "## 解决方案的结构\n\n一个易于维护的解决方案会把四个关注点分开：\n\n1. **清单 (Inventory)（是什么）：** 一个 YAML 或 JSON 文件，或者 NetBox 之类的事实来源 (Source of Truth)，列出设备及其变量。代码中不出现设备名称。参见 [事实来源集成](/learn/network-automation-devops/source-of-truth-integration)。\n2. **期望状态 (Desired State)（应该是什么样子）：** 用于渲染配置或 JSON 载荷的变量和 Jinja2 模板。\n3. **逻辑 (Logic)（要做什么）：** 每个只做一件事的小函数：连接、读取、比较、更改、验证。\n4. **报告 (Reporting)（发生了什么）：** 日志记录以及每台设备的结果。参见 [自动化解决方案的日志记录](/learn/network-automation-devops/logging-for-automation-solutions)。\n\n把逻辑打包为带有类型提示和文档字符串的模块，把配置放在环境变量或保险库 (Vault) 中，并在 `requirements.txt` 中固定依赖版本，这样 CI 运行器和你的笔记本电脑表现一致。"
+    },
+    {
+      "id": "code",
+      "type": "code",
+      "language": "python",
+      "filename": "ntp_sync.py",
+      "code": "import logging\nimport os\nfrom concurrent.futures import ThreadPoolExecutor, as_completed\n\nimport requests\nimport yaml\nfrom requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\nlog = logging.getLogger(\"ntp-sync\")\nJSON = \"application/yang-data+json\"\n\n\ndef make_session():\n    s = requests.Session()\n    s.auth = (os.environ[\"NET_USER\"], os.environ[\"NET_PASS\"])  # never hard-code\n    s.headers.update({\"Accept\": JSON, \"Content-Type\": JSON})\n    s.verify = \"/etc/ssl/certs/lab-ca.pem\"                      # keep TLS checks on\n    retry = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])\n    s.mount(\"https://\", HTTPAdapter(max_retries=retry))\n    return s\n\n\ndef ensure_ntp(host, server):\n    url = f\"https://{host}/restconf/data/Cisco-IOS-XE-native:native\"\n    with make_session() as s:\n        r = s.get(url + \"/ntp\", timeout=10)\n        if r.status_code == 200 and server in r.text:\n            return host, \"unchanged\"                            # idempotent\n        body = {\"Cisco-IOS-XE-ntp:ntp\": {\"server\": {\"server-list\": [{\"ip-address\": server}]}}}\n        r = s.patch(url + \"/ntp\", json=body, timeout=10)\n        r.raise_for_status()\n        return host, \"changed\"\n\n\ndef main():\n    inv = yaml.safe_load(open(\"inventory.yaml\"))\n    with ThreadPoolExecutor(max_workers=5) as pool:\n        jobs = {pool.submit(ensure_ntp, h, inv[\"ntp_server\"]): h for h in inv[\"hosts\"]}\n        for job in as_completed(jobs):\n            try:\n                host, state = job.result()\n                log.info(\"%s %s\", host, state)\n            except requests.RequestException as exc:\n                log.error(\"%s FAILED %s\", jobs[job], exc)\n\n\nif __name__ == \"__main__\":\n    logging.basicConfig(level=logging.INFO, format=\"%(asctime)s %(levelname)s %(message)s\")\n    main()\n",
+      "caption": "一个小型 RESTCONF 解决方案：凭据来自环境变量、TLS 验证、重试、幂等性检查、线程以及按设备的结果。",
+      "highlight": [
+        16,
+        17,
+        18,
+        24,
+        28,
+        29,
+        41
+      ]
+    },
+    {
+      "id": "inv",
+      "type": "code",
+      "language": "yaml",
+      "filename": "inventory.yaml",
+      "code": "ntp_server: 192.0.2.123\nhosts:\n  - 198.51.100.11\n  - 198.51.100.12\n  - 198.51.100.13\n",
+      "caption": "清单是数据，所以同一份代码既可以针对实验环境运行，也可以针对生产环境运行。"
+    },
+    {
+      "id": "run",
+      "type": "terminal",
+      "title": "python ntp_sync.py",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "export NET_USER=automation NET_PASS='<from-vault>'"
+        },
+        {
+          "cmd": "python ntp_sync.py",
+          "output": "2026-03-02 09:14:01,220 INFO 198.51.100.11 changed\n2026-03-02 09:14:01,305 INFO 198.51.100.13 changed\n2026-03-02 09:14:11,873 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+          "comment": "一台不可达的路由器被记录下来，并不会阻止其他两台。"
+        },
+        {
+          "cmd": "python ntp_sync.py",
+          "output": "2026-03-02 09:15:40,114 INFO 198.51.100.11 unchanged\n2026-03-02 09:15:40,201 INFO 198.51.100.13 unchanged\n2026-03-02 09:15:50,630 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+          "comment": "第二次运行不会改变任何东西：该脚本是幂等的。"
+        }
+      ],
+      "caption": "结果按设备分别列出，因此部分失败是可见的，并且可以安全地重新运行。"
+    },
+    {
+      "id": "props",
+      "type": "text",
+      "markdown": "## 生产级脚本的特性\n\n- **幂等 (Idempotent)：** 先读取当前状态，只更改有差异的部分。失败后重新运行必须是安全的。上面的脚本在 patch 之前会检查服务器是否已存在。\n- **按设备失败，而不是按整次运行失败：** 捕获最窄的异常（`requests.RequestException`，而不是裸 `except`），记录失败并继续。返回一个结果对象，以便调用者设置退出码。\n- **超时和重试：** 每个网络调用都需要 `timeout`。只对瞬时错误（502、503、504、连接重置）进行带退避的重试。切勿重试 `400` 或 `401`。\n- **并发：** 网络调用在等待 I/O，所以线程会有帮助。使用有界线程池 (`max_workers=5`)，这样不会压垮控制器并触发其速率限制。参见 [高级 REST API](/learn/network-automation-devops/advanced-rest-apis-pagination-auth-and-rate-limits)。\n- **密钥和 TLS：** 从环境变量或保险库读取凭据，并使用 CA 证书包验证证书。切勿通过设置 `verify=False` 来消除错误。参见 [安全编码](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management)。\n- **试运行 (Dry Run)：** 提供一个打印预期更改的 `--check` 模式，使审查变得容易。"
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "一次自动化运行的生命周期",
+      "caption": "每个阶段只做一件事，并且可以单独测试。",
+      "data": {
+        "token": "变更",
+        "nodes": [
+          {
+            "id": "inv",
+            "label": "清单",
+            "sub": "YAML / NetBox",
+            "icon": "file"
+          },
+          {
+            "id": "code",
+            "label": "Python",
+            "sub": "requests / ncclient",
+            "icon": "cpu"
+          },
+          {
+            "id": "dev",
+            "label": "设备",
+            "sub": "RESTCONF",
+            "icon": "router"
+          },
+          {
+            "id": "log",
+            "label": "结果日志",
+            "sub": "按设备记录",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "inv",
+            "caption": "主机和变量从数据中加载，而不是从代码中加载。"
+          },
+          {
+            "at": "code",
+            "caption": "脚本构建一个带有凭据、TLS 和重试的会话。"
+          },
+          {
+            "at": "dev",
+            "token": "GET",
+            "caption": "它先读取当前状态。"
+          },
+          {
+            "at": "code",
+            "token": "差异",
+            "caption": "它把当前状态与期望值比较，并判断是否需要更改。"
+          },
+          {
+            "at": "dev",
+            "token": "PATCH",
+            "caption": "只有存在差异才会触发写入。",
+            "tone": "success"
+          },
+          {
+            "at": "log",
+            "caption": "每台设备的结果（已更改、未更改或失败）都会被记录下来。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "scale",
+      "type": "text",
+      "markdown": "## 从一个脚本到团队工具\n\n当其他人开始依赖一个只由某人运行的脚本时，它就成了一个工具。这时要增加一些习惯。\n\n- **命令行界面。** 使用 `argparse` 或 `click`，让用户传入清单、目标组和 `--check` 之类的标志，而不是去编辑代码。\n- **有意义的退出码。** 仅当每台设备都成功时才返回 `0`，这样流水线可以在失败时停止。\n- **带版本的发布。** 把代码放在 Git 中，为发布打标签并固定依赖版本，这样几个月后仍可复现一次运行。参见 [高级 Git](/learn/network-automation-devops/advanced-git-merge-squash-cherry-pick-reset-and-revert)。\n- **文档。** 一份简短的 README，写明用途、输入、所需的环境变量和运行示例，能为下一位工程师节省数小时。\n\n### 选择数据模型\n\n优先使用结构化数据，而不是拼接字符串。把 RESTCONF 请求体构建为 Python 字典，让 `json` 去序列化，而不是拼接文本。对于 CLI 配置，应根据变量渲染 Jinja2 模板，并先验证这些变量（例如使用 `pydantic` 或 JSON Schema），这样清单中的拼写错误会在到达路由器之前就失败。"
+    },
+    {
+      "id": "test",
+      "type": "text",
+      "markdown": "## 先测试再信任\n\n与设备交互的业务逻辑很难测试，所以要让它保持精简，把决策放在接收数据并返回数据的纯函数中。用 `pytest` 对这些函数进行单元测试，并用模拟对象 (Mock)（`unittest.mock` 或 `responses` 库）替换网络。在 CI 中对每次提交运行测试、`flake8` 之类的代码检查器和格式检查。然后在投入生产之前，使用 [Cisco Modeling Labs](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing) 针对模拟网络进行验证，并用 [pyATS](/learn/network-automation-devops/change-validation-with-pyats) 验证结果。另请参见 [Python 单元测试](/learn/network-automation-devops/python-unit-testing)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "常见错误",
+      "markdown": "不要记录请求体或请求头：它们包含凭据。不要捕获 `Exception` 后再 `pass`：静默失败看起来就像成功。不要为了“让它能运行”而禁用证书检查。应当修复信任链。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "使用你获准使用的 DevNet Sandbox IOS XE 设备或 CML 路由器：\n\n1. 复制 `ntp_sync.py` 和 `inventory.yaml`，用你的设备替换清单，并导出 `NET_USER` 和 `NET_PASS`。\n2. 运行两次。确认第一次运行显示 `changed`，第二次显示 `unchanged`。\n3. 添加一个 `--check` 选项，打印计划的更改而不发送 `PATCH`。\n4. 为函数 `needs_change(current_json, server)` 编写一个 `pytest` 测试，该函数返回 `True` 或 `False`。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "幂等 (Idempotent)",
+          "definition": "无论运行多少次都给出相同结果的操作。"
+        },
+        {
+          "term": "Netmiko",
+          "definition": "一个在网络设备上自动执行 SSH CLI 会话的 Python 库。"
+        },
+        {
+          "term": "ncclient",
+          "definition": "一个用于模型驱动配置和状态的 Python NETCONF 客户端。"
+        },
+        {
+          "term": "Nornir",
+          "definition": "一个用于跨设备的清单管理和多线程任务执行的 Python 框架。"
+        },
+        {
+          "term": "带退避的重试 (Retry with back-off)",
+          "definition": "在逐渐增长的延迟之后重复一次失败的调用，仅用于瞬时错误。"
+        },
+        {
+          "term": "模拟对象 (Mock)",
+          "definition": "一种测试替身，用可控的响应替换网络调用。"
+        },
+        {
+          "term": "试运行 (Dry run)",
+          "definition": "一种只报告预期更改而不实际应用的模式。"
+        },
+        {
+          "term": "requirements.txt",
+          "definition": "固定项目所需确切软件包版本的文件。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "为什么脚本在 patch 之前要读取 NTP 配置？",
+          "options": [
+            "使脚本具有幂等性，避免不必要的更改",
+            "因为 RESTCONF 禁止在没有读取的情况下写入",
+            "为了加快 TLS 协商",
+            "为了避免使用凭据"
+          ],
+          "answer": 0,
+          "explanation": "比较当前状态与期望状态意味着重新运行不会改变任何东西。"
+        },
+        {
+          "question": "对于生产环境中的 Python 自动化脚本，哪些是良好实践？选择所有适用项。",
+          "options": [
+            "从环境变量或保险库读取凭据",
+            "为每个请求设置超时",
+            "使用 verify=False 来避免证书错误",
+            "捕获范围狭窄的异常，并继续处理其他设备"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "禁用证书验证会去掉 TLS 的保护。其他三项可以提高安全性和韧性。"
+        },
+        {
+          "question": "哪个库适用于支持使用 YANG 模型的 NETCONF 的设备？",
+          "options": [
+            "ncclient",
+            "仅使用 TextFSM",
+            "Netmiko 屏幕抓取",
+            "smtplib"
+          ],
+          "answer": 0,
+          "explanation": "ncclient 使用 NETCONF 通信并返回结构化数据。抓取 CLI 是最后的手段。"
+        },
+        {
+          "question": "哪种错误应当自动进行带退避的重试？",
+          "options": [
+            "401 Unauthorized",
+            "400 Bad Request",
+            "503 Service Unavailable",
+            "因路径错误而出现的 404 Not Found"
+          ],
+          "answer": 2,
+          "explanation": "503 是瞬时性的。400、401 和 404 每次都会以同样的方式失败。"
+        },
+        {
+          "question": "为什么要使用有界线程池？",
+          "options": [
+            "避免使控制器过载并触及速率限制",
+            "因为 Python 无法创建超过五个线程",
+            "为了加密流量",
+            "为了跳过日志记录"
+          ],
+          "answer": 0,
+          "explanation": "无限制的并行可能压垮 API 并触发限流。"
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## 小结\n\n- 按接口选择库：RESTCONF/REST 用 requests，NETCONF 用 ncclient，CLI 用 Netmiko 或 Scrapli，多厂商场景用 Nornir 或 NAPALM。\n- 把清单、期望状态、逻辑和报告分开。\n- 让每次运行都具备幂等性，在时间和并发上有界，并按设备相互隔离。\n- 不要把密钥放进代码，保持 TLS 验证开启，并记录每个结果。\n- 对逻辑进行单元测试，在 CML 中仿真，并用 pyATS 验证更改。"
+    }
+  ]
+}

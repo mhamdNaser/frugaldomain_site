@@ -1,0 +1,369 @@
+{
+  "title": "YANG、NETCONF 和 RESTCONF 可编程性",
+  "summary": "学习阅读 YANG 模型，然后通过 SSH 上的 NETCONF 和 HTTPS 上的 RESTCONF，以结构化数据而非 CLI 文本的方式读取和更改 IOS XE 配置。",
+  "objectives": [
+    "解释模型驱动可编程性 (Model-driven Programmability) 以及它为何取代屏幕抓取 (Screen Scraping)",
+    "阅读 YANG 树，并识别容器 (Container)、列表 (List)、键 (Key)、叶子 (Leaf)，以及配置数据与状态数据的区别",
+    "描述 NETCONF 的分层、操作、数据存储 (Datastore) 以及能力交换 (Capabilities Exchange)",
+    "在 IOS XE 上启用并验证 NETCONF 和 RESTCONF",
+    "构建 RESTCONF URI，并将 HTTP 方法映射到 NETCONF 操作"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "几十年来，自动化一台路由器意味着通过 SSH 发送 CLI 命令，并解析返回的文本。新的软件版本只要在 `show interfaces` 中多出一列，就可能破坏所有脚本。屏幕抓取之所以脆弱，是因为 CLI 输出是写给人看的，而不是写给程序的。\n\n**模型驱动可编程性 (Model-driven Programmability)** 解决了这个问题。**YANG** 模型精确定义设备拥有哪些数据以及每个值的类型。**NETCONF** 和 **RESTCONF** 是以结构化格式（XML 或 JSON）读取和更改这些数据的协议。CCNA Automation 考试要求你能阅读 YANG 树、解释 NETCONF 和 RESTCONF 的工作原理，并针对 IOS XE 构建请求。"
+    },
+    {
+      "id": "yang",
+      "type": "text",
+      "markdown": "## YANG：数据模型\n\n**YANG** (RFC 7950) 是一种 **数据建模语言 (Data Modeling Language)**。它本身并不承载数据，而是描述配置数据和状态数据的结构、类型和规则，再由协议以 XML 或 JSON 形式承载数据。参见 [数据格式：XML、JSON 和 YAML](/learn/network-automation-devops/data-formats-xml-json-and-yaml)。\n\n### 构成要素\n\n| 语句 | 含义 | 示例 |\n|:--|:--|:--|\n| `module` | 带有自己命名空间的命名模型 | `ietf-interfaces` |\n| `container` | 一组相关节点，只出现一次 | `interfaces` |\n| `list` | 由 **键 (Key)** 标识的重复条目 | 以 `name` 为键的 `interface` |\n| `leaf` | 带类型的单个值 | `description`（字符串） |\n| `leaf-list` | 简单值的列表 | DNS 服务器地址 |\n| `typedef` / `grouping` | 可复用的类型和节点集合 | `yang:counter64` |\n\n节点要么是 **配置数据**（`rw`，可以写入），要么是 **运行状态数据**（`ro`，只读，例如计数器和 `oper-status`）。\n\n### 谁来编写模型\n\n- **IETF** 标准模型，例如 `ietf-interfaces` 和 `ietf-ip`：与厂商无关，但只涵盖通用功能。\n- **OpenConfig** 模型：由网络运营商编写，与厂商无关，广泛用于 gNMI。\n- **原生 (Native)**（厂商）模型，例如 `Cisco-IOS-XE-native`：涵盖该平台的所有功能，但只能用于该平台。\n\n`pyang` 工具可以将模型打印为树形结构，这是阅读模型最简单的方法。"
+    },
+    {
+      "id": "tree",
+      "type": "code",
+      "language": "plain",
+      "filename": "pyang-tree.txt",
+      "caption": "rw 节点是配置数据，ro 节点是状态数据。星号表示列表，[name] 是它的键。问号表示该叶子是可选的。",
+      "code": "$ pyang -f tree ietf-interfaces.yang\nmodule: ietf-interfaces\n  +--rw interfaces\n     +--rw interface* [name]\n        +--rw name                        string\n        +--rw description?                string\n        +--rw type                        identityref\n        +--rw enabled?                    boolean\n        +--rw link-up-down-trap-enable?   enumeration {if-mib}?\n        +--ro admin-status                enumeration {if-mib}?\n        +--ro oper-status                 enumeration\n        +--ro phys-address?               yang:phys-address\n        +--ro statistics\n           +--ro in-octets?               yang:counter64\n           +--ro out-octets?              yang:counter64",
+      "highlight": [
+        4
+      ]
+    },
+    {
+      "id": "netconf",
+      "type": "text",
+      "markdown": "## NETCONF：SSH 上的 RPC\n\n**NETCONF** (RFC 6241) 是一种 RPC 风格的协议（参见 [API 风格：REST、RPC、同步与异步](/learn/network-automation-devops/api-styles-rest-rpc-synchronous-and-asynchronous)）。它运行在 **SSH 的 TCP 830 端口** 上，并以 **XML** 编码所有内容。它分为四层：\n\n| 层 | 内容 |\n|:--|:--|\n| 内容层 (Content) | 由 YANG 定义的配置数据和状态数据 |\n| 操作层 (Operations) | `<get>`、`<get-config>`、`<edit-config>`、`<copy-config>`、`<delete-config>`、`<lock>`、`<unlock>`、`<commit>`、`<close-session>`、`<kill-session>` |\n| 消息层 (Messages) | `<rpc>` 和 `<rpc-reply>`，以及 `<notification>` |\n| 安全传输层 (Secure transport) | SSH（也定义了 TLS） |\n\n### 数据存储 (Datastore)\n\n- **running**：当前生效的配置。\n- **startup**：启动时加载的配置（如果设备支持）。\n- **candidate**：一份草稿副本，你先编辑它，再一步 **提交 (Commit)**。启用后 IOS XE 支持它；IOS XR 默认使用它。\n\n### 一次会话\n\n客户端和服务器首先交换 `<hello>` 消息，列出各自的 **能力 (Capabilities)**：NETCONF 版本以及设备支持的每一个 YANG 模块。然后客户端发送带有 `message-id` 的 `<rpc>` 消息，服务器用 `<rpc-reply>` 回答每一条，其中包含数据、`<ok/>` 或 `<rpc-error>`。由于更改会依据模型进行校验，错误的值会被整体拒绝，而不会只应用一半。在 Python 中，**ncclient** 库负责处理 SSH 会话和 XML 帧。"
+    },
+    {
+      "id": "nc-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "与 IOS XE 的 NETCONF 会话",
+      "caption": "Hello 消息通告各自的能力；每个 rpc 都会收到带有相同 message-id 的 rpc-reply。",
+      "data": {
+        "actors": [
+          {
+            "id": "c",
+            "label": "ncclient 脚本",
+            "sub": "自动化主机",
+            "icon": "laptop"
+          },
+          {
+            "id": "r",
+            "label": "R1",
+            "sub": "IOS XE，TCP 830",
+            "icon": "router"
+          }
+        ],
+        "steps": [
+          {
+            "from": "c",
+            "to": "r",
+            "label": "SSH 连接",
+            "detail": "端口 830，子系统 netconf",
+            "tone": "secure",
+            "note": "客户端打开一个 SSH 会话，并请求 netconf 子系统。"
+          },
+          {
+            "from": "r",
+            "to": "c",
+            "label": "<hello>",
+            "detail": "base:1.1 + YANG 模块",
+            "note": "路由器列出它的能力，包括它支持的每一个 YANG 模块。"
+          },
+          {
+            "from": "c",
+            "to": "r",
+            "label": "<hello>",
+            "detail": "base:1.0、base:1.1",
+            "note": "客户端发送自己的能力。双方使用共同支持的最高版本。"
+          },
+          {
+            "from": "c",
+            "to": "r",
+            "label": "<rpc> <get-config>",
+            "detail": "源为 running，子树过滤器",
+            "note": "客户端从 running 数据存储中请求一个接口。"
+          },
+          {
+            "from": "r",
+            "to": "c",
+            "label": "<rpc-reply> <data>",
+            "detail": "按 ietf-interfaces 的 XML",
+            "tone": "success",
+            "note": "回复只包含过滤后的数据，其结构完全符合模型的定义。"
+          },
+          {
+            "from": "c",
+            "to": "r",
+            "label": "<rpc> <edit-config>",
+            "detail": "目标为 running",
+            "note": "客户端为该接口发送新的描述。"
+          },
+          {
+            "from": "r",
+            "to": "c",
+            "label": "<rpc-reply> <ok/>",
+            "tone": "success",
+            "note": "该更改已依据模型校验并应用。"
+          },
+          {
+            "from": "c",
+            "to": "r",
+            "label": "<rpc> <close-session>",
+            "note": "客户端正常结束会话。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "enable",
+      "type": "terminal",
+      "title": "在 IOS XE 上启用 NETCONF 和 RESTCONF",
+      "prompt": "R1#",
+      "lines": [
+        {
+          "cmd": "configure terminal",
+          "prompt": "R1#",
+          "output": "Enter configuration commands, one per line.  End with CNTL/Z."
+        },
+        {
+          "cmd": "aaa new-model",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "aaa authentication login default local",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "aaa authorization exec default local",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "username netops privilege 15 secret <password-placeholder>",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "comment": "NETCONF 和 RESTCONF 需要 AAA 和一个特权级别 15 的用户。"
+        },
+        {
+          "cmd": "netconf-yang",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "ip http secure-server",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "restconf",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "end",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "comment": "netconf-yang 在 TCP 830 上启动 NETCONF 服务器。RESTCONF 运行在 HTTPS 服务器上，因此需要 ip http secure-server。"
+        },
+        {
+          "cmd": "show netconf-yang status",
+          "prompt": "R1#",
+          "output": "netconf-yang: enabled\nnetconf-yang ssh port: 830\nnetconf-yang candidate-datastore: disabled"
+        },
+        {
+          "cmd": "show platform software yang-management process",
+          "prompt": "R1#",
+          "output": "confd            : Running\nnesd             : Running\nsyncfd           : Running\nncsshd           : Running\ndmiauthd         : Running\nnginx            : Running\nndbmand          : Running\npubd             : Running"
+        },
+        {
+          "comment": "每个进程都必须处于 Running 状态。nginx 提供 RESTCONF 服务，ncsshd 提供 SSH 上的 NETCONF 服务。"
+        }
+      ],
+      "caption": "实验室路由器。在生产环境中，请使用 ACL 将管理访问限制在自动化主机上。"
+    },
+    {
+      "id": "nc-code",
+      "type": "code",
+      "language": "python",
+      "filename": "netconf_interface.py",
+      "caption": "使用 ncclient 读取并更改一个接口。凭据来自环境变量，并且会验证 SSH 主机密钥。",
+      "code": "import os\nfrom ncclient import manager\n\nFILTER = \"\"\"\n<filter>\n  <interfaces xmlns=\"urn:ietf:params:xml:ns:yang:ietf-interfaces\">\n    <interface>\n      <name>GigabitEthernet2</name>\n    </interface>\n  </interfaces>\n</filter>\"\"\"\n\nCONFIG = \"\"\"\n<config>\n  <interfaces xmlns=\"urn:ietf:params:xml:ns:yang:ietf-interfaces\">\n    <interface>\n      <name>GigabitEthernet2</name>\n      <description>Uplink to core - set by NETCONF</description>\n    </interface>\n  </interfaces>\n</config>\"\"\"\n\nwith manager.connect(host=\"r1.example.com\", port=830,\n                     username=os.environ[\"NETOPS_USER\"],\n                     password=os.environ[\"NETOPS_PASSWORD\"],\n                     hostkey_verify=True,\n                     device_params={\"name\": \"iosxe\"}) as m:\n    print([c for c in m.server_capabilities if \"ietf-interfaces\" in c])\n\n    reply = m.get_config(source=\"running\", filter=FILTER)   # <get-config>\n    print(reply.xml)\n\n    result = m.edit_config(target=\"running\", config=CONFIG)  # <edit-config>\n    print(result.ok)                                          # True when <ok/> came back",
+      "highlight": [
+        30,
+        33
+      ]
+    },
+    {
+      "id": "restconf",
+      "type": "text",
+      "markdown": "## RESTCONF：HTTPS 上的同一套模型\n\n**RESTCONF** (RFC 8040) 以 REST API 的形式，通过 **HTTPS** 开放相同的 YANG 数据。它更容易上手，因为任何 HTTP 工具都能使用，并且除了 XML 之外还可以使用 **JSON**。\n\n### URI 遵循模型\n\n`https://<device>/restconf/data/<module>:<container>/<list>=<key>`\n\n例如 `/restconf/data/ietf-interfaces:interfaces/interface=GigabitEthernet2`。不属于数据的操作（例如 `save-config`）位于 `/restconf/operations/` 之下。\n\n### 媒体类型 (Media Type)\n\n在 `Accept` 和 `Content-Type` 头部中使用 `application/yang-data+json` 或 `application/yang-data+xml`。普通的 `application/json` 可能会被拒绝。\n\n### 与 NETCONF 对应的方法\n\n| RESTCONF | 对应的 NETCONF | 效果 |\n|:--|:--|:--|\n| `GET` | `<get>` / `<get-config>` | 读取数据 |\n| `POST` | `<edit-config>`（创建） | 创建新资源；如果已存在则失败 |\n| `PUT` | `<edit-config>`（替换） | 创建或替换整个资源 |\n| `PATCH` | `<edit-config>`（合并） | 将更改合并到资源中 |\n| `DELETE` | `<edit-config>`（删除） | 删除资源 |\n\n### 选 NETCONF 还是 RESTCONF？\n\nRESTCONF 更简单，适合 Web 工具。NETCONF 提供 RESTCONF 所缺少的功能：带提交的 **candidate** 数据存储、用于阻止并发更改的 **锁 (Lock)**，以及全网事务。Cisco NSO 和 Ansible 等工具正是出于这个原因使用 NETCONF。许多团队会先在 Cisco Modeling Labs 中测试他们的更改；参见 [仿真与测试：Cisco Modeling Labs 和 pyATS](/learn/network-automation-devops/simulation-and-testing-cisco-modeling-labs-and-pyats)。"
+    },
+    {
+      "id": "rc-term",
+      "type": "terminal",
+      "title": "使用 curl 进行 RESTCONF GET 和 PATCH",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -u netops:<password-placeholder> -H \"Accept: application/yang-data+json\" https://r1.example.com/restconf/data/ietf-interfaces:interfaces/interface=GigabitEthernet2",
+          "output": "{\n  \"ietf-interfaces:interface\": {\n    \"name\": \"GigabitEthernet2\",\n    \"description\": \"Uplink to core - set by NETCONF\",\n    \"type\": \"iana-if-type:ethernetCsmacd\",\n    \"enabled\": true,\n    \"ietf-ip:ipv4\": {\n      \"address\": [\n        { \"ip\": \"192.0.2.1\", \"netmask\": \"255.255.255.0\" }\n      ]\n    },\n    \"ietf-ip:ipv6\": {}\n  }\n}"
+        },
+        {
+          "comment": "URI 遵循 YANG 树：module:container/list=key。通过 NETCONF 修改的描述可以通过 RESTCONF 看到，因为两者读取的是同一个数据存储。"
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w \"%{http_code}\\n\" -u netops:<password-placeholder> -X PATCH -H \"Content-Type: application/yang-data+json\" -d '{\"ietf-interfaces:interface\": {\"name\": \"GigabitEthernet2\", \"enabled\": true}}' https://r1.example.com/restconf/data/ietf-interfaces:interfaces/interface=GigabitEthernet2",
+          "output": "204"
+        },
+        {
+          "comment": "PATCH 合并更改。204 No Content 表示成功，且没有返回的正文。"
+        }
+      ],
+      "caption": "实验室输出。在生产环境中请验证设备证书，而不是禁用检查。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "学习者常见误区",
+      "markdown": "- **把 YANG 称为协议。** YANG 是模型；NETCONF 和 RESTCONF 是协议；XML 和 JSON 是编码。\n- **端口错误。** NETCONF 使用 SSH 的 **830** 端口，而不是 22。RESTCONF 使用 HTTPS 的 443 端口。\n- **忘记前提条件。** 如果没有 `aaa new-model`、特权级别 15 的用户和 `ip http secure-server`，RESTCONF 会返回 `401` 或完全没有响应。\n- **想用 PATCH 却用了 PUT。** `PUT` 会替换整个资源，因此你没有发送的叶子可能会被删除。\n- **媒体类型错误。** 使用 `application/yang-data+json`，并在 URI 和正文中写出模块前缀（`ietf-interfaces:interface`）。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "使用实验室的 IOS XE 路由器，例如 Cisco Modeling Labs 中的 Catalyst 8000v 或 IOS XE DevNet Sandbox。\n\n1. 用上面的命令启用 NETCONF 和 RESTCONF，并确认每个 yang-management 进程都处于 `Running` 状态。\n2. 安装 `pyang`，下载 `ietf-interfaces.yang` 并打印它的树。找出 `interface` 列表的键。\n3. 运行 `netconf_interface.py`。然后在 CLI 中用 `show running-config interface GigabitEthernet2` 检查结果。\n4. 用 RESTCONF 分别以 JSON 和 XML（`application/yang-data+xml`）读取同一个接口，并比较两者。\n5. 向一个测试环回接口发送仅含 `name` 叶子的 `PUT`，并观察它的描述会发生什么。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "模型驱动可编程性 (Model-driven Programmability)",
+          "definition": "通过由模型定义的结构化数据来管理设备，而不是发送 CLI 命令并解析文本。"
+        },
+        {
+          "term": "YANG",
+          "definition": "一种数据建模语言 (RFC 7950)，定义配置数据和状态数据的结构、类型和规则。"
+        },
+        {
+          "term": "容器、列表、叶子 (Container, List, Leaf)",
+          "definition": "YANG 的构成要素：一组节点、由键标识的重复条目，以及带类型的单个值。"
+        },
+        {
+          "term": "原生模型 (Native Model)",
+          "definition": "厂商的 YANG 模型，例如 Cisco-IOS-XE-native，涵盖某一平台的所有功能。"
+        },
+        {
+          "term": "NETCONF",
+          "definition": "一种 RPC 协议 (RFC 6241)，通过 SSH 830 端口使用 XML 来读取和更改由 YANG 建模的数据。"
+        },
+        {
+          "term": "能力 (Capabilities)",
+          "definition": "NETCONF 对端在其 hello 消息中通告的协议版本和 YANG 模块。"
+        },
+        {
+          "term": "候选数据存储 (Candidate Datastore)",
+          "definition": "配置的一份工作副本，先对其进行编辑，然后通过提交 (commit) 一步应用。"
+        },
+        {
+          "term": "RESTCONF",
+          "definition": "一种 REST 协议 (RFC 8040)，通过 HTTPS 以 JSON 或 XML 开放 YANG 数据。"
+        },
+        {
+          "term": "application/yang-data+json",
+          "definition": "用于以 JSON 编码的 YANG 数据的 RESTCONF 媒体类型 (Media Type)。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "NETCONF 默认使用哪种传输方式和端口？",
+          "options": [
+            "TCP 443 上的 HTTPS",
+            "TCP 830 上的 SSH",
+            "TCP 22 上的 SSH",
+            "TCP 57400 上的 gRPC"
+          ],
+          "answer": 1,
+          "explanation": "NETCONF 作为 SSH 子系统运行在 TCP 830 端口上。RESTCONF 使用 HTTPS。"
+        },
+        {
+          "question": "在 pyang 树中，'+--rw interface* [name]' 告诉你什么？（选择所有适用项。）",
+          "options": [
+            "interface 是一个列表",
+            "条目由 name 键标识",
+            "该节点是只读的状态数据",
+            "该节点是配置数据"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "星号表示列表，[name] 是它的键，rw 表示可写入的配置数据。只读状态显示为 ro。"
+        },
+        {
+          "question": "哪种 RESTCONF 方法可以将更改合并到现有资源中而不替换它？",
+          "options": [
+            "PUT",
+            "POST",
+            "PATCH",
+            "GET"
+          ],
+          "answer": 2,
+          "explanation": "PATCH 对应 edit-config 的合并 (merge)。PUT 替换整个资源，POST 创建新资源。"
+        },
+        {
+          "question": "NETCONF 提供哪些 RESTCONF 所没有的功能？（选择所有适用项。）",
+          "options": [
+            "带提交的候选数据存储",
+            "锁定数据存储",
+            "JSON 编码",
+            "由 YANG 模型定义的数据"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "NETCONF 拥有候选数据存储、提交和锁。RESTCONF 支持 JSON，并且两种协议都承载由 YANG 建模的数据。"
+        },
+        {
+          "question": "在 RESTCONF 能够工作之前，IOS XE 需要哪些命令？（选择所有适用项。）",
+          "options": [
+            "aaa new-model",
+            "ip http secure-server",
+            "restconf",
+            "feature nxapi"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "RESTCONF 需要 AAA、特权级别 15 的用户、HTTPS 服务器和 restconf 命令。feature nxapi 是 NX-OS 命令。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n- **YANG** 模型定义数据：模块、容器、带键的列表和带类型的叶子。模型来自 IETF、OpenConfig 或厂商（原生）。\n- **NETCONF** 通过 SSH 830 端口发送 XML RPC。它在 `<hello>` 中交换能力，支持 running、startup 和 candidate 数据存储，并提供锁和提交。\n- **RESTCONF** 通过 HTTPS 开放相同的数据。URI 遵循模型，媒体类型是 `application/yang-data+json`，HTTP 方法对应 NETCONF 操作。\n- 在 IOS XE 上，启用 AAA、特权级别 15 的用户、`netconf-yang`、`ip http secure-server` 和 `restconf`。\n\n接下来，了解各种工具如何构建在这些协议之上：[Ansible、Terraform 和 Cisco NSO](/learn/network-automation-devops/ansible-terraform-and-cisco-nso)。"
+    }
+  ]
+}

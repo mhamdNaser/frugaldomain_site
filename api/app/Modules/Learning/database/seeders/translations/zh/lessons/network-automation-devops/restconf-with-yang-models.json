@@ -1,0 +1,360 @@
+{
+  "title": "使用 YANG 模型的 RESTCONF",
+  "summary": "根据 YANG 模型构建 RESTCONF 请求并应用到 IOS XE：启用服务、构造 URI、选择方法、读取状态码和错误响应体，以及安全地保存更改。",
+  "objectives": [
+    "比较 RESTCONF 与 NETCONF，并识别 IETF、OpenConfig 和 Cisco 原生 (Native) YANG 模型",
+    "在 IOS XE 上通过 AAA 和 HTTPS 启用并验证 RESTCONF",
+    "根据 YANG 树构造 RESTCONF URI，包括模块前缀、列表键和查询参数",
+    "在 GET、POST、PUT、PATCH 和 DELETE 之间做出选择，并解读状态码和错误响应体",
+    "使用 curl 和 Python requests 读取、更改并保存配置"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一个运维团队必须在 50 台 IOS XE 路由器的 WAN 接口上设置标准描述，然后读回结果以证明操作成功。每当输出格式变化时，对 `show interfaces` 进行屏幕抓取（screen-scraping）就会失效。**RESTCONF** 为同一个团队提供了稳定的、模型驱动的 HTTPS API：URL 源自 **YANG** 模型，载荷是与该模型相匹配的 JSON，而应答是标准的 HTTP 状态码。\n\nAUTOCOR 350-901 要求你能够根据 YANG 模型构造 RESTCONF 请求，把它们应用到 IOS XE，并解读响应。数据模型本身，以及如何把它们转换为 YAML 或 JSON 载荷，将在 [根据 YANG 模型生成 YAML / JSON 配置](/learn/network-automation-devops/yaml-json-configurations-from-yang-models) 中介绍。"
+    },
+    {
+      "id": "context",
+      "type": "text",
+      "markdown": "## RESTCONF 的背景\n\nRESTCONF (RFC 8040) 提供与 NETCONF 相同的、由 YANG 建模的数据存储 (Datastore)，只是通过 HTTP 访问。YANG 树中的每个节点都变成一个带 URI 的**资源**，并由标准 HTTP 方法对其进行操作。\n\n| | NETCONF (RFC 6241) | RESTCONF (RFC 8040) |\n|:--|:--|:--|\n| 传输方式 | SSH，TCP 830 | HTTPS，TCP 443 |\n| 编码 | XML | JSON 或 XML |\n| 操作 | `<get>`、`<get-config>`、`<edit-config>`、`<commit>`、`<lock>` | GET、POST、PUT、PATCH、DELETE |\n| 数据存储 | running、candidate、startup | 统一视图；在 IOS XE 上编辑会写入 running |\n| 事务 | 通过 candidate、validate、commit 和 lock 实现多步骤 | 一个请求就是一个事务 |\n| 最适合 | 大型、原子性的多部分更改 | 简单工具、Web 集成、快速读取 |\n\nRESTCONF 服务器会在 **YANG 库 (YANG Library)**（`/restconf/data/ietf-yang-library:modules-state`）中列出它所支持的模型。在 IOS XE 上你会用到三类模型：**IETF**（厂商中立，如 `ietf-interfaces`）、**OpenConfig**（由运营商推动，如 `openconfig-interfaces`）和 **Cisco 原生**（用于配置的 `Cisco-IOS-XE-native`，用于运行状态的 `Cisco-IOS-XE-*-oper`）。原生模型几乎覆盖所有 CLI 功能；IETF 和 OpenConfig 模型可以跨厂商移植。"
+    },
+    {
+      "id": "enable",
+      "type": "text",
+      "markdown": "## 在 IOS XE 上启用 RESTCONF\n\nRESTCONF 运行在设备的 HTTPS 服务器上，并使用 AAA 进行身份验证和授权。用户需要**权限级别 15**。下面的配置禁用了明文 HTTP，使用本地身份验证启用 HTTPS，并启动 RESTCONF 服务。在生产环境中，请把自签名证书替换为 CA 签发的证书，详见 [CA 签发的 TLS 证书](/learn/network-automation-devops/ca-signed-tls-certificates)。"
+    },
+    {
+      "id": "ios-code",
+      "type": "code",
+      "language": "cisco",
+      "filename": "edge1-restconf.cfg",
+      "caption": "IOS XE 上的最小 RESTCONF 配置。其中的 secret 只是占位符。",
+      "highlight": [
+        5,
+        8,
+        9,
+        12
+      ],
+      "code": "aaa new-model\naaa authentication login default local\naaa authorization exec default local\n!\nusername netauto privilege 15 secret <STRONG-SECRET-PLACEHOLDER>\n!\nno ip http server\nip http secure-server\nip http authentication local\n!\nrestconf"
+    },
+    {
+      "id": "verify",
+      "type": "terminal",
+      "title": "检查可编程性进程",
+      "prompt": "edge1#",
+      "lines": [
+        {
+          "cmd": "show platform software yang-management process",
+          "output": "confd            : Running\nnesd             : Running\nsyncfd           : Running\nncsshd           : Not Running\ndmiauthd         : Running\nnginx            : Running\nndbmand          : Running\npubd             : Running\ngnmib            : Not Running"
+        },
+        {
+          "comment": "RESTCONF 要求 confd、nginx 和 dmiauthd 处于 Running 状态。ncsshd 属于 NETCONF (netconf-yang)，gnmib 属于 gNMI，这里都没有启用。"
+        },
+        {
+          "cmd": "show running-config | include ^restconf|secure-server",
+          "output": "ip http secure-server\nrestconf"
+        }
+      ]
+    },
+    {
+      "id": "uri",
+      "type": "text",
+      "markdown": "## RESTCONF URI 的结构\n\n每个请求 URI 都有相同的形式：\n\n`https://<host>/restconf/data/<module>:<container>/<list>=<key>/<leaf>`\n\n- `/restconf/data` 指向数据存储；`/restconf/operations/<module>:<rpc>` 用于调用 RPC。\n- **第一个节点**带有其模块名作为前缀：`ietf-interfaces:interfaces`。来自同一模块的子节点不会重复该前缀。由其他模块通过 `augment` 添加的节点则需要：`ietf-ip:ipv4`。\n- **列表条目**用 `=key` 选择。多个键以逗号分隔，特殊字符要进行百分号编码：`GigabitEthernet1/0/1` 变为 `interface=GigabitEthernet1%2F0%2F1`。\n\n常用的**查询参数**：\n\n| 参数 | 效果 |\n|:--|:--|\n| `depth=N` | 限制返回多少层子节点 |\n| `fields=a;b` | 只返回选定的叶子节点 |\n| `content=config` / `nonconfig` | 只返回配置数据或只返回运行状态数据 |\n| `with-defaults=report-all` | 包含处于默认值的叶子节点 |\n\n媒体类型为 `application/yang-data+json` 和 `application/yang-data+xml`。读取时发送 `Accept`，写入时发送 `Content-Type`；在许多平台上，普通的 `application/json` 会被以 **415 Unsupported Media Type** 拒绝。"
+    },
+    {
+      "id": "methods",
+      "type": "text",
+      "markdown": "## 方法和状态码\n\n| 方法 | 含义 | 典型成功结果 | 典型失败结果 |\n|:--|:--|:--|:--|\n| GET | 读取资源 | 200 OK | 若不存在则为 404 |\n| POST | 在目标之下创建**子节点** | 201 Created | 409 Conflict (`data-exists`) |\n| PUT | 创建或**替换**目标 | 201 Created / 204 No Content | 若请求体与 URI 不匹配则为 400 |\n| PATCH | 把请求体**合并**到目标中 | 204 No Content | 若目标缺失则为 404 |\n| DELETE | 删除目标 | 204 No Content | 404 (`data-missing`) |\n\nPUT 是幂等的，并且会替换目标之下的所有内容，所以对整个接口执行不带其 IP 地址的 PUT 会删除该地址。当你只更改一个叶子节点时，PATCH 是更安全的选择。"
+    },
+    {
+      "id": "yang",
+      "type": "text",
+      "markdown": "## 从 YANG 树到请求\n\n在编写请求之前先阅读模型。`pyang -f tree` 会打印这棵树：`rw` 节点是配置，`ro` 节点是状态，`*` 表示列表（其键写在方括号中），`?` 表示可选叶子节点，`!` 表示存在容器 (presence container)。Cisco 还提供 **YANG Suite**，这是一个可浏览设备上的模型并生成 RESTCONF 和 NETCONF 请求的 Web 工具。下面的树解释了随后各个请求的每一部分：`interface=GigabitEthernet2` 来自 `interface* [name]`，而 `ietf-ip:` 前缀之所以出现，是因为 `ipv4` 是来自另一个模块的扩充 (augmentation)。"
+    },
+    {
+      "id": "tree",
+      "type": "code",
+      "language": "plain",
+      "filename": "ietf-interfaces tree (abridged)",
+      "caption": "rw = 配置，ro = 运行状态，* = 列表，[name] = 键，ip: = 来自 ietf-ip 的扩充。",
+      "code": "$ pyang -f tree ietf-interfaces.yang ietf-ip.yang\nmodule: ietf-interfaces\n  +--rw interfaces\n     +--rw interface* [name]\n        +--rw name                 string\n        +--rw description?         string\n        +--rw type                 identityref\n        +--rw enabled?             boolean\n        +--ro oper-status          enumeration\n        +--ro statistics\n        |  +--ro in-octets?        yang:counter64\n        |  +--ro out-octets?       yang:counter64\n        +--rw ip:ipv4!\n           +--rw ip:enabled?       boolean\n           +--rw ip:address* [ip]\n              +--rw ip:ip          inet:ipv4-address-no-zone\n              +--rw (ip:subnet)\n                 +--:(ip:prefix-length)\n                 |  +--rw ip:prefix-length?   uint8\n                 +--:(ip:netmask)\n                    +--rw ip:netmask?          yang:dotted-quad"
+    },
+    {
+      "id": "seq-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "通过 RESTCONF 发现、读取、更改并保存",
+      "caption": "一次 RESTCONF 更改是一系列简短的无状态 HTTPS 请求，每个请求都得到一个标准状态码作为应答。",
+      "data": {
+        "actors": [
+          {
+            "id": "cli",
+            "label": "自动化客户端",
+            "sub": "curl / Python requests",
+            "icon": "laptop"
+          },
+          {
+            "id": "dev",
+            "label": "IOS XE 路由器",
+            "sub": "nginx + confd",
+            "icon": "router"
+          }
+        ],
+        "steps": [
+          {
+            "from": "cli",
+            "to": "dev",
+            "label": "GET /.well-known/host-meta",
+            "detail": "HTTPS 443，基本身份验证",
+            "tone": "secure",
+            "note": "客户端发现 RESTCONF 根路径。在 IOS XE 上它是 /restconf。"
+          },
+          {
+            "from": "dev",
+            "to": "cli",
+            "label": "200 OK：根路径是 /restconf",
+            "note": "AAA 已对用户进行身份验证，并授权了权限级别 15。"
+          },
+          {
+            "from": "cli",
+            "to": "dev",
+            "label": "GET .../interface=GigabitEthernet2",
+            "detail": "Accept: application/yang-data+json",
+            "note": "URI 遵循 YANG 树：模块前缀、容器、列表名称和键。"
+          },
+          {
+            "from": "dev",
+            "to": "cli",
+            "label": "200 OK + JSON",
+            "tone": "success",
+            "note": "数据按照 ietf-interfaces 和 ietf-ip 模型进行编码。"
+          },
+          {
+            "from": "cli",
+            "to": "dev",
+            "label": "PATCH 描述",
+            "detail": "Content-Type: application/yang-data+json",
+            "tone": "warning",
+            "note": "PATCH 只合并请求体中的字段。接口的其余部分保持不变。"
+          },
+          {
+            "from": "dev",
+            "to": "dev",
+            "label": "验证并提交到 running",
+            "note": "confd 根据 YANG 模型验证更改，并将其应用到运行配置。"
+          },
+          {
+            "from": "dev",
+            "to": "cli",
+            "label": "204 No Content",
+            "tone": "success",
+            "note": "成功且没有响应体。若是 400 或 409，则会携带 error-tag 和 error-path。"
+          },
+          {
+            "from": "cli",
+            "to": "dev",
+            "label": "POST /operations/cisco-ia:save-config",
+            "note": "RESTCONF 只编辑运行配置；保存到 startup 需要单独的 RPC 或 write memory。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "curl",
+      "type": "terminal",
+      "title": "使用 curl 的 RESTCONF",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "export RC=https://10.10.0.1/restconf; AUTH=\"netauto:$RC_PASS\"",
+          "comment": "RC_PASS 从密钥管理器读取或通过提示输入；绝不直接写进脚本里。"
+        },
+        {
+          "cmd": "curl -s --cacert lab-ca.pem -u \"$AUTH\" https://10.10.0.1/.well-known/host-meta",
+          "output": "<XRD xmlns='http://docs.oasis-open.org/ns/xri/xrd-1.0'>\n    <Link rel='restconf' href='/restconf'/>\n</XRD>"
+        },
+        {
+          "cmd": "curl -s --cacert lab-ca.pem -u \"$AUTH\" -H \"Accept: application/yang-data+json\" \"$RC/data/ietf-interfaces:interfaces/interface=GigabitEthernet2\"",
+          "output": "{\n  \"ietf-interfaces:interface\": {\n    \"name\": \"GigabitEthernet2\",\n    \"type\": \"iana-if-type:ethernetCsmacd\",\n    \"enabled\": true,\n    \"ietf-ip:ipv4\": {\n      \"address\": [\n        {\n          \"ip\": \"198.51.100.1\",\n          \"netmask\": \"255.255.255.252\"\n        }\n      ]\n    },\n    \"ietf-ip:ipv6\": {\n    }\n  }\n}"
+        },
+        {
+          "comment": "没有出现 description 叶子节点，因为没有配置它。没有值的叶子节点会被直接省略。"
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w \"%{http_code}\\n\" --cacert lab-ca.pem -u \"$AUTH\" -X PATCH -H \"Content-Type: application/yang-data+json\" -d '{\"ietf-interfaces:interface\": {\"name\": \"GigabitEthernet2\", \"description\": \"WAN uplink ISP-A\"}}' \"$RC/data/ietf-interfaces:interfaces/interface=GigabitEthernet2\"",
+          "output": "204"
+        },
+        {
+          "comment": "204 表示成功且无响应体。PATCH 只更改了描述。"
+        },
+        {
+          "cmd": "curl -s --cacert lab-ca.pem -u \"$AUTH\" -H \"Accept: application/yang-data+json\" \"$RC/data/ietf-interfaces:interfaces/interface=GigabitEthernet2?fields=name;description\"",
+          "output": "{\n  \"ietf-interfaces:interface\": {\n    \"name\": \"GigabitEthernet2\",\n    \"description\": \"WAN uplink ISP-A\"\n  }\n}"
+        },
+        {
+          "cmd": "curl -s --cacert lab-ca.pem -u \"$AUTH\" -H \"Accept: application/yang-data+json\" -X POST \"$RC/operations/cisco-ia:save-config\"",
+          "output": "{\n  \"cisco-ia:output\": {\n    \"result\": \"Save running config successful\"\n  }\n}"
+        },
+        {
+          "comment": "cisco-ia:save-config RPC 把 running 复制到 startup，类似 write memory。"
+        }
+      ],
+      "caption": "--cacert 用于验证路由器的证书。除一次性的实验环境外，请避免使用 -k（不安全）。"
+    },
+    {
+      "id": "py-code",
+      "type": "code",
+      "language": "python",
+      "filename": "loopback_put.py",
+      "caption": "使用 Python requests 的幂等 PUT：第一次运行返回 201，之后的运行返回 204，并且在设备拒绝载荷时给出可读的错误信息。",
+      "highlight": [
+        12,
+        14,
+        17,
+        28
+      ],
+      "code": "import os\nimport requests\n\nHOST = \"10.10.0.1\"\nBASE = f\"https://{HOST}/restconf/data\"\nHEADERS = {\n    \"Accept\": \"application/yang-data+json\",\n    \"Content-Type\": \"application/yang-data+json\",\n}\n\nsession = requests.Session()\nsession.auth = (\"netauto\", os.environ[\"RC_PASS\"])      # never hard-code secrets\nsession.headers.update(HEADERS)\nsession.verify = \"lab-ca.pem\"                           # validate the device certificate\n\nname = \"Loopback100\"\nurl = f\"{BASE}/ietf-interfaces:interfaces/interface={name}\"\nbody = {\n    \"ietf-interfaces:interface\": {\n        \"name\": name,\n        \"description\": \"Router ID - managed by RESTCONF\",\n        \"type\": \"iana-if-type:softwareLoopback\",\n        \"enabled\": True,\n        \"ietf-ip:ipv4\": {\"address\": [{\"ip\": \"192.0.2.11\", \"netmask\": \"255.255.255.255\"}]},\n    }\n}\n\nresp = session.put(url, json=body, timeout=15)          # PUT = create or replace this one resource\nif resp.status_code in (201, 204):\n    print(f\"{name}: {'created' if resp.status_code == 201 else 'replaced'}\")\nelse:\n    # RESTCONF returns a structured error body: error-tag, error-path, error-message\n    for err in resp.json().get(\"ietf-restconf:errors\", {}).get(\"error\", []):\n        print(resp.status_code, err.get(\"error-tag\"), err.get(\"error-message\"))\n    resp.raise_for_status()"
+    },
+    {
+      "id": "troubleshoot",
+      "type": "text",
+      "markdown": "## 排查 RESTCONF 请求\n\n先看状态码，再看 `ietf-restconf:errors` 响应体，它会给出 `error-tag`、`error-path` 和一条消息。\n\n- **401 Unauthorized：** 凭据错误，或缺少 `ip http authentication local` 和 AAA 配置行。\n- **403 Forbidden** 或对有效用户返回 **401：** 该用户的权限级别低于 15。\n- **404 Not Found：** 模块前缀错误、节点拼写错误、键中的 `/` 未编码，或平台不支持该模型。请检查 YANG 库。\n- **400 Bad Request：** JSON 与模型不匹配、缺少必需的键，或请求体中的键与 URI 中的键不一致。\n- **409 Conflict：** 你对已存在的对象使用了 POST。请使用 PUT 或 PATCH。\n- **415 Unsupported Media Type：** `Content-Type` 错误。\n- **连接被拒绝或 TLS 错误：** `ip http secure-server` 已关闭、ACL 阻断了 TCP 443，或客户端不信任设备证书。\n\n在设备上，`show platform software yang-management process` 和 `debug restconf`（在实验环境中）可以帮助你确认服务端的情况。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "注意事项",
+      "markdown": "- **PUT 会替换。** 对 `interface=GigabitEthernet2` 只带描述执行 PUT，会删除它的 IP 地址。局部更改请使用 PATCH。\n- **running 与 startup。** RESTCONF 写入运行配置。请显式保存，否则重新加载会丢失更改。\n- **`curl -k` 和 `verify=False`** 会禁用证书检查，使中间人窃取凭据变得很容易。请使用受信任的 CA 证书包。\n- **并发编辑。** RESTCONF 在多个请求之间没有锁。请协调更改，或对多步骤更改使用带 candidate 和 lock 的 NETCONF。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "考试提示",
+      "markdown": "给定一棵 YANG 树，你应该能够构建完整的 URI（模块前缀、列表键、编码后的斜杠），并选对方法：用 POST 创建子节点，用 PUT 创建或替换，用 PATCH 合并，用 DELETE 删除。请记住，Terraform 的 iosxe 提供程序使用相同的 RESTCONF 路径；参见 [用于网络配置的 Terraform](/learn/network-automation-devops/terraform-for-network-configuration)。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "使用你控制的 IOS XE 设备，例如 Cisco Modeling Labs 中的 Catalyst 8000V 或 DevNet 沙箱。\n\n1. 使用你自己的实验账户应用上面的配置，并确认各进程处于 Running 状态。\n2. 下载 `ietf-interfaces.yang` 和 `ietf-ip.yang`（或使用 YANG Suite），并用 `pyang -f tree` 打印树。\n3. 使用 curl 对 YANG 库执行 GET，并检查 `ietf-interfaces` 和 `Cisco-IOS-XE-native` 是否在列。\n4. 对实验接口 PATCH 一条描述，使用 `fields=` 读回它，并用 `show run interface` 确认。\n5. 运行 `loopback_put.py` 两次并记下状态码。然后把同一个环回接口 POST 到 `/restconf/data/ietf-interfaces:interfaces`，并阅读 409 错误响应体。\n6. 从 `Cisco-IOS-XE-interfaces-oper:interfaces/interface=GigabitEthernet1/statistics` 读取运行计数器。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "RESTCONF",
+          "definition": "一种基于 HTTP 的协议 (RFC 8040)，将 YANG 建模的配置和状态数据作为资源公开。"
+        },
+        {
+          "term": "YANG",
+          "definition": "一种数据建模语言 (RFC 7950)，用于定义网络配置和状态的结构、类型与约束。"
+        },
+        {
+          "term": "YANG 库 (YANG library)",
+          "definition": "服务器所支持的模块、修订版本和特性的列表。"
+        },
+        {
+          "term": "原生模型 (Native model)",
+          "definition": "厂商特定的 YANG 模型，例如 Cisco-IOS-XE-native，覆盖设备的完整功能集。"
+        },
+        {
+          "term": "列表键 (List key)",
+          "definition": "唯一标识某个列表条目的叶子节点；在 URI 中写作 list=value。"
+        },
+        {
+          "term": "扩充 (Augmentation)",
+          "definition": "一种 YANG 机制，把一个模块中的节点添加到另一个模块中；这些节点保留它们自己的模块前缀。"
+        },
+        {
+          "term": "PATCH（合并，merge）",
+          "definition": "一种 RESTCONF 方法，把请求体合并到现有资源中。"
+        },
+        {
+          "term": "yang-data+json",
+          "definition": "用于 JSON 编码的 YANG 数据的 RESTCONF 媒体类型，用在 Accept 和 Content-Type 头中。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "哪个 URI 能正确选中 ietf-interfaces 模型中的 GigabitEthernet1/0/1？",
+          "options": [
+            "/restconf/data/interfaces/interface/GigabitEthernet1/0/1",
+            "/restconf/data/ietf-interfaces:interfaces/interface=GigabitEthernet1%2F0%2F1",
+            "/restconf/ietf-interfaces/interface?name=GigabitEthernet1/0/1",
+            "/restconf/data/ietf-interfaces:interface=GigabitEthernet1/0/1"
+          ],
+          "answer": 1,
+          "explanation": "顶层节点带有模块前缀，列表条目用 =key 选择，并且键内部的斜杠必须进行百分号编码为 %2F。"
+        },
+        {
+          "question": "你只需要更改接口的描述，并保留其 IP 地址。哪种方法最安全？",
+          "options": [
+            "PUT",
+            "POST",
+            "PATCH",
+            "先 DELETE 再 POST"
+          ],
+          "answer": 2,
+          "explanation": "PATCH 把请求体合并到现有资源中。PUT 会替换目标，所以请求体中缺失的叶子节点（例如 IP 地址）会被删除。"
+        },
+        {
+          "question": "创建 Loopback100 的 POST 返回了 409 Conflict。发生了什么？",
+          "options": [
+            "用户的权限级别不是 15",
+            "Loopback100 已经存在",
+            "Content-Type 头错误",
+            "未启用 RESTCONF"
+          ],
+          "answer": 1,
+          "explanation": "带有 error-tag data-exists 的 409 表示资源已经存在。请使用 PUT 或 PATCH 来更改已有对象。"
+        },
+        {
+          "question": "在 IOS XE 上，RESTCONF 要正常工作需要哪些条目？（选择所有适用项。）",
+          "options": [
+            "restconf 全局命令",
+            "ip http secure-server",
+            "通过 AAA 授权的权限级别 15 用户",
+            "netconf-yang"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "RESTCONF 需要 HTTPS 服务器、AAA 身份验证与权限级别 15 的授权，以及 restconf 命令。netconf-yang 启用的是 NETCONF，那是一个独立的服务。"
+        },
+        {
+          "question": "关于 RESTCONF 与 NETCONF 的比较，哪些说法是正确的？（选择所有适用项。）",
+          "options": [
+            "RESTCONF 可以用 JSON 或 XML 编码数据",
+            "RESTCONF 使用 HTTPS，而 NETCONF 在 830 端口使用 SSH",
+            "RESTCONF 支持跨请求的、带 lock 和 commit 的 candidate 数据存储",
+            "两者都使用 YANG 模型来定义数据"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "两者都由 YANG 驱动。RESTCONF 使用 HTTPS 以及 JSON 或 XML；NETCONF 使用 SSH 和 XML。带有 candidate、lock 和 commit 的多请求事务是 NETCONF 的特性。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- RESTCONF (RFC 8040) 通过 HTTPS 使用 GET、POST、PUT、PATCH 和 DELETE 公开由 YANG 建模的数据，编码为 JSON 或 XML。\n- 在 IOS XE 上，它需要 `ip http secure-server`、带有权限级别 15 用户的 AAA，以及 `restconf`。使用 `show platform software yang-management process` 检查进程。\n- 根据 YANG 树构建 URI：第一个节点带模块前缀，`list=key`，键要进行百分号编码，需要时加上扩充模块的前缀。\n- 谨慎选择方法：POST 创建子节点，PUT 替换，PATCH 合并。出现故障时，阅读状态码和 `ietf-restconf:errors` 响应体。\n- 更改会写入 running；请保存它们，验证证书，并让密钥远离脚本。\n\n接下来，请在 [模型驱动遥测](/learn/network-automation-devops/model-driven-telemetry) 中学习如何以流式方式获取相同的 YANG 数据而不是轮询，并在 [Python 网络自动化解决方案](/learn/network-automation-devops/python-network-automation-solutions) 中把这些调用封装为健壮的工具。"
+    }
+  ]
+}

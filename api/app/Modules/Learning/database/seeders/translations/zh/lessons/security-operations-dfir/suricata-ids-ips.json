@@ -1,0 +1,278 @@
+{
+  "title": "Suricata IDS/IPS",
+  "summary": "了解 Suricata 如何检查网络流量、其规则的结构，以及如何以 IDS 模式运行、读取 EVE JSON 告警并调优噪声较大的签名。",
+  "objectives": [
+    "比较 IDS 和 IPS 部署模式",
+    "读懂 Suricata 规则的结构",
+    "使用 suricata-update 安装规则并以 IDS 模式运行",
+    "调查 EVE JSON 告警并调优误报"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "终端代理能看到主机内部发生的事情，但看不到不受管理的打印机、被遗忘的摄像头，或从未注册的笔记本电脑。而网络能看到它们。如果某台设备开始与已知的恶意服务器通信，或某个客户端发送了与已知攻击模式匹配的载荷，监视网络线路的传感器就能察觉。\n\n**Suricata** 是一款开源的网络威胁检测引擎。它检查数据包，将其与规则匹配，解码协议并写出结构化日志。在本课中，你将学习它如何部署、规则如何编写，以及如何在你自己拥有的网络上读取并调优其告警。"
+    },
+    {
+      "id": "modes",
+      "type": "text",
+      "markdown": "## IDS 和 IPS 模式\n\n同一个引擎可以有两种工作方式。\n\n| 模式 | 部署位置 | 动作 | 风险 |\n|:--|:--|:--|:--|\n| IDS（入侵检测系统，Intrusion Detection System） | 被动，位于 SPAN 端口或网络 TAP 上 | 仅告警 | 看不到的流量就无法察觉；无法阻断 |\n| IPS（入侵防御系统，Intrusion Prevention System） | 串联 (inline)，流量经过它（AF_PACKET 桥接或 NFQUEUE） | 丢弃或拒绝匹配的数据包 | 误报会阻断真实用户；故障可能导致链路中断 |\n\n从 IDS 模式开始。运行数周，研究告警并加以调优，然后才将选定的高置信度规则改为 `drop` 动作。在 IPS 模式下要针对故障进行设计：使用支持旁路 (bypass) 的网卡或故障放行 (fail-open) 设置，并监控传感器本身。\n\n部署位置与模式同样重要。位于互联网边界的传感器能看到攻击，而位于内部核心的传感器能看到横向移动。许多网络两者都需要。Suricata 只能看到已解密的流量；对于 TLS，它仍会记录服务器名称 (SNI)、证书详情以及 JA3 或 JA4 指纹。"
+    },
+    {
+      "id": "sur-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "检测引擎内部",
+      "caption": "数据包在写出告警之前，会先被捕获、解码、重组并与规则匹配。",
+      "data": {
+        "token": "数据包",
+        "nodes": [
+          {
+            "id": "cap",
+            "label": "捕获 (Capture)",
+            "sub": "AF_PACKET / NFQ",
+            "icon": "wifi"
+          },
+          {
+            "id": "dec",
+            "label": "解码 (Decode)",
+            "sub": "Ethernet、IP、TCP",
+            "icon": "cpu"
+          },
+          {
+            "id": "stream",
+            "label": "流 + 应用层",
+            "sub": "重组、HTTP、TLS、DNS",
+            "icon": "globe"
+          },
+          {
+            "id": "det",
+            "label": "检测 (Detect)",
+            "sub": "规则匹配",
+            "icon": "shield"
+          },
+          {
+            "id": "out",
+            "label": "输出 (Output)",
+            "sub": "eve.json",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "cap",
+            "caption": "传感器从镜像接口复制一个数据包。"
+          },
+          {
+            "at": "dec",
+            "caption": "解码报头，找出该流的地址、端口和协议。"
+          },
+          {
+            "at": "stream",
+            "caption": "重组 TCP 段，并识别应用层协议。",
+            "tone": "secure"
+          },
+          {
+            "at": "det",
+            "caption": "检查规则：先做快速模式匹配，再检查完整的规则选项。",
+            "tone": "warning"
+          },
+          {
+            "at": "det",
+            "caption": "sid 为 2024897 的规则匹配到一个已知的命令与控制 (C2) URI。",
+            "tone": "danger"
+          },
+          {
+            "at": "out",
+            "caption": "一个包含流、HTTP 和规则元数据的告警事件被写成 JSON。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "rules",
+      "type": "text",
+      "markdown": "## 规则剖析\n\n每条规则都有**动作 (action)**、**报头 (header)** 和**选项 (options)**：\n\n`alert http $HOME_NET any -> $EXTERNAL_NET any (msg:\"LAB Suspicious download\"; flow:established,to_server; http.uri; content:\"/payload.bin\"; sid:1000001; rev:1;)`\n\n- **动作：** `alert`、`drop`（仅 IPS）、`reject` 或 `pass`。\n- **报头：** 协议、源地址、源端口、方向、目的地址、目的端口。`$HOME_NET` 和 `$EXTERNAL_NET` 来自 `suricata.yaml`；务必正确设置 `HOME_NET`，否则一半的规则永远不会匹配。\n- **选项：** `msg` 是文本，`flow` 限定方向和状态，`http.uri` 等粘性缓冲区 (sticky buffer) 选择在何处查找，`content` 是模式，`sid` 和 `rev` 标识规则并标记版本。\n\n自定义 `sid` 值应为 1,000,000 或更高。规则还可以匹配 IP 信誉列表、TLS 字段、DNS 查询和文件哈希。"
+    },
+    {
+      "id": "suri-yaml",
+      "type": "code",
+      "language": "yaml",
+      "code": "vars:\n  address-groups:\n    HOME_NET: \"[192.0.2.0/24,198.51.100.0/24,10.0.0.0/8]\"\n    EXTERNAL_NET: \"!$HOME_NET\"\n\naf-packet:\n  - interface: eth1          # mirrored (SPAN) interface, no IP address\n    cluster-id: 99\n    cluster-type: cluster_flow\n    defrag: yes\n\noutputs:\n  - eve-log:\n      enabled: yes\n      filetype: regular\n      filename: eve.json\n      types:\n        - alert:\n            payload: no\n            http-body: no\n        - http\n        - dns\n        - tls\n        - flow\n\ndefault-rule-path: /var/lib/suricata/rules\nrule-files:\n  - suricata.rules\n  - local.rules",
+      "filename": "/etc/suricata/suricata.yaml  (excerpt)",
+      "caption": "最常导致部署出问题的设置：HOME_NET、捕获接口和 EVE JSON 输出。"
+    },
+    {
+      "id": "run",
+      "type": "terminal",
+      "title": "suricata",
+      "prompt": "$",
+      "caption": "在你自己拥有的传感器上更新规则、验证配置并以 IDS 模式启动。",
+      "lines": [
+        {
+          "cmd": "sudo suricata-update",
+          "output": "Loaded 48210 rules.\nEnabled 41876 rules, disabled 6334 rules.\nWriting rules to /var/lib/suricata/rules/suricata.rules: total: 48210; enabled: 41876",
+          "comment": "下载 Emerging Threats Open 规则集并合并"
+        },
+        {
+          "cmd": "sudo suricata -T -c /etc/suricata/suricata.yaml -v",
+          "output": "Notice: suricata: This is Suricata version 7.0.x RELEASE running in SYSTEM mode\nInfo: detect: 2 rule files processed. 41921 rules successfully loaded, 0 rules failed\nNotice: suricata: Configuration provided was successfully loaded. Exiting.",
+          "comment": "重启前务必先测试：0 rules failed"
+        },
+        {
+          "cmd": "sudo systemctl restart suricata && sudo tail -n 2 /var/log/suricata/suricata.log",
+          "output": "Notice: threads: Threads created -> W: 4 FM: 1 FR: 1  Engine started.\nInfo: stats: capture: 18.4 Mbps, drops: 0",
+          "comment": "引擎已启动；关注 drops，它在传感器过载时出现"
+        }
+      ]
+    },
+    {
+      "id": "eve",
+      "type": "text",
+      "markdown": "## 读取 EVE JSON 告警\n\nSuricata 在 `eve.json` 中每行写入一个 JSON 对象。每条告警都带有规则、流以及任何已解码的应用数据，因此你往往能在几秒内做出判断。使用 `jq` 的一个有用的首次查询可列出最常见的签名：\n\n`jq -r 'select(.event_type==\"alert\") | .alert.signature' eve.json | sort | uniq -c | sort -rn | head`\n\n对每条告警，请问四个问题。涉及哪台内部主机？流量是入站还是出站？连接是否成功？`flow` 和 `http.status` 可以告诉你。同一个 `flow_id` 是否还有相关的 DNS 或 TLS 事件？通过 `flow_id` 关联，可将告警与周围的会话联系起来。将该文件发送到你的 SIEM，例如使用 Wazuh 或 Filebeat，详见 [集中式日志管理](/learn/security-operations-dfir/centralized-log-management)。"
+    },
+    {
+      "id": "eve-sample",
+      "type": "code",
+      "language": "json",
+      "code": "{\n  \"timestamp\": \"2026-11-12T10:05:44.120+0000\",\n  \"flow_id\": 1722045321984,\n  \"event_type\": \"alert\",\n  \"src_ip\": \"192.0.2.77\",\n  \"dest_ip\": \"203.0.113.45\",\n  \"dest_port\": 80,\n  \"proto\": \"TCP\",\n  \"alert\": {\n    \"action\": \"allowed\",\n    \"signature_id\": 1000001,\n    \"rev\": 1,\n    \"signature\": \"LAB Suspicious download\",\n    \"category\": \"Potentially Bad Traffic\",\n    \"severity\": 2\n  },\n  \"http\": {\n    \"hostname\": \"files.example.net\",\n    \"url\": \"/payload.bin\",\n    \"http_method\": \"GET\",\n    \"status\": 200\n  }\n}",
+      "filename": "eve.json (one alert, formatted)",
+      "caption": "一条出站告警。地址为文档示例。flow_id 可帮助你找到同一会话的 DNS 和 HTTP 事件。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "用数据调优，而不是直接禁用",
+      "markdown": "当某个签名噪声较大时，首先检查该告警是否真实。如果它来自你自己已知的良性扫描器，请在 `threshold.config` 中仅针对该来源和该签名添加一条 `suppress` 条目，例如 `suppress gen_id 1, sig_id 2210051, track by_src, ip 192.0.2.200`。禁用整条规则会让所有人都失去可见性。请记录每条抑制 (suppression) 存在的原因。"
+    },
+    {
+      "id": "health",
+      "type": "text",
+      "markdown": "## 保持传感器健康\n\n丢包的传感器会带来虚假的安心感。请定期检查以下基本项：\n\n- **丢包。** 读取 `eve.json` 中的 `stats` 事件和 `drops` 计数器。任何持续的丢包都意味着传感器需要更多工作线程、更快的网卡或更少的规则。\n- **规则负载。** 禁用你不需要的类别，例如网络中不存在的协议。规则越少，匹配越快。\n- **规则新鲜度。** 安排每天运行 `suricata-update`，然后用 `suricatasc -c ruleset-reload-nonblocking` 重新加载，使引擎持续运行。\n- **镜像流量质量。** SPAN 端口在高负载下可能丢帧，非对称路由可能只显示会话的一个方向。请用已知的测试进行验证，例如发送一个应当触发你实验规则的无害请求。\n\n同时也要记住其局限。签名只能捕获已知模式，因此新技术或加密通道需要其他证据，例如 DNS 和流量分析。"
+    },
+    {
+      "id": "ips",
+      "type": "text",
+      "markdown": "## 将选定规则转入 IPS\n\n只有当规则通过三项检验时，才把它从 `alert` 提升为 `drop`：它在你自己的流量中误报率极低；它所针对的攻击危害足够大，值得阻断；并且你能在几分钟内撤销该更改。使用带有 `modify.conf` 的 `suricata-update` 来转换选定的 sid，这样上游更新就不会覆盖你的选择。同时记录告警和丢弃，并在第一个月内每天复查阻断情况。\n\nSuricata 是对其他工具的补充，而非替代。[Zeek 网络安全监控](/learn/security-operations-dfir/zeek-network-security-monitoring) 提供丰富的协议日志用于狩猎，而 Suricata 提供基于签名的检测。告警随后进入 [安全告警分诊](/learn/security-operations-dfir/security-alert-triage) 中的分诊流程。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "在你自己拥有的 Linux 虚拟机上安装 Suricata 并运行 `suricata-update`。将 `HOME_NET` 设为你的实验子网，并让 `af-packet` 指向实验接口。将本课中的自定义规则添加到 `local.rules`，用 `suricata -T` 验证，然后重启。在第二台实验虚拟机上，从你控制的 Web 服务器获取 `/payload.bin`。然后使用 `jq` 查询找到你的告警及其 `flow_id`。仅在你自己拥有的网络上测试。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "IDS（入侵检测系统，Intrusion Detection System）",
+          "definition": "入侵检测系统：被动，仅告警。"
+        },
+        {
+          "term": "IPS（入侵防御系统，Intrusion Prevention System）",
+          "definition": "入侵防御系统：串联部署，可以丢弃流量。"
+        },
+        {
+          "term": "EVE JSON",
+          "definition": "Suricata 用于告警和协议事件的结构化 JSON 输出。"
+        },
+        {
+          "term": "sid（签名 ID，signature ID）",
+          "definition": "规则的唯一签名 ID。"
+        },
+        {
+          "term": "HOME_NET",
+          "definition": "定义你的内部地址空间的变量。"
+        },
+        {
+          "term": "flow_id",
+          "definition": "将同一次网络会话的所有事件关联起来的 ID。"
+        },
+        {
+          "term": "suricata-update",
+          "definition": "下载并合并规则集的工具。"
+        },
+        {
+          "term": "SPAN / TAP",
+          "definition": "将网络流量复制到传感器的方法。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "IDS 和 IPS 模式的主要区别是什么？",
+          "options": [
+            "IDS 串联部署并丢弃数据包",
+            "IPS 串联部署并可以丢弃数据包",
+            "IDS 不需要规则",
+            "IPS 无法记录日志"
+          ],
+          "answer": 1,
+          "explanation": "IPS 位于流量路径中，可以阻断。IDS 监视副本，仅告警。"
+        },
+        {
+          "question": "HOME_NET 设置错误会引发哪些问题？选择所有适用项。",
+          "options": [
+            "许多规则永远不会匹配",
+            "告警的方向逻辑可能出错",
+            "CPU 被超频",
+            "内部流量可能被错误分类"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "规则依靠 HOME_NET 和 EXTERNAL_NET 判断方向；取值错误会导致漏报或方向错误的检测。"
+        },
+        {
+          "question": "哪个 sid 范围适合你自己的本地规则？",
+          "options": [
+            "1 到 1000",
+            "1,000,000 或更高",
+            "任意值",
+            "零"
+          ],
+          "answer": 1,
+          "explanation": "自定义规则使用 1,000,000 及以上，以避免与公共规则集冲突。"
+        },
+        {
+          "question": "如何将一条告警与同一会话的 DNS 和 HTTP 事件关联起来？",
+          "options": [
+            "仅通过时间戳",
+            "通过 flow_id",
+            "通过规则的 msg",
+            "通过文件名"
+          ],
+          "answer": 1,
+          "explanation": "同一个流的所有事件共享 flow_id。"
+        },
+        {
+          "question": "面对一个噪声很大的签名，首先应该怎么做？",
+          "options": [
+            "禁用所有规则",
+            "检查它是否真实，然后针对特定来源和签名进行抑制",
+            "将其改为 drop",
+            "删除 eve.json"
+          ],
+          "answer": 1,
+          "explanation": "调优要有针对性并做好记录。大范围禁用会丧失可见性。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\nSuricata 使用规则检查流量并写出丰富的 JSON 事件。从被动 IDS 模式开始，正确设置 `HOME_NET`，用 `suricata-update` 更新规则，用 `suricata -T` 验证，并通过 `eve.json` 和 `flow_id` 读取告警。用有针对性的抑制进行调优，只把经过验证的高置信度规则提升为 `drop`。将网络告警与来自 [Wazuh 安全监控](/learn/security-operations-dfir/wazuh-security-monitoring) 的主机证据结合，以获得完整的全貌。"
+    }
+  ]
+}

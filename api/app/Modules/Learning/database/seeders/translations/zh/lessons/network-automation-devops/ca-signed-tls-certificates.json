@@ -1,0 +1,396 @@
+{
+  "title": "CA 签发的 TLS 证书 (CA-Signed TLS Certificates)",
+  "summary": "用企业 CA 签发的证书替换自动化端点上的自签名证书，将其安装到 Linux 服务和 IOS XE 上，并让自动化客户端对其进行验证。",
+  "objectives": [
+    "解释客户端如何验证证书链、有效期、SAN 和密钥用途",
+    "使用 OpenSSL 生成带 SAN 条目的密钥和 CSR，并验证 CA 签发的证书",
+    "在 IOS XE 上申请 CA 签发的证书并将其绑定到 HTTPS/RESTCONF 服务器",
+    "在 Python 自动化中验证服务器证书，并描述双向 TLS (mutual TLS)",
+    "排查常见的证书链、名称和过期错误，并规划证书续期"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "你的流水线要向四十台 IOS XE 路由器推送 RESTCONF 变更。每台路由器仍在使用开机时自行生成的自签名证书，因此每个脚本里都有 `verify=False`。审计人员指出了后果：任何能够处于自动化服务器与路由器之间路径上的人，都可以出示自己的证书、截获 HTTP Basic 凭据，并用它们对整个网络重放攻击。\n\n只有加密而没有认证，并不等于安全。AUTOCOR 350-901 v2.0 考试大纲要求你为自动化端点实现 **CA 签发的 TLS 证书 (CA-signed TLS certificates)**：从受信任的证书颁发机构签发证书，将其安装到设备和服务上，并让每个客户端都对其进行验证。本课将介绍在 Linux、IOS XE 和 Python 上的这一工作流程。"
+    },
+    {
+      "id": "trust",
+      "type": "text",
+      "markdown": "## CA 信任的工作原理\n\n**证书 (certificate)** 将公钥与一个身份绑定，而**证书颁发机构 (certificate authority, CA)** 用其数字签名为这种绑定担保。大多数企业运行两层**公钥基础设施 (public key infrastructure, PKI)**：\n\n- **根 CA (Root CA)**：自签名，离线保存，并安装在每个客户端的信任库中。\n- **颁发 CA（中间 CA）**：由根 CA 签发；负责签发日常使用的证书。\n- **叶证书 (Leaf certificate)**：颁发给路由器、控制器或自动化服务。\n\n客户端连接时，分四步验证叶证书：\n\n1. **证书链**：每个签名都能一路验证到客户端已信任的根。\n2. **有效期**：当前时间介于 `notBefore` 和 `notAfter` 之间。\n3. **名称**：客户端所访问的主机名或 IP 地址出现在**使用者备用名称 (subject alternative name, SAN)** 中。现代客户端在这项检查中会忽略通用名称 (CN)。\n4. **用途与吊销**：扩展密钥用途 (extended key usage) 允许 `serverAuth`，且证书未被吊销（CRL 或 OCSP）。\n\n| 选项 | 谁信任它 | 典型用途 |\n|:--|:--|:--|\n| 自签名 | 没有人，除非手动固定 | 仅用于第零天引导 |\n| 私有（企业）CA | 获得你的根证书的客户端 | 路由器、控制器、内部 API |\n| 公共 CA | 所有浏览器和操作系统 | 面向互联网的门户和 webhook |\n\n对于设备管理接口，企业 CA 是常规选择：公共 CA 不会为内部名称或私有地址签发证书。"
+    },
+    {
+      "id": "workflow",
+      "type": "text",
+      "markdown": "## 证书申请流程\n\n无论是哪种平台，证书申请 (enrollment) 都遵循相同的步骤：\n\n1. 在将要使用密钥的系统上**生成密钥对**。私钥绝不应被复制到其他地方。\n2. **创建证书签名请求 (certificate signing request, CSR)**，其中包含公钥、使用者 (subject) 以及客户端将使用的每个 SAN 条目（DNS 名称，以及脚本通过地址连接时的 IP 地址）。\n3. 手动或通过 SCEP、EST 或 ACME 等协议，将 **CSR 提交**给颁发 CA。\n4. 连同中间 CA 证书一起**安装已签名的证书**，以便服务器能够出示完整的证书链。\n5. 将根 CA 证书**分发**给每个客户端：自动化容器、CI 运行器和工程师的笔记本电脑。\n6. **监控过期时间并在 `notAfter` 之前续期**，最好自动完成。"
+    },
+    {
+      "id": "enroll-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "申请 R1 的证书并从自动化客户端进行验证",
+      "data": {
+        "actors": [
+          {
+            "id": "eng",
+            "label": "工程师",
+            "sub": "跳板机",
+            "icon": "laptop"
+          },
+          {
+            "id": "r1",
+            "label": "R1 (IOS XE)",
+            "sub": "r1.example.com",
+            "icon": "router"
+          },
+          {
+            "id": "ca",
+            "label": "企业 CA",
+            "sub": "Example Issuing CA 01",
+            "icon": "lock"
+          },
+          {
+            "id": "bot",
+            "label": "自动化服务器",
+            "sub": "192.0.2.50",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "eng",
+            "to": "r1",
+            "label": "crypto pki enroll",
+            "detail": "RSA 密钥 + CSR",
+            "note": "工程师在路由器上生成密钥对并创建证书签名请求。私钥永远不会离开 R1。"
+          },
+          {
+            "from": "r1",
+            "to": "ca",
+            "label": "CSR",
+            "detail": "CN + SAN r1.example.com",
+            "note": "CSR 携带公钥、使用者以及客户端将使用的使用者备用名称。"
+          },
+          {
+            "from": "ca",
+            "to": "r1",
+            "label": "已签名的证书",
+            "detail": "有效期 1 年",
+            "note": "颁发 CA 检查请求，用自己的密钥签名并返回证书。该证书被导入 CORP-CA 信任点。",
+            "tone": "secure"
+          },
+          {
+            "from": "bot",
+            "to": "r1",
+            "label": "ClientHello",
+            "detail": "SNI r1.example.com",
+            "note": "之后，自动化服务器打开 HTTPS 会话，并通过服务器名称指示 (Server Name Indication) 发送它所期望的主机名。"
+          },
+          {
+            "from": "r1",
+            "to": "bot",
+            "label": "证书链",
+            "detail": "叶证书 + 颁发 CA",
+            "note": "R1 出示自己的证书和颁发 CA 的证书，使客户端能够构建完整的证书链。"
+          },
+          {
+            "from": "bot",
+            "to": "bot",
+            "label": "验证证书链",
+            "detail": "根是否受信任？",
+            "note": "客户端检查每个签名，直至其本地信任包中的某个根 CA。",
+            "tone": "secure"
+          },
+          {
+            "from": "bot",
+            "to": "bot",
+            "label": "检查名称和日期",
+            "detail": "SAN、notAfter",
+            "note": "随后确认 r1.example.com 出现在 SAN 中，且证书尚未过期。",
+            "tone": "secure"
+          },
+          {
+            "from": "bot",
+            "to": "r1",
+            "label": "加密的 RESTCONF GET",
+            "detail": "TLS 内的 HTTP Basic",
+            "note": "只有验证成功之后，客户端才会在加密隧道内发送凭据和 RESTCONF 请求。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "linux",
+      "type": "text",
+      "markdown": "## 自动化服务的证书\n\n自动化平台也会暴露 HTTPS 端点：NetBox 事实来源、Catalyst Center 事件的 webhook 接收端，或你的流水线调用的 FastAPI 服务。在 Linux 上，由 OpenSSL 生成密钥和 CSR。`-addext` 选项（OpenSSL 1.1.1 或更高版本）可将 SAN 直接添加到请求中。\n\nCA 对请求签名之后，在部署之前先验证结果：检查证书链是否验证通过、SAN 是否包含预期的名称，以及扩展密钥用途是否包含 TLS Web Server Authentication。然后使用**完整证书链**（叶证书之后紧跟颁发 CA）和私钥配置 Web 服务器（例如 NGINX）。"
+    },
+    {
+      "id": "openssl",
+      "type": "code",
+      "language": "bash",
+      "filename": "enroll-automation-host.sh",
+      "code": "# 1. Private key and CSR with the SAN the clients will use\nopenssl req -new -newkey rsa:3072 -nodes \\\n  -keyout automation.example.com.key \\\n  -out automation.example.com.csr \\\n  -subj \"/C=US/O=Example Corp/CN=automation.example.com\" \\\n  -addext \"subjectAltName=DNS:automation.example.com,IP:192.0.2.50\"\nchmod 600 automation.example.com.key      # the key never leaves this host\n\n# 2. Check the request before sending it to the CA\nopenssl req -in automation.example.com.csr -noout -text | grep -A1 \"Subject Alternative Name\"\n\n# 3. After the CA returns the certificate: verify it against the chain\ncat issuing-ca.pem root-ca.pem > corp-chain.pem\nopenssl verify -CAfile corp-chain.pem automation.example.com.crt\n\n# 4. Inspect what you received\nopenssl x509 -in automation.example.com.crt -noout -subject -issuer -dates -ext subjectAltName,extendedKeyUsage\n\n# 5. Serve leaf + issuing CA together (full chain), never the root alone\ncat automation.example.com.crt issuing-ca.pem > automation.example.com.fullchain.pem",
+      "caption": "生成带 SAN 的密钥和 CSR，然后验证并打包 CA 签发的证书。",
+      "highlight": [
+        6,
+        14,
+        20
+      ]
+    },
+    {
+      "id": "iosxe",
+      "type": "text",
+      "markdown": "## 在 IOS XE 上安装 CA 签发的证书\n\nIOS XE 将证书存储在**信任点 (trustpoint)** 中。使用 `enrollment terminal pem` 时，需要手动复制 CSR 和证书；在生产环境中，可以通过 SCEP 或 EST 使用 `enrollment url`，并配合 `auto-enroll`，让设备自行续期。\n\n顺序很重要：\n\n1. 生成一个命名的 RSA 密钥对。\n2. 定义信任点及其使用者和 SAN，并通过 `rsakeypair` 将其与密钥关联。\n3. `crypto pki authenticate` 安装将为路由器证书签名的 CA 证书。将指纹与你的 PKI 团队发布的值进行比对。\n4. `crypto pki enroll` 打印 CSR；由 CA 对其签名。\n5. `crypto pki import ... certificate` 安装已签名的证书。\n6. `ip http secure-trustpoint` 告诉 HTTPS 服务器（因此也包括 RESTCONF）出示该证书。\n\nNETCONF 运行在 SSH 而非 TLS 之上，因此不受影响；它依赖的是 SSH 主机密钥。"
+    },
+    {
+      "id": "iosxe-cli",
+      "type": "terminal",
+      "title": "R1：申请、安装和验证",
+      "lines": [
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto key generate rsa general-keys label RESTCONF-KEY modulus 2048",
+          "comment": "仅供该信任点使用的命名密钥对"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki trustpoint CORP-CA"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "enrollment terminal pem"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "subject-name CN=r1.example.com, O=Example Corp"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "subject-alt-name r1.example.com"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "rsakeypair RESTCONF-KEY"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "revocation-check none",
+          "comment": "仅限实验：在 CDP 可达时使用 crl 或 ocsp"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "exit"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki authenticate CORP-CA",
+          "comment": "安装颁发 CA 证书并检查其指纹",
+          "output": "Enter the base 64 encoded CA certificate.\nEnd with a blank line or the word \"quit\" on a line by itself\n\n-----BEGIN CERTIFICATE-----\n<issuing CA certificate, PEM>\n-----END CERTIFICATE-----\nquit\nCertificate has the following attributes:\n       Fingerprint MD5: <md5-fingerprint>\n      Fingerprint SHA1: <sha1-fingerprint>\n\n% Do you accept this certificate? [yes/no]: yes\nTrustpoint CA certificate accepted.\n% Certificate successfully imported"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki enroll CORP-CA",
+          "comment": "将 CSR 复制到 CA 进行签名",
+          "output": "% Start certificate enrollment ..\n% The subject name in the certificate will include: CN=r1.example.com, O=Example Corp\n% The subject name in the certificate will include: r1.example.com\n% Include the router serial number in the subject name? [yes/no]: no\n% Include an IP address in the subject name? [no]: no\nDisplay Certificate Request to terminal? [yes/no]: yes\nCertificate Request follows:\n\n-----BEGIN CERTIFICATE REQUEST-----\n<CSR, PEM>\n-----END CERTIFICATE REQUEST-----\n\n---End - This line not part of the certificate request---"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki import CORP-CA certificate",
+          "comment": "粘贴 CA 返回的证书",
+          "output": "Enter the base 64 encoded certificate.\nEnd with a blank line or the word \"quit\" on a line by itself\n\n-----BEGIN CERTIFICATE-----\n<router certificate signed by the CA, PEM>\n-----END CERTIFICATE-----\nquit\n% Router Certificate successfully imported"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "ip http secure-server"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "ip http secure-trustpoint CORP-CA",
+          "comment": "HTTPS 和 RESTCONF 现在出示 CA 签发的证书"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "restconf"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "end"
+        },
+        {
+          "prompt": "R1#",
+          "cmd": "show crypto pki certificates CORP-CA",
+          "comment": "由颁发 CA 签发的叶证书，有效期一年",
+          "output": "Certificate\n  Status: Available\n  Certificate Serial Number (hex): 3A00000123\n  Certificate Usage: General Purpose\n  Issuer:\n    cn=Example Issuing CA 01\n    o=Example Corp\n  Subject:\n    Name: r1.example.com\n    cn=r1.example.com\n    o=Example Corp\n  Validity Date:\n    start date: 09:12:44 UTC Nov 2 2026\n    end   date: 09:12:44 UTC Nov 2 2027\n  Associated Trustpoints: CORP-CA\n\nCA Certificate\n  Status: Available\n  Certificate Serial Number (hex): 1F00000002\n  Certificate Usage: Signature\n  Issuer:\n    cn=Example Root CA\n    o=Example Corp\n  Subject:\n    cn=Example Issuing CA 01\n    o=Example Corp\n  Validity Date:\n    start date: 08:00:00 UTC Jan 5 2025\n    end   date: 08:00:00 UTC Jan 5 2030\n  Associated Trustpoints: CORP-CA"
+        },
+        {
+          "prompt": "netops@jump:~$",
+          "cmd": "openssl s_client -connect r1.example.com:443 -servername r1.example.com -CAfile corp-chain.pem -brief </dev/null",
+          "comment": "在跳板机上：证书链已根据企业信任包验证通过",
+          "output": "CONNECTION ESTABLISHED\nProtocol version: TLSv1.2\nCiphersuite: ECDHE-RSA-AES256-GCM-SHA384\nPeer certificate: CN = r1.example.com, O = Example Corp\nHash used: SHA256\nSignature type: RSA-PSS\nVerification: OK\nServer Temp Key: ECDH, prime256v1, 256 bits\nDONE"
+        }
+      ]
+    },
+    {
+      "id": "client",
+      "type": "text",
+      "markdown": "## 在自动化代码中验证证书\n\n服务器上有证书只完成了一半工作，客户端必须对其进行检查。在 Python `requests` 中，`verify` 参数接收包含你的根（如果服务器不发送颁发 CA，则也包括颁发 CA）的 CA 包的路径。你也可以为整个进程设置 `REQUESTS_CA_BUNDLE`，这适用于容器和 CI 运行器。Ansible 的 `uri` 模块使用 `validate_certs` 和 `ca_path`，而 Terraform 提供程序通常会暴露一个 `insecure` 标志，必须保持为 `false`。\n\n对于机器到机器的 API，可以考虑**双向 TLS (mutual TLS, mTLS)**：服务器同时要求客户端证书，因此自动化身份由 CA 签发的证书而不是可重复使用的密码来证明。请将客户端私钥视为机密。"
+    },
+    {
+      "id": "client-code",
+      "type": "code",
+      "language": "python",
+      "filename": "restconf_tls.py",
+      "code": "import os\n\nimport requests\n\n# Root + issuing CA of the enterprise PKI, distributed with the automation image\nCA_BUNDLE = \"/etc/pki/example/corp-chain.pem\"\nHEADERS = {\"Accept\": \"application/yang-data+json\"}\n\n\ndef get_hostname(device: str) -> str:\n    url = f\"https://{device}/restconf/data/Cisco-IOS-XE-native:native/hostname\"\n    resp = requests.get(\n        url,\n        auth=(os.environ[\"NET_USER\"], os.environ[\"NET_PASSWORD\"]),\n        headers=HEADERS,\n        verify=CA_BUNDLE,   # validates chain, dates and that the SAN matches \"device\"\n        timeout=10,\n    )\n    resp.raise_for_status()\n    return resp.json()[\"Cisco-IOS-XE-native:hostname\"]\n\n\ndef get_with_client_cert(url: str) -> dict:\n    # Mutual TLS: the server also verifies the script's own CA-signed certificate\n    resp = requests.get(\n        url,\n        cert=(\"/etc/pki/example/netbot.crt\", \"/etc/pki/example/netbot.key\"),\n        verify=CA_BUNDLE,\n        timeout=10,\n    )\n    resp.raise_for_status()\n    return resp.json()\n\n\nif __name__ == \"__main__\":\n    print(get_hostname(\"r1.example.com\"))",
+      "caption": "根据企业 CA 包验证路由器证书，另加一次使用客户端证书的 mTLS 调用。",
+      "highlight": [
+        6,
+        16,
+        27
+      ]
+    },
+    {
+      "id": "verify-warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "verify=False 不是解决办法",
+      "markdown": "禁用验证虽然仍保持流量加密，但去掉了服务器认证，使中间人攻击变得轻而易举。它还会掩盖真正的问题，例如缺少中间证书或证书已过期。如果实验设备使用自签名证书，请将 `verify` 指向该特定证书，而不是关闭检查。"
+    },
+    {
+      "id": "troubleshoot",
+      "type": "text",
+      "markdown": "## 生命周期与故障排查\n\n自动化中大多数 TLS 故障是证书过期或不完整，而不是攻击。跟踪每个证书的 `notAfter` 日期，提前 30 天告警，并将续期自动化：IOS XE 上的 `auto-enroll 80 regenerate` 在生命周期达到 80% 时使用新密钥续期，而 ACME 客户端对 Linux 服务也做同样的事。较短的有效期可以限制密钥被盗所造成的损害。\n\n| 客户端看到的错误 | 可能原因 | 修复 |\n|:--|:--|:--|\n| `unable to get local issuer certificate` | 服务器只发送叶证书，或客户端缺少根 | 提供完整证书链；将根添加到信任包 |\n| `self-signed certificate in certificate chain` | 根不在客户端信任库中 | 分发企业根 CA |\n| `Hostname mismatch` | 所访问的名称不在 SAN 中 | 重新签发，包含所用的每个 DNS 名称和 IP |\n| `certificate has expired` | 错过了续期 | 立即续期；添加监控 |\n| 续期后握手失败 | 密钥已更新，但服务仍在使用旧的信任点或文件 | 重新加载服务；检查 `ip http secure-trustpoint` |\n\n`openssl s_client -showcerts` 能准确显示服务器出示的是哪条证书链，这是判断哪一方出错的最快办法。"
+    },
+    {
+      "id": "chain-tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "用什么名称访问就写什么名称",
+      "markdown": "如果你的清单 (inventory) 通过管理 IP 连接设备，则该 IP 必须作为 `IP:` 条目出现在 SAN 中。更好的做法是从你的事实来源通过 DNS 名称连接（参见 [事实来源集成](/learn/network-automation-devops/source-of-truth-integration)），这样证书在地址变更后依然有效。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在实验环境中（例如 [Cisco Modeling Labs](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing)），使用 OpenSSL 构建一个两层测试 PKI：一个根 CA、一个颁发 CA，以及来自 Catalyst 8000v 的 CSR。将证书安装到信任点中，用 `ip http secure-trustpoint` 绑定，然后在 Python 中调用 RESTCONF，并让 `verify` 指向你的证书链文件（参见 [结合 YANG 模型使用 RESTCONF](/learn/network-automation-devops/restconf-with-yang-models)）。接下来故意破坏它：从信任包中移除颁发 CA，然后使用不在 SAN 中的 IP 连接，并记录每条错误消息。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "证书颁发机构 (Certificate authority, CA)",
+          "definition": "对证书签名的受信任实体，为某个公钥属于某个具名身份提供担保。"
+        },
+        {
+          "term": "根 CA (Root CA)",
+          "definition": "PKI 层级中自签名的顶端，安装在客户端信任库中，通常离线保存。"
+        },
+        {
+          "term": "颁发 CA（中间 CA）(Issuing / intermediate CA)",
+          "definition": "由根 CA 认证并为叶证书签名的 CA；服务器将其证书作为证书链的一部分发送。"
+        },
+        {
+          "term": "CSR",
+          "definition": "证书签名请求 (Certificate signing request)：发送给 CA 的已签名消息，包含公钥和所请求的身份。"
+        },
+        {
+          "term": "使用者备用名称 (Subject alternative name, SAN)",
+          "definition": "列出该证书有效的 DNS 名称和 IP 地址的证书扩展。"
+        },
+        {
+          "term": "信任点 (Trustpoint)",
+          "definition": "IOS XE 中保存 CA 证书、设备证书、其密钥对和证书申请设置的对象。"
+        },
+        {
+          "term": "证书链 (Certificate chain)",
+          "definition": "叶证书加上将其链接到受信任根所需的中间证书。"
+        },
+        {
+          "term": "双向 TLS (Mutual TLS, mTLS)",
+          "definition": "服务器和客户端都出示 CA 签发的证书并相互认证的 TLS。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "某个 Python 脚本失败，提示 'certificate verify failed: unable to get local issuer certificate'。叶证书有效，且由企业颁发 CA 签发。最可能的原因是什么？",
+          "options": [
+            "SAN 不包含该主机名",
+            "服务器只发送其叶证书，而客户端信任包中缺少颁发 CA",
+            "证书使用了 RSA 3072",
+            "RESTCONF 被禁用"
+          ],
+          "answer": 1,
+          "explanation": "由于缺少中间证书，客户端无法将叶证书链接到受信任的根。请提供完整证书链，或将颁发 CA 添加到客户端信任包。"
+        },
+        {
+          "question": "TLS 客户端会对服务器证书执行哪些检查？（选择所有适用项。）",
+          "options": [
+            "签名链通向受信任的根",
+            "当前日期在有效期之内",
+            "所访问的名称出现在 SAN 中",
+            "证书由公共 CA 签发",
+            "扩展密钥用途允许服务器认证"
+          ],
+          "answer": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "explanation": "客户端会验证证书链、日期、名称和用途（以及已配置时的吊销状态）。只要其根受信任，私有企业 CA 完全有效。"
+        },
+        {
+          "question": "在 IOS XE 上，哪条命令使 HTTPS 服务器（因此也包括 RESTCONF）出示 CORP-CA 信任点中的证书？",
+          "options": [
+            "crypto pki authenticate CORP-CA",
+            "ip http secure-trustpoint CORP-CA",
+            "restconf trustpoint CORP-CA",
+            "crypto pki enroll CORP-CA"
+          ],
+          "answer": 1,
+          "explanation": "ip http secure-trustpoint 将信任点绑定到 HTTPS 服务器。authenticate 安装 CA 证书，enroll 生成 CSR。"
+        },
+        {
+          "question": "你的脚本通过管理 IP 地址连接路由器。路由器证书必须包含什么？",
+          "options": [
+            "仅在通用名称中包含该 IP 地址",
+            "在 SAN 中以 IP 条目形式包含该 IP 地址",
+            "什么都不需要；IP 连接会跳过名称检查",
+            "路由器序列号"
+          ],
+          "answer": 1,
+          "explanation": "客户端会将所访问的地址与 SAN 条目进行匹配。IP 需要 IP: 形式的 SAN 条目；现代客户端会忽略 CN。"
+        },
+        {
+          "question": "哪些做法可以减少自动化中与证书相关的故障和风险？（选择所有适用项。）",
+          "options": [
+            "使用 auto-enroll 或 ACME 自动续期",
+            "续期后在生产环境中设置 verify=False",
+            "在 notAfter 之前很早就发出告警",
+            "使用更短的证书有效期并自动轮换",
+            "在所有路由器之间共享同一个私钥"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "自动续期、过期监控和较短的有效期能让证书保持有效。禁用验证和共享密钥会去掉 PKI 提供的保护。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- CA 签发的证书让客户端能够**认证**服务器，而不仅仅是加密流量。自签名证书迫使人们采用不安全的 `verify=False` 变通做法。\n- 客户端检查到受信任根的**证书链**、**有效期**、**SAN** 以及密钥用途。\n- 证书申请：密钥对、包含每个 SAN 的 **CSR**、CA 签名、使用**完整证书链**安装、分发根证书、在过期之前续期。\n- 在 IOS XE 上：RSA 密钥、**信任点**、`crypto pki authenticate`、`enroll`、`import`，然后用 `ip http secure-trustpoint` 供 HTTPS 和 RESTCONF 使用。\n- 在代码中，将 CA 包传给 `verify`，对服务身份考虑使用 **mTLS**，并用 `openssl s_client` 排查证书链。"
+    }
+  ]
+}

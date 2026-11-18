@@ -1,0 +1,342 @@
+{
+  "title": "基于 YANG 模型的 YAML / JSON 配置",
+  "summary": "将 YANG 树转换为有效的 JSON 和 YAML 负载：把语句映射到数据结构，应用 RFC 7951 编码规则，用 yanglint 校验，并通过 RESTCONF 发送。",
+  "objectives": [
+    "将 YANG 的容器 (container)、列表 (list)、叶子 (leaf)、选择 (choice) 和存在容器 (presence container) 映射为 JSON 和 YAML",
+    "应用 RFC 7951 中关于模块前缀、数值类型、布尔值、empty 和 identityref 的规则",
+    "使用 Python 根据简短的 YAML 意图文件构建符合模型结构的负载",
+    "在发送之前，根据 YANG 模块校验负载",
+    "选择 pyang、Cisco YANG Suite 和 yanglint 等工具来构建和检查负载"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一次 RESTCONF 调用失败，返回 `400 Bad Request` 和消息 `unknown element`。负载看起来没问题：它是有效的 JSON，每个值也都正确。但它仍然与 **YANG 模型**不匹配：缺少模块前缀，布尔值被当作字符串发送，而列表被写成了单个对象。\n\nYANG 定义了数据的形状，负载必须完全遵循这个形状。AUTOCOR 蓝图要求你根据 YANG 模型构造 YAML 和 JSON 配置：读懂树、应用编码规则、校验结果并发送。本课针对 IETF 模型和 IOS XE 原生模型 (native model) 完成这一过程。"
+    },
+    {
+      "id": "map",
+      "type": "text",
+      "markdown": "## 在写数据之前先读懂模型\n\n先从 `pyang -f tree` 得到的树视图开始，或者在 **Cisco YANG Suite** 中浏览模型。每条 YANG 语句都对应一种 JSON 或 YAML 结构：\n\n| YANG 语句 | 树中标记 | JSON | YAML |\n|:--|:--|:--|:--|\n| `container` | `+--rw ip` | 对象 `{ }` | 映射 (mapping) |\n| `list` | `Loopback* [name]` | 对象数组，每个对象包含其键 | 映射序列 |\n| `leaf` | `name  uint32` | 单个值 | 标量 |\n| `leaf-list` | `server*`（无键） | 值数组 | 标量序列 |\n| 存在容器 (presence container) | `primary!` | 对象，即使为空 | 映射 |\n| `choice` / `case` | `(address-choice)`、`:(fixed-case)` | **不被编码**：选择一个 case 并写出它的节点 | 不被编码 |\n\n还要检查：\n\n- **rw 还是 ro。**只有 `rw` 节点属于配置负载。`ro` 节点是状态数据，设备会在编辑时拒绝它们。\n- **必选与可选。**`?` 标记可选叶子。列表的键始终是必需的。\n- **设备支持。**设备必须实现你所针对的模块及其修订版本。请检查其能力集，或 `/restconf/data/ietf-yang-library:modules-state`。"
+    },
+    {
+      "id": "tree",
+      "type": "code",
+      "language": "plain",
+      "filename": "native-loopback-tree.txt",
+      "caption": "IOS XE 原生模型的精简树。choice 和 case 行绝不会出现在负载中；出现的是它们的子节点。",
+      "code": "$ pyang -p ./yang -f tree --tree-path /native/interface/Loopback Cisco-IOS-XE-native.yang\nmodule: Cisco-IOS-XE-native\n  +--rw native\n     +--rw interface\n        +--rw Loopback* [name]\n           +--rw name               uint32\n           +--rw description?       string\n           +--rw shutdown?          empty\n           +--rw ip\n              +--rw address\n                 +--rw (address-choice)?\n                    +--:(fixed-case)\n                       +--rw primary!\n                          +--rw address    inet:ipv4-address\n                          +--rw mask       inet:ipv4-address\n           ... (trimmed)",
+      "highlight": [
+        5,
+        11,
+        12
+      ]
+    },
+    {
+      "id": "rfc7951",
+      "type": "text",
+      "markdown": "## RFC 7951：JSON 编码规则\n\nRESTCONF 和 gNMI 按照 **RFC 7951** 的定义，以 JSON 编码 YANG 数据。最容易让负载出错的规则如下：\n\n| 规则 | 正确 | 错误 |\n|:--|:--|:--|\n| 顶层节点带有模块名 | `\"Cisco-IOS-XE-native:interface\"` | `\"interface\"` |\n| 仅当命名空间改变 (augment) 时，子节点才重复前缀 | `ietf-interfaces` 内的 `\"ietf-ip:ipv4\"` | `\"ipv4\"` |\n| `int8` 到 `int32` 以及 `uint8` 到 `uint32` 是数字 | `\"name\": 100` | `\"name\": \"100\"` |\n| `int64`、`uint64` 和 `decimal64` 是字符串 | `\"in-octets\": \"1529384\"` | `\"in-octets\": 1529384` |\n| `boolean` 是 JSON 字面量 | `true` | `\"true\"` |\n| `empty` 是包含 null 的数组 | `\"shutdown\": [null]` | `\"shutdown\": true` |\n| `identityref` 由其模块限定 | `\"iana-if-type:softwareLoopback\"` | `\"softwareLoopback\"` |\n| 列表是数组，即使只有一个条目 | `\"Loopback\": [ { ... } ]` | `\"Loopback\": { ... }` |\n\nRESTCONF 请求体以 URI 的**目标资源 (target resource)** 命名。向 `/restconf/data/Cisco-IOS-XE-native:native/interface` 发送的 `PATCH` 请求，其顶层携带 `Cisco-IOS-XE-native:interface`。当你 `GET` 单个列表条目时，IOS XE 会将其作为对象返回，因此请让你的解析器同时接受两种形式。NETCONF 以 XML (RFC 7950) 携带相同的树，用 `xmlns` 命名空间取代前缀。参见 [基于 YANG 模型的 RESTCONF](/learn/network-automation-devops/restconf-with-yang-models)。"
+    },
+    {
+      "id": "native",
+      "type": "code",
+      "language": "json",
+      "filename": "loopbacks-native.json",
+      "caption": "同一棵树的 JSON 形式。Loopback 是列表，所以是数组；name 是 uint32，所以是数字；shutdown 是 empty，所以是 [null]。",
+      "code": "{\n  \"Cisco-IOS-XE-native:interface\": {\n    \"Loopback\": [\n      {\n        \"name\": 100,\n        \"description\": \"Router ID - managed by automation\",\n        \"ip\": {\n          \"address\": {\n            \"primary\": {\n              \"address\": \"198.51.100.100\",\n              \"mask\": \"255.255.255.255\"\n            }\n          }\n        }\n      },\n      {\n        \"name\": 101,\n        \"description\": \"Probe target - parked\",\n        \"shutdown\": [null]\n      }\n    ]\n  }\n}",
+      "highlight": [
+        2,
+        3,
+        19
+      ]
+    },
+    {
+      "id": "yaml",
+      "type": "text",
+      "markdown": "## YAML：面向人的同一棵树\n\nYAML 1.2 是 JSON 的超集，因此任何 RFC 7951 文档都可以写成 YAML，并且无损地转换回来。团队把 YAML 用于人需要编辑的内容，例如意图文件、Ansible 变量和拉取请求评审，而把 JSON 用于在线路上传输的内容。\n\n常见的两种设计：\n\n1. **符合模型结构的 YAML。**文件镜像 YANG 树（带前缀），并原样转换为 JSON。它精确，但冗长。\n2. **意图 YAML 加构建器。**文件只包含会变化的内容，例如环回口编号、描述和地址。由 Python 脚本或 Jinja2 模板把它映射到模型。人编辑简短的文件，代码则只需应用一次编码规则。\n\n### YAML 陷阱\n\nPyYAML 遵循 YAML 1.1 的隐式类型规则，这可能在你的代码看到某个值之前就改变了它：\n\n- `enabled: no`、`on` 和 `yes` 会变成布尔值。描述为 `off` 时，它就不再是字符串。\n- `0755` 会变成八进制数，`10:30` 可能会变成六十进制数。\n- IP 地址仍是字符串，但像 `0100` 这样的 VLAN ID 则不是。\n\n请给字符串值加引号，使用 `yaml.safe_load`，并在构建器中有意识地转换类型。绝不要对不可信的文件使用 `yaml.load`。"
+    },
+    {
+      "id": "intent",
+      "type": "code",
+      "language": "yaml",
+      "filename": "intent/loopbacks.yml",
+      "caption": "意图 YAML：只包含会变化的值。",
+      "code": "# intent/loopbacks.yml - written by people, reviewed in Git\ndevice: dc1-leaf-01\nloopbacks:\n  - id: 100\n    description: \"Router ID - managed by automation\"\n    ip: 198.51.100.100\n  - id: 101\n    description: \"Probe target - parked\"\n    ip: 198.51.100.101\n    enabled: false\n"
+    },
+    {
+      "id": "builder",
+      "type": "code",
+      "language": "python",
+      "filename": "build_payload.py",
+      "caption": "构建器应用 RFC 7951 规则：顶层的模块前缀、ipv4 上的 augment 前缀、限定名称的 identity、真正的布尔值，以及作为数组的列表。",
+      "code": "import json\nimport yaml\n\nwith open(\"intent/loopbacks.yml\", encoding=\"utf-8\") as f:\n    intent = yaml.safe_load(f)\n\npayload = {\"ietf-interfaces:interfaces\": {\"interface\": [\n    {\n        \"name\": f\"Loopback{lo['id']}\",\n        \"description\": lo[\"description\"],\n        \"type\": \"iana-if-type:softwareLoopback\",   # identityref = module:identity\n        \"enabled\": bool(lo.get(\"enabled\", True)),    # JSON true/false, never \"true\"\n        \"ietf-ip:ipv4\": {                            # augment from another module\n            \"address\": [{\"ip\": str(lo[\"ip\"]), \"netmask\": \"255.255.255.255\"}]\n        },\n    }\n    for lo in intent[\"loopbacks\"]\n]}}\n\nwith open(\"build/loopbacks.json\", \"w\", encoding=\"utf-8\") as f:\n    json.dump(payload, f, indent=2)\nprint(f\"wrote build/loopbacks.json ({len(intent['loopbacks'])} interfaces)\")\n",
+      "highlight": [
+        7,
+        11,
+        12,
+        13
+      ]
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从 YANG 模型到被接受的配置",
+      "caption": "模型决定负载的形状；校验在任何设备看到它之前运行。",
+      "data": {
+        "token": "数据",
+        "nodes": [
+          {
+            "id": "yang",
+            "label": "YANG 模块",
+            "sub": "ietf-interfaces",
+            "icon": "file"
+          },
+          {
+            "id": "tree",
+            "label": "树 / YANG Suite",
+            "sub": "路径和类型",
+            "icon": "eye"
+          },
+          {
+            "id": "intent",
+            "label": "YAML 意图",
+            "sub": "Git",
+            "icon": "file"
+          },
+          {
+            "id": "build",
+            "label": "构建器",
+            "sub": "Python",
+            "icon": "cpu"
+          },
+          {
+            "id": "lint",
+            "label": "yanglint",
+            "sub": "模式检查",
+            "icon": "shield"
+          },
+          {
+            "id": "dev",
+            "label": "R1",
+            "sub": "RESTCONF",
+            "icon": "router"
+          }
+        ],
+        "steps": [
+          {
+            "at": "yang",
+            "token": "模型",
+            "caption": "设备通告 ietf-interfaces、ietf-ip 和 iana-if-type。你下载相同的修订版本。"
+          },
+          {
+            "at": "tree",
+            "token": "模型",
+            "caption": "树显示路径、列表键、类型，以及哪些节点是 rw。"
+          },
+          {
+            "at": "intent",
+            "token": "意图",
+            "caption": "工程师向 YAML 意图文件中添加一个环回口，并发起合并请求。"
+          },
+          {
+            "at": "build",
+            "token": "JSON",
+            "caption": "构建器将意图映射到模型，并应用 RFC 7951 编码规则。"
+          },
+          {
+            "at": "lint",
+            "token": "JSON",
+            "caption": "yanglint 根据相同的模块检查负载。字符串 \"true\" 会在这里失败。",
+            "tone": "success"
+          },
+          {
+            "at": "dev",
+            "token": "PATCH",
+            "caption": "流水线发送 RESTCONF PATCH，R1 回应 204 No Content。",
+            "tone": "secure"
+          },
+          {
+            "at": "dev",
+            "token": "GET",
+            "caption": "GET 将数据读回，并将结果与意图比较。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "build-term",
+      "type": "terminal",
+      "title": "构建、校验、发送并验证",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "python build_payload.py",
+          "output": "wrote build/loopbacks.json (2 interfaces)"
+        },
+        {
+          "cmd": "yanglint -t config -F ietf-ip:ipv4-non-contiguous-netmasks ietf-interfaces.yang ietf-ip.yang iana-if-type.yang build/loopbacks.json",
+          "output": ""
+        },
+        {
+          "comment": "没有输出表示数据对这三个模块有效。-F 启用定义 netmask 的 ietf-ip 特性 (feature)。"
+        },
+        {
+          "cmd": "yanglint -t config -F ietf-ip:ipv4-non-contiguous-netmasks ietf-interfaces.yang ietf-ip.yang iana-if-type.yang build/bad.json",
+          "output": "libyang err : Invalid non-boolean-encoded boolean value \"true\". (Data location \"/ietf-interfaces:interfaces/interface[name='Loopback101']/enabled\".)"
+        },
+        {
+          "comment": "同一个文件如果使用 \"enabled\": \"true\" 就会失败：JSON 字符串不是 YANG 布尔值。流水线会在触及任何设备之前停止。"
+        },
+        {
+          "cmd": "curl -s -o /dev/null -w \"%{http_code}\\n\" -u netops:<password-placeholder> -X PATCH -H \"Content-Type: application/yang-data+json\" -d @build/loopbacks.json https://r1.example.com/restconf/data/ietf-interfaces:interfaces",
+          "output": "204"
+        },
+        {
+          "comment": "PATCH 将两个环回口合并到 interfaces 容器中。204 表示成功且没有响应体。"
+        },
+        {
+          "cmd": "curl -s -u netops:<password-placeholder> -H \"Accept: application/yang-data+json\" https://r1.example.com/restconf/data/ietf-interfaces:interfaces/interface=Loopback100",
+          "output": "{\n  \"ietf-interfaces:interface\": {\n    \"name\": \"Loopback100\",\n    \"description\": \"Router ID - managed by automation\",\n    \"type\": \"iana-if-type:softwareLoopback\",\n    \"enabled\": true,\n    \"ietf-ip:ipv4\": {\n      \"address\": [\n        { \"ip\": \"198.51.100.100\", \"netmask\": \"255.255.255.255\" }\n      ]\n    },\n    \"ietf-ip:ipv6\": {}\n  }\n}"
+        },
+        {
+          "comment": "读回时，单个列表条目作为对象返回。ietf-ip:ipv6 显示为空，因为没有配置 IPv6 数据。"
+        }
+      ],
+      "caption": "实验环境输出。yanglint 成功时不输出任何内容。在生产环境中请使用 HTTPS 证书校验和密钥存储。"
+    },
+    {
+      "id": "tools",
+      "type": "text",
+      "markdown": "## 帮助你构建负载的工具\n\n| 工具 | 它提供什么 |\n|:--|:--|\n| `pyang -f tree` | 带有路径、键、类型和 rw/ro 的可读树 |\n| `pyang -f sample-xml-skeleton` | 用于 NETCONF 的空 XML 骨架 |\n| **Cisco YANG Suite** | 模型浏览、面向 NETCONF、RESTCONF 和 gNMI 的负载与 RPC 构建器，以及生成的 Python 和 Ansible 代码 |\n| `yanglint` (libyang) | 根据模块校验 JSON 或 XML 数据 |\n| RESTCONF `GET` | 设备自己为你曾通过 CLI 配置过一次的对象给出的 JSON：通常是最快的模板 |\n\n更高层的工具会隐藏其中一部分工作。Ansible 资源模块（例如 `cisco.ios.ios_interfaces`）使用自己的 YAML 模式，而 `ansible.netcommon.restconf_config` 和 `netconf_config` 则接受符合模型结构的内容。CiscoDevNet 的 `iosxe` Terraform provider 将其资源映射到原生 YANG 路径，其通用的 `iosxe_restconf` 资源接受路径和属性。参见 [Ansible 网络配置](/learn/network-automation-devops/ansible-for-network-configuration)和 [Terraform 网络配置](/learn/network-automation-devops/terraform-for-network-configuration)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "工程师常犯的错误",
+      "markdown": "- **在负载中写出 choice 或 case 名称。**`address-choice` 和 `fixed-case` 是仅存在于模式中的节点。\n- **给每个键都加前缀，或者都不加。**只给顶层节点以及来自其他命名空间的节点加前缀，其余不加。\n- **给 uint32 加引号，或者让 counter64 不加引号。**32 位整数是数字；64 位整数是字符串。\n- **在编辑中发送 `ro` 节点。**把完整的 `GET` 回复复制进 `PUT` 会包含设备会拒绝的状态叶子。\n- **在一次变更中混用多个模型。**在同一次运行中通过原生模型和 IETF 模型编辑同一个接口，可能产生令人困惑的结果。每个功能只选择一个模型。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在 Cisco Modeling Labs 中使用一台已启用 RESTCONF 的实验用 Catalyst 8000v。\n\n1. 从 YangModels GitHub 仓库下载 `ietf-interfaces`、`ietf-ip` 和 `iana-if-type`，版本与路由器通告的修订版本一致。用 `pyang -f tree` 打印树。\n2. 编写 `intent/loopbacks.yml` 和 `build_payload.py`，然后用 `yanglint` 校验输出。\n3. 将 `enabled` 改为字符串 `\"true\"` 和 `no`。注意 `yanglint` 拒绝哪一个，以及 YAML 悄悄把哪一个变成了布尔值。\n4. 用 `PATCH` 发送负载，并用 `GET` 读回。\n5. 通过 CLI 配置 `Loopback102`，从原生模型 `GET` 它，并把回复用作原生负载的模板。重用之前先删除每一个 `ro` 节点。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "RFC 7951",
+          "definition": "定义如何以 JSON 编码 YANG 建模数据的标准。"
+        },
+        {
+          "term": "模块前缀 (Module prefix，命名空间限定)",
+          "definition": "位于节点名之前的模块名，在顶层节点以及命名空间发生变化的位置是必需的。"
+        },
+        {
+          "term": "扩充 (Augment)",
+          "definition": "一种 YANG 机制，将一个模块的节点添加到另一个模块的树中，例如接口内的 ietf-ip:ipv4。"
+        },
+        {
+          "term": "选择 / 分支 (Choice / case)",
+          "definition": "仅存在于模式中的 YANG 节点，提供若干备选项；数据中只会出现所选 case 的节点。"
+        },
+        {
+          "term": "存在容器 (Presence container)",
+          "definition": "其存在本身就带有含义的容器，在树中以 ! 表示。"
+        },
+        {
+          "term": "identityref",
+          "definition": "一种 YANG 类型，其值是一个 identity，在 JSON 中编码为 module:identity。"
+        },
+        {
+          "term": "yanglint",
+          "definition": "根据 YANG 模块校验 JSON 或 XML 数据的 libyang 命令行工具。"
+        },
+        {
+          "term": "Cisco YANG Suite",
+          "definition": "Cisco 的工具，用于浏览 YANG 模型，以及构建和测试 NETCONF、RESTCONF 和 gNMI 负载。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "根据 RFC 7951，下列哪个 JSON 片段正确编码了 empty 叶子 shutdown？",
+          "options": [
+            "\"shutdown\": true",
+            "\"shutdown\": \"\"",
+            "\"shutdown\": [null]",
+            "\"shutdown\": null"
+          ],
+          "answer": 2,
+          "explanation": "YANG 的 empty 类型被编码为包含单个 null 的数组。"
+        },
+        {
+          "question": "在 ietf-interfaces:interface 对象内部，哪些键需要模块前缀？（选择所有适用项。）",
+          "options": [
+            "name",
+            "来自 ietf-ip augment 的 ipv4",
+            "description",
+            "type 的值，它是一个 identityref"
+          ],
+          "answer": [
+            1,
+            3
+          ],
+          "explanation": "ipv4 来自另一个命名空间，因此写作 ietf-ip:ipv4。identityref 的值被限定为 iana-if-type:softwareLoopback。来自同一模块的节点（如 name 和 description）不加前缀。"
+        },
+        {
+          "question": "pyang 树显示 '+--rw (address-choice)?'，其下有 ':(fixed-case)' 和 'primary!'。它在 JSON 中如何呈现？",
+          "options": [
+            "\"address-choice\": {\"fixed-case\": {\"primary\": {...}}}",
+            "\"primary\": {...} 直接位于 address 之下",
+            "\"fixed-case\": {\"primary\": {...}}",
+            "\"address-choice\": \"fixed-case\""
+          ],
+          "answer": 1,
+          "explanation": "Choice 和 case 是仅存在于模式中的节点。数据中只会出现所选 case 的节点，这里是 primary 容器。"
+        },
+        {
+          "question": "根据 RFC 7951，哪些值的编码是正确的？（选择所有适用项。）",
+          "options": [
+            "uint32 的环回口编号写作 100",
+            "counter64 写作 \"1529384\"",
+            "布尔值写作 \"false\"",
+            "只有一个条目的列表写作含一个对象的数组"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "32 位整数是数字，64 位整数是字符串，列表是数组。布尔值必须是字面量 true 和 false，而不是字符串。"
+        },
+        {
+          "question": "为什么构建器脚本要用 bool() 转换 enabled，并且在 YAML 意图中给描述加引号？",
+          "options": [
+            "YAML 1.1 的隐式类型可能把 no 或 off 之类的值变成布尔值",
+            "RESTCONF 只接受带引号的值",
+            "JSON 不支持布尔值",
+            "yanglint 要求每个值都是字符串"
+          ],
+          "answer": 0,
+          "explanation": "PyYAML 遵循 YAML 1.1 规则，因此不加引号的 yes、no、on 和 off 等词会变成布尔值。加引号和显式转换能保持你想要的类型。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- 先读懂树：容器变为对象，列表变为以其键叶子为键的数组，choice 和 case 绝不会出现在数据中。\n- 应用 **RFC 7951**：为顶层和被扩充的节点加前缀，32 位以内用数字、64 位用字符串，布尔值用 `true`/`false`，empty 用 `[null]`，identityref 用 `module:identity`。\n- 把 **YAML** 用于人要编辑的内容，要么镜像模型，要么让意图保持简短并由构建器映射。注意 YAML 1.1 的隐式类型。\n- 发送前用 **yanglint** 或 YANG Suite 校验，通过 RESTCONF 发送，并将数据读回以确认。\n\n接下来，在[模型驱动遥测](/learn/network-automation-devops/model-driven-telemetry)中，学习如何从设备流式输出同样的模型。"
+    }
+  ]
+}

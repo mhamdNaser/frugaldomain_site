@@ -1,0 +1,274 @@
+{
+  "title": "集中式日志管理 (Centralized Log Management)",
+  "summary": "了解为什么必须把日志收集到一个受保护的统一平台，日志管道 (log pipeline) 是如何构建的，以及如何从你自己拥有的主机上传输并验证日志。",
+  "objectives": [
+    "解释为什么本地日志不足以支撑安全运营",
+    "描述日志管道的各个阶段",
+    "选择要收集哪些日志以及保留多长时间",
+    "将日志从 Linux 主机传输到收集器 (collector) 并验证"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "凌晨 02:10，攻击者用被盗的密码登录了一台 Web 服务器，清空了本地的 `auth.log`，然后继续横向移动。第二天早上，分析师打开这台服务器，只看到一个干净的文件。证据已经消失，因为它存放在被攻击者控制的机器上。\n\n这正是**集中式日志管理 (centralized log management)** 的核心理由：近实时地把每个系统上的事件复制出去，存放到攻击者难以触及的平台。在本课中，你将学习日志管道是什么样子、该收集什么、保留多久，以及如何从你自己拥有的 Linux 主机传输并验证日志。"
+    },
+    {
+      "id": "why",
+      "type": "text",
+      "markdown": "## 为什么本地日志不够\n\n只把日志保存在各台主机上，会在四个方面出问题：\n\n- **篡改。**任何拥有管理员权限的人都可以编辑或删除本地文件。\n- **丢失。**磁盘会写满，日志会轮转，重建的虚拟机会连同历史记录一起消失。\n- **无法关联。**单次登录没什么意义。但同一个账户在五分钟内先后从 VPN、邮件服务器和数据库主机登录就不寻常了，而只有当事件并排放在一起时，你才能看到这一点。\n- **响应缓慢。**事件发生期间，没有人愿意通过 SSH 登录 200 台服务器去运行 `grep`。\n\n集中收集也有助于合规。PCI DSS 和 ISO 27001 等框架要求审计轨迹受到保护、时间同步，并保留规定的时长。"
+    },
+    {
+      "id": "pipe-anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "一条日志事件的生命周期",
+      "caption": "一个事件从来源到分析师，要经过五个阶段。",
+      "data": {
+        "token": "事件",
+        "nodes": [
+          {
+            "id": "src",
+            "label": "来源 (Source)",
+            "sub": "服务器、防火墙、应用",
+            "icon": "server"
+          },
+          {
+            "id": "agent",
+            "label": "代理 / 转发器 (Agent / forwarder)",
+            "sub": "读取并传输",
+            "icon": "log"
+          },
+          {
+            "id": "coll",
+            "label": "收集器 (Collector)",
+            "sub": "解析、规范化",
+            "icon": "cpu"
+          },
+          {
+            "id": "store",
+            "label": "索引 / 存储 (Index / storage)",
+            "sub": "热、温、冷",
+            "icon": "database"
+          },
+          {
+            "id": "soc",
+            "label": "分析师 (Analyst)",
+            "sub": "搜索、告警",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "src",
+            "caption": "一次失败的 SSH 登录被写入本地日志。"
+          },
+          {
+            "at": "agent",
+            "caption": "代理持续读取该文件，并添加主机和时间戳元数据。"
+          },
+          {
+            "at": "coll",
+            "caption": "收集器把这一行解析为字段：用户、源 IP、结果。",
+            "tone": "secure"
+          },
+          {
+            "at": "coll",
+            "caption": "规范化把这些字段映射到通用模式，使所有来源看起来一致。"
+          },
+          {
+            "at": "store",
+            "caption": "事件被建立索引，并按保留策略保存。",
+            "tone": "success"
+          },
+          {
+            "at": "soc",
+            "caption": "检测规则在五次失败后触发，分析师打开案件。",
+            "tone": "warning"
+          }
+        ]
+      }
+    },
+    {
+      "id": "collect",
+      "type": "text",
+      "markdown": "## 收集什么\n\n什么都收集既昂贵又嘈杂。应从调查时必须回答的问题出发：谁登录了、运行了什么、改变了什么，以及什么离开了网络。\n\n| 来源 | 示例 | 为什么重要 |\n|:--|:--|:--|\n| 身份 | 域控制器、SSO、VPN | 账户滥用和横向移动 |\n| 终端和服务器 | Windows 安全日志、Linux `auth.log`、auditd | 登录、进程启动、权限使用 |\n| 网络 | 防火墙、代理、DNS、NetFlow | 命令与控制 (C2) 和数据外泄 |\n| 应用 | Web 服务器、数据库、API 网关 | 注入尝试、数据访问 |\n| 云和 SaaS | 审计轨迹、邮件网关 | 错误配置和邮箱滥用 |\n\n按价值确定优先级。身份验证日志和 DNS 日志通常每 GB 的回报最高，冗长的调试日志通常最低。"
+    },
+    {
+      "id": "time",
+      "type": "text",
+      "markdown": "## 时间、保留与完整性\n\n三项设计选择决定了你的日志能否作为证据使用。\n\n### 同步的时间\n\n每个来源都必须使用 NTP，并以 UTC 或带明确偏移量的方式写入时间戳。防火墙和服务器之间五分钟的时钟偏差，会让时间线出错，并拖慢调查。同时存储事件发生时间和平台接收时间。\n\n### 保留层级\n\n把近期数据保存在高速存储上，把较旧的数据迁移到更便宜的存储：\n\n- **热 (Hot)：**7 到 30 天，被检测规则持续搜索。\n- **温 (Warm)：**30 到 90 天，在调查期间搜索。\n- **冷 (Cold)：**1 年或更长，用于合规以及缓慢渗透的入侵。\n\n攻击者往往在内部潜伏数周，因此保留期短于你的检测时间就是盲区。\n\n### 完整性与访问\n\n通过 TLS 发送日志，限制谁能删除索引，并保留一份不可变副本（一次写入存储或单独的账户）。同时记录对日志平台本身的访问。"
+    },
+    {
+      "id": "fb-conf",
+      "type": "code",
+      "language": "yaml",
+      "code": "filebeat.inputs:\n  - type: filestream\n    id: linux-auth\n    paths:\n      - /var/log/auth.log\n    fields:\n      env: lab\n      source_type: linux_auth\n    fields_under_root: true\n\nprocessors:\n  - add_host_metadata: ~\n\noutput.logstash:\n  hosts: [\"logs.example.com:5044\"]\n  ssl.certificate_authorities: [\"/etc/filebeat/ca.pem\"]\n",
+      "filename": "/etc/filebeat/filebeat.yml",
+      "caption": "一个最小化的 Filebeat 传输器。它持续读取一个文件，打上标签，并通过 TLS 发送到收集器。"
+    },
+    {
+      "id": "fb-test",
+      "type": "terminal",
+      "title": "filebeat",
+      "prompt": "$",
+      "caption": "务必端到端验证整条路径。收集器的名称是你自己拥有的实验网络中的示例。",
+      "lines": [
+        {
+          "cmd": "sudo filebeat test config",
+          "output": "Config OK",
+          "comment": "重启前检查语法"
+        },
+        {
+          "cmd": "sudo filebeat test output",
+          "output": "logstash: logs.example.com:5044...\n  connection...\n    parse host... OK\n    dns lookup... OK\n    addresses: 192.0.2.50\n    dial up... OK\n  TLS...\n    security: server certificate chain verification is enabled\n    handshake... OK\n    TLS version: TLSv1.3\n  talk to server... OK",
+          "comment": "证书验证已开启，并协商使用了 TLS 1.3"
+        },
+        {
+          "cmd": "sudo systemctl restart filebeat && sudo journalctl -u filebeat -n 3 --no-pager",
+          "output": "Starting filebeat\nHarvester started for file: /var/log/auth.log\nConnection to logs.example.com:5044 established",
+          "comment": "harvester 这一行证明文件正在被读取"
+        }
+      ]
+    },
+    {
+      "id": "methods",
+      "type": "text",
+      "markdown": "## 收集方式\n\n从来源获取事件有三种常见方式，大多数环境会同时使用这三种。\n\n| 方式 | 工作原理 | 最适合 | 权衡 |\n|:--|:--|:--|:--|\n| 代理 (Agent) | 主机上的软件读取文件或事件日志 | 服务器和终端 | 需要部署和更新 |\n| 无代理推送 (Agentless push) | 设备发送 syslog 或 SNMP 陷阱 | 防火墙、交换机、专用设备 | 通常是明文 UDP，不保证送达 |\n| API 拉取 (API pull) | 收集器轮询云或 SaaS 的 API | 云审计轨迹、邮件 | 有速率限制，需要保护凭据 |\n\n选择来源原生支持的方式，并添加缓冲区（磁盘队列），这样短暂的中断就不会丢失事件。"
+    },
+    {
+      "id": "parse",
+      "type": "text",
+      "markdown": "## 解析与规范化\n\n原始文本很难搜索。收集器会把类似 `Failed password for admin from 198.51.100.23 port 51422 ssh2` 的一行转换为字段：`event.action=logon_failed`、`user.name=admin`、`source.ip=198.51.100.23`。一旦所有来源都使用相同的字段名，一次查询就能在防火墙、VPN 和服务器上找到同一个用户。\n\n公共模式 (schema) 很有帮助：Elastic 通用模式 (Elastic Common Schema, ECS)、Splunk 通用信息模型 (Common Information Model, CIM) 以及 Microsoft 的 ASIM 都定义了标准名称。选定一种并坚持使用。同时在某个字段中保留原始消息，因为解析器会有缺陷，你以后可能需要重新解析。\n\n关于不同系统的事件之后如何被关联和丰富，请参见 [日志关联与事件丰富](/learn/security-operations-dfir/log-correlation-and-event-enrichment)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "不要记录机密，也不要盲目传输它们",
+      "markdown": "应用有时会把密码、API 令牌或完整的银行卡号写入调试日志。一旦被传输，这些数据就会存放在许多分析师都能读取的索引中。请在来源端或收集器中对敏感字段进行掩码处理，并在启用新的日志源之前先进行审查。"
+    },
+    {
+      "id": "health",
+      "type": "text",
+      "markdown": "## 监控管道本身\n\n沉默的来源与安静的来源看起来完全一样。请建立健康检查：\n\n1. 当通常会发送事件的来源连续 15 分钟没有发送任何事件时，发出告警。\n2. 跟踪摄取延迟 (ingestion lag)：事件时间与接收时间之间的差距。\n3. 关注解析失败率和丢弃事件的计数器。\n4. 预留磁盘并设置队列上限，使突发流量不会导致收集器崩溃。\n\n这些检查能发现损坏的代理、过期的证书，以及为了让你失明而停止服务的攻击者。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在你自己拥有的 Linux 虚拟机上，于实验网络中安装 Filebeat 和免费的 Elastic 技术栈（或任何你喜欢的收集器）。配置本课中的传输器来发送 `/var/log/auth.log`。然后用 `ssh wronguser@localhost` 产生三次失败登录，并在收集器中搜索 `Failed password` 找到它们。最后把 Filebeat 服务停止两分钟，并记下你的健康检查需要多久才能发现。只使用你自己拥有的系统。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "日志管道 (Log pipeline)",
+          "definition": "从来源经代理、收集器和存储到分析师的整条链路。"
+        },
+        {
+          "term": "转发器 / 代理 (Forwarder / agent)",
+          "definition": "安装在来源上、读取日志并传输日志的软件。"
+        },
+        {
+          "term": "规范化 (Normalization)",
+          "definition": "把不同来源的字段映射到同一个通用模式。"
+        },
+        {
+          "term": "解析 (Parsing)",
+          "definition": "把原始文本拆分为带名称的字段。"
+        },
+        {
+          "term": "保留 (Retention)",
+          "definition": "数据保存多长时间，通常分为热、温、冷层级。"
+        },
+        {
+          "term": "摄取延迟 (Ingestion lag)",
+          "definition": "事件发生与变得可搜索之间的延迟。"
+        },
+        {
+          "term": "ECS / CIM",
+          "definition": "Elastic 和 Splunk 的通用字段模式。"
+        },
+        {
+          "term": "不可变存储 (Immutable storage)",
+          "definition": "写入后的数据无法被更改或删除的存储。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "为什么把日志发送到主机之外有助于事件处置？",
+          "options": [
+            "它使日志变小",
+            "攻击者难以抹除这份副本",
+            "它使 NTP 变得不再必要",
+            "它会加密磁盘"
+          ],
+          "answer": 1,
+          "explanation": "即使攻击者清空了本地文件，远程副本依然存在。"
+        },
+        {
+          "question": "以下哪些是规范化的好处？选择所有适用项。",
+          "options": [
+            "一次查询即可跨来源工作",
+            "总是占用更少的磁盘空间",
+            "更容易关联",
+            "检测规则可跨厂商复用"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "规范化统一了字段名称，但并不保证存储更小。"
+        },
+        {
+          "question": "分析师看到两个实际上同时发生的事件，时间却相差 5 分钟。最可能的原因是：",
+          "options": [
+            "日志轮转",
+            "各来源之间的时钟漂移",
+            "解析器失败",
+            "压缩"
+          ],
+          "answer": 1,
+          "explanation": "未同步的时钟会扭曲时间线。请在所有地方使用 NTP 和 UTC。"
+        },
+        {
+          "question": "哪种来源通常每 GB 的安全价值最高？",
+          "options": [
+            "调试日志",
+            "身份验证和 DNS 日志",
+            "打印服务器日志",
+            "屏幕保护程序日志"
+          ],
+          "answer": 1,
+          "explanation": "身份验证和 DNS 能以较小的数据量回答“谁”和“在哪里”。"
+        },
+        {
+          "question": "一台通常每小时发送 1,000 个事件的服务器突然沉默了。你首先应该假设什么？",
+          "options": [
+            "什么都没有发生",
+            "代理可能已被停止或被篡改",
+            "索引中已塞满数据",
+            "保留期已过期"
+          ],
+          "answer": 1,
+          "explanation": "沉默本身就是一种信号。应对缺失的来源发出告警。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n集中式日志记录能保护证据、支持关联并加快响应。构建一条由来源、代理、收集器、存储和分析师组成的管道。优先收集身份、终端、网络和应用日志。同步时间、规范化字段、分层保留数据，并保护平台本身。最后，监控管道本身。接下来，请在 [Syslog 架构](/learn/security-operations-dfir/syslog-architecture) 中了解网络设备如何传输日志。"
+    }
+  ]
+}

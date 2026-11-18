@@ -1,0 +1,415 @@
+{
+  "title": "मॉडल-ड्रिवन टेलीमेट्री (Model-Driven Telemetry)",
+  "summary": "IOS XE से YANG-मॉडल वाले ऑपरेशनल डेटा को डायल-इन और डायल-आउट सब्सक्रिप्शन, आवधिक (periodic) और ऑन-चेंज (on-change) पॉलिसी, तथा Telegraf, InfluxDB और Grafana पाइपलाइन के साथ स्ट्रीम करें।",
+  "objectives": [
+    "मॉडल-ड्रिवन टेलीमेट्री की तुलना SNMP पोलिंग से करना",
+    "डायल-इन और डायल-आउट सब्सक्रिप्शन तथा उनके प्रोटोकॉल और एन्कोडिंग में अंतर करना",
+    "आवधिक (periodic) और ऑन-चेंज (on-change) अपडेट पॉलिसी में से चुनना",
+    "IOS XE पर gRPC डायल-आउट सब्सक्रिप्शन कॉन्फ़िगर और सत्यापित करना तथा gNMI से सब्सक्राइब करना",
+    "टेलीमेट्री कलेक्टर पाइपलाइन को डिज़ाइन करना, सुरक्षित करना और संचालित करना"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "उपयोगकर्ता शिकायत करते हैं कि हर दोपहर वीडियो कॉल कुछ सेकंड के लिए फ़्रीज़ हो जाती हैं। SNMP ग्राफ़ में कुछ नहीं दिखता: इंटरफ़ेस उपयोग अधिकतम 40% है। ग्राफ़ पाँच मिनट की पोलिंग का औसत दिखाते हैं, इसलिए कतार (queue) को भर देने वाला 20 सेकंड का माइक्रोबर्स्ट औसत में खो जाता है।\n\n**मॉडल-ड्रिवन टेलीमेट्री (Model-Driven Telemetry, MDT)** निगरानी को उलट देती है। हर डिवाइस से काउंटर माँगने वाले पोलर की जगह, हर डिवाइस YANG-मॉडल वाला डेटा कलेक्टरों को **स्ट्रीम** करता है, या तो तय अंतराल पर या जैसे ही कुछ बदलता है। AUTOCOR ब्लूप्रिंट अपेक्षा करता है कि आप MDT को कॉन्फ़िगर और उपयोग करें: डायल-इन या डायल-आउट चुनें, आवधिक या ऑन-चेंज चुनें, एन्कोडिंग और पाथ चुनें, और कलेक्टर पाइपलाइन बनाएँ।"
+    },
+    {
+      "id": "why",
+      "type": "text",
+      "markdown": "## पोल की जगह पुश क्यों\n\n| | SNMP पोलिंग | मॉडल-ड्रिवन टेलीमेट्री |\n|:--|:--|:--|\n| दिशा | कलेक्टर खींचता है, हर OID वॉक पर एक अनुरोध | एक सब्सक्रिप्शन के बाद डिवाइस पुश करता है |\n| सामान्य ग्रैन्युलैरिटी | 1 से 5 मिनट | सेकंड, या बदलाव के ठीक क्षण |\n| डेटा मॉडल | MIBs | YANG (नेटिव, IETF, OpenConfig) |\n| एन्कोडिंग | BER | kvGPB, GPB, JSON, XML |\n| ट्रांसपोर्ट | UDP | gRPC (HTTP/2), SSH पर NETCONF, gNMI |\n| डिवाइस पर लागत | टेबल वॉक के दौरान CPU में उछाल | डेटा एक बार पढ़ा जाता है और सभी रिसीवरों को भेजा जाता है |\n\nटेलीमेट्री **वही YANG मॉडल** उपयोग करती है जिनसे आप पहले से NETCONF और RESTCONF के ज़रिए कॉन्फ़िगर करते हैं; ऑपरेशनल (`-oper`) मॉडल स्थिति (state) प्रदान करते हैं। `/process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds` जैसा पाथ उस ट्री में एक XPath है। देखें [YANG Models से YAML / JSON Configurations](/learn/network-automation-devops/yaml-json-configurations-from-yang-models)।\n\nछोटे नेटवर्क और पुराने डिवाइसों के लिए SNMP की अब भी जगह है। आधुनिक प्लेटफ़ॉर्म पर, टेलीमेट्री क्षमता योजना (capacity planning), तेज़ फ़ॉल्ट पहचान और क्लोज़्ड-लूप ऑटोमेशन का स्रोत है।"
+    },
+    {
+      "id": "subs",
+      "type": "text",
+      "markdown": "## सब्सक्रिप्शन: डायल-इन और डायल-आउट\n\n**सब्सक्रिप्शन (Subscription)** डिवाइस को बताता है कि क्या भेजना है (पाथ फ़िल्टर), कब भेजना है (अपडेट पॉलिसी) और कैसे एन्कोड करना है।\n\n| | डायल-इन (डायनामिक) | डायल-आउट (कॉन्फ़िगर किया हुआ) |\n|:--|:--|:--|\n| कौन कनेक्ट करता है | कलेक्टर डिवाइस से कनेक्ट करता है | डिवाइस रिसीवर से कनेक्ट करता है |\n| कहाँ परिभाषित होता है | कलेक्टर के सत्र (session) में | डिवाइस कॉन्फ़िगरेशन में |\n| जीवनकाल | सत्र बंद होने पर समाप्त | रीबूट और पुन: कनेक्शन के बाद भी बना रहता है |\n| IOS XE विकल्प | NETCONF `establish-subscription` (XML), gNMI `Subscribe` (JSON_IETF, डिफ़ॉल्ट रूप से TCP 9339) | kvGPB के साथ gRPC (`grpc-tcp` या `grpc-tls`) |\n| फ़ायरवॉल पर प्रभाव | डिवाइस की ओर इनबाउंड | डिवाइस से आउटबाउंड |\n\n**डायल-इन (Dial-in)** उन टूल्स के लिए उपयुक्त है जो माँग पर शुरू और बंद होते हैं, जैसे ट्रबलशूटिंग स्क्रिप्ट या ऐसा gNMI कलेक्टर जो अपनी सब्सक्रिप्शन सूची स्वयं प्रबंधित करता है। IOS XE पर gNMI को `gnxi`, `gnxi secure-trustpoint <trustpoint>` और `gnxi secure-server` से सक्षम करें।\n\n**डायल-आउट (Dial-out)** हमेशा चालू रहने वाली निगरानी के लिए उपयुक्त है। सब्सक्रिप्शन कॉन्फ़िगरेशन में रहता है, इसलिए वह वर्ज़न-कंट्रोल में रहता है और किसी भी अन्य कॉन्फ़िगरेशन की तरह डिप्लॉय होता है, और कलेक्टर के रीस्टार्ट के बाद अपने-आप फिर कनेक्ट हो जाता है।\n\n### gNMI सब्सक्राइब मोड\n\n- **STREAM:** लंबे समय तक चलने वाली स्ट्रीम। `SAMPLE` हर अंतराल पर भेजता है, `ON_CHANGE` केवल बदलाव भेजता है, और `TARGET_DEFINED` डिवाइस को हर पाथ के लिए चुनने देता है।\n- **ONCE:** एक स्नैपशॉट, फिर स्ट्रीम बंद हो जाती है।\n- **POLL:** क्लाइंट खुली स्ट्रीम पर हर अपडेट स्वयं ट्रिगर करता है।"
+    },
+    {
+      "id": "policy",
+      "type": "text",
+      "markdown": "## आवधिक (Periodic) या ऑन-चेंज (On-change)\n\n- **आवधिक (Periodic)** अपडेट तय अंतराल पर वर्तमान मान भेजते हैं। IOS XE पर `update-policy periodic` **सेंटीसेकंड (centiseconds)** में होता है, इसलिए `6000` का अर्थ 60 सेकंड है। इसे CPU, मेमोरी, इंटरफ़ेस ऑक्टेट और क्यू ड्रॉप जैसे काउंटर और गेज के लिए उपयोग करें।\n- **ऑन-चेंज (On-change)** अपडेट मान बदलने पर ही डेटा भेजते हैं, साथ में शुरुआत में एक पूरा स्नैपशॉट। इसे इवेंट और धीरे-धीरे बदलने वाली स्थिति के लिए उपयोग करें: नेबर सूची, इंटरफ़ेस oper-status, राउटिंग एडजेसेंसी। केवल वही पाथ इसे स्वीकार करते हैं जिन्हें प्लेटफ़ॉर्म ऑन-चेंज सक्षम के रूप में चिह्नित करता है।\n\nफ़िल्टर संकरे रखें। पूरे `-oper` मॉडल को 10 सेकंड के अंतराल पर सब्सक्राइब करने से प्रति डिवाइस हज़ारों मान बन सकते हैं और डिवाइस तथा कलेक्टर दोनों पर ओवरलोड हो सकता है। उन लीफ़ से शुरू करें जिन्हें आप ग्राफ़ करेंगे या जिन पर अलर्ट लगाएँगे।"
+    },
+    {
+      "id": "dialout",
+      "type": "terminal",
+      "title": "IOS XE पर डायल-आउट सब्सक्रिप्शन को कॉन्फ़िगर और सत्यापित करना",
+      "prompt": "R1#",
+      "lines": [
+        {
+          "cmd": "configure terminal",
+          "prompt": "R1#",
+          "output": "Enter configuration commands, one per line.  End with CNTL/Z."
+        },
+        {
+          "cmd": "telemetry ietf subscription 101",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "encoding encode-kvgpb",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "filter xpath /process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "source-address 192.0.2.1",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "stream yang-push",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "update-policy periodic 6000",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "receiver ip address 198.51.100.50 57000 protocol grpc-tcp",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "comment": "सब्सक्रिप्शन 101 पाँच-सेकंड CPU मान को हर 60 सेकंड (6000 सेंटीसेकंड) पर kvGPB में gRPC के ज़रिए भेजता है।"
+        },
+        {
+          "cmd": "exit",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "telemetry ietf subscription 102",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "encoding encode-kvgpb",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "filter xpath /cdp-ios-xe-oper:cdp-neighbor-details/cdp-neighbor-detail",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "source-address 192.0.2.1",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "stream yang-push",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "update-policy on-change",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "receiver ip address 198.51.100.50 57000 protocol grpc-tcp",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "end",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "comment": "सब्सक्रिप्शन 102 CDP नेबर विवरण के लिए ऑन-चेंज पॉलिसी उपयोग करता है: पहले एक स्नैपशॉट, फिर केवल बदलाव।"
+        },
+        {
+          "cmd": "show telemetry ietf subscription all",
+          "prompt": "R1#",
+          "output": "  ID         Type        State       State Description\n  101        Configured  Valid       Subscription validated\n  102        Configured  Valid       Subscription validated"
+        },
+        {
+          "cmd": "show telemetry ietf subscription 101 detail",
+          "prompt": "R1#",
+          "output": "Telemetry subscription detail:\n\n  Subscription ID: 101\n  Type: Configured\n  State: Valid\n  Stream: yang-push\n  Filter:\n    Filter type: xpath\n    XPath: /process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds\n  Update policy:\n    Update Trigger: periodic\n    Period: 6000\n  Encoding: encode-kvgpb\n  Source VRF:\n  Source Address: 192.0.2.1\n  Notes:\n\n  Receivers:\n    Address                                    Port     Protocol         Protocol Profile\n    -----------------------------------------------------------------------------------------\n    198.51.100.50                              57000    grpc-tcp"
+        },
+        {
+          "cmd": "show telemetry ietf subscription 101 receiver",
+          "prompt": "R1#",
+          "output": "Telemetry subscription receivers detail:\n\n  Subscription ID: 101\n  Address: 198.51.100.50\n  Port: 57000\n  Protocol: grpc-tcp\n  Profile:\n  Connection: 1\n  State: Connected\n  Explanation:"
+        },
+        {
+          "comment": "State: Valid का अर्थ है कि डिवाइस ने पाथ, एन्कोडिंग और पॉलिसी स्वीकार कर ली। Connected का अर्थ है कि रिसीवर तक gRPC सत्र चालू है।"
+        },
+        {
+          "comment": "Invalid आमतौर पर गलत XPath या असमर्थित पॉलिसी दर्शाता है; Disconnected रिसीवर, राउटिंग या ACL की ओर संकेत करता है।"
+        }
+      ],
+      "caption": "लैब आउटपुट। प्रोडक्शन में रिसीवर प्रोफ़ाइल और CA-साइन्ड सर्टिफ़िकेट के साथ protocol grpc-tls उपयोग करें।"
+    },
+    {
+      "id": "seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "TIG स्टैक में डायल-आउट टेलीमेट्री",
+      "caption": "डिवाइस एक बार कनेक्ट होता है और फिर पुश करता है; कलेक्टर टाइम सीरीज़ लिखता है जिन्हें डैशबोर्ड और अलर्ट पढ़ते हैं।",
+      "data": {
+        "actors": [
+          {
+            "id": "r",
+            "label": "R1",
+            "sub": "IOS XE, सब्सक्रिप्शन 101/102",
+            "icon": "router"
+          },
+          {
+            "id": "t",
+            "label": "Telegraf",
+            "sub": "198.51.100.50:57000",
+            "icon": "server"
+          },
+          {
+            "id": "db",
+            "label": "InfluxDB",
+            "sub": "बकेट telemetry",
+            "icon": "database"
+          },
+          {
+            "id": "g",
+            "label": "Grafana",
+            "sub": "डैशबोर्ड, अलर्ट",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "from": "r",
+            "to": "t",
+            "label": "gRPC कनेक्ट",
+            "detail": "स्रोत 192.0.2.1, TCP 57000",
+            "note": "राउटर कनेक्शन खोलता है। डायल-आउट में डिवाइस क्लाइंट होता है, इसलिए उस पर कोई इनबाउंड पोर्ट नहीं खुलता।",
+            "tone": "secure"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB अपडेट",
+            "detail": "सब्सक्रिप्शन 101, cpu five-seconds = 7",
+            "note": "हर 6000 सेंटीसेकंड (60 सेकंड) पर राउटर बिना माँगे मान पुश करता है।"
+          },
+          {
+            "from": "t",
+            "to": "db",
+            "label": "पॉइंट लिखें",
+            "detail": "मेज़रमेंट + टैग + फ़ील्ड",
+            "note": "Telegraf kvGPB को डिकोड करता है और स्रोत तथा सब्सक्रिप्शन के टैग वाला एक पॉइंट लिखता है।",
+            "tone": "success"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB अपडेट",
+            "detail": "सब्सक्रिप्शन 101, cpu five-seconds = 82",
+            "note": "अगला सैंपल CPU में उछाल दिखाता है। हर पाँच मिनट की SNMP पोलिंग इसे चूक सकती थी।"
+          },
+          {
+            "from": "t",
+            "to": "db",
+            "label": "पॉइंट लिखें",
+            "detail": "वही सीरीज़",
+            "note": "नया मान उसी टाइम सीरीज़ में जुड़ जाता है।"
+          },
+          {
+            "from": "g",
+            "to": "db",
+            "label": "क्वेरी",
+            "detail": "पिछले 15 मिनट",
+            "note": "Grafana InfluxDB से क्वेरी करता है और CPU पैनल तथा अलर्ट नियम बनाता है।"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB अपडेट",
+            "detail": "सब्सक्रिप्शन 102, ऑन-चेंज: CDP नेबर खोया",
+            "note": "सब्सक्रिप्शन 102 डेटा केवल तब भेजता है जब कोई CDP नेबर प्रकट या गायब होता है, कुछ ही सेकंड में।",
+            "tone": "warning"
+          },
+          {
+            "from": "g",
+            "to": "g",
+            "label": "अलर्ट",
+            "detail": "नेबर डाउन + CPU अधिक",
+            "note": "अलर्ट नियम दोनों सीरीज़ को आपस में जोड़ता है और ऑन-कॉल इंजीनियर को सूचित करता है।",
+            "tone": "warning"
+          }
+        ]
+      }
+    },
+    {
+      "id": "telegraf",
+      "type": "code",
+      "language": "ini",
+      "filename": "telegraf.conf",
+      "caption": "Telegraf, cisco_telemetry_mdt इनपुट के साथ gRPC डायल-आउट प्राप्त करता है और InfluxDB में लिखता है। टोकन एक एनवायरनमेंट वेरिएबल से आता है।",
+      "code": "# telegraf.conf - collector for IOS XE gRPC dial-out\n[[inputs.cisco_telemetry_mdt]]\n  transport = \"grpc\"\n  service_address = \":57000\"\n  ## For protocol grpc-tls on the router, present a CA-signed certificate:\n  # tls_cert = \"/etc/telegraf/certs/collector.pem\"\n  # tls_key  = \"/etc/telegraf/certs/collector.key\"\n\n[[outputs.influxdb_v2]]\n  urls = [\"http://influxdb:8086\"]\n  token = \"${INFLUX_TOKEN}\"          # injected from the environment, never committed\n  organization = \"netops\"\n  bucket = \"telemetry\"\n",
+      "highlight": [
+        2,
+        4
+      ]
+    },
+    {
+      "id": "dialin",
+      "type": "terminal",
+      "title": "gnmic के साथ gNMI डायल-इन सब्सक्रिप्शन",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "gnmic -a r1.example.com:9339 -u netops -p <password-placeholder> --tls-ca ca.pem --encoding json_ietf subscribe --path \"/interfaces/interface[name=GigabitEthernet1]/state/counters/in-octets\" --mode stream --stream-mode sample --sample-interval 10s",
+          "output": "{\n  \"source\": \"r1.example.com:9339\",\n  \"subscription-name\": \"default-1762683300\",\n  \"timestamp\": 1762683302104000000,\n  \"time\": \"2026-11-09T10:15:02.104Z\",\n  \"updates\": [\n    {\n      \"Path\": \"interfaces/interface[name=GigabitEthernet1]/state/counters/in-octets\",\n      \"values\": {\n        \"interfaces/interface/state/counters/in-octets\": \"918273645\"\n      }\n    }\n  ]\n}\n... a new update arrives every 10 seconds ..."
+        },
+        {
+          "comment": "कलेक्टर सब्सक्रिप्शन खोलता है, इसलिए gnmic रुकने पर यह समाप्त हो जाता है। counter64 मान स्ट्रिंग के रूप में आता है, जैसा RFC 7951 की आवश्यकता है।"
+        }
+      ],
+      "caption": "लैब आउटपुट, संक्षिप्त। gnmic राउटर के सर्टिफ़िकेट को लैब CA से सत्यापित करता है।"
+    },
+    {
+      "id": "pipeline",
+      "type": "text",
+      "markdown": "## कलेक्टर पाइपलाइन और उसका संचालन\n\nसबसे आम ओपन-सोर्स स्टैक **TIG** है: **Telegraf** प्राप्त और डिकोड करता है, **InfluxDB** (या Prometheus) टाइम सीरीज़ संग्रहीत करता है, और **Grafana** विज़ुअलाइज़ करता है तथा अलर्ट देता है। लैब में इसे Docker Compose से चलाएँ। देखें [Docker Compose](/learn/network-automation-devops/docker-compose)। बड़े पैमाने पर, रिसीवर और स्टोरेज के बीच Kafka जैसा मैसेज बस होता है, और Crosswork तथा Catalyst Center जैसे Cisco प्लेटफ़ॉर्म वही स्ट्रीम उपयोग करते हैं।\n\n### इसे प्रोडक्शन कोड की तरह संचालित करें\n\n- **ट्रांसपोर्ट को सुरक्षित करें।** डायल-आउट के लिए रिसीवर प्रोफ़ाइल और ट्रस्टपॉइंट के साथ `grpc-tls` उपयोग करें, और gNMI के लिए TLS (अधिमानतः म्यूचुअल TLS)। CA-साइन्ड सर्टिफ़िकेट उपयोग करें, सेल्फ़-साइन्ड नहीं। देखें [CA-Signed TLS Certificates](/learn/network-automation-devops/ca-signed-tls-certificates)।\n- **स्रोत को नियंत्रित करें।** `source-address` (और मैनेजमेंट VRF के लिए `source-vrf`) सेट करें ताकि ACL और कलेक्टर फ़िल्टर उससे मेल खा सकें।\n- **समय सिंक्रनाइज़ करें।** हर सैंपल में डिवाइस का टाइमस्टैम्प होता है। NTP के बिना, डिवाइसों के बीच सहसंबंध (correlation) बेमानी है।\n- **कार्डिनैलिटी (Cardinality) पर नज़र रखें।** टैग (डिवाइस, इंटरफ़ेस, क्यू) का हर अद्वितीय संयोजन एक नई सीरीज़ है। स्थिर पहचानकर्ताओं से टैग करें, और काउंटर जैसे मानों से टैग न करें।\n- **निगरानी की निगरानी करें।** तब अलर्ट दें जब कोई सब्सक्रिप्शन `Valid` स्थिति छोड़े, जब रिसीवर `Connected` न हो, या जब कोई सीरीज़ अपडेट होना बंद कर दे।\n- **सब्सक्रिप्शन को ऑटोमेट करें।** उन्हें अपने source of truth से NETCONF, RESTCONF या Ansible के ज़रिए पुश करें, ताकि नए डिवाइस अपने-आप स्ट्रीमिंग शुरू कर दें। देखें [Source of Truth Integration](/learn/network-automation-devops/source-of-truth-integration)।"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "इंजीनियर कहाँ गलती करते हैं",
+      "markdown": "- **अवधि को सेकंड समझना।** `update-policy periodic 60` हर 0.6 सेकंड पर भेजता है, हर मिनट पर नहीं।\n- **एन्कोडिंग और ट्रांसपोर्ट मिलाना।** IOS XE पर gRPC डायल-आउट `encode-kvgpb` उपयोग करता है। JSON की अपेक्षा करने वाला रिसीवर इसे डिकोड नहीं कर सकता।\n- **XPath में मॉड्यूल नाम उपयोग करना।** IOS XE फ़िल्टर मॉड्यूल प्रीफ़िक्स उपयोग करते हैं, जैसे `process-cpu-ios-xe-oper:`, न कि मॉड्यूल नाम `Cisco-IOS-XE-process-cpu-oper`।\n- **हर जगह ऑन-चेंज की अपेक्षा करना।** जिस पाथ पर ऑन-चेंज समर्थित नहीं है, उस पर सब्सक्रिप्शन अस्वीकार हो जाता है। `State` फ़ील्ड जाँचें।\n- **सत्र को गलत दिशा में ब्लॉक करना।** डायल-आउट को डिवाइस से रिसीवर पोर्ट तक आउटबाउंड TCP चाहिए; डायल-इन को डिवाइस तक इनबाउंड TCP चाहिए।"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "खुद आज़माएँ",
+      "markdown": "Cisco Modeling Labs में एक Catalyst 8000v और एक Linux VM उपयोग करें जो उस तक पहुँच सके।\n\n1. ऊपर दी गई `telegraf.conf` के साथ Docker Compose से InfluxDB, Telegraf और Grafana शुरू करें।\n2. राउटर के अपने पते को `source-address` बनाकर सब्सक्रिप्शन 101 कॉन्फ़िगर करें, और पुष्टि करें कि `show telemetry ietf subscription 101 receiver` में `Connected` दिखता है।\n3. Grafana में पाँच-सेकंड CPU मान का ग्राफ़ बनाएँ। राउटर पर लोड उत्पन्न करें, उदाहरण के लिए `show tech-support` चलाकर, और उछाल देखें।\n4. `update-policy on-change` के साथ CDP नेबर के लिए सब्सक्रिप्शन 102 जोड़ें। किसी नेबर का लिंक शटडाउन करें और मापें कि अपडेट कितनी जल्दी आता है।\n5. राउटर पर gNMI सक्षम करें और ऊपर दिया `gnmic` कमांड चलाएँ। oper-status पाथ पर `sample` स्ट्रीम की तुलना `--stream-mode on-change` से करें।"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "मुख्य शब्द",
+      "items": [
+        {
+          "term": "मॉडल-ड्रिवन टेलीमेट्री (Model-driven telemetry, MDT)",
+          "definition": "YANG-मॉडल वाले ऑपरेशनल डेटा को पोल करने की बजाय डिवाइसों से कलेक्टरों तक स्ट्रीम करना।"
+        },
+        {
+          "term": "सब्सक्रिप्शन (Subscription)",
+          "definition": "यह परिभाषा कि कौन-सा डेटा (पाथ), कब (अपडेट पॉलिसी) और कैसे (एन्कोडिंग और ट्रांसपोर्ट) भेजना है।"
+        },
+        {
+          "term": "डायल-इन (Dial-in)",
+          "definition": "एक डायनामिक सब्सक्रिप्शन जिसे कलेक्टर डिवाइस के साथ सत्र पर खोलता है; यह सत्र के साथ समाप्त हो जाता है।"
+        },
+        {
+          "term": "डायल-आउट (Dial-out)",
+          "definition": "एक कॉन्फ़िगर किया हुआ सब्सक्रिप्शन जिसमें डिवाइस रिसीवर से कनेक्ट करता है; यह कॉन्फ़िगरेशन में बना रहता है।"
+        },
+        {
+          "term": "आवधिक अपडेट (Periodic update)",
+          "definition": "तय अंतराल पर वर्तमान मान भेजना, IOS XE पर सेंटीसेकंड में।"
+        },
+        {
+          "term": "ऑन-चेंज अपडेट (On-change update)",
+          "definition": "प्रारंभिक स्नैपशॉट के बाद डेटा केवल तब भेजना जब मान बदलता है।"
+        },
+        {
+          "term": "kvGPB",
+          "definition": "Key-value Google Protocol Buffers, एक स्वयं-वर्णनात्मक बाइनरी एन्कोडिंग जो IOS XE gRPC डायल-आउट में उपयोग होती है।"
+        },
+        {
+          "term": "gNMI",
+          "definition": "gRPC Network Management Interface, जो gRPC पर Get, Set और Subscribe RPC प्रदान करता है।"
+        },
+        {
+          "term": "TIG स्टैक (TIG stack)",
+          "definition": "Telegraf, InfluxDB और Grafana: टेलीमेट्री को एकत्र करने, संग्रहीत करने और दिखाने के लिए एक आम ओपन-सोर्स पाइपलाइन।"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "अपनी समझ जाँचें",
+      "questions": [
+        {
+          "question": "एक इंजीनियर IOS XE पर 'update-policy periodic 3000' कॉन्फ़िगर करता है। राउटर कितनी बार अपडेट भेजता है?",
+          "options": [
+            "हर 3,000 सेकंड",
+            "हर 30 सेकंड",
+            "हर 3 सेकंड",
+            "हर 3,000 मिलीसेकंड"
+          ],
+          "answer": 1,
+          "explanation": "IOS XE में periodic मान सेंटीसेकंड (सेकंड का सौवाँ भाग) में होता है, इसलिए 3000 का अर्थ 30 सेकंड है।"
+        },
+        {
+          "question": "कॉन्फ़िगर किए गए डायल-आउट सब्सक्रिप्शन का वर्णन कौन-से कथन करते हैं? (सभी लागू चुनें।)",
+          "options": [
+            "यह रीबूट के बाद भी बना रहता है क्योंकि यह कॉन्फ़िगरेशन का हिस्सा है",
+            "डिवाइस रिसीवर से कनेक्शन शुरू करता है",
+            "कलेक्टर के सत्र बंद करने पर यह समाप्त हो जाता है",
+            "इसके लिए कलेक्टर से डिवाइस तक इनबाउंड एक्सेस चाहिए"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "डायल-आउट सब्सक्रिप्शन कॉन्फ़िगरेशन में रहते हैं और डिवाइस आउटबाउंड कनेक्ट करता है। सत्र के साथ समाप्त होना और इनबाउंड एक्सेस की ज़रूरत डायल-इन का वर्णन करते हैं।"
+        },
+        {
+          "question": "CDP नेबर और इंटरफ़ेस oper-status डेटा के लिए कौन-सी अपडेट पॉलिसी सबसे उपयुक्त है?",
+          "options": [
+            "हर सेकंड आवधिक (Periodic)",
+            "ऑन-चेंज (On-change)",
+            "हर मिनट gNMI ONCE अनुरोध",
+            "SNMP पोलिंग"
+          ],
+          "answer": 1,
+          "explanation": "नेबर सूची और oper-status कम बदलते हैं लेकिन तुरंत मायने रखते हैं। ऑन-चेंज पहले स्नैपशॉट भेजता है, फिर बदलाव होते ही केवल बदलाव भेजता है।"
+        },
+        {
+          "question": "डायल-आउट सब्सक्रिप्शन State: Valid दिखाता है, लेकिन रिसीवर की स्थिति Connected नहीं है। आपको क्या जाँचना चाहिए? (सभी लागू चुनें।)",
+          "options": [
+            "कि Telegraf कॉन्फ़िगर किए गए पोर्ट पर सुन रहा है",
+            "कि कोई ACL या फ़ायरवॉल स्रोत पते से रिसीवर तक TCP की अनुमति देता है",
+            "कि स्रोत पता रिसीवर से पहुँचने योग्य है",
+            "कि राउटर पर NETCONF सक्षम है"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "बिना कनेक्शन वाला वैध सब्सक्रिप्शन ट्रांसपोर्ट की समस्या है: लिसनर, ACL और फ़ायरवॉल से होकर जाने वाला रास्ता, और स्रोत पते की राउटिंग। gRPC डायल-आउट NETCONF पर निर्भर नहीं करता।"
+        },
+        {
+          "question": "IOS XE gRPC डायल-आउट टेलीमेट्री के लिए कौन-सी एन्कोडिंग उपयोग करता है?",
+          "options": [
+            "encode-kvgpb",
+            "BER",
+            "JSON_IETF",
+            "CSV"
+          ],
+          "answer": 0,
+          "explanation": "IOS XE पर gRPC डायल-आउट key-value GPB उपयोग करता है। JSON_IETF gNMI डायल-इन में उपयोग होता है, और BER SNMP की एन्कोडिंग है।"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## सारांश\n\n- **MDT** YANG-मॉडल वाला डेटा डिवाइसों से सेकंड के अंतराल पर या बदलाव के क्षण पुश करती है, और तेज़, विस्तृत दृश्यता के लिए SNMP पोलिंग की जगह लेती है।\n- **डायल-इन (Dial-in)** सब्सक्रिप्शन (NETCONF, gNMI) कलेक्टर सत्र में रहते हैं। **डायल-आउट (Dial-out)** सब्सक्रिप्शन (kvGPB के साथ gRPC) डिवाइस कॉन्फ़िगरेशन में रहते हैं और रीबूट के बाद भी बने रहते हैं।\n- **आवधिक (Periodic)** पॉलिसी IOS XE पर सेंटीसेकंड उपयोग करती हैं। **ऑन-चेंज (On-change)** समर्थित पाथ पर इवेंट और धीरे-धीरे बदलने वाली स्थिति के लिए उपयुक्त है।\n- `show telemetry ietf subscription` और उसके `detail` तथा `receiver` व्यू से सत्यापित करें।\n- Telegraf, InfluxDB और Grafana जैसी पाइपलाइन बनाएँ, और उसे किसी भी प्रोडक्शन सेवा की तरह सुरक्षित करें, उसका समय सिंक करें, आकार तय करें और निगरानी करें।\n\nअगले पाठ में जानें कि आपका ऑटोमेशन स्वयं जो करता है उसे कैसे रिकॉर्ड करे: [ऑटोमेशन समाधानों के लिए Logging](/learn/network-automation-devops/logging-for-automation-solutions)।"
+    }
+  ]
+}

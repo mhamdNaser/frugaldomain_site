@@ -1,0 +1,396 @@
+{
+  "title": "CA İmzalı TLS Sertifikaları",
+  "summary": "Otomasyon uç noktalarındaki kendinden imzalı sertifikaları kurumsal bir CA'nın verdiği sertifikalarla değiştirin, bunları Linux servislerine ve IOS XE'ye kurun ve otomasyon istemcilerinin bunları doğrulamasını sağlayın.",
+  "objectives": [
+    "Bir istemcinin sertifika zincirini, geçerlilik süresini, SAN'ı ve anahtar kullanımını nasıl doğruladığını açıklamak",
+    "SAN girdileriyle bir anahtar ve CSR üretmek ve OpenSSL ile CA imzalı bir sertifikayı doğrulamak",
+    "IOS XE üzerindeki HTTPS/RESTCONF sunucusuna CA imzalı bir sertifika kaydettirmek (enroll) ve bağlamak",
+    "Python otomasyonunda sunucu sertifikalarını doğrulamak ve karşılıklı TLS'i (mutual TLS) tanımlamak",
+    "Yaygın zincir, ad ve süre dolumu hatalarını gidermek ve sertifika yenilemeyi planlamak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "İşlem hattınız kırk IOS XE yönlendiricisine RESTCONF değişiklikleri gönderiyor. Her yönlendirici hâlâ açılışta kendi ürettiği kendinden imzalı sertifikayı kullanıyor; bu yüzden her betikte `verify=False` var. Bir denetçi sonucu işaret ediyor: otomasyon sunucusu ile bir yönlendirici arasındaki yola girebilen herkes kendi sertifikasını sunabilir, HTTP Basic kimlik bilgilerini toplayabilir ve bunları tüm ortama karşı yeniden oynatabilir.\n\nKimlik doğrulaması olmayan şifreleme güvenlik değildir. AUTOCOR 350-901 v2.0 blueprint'i, otomasyon uç noktaları için **CA imzalı TLS sertifikaları** uygulamanızı bekler: güvenilir bir sertifika yetkilisinden sertifika alın, bunları cihazlara ve servislere kurun ve her istemcinin bunları doğrulamasını sağlayın. Bu ders, bu iş akışını Linux'ta, IOS XE'de ve Python'da adım adım gösterir."
+    },
+    {
+      "id": "trust",
+      "type": "text",
+      "markdown": "## CA güveni nasıl çalışır\n\n**Sertifika (certificate)**, bir genel anahtarı bir kimliğe bağlar; **sertifika yetkilisi (certificate authority, CA)** ise dijital imzasıyla bu bağlamanın doğruluğunu onaylar. Çoğu kurum iki katmanlı bir **genel anahtar altyapısı (public key infrastructure, PKI)** işletir:\n\n- **Kök CA (Root CA)**: kendinden imzalıdır, çevrimdışı tutulur ve her istemcinin güven deposuna (trust store) kurulur.\n- **Veren (ara) CA (Issuing / intermediate CA)**: kök tarafından imzalanır; günlük sertifikaları imzalar.\n- **Yaprak sertifika (Leaf certificate)**: bir yönlendiriciye, denetleyiciye veya otomasyon servisine verilir.\n\nBir istemci bağlandığında yaprak sertifikayı dört adımda doğrular:\n\n1. **Zincir**: her imza, istemcinin zaten güvendiği bir köke kadar doğrulanır.\n2. **Geçerlilik süresi**: geçerli zaman `notBefore` ile `notAfter` arasındadır.\n3. **Ad**: istemcinin çevirdiği ana bilgisayar adı veya IP adresi **konu alternatif adı (subject alternative name, SAN)** içinde yer alır. Modern istemciler bu denetimde ortak adı (CN) yok sayar.\n4. **Kullanım ve iptal**: genişletilmiş anahtar kullanımı (extended key usage) `serverAuth` değerine izin verir ve sertifika iptal edilmemiştir (CRL veya OCSP).\n\n| Seçenek | Kim güvenir | Tipik kullanım |\n|:--|:--|:--|\n| Kendinden imzalı | Elle sabitlenmedikçe kimse | Yalnızca sıfırıncı gün (day-zero) kurulumu |\n| Özel (kurumsal) CA | Kökünüzü alan istemciler | Yönlendiriciler, denetleyiciler, dahili API'ler |\n| Genel (public) CA | Her tarayıcı ve işletim sistemi | İnternete açık portallar ve webhook'lar |\n\nCihaz yönetim arayüzleri için kurumsal bir CA olağan seçimdir: genel CA'lar dahili adlar veya özel adresler için sertifika vermez."
+    },
+    {
+      "id": "workflow",
+      "type": "text",
+      "markdown": "## Kayıt (enrollment) iş akışı\n\nPlatform ne olursa olsun, kayıt aynı adımları izler:\n\n1. Anahtar çiftini onu kullanacak sistemde **üretin**. Özel anahtar asla başka bir yere kopyalanmamalıdır.\n2. Genel anahtarı, konuyu ve istemcilerin kullanacağı her SAN girdisini (DNS adları ve betikler adresle bağlanıyorsa IP adresleri) içeren bir **sertifika imzalama isteği (certificate signing request, CSR)** oluşturun.\n3. CSR'yi veren CA'ya elle veya SCEP, EST ya da ACME gibi bir protokolle **gönderin**.\n4. İmzalı sertifikayı, sunucunun eksiksiz bir zincir sunabilmesi için ara CA sertifikasıyla birlikte **kurun**.\n5. Kök CA sertifikasını her istemciye **dağıtın**: otomasyon konteyneri, CI çalıştırıcıları ve mühendislerin dizüstü bilgisayarları.\n6. Süre dolumunu **izleyin** ve `notAfter` tarihinden önce, ideal olarak otomatik biçimde yenileyin."
+    },
+    {
+      "id": "enroll-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "R1'i kaydettirmek ve bir otomasyon istemcisinden doğrulamak",
+      "data": {
+        "actors": [
+          {
+            "id": "eng",
+            "label": "Mühendis",
+            "sub": "jump host",
+            "icon": "laptop"
+          },
+          {
+            "id": "r1",
+            "label": "R1 (IOS XE)",
+            "sub": "r1.example.com",
+            "icon": "router"
+          },
+          {
+            "id": "ca",
+            "label": "Kurumsal CA",
+            "sub": "Example Issuing CA 01",
+            "icon": "lock"
+          },
+          {
+            "id": "bot",
+            "label": "Otomasyon sunucusu",
+            "sub": "192.0.2.50",
+            "icon": "server"
+          }
+        ],
+        "steps": [
+          {
+            "from": "eng",
+            "to": "r1",
+            "label": "crypto pki enroll",
+            "detail": "RSA anahtarı + CSR",
+            "note": "Mühendis yönlendiricide bir anahtar çifti üretir ve bir sertifika imzalama isteği oluşturur. Özel anahtar R1'den asla ayrılmaz."
+          },
+          {
+            "from": "r1",
+            "to": "ca",
+            "label": "CSR",
+            "detail": "CN + SAN r1.example.com",
+            "note": "CSR, genel anahtarı, konuyu ve istemcilerin kullanacağı konu alternatif adını taşır."
+          },
+          {
+            "from": "ca",
+            "to": "r1",
+            "label": "İmzalı sertifika",
+            "detail": "1 yıl geçerli",
+            "note": "Veren CA isteği denetler, kendi anahtarıyla imzalar ve sertifikayı döndürür. Sertifika CORP-CA trustpoint'ine aktarılır.",
+            "tone": "secure"
+          },
+          {
+            "from": "bot",
+            "to": "r1",
+            "label": "ClientHello",
+            "detail": "SNI r1.example.com",
+            "note": "Daha sonra otomasyon sunucusu bir HTTPS oturumu açar ve beklediği ana bilgisayar adını Server Name Indication ile gönderir."
+          },
+          {
+            "from": "r1",
+            "to": "bot",
+            "label": "Sertifika zinciri",
+            "detail": "yaprak + veren CA",
+            "note": "R1 kendi sertifikasını ve veren CA sertifikasını sunar; böylece istemci tam zinciri kurabilir."
+          },
+          {
+            "from": "bot",
+            "to": "bot",
+            "label": "Zinciri doğrula",
+            "detail": "güvenilir kök mü?",
+            "note": "İstemci, yerel güven paketindeki bir kök CA'ya kadar her imzayı denetler.",
+            "tone": "secure"
+          },
+          {
+            "from": "bot",
+            "to": "bot",
+            "label": "Adı ve tarihleri denetle",
+            "detail": "SAN, notAfter",
+            "note": "Ardından r1.example.com adının SAN içinde yer aldığını ve sertifikanın süresinin dolmadığını doğrular.",
+            "tone": "secure"
+          },
+          {
+            "from": "bot",
+            "to": "r1",
+            "label": "Şifreli RESTCONF GET",
+            "detail": "TLS içinde HTTP Basic",
+            "note": "Ancak doğrulama başarılı olduktan sonra istemci, kimlik bilgilerini ve RESTCONF isteklerini şifreli tünelin içinde gönderir.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "linux",
+      "type": "text",
+      "markdown": "## Otomasyon servisleri için sertifikalar\n\nOtomasyon platformları da HTTPS uç noktaları sunar: bir NetBox doğruluk kaynağı (source of truth), Catalyst Center olayları için bir webhook alıcısı veya işlem hattınızın çağırdığı bir FastAPI servisi. Linux'ta anahtarı ve CSR'yi OpenSSL üretir. `-addext` seçeneği (OpenSSL 1.1.1 veya sonrası) SAN'ı doğrudan isteğe ekler.\n\nCA isteği imzaladıktan sonra dağıtmadan önce sonucu doğrulayın: zincirin doğrulandığını, SAN'ın beklenen adları içerdiğini ve genişletilmiş anahtar kullanımının TLS Web Server Authentication değerini kapsadığını denetleyin. Ardından web sunucusunu (örneğin NGINX) **tam zincirle**, yani yaprak ve ardından veren CA ile ve özel anahtarla yapılandırın."
+    },
+    {
+      "id": "openssl",
+      "type": "code",
+      "language": "bash",
+      "filename": "enroll-automation-host.sh",
+      "code": "# 1. Private key and CSR with the SAN the clients will use\nopenssl req -new -newkey rsa:3072 -nodes \\\n  -keyout automation.example.com.key \\\n  -out automation.example.com.csr \\\n  -subj \"/C=US/O=Example Corp/CN=automation.example.com\" \\\n  -addext \"subjectAltName=DNS:automation.example.com,IP:192.0.2.50\"\nchmod 600 automation.example.com.key      # the key never leaves this host\n\n# 2. Check the request before sending it to the CA\nopenssl req -in automation.example.com.csr -noout -text | grep -A1 \"Subject Alternative Name\"\n\n# 3. After the CA returns the certificate: verify it against the chain\ncat issuing-ca.pem root-ca.pem > corp-chain.pem\nopenssl verify -CAfile corp-chain.pem automation.example.com.crt\n\n# 4. Inspect what you received\nopenssl x509 -in automation.example.com.crt -noout -subject -issuer -dates -ext subjectAltName,extendedKeyUsage\n\n# 5. Serve leaf + issuing CA together (full chain), never the root alone\ncat automation.example.com.crt issuing-ca.pem > automation.example.com.fullchain.pem",
+      "caption": "SAN içeren bir anahtar ve CSR üretmek, ardından CA imzalı sertifikayı doğrulamak ve paketlemek.",
+      "highlight": [
+        6,
+        14,
+        20
+      ]
+    },
+    {
+      "id": "iosxe",
+      "type": "text",
+      "markdown": "## IOS XE üzerine CA imzalı sertifika kurmak\n\nIOS XE sertifikaları bir **trustpoint** içinde saklar. `enrollment terminal pem` ile CSR'yi ve sertifikayı elle kopyalarsınız; üretimde SCEP veya EST ile `enrollment url` ve cihazın kendini yenilemesi için `auto-enroll` kullanabilirsiniz.\n\nSıra önemlidir:\n\n1. Adlandırılmış bir RSA anahtar çifti üretin.\n2. Trustpoint'i, konusunu ve SAN'ını tanımlayın ve `rsakeypair` ile anahtara bağlayın.\n3. `crypto pki authenticate`, yönlendirici sertifikasını imzalayacak CA sertifikasını kurar. Parmak izini (fingerprint) PKI ekibinizin yayımladığı değerle karşılaştırın.\n4. `crypto pki enroll` CSR'yi yazdırır; CA bunu imzalar.\n5. `crypto pki import ... certificate` imzalı sertifikayı kurar.\n6. `ip http secure-trustpoint`, HTTPS sunucusuna ve dolayısıyla RESTCONF'a bunu sunmasını söyler.\n\nNETCONF, TLS değil SSH üzerinden çalışır; bu yüzden etkilenmez, bunun yerine SSH ana bilgisayar anahtarlarına dayanır."
+    },
+    {
+      "id": "iosxe-cli",
+      "type": "terminal",
+      "title": "R1: kaydettir, kur ve doğrula",
+      "lines": [
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto key generate rsa general-keys label RESTCONF-KEY modulus 2048",
+          "comment": "Yalnızca bu trustpoint tarafından kullanılan adlandırılmış anahtar çifti"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki trustpoint CORP-CA"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "enrollment terminal pem"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "subject-name CN=r1.example.com, O=Example Corp"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "subject-alt-name r1.example.com"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "rsakeypair RESTCONF-KEY"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "revocation-check none",
+          "comment": "Yalnızca laboratuvar: CDP'ye erişilebiliyorsa crl veya ocsp kullanın"
+        },
+        {
+          "prompt": "R1(ca-trustpoint)#",
+          "cmd": "exit"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki authenticate CORP-CA",
+          "comment": "Veren CA sertifikasını kurun ve parmak izini denetleyin",
+          "output": "Enter the base 64 encoded CA certificate.\nEnd with a blank line or the word \"quit\" on a line by itself\n\n-----BEGIN CERTIFICATE-----\n<issuing CA certificate, PEM>\n-----END CERTIFICATE-----\nquit\nCertificate has the following attributes:\n       Fingerprint MD5: <md5-fingerprint>\n      Fingerprint SHA1: <sha1-fingerprint>\n\n% Do you accept this certificate? [yes/no]: yes\nTrustpoint CA certificate accepted.\n% Certificate successfully imported"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki enroll CORP-CA",
+          "comment": "CSR'yi imzalanması için CA'ya kopyalayın",
+          "output": "% Start certificate enrollment ..\n% The subject name in the certificate will include: CN=r1.example.com, O=Example Corp\n% The subject name in the certificate will include: r1.example.com\n% Include the router serial number in the subject name? [yes/no]: no\n% Include an IP address in the subject name? [no]: no\nDisplay Certificate Request to terminal? [yes/no]: yes\nCertificate Request follows:\n\n-----BEGIN CERTIFICATE REQUEST-----\n<CSR, PEM>\n-----END CERTIFICATE REQUEST-----\n\n---End - This line not part of the certificate request---"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "crypto pki import CORP-CA certificate",
+          "comment": "CA'nın döndürdüğü sertifikayı yapıştırın",
+          "output": "Enter the base 64 encoded certificate.\nEnd with a blank line or the word \"quit\" on a line by itself\n\n-----BEGIN CERTIFICATE-----\n<router certificate signed by the CA, PEM>\n-----END CERTIFICATE-----\nquit\n% Router Certificate successfully imported"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "ip http secure-server"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "ip http secure-trustpoint CORP-CA",
+          "comment": "HTTPS ve RESTCONF artık CA imzalı sertifikayı sunar"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "restconf"
+        },
+        {
+          "prompt": "R1(config)#",
+          "cmd": "end"
+        },
+        {
+          "prompt": "R1#",
+          "cmd": "show crypto pki certificates CORP-CA",
+          "comment": "Veren CA tarafından verilmiş, bir yıl geçerli yaprak sertifika",
+          "output": "Certificate\n  Status: Available\n  Certificate Serial Number (hex): 3A00000123\n  Certificate Usage: General Purpose\n  Issuer:\n    cn=Example Issuing CA 01\n    o=Example Corp\n  Subject:\n    Name: r1.example.com\n    cn=r1.example.com\n    o=Example Corp\n  Validity Date:\n    start date: 09:12:44 UTC Nov 2 2026\n    end   date: 09:12:44 UTC Nov 2 2027\n  Associated Trustpoints: CORP-CA\n\nCA Certificate\n  Status: Available\n  Certificate Serial Number (hex): 1F00000002\n  Certificate Usage: Signature\n  Issuer:\n    cn=Example Root CA\n    o=Example Corp\n  Subject:\n    cn=Example Issuing CA 01\n    o=Example Corp\n  Validity Date:\n    start date: 08:00:00 UTC Jan 5 2025\n    end   date: 08:00:00 UTC Jan 5 2030\n  Associated Trustpoints: CORP-CA"
+        },
+        {
+          "prompt": "netops@jump:~$",
+          "cmd": "openssl s_client -connect r1.example.com:443 -servername r1.example.com -CAfile corp-chain.pem -brief </dev/null",
+          "comment": "Jump host'tan: zincir kurumsal paketle doğrulanır",
+          "output": "CONNECTION ESTABLISHED\nProtocol version: TLSv1.2\nCiphersuite: ECDHE-RSA-AES256-GCM-SHA384\nPeer certificate: CN = r1.example.com, O = Example Corp\nHash used: SHA256\nSignature type: RSA-PSS\nVerification: OK\nServer Temp Key: ECDH, prime256v1, 256 bits\nDONE"
+        }
+      ]
+    },
+    {
+      "id": "client",
+      "type": "text",
+      "markdown": "## Otomasyon kodunda sertifikaları doğrulamak\n\nSunucudaki bir sertifika işin yalnızca yarısıdır. İstemci de bunu denetlemelidir. Python `requests` kütüphanesinde `verify` argümanı, kökünüzü (ve sunucular göndermiyorsa veren CA'yı) içeren bir CA paketinin yolunu alır. Konteynerlere ve CI çalıştırıcılarına uygun olacak şekilde, tüm süreç için `REQUESTS_CA_BUNDLE` değişkenini de ayarlayabilirsiniz. Ansible'ın `uri` modülü `validate_certs` ve `ca_path` kullanır; Terraform sağlayıcıları ise genellikle `false` kalması gereken bir `insecure` bayrağı sunar.\n\nMakineden makineye API'ler için **karşılıklı TLS'i (mutual TLS, mTLS)** düşünün: sunucu ayrıca bir istemci sertifikası ister; böylece otomasyon kimliği, yeniden kullanılabilir bir parola yerine CA imzalı bir sertifikayla kanıtlanır. İstemci özel anahtarını bir gizli bilgi olarak ele alın."
+    },
+    {
+      "id": "client-code",
+      "type": "code",
+      "language": "python",
+      "filename": "restconf_tls.py",
+      "code": "import os\n\nimport requests\n\n# Root + issuing CA of the enterprise PKI, distributed with the automation image\nCA_BUNDLE = \"/etc/pki/example/corp-chain.pem\"\nHEADERS = {\"Accept\": \"application/yang-data+json\"}\n\n\ndef get_hostname(device: str) -> str:\n    url = f\"https://{device}/restconf/data/Cisco-IOS-XE-native:native/hostname\"\n    resp = requests.get(\n        url,\n        auth=(os.environ[\"NET_USER\"], os.environ[\"NET_PASSWORD\"]),\n        headers=HEADERS,\n        verify=CA_BUNDLE,   # validates chain, dates and that the SAN matches \"device\"\n        timeout=10,\n    )\n    resp.raise_for_status()\n    return resp.json()[\"Cisco-IOS-XE-native:hostname\"]\n\n\ndef get_with_client_cert(url: str) -> dict:\n    # Mutual TLS: the server also verifies the script's own CA-signed certificate\n    resp = requests.get(\n        url,\n        cert=(\"/etc/pki/example/netbot.crt\", \"/etc/pki/example/netbot.key\"),\n        verify=CA_BUNDLE,\n        timeout=10,\n    )\n    resp.raise_for_status()\n    return resp.json()\n\n\nif __name__ == \"__main__\":\n    print(get_hostname(\"r1.example.com\"))",
+      "caption": "Yönlendirici sertifikasını kurumsal CA paketine karşı doğrulamak ve bir istemci sertifikasıyla mTLS çağrısı yapmak.",
+      "highlight": [
+        6,
+        16,
+        27
+      ]
+    },
+    {
+      "id": "verify-warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "verify=False bir çözüm değildir",
+      "markdown": "Doğrulamayı kapatmak trafiği şifreli tutar ama sunucu kimlik doğrulamasını ortadan kaldırır; bu da ortadaki adam (man-in-the-middle) saldırısını çok kolaylaştırır. Ayrıca eksik bir ara sertifika veya süresi dolmuş bir sertifika gibi gerçek sorunları da gizler. Bir laboratuvar cihazında kendinden imzalı sertifika varsa denetimleri kapatmak yerine `verify` değerini o belirli sertifikaya yönlendirin."
+    },
+    {
+      "id": "troubleshoot",
+      "type": "text",
+      "markdown": "## Yaşam döngüsü ve sorun giderme\n\nOtomasyondaki çoğu TLS kesintisi saldırı değil, süresi dolmuş veya eksik sertifikalardır. Her sertifikanın `notAfter` tarihini izleyin, 30 gün önceden alarm verin ve yenilemeyi otomatikleştirin: IOS XE'de `auto-enroll 80 regenerate` ömrün yüzde 80'inde yeni bir anahtarla yeniler, ACME istemcileri de Linux servisleri için aynısını yapar. Kısa ömürler, çalınan bir anahtarın zararını sınırlar.\n\n| İstemcinin gördüğü hata | Olası neden | Çözüm |\n|:--|:--|:--|\n| `unable to get local issuer certificate` | Sunucu yalnızca yaprağı gönderiyor veya istemcide kök yok | Tam zinciri sunun; kökü pakete ekleyin |\n| `self-signed certificate in certificate chain` | Kök, istemci güven deposunda değil | Kurumsal kök CA'yı dağıtın |\n| `Hostname mismatch` | Çevrilen ad SAN içinde yok | Kullanılan her DNS adı ve IP ile yeniden verin |\n| `certificate has expired` | Yenileme kaçırıldı | Şimdi yenileyin; izleme ekleyin |\n| Yenilemeden sonra el sıkışma (handshake) başarısız | Yeni anahtar var, ancak servis hâlâ eski trustpoint'i veya dosyayı kullanıyor | Servisi yeniden yükleyin; `ip http secure-trustpoint` değerini denetleyin |\n\n`openssl s_client -showcerts`, bir sunucunun tam olarak hangi zinciri sunduğunu gösterir; hangi tarafın hatalı olduğunu anlamanın en hızlı yolu budur."
+    },
+    {
+      "id": "chain-tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "Çevirdiğiniz adı belirtin",
+      "markdown": "Envanteriniz cihazlara yönetim IP'siyle bağlanıyorsa IP, SAN içinde bir `IP:` girdisi olarak bulunmalıdır. Daha da iyisi, sertifikaların yeniden adreslemeden etkilenmemesi için doğruluk kaynağınızdan DNS adıyla bağlanın (bkz. [Tek Doğru Kaynak (Source of Truth) Entegrasyonu](/learn/network-automation-devops/source-of-truth-integration))."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Bir laboratuvarda (örneğin [Cisco Modeling Labs](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing)) OpenSSL ile iki katmanlı bir test PKI'ı kurun: bir kök CA, bir veren CA ve bir Catalyst 8000v'den gelen bir CSR. Sertifikayı bir trustpoint'e kurun, `ip http secure-trustpoint` ile bağlayın, ardından Python'dan `verify` zincir dosyanızı gösterecek şekilde RESTCONF çağırın (bkz. [YANG Modelleriyle RESTCONF](/learn/network-automation-devops/restconf-with-yang-models)). Sonra bilerek bozun: veren CA'yı paketten çıkarın, ardından SAN içinde olmayan bir IP ile bağlanın ve her hata mesajını kaydedin."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Sertifika yetkilisi (Certificate authority, CA)",
+          "definition": "Sertifikaları imzalayan, bir genel anahtarın adı belli bir kimliğe ait olduğunu onaylayan güvenilir bir varlık."
+        },
+        {
+          "term": "Kök CA (Root CA)",
+          "definition": "Bir PKI hiyerarşisinin kendinden imzalı tepesi; istemci güven depolarına kurulur ve normalde çevrimdışı tutulur."
+        },
+        {
+          "term": "Veren (ara) CA (Issuing / intermediate CA)",
+          "definition": "Kök tarafından onaylanmış ve yaprak sertifikaları imzalayan bir CA; sunucular sertifikasını zincirin parçası olarak gönderir."
+        },
+        {
+          "term": "CSR",
+          "definition": "Sertifika imzalama isteği (Certificate Signing Request): genel anahtarı ve istenen kimliği içeren, bir CA'ya gönderilen imzalı bir mesaj."
+        },
+        {
+          "term": "Konu alternatif adı (Subject alternative name, SAN)",
+          "definition": "Sertifikanın hangi DNS adları ve IP adresleri için geçerli olduğunu listeleyen sertifika uzantısı."
+        },
+        {
+          "term": "Trustpoint",
+          "definition": "Bir CA sertifikasını, cihaz sertifikasını, anahtar çiftini ve kayıt ayarlarını tutan IOS XE nesnesi."
+        },
+        {
+          "term": "Sertifika zinciri (Certificate chain)",
+          "definition": "Yaprak sertifika ile onu güvenilir bir köke bağlamak için gereken ara sertifikalar."
+        },
+        {
+          "term": "Karşılıklı TLS (Mutual TLS, mTLS)",
+          "definition": "Hem sunucunun hem istemcinin CA imzalı sertifika sunduğu ve birbirini doğruladığı TLS."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı sınayın",
+      "questions": [
+        {
+          "question": "Bir Python betiği 'certificate verify failed: unable to get local issuer certificate' hatasıyla başarısız oluyor. Yaprak sertifika geçerli ve kurumsal veren CA tarafından imzalanmış. En olası neden nedir?",
+          "options": [
+            "SAN, ana bilgisayar adını içermiyor",
+            "Sunucu yalnızca yaprak sertifikasını gönderiyor ve istemci paketinde veren CA yok",
+            "Sertifika RSA 3072 kullanıyor",
+            "RESTCONF devre dışı"
+          ],
+          "answer": 1,
+          "explanation": "Ara sertifika eksik olduğu için istemci yaprağı güvenilir bir köke bağlayamıyor. Tam zinciri sunun veya veren CA'yı istemci paketine ekleyin."
+        },
+        {
+          "question": "Bir TLS istemcisi sunucu sertifikası üzerinde hangi denetimleri yapar? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "İmza zinciri güvenilir bir köke çıkar",
+            "Geçerli tarih geçerlilik süresi içindedir",
+            "Çevrilen ad SAN içinde yer alır",
+            "Sertifika genel bir CA tarafından verilmiştir",
+            "Genişletilmiş anahtar kullanımı sunucu kimlik doğrulamasına izin verir"
+          ],
+          "answer": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "explanation": "İstemciler zinciri, tarihleri, adı ve kullanımı (yapılandırılmışsa iptali de) doğrular. Kökü güvenilir olduğu sürece özel bir kurumsal CA tamamen geçerlidir."
+        },
+        {
+          "question": "IOS XE üzerinde hangi komut, HTTPS sunucusunun ve dolayısıyla RESTCONF'un CORP-CA trustpoint'indeki sertifikayı sunmasını sağlar?",
+          "options": [
+            "crypto pki authenticate CORP-CA",
+            "ip http secure-trustpoint CORP-CA",
+            "restconf trustpoint CORP-CA",
+            "crypto pki enroll CORP-CA"
+          ],
+          "answer": 1,
+          "explanation": "ip http secure-trustpoint, trustpoint'i HTTPS sunucusuna bağlar. authenticate CA sertifikasını kurar, enroll ise CSR'yi üretir."
+        },
+        {
+          "question": "Betikleriniz yönlendiricilere yönetim IP adresiyle bağlanıyor. Yönlendirici sertifikası neyi içermelidir?",
+          "options": [
+            "IP adresini yalnızca ortak adda (common name)",
+            "IP adresini SAN içinde bir IP girdisi olarak",
+            "Hiçbir şey; IP bağlantıları ad denetimini atlar",
+            "Yönlendiricinin seri numarasını"
+          ],
+          "answer": 1,
+          "explanation": "İstemciler çevrilen adresi SAN girdileriyle eşleştirir. Bir IP için IP: SAN girdisi gerekir; CN modern istemciler tarafından yok sayılır."
+        },
+        {
+          "question": "Hangi uygulamalar otomasyondaki sertifikaya bağlı kesintileri ve riski azaltır? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "Yenilemeyi auto-enroll veya ACME ile otomatikleştirmek",
+            "Bir yenilemeden sonra üretimde verify=False ayarlamak",
+            "notAfter tarihinden çok önce alarm vermek",
+            "Otomatik döndürmeyle daha kısa sertifika ömürleri kullanmak",
+            "Tüm yönlendiriciler arasında tek bir özel anahtarı paylaşmak"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "Otomatik yenileme, süre dolumu izleme ve kısa ömürler sertifikaları güncel tutar. Doğrulamayı kapatmak ve anahtar paylaşmak PKI'ın sağladığı korumayı ortadan kaldırır."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- CA imzalı bir sertifika, istemcilerin yalnızca trafiği şifrelemesini değil sunucuyu **doğrulamasını (authenticate)** da sağlar. Kendinden imzalı sertifikalar güvensiz `verify=False` geçici çözümlerini zorunlu kılar.\n- İstemciler güvenilir köke giden **zinciri**, **geçerlilik tarihlerini**, **SAN**'ı ve anahtar kullanımını denetler.\n- Kayıt: anahtar çifti, her SAN'ı içeren **CSR**, CA imzası, **tam zincirle** kurulum, kökü dağıtma, süre dolmadan yenileme.\n- IOS XE'de: RSA anahtarı, **trustpoint**, `crypto pki authenticate`, `enroll`, `import`, ardından HTTPS ve RESTCONF için `ip http secure-trustpoint`.\n- Kodda `verify` değerine bir CA paketi verin, servis kimlikleri için **mTLS**'i düşünün ve zincirlerde sorun gidermek için `openssl s_client` kullanın."
+    }
+  ]
+}

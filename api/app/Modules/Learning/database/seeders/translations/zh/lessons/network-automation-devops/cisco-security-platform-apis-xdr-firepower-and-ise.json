@@ -1,0 +1,334 @@
+{
+  "title": "思科安全平台 API：XDR、Firepower 与 ISE",
+  "summary": "了解如何对 Cisco XDR、安全防火墙管理中心 (Secure Firewall Management Center) 和 ISE 的 API 进行身份验证并加以使用，以及它们如何组合成自动化的调查与遏制剧本 (Playbook)。",
+  "objectives": [
+    "使用 OAuth 2.0 客户端凭据 (Client Credentials) 获取 Cisco XDR 令牌 (Token)，并使用 Inspect 和 Enrich API",
+    "对 FMC REST API 进行身份验证，并在某个域 (Domain) 中创建对象",
+    "解释为什么 FMC 的更改需要部署请求 (Deployment Request)",
+    "描述 ISE 的 ERS、OpenAPI、MnT 和 pxGrid 接口，并安全地启用 ERS",
+    "通过 ERS 使用 ANC 隔离终端，并解释由此产生的 CoA"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "凌晨 02:10，一条告警报告某台笔记本电脑正在向未知地址发送信标 (Beaconing) 流量。手动响应意味着要打开四个控制台：查询该地址、检查哪些主机与它通信过、在防火墙上封锁它，以及隔离这台笔记本电脑。借助 API，一个剧本就能在一分钟内完成所有这些操作，并记录每一个步骤。\n\nCCNA Automation 考试要求你能描述思科安全平台的 API，并能阅读使用这些 API 的代码。本课介绍自动化中最常出现的三个平台：用于检测与调查的 **Cisco XDR**、用于防火墙策略的 **安全防火墙管理中心 (Secure Firewall Management Center)**（FMC，旧称 Firepower Management Center），以及用于身份与网络访问的 **身份服务引擎 (Identity Services Engine)**（ISE）。"
+    },
+    {
+      "id": "xdr",
+      "type": "text",
+      "markdown": "## Cisco XDR API\n\n**Cisco XDR**（扩展检测与响应，extended detection and response）将来自思科及第三方产品的遥测数据进行关联，包括终端、防火墙、电子邮件、DNS 和网络流。其 API 源自 Threat Response 平台，因此许多路径以 `/iroh/` 开头。\n\n### 身份验证：OAuth 2.0 客户端凭据\n\n1. 在 XDR 控制台中，管理员创建一个 **API 客户端 (API Client)**，并仅授予其所需的 **作用域 (Scope)**，例如 `inspect`、`enrich:read` 和 `response`。\n2. 脚本将客户端 ID 和密码以 `grant_type=client_credentials` 发送到 `POST /iroh/oauth2/token`。\n3. XDR 返回一个约 10 分钟后过期的 `access_token`。每次 API 调用都以 `Authorization: Bearer <token>` 的形式携带它。\n\n主机地址取决于租户所在的区域（北美、欧洲或亚太）。\n\n### 关键 API\n\n| API | 路径 | 功能 |\n|:--|:--|:--|\n| **Inspect** | `/iroh/iroh-inspect/inspect` | 从自由文本中提取 **可观察对象 (Observable)**（IP、域名、哈希、URL） |\n| **Enrich** | `/iroh/iroh-enrich/observe/observables` | 向所有已集成的模块查询结论 (Verdict) 和 **目击记录 (Sighting)** |\n| **Response** | `/iroh/iroh-response/respond/observables` | 列出针对某个可观察对象可用的操作，例如封锁或隔离 |\n| **Private Intelligence** | `/ctia/...` | 在 CTIM 模型中存储你自己的判定、目击记录和事件 |\n\n可观察对象始终是一个带有 `type` 和 `value` 的小型 JSON 对象，例如 `{\"type\": \"ip\", \"value\": \"203.0.113.50\"}`。XDR 还包含 **自动化 (Automation)** 工作流，这是一个无代码引擎，可以调用这些相同的 API。"
+    },
+    {
+      "id": "xdr-code",
+      "type": "code",
+      "language": "python",
+      "filename": "xdr_enrich.py",
+      "caption": "获取 XDR 令牌，从告警文本中提取可观察对象并对其进行丰富 (Enrich)。客户端凭据来自环境变量。",
+      "code": "import os\nimport requests\n\nXDR = \"https://visibility.amp.cisco.com\"          # North America region; EU and APJC differ\nCLIENT_ID = os.environ[\"XDR_CLIENT_ID\"]\nCLIENT_SECRET = os.environ[\"XDR_CLIENT_PASSWORD\"]\n\n\ndef get_token():\n    \"\"\"OAuth 2.0 client credentials grant. The token is short-lived (about 10 minutes).\"\"\"\n    resp = requests.post(\n        f\"{XDR}/iroh/oauth2/token\",\n        auth=(CLIENT_ID, CLIENT_SECRET),\n        data={\"grant_type\": \"client_credentials\"},\n        headers={\"Accept\": \"application/json\"},\n        timeout=10,\n    )\n    resp.raise_for_status()\n    return resp.json()[\"access_token\"]\n\n\nheaders = {\"Authorization\": f\"Bearer {get_token()}\", \"Content-Type\": \"application/json\"}\n\n# 1. Inspect: pull observables out of free text (an alert, an email, a ticket)\ntext = \"Beaconing from 10.20.30.44 to 203.0.113.50 and bad.example.net\"\nobservables = requests.post(f\"{XDR}/iroh/iroh-inspect/inspect\",\n                            headers=headers, json={\"content\": text}, timeout=10).json()\nprint(observables)\n# [{'type': 'ip', 'value': '10.20.30.44'}, {'type': 'ip', 'value': '203.0.113.50'},\n#  {'type': 'domain', 'value': 'bad.example.net'}]\n\n# 2. Enrich: ask every integrated module what it knows about them\nreport = requests.post(f\"{XDR}/iroh/iroh-enrich/observe/observables\",\n                       headers=headers, json=observables, timeout=30).json()\nfor module in report[\"data\"]:\n    verdicts = module[\"data\"].get(\"verdicts\", {}).get(\"docs\", [])\n    for v in verdicts:\n        print(module[\"module\"], v[\"observable\"][\"value\"], v[\"disposition_name\"])",
+      "highlight": [
+        11,
+        26,
+        33
+      ]
+    },
+    {
+      "id": "fmc",
+      "type": "text",
+      "markdown": "## 安全防火墙管理中心 (FMC) REST API\n\n**FMC** 集中管理安全防火墙威胁防御 (Secure Firewall Threat Defense，FTD) 设备。其 REST API 涵盖对象、访问控制策略、NAT、设备记录和部署。每台 FMC 都内置交互式的 **API Explorer**，地址为 `https://<fmc>/api/api-explorer`，你可以在其中试用调用并查看数据结构 (Schema)。\n\n### 身份验证\n\n- 使用 **HTTP Basic** 凭据调用 `POST /api/fmc_platform/v1/auth/generatetoken` 会返回 `204 No Content`。令牌位于响应 **头部 (Header)** 中：`X-auth-access-token`、`X-auth-refresh-token` 和 `DOMAIN_UUID`。\n- 每个请求都要携带 `X-auth-access-token`。令牌有效期为 **30 分钟**，可通过 `/auth/refreshtoken` 最多刷新 **三次**。\n- 请使用专用的 API 用户。用与 GUI 会话相同的账户登录 API，可能会结束该 GUI 会话。\n\n### 处理配置\n\n- 配置路径包含域：`/api/fmc_config/v1/domain/{domainUUID}/object/hosts`、`/object/networkgroups`、`/policy/accesspolicies`、`/devices/devicerecords`。\n- 列表通过 `offset` 和 `limit` 分页；`expanded=true` 返回完整对象。\n- FMC 将 API 客户端限制在约 **每分钟 120 个请求**；超过后会返回 `429`。\n- **更改在部署之前不会生效。** `POST .../deployment/deploymentrequests` 会启动一个 **异步 (Asynchronous)** 部署任务，之后你需要对其进行监控。\n\n对于单台非托管防火墙，**防火墙设备管理器 (Firewall Device Manager，FDM)** 提供自己的 REST API，使用类似 OAuth 的令牌；而云交付的 FMC 则通过 Security Cloud Control 开放相同的 FMC API。"
+    },
+    {
+      "id": "fmc-term",
+      "type": "terminal",
+      "title": "FMC：令牌、设备列表和新的主机对象",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "curl -s -i -X POST -u apiuser:<password-placeholder> https://fmc.example.com/api/fmc_platform/v1/auth/generatetoken",
+          "output": "HTTP/1.1 204 No Content\nX-auth-access-token: 4b1f6c2e-<truncated>\nX-auth-refresh-token: 9e07d3a1-<truncated>\nDOMAIN_UUID: e276abec-e0f2-11e3-8169-6d9ed49b625f\nglobal: e276abec-e0f2-11e3-8169-6d9ed49b625f"
+        },
+        {
+          "comment": "令牌在响应头部中返回，而不是在响应正文中。它有效期为 30 分钟，可以刷新三次。"
+        },
+        {
+          "cmd": "export TOKEN=\"<token-placeholder>\" DOM=\"e276abec-e0f2-11e3-8169-6d9ed49b625f\"",
+          "output": ""
+        },
+        {
+          "cmd": "curl -s -H \"X-auth-access-token: $TOKEN\" \"https://fmc.example.com/api/fmc_config/v1/domain/$DOM/devices/devicerecords?expanded=true\" | jq '.items[] | {name, model, sw_version, healthStatus}'",
+          "output": "{\n  \"name\": \"ftd-edge-1\",\n  \"model\": \"Cisco Secure Firewall 3110 Threat Defense\",\n  \"sw_version\": \"7.4.1\",\n  \"healthStatus\": \"green\"\n}"
+        },
+        {
+          "comment": "配置资源位于 /api/fmc_config/v1/domain/{domainUUID}/ 之下。expanded=true 返回完整对象，而不是引用。"
+        },
+        {
+          "cmd": "curl -s -X POST -H \"X-auth-access-token: $TOKEN\" -H \"Content-Type: application/json\" -d '{\"name\": \"blk-203.0.113.50\", \"type\": \"Host\", \"value\": \"203.0.113.50\", \"description\": \"XDR case 1042\"}' \"https://fmc.example.com/api/fmc_config/v1/domain/$DOM/object/hosts\"",
+          "output": "{\"type\": \"Host\", \"value\": \"203.0.113.50\", \"name\": \"blk-203.0.113.50\", \"id\": \"005056A1-0733-0ed3-0000-004294969331\", ...}"
+        },
+        {
+          "comment": "201 Created：该对象目前只存在于 FMC 上。只有在部署请求之后，它才会到达防火墙。"
+        }
+      ],
+      "caption": "实验室输出，已精简。所示的域 UUID 是默认的 Global 域。"
+    },
+    {
+      "id": "ise",
+      "type": "text",
+      "markdown": "## 身份服务引擎 (ISE) API\n\n**ISE** 通过 802.1X、MAB 和终端状态评估 (Posture)，决定谁和什么可以加入网络。它提供多种 API，各自承担不同的任务：\n\n| API | 传输方式 | 典型用途 |\n|:--|:--|:--|\n| **ERS**（External RESTful Services，外部 RESTful 服务） | REST，HTTPS 端口 **9060** | 对终端、网络设备、内部用户、身份组、ANC 进行增删改查 (CRUD) |\n| **OpenAPI** | REST，HTTPS 443，`/api/v1/` | 策略集、授权规则、证书、备份（ISE 3.1 及更高版本） |\n| **MnT**（监控，Monitoring） | REST，XML | 活动会话、认证状态、会话详情 |\n| **pxGrid 2.0** | WebSocket 发布/订阅加 REST | 共享会话上下文，并接收来自合作伙伴产品的 ANC 请求 |\n\n### 启用并保护 ERS\n\nERS **默认处于禁用状态**。请在 **Administration > System > Settings > API Settings** 下启用它，然后在 **ERS Admin** 组（读写）或 **ERS Operator** 组（只读）中创建管理员账户。请求通过 TLS 使用 **HTTP Basic** 身份验证，并且需要将 `Accept` 和 `Content-Type` 头部设置为 `application/json`（或 XML）。\n\n### 自适应网络控制 (Adaptive Network Control，ANC)\n\nANC 让自动化程序可以 **隔离 (Quarantine)** 终端。管理员定义诸如 `Quarantine` 之类的 ANC 策略，以及与之匹配的授权规则。当脚本将该策略应用到某个 MAC 地址时，ISE 会向交换机或无线控制器发出 **授权变更 (Change of Authorization，CoA)**，终端随后被重新授权到受限的 VLAN 或可下载 ACL 中。"
+    },
+    {
+      "id": "ise-code",
+      "type": "code",
+      "language": "python",
+      "filename": "ise_quarantine.py",
+      "caption": "通过 ERS 查找终端并应用 ANC 隔离策略。证书验证使用 ISE CA 证书包。",
+      "code": "import os\nimport requests\n\nISE = \"https://ise.example.com:9060\"                # ERS listens on TCP 9060\nAUTH = (os.environ[\"ISE_ERS_USER\"], os.environ[\"ISE_ERS_PASSWORD\"])\nHDRS = {\"Accept\": \"application/json\", \"Content-Type\": \"application/json\"}\nMAC = \"00:50:56:A1:07:33\"\n\n# Find the endpoint by MAC address (ERS filter syntax: field.OPERATOR.value)\nr = requests.get(f\"{ISE}/ers/config/endpoint\", params={\"filter\": f\"mac.EQ.{MAC}\"},\n                 auth=AUTH, headers=HDRS, timeout=10, verify=\"/etc/ssl/ise-ca.pem\")\nresult = r.json()[\"SearchResult\"]\nprint(\"Matches:\", result[\"total\"])                  # 1\n\n# Apply the ANC \"Quarantine\" policy; ISE then sends a CoA to the switch\nbody = {\"OperationAdditionalData\": {\"additionalData\": [\n    {\"name\": \"macAddress\", \"value\": MAC},\n    {\"name\": \"policyName\", \"value\": \"Quarantine\"}]}}\nr = requests.put(f\"{ISE}/ers/config/ancendpoint/apply\", json=body,\n                 auth=AUTH, headers=HDRS, timeout=10, verify=\"/etc/ssl/ise-ca.pem\")\nprint(r.status_code)                                # 204 No Content = applied",
+      "highlight": [
+        10,
+        19
+      ]
+    },
+    {
+      "id": "soar-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "自动化遏制剧本",
+      "caption": "XDR 做出判断，FMC 封锁目的地址，ISE 隔离源端。剧本会记录每一次调用。",
+      "data": {
+        "actors": [
+          {
+            "id": "p",
+            "label": "剧本 (Playbook)",
+            "sub": "Python 或 XDR Automation",
+            "icon": "cpu"
+          },
+          {
+            "id": "x",
+            "label": "Cisco XDR",
+            "sub": "Inspect / Enrich",
+            "icon": "shield"
+          },
+          {
+            "id": "f",
+            "label": "FMC",
+            "sub": "fmc.example.com",
+            "icon": "firewall"
+          },
+          {
+            "id": "i",
+            "label": "ISE",
+            "sub": "ise.example.com",
+            "icon": "lock"
+          },
+          {
+            "id": "s",
+            "label": "接入交换机",
+            "sub": "Gi1/0/12",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "p",
+            "to": "x",
+            "label": "POST /inspect",
+            "detail": "告警文本",
+            "note": "剧本提取可观察对象：内部主机和外部地址。"
+          },
+          {
+            "from": "p",
+            "to": "x",
+            "label": "POST /observe/observables",
+            "detail": "ip 203.0.113.50",
+            "note": "XDR 向其已集成的模块查询它们对该地址了解的信息。"
+          },
+          {
+            "from": "x",
+            "to": "p",
+            "label": "结论：恶意 (Malicious)",
+            "detail": "3 条目击记录",
+            "tone": "danger",
+            "note": "多个模块一致认为该地址是恶意的，因此采取遏制措施是合理的。"
+          },
+          {
+            "from": "p",
+            "to": "f",
+            "label": "PUT /object/networkgroups/{id}",
+            "detail": "添加 blk-203.0.113.50",
+            "tone": "blocked",
+            "note": "该地址被添加到一个已被访问控制规则使用的封锁列表组中。"
+          },
+          {
+            "from": "p",
+            "to": "f",
+            "label": "POST /deploymentrequests",
+            "detail": "202 Accepted",
+            "note": "更改以异步部署任务的形式推送到 FTD 设备。"
+          },
+          {
+            "from": "p",
+            "to": "i",
+            "label": "PUT /ancendpoint/apply",
+            "detail": "Quarantine，00:50:56:A1:07:33",
+            "tone": "warning",
+            "note": "ISE 用 Quarantine ANC 策略标记这台笔记本电脑的 MAC 地址。"
+          },
+          {
+            "from": "i",
+            "to": "s",
+            "label": "RADIUS CoA",
+            "detail": "重新认证 (reauthenticate)",
+            "tone": "secure",
+            "note": "ISE 发送授权变更 (Change of Authorization)；交换机对该端口重新认证。"
+          },
+          {
+            "from": "s",
+            "to": "s",
+            "label": "隔离 VLAN (Quarantine VLAN)",
+            "tone": "success",
+            "note": "这台笔记本电脑只能访问修复服务。剧本为分析人员创建一个工单。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "compare",
+      "type": "text",
+      "markdown": "## 安全 API 对比\n\n| | Cisco XDR | FMC | ISE ERS |\n|:--|:--|:--|:--|\n| 在剧本中的角色 | 调查并做出判断 | 封锁流量 | 遏制终端 |\n| 身份验证 | OAuth 2.0 客户端凭据，Bearer 令牌 | Basic，随后使用 `X-auth-access-token` | 每个请求都使用 HTTP Basic |\n| 令牌有效期 | 约 10 分钟 | 30 分钟，可刷新三次 | 无令牌 |\n| 更改何时生效 | 立即 | 部署之后 | 立即 (CoA) |\n\n安全 API 功能强大，因此要像保护管理控制台一样保护它们：使用最小权限的专用账户、将密钥存放在保险库 (Vault) 中、进行 TLS 验证，并保留审计日志。参见 [应用安全：密钥、加密与数据处理](/learn/network-automation-devops/app-security-secrets-encryption-data-handling) 和 [HTTP 响应码与 API 身份验证](/learn/network-automation-devops/http-response-codes-and-api-authentication)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "学习者常见误区",
+      "markdown": "- **忘记 FMC 部署。** 在你部署之前，FMC 上的 `201 Created` 不会对防火墙产生任何改变。\n- **在正文中寻找 FMC 令牌。** 它位于 `204` 响应的头部中。\n- **未启用 ERS 就调用它。** ERS 默认关闭，并且需要 ERS Admin 或 ERS Operator 账户。\n- **API 客户端权限过大。** 只授予 XDR 客户端剧本用到的作用域，切勿复用个人管理员账户。\n- **在没有防护措施的情况下自动化遏制。** 要求有明确的强结论，为关键主机保留允许列表，并记录每个操作以供复查。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "仅在你被授权使用的实验室或 DevNet Sandbox 中操作。切勿在生产环境的终端上测试遏制功能。\n\n1. **FMC：** 打开 API Explorer，用 `curl -i` 生成令牌，并列出设备记录。为 `203.0.113.50` 创建一个主机对象，然后将其删除。\n2. **ISE：** 启用 ERS，创建一个 ERS Operator 账户，并用 `GET /ers/config/endpoint` 列出终端。留意同一个账户尝试 `POST` 时会发生什么。\n3. **XDR：** 创建一个仅具有 `inspect` 作用域的 API 客户端，并运行 `xdr_enrich.py` 的第 1 步。然后尝试 enrich 调用，并观察授权错误。\n4. 针对每个平台，写下令牌在哪里返回以及有效期是多久。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "Cisco XDR",
+          "definition": "思科的扩展检测与响应平台，它关联来自众多安全产品的遥测数据，并提供 Inspect、Enrich 和 Response API。"
+        },
+        {
+          "term": "可观察对象 (Observable)",
+          "definition": "一项证据，例如 IP 地址、域名、URL 或文件哈希，在 XDR 中以类型 (type) 和值 (value) 表示。"
+        },
+        {
+          "term": "客户端凭据授权 (Client Credentials Grant)",
+          "definition": "一种 OAuth 2.0 流程，应用程序用自己的客户端 ID 和密钥换取访问令牌，无需用户参与。"
+        },
+        {
+          "term": "FMC",
+          "definition": "安全防火墙管理中心 (Secure Firewall Management Center)，威胁防御防火墙的集中管理器，其 REST API 位于 /api/fmc_config/v1 之下。"
+        },
+        {
+          "term": "域 UUID (Domain UUID)",
+          "definition": "FMC 的域标识符，出现在每个配置路径中，并在生成令牌时返回。"
+        },
+        {
+          "term": "部署请求 (Deployment Request)",
+          "definition": "FMC API 调用，以异步任务的形式将待处理的配置更改推送到受管设备。"
+        },
+        {
+          "term": "ERS",
+          "definition": "外部 RESTful 服务 (External RESTful Services)，ISE 在 TCP 9060 上的 REST API，用于终端、网络设备、用户、组和 ANC。"
+        },
+        {
+          "term": "ANC",
+          "definition": "自适应网络控制 (Adaptive Network Control)，ISE 的一项功能，可对终端应用 Quarantine 之类的策略并触发重新授权。"
+        },
+        {
+          "term": "pxGrid",
+          "definition": "平台交换网格 (Platform Exchange Grid)，ISE 的发布/订阅框架，用于与其他安全产品共享上下文。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "脚本如何从 Cisco XDR 获取访问令牌？",
+          "options": [
+            "向 /api/fmc_platform/v1/auth/generatetoken 发送 HTTP Basic 请求",
+            "向 /iroh/oauth2/token 使用 OAuth 2.0 客户端凭据",
+            "使用 JSON 正文 POST /api/aaaLogin.json",
+            "在用户个人资料中生成的 API 密钥"
+          ],
+          "answer": 1,
+          "explanation": "XDR API 客户端使用 OAuth 2.0 客户端凭据授权。客户端 ID 和密码被发送到 /iroh/oauth2/token，它会返回一个短期有效的 Bearer 令牌。"
+        },
+        {
+          "question": "某脚本在 FMC 上创建了一个主机对象并收到 201 Created，但防火墙仍然允许该流量。缺少了什么？",
+          "options": [
+            "令牌刷新",
+            "部署请求",
+            "pxGrid 订阅",
+            "授权变更 (Change of Authorization)"
+          ],
+          "answer": 1,
+          "explanation": "FMC 会保存更改，但在请求部署并完成之前，不会将其推送到受管设备。"
+        },
+        {
+          "question": "关于 ISE ERS API，下列哪些说法是正确的？（选择所有适用项。）",
+          "options": [
+            "它默认处于禁用状态",
+            "它监听 TCP 9060",
+            "它使用 OAuth Bearer 令牌",
+            "账户需要 ERS Admin 或 ERS Operator 角色",
+            "它可以对终端应用 ANC 策略"
+          ],
+          "answer": [
+            0,
+            1,
+            3,
+            4
+          ],
+          "explanation": "ERS 必须先启用，监听 9060 端口，使用 ERS Admin 或 ERS Operator 账户的 HTTP Basic 身份验证，并包含用于 ANC 的 ancendpoint 资源。"
+        },
+        {
+          "question": "generatetoken 调用成功后，FMC 在哪里返回访问令牌？",
+          "options": [
+            "在 JSON 正文的 access_token 下",
+            "在 X-auth-access-token 响应头部中",
+            "在 Set-Cookie 头部中",
+            "在 URL 查询字符串中"
+          ],
+          "answer": 1,
+          "explanation": "FMC 返回 204 No Content，并将 X-auth-access-token、X-auth-refresh-token 和 DOMAIN_UUID 放在响应头部中。"
+        },
+        {
+          "question": "哪些做法能让自动化遏制更安全？（选择所有适用项。）",
+          "options": [
+            "只授予 API 客户端所需的作用域",
+            "所有脚本共用一个个人管理员账户",
+            "在封锁之前要求有已确认的结论",
+            "记录每一个 API 操作以供复查"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "最小权限、基于证据的决策和审计日志可以限制失误造成的损害。共用的个人账户会使责任无法追溯，并扩大访问范围。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n- **Cisco XDR** 使用 OAuth 2.0 客户端凭据。Inspect 提取可观察对象，Enrich 收集结论和目击记录，Response 列出并触发操作。\n- **FMC** 在响应头部中颁发令牌，以域 UUID 限定每条路径的范围，对客户端限速，并且需要先进行 **部署**，更改才会生效。\n- **ISE** 提供 ERS（端口 9060，Basic 身份验证）、OpenAPI、MnT 和 pxGrid。ANC 通过 CoA 隔离终端。\n- 它们共同构成一个遏制剧本：在 XDR 中判断，在 FMC 中封锁，在 ISE 中隔离。\n\n接下来，请学习设备本身是如何被编程的：[YANG、NETCONF 和 RESTCONF 可编程性](/learn/network-automation-devops/yang-netconf-and-restconf-programmability)。"
+    }
+  ]
+}

@@ -1,0 +1,272 @@
+{
+  "title": "Zeek 网络安全监控 (Network Security Monitoring)",
+  "summary": "了解 Zeek 记录什么、如何部署你自己的传感器，以及如何借助 uid 在 conn、dns 和 ssl 日志中进行狩猎。",
+  "objectives": [
+    "解释 Zeek 与基于签名的 IDS 有何不同",
+    "描述 Zeek 的主要日志和 uid",
+    "使用正确的站点策略部署独立传感器",
+    "查询日志以发现长连接和信标 (beaconing) 行为",
+    "负责任地处理网络元数据"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一位用户反映财务 VLAN 中的一台笔记本电脑运行缓慢。你的 EDR 没有显示任何异常，防火墙也只记录了被允许的 HTTPS 流量。你需要知道这台笔记本电脑究竟与什么通信、持续了多久、传输了多少数据。数据包捕获可以回答这个问题，但没有人能手工阅读数 TB 的 PCAP。\n\n**Zeek** 通过监视网络流量的副本，并将其理解的一切写成紧凑的结构化记录来解决这个问题：连接、DNS 查询、HTTP 请求、TLS 握手、文件等等。与其说它是报警系统，不如说它是网络的飞行记录仪。在本课中，你将了解 Zeek 会产生什么、如何在你自己拥有的传感器上部署它，以及如何查询它的日志。这些日志会进入 [集中式日志管理](/learn/security-operations-dfir/centralized-log-management) 中描述的同一类管道。"
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## Zeek 是什么，不是什么\n\nZeek（旧称 Bro）是一个被动的网络分析框架。它从镜像端口、网络 TAP 或 PCAP 文件读取数据包，重组数据流，解码协议，并运行用 Zeek 脚本语言编写的事件处理程序。它的主要输出不是告警，而是**日志**。\n\n这使 Zeek 不同于 Suricata 之类基于签名的 IDS（参见 [Suricata IDS/IPS](/learn/security-operations-dfir/suricata-ids-ips)）。两者互为补充。\n\n| 问题 | Suricata | Zeek |\n|:--|:--|:--|\n| 主要输出 | 来自签名的告警 | 协议日志和元数据 |\n| 优势 | 已知恶意模式、串联阻断 | 上下文、狩猎、回溯分析 |\n| 典型问题 | “是否有规则被触发？” | “10.20.5.14 上周二与哪些对象通信？” |\n| 可扩展性 | 规则文件 | 完整的脚本语言和软件包 |\n\n由于即使没有任何看起来恶意的内容，Zeek 也会保留元数据，因此在流量消失很久之后，你仍可以调查事件。元数据也比全量数据包捕获小得多，所以可以保留数周乃至数月。"
+    },
+    {
+      "id": "logs",
+      "type": "text",
+      "markdown": "## 最常用的日志文件\n\nZeek 为每个协议或分析器写一份日志，格式为制表符分隔的文本或 JSON。每个连接都有一个称为 **uid** 的唯一标识符，其他每份日志都带有同一个 uid。这样你就能从一次 DNS 查询跳转到随后的连接，再跳转到所传输的文件。\n\n| 日志 | 记录内容 | 常见用途 |\n|:--|:--|:--|\n| `conn.log` | 每个流：地址、端口、持续时间、字节数、状态 | 信标、数据量、扫描 |\n| `dns.log` | 查询和应答 | 罕见域名、隧道、解析历史 |\n| `http.log` | 方法、主机、URI、用户代理、状态 | 明文的 Web 活动 |\n| `ssl.log` | TLS 版本、SNI、证书验证 | 意外的目的地、过期证书 |\n| `files.log` | 文件哈希、MIME 类型、来源 | 对照威胁情报查询哈希 |\n| `notice.log` | 脚本标记为值得关注的事件 | 分诊的起点 |\n| `weird.log` | 协议违规和异常现象 | 规避尝试和有缺陷的软件 |\n\n`conn.log` 中的 `conn_state` 字段值得尽早了解。`S0` 表示看到 SYN 但没有回复，`SF` 是正常完成的连接，`REJ` 是被拒绝的尝试。一台主机向许多目的地产生数百条 `S0` 记录，就是扫描的候选对象。"
+    },
+    {
+      "id": "cfg",
+      "type": "code",
+      "language": "ini",
+      "filename": "/opt/zeek/etc/node.cfg",
+      "caption": "一台监听 SPAN 或 TAP 接口的独立传感器，以及相应的站点策略。",
+      "code": "[zeek]\ntype=standalone\nhost=localhost\ninterface=eth1\n\n# ---- /opt/zeek/share/zeek/site/local.zeek ----\n# @load base/frameworks/notice\n# @load policy/tuning/json-logs\n# @load policy/protocols/ssl/validate-certs\n# @load policy/frameworks/files/hash-all-files\n# redef Site::local_nets += { 10.20.0.0/16, 192.0.2.0/24 };"
+    },
+    {
+      "id": "deploy",
+      "type": "text",
+      "markdown": "## 部署传感器\n\nZeek 传感器需要三样东西：流量的副本、足以应对最繁忙时段的 CPU，以及用于存放日志的高速磁盘。\n\n1. **获取流量。** 在你想监视的链路上使用交换机 SPAN 端口或网络 TAP，通常是互联网边界和数据中心核心。捕获接口不需要 IP 地址。\n2. **定义你的网络。** 设置 `Site::local_nets`，使 Zeek 能区分内部和外部主机。如果没有它，许多脚本和你自己的查询都会出错。\n3. **选择格式。** 加载 `policy/tuning/json-logs` 会产生 JSON，SIEM 很容易摄取。TSV 体积更小，且与 `zeek-cut` 配合良好。\n4. **部署并监控。** 运行 `zeekctl deploy`，然后用 `zeekctl status` 和 `zeekctl diag` 确认它正在运行且没有丢包。\n5. **发送日志。** 使用 Filebeat、Splunk Universal Forwarder 或 Wazuh 将日志转发到你的 SIEM。\n\n加密流量会限制 Zeek 能看到的内容，但并非全部。对于 TLS，它仍会记录服务器名称 (SNI)、证书详情、JA3/JA4 指纹、大小和时序。这足以发现意外的目的地或规律的心跳。"
+    },
+    {
+      "id": "term",
+      "type": "terminal",
+      "title": "analyst@sensor01:/opt/zeek/logs/current",
+      "prompt": "$",
+      "caption": "在财务 VLAN 中进行狩猎。地址为文档示例。",
+      "lines": [
+        {
+          "comment": "确认传感器运行正常且没有丢包",
+          "cmd": "zeekctl status",
+          "output": "Name         Type       Host          Status    Pid    Started\nzeek         standalone localhost     running   2417   12 Nov 08:01:12"
+        },
+        {
+          "comment": "可疑笔记本电脑发起的最长连接",
+          "cmd": "zeek-cut id.orig_h id.resp_h id.resp_p service duration orig_bytes < conn.log | awk '$1==\"10.20.5.14\"' | sort -k5 -nr | head -3",
+          "output": "10.20.5.14  203.0.113.50  443  ssl  86112.4  9120455\n10.20.5.14  198.51.100.7 443  ssl  7203.9   88104\n10.20.5.14  192.0.2.10    53   dns  0.03     64"
+        },
+        {
+          "comment": "信标检查：统计每个目的地的连接数",
+          "cmd": "zeek-cut id.resp_h < conn.log | sort | uniq -c | sort -nr | head -2",
+          "output": "   1440 203.0.113.50\n    212 192.0.2.10"
+        },
+        {
+          "comment": "跳转到该目的地对应的 TLS 服务器名称",
+          "cmd": "zeek-cut ts id.orig_h server_name validation_status < ssl.log | grep 203.0.113.50 | head -1",
+          "output": "1762934521.12  10.20.5.14  updates.example.net  self signed certificate"
+        }
+      ]
+    },
+    {
+      "id": "note-read",
+      "type": "callout",
+      "variant": "note",
+      "title": "解读输出",
+      "markdown": "这台笔记本电脑保持了一个持续约 24 小时的连接，并向外发送了大约 9 MB 数据。到同一地址有 1,440 个连接，恰好每分钟一个。固定的间隔、自签名证书，以及与已知厂商不匹配的名称，都是线索。它们值得进一步调查，但并不能单独证明系统已被入侵。"
+    },
+    {
+      "id": "flow",
+      "type": "animation",
+      "kind": "flow",
+      "title": "从数据包到日志记录",
+      "caption": "Zeek 位于流量旁边，从不处于流量路径之中。",
+      "data": {
+        "token": "数据包",
+        "nodes": [
+          {
+            "id": "lan",
+            "label": "笔记本电脑 (Laptop)",
+            "sub": "10.20.5.14",
+            "icon": "laptop"
+          },
+          {
+            "id": "sw",
+            "label": "交换机 (Switch)",
+            "sub": "SPAN 端口",
+            "icon": "switch"
+          },
+          {
+            "id": "zeek",
+            "label": "Zeek",
+            "sub": "解码与脚本",
+            "icon": "eye"
+          },
+          {
+            "id": "logs",
+            "label": "日志文件 (Log files)",
+            "sub": "conn、dns、ssl",
+            "icon": "log"
+          },
+          {
+            "id": "siem",
+            "label": "SIEM",
+            "sub": "搜索与告警",
+            "icon": "database"
+          }
+        ],
+        "steps": [
+          {
+            "at": "lan",
+            "caption": "笔记本电脑向一台外部服务器发起 TLS 连接。"
+          },
+          {
+            "at": "sw",
+            "caption": "交换机正常转发数据包，并将一份副本镜像到传感器。"
+          },
+          {
+            "at": "zeek",
+            "caption": "Zeek 重组数据流，并根据内容而不仅是端口来识别协议。",
+            "tone": "secure"
+          },
+          {
+            "at": "logs",
+            "caption": "事件处理程序写入共享同一个 uid 的 conn.log、ssl.log 和 dns.log 行。"
+          },
+          {
+            "at": "siem",
+            "caption": "转发器发送日志；分析人员查询日志，检测规则对其进行关联分析。",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "scripts",
+      "type": "text",
+      "markdown": "## 脚本、通知和软件包\n\nZeek 脚本是事件驱动的。当分析器看到 TLS 证书时，会触发一个事件，你的处理程序可以检查字段并调用 `NOTICE()` 写入 `notice.log`。你很少需要从零开始编写脚本：标准发行版自带策略，而 Zeek 软件包管理器 (`zkg`) 可以安装社区软件包，例如 JA3 或文件提取附加组件。\n\n从这些实用规则开始：\n\n- 在编写自己的策略之前，先加载内置策略。\n- 使用 `Notice::policy` 框架，对来自同一来源的重复告警进行抑制，以调优通知。\n- 在部署到实时传感器之前，先用 `zeek -r sample.pcap local` 在 PCAP 上测试每一项更改。\n- 像对待检测规则一样，将脚本纳入版本控制。\n\nSecurity Onion 捆绑了 Zeek、Suricata 和 Elastic，所以许多团队最先在那里接触到 Zeek；参见 [Security Onion 架构](/learn/security-operations-dfir/security-onion-architecture)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "只捕获你被授权监控的内容",
+      "markdown": "网络元数据可能暴露个人的浏览习惯。仅在你所在组织拥有的网络上部署传感器，在监控策略中记录其目的，限制对日志的访问，并设定保留期限。切勿在你未被授权监控的网络上运行传感器。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "使用家庭实验环境或你自己拥有的虚拟机。\n\n1. 从发行版软件包或官方仓库安装 Zeek，并运行 `zeek --version`。\n2. 用 `tcpdump -i eth0 -w lab.pcap` 捕获几分钟你自己的浏览流量，然后停止。\n3. 回放它：`mkdir out && cd out && zeek -r ../lab.pcap`。\n4. 运行 `zeek-cut query answers < dns.log | head` 和 `zeek-cut id.resp_h resp_bytes < conn.log | sort -k2 -nr | head`。\n5. 从 `conn.log` 中挑选一个 uid，并在 `ssl.log` 或 `http.log` 中找到同一个 uid。用两句话写下这次跳转告诉了你什么。"
+    },
+    {
+      "id": "keyterms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "Zeek",
+          "definition": "一个将流量转换为结构化日志的被动网络分析框架。"
+        },
+        {
+          "term": "uid（唯一标识符，unique identifier）",
+          "definition": "描述某个连接的所有日志共享的唯一连接标识符。"
+        },
+        {
+          "term": "conn.log",
+          "definition": "每个网络流对应一行的日志，包含字节数、持续时间和状态。"
+        },
+        {
+          "term": "SPAN 端口 (SPAN port)",
+          "definition": "交换机的一项功能，可将其他端口的流量复制到监控端口。"
+        },
+        {
+          "term": "网络 TAP (Network TAP)",
+          "definition": "被动复制链路上流量的硬件设备。"
+        },
+        {
+          "term": "通知 (Notice)",
+          "definition": "被脚本标记为值得分析人员关注的 Zeek 事件。"
+        },
+        {
+          "term": "zeek-cut",
+          "definition": "从 TSV 日志中提取所选列的命令行辅助工具。"
+        },
+        {
+          "term": "JA3",
+          "definition": "TLS 客户端问候 (client hello) 的指纹，有助于识别客户端软件。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "Zeek 的主要输出是什么？",
+          "options": [
+            "被阻断的数据包",
+            "结构化的协议日志",
+            "仅有完整的数据包捕获",
+            "杀毒软件的判定结果"
+          ],
+          "answer": 1,
+          "explanation": "Zeek 是被动的，写出的是元数据日志。告警是脚本产生的次要输出。"
+        },
+        {
+          "question": "如何将一次 DNS 查询与随后的连接关联起来？",
+          "options": [
+            "通过 uid 字段",
+            "通过文件名",
+            "仅通过日志时间戳",
+            "无法关联"
+          ],
+          "answer": 0,
+          "explanation": "每个连接都有一个 uid，它同时出现在 conn.log 和协议日志中。在繁忙的网络上，仅靠时间戳是有歧义的。"
+        },
+        {
+          "question": "下列哪些是向 Zeek 传感器提供流量的有效方式？（选择所有适用项。）",
+          "options": [
+            "交换机 SPAN 端口",
+            "网络 TAP",
+            "回放 PCAP 文件",
+            "读取防火墙规则库"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Zeek 需要数据包。SPAN、TAP 和 PCAP 文件都能提供数据包；规则库不包含流量。"
+        },
+        {
+          "question": "一台主机向许多不同的目的地产生数百条 conn_state 为 S0 的记录。最可能的解释是什么？",
+          "options": [
+            "正常的网页浏览",
+            "扫描活动",
+            "已完成的文件传输",
+            "DNS 缓存"
+          ],
+          "answer": 1,
+          "explanation": "S0 表示发出了 SYN 但没有回复。针对许多目标出现大量 S0，是扫描或有故障的客户端的典型特征。"
+        },
+        {
+          "question": "为什么应该设置 Site::local_nets？",
+          "options": [
+            "这样 Zeek 才能区分内部和外部主机",
+            "为了启用加密",
+            "为了提高磁盘速度",
+            "为了阻断恶意 IP"
+          ],
+          "answer": 0,
+          "explanation": "许多脚本和查询都依赖于知道哪一侧是本地。没有该设置，结果会产生误导。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- Zeek 是一个被动传感器，将所见内容记录为结构化日志，为你提供可搜索的网络历史。\n- `uid` 将同一个连接的 `conn.log`、`dns.log`、`ssl.log` 和 `files.log` 关联起来。\n- 将其部署在 SPAN 或 TAP 上，定义 `Site::local_nets`，选择 JSON 或 TSV，并监控是否丢包。\n- 加密流量仍会留下有用的元数据：SNI、证书、指纹、大小和时序。\n- Zeek 是对签名类工具的补充；请按 [日志关联与事件丰富](/learn/security-operations-dfir/log-correlation-and-event-enrichment) 所述，将其日志与其他来源关联。"
+    }
+  ]
+}

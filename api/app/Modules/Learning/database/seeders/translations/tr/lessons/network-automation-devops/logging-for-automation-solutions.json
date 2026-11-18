@@ -1,0 +1,259 @@
+{
+  "title": "Otomasyon Çözümleri için Günlük Kaydı (Logging)",
+  "summary": "Ağ otomasyonu için günlük kaydını tasarlayın: seviyeler, korelasyon kimlikli yapılandırılmış JSON, merkezi toplama ve gizli bilgilerin güvenli işlenmesi.",
+  "objectives": [
+    "Her olay için doğru günlük seviyesini (log level) seçmek",
+    "Korelasyon kimliği (correlation ID) içeren yapılandırılmış günlükler yazmak",
+    "Gizli bilgileri maskelemek (redaction) ve hassas verileri günlüğe yazmaktan kaçınmak",
+    "CI ve konteynerler için günlükleri toplamak ve döndürmek (rotation)",
+    "Otomasyon çalıştırmalarında sorun gidermek ve denetim yapmak için günlükleri kullanmak"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Saat 02:10'da bir işlem hattı (pipeline) 60 anahtara bir değişiklik gönderdi. 02:14'te izleme sistemi, bunlardan altısının uplink bağlantısını kaybettiği alarmını verdi. Nöbetçi mühendis iş günlüğünü açıyor ve tek bir satır buluyor: `Error`. Hangi cihaz? Hangi görev? Hangi istek? Kullanışlı günlükler yoksa tek seçenek tahmin yürütmek ya da her şeyi geri almaktır.\n\nGünlük kaydı, bir otomasyon çözümünün kendini açıklama yoludur. İyi günlükler dört soruyu yanıtlar: **ne** oldu, **nerede** (hangi cihaz ve görev), **ne zaman** ve **neden** başarısız oldu. Kötü günlükler ya hiçbir şey söylemez ya da daha kötüsü, kullandığı parolayı sızdırır."
+    },
+    {
+      "id": "levels",
+      "type": "text",
+      "markdown": "## Günlük seviyeleri ve her birine ne girer\n\n| Seviye | Ne için kullanılır | Örnek |\n|:--|:--|:--|\n| `DEBUG` | Geliştiriciler için ayrıntı: veri yükü boyutları, süreler | `GET /restconf/data/... took 0.42s` |\n| `INFO` | Normal kilometre taşları | `R1 ntp changed` |\n| `WARNING` | Beklenmeyen ama ele alınmış bir durum | `retry 2/3 after 503` |\n| `ERROR` | Bir görev başarısız oldu; çalıştırma devam eder | `R2 patch failed: 401` |\n| `CRITICAL` | Çalıştırmanın tamamı devam edemez | `inventory file missing` |\n\nÜretimi `INFO` seviyesinde çalıştırın ve `DEBUG` seviyesine yalnızca sorun giderirken, tercihen bir ortam değişkeni aracılığıyla çalıştırma başına geçin. Gevezelik değil olay kaydedin: cihaz ve eylem başına bir satır, 500 satırlık ilerleme noktalarından daha yararlıdır.\n\nAyrıca **istisnaları yığın izleriyle (stack trace)** birlikte (`except` içinde `log.exception(...)`) ve her görevin **sonucunu** (değişti, değişmedi, başarısız) günlüğe yazın. Bir denetim izi (audit trail), \"kim, hangi cihazda ne çalıştırdı ve sonuç neydi\" sorusunun yanıtını gerektirir."
+    },
+    {
+      "id": "struct",
+      "type": "text",
+      "markdown": "## Yapılandırılmış günlükler ve korelasyon\n\nSerbest metin yazması kolay, aranması zordur. **Yapılandırılmış günlük kaydı (structured logging)**, her olayı sabit alanlarla JSON olarak yazar; böylece Splunk, Elastic veya Loki gibi bir günlük platformu, düzenli ifadeler olmadan `device=\"R2\"` veya `level=\"ERROR\"` üzerinden filtreleme yapabilir.\n\nBir çalıştırmanın her satırına bir **korelasyon kimliği (correlation ID)** (`run_id`) ekleyin. Böylece tek bir arama, bir işlem hattı işinin betikler, API çağrıları ve cihazlar boyunca tüm hikayesini döndürür. Her araçta aynı alan adlarını kullanın ve zaman damgalarını farklı saat dilimlerindeki günlüklerin hizalanması için UTC ve ofsetle kaydedin.\n\nGünlükleri merkezi bir yere gönderin. Yerel dosyalar, geçici bir CI çalıştırıcısı (runner) veya konteynerle birlikte kaybolur; bu yüzden **stdout**'a yazın ve platformun toplamasına izin verin ya da bir syslog veya ajanla gönderin. Yoğun bir gecenin diski doldurmaması için yerel dosyaları döndürme (`RotatingFileHandler`) ile sınırlayın. Bu verinin cihaz tarafındaki karşılığı için ayrıca bkz. [Model Tabanlı Telemetri](/learn/network-automation-devops/model-driven-telemetry)."
+    },
+    {
+      "id": "code",
+      "type": "code",
+      "language": "python",
+      "filename": "logsetup.py",
+      "code": "import json\nimport logging\nimport logging.handlers\nimport re\nimport sys\nimport uuid\n\nSECRET = re.compile(r\"(password|token|secret|api[_-]?key)(\\\"?\\s*[:=]\\s*\\\"?)[^\\s\\\",}]+\", re.I)\n\n\nclass RedactFilter(logging.Filter):\n    def filter(self, record):\n        record.msg = SECRET.sub(r\"\\1\\2***\", str(record.msg))   # mask before output\n        return True\n\n\nclass JsonFormatter(logging.Formatter):\n    def format(self, record):\n        entry = {\n            \"ts\": self.formatTime(record, \"%Y-%m-%dT%H:%M:%S%z\"),\n            \"level\": record.levelname,\n            \"logger\": record.name,\n            \"msg\": record.getMessage(),\n            \"run_id\": getattr(record, \"run_id\", None),\n            \"device\": getattr(record, \"device\", None),\n        }\n        if record.exc_info:\n            entry[\"exc\"] = self.formatException(record.exc_info)\n        return json.dumps(entry)\n\n\ndef setup(level=logging.INFO):\n    root = logging.getLogger()\n    root.setLevel(level)\n    console = logging.StreamHandler(sys.stdout)                     # CI and containers read stdout\n    console.setFormatter(JsonFormatter())\n    console.addFilter(RedactFilter())\n    root.addHandler(console)\n    rotating = logging.handlers.RotatingFileHandler(\"automation.log\", maxBytes=5_000_000, backupCount=5)\n    rotating.setFormatter(JsonFormatter())\n    rotating.addFilter(RedactFilter())\n    root.addHandler(rotating)\n\n\nif __name__ == \"__main__\":\n    setup()\n    log = logging.LoggerAdapter(logging.getLogger(\"ntp-sync\"), {\"run_id\": uuid.uuid4().hex[:8], \"device\": \"198.51.100.11\"})\n    log.info(\"change applied\")\n    log.warning(\"login retry password=Sup3rSecret\")\n    try:\n        1 / 0\n    except ZeroDivisionError:\n        log.exception(\"unexpected error\")\n",
+      "caption": "Korelasyon kimlikli yapılandırılmış JSON günlük kaydı, gizli bilgi maskeleme, stdout çıktısı ve dosya döndürme.",
+      "highlight": [
+        10,
+        11,
+        12,
+        30,
+        31,
+        32,
+        36
+      ]
+    },
+    {
+      "id": "out",
+      "type": "terminal",
+      "title": "python logsetup.py",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "python logsetup.py",
+          "output": "{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"INFO\", \"logger\": \"ntp-sync\", \"msg\": \"change applied\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"WARNING\", \"logger\": \"ntp-sync\", \"msg\": \"login retry password=***\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\"}\n{\"ts\": \"2026-03-02T02:10:04+0000\", \"level\": \"ERROR\", \"logger\": \"ntp-sync\", \"msg\": \"unexpected error\", \"run_id\": \"9f3c1a7e\", \"device\": \"198.51.100.11\", \"exc\": \"Traceback ... ZeroDivisionError: division by zero\"}",
+          "comment": "Parola değeri, satır yazılmadan önce maskelenir."
+        }
+      ],
+      "caption": "Olay başına bir JSON nesnesi; hepsi aynı run_id değerini paylaşır."
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Olaydan içgörüye",
+      "caption": "Bir günlük satırı ancak aranabilir, korunan bir yere ulaşırsa işe yarar.",
+      "data": {
+        "token": "Günlük olayı",
+        "nodes": [
+          {
+            "id": "app",
+            "label": "Otomasyon işi",
+            "sub": "Python / Ansible",
+            "icon": "cpu"
+          },
+          {
+            "id": "flt",
+            "label": "Maskeleme (Redaction)",
+            "sub": "gizli bilgileri maskele",
+            "icon": "shield"
+          },
+          {
+            "id": "col",
+            "label": "Toplayıcı",
+            "sub": "stdout / syslog",
+            "icon": "server"
+          },
+          {
+            "id": "sto",
+            "label": "Günlük platformu",
+            "sub": "Splunk / Elastic",
+            "icon": "database"
+          },
+          {
+            "id": "eng",
+            "label": "Mühendis",
+            "sub": "run_id ile ara",
+            "icon": "user"
+          }
+        ],
+        "steps": [
+          {
+            "at": "app",
+            "caption": "İş, cihaz ve eylem başına bir yapılandırılmış olay üretir."
+          },
+          {
+            "at": "flt",
+            "caption": "Bir filtre, herhangi bir şey yazılmadan önce parolaları ve token'ları maskeler.",
+            "tone": "success"
+          },
+          {
+            "at": "col",
+            "caption": "CI çalıştırıcısı veya konteyner platformu stdout'u toplar."
+          },
+          {
+            "at": "sto",
+            "caption": "Olaylar; zaman, seviye, cihaz ve run_id ile ve bir saklama politikasıyla dizinlenir."
+          },
+          {
+            "at": "eng",
+            "caption": "Tek bir run_id üzerinden yapılan arama, işin tamamını sırasıyla yeniden oluşturur.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "sec",
+      "type": "text",
+      "markdown": "## Günlükleri korumak\n\nGünlükler de veridir. Çoğunlukla ana bilgisayar adları, kullanıcı adları, IP adresleri ve API yanıtları içerirler; bu yüzden onlara hassas veri olarak davranın.\n\n- **Gizli bilgileri asla günlüğe yazmayın.** Buna parolalar, token'lar, API anahtarları, SNMP community'leri, önceden paylaşılan anahtarlar (pre-shared key) ve `Authorization` başlıkları dahildir. Güvenlik ağı olarak desene göre maskeleyin, ancak buna güvenmeyin: en başta gizli bilgileri mesajlara koymaktan kaçının. Bkz. [Secure Coding](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n- **Tam yanıtlara dikkat edin.** Bir API'nin döndürdüğü cihaz yapılandırması, özetlenmiş (hash) veya geri çözülebilir parolalar içerebilir. Gövdeyi değil, durum kodunu ve boyutu günlüğe yazın.\n- **Erişimi kısıtlayın ve bütünlüğü koruyun.** Salt okunur erişimi ihtiyacı olanlara verin, günlükleri otomasyon hesabının silemeyeceği bir depolamaya yazın ve politikanızın gerektirdiği süre boyunca saklayın.\n- **Kullanıcı girdisini günlüğe yazmadan önce temizleyin.** Satır sonu içeren bir değer sahte bir günlük satırı üretebilir (log injection). Yapılandırılmış JSON bunu sizin yerinize kaçışlar (escape).\n- **`print()` kullanmayın.** Seviyesi, zaman damgası ve işleyici (handler) denetimi yoktur."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Üretimde debug günlükleri",
+      "markdown": "HTTP kütüphanelerinin `DEBUG` çıktısı, kimlik bilgileri içeren istek başlıklarını kapsayabilir. Bir üretim çalıştırmasında debug günlüğünü asla açık bırakmayın ve etkinleştirmeden önce bir kütüphanenin neyi günlüğe yazdığını gözden geçirin."
+    },
+    {
+      "id": "ops",
+      "type": "text",
+      "markdown": "## Sorun gidermek için günlükleri kullanmak\n\n02:14 alarmı çaldığında, iyi bir günlük sabit bir sırayla çalışmanızı sağlar.\n\n1. **Çalıştırmayı bulun.** İşin `run_id` değerini ya da zaman aralığını ve cihaz adını arayın.\n2. **Sonuncuyu değil, ilk hatayı okuyun.** Sonraki hatalar çoğunlukla ilk başarısızlığın sonuçlarıdır.\n3. **Bağlama bakın.** Hatadan önceki satırları inceleyin: hangi istek, hangi yeniden deneme, hangi yanıt kodu.\n4. **İyi bir çalıştırmayla karşılaştırın.** Dünkü çalıştırmada aynı cihaz, nelerin değiştiğini gösterir.\n\nDüz günlük satırları **alarmları** da besleyebilir. Çalıştırma başına `ERROR` olaylarını sayın ve oran bir eşiği aşarsa ya da bir çalıştırma hiç `INFO` tamamlanma satırı üretmezse, ki bu sessizce çöktüğünü düşündürür, ekibi bilgilendirin.\n\n### Saklama ve maliyet\n\nAyrıntılı günlükleri kısa süre, özet veya denetim olaylarını daha uzun süre saklayın. Yaygın bir ayrım, uyumluluk politikanıza göre tam günlükler için 30 gün, kim neyi değiştirdi kayıtları için bir yıl veya daha fazladır. `INFO` seviyesinde tüm veri yüklerini günlüğe yazmaktan kaçının: hacim merkezi bir platformda para tutar ve sinyali gömer.\n\n### Ansible ve diğer araçlar\n\nAynı ilkeler Python dışında da geçerlidir. Ansible, `log_path` ayarı ile bir günlük dosyası yazabilir ve görev sonuçlarını `-v` ayrıntı düzeyiyle gösterir; ancak daha yüksek seviyeler modül argümanlarını yazdırır, bu yüzden üretimde bunları kapalı tutun ve gizli bilgileri işleyen görevlerde `no_log: true` kullanın.\n\n### Günlükleri değişikliğin parçası olarak gözden geçirin\n\nHer önemli çalıştırmadan sonra özete göz atın: kaç cihaz değişti, değişmeden kaldı ve başarısız oldu. Bir denetçinin kanıta sonradan ulaşabilmesi için `run_id` değerini değişiklik kaydına (ticket) yazın. Kimsenin işlem yapamayacağı bir günlük mesajını bir kusur sayın ve ifadesini iyileştirin; çünkü onu gece okuyan mühendisin başka bir bağlamı yoktur."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "1. `logsetup.py` dosyasını kaydedin ve çalıştırın. Parolanın konsolda ve `automation.log` içinde `***` ile değiştirildiğini doğrulayın.\n2. Üç dokümantasyon adresi (198.51.100.11 ile .13 arası) üzerinde bir döngüden bir `device` değeri ekleyin ve bunlardan biri için bir başarısızlık üretin.\n3. Yalnızca hataları listelemek için `jq` kullanın: `jq 'select(.level==\"ERROR\")' automation.log`.\n4. Bir çalıştırmanın satırlarını `jq 'select(.run_id==\"<id>\")' automation.log` ile gruplayın. Ardından bir `Authorization` başlığının maskelenmesini ekleyin ve test edin."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Günlük seviyesi (Log level)",
+          "definition": "Ne kadarının kaydedileceğini denetleyen bir önem etiketi (DEBUG'dan CRITICAL'a)."
+        },
+        {
+          "term": "Yapılandırılmış günlük kaydı (Structured logging)",
+          "definition": "Olayları serbest metin yerine JSON gibi anahtar-değer verisi olarak yazmak."
+        },
+        {
+          "term": "Korelasyon kimliği (Correlation ID)",
+          "definition": "Bir çalıştırmanın veya isteğin her günlük satırına eklenen benzersiz bir değer."
+        },
+        {
+          "term": "Maskeleme (Redaction)",
+          "definition": "Hassas değerleri günlüğe yazılmadan önce gizlemek."
+        },
+        {
+          "term": "Günlük döndürme (Log rotation)",
+          "definition": "Geçerli dosya bir boyut veya yaş sınırına ulaştığında yeni bir günlük dosyası başlatmak."
+        },
+        {
+          "term": "Günlük enjeksiyonu (Log injection)",
+          "definition": "Satır sonu gibi denetim karakterleri ekleyerek sahte günlük kayıtları üretmek."
+        },
+        {
+          "term": "Denetim izi (Audit trail)",
+          "definition": "Kimin neyi, nerede ve ne zaman yaptığına dair kurcalamaya dayanıklı bir kayıt."
+        },
+        {
+          "term": "Syslog",
+          "definition": "Günlük mesajlarını merkezi bir toplayıcıya göndermek için standart bir protokol."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı sınayın",
+      "questions": [
+        {
+          "question": "run_id gibi bir korelasyon kimliğinin başlıca yararı nedir?",
+          "options": [
+            "Bir çalıştırmanın tüm günlük satırlarını araçlar ve cihazlar boyunca getirmenizi sağlar",
+            "Günlük dosyalarını şifreler",
+            "Cihaz CPU'sunu hızlandırır",
+            "Günlük seviyelerinin yerini alır"
+          ],
+          "answer": 0,
+          "explanation": "Kimlik üzerinden yapılan tek bir arama, çalıştırmanın tamamını sırasıyla yeniden oluşturur."
+        },
+        {
+          "question": "Hangileri günlüklerde asla yer almamalıdır? Uygun olanların hepsini seçin.",
+          "options": [
+            "API token'ları",
+            "Authorization başlıkları",
+            "Cihaz ana bilgisayar adı",
+            "SNMP community dizeleri"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Ana bilgisayar adları normal bağlamdır. Token'lar, yetkilendirme başlıkları ve community dizeleri gizli bilgilerdir."
+        },
+        {
+          "question": "Ele alınmış, beklenmeyen bir yeniden deneme hangi seviyede günlüğe yazılmalıdır?",
+          "options": [
+            "DEBUG",
+            "WARNING",
+            "CRITICAL",
+            "Hiçbiri, yeniden denemeler sessiz olmalıdır"
+          ],
+          "answer": 1,
+          "explanation": "WARNING, işi durdurmayan olağandışı bir durumu işaretler."
+        },
+        {
+          "question": "Konteynerleştirilmiş bir CI işinde günlükler neden stdout'a yazılır?",
+          "options": [
+            "Yerel dosyalar konteynerle birlikte kaybolur, platform ise stdout'u toplar",
+            "stdout varsayılan olarak şifrelidir",
+            "Dosyalar döndürülemez",
+            "Zaman damgası kullanmayı gereksiz kılar"
+          ],
+          "answer": 0,
+          "explanation": "Merkezi toplama, çalıştırıcı ortadan kalktıktan sonra da kanıtı korur."
+        },
+        {
+          "question": "Başarısız bir çalıştırmada sorun gidermeyi hangi uygulama hızlandırır?",
+          "options": [
+            "Önce son hata satırını okumak",
+            "İlk hatayı ve ondan önceki satırları okumak",
+            "Günlüğü silip üretimde DEBUG seviyesinde yeniden çalıştırmak",
+            "Uyarıları yok saymak"
+          ],
+          "answer": 1,
+          "explanation": "Sonraki hatalar çoğunlukla ilk başarısızlığın sonuçlarıdır ve ondan önceki satırlar bağlamı gösterir."
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## Özet\n\n- Günlükler, her cihaz ve görev için bir sonuçla birlikte neyin, nerede, ne zaman ve neden olduğunu söylemelidir.\n- Seviyeleri doğru kullanın: kilometre taşları için INFO, ele alınmış sürprizler için WARNING, başarısız görevler için ERROR.\n- Korelasyon kimliği, UTC zaman damgaları ve tutarlı alan adlarıyla yapılandırılmış JSON tercih edin.\n- Günlükleri merkezi, erişimi denetlenen bir yere gönderin ve yerel dosyaları döndürün.\n- Gizli bilgileri veya tam cihaz yapılandırmalarını asla günlüğe yazmayın ve üretimde debug günlüğünü kapalı tutun."
+    }
+  ]
+}

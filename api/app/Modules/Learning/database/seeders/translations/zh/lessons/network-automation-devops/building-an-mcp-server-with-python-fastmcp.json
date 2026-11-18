@@ -1,0 +1,325 @@
+{
+  "title": "使用 Python FastMCP 构建 MCP 服务器",
+  "summary": "使用 FastMCP 在 Python 中构建模型上下文协议 (Model Context Protocol) 服务器，通过 RESTCONF 暴露安全且经过验证的网络工具，并在任何 AI 模型使用之前用 MCP Inspector 对其进行测试。",
+  "objectives": [
+    "描述 MCP 主机 (Host)、客户端 (Client) 和服务器 (Server) 的角色，以及工具 (Tool)、资源 (Resource) 和提示 (Prompt) 这三种原语",
+    "比较 stdio 和 Streamable HTTP 传输方式，并为某个用例选择其中一种",
+    "构建一个 FastMCP 服务器，其工具封装 IOS XE RESTCONF 调用",
+    "使用 MCP Inspector 测试服务器并读懂 JSON-RPC 交互",
+    "对 MCP 工具应用允许列表、输入验证、默认试运行 (dry-run) 和最小权限"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "您的 NOC 希望有一个 AI 助手，能够回答“edge-rtr1 上的 GigabitEthernet0/0/1 是否已启用，是否出现错误？”，而无需任何人把 `show` 输出粘贴到聊天窗口中。最显而易见的捷径，即让模型通过 SSH 访问路由器，同时也是最危险的一种。您真正想要的，是模型可以请求的一小组定义明确的操作，每一项都由您编写、测试并且可以审计的代码支撑。\n\n**模型上下文协议 (Model Context Protocol，MCP)** 正是为此而生的开放标准。您编写一个暴露工具的 **MCP 服务器 (MCP server)**，任何支持 MCP 的 AI 应用都可以发现并调用这些工具。AUTOCOR 350-901 v2.0 考试大纲要求您能够构建这样的服务器，而在 Python 中最快的途径是 **FastMCP**。在本课中，您将基于 RESTCONF 为 IOS XE 路由器构建一个以读为主的服务器。"
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## 什么是 MCP\n\nMCP 把 AI 应用与它所对接的系统分离开来。参与其中的有三种角色：\n\n- **主机 (Host)**：工程师使用的 AI 应用，例如聊天客户端、IDE 或 ChatOps 机器人。它拥有语言模型和对话。\n- **客户端 (Client)**：主机内部的连接器。每个客户端与一个服务器保持一对一的会话。\n- **服务器 (Server)**：您的程序。它提供能力并运行这些能力背后的代码。\n\n消息是 **JSON-RPC 2.0** 的请求、响应和通知。会话以 `initialize` 开始，双方在其中商定协议版本和能力，随后是一条 `initialized` 通知。此后，客户端就可以列出并使用服务器提供的内容。\n\n### 服务器原语\n\n| 原语 | 由谁控制 | 网络示例 |\n|:--|:--|:--|\n| **工具 (Tool)** | 由模型决定何时调用 | `get_interface_status(hostname, interface)` |\n| **资源 (Resource)** | 应用将其作为上下文读取 | `inventory://devices`，一份黄金配置 |\n| **提示 (Prompt)** | 由用户选取为模板 | “排查接口故障” |\n\n### 传输方式\n\n- **stdio**：主机将服务器作为子进程启动，并通过 stdin 和 stdout 交换消息。它简单且是本地的，服务器只继承您提供的环境。\n- **Streamable HTTP**：服务器作为长期运行的 Web 服务，多个客户端可以共享。与任何其他 API 一样，它需要 TLS、身份验证和网络访问控制。"
+    },
+    {
+      "id": "fastmcp",
+      "type": "text",
+      "markdown": "## Python SDK 中的 FastMCP\n\n官方的 MCP Python SDK（`pip install \"mcp[cli]\"`）包含 **FastMCP**，这是一个高级 API，通过装饰器把普通函数变成 MCP 原语。另有一个由社区维护的独立 `fastmcp` 包，在相同思路上扩展了更多功能；这里的代码使用 SDK 版本，从 `mcp.server.fastmcp` 导入。\n\nFastMCP 为您做了三件有用的事：\n\n1. **由类型提示生成模式 (Schema)。** `hostname: str` 和 `dry_run: bool = True` 会变成 JSON Schema，因此模型知道参数名称、类型以及哪些是必需的。\n2. **由文档字符串生成描述。** 模型通过阅读文档字符串来决定*何时*使用某个工具，所以要为模型来写：工具做什么、有效的参数格式以及一个示例。\n3. **协议底层处理。** 它处理 `initialize`、`tools/list`、`tools/call`、序列化和错误。如果您的函数抛出异常，客户端会收到带有 `isError: true` 和错误消息的结果，而不是服务器崩溃。\n\n下面的服务器封装了 IOS XE 上的 RESTCONF。它把凭据保存在环境变量中，拒绝未知设备和格式错误的接口名称，并且让它唯一的写入工具默认为试运行。有关 RESTCONF 的细节，参见 [结合 YANG 模型使用 RESTCONF](/learn/network-automation-devops/restconf-with-yang-models)。"
+    },
+    {
+      "id": "server",
+      "type": "code",
+      "language": "python",
+      "filename": "netops_server.py",
+      "highlight": [
+        9,
+        14,
+        16,
+        22,
+        33,
+        34,
+        40,
+        53,
+        70,
+        85,
+        93
+      ],
+      "caption": "每项能力都是一个带装饰器的 Python 函数。设备清单允许列表、输入检查和默认试运行都在代码中强制执行，而不是在提示中。",
+      "code": "\"\"\"netops_server.py - a read-mostly MCP server for IOS XE routers.\"\"\"\nimport json\nimport logging\nimport os\nimport re\nfrom urllib.parse import quote\n\nimport requests\nfrom mcp.server.fastmcp import FastMCP\n\nlogging.basicConfig(level=logging.INFO)          # logs go to stderr, never stdout\nlog = logging.getLogger(\"netops\")\n\nmcp = FastMCP(\"netops\")\n\nINVENTORY = {\"edge-rtr1\": \"192.0.2.11\", \"edge-rtr2\": \"192.0.2.12\"}\nIFACE_RE = re.compile(r\"^(GigabitEthernet|TenGigabitEthernet|Loopback)\\d+(/\\d+){0,2}$\")\nHEADERS = {\"Accept\": \"application/yang-data+json\",\n           \"Content-Type\": \"application/yang-data+json\"}\n\n\ndef _check(hostname, interface):\n    if hostname not in INVENTORY:\n        raise ValueError(f\"unknown device {hostname!r}; call list_devices first\")\n    if not IFACE_RE.match(interface):\n        raise ValueError(\"interface must be a full name such as GigabitEthernet0/0/1\")\n\n\ndef _restconf(method, hostname, path, body=None):\n    resp = requests.request(\n        method, f\"https://{INVENTORY[hostname]}/restconf/data/{path}\",\n        headers=HEADERS, json=body, timeout=10,\n        auth=(os.environ[\"NETOPS_USER\"], os.environ[\"NETOPS_PASS\"]),\n        verify=os.environ.get(\"NETOPS_CA_BUNDLE\", True),\n    )\n    resp.raise_for_status()\n    return resp.json() if resp.content else {}\n\n\n@mcp.resource(\"inventory://devices\")\ndef inventory() -> str:\n    \"\"\"The devices this server is allowed to reach.\"\"\"\n    return json.dumps(INVENTORY)\n\n\n@mcp.tool()\ndef list_devices() -> list[str]:\n    \"\"\"List the hostnames this server can query.\"\"\"\n    return sorted(INVENTORY)\n\n\n@mcp.tool()\ndef get_interface_status(hostname: str, interface: str) -> dict:\n    \"\"\"Return the admin status, oper status and input errors of one interface.\n\n    hostname: a name returned by list_devices, for example edge-rtr1\n    interface: the full IOS XE name, for example GigabitEthernet0/0/1\n    \"\"\"\n    _check(hostname, interface)\n    path = f\"ietf-interfaces:interfaces-state/interface={quote(interface, safe='')}\"\n    data = _restconf(\"GET\", hostname, path)[\"ietf-interfaces:interface\"]\n    return {\"interface\": data[\"name\"],\n            \"admin_status\": data[\"admin-status\"],\n            \"oper_status\": data[\"oper-status\"],\n            \"in_errors\": int(data[\"statistics\"][\"in-errors\"])}\n\n\n@mcp.tool()\ndef set_interface_description(hostname: str, interface: str,\n                              description: str, dry_run: bool = True) -> dict:\n    \"\"\"Set an interface description. Defaults to a dry run that changes nothing.\"\"\"\n    _check(hostname, interface)\n    if not re.fullmatch(r\"[\\w .:/-]{1,80}\", description):\n        raise ValueError(\"description: 1-80 letters, digits, spaces or . : / - _\")\n    path = f\"ietf-interfaces:interfaces/interface={quote(interface, safe='')}\"\n    body = {\"ietf-interfaces:interface\": {\"name\": interface,\n                                          \"description\": description}}\n    if dry_run:\n        return {\"dry_run\": True, \"would_patch\": path, \"body\": body}\n    _restconf(\"PATCH\", hostname, path, body)\n    log.info(\"description changed on %s %s\", hostname, interface)\n    return {\"dry_run\": False, \"changed\": True}\n\n\n@mcp.prompt()\ndef troubleshoot_interface(hostname: str, interface: str) -> str:\n    \"\"\"A reusable, read-only troubleshooting prompt.\"\"\"\n    return (f\"Check {interface} on {hostname} with get_interface_status. \"\n            \"Report admin status, oper status and input errors. Change nothing.\")\n\n\nif __name__ == \"__main__\":\n    mcp.run()                     # stdio transport by default\n"
+    },
+    {
+      "id": "mcp-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "一个问题，一次工具调用",
+      "caption": "模型从不接触路由器。它请求主机调用一个工具，而实际发生什么由您的服务器决定。",
+      "data": {
+        "actors": [
+          {
+            "id": "eng",
+            "label": "工程师",
+            "icon": "user"
+          },
+          {
+            "id": "host",
+            "label": "AI 主机",
+            "sub": "LLM + MCP 客户端",
+            "icon": "laptop"
+          },
+          {
+            "id": "srv",
+            "label": "MCP 服务器",
+            "sub": "netops_server.py",
+            "icon": "server"
+          },
+          {
+            "id": "rtr",
+            "label": "edge-rtr1",
+            "sub": "192.0.2.11 RESTCONF",
+            "icon": "router"
+          }
+        ],
+        "steps": [
+          {
+            "from": "host",
+            "to": "srv",
+            "label": "initialize",
+            "detail": "protocolVersion, capabilities",
+            "note": "主机通过 stdio 启动服务器，双方协商协议版本和能力。"
+          },
+          {
+            "from": "host",
+            "to": "srv",
+            "label": "tools/list",
+            "note": "客户端询问存在哪些工具。FastMCP 返回名称、文档字符串和 JSON Schema。"
+          },
+          {
+            "from": "eng",
+            "to": "host",
+            "label": "edge-rtr1 上的 Gi0/0/1 是否已启用？",
+            "note": "工程师用自然语言提问。主机把问题和工具列表传给模型。"
+          },
+          {
+            "from": "host",
+            "to": "srv",
+            "label": "tools/call get_interface_status",
+            "detail": "hostname=edge-rtr1 interface=GigabitEthernet0/0/1",
+            "tone": "secure",
+            "note": "模型选择工具和参数。在任何内容离开服务器之前，您的代码会验证两者。"
+          },
+          {
+            "from": "srv",
+            "to": "rtr",
+            "label": "GET /restconf/data/ietf-interfaces:interfaces-state/...",
+            "note": "服务器使用自己的只读凭据，并验证路由器的 TLS 证书。"
+          },
+          {
+            "from": "rtr",
+            "to": "srv",
+            "label": "200 OK",
+            "detail": "admin-status up, oper-status down",
+            "tone": "success",
+            "note": "路由器返回基于 YANG 建模的 JSON。"
+          },
+          {
+            "from": "srv",
+            "to": "host",
+            "label": "结果",
+            "detail": "isError=false，4 个字段",
+            "note": "服务器返回简短的结构化摘要，而不是完整的负载，这样可以保持模型的上下文较小。"
+          },
+          {
+            "from": "host",
+            "to": "eng",
+            "label": "管理状态为 up，运行状态为 down，0 个输入错误",
+            "tone": "warning",
+            "note": "模型写出答案，并建议检查线缆或对端。它没有更改任何内容。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "run",
+      "type": "text",
+      "markdown": "## 运行和测试服务器\n\n开发期间，使用 `mcp dev` 在 **MCP Inspector** 下运行服务器。Inspector 是一个本地 Web 界面，它以客户端身份连接，列出您的工具、资源和提示，允许您用自己的参数调用它们，并显示原始的 JSON-RPC 流量。在连接模型之前，请在这里测试每个工具，因为 Inspector 清楚显示的错误，通过 LLM 的转述要难发现得多。\n\n要连接桌面 AI 主机，请在主机的配置中注册一条命令，例如 `uv run python netops_server.py`；之后主机会在需要时通过 stdio 启动服务器。要在团队中共享一个服务器，请用 `mcp.run(transport=\"streamable-http\")` 切换传输方式，并将其置于 TLS 和身份验证之后。对于 CI 中的工具级测试，请使用 `unittest` 或 `pytest` 调用普通的 Python 函数并模拟 `requests`，与测试任何其他自动化代码完全一样。"
+    },
+    {
+      "id": "run-term",
+      "type": "terminal",
+      "title": "设置、检查并运行",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "uv init netops-mcp && cd netops-mcp",
+          "comment": "使用 uv 创建项目（pip install \"mcp[cli]\" 也可以）"
+        },
+        {
+          "cmd": "uv add \"mcp[cli]\" requests",
+          "output": "Resolved 32 packages in 1.21s\nInstalled 30 packages in 410ms\n + mcp==1.x.x\n + requests==2.x.x\n ...",
+          "comment": "安装官方 MCP Python SDK，其中包含 FastMCP 和 mcp CLI"
+        },
+        {
+          "cmd": "export NETOPS_USER=netops-ro NETOPS_PASS='<lab-password>'",
+          "comment": "只读实验室凭据；绝不要在服务器中硬编码它们"
+        },
+        {
+          "cmd": "uv run mcp dev netops_server.py",
+          "output": "Starting MCP inspector...\nProxy server listening on port 6277\nMCP Inspector is up and running at http://127.0.0.1:6274",
+          "comment": "在 MCP Inspector 下启动服务器：列出工具、调用它们并查看原始 JSON-RPC"
+        },
+        {
+          "cmd": "uv run python netops_server.py",
+          "comment": "直接通过 stdio 运行：它不打印任何内容，并在 stdin 上等待 JSON-RPC（按 Ctrl+C 停止）"
+        }
+      ],
+      "caption": "输出已缩略；软件包版本和 Inspector 端口取决于您的 SDK 版本。"
+    },
+    {
+      "id": "wire",
+      "type": "code",
+      "language": "json",
+      "filename": "jsonrpc-exchange.json",
+      "caption": "Inspector 在线路上显示的内容：先用 tools/list 发现，然后是一次 tools/call。注释是为便于阅读而添加的；真实的 JSON-RPC 没有注释。",
+      "code": "// Client -> server: which tools exist?\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\"}\n\n// Server -> client (one tool shown). The schema comes from the type hints.\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"result\": {\"tools\": [{\n  \"name\": \"get_interface_status\",\n  \"description\": \"Return the admin status, oper status and input errors of one interface. ...\",\n  \"inputSchema\": {\"type\": \"object\",\n    \"properties\": {\"hostname\": {\"title\": \"Hostname\", \"type\": \"string\"},\n                   \"interface\": {\"title\": \"Interface\", \"type\": \"string\"}},\n    \"required\": [\"hostname\", \"interface\"]}}]}}\n\n// Client -> server: the model chose a tool and its arguments\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",\n \"params\": {\"name\": \"get_interface_status\",\n            \"arguments\": {\"hostname\": \"edge-rtr1\", \"interface\": \"GigabitEthernet0/0/1\"}}}\n\n// Server -> client: the result the model will read\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"result\": {\n  \"content\": [{\"type\": \"text\", \"text\": \"{\\\"interface\\\": \\\"GigabitEthernet0/0/1\\\", \\\"admin_status\\\": \\\"up\\\", \\\"oper_status\\\": \\\"down\\\", \\\"in_errors\\\": 0}\"}],\n  \"isError\": false}}"
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## 设计可以安全交给模型的工具\n\n模型会用它认为正确的任何参数来调用您的工具，包括错误的参数。请把每个参数都视为不可信输入。\n\n- **先只读 (Read-only first)。** 从仅做观察的工具开始。之后再添加写入工具，一次只添加一个窄范围的操作，绝不要提供“运行任意 CLI 命令”。\n- **允许列表和验证 (Allowlists and validation)。** 只接受已知的主机名、格式正确的接口名称和有界字符串。对其他任何内容，返回模型能够据以行动的明确错误。\n- **安全的默认值 (Safe defaults)。** `dry_run: bool = True` 参数意味着模型必须明确请求才能进行更改，并且主机可以要求对该调用进行人工审批。\n- **最小权限凭据 (Least-privilege credentials)。** 服务器账户应只拥有其工具所需的 RESTCONF 权限，最好通过 TACACS+ 命令授权或受限角色实现。从环境变量或保险库 (vault) 加载密钥。\n- **简洁的结构化结果 (Concise, structured results)。** 返回能回答问题的字段，而不是 2,000 行运行配置。大量输出会浪费上下文并淹没事实。\n- **审计跟踪 (Audit trail)。** 记录每一次写入调用的人员、内容和时间。诸如 `readOnlyHint` 和 `destructiveHint` 之类的工具注解有助于主机决定何时请求确认，但它们只是提示：您的代码仍然必须强制执行规则。\n\n工具结果会回流到模型中，因此恶意的接口描述可能携带被注入的指令。该风险在 [基于 AI 的自动化中的安全风险](/learn/network-automation-devops/security-risks-in-ai-based-automation) 中介绍。"
+    },
+    {
+      "id": "pitfalls",
+      "type": "callout",
+      "variant": "warning",
+      "title": "学习者常犯的错误",
+      "markdown": "- **在 stdio 服务器中向 stdout 打印。** stdout *就是*协议通道。一个多余的 `print()` 会破坏 JSON-RPC 流。请改为记录到 stderr。\n- **含糊的文档字符串。** 如果文档字符串没有说明 `interface` 必须是完整名称，模型就会发送 `Gi0/0/1` 并失败。\n- **把原始设备输出作为结果。** 要解析并汇总；模型对四个字段的推理效果优于对一页文本的推理。\n- **“仅用于实验室”的 `verify=False`。** 它往往会流入生产环境。请改为让 `verify` 指向您的 CA 证书包。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "亲自动手试试",
+      "markdown": "使用您自己拥有的实验室路由器，例如 Cisco Modeling Labs 中的 Catalyst 8000V，并启用 `restconf` 和一个只读本地用户。\n\n1. 用 `uv init` 和 `uv add \"mcp[cli]\" requests` 创建项目，然后保存 `netops_server.py`，并在 `INVENTORY` 中填入您的实验室路由器地址。\n2. 运行 `uv run mcp dev netops_server.py`。在 Inspector 中调用 `list_devices`，然后用有效接口调用 `get_interface_status`。\n3. 再次调用它，将 `interface` 设为 `Gi0/0/1`，并使用不在清单中的主机名。确认两者都返回 `isError: true` 并带有有用的消息。\n4. 不带 `dry_run` 调用 `set_interface_description`，并确认路由器上没有任何变化。\n5. 添加一个只读工具 `get_ospf_neighbors(hostname)`，它只返回邻居 ID、状态和接口。在 Inspector 中测试它。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "模型上下文协议 (Model Context Protocol，MCP)",
+          "definition": "一种开放标准，使 AI 应用能够发现并使用外部服务器提供的工具、资源和提示。"
+        },
+        {
+          "term": "MCP 主机 (MCP host)",
+          "definition": "AI 应用，例如聊天客户端、IDE 或机器人，它拥有模型并为每个服务器运行一个 MCP 客户端。"
+        },
+        {
+          "term": "MCP 服务器 (MCP server)",
+          "definition": "通过 MCP 暴露能力并运行其背后代码的程序。"
+        },
+        {
+          "term": "工具 (Tool)",
+          "definition": "模型可以请求调用的函数，由名称、描述和其参数的 JSON Schema 来描述。"
+        },
+        {
+          "term": "资源 (Resource)",
+          "definition": "由 URI 标识的只读数据，应用可以将其加载到模型的上下文中。"
+        },
+        {
+          "term": "提示 (Prompt，MCP)",
+          "definition": "用户可以选择的、可复用且带参数的消息模板。"
+        },
+        {
+          "term": "FastMCP",
+          "definition": "MCP SDK 中的高级 Python API，可将带装饰器的函数变成工具、资源和提示。"
+        },
+        {
+          "term": "stdio 传输 (stdio transport)",
+          "definition": "主机将服务器作为子进程启动，并通过 stdin 和 stdout 交换 JSON-RPC 消息。"
+        },
+        {
+          "term": "Streamable HTTP",
+          "definition": "用于远程、共享服务器的 MCP 传输方式，通过 HTTP 承载，并像任何 Web API 一样进行保护。"
+        },
+        {
+          "term": "MCP Inspector",
+          "definition": "一种开发者工具，通过 mcp dev 启动，用于列出和调用服务器的能力并查看原始 JSON-RPC。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查您的理解",
+      "questions": [
+        {
+          "question": "在 FastMCP 中，工具参数的 JSON Schema 来自哪里？",
+          "options": [
+            "您在服务器旁边编写的 YAML 文件",
+            "带装饰器函数的 Python 类型提示和默认值",
+            "模型在运行时从文档字符串推断",
+            "MCP 主机根据之前的调用生成"
+          ],
+          "answer": 1,
+          "explanation": "FastMCP 根据函数签名构建 inputSchema：类型变成 JSON 类型，没有默认值的参数变为必需。文档字符串成为描述。"
+        },
+        {
+          "question": "哪种 MCP 原语是由模型在对话期间选择的？",
+          "options": [
+            "资源 (Resource)",
+            "提示 (Prompt)",
+            "工具 (Tool)",
+            "传输 (Transport)"
+          ],
+          "answer": 2,
+          "explanation": "工具由模型控制：模型决定何时调用它们。资源是由应用控制的上下文，提示是由用户选择的模板。"
+        },
+        {
+          "question": "您的 stdio 服务器在单元测试中正常，但主机在第一次调用之后报告无效的 JSON。最可能的原因是什么？",
+          "options": [
+            "服务器使用了类型提示",
+            "print() 语句向 stdout 写入，而 stdout 是协议通道",
+            "logging 被配置为写入 stderr",
+            "工具返回了一个 dict"
+          ],
+          "answer": 1,
+          "explanation": "使用 stdio 传输时，stdout 承载 JSON-RPC 消息。stdout 上的任何其他文本都会破坏该流，因此诊断信息必须发送到 stderr。"
+        },
+        {
+          "question": "哪些设计选择能使网络 MCP 服务器更安全地暴露给模型？（选择所有适用项。）",
+          "options": [
+            "设备允许列表和经过验证的参数格式",
+            "为了灵活性而提供单一的 run_cli(command) 工具",
+            "默认 dry_run=True 的写入工具",
+            "从环境变量或保险库加载的凭据",
+            "每次查询都返回完整的运行配置"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "允许列表、验证、安全默认值和外部化的最小权限凭据可以限制错误或被操纵的调用所能造成的影响。通用的 CLI 工具和庞大的原始输出则恰恰相反。"
+        },
+        {
+          "question": "何时应选择 Streamable HTTP 传输而不是 stdio？（选择所有适用项。）",
+          "options": [
+            "当多个用户或主机必须共享一个中央服务器时",
+            "当服务器必须运行在与主机不同的机器上时",
+            "当您想避免任何身份验证时",
+            "当您只在 MCP Inspector 中进行本地测试时"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "Streamable HTTP 适合远程和共享服务器，此时必须用 TLS 和身份验证对其进行保护。对于本地开发和单用户桌面主机，stdio 更简单。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 总结\n\n- **MCP** 规范了 AI 主机如何发现和调用外部能力。主机运行客户端；您的代码是**服务器**。\n- 服务器提供**工具**（由模型控制）、**资源**（由应用控制）和**提示**（由用户选择），通过 **stdio** 或 **Streamable HTTP** 上的 JSON-RPC 2.0 传输。\n- **FastMCP** 把带装饰器的函数变成工具，从类型提示派生模式，从文档字符串派生描述。\n- 在连接模型之前，使用 **MCP Inspector**（`mcp dev`）和普通单元测试进行测试。\n- 在代码中保证服务器安全：先提供只读工具、允许列表、输入验证、`dry_run` 默认值、最小权限凭据、简短的结构化结果和日志记录。绝不要在 stdio 服务器中向 stdout 写入。"
+    }
+  ]
+}

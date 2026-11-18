@@ -1,0 +1,325 @@
+{
+  "title": "Python FastMCP के साथ MCP सर्वर बनाना",
+  "summary": "FastMCP के साथ Python में एक Model Context Protocol सर्वर बनाएँ जो RESTCONF पर सुरक्षित, सत्यापित नेटवर्क टूल उपलब्ध कराए, और किसी AI मॉडल के उपयोग से पहले उसे MCP Inspector से टेस्ट करें।",
+  "objectives": [
+    "MCP होस्ट, क्लाइंट और सर्वर की भूमिकाओं तथा टूल, रिसोर्स और प्रॉम्प्ट प्रिमिटिव का वर्णन करें",
+    "stdio और Streamable HTTP ट्रांसपोर्ट की तुलना करें और किसी उपयोग-स्थिति के लिए एक चुनें",
+    "ऐसा FastMCP सर्वर बनाएँ जिसके टूल IOS XE RESTCONF कॉल को रैप करते हों",
+    "MCP Inspector से सर्वर टेस्ट करें और JSON-RPC आदान-प्रदान पढ़ें",
+    "MCP टूल पर अनुमति सूची (Allowlist), इनपुट सत्यापन, डिफ़ॉल्ट रूप से ड्राई-रन और न्यूनतम विशेषाधिकार लागू करें"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "आपका NOC एक AI असिस्टेंट चाहता है जो \"क्या edge-rtr1 पर GigabitEthernet0/0/1 अप है, और क्या उस पर त्रुटियाँ आ रही हैं?\" जैसे सवाल का जवाब दे सके, बिना किसी के चैट विंडो में `show` आउटपुट पेस्ट किए। सबसे आसान शॉर्टकट, यानी मॉडल को राउटर की SSH पहुँच देना, सबसे खतरनाक भी है। असल में आप चाहते हैं कि कार्यों का एक छोटा, स्पष्ट रूप से परिभाषित समूह हो जिसका अनुरोध मॉडल कर सके, और हर कार्य के पीछे ऐसा कोड हो जो आपने लिखा, टेस्ट किया और ऑडिट कर सकते हैं।\n\n**Model Context Protocol (MCP)** ठीक इसी के लिए एक ओपन स्टैंडर्ड है। आप एक **MCP सर्वर (MCP Server)** लिखते हैं जो टूल उपलब्ध कराता है, और कोई भी MCP-सक्षम AI एप्लिकेशन उन्हें खोजकर कॉल कर सकता है। AUTOCOR 350-901 v2.0 ब्लूप्रिंट अपेक्षा करता है कि आप ऐसा सर्वर बना सकें, और Python में इसका सबसे तेज़ रास्ता **FastMCP** है। इस पाठ में आप RESTCONF के ऊपर IOS XE राउटरों के लिए एक मुख्यतः रीड-ओनली सर्वर बनाएँगे।"
+    },
+    {
+      "id": "what",
+      "type": "text",
+      "markdown": "## MCP क्या है\n\nMCP AI एप्लिकेशन को उन सिस्टम से अलग करता है जिनसे वह बात करता है। इसमें तीन भूमिकाएँ भाग लेती हैं:\n\n- **होस्ट (Host)**: वह AI एप्लिकेशन जिसे इंजीनियर उपयोग करता है, जैसे चैट क्लाइंट, IDE या ChatOps बॉट। भाषा मॉडल और बातचीत उसी के पास रहती है।\n- **क्लाइंट (Client)**: होस्ट के अंदर एक कनेक्टर। हर क्लाइंट एक सर्वर के साथ एक-से-एक सेशन रखता है।\n- **सर्वर (Server)**: आपका प्रोग्राम। वह क्षमताएँ प्रदान करता है और उनके पीछे का कोड चलाता है।\n\nसंदेश **JSON-RPC 2.0** अनुरोध, प्रतिक्रियाएँ और नोटिफ़िकेशन होते हैं। सेशन `initialize` से शुरू होता है, जहाँ दोनों पक्ष प्रोटोकॉल वर्ज़न और क्षमताओं पर सहमत होते हैं, उसके बाद `initialized` नोटिफ़िकेशन आता है। इसके बाद क्लाइंट सर्वर की पेशकश को सूचीबद्ध कर सकता है और उपयोग कर सकता है।\n\n### सर्वर प्रिमिटिव (Server Primitives)\n\n| प्रिमिटिव | कौन नियंत्रित करता है | नेटवर्क उदाहरण |\n|:--|:--|:--|\n| **टूल (Tool)** | मॉडल तय करता है कि कब कॉल करना है | `get_interface_status(hostname, interface)` |\n| **रिसोर्स (Resource)** | एप्लिकेशन इसे कॉन्टेक्स्ट के रूप में पढ़ता है | `inventory://devices`, एक गोल्डन कॉन्फ़िग |\n| **प्रॉम्प्ट (Prompt)** | यूज़र इसे टेम्पलेट के रूप में चुनता है | \"किसी इंटरफ़ेस की समस्या का निवारण करें\" |\n\n### ट्रांसपोर्ट (Transports)\n\n- **stdio**: होस्ट सर्वर को चाइल्ड प्रोसेस के रूप में शुरू करता है और stdin व stdout पर संदेशों का आदान-प्रदान करता है। यह सरल और लोकल है, और सर्वर केवल वही एनवायरनमेंट विरासत में पाता है जो आप उसे देते हैं।\n- **Streamable HTTP**: सर्वर एक दीर्घकालिक वेब सेवा के रूप में चलता है जिसे कई क्लाइंट साझा कर सकते हैं। इसे किसी भी अन्य API की तरह TLS, ऑथेंटिकेशन और नेटवर्क एक्सेस कंट्रोल चाहिए।"
+    },
+    {
+      "id": "fastmcp",
+      "type": "text",
+      "markdown": "## Python SDK में FastMCP\n\nआधिकारिक MCP Python SDK (`pip install \"mcp[cli]\"`) में **FastMCP** शामिल है, जो एक उच्च-स्तरीय API है और डेकोरेटर की मदद से सामान्य फ़ंक्शन को MCP प्रिमिटिव में बदल देता है। एक अलग, समुदाय द्वारा संचालित `fastmcp` पैकेज इन्हीं विचारों को अतिरिक्त सुविधाओं के साथ आगे बढ़ाता है; यहाँ का कोड SDK वाला संस्करण उपयोग करता है, जिसे `mcp.server.fastmcp` से इम्पोर्ट किया जाता है।\n\nFastMCP आपके लिए तीन उपयोगी काम करता है:\n\n1. **टाइप हिंट से स्कीमा।** `hostname: str` और `dry_run: bool = True` JSON Schema बन जाते हैं, इसलिए मॉडल को आर्गुमेंट के नाम, प्रकार और यह पता रहता है कि कौन-से अनिवार्य हैं।\n2. **डॉकस्ट्रिंग से विवरण।** मॉडल यह तय करने के लिए डॉकस्ट्रिंग पढ़ता है कि टूल का उपयोग *कब* करना है, इसलिए इसे मॉडल के लिए लिखें: टूल क्या करता है, वैध आर्गुमेंट फ़ॉर्मेट और एक उदाहरण।\n3. **प्रोटोकॉल की प्लंबिंग।** यह `initialize`, `tools/list`, `tools/call`, सीरियलाइज़ेशन और त्रुटियों को संभालता है। यदि आपका फ़ंक्शन अपवाद (Exception) उठाता है, तो सर्वर क्रैश होने के बजाय क्लाइंट को `isError: true` और संदेश वाला परिणाम मिलता है।\n\nनीचे का सर्वर IOS XE पर RESTCONF को रैप करता है। यह क्रेडेंशियल को एनवायरनमेंट वेरिएबल में रखता है, अज्ञात डिवाइस और गलत फ़ॉर्मेट वाले इंटरफ़ेस नामों को अस्वीकार करता है, और अपने एकमात्र राइट टूल को डिफ़ॉल्ट रूप से ड्राई रन बनाता है। RESTCONF के विवरण के लिए देखें [YANG Models के साथ RESTCONF](/learn/network-automation-devops/restconf-with-yang-models)।"
+    },
+    {
+      "id": "server",
+      "type": "code",
+      "language": "python",
+      "filename": "netops_server.py",
+      "highlight": [
+        9,
+        14,
+        16,
+        22,
+        33,
+        34,
+        40,
+        53,
+        70,
+        85,
+        93
+      ],
+      "caption": "हर क्षमता एक डेकोरेट किया हुआ Python फ़ंक्शन है। इन्वेंटरी अनुमति सूची, इनपुट जाँच और डिफ़ॉल्ट ड्राई-रन कोड में लागू होते हैं, प्रॉम्प्ट में नहीं।",
+      "code": "\"\"\"netops_server.py - a read-mostly MCP server for IOS XE routers.\"\"\"\nimport json\nimport logging\nimport os\nimport re\nfrom urllib.parse import quote\n\nimport requests\nfrom mcp.server.fastmcp import FastMCP\n\nlogging.basicConfig(level=logging.INFO)          # logs go to stderr, never stdout\nlog = logging.getLogger(\"netops\")\n\nmcp = FastMCP(\"netops\")\n\nINVENTORY = {\"edge-rtr1\": \"192.0.2.11\", \"edge-rtr2\": \"192.0.2.12\"}\nIFACE_RE = re.compile(r\"^(GigabitEthernet|TenGigabitEthernet|Loopback)\\d+(/\\d+){0,2}$\")\nHEADERS = {\"Accept\": \"application/yang-data+json\",\n           \"Content-Type\": \"application/yang-data+json\"}\n\n\ndef _check(hostname, interface):\n    if hostname not in INVENTORY:\n        raise ValueError(f\"unknown device {hostname!r}; call list_devices first\")\n    if not IFACE_RE.match(interface):\n        raise ValueError(\"interface must be a full name such as GigabitEthernet0/0/1\")\n\n\ndef _restconf(method, hostname, path, body=None):\n    resp = requests.request(\n        method, f\"https://{INVENTORY[hostname]}/restconf/data/{path}\",\n        headers=HEADERS, json=body, timeout=10,\n        auth=(os.environ[\"NETOPS_USER\"], os.environ[\"NETOPS_PASS\"]),\n        verify=os.environ.get(\"NETOPS_CA_BUNDLE\", True),\n    )\n    resp.raise_for_status()\n    return resp.json() if resp.content else {}\n\n\n@mcp.resource(\"inventory://devices\")\ndef inventory() -> str:\n    \"\"\"The devices this server is allowed to reach.\"\"\"\n    return json.dumps(INVENTORY)\n\n\n@mcp.tool()\ndef list_devices() -> list[str]:\n    \"\"\"List the hostnames this server can query.\"\"\"\n    return sorted(INVENTORY)\n\n\n@mcp.tool()\ndef get_interface_status(hostname: str, interface: str) -> dict:\n    \"\"\"Return the admin status, oper status and input errors of one interface.\n\n    hostname: a name returned by list_devices, for example edge-rtr1\n    interface: the full IOS XE name, for example GigabitEthernet0/0/1\n    \"\"\"\n    _check(hostname, interface)\n    path = f\"ietf-interfaces:interfaces-state/interface={quote(interface, safe='')}\"\n    data = _restconf(\"GET\", hostname, path)[\"ietf-interfaces:interface\"]\n    return {\"interface\": data[\"name\"],\n            \"admin_status\": data[\"admin-status\"],\n            \"oper_status\": data[\"oper-status\"],\n            \"in_errors\": int(data[\"statistics\"][\"in-errors\"])}\n\n\n@mcp.tool()\ndef set_interface_description(hostname: str, interface: str,\n                              description: str, dry_run: bool = True) -> dict:\n    \"\"\"Set an interface description. Defaults to a dry run that changes nothing.\"\"\"\n    _check(hostname, interface)\n    if not re.fullmatch(r\"[\\w .:/-]{1,80}\", description):\n        raise ValueError(\"description: 1-80 letters, digits, spaces or . : / - _\")\n    path = f\"ietf-interfaces:interfaces/interface={quote(interface, safe='')}\"\n    body = {\"ietf-interfaces:interface\": {\"name\": interface,\n                                          \"description\": description}}\n    if dry_run:\n        return {\"dry_run\": True, \"would_patch\": path, \"body\": body}\n    _restconf(\"PATCH\", hostname, path, body)\n    log.info(\"description changed on %s %s\", hostname, interface)\n    return {\"dry_run\": False, \"changed\": True}\n\n\n@mcp.prompt()\ndef troubleshoot_interface(hostname: str, interface: str) -> str:\n    \"\"\"A reusable, read-only troubleshooting prompt.\"\"\"\n    return (f\"Check {interface} on {hostname} with get_interface_status. \"\n            \"Report admin status, oper status and input errors. Change nothing.\")\n\n\nif __name__ == \"__main__\":\n    mcp.run()                     # stdio transport by default\n"
+    },
+    {
+      "id": "mcp-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "एक सवाल, एक टूल कॉल",
+      "caption": "मॉडल कभी राउटर को नहीं छूता। वह होस्ट से टूल कॉल करने को कहता है, और असल में क्या होगा यह आपका सर्वर तय करता है।",
+      "data": {
+        "actors": [
+          {
+            "id": "eng",
+            "label": "इंजीनियर",
+            "icon": "user"
+          },
+          {
+            "id": "host",
+            "label": "AI होस्ट",
+            "sub": "LLM + MCP क्लाइंट",
+            "icon": "laptop"
+          },
+          {
+            "id": "srv",
+            "label": "MCP सर्वर",
+            "sub": "netops_server.py",
+            "icon": "server"
+          },
+          {
+            "id": "rtr",
+            "label": "edge-rtr1",
+            "sub": "192.0.2.11 RESTCONF",
+            "icon": "router"
+          }
+        ],
+        "steps": [
+          {
+            "from": "host",
+            "to": "srv",
+            "label": "initialize",
+            "detail": "protocolVersion, capabilities",
+            "note": "होस्ट सर्वर को stdio पर शुरू करता है और दोनों पक्ष प्रोटोकॉल वर्ज़न और क्षमताओं पर सहमत होते हैं।"
+          },
+          {
+            "from": "host",
+            "to": "srv",
+            "label": "tools/list",
+            "note": "क्लाइंट पूछता है कि कौन-से टूल मौजूद हैं। FastMCP नाम, डॉकस्ट्रिंग और JSON Schema लौटाता है।"
+          },
+          {
+            "from": "eng",
+            "to": "host",
+            "label": "क्या edge-rtr1 पर Gi0/0/1 अप है?",
+            "note": "इंजीनियर सामान्य भाषा में पूछता है। होस्ट सवाल और टूल सूची मॉडल को देता है।"
+          },
+          {
+            "from": "host",
+            "to": "srv",
+            "label": "tools/call get_interface_status",
+            "detail": "hostname=edge-rtr1 interface=GigabitEthernet0/0/1",
+            "tone": "secure",
+            "note": "मॉडल एक टूल और आर्गुमेंट चुनता है। सर्वर से कुछ भी बाहर जाने से पहले आपका कोड दोनों को सत्यापित करता है।"
+          },
+          {
+            "from": "srv",
+            "to": "rtr",
+            "label": "GET /restconf/data/ietf-interfaces:interfaces-state/...",
+            "note": "सर्वर अपने रीड-ओनली क्रेडेंशियल उपयोग करता है और राउटर के TLS सर्टिफ़िकेट को सत्यापित करता है।"
+          },
+          {
+            "from": "rtr",
+            "to": "srv",
+            "label": "200 OK",
+            "detail": "admin-status up, oper-status down",
+            "tone": "success",
+            "note": "राउटर YANG-मॉडल्ड JSON लौटाता है।"
+          },
+          {
+            "from": "srv",
+            "to": "host",
+            "label": "परिणाम",
+            "detail": "isError=false, 4 फ़ील्ड",
+            "note": "सर्वर पूरा पेलोड लौटाने के बजाय एक छोटा, संरचित सारांश लौटाता है, जिससे मॉडल का कॉन्टेक्स्ट छोटा रहता है।"
+          },
+          {
+            "from": "host",
+            "to": "eng",
+            "label": "Admin up, oper down, 0 input errors",
+            "tone": "warning",
+            "note": "मॉडल जवाब लिखता है और केबल या दूसरे सिरे की जाँच करने का सुझाव देता है। उसने कुछ नहीं बदला।"
+          }
+        ]
+      }
+    },
+    {
+      "id": "run",
+      "type": "text",
+      "markdown": "## सर्वर चलाना और टेस्ट करना\n\nडेवलपमेंट के दौरान, सर्वर को `mcp dev` से **MCP Inspector** के अंतर्गत चलाएँ। Inspector एक लोकल वेब UI है जो क्लाइंट के रूप में जुड़ता है, आपके टूल, रिसोर्स और प्रॉम्प्ट सूचीबद्ध करता है, आपको अपने आर्गुमेंट के साथ उन्हें कॉल करने देता है, और कच्चा JSON-RPC ट्रैफ़िक दिखाता है। मॉडल को जोड़ने से पहले यहाँ हर टूल टेस्ट करें, क्योंकि जो बग Inspector में साफ़ दिखता है, उसे LLM के पैराफ़्रेज़ के ज़रिए पकड़ना कहीं ज़्यादा कठिन होता है।\n\nडेस्कटॉप AI होस्ट को जोड़ने के लिए, आप होस्ट के कॉन्फ़िगरेशन में `uv run python netops_server.py` जैसी कमांड रजिस्टर करते हैं; फिर ज़रूरत पड़ने पर होस्ट सर्वर को stdio पर शुरू करता है। एक सर्वर को पूरी टीम में साझा करने के लिए, ट्रांसपोर्ट को `mcp.run(transport=\"streamable-http\")` से बदलें और उसे TLS तथा ऑथेंटिकेशन के पीछे रखें। CI में टूल-स्तर की टेस्टिंग के लिए, सामान्य Python फ़ंक्शन को `unittest` या `pytest` से कॉल करें और `requests` को मॉक करें, ठीक वैसे जैसे आप किसी अन्य ऑटोमेशन कोड को टेस्ट करते हैं।"
+    },
+    {
+      "id": "run-term",
+      "type": "terminal",
+      "title": "सेटअप, निरीक्षण और रन",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "uv init netops-mcp && cd netops-mcp",
+          "comment": "uv से प्रोजेक्ट बनाएँ (pip install \"mcp[cli]\" भी काम करता है)"
+        },
+        {
+          "cmd": "uv add \"mcp[cli]\" requests",
+          "output": "Resolved 32 packages in 1.21s\nInstalled 30 packages in 410ms\n + mcp==1.x.x\n + requests==2.x.x\n ...",
+          "comment": "आधिकारिक MCP Python SDK इंस्टॉल करें, जिसमें FastMCP और mcp CLI शामिल हैं"
+        },
+        {
+          "cmd": "export NETOPS_USER=netops-ro NETOPS_PASS='<lab-password>'",
+          "comment": "रीड-ओनली लैब क्रेडेंशियल; इन्हें सर्वर में कभी हार्ड-कोड न करें"
+        },
+        {
+          "cmd": "uv run mcp dev netops_server.py",
+          "output": "Starting MCP inspector...\nProxy server listening on port 6277\nMCP Inspector is up and running at http://127.0.0.1:6274",
+          "comment": "सर्वर को MCP Inspector के अंतर्गत शुरू करें: टूल सूचीबद्ध करें, उन्हें कॉल करें और कच्चा JSON-RPC देखें"
+        },
+        {
+          "cmd": "uv run python netops_server.py",
+          "comment": "इसे सीधे stdio पर चलाएँ: यह कुछ प्रिंट नहीं करता और stdin पर JSON-RPC की प्रतीक्षा करता है (रोकने के लिए Ctrl+C)"
+        }
+      ],
+      "caption": "आउटपुट संक्षिप्त है; पैकेज वर्ज़न और Inspector पोर्ट आपके SDK रिलीज़ पर निर्भर करते हैं।"
+    },
+    {
+      "id": "wire",
+      "type": "code",
+      "language": "json",
+      "filename": "jsonrpc-exchange.json",
+      "caption": "Inspector तार (Wire) पर क्या दिखाता है: tools/list से खोज, फिर एक tools/call। टिप्पणियाँ पढ़ने की सुविधा के लिए जोड़ी गई हैं; असली JSON-RPC में कोई टिप्पणी नहीं होती।",
+      "code": "// Client -> server: which tools exist?\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\"}\n\n// Server -> client (one tool shown). The schema comes from the type hints.\n{\"jsonrpc\": \"2.0\", \"id\": 2, \"result\": {\"tools\": [{\n  \"name\": \"get_interface_status\",\n  \"description\": \"Return the admin status, oper status and input errors of one interface. ...\",\n  \"inputSchema\": {\"type\": \"object\",\n    \"properties\": {\"hostname\": {\"title\": \"Hostname\", \"type\": \"string\"},\n                   \"interface\": {\"title\": \"Interface\", \"type\": \"string\"}},\n    \"required\": [\"hostname\", \"interface\"]}}]}}\n\n// Client -> server: the model chose a tool and its arguments\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",\n \"params\": {\"name\": \"get_interface_status\",\n            \"arguments\": {\"hostname\": \"edge-rtr1\", \"interface\": \"GigabitEthernet0/0/1\"}}}\n\n// Server -> client: the result the model will read\n{\"jsonrpc\": \"2.0\", \"id\": 3, \"result\": {\n  \"content\": [{\"type\": \"text\", \"text\": \"{\\\"interface\\\": \\\"GigabitEthernet0/0/1\\\", \\\"admin_status\\\": \\\"up\\\", \\\"oper_status\\\": \\\"down\\\", \\\"in_errors\\\": 0}\"}],\n  \"isError\": false}}"
+    },
+    {
+      "id": "design",
+      "type": "text",
+      "markdown": "## मॉडल को सौंपने के लिए सुरक्षित टूल डिज़ाइन करना\n\nमॉडल आपके टूल को उन आर्गुमेंट के साथ कॉल करेगा जो उसे सही लगते हैं, गलत आर्गुमेंट सहित। हर आर्गुमेंट को अविश्वसनीय इनपुट मानें।\n\n- **पहले रीड-ओनली।** ऐसे टूल से शुरू करें जो केवल निरीक्षण करते हैं। राइट टूल बाद में जोड़ें, एक-एक संकीर्ण कार्य के रूप में, कभी \"कोई भी CLI कमांड चलाओ\" नहीं।\n- **अनुमति सूची और सत्यापन।** केवल ज्ञात होस्टनेम, सही फ़ॉर्मेट वाले इंटरफ़ेस नाम और सीमित स्ट्रिंग स्वीकार करें। बाकी सब कुछ स्पष्ट त्रुटि के साथ अस्वीकार करें जिस पर मॉडल कार्रवाई कर सके।\n- **सुरक्षित डिफ़ॉल्ट।** `dry_run: bool = True` पैरामीटर का अर्थ है कि मॉडल को बदलाव के लिए स्पष्ट रूप से अनुरोध करना होगा, और होस्ट उस कॉल के लिए मानव अनुमोदन आवश्यक कर सकता है।\n- **न्यूनतम विशेषाधिकार वाले क्रेडेंशियल।** सर्वर अकाउंट के पास ठीक वही RESTCONF अधिकार होने चाहिए जो उसके टूल को चाहिए, अधिमानतः TACACS+ कमांड ऑथराइज़ेशन या प्रतिबंधित रोल के ज़रिए। सीक्रेट एनवायरनमेंट या वॉल्ट से लोड करें।\n- **संक्षिप्त, संरचित परिणाम।** वे फ़ील्ड लौटाएँ जो सवाल का जवाब देते हैं, 2,000 पंक्तियों का running config नहीं। बड़े आउटपुट कॉन्टेक्स्ट बर्बाद करते हैं और तथ्यों को दबा देते हैं।\n- **ऑडिट ट्रेल।** हर राइट कॉल को लॉग करें: किसने, क्या और कब। `readOnlyHint` और `destructiveHint` जैसे टूल एनोटेशन होस्ट को यह तय करने में मदद करते हैं कि पुष्टि कब माँगनी है, लेकिन वे केवल संकेत हैं: नियमों को आपके कोड को ही लागू करना होगा।\n\nटूल के परिणाम वापस मॉडल में जाते हैं, इसलिए कोई दुर्भावनापूर्ण इंटरफ़ेस डिस्क्रिप्शन इंजेक्ट किए गए निर्देश ले जा सकता है। इस जोखिम की चर्चा [AI-आधारित ऑटोमेशन में सुरक्षा जोखिम](/learn/network-automation-devops/security-risks-in-ai-based-automation) में है।"
+    },
+    {
+      "id": "pitfalls",
+      "type": "callout",
+      "variant": "warning",
+      "title": "सीखने वाले कहाँ गलती करते हैं",
+      "markdown": "- **stdio सर्वर में stdout पर प्रिंट करना।** stdout ही प्रोटोकॉल चैनल *है*। कोई भटका हुआ `print()` JSON-RPC स्ट्रीम को बिगाड़ देता है। इसके बजाय stderr पर लॉग करें।\n- **अस्पष्ट डॉकस्ट्रिंग।** यदि डॉकस्ट्रिंग यह नहीं बताती कि `interface` पूरा नाम होना चाहिए, तो मॉडल `Gi0/0/1` भेजेगा और विफल होगा।\n- **कच्चा डिवाइस आउटपुट ही परिणाम के रूप में।** पार्स करें और सारांश दें; मॉडल एक पृष्ठ के टेक्स्ट की तुलना में चार फ़ील्ड पर बेहतर तर्क करता है।\n- **\"बस लैब के लिए\" `verify=False`।** यह अक्सर प्रोडक्शन तक पहुँच जाता है। इसके बजाय `verify` को अपने CA बंडल की ओर इंगित करें।"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "खुद आज़माएँ",
+      "markdown": "अपनी किसी लैब राउटर का उपयोग करें, उदाहरण के लिए Cisco Modeling Labs में Catalyst 8000V जिसमें `restconf` सक्षम हो और एक रीड-ओनली लोकल यूज़र हो।\n\n1. `uv init` और `uv add \"mcp[cli]\" requests` से प्रोजेक्ट बनाएँ, फिर `netops_server.py` सहेजें और `INVENTORY` में अपने लैब राउटर का पता रखें।\n2. `uv run mcp dev netops_server.py` चलाएँ। Inspector में `list_devices` कॉल करें, फिर किसी वैध इंटरफ़ेस के साथ `get_interface_status` कॉल करें।\n3. इसे फिर कॉल करें, `interface` को `Gi0/0/1` पर सेट करके और ऐसे होस्टनेम के साथ जो इन्वेंटरी में नहीं है। पुष्टि करें कि दोनों उपयोगी संदेश के साथ `isError: true` लौटाते हैं।\n4. `dry_run` के बिना `set_interface_description` कॉल करें और पुष्टि करें कि राउटर पर कुछ नहीं बदलता।\n5. एक रीड-ओनली टूल `get_ospf_neighbors(hostname)` जोड़ें जो केवल नेबर ID, स्टेट और इंटरफ़ेस लौटाए। इसे Inspector में टेस्ट करें।"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "मुख्य शब्द",
+      "items": [
+        {
+          "term": "Model Context Protocol (MCP)",
+          "definition": "एक ओपन स्टैंडर्ड जो AI एप्लिकेशन को बाहरी सर्वर द्वारा दिए गए टूल, रिसोर्स और प्रॉम्प्ट खोजने और उपयोग करने देता है।"
+        },
+        {
+          "term": "MCP होस्ट (MCP Host)",
+          "definition": "AI एप्लिकेशन, जैसे चैट क्लाइंट, IDE या बॉट, जिसके पास मॉडल रहता है और जो हर सर्वर के लिए एक MCP क्लाइंट चलाता है।"
+        },
+        {
+          "term": "MCP सर्वर (MCP Server)",
+          "definition": "एक प्रोग्राम जो MCP पर क्षमताएँ उपलब्ध कराता है और उनके पीछे का कोड चलाता है।"
+        },
+        {
+          "term": "टूल (Tool)",
+          "definition": "एक फ़ंक्शन जिसे कॉल करने के लिए मॉडल अनुरोध कर सकता है, जिसका वर्णन नाम, विवरण और उसके आर्गुमेंट के JSON Schema से होता है।"
+        },
+        {
+          "term": "रिसोर्स (Resource)",
+          "definition": "URI से पहचाना गया रीड-ओनली डेटा जिसे एप्लिकेशन मॉडल के कॉन्टेक्स्ट में लोड कर सकता है।"
+        },
+        {
+          "term": "प्रॉम्प्ट (MCP) (Prompt)",
+          "definition": "एक पुन: उपयोग योग्य, पैरामीटर वाला संदेश टेम्पलेट जिसे यूज़र चुन सकता है।"
+        },
+        {
+          "term": "FastMCP",
+          "definition": "MCP SDK में उच्च-स्तरीय Python API जो डेकोरेट किए गए फ़ंक्शन को टूल, रिसोर्स और प्रॉम्प्ट में बदल देती है।"
+        },
+        {
+          "term": "stdio ट्रांसपोर्ट (stdio Transport)",
+          "definition": "होस्ट सर्वर को सबप्रोसेस के रूप में लॉन्च करता है और stdin व stdout पर JSON-RPC संदेशों का आदान-प्रदान करता है।"
+        },
+        {
+          "term": "Streamable HTTP",
+          "definition": "दूरस्थ, साझा सर्वर के लिए MCP ट्रांसपोर्ट, जो HTTP पर चलता है और किसी भी वेब API की तरह सुरक्षित किया जाता है।"
+        },
+        {
+          "term": "MCP Inspector",
+          "definition": "mcp dev से शुरू होने वाला एक डेवलपर टूल, जो सर्वर की क्षमताओं को सूचीबद्ध करने और कॉल करने तथा कच्चा JSON-RPC देखने के लिए है।"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "अपनी समझ जाँचें",
+      "questions": [
+        {
+          "question": "FastMCP में, टूल के आर्गुमेंट का JSON Schema कहाँ से आता है?",
+          "options": [
+            "सर्वर के साथ आपकी लिखी एक YAML फ़ाइल",
+            "डेकोरेट किए गए फ़ंक्शन के Python टाइप हिंट और डिफ़ॉल्ट मान",
+            "मॉडल रन टाइम पर डॉकस्ट्रिंग से अनुमान लगाता है",
+            "MCP होस्ट पिछली कॉल से इसे जनरेट करता है"
+          ],
+          "answer": 1,
+          "explanation": "FastMCP फ़ंक्शन सिग्नेचर से inputSchema बनाता है: टाइप JSON टाइप बन जाते हैं, और बिना डिफ़ॉल्ट वाले पैरामीटर अनिवार्य हो जाते हैं। डॉकस्ट्रिंग विवरण बन जाती है।"
+        },
+        {
+          "question": "बातचीत के दौरान कौन-सा MCP प्रिमिटिव मॉडल द्वारा चुना जाता है?",
+          "options": [
+            "रिसोर्स (Resource)",
+            "प्रॉम्प्ट (Prompt)",
+            "टूल (Tool)",
+            "ट्रांसपोर्ट (Transport)"
+          ],
+          "answer": 2,
+          "explanation": "टूल मॉडल-नियंत्रित होते हैं: मॉडल तय करता है कि उन्हें कब कॉल करना है। रिसोर्स एप्लिकेशन-नियंत्रित कॉन्टेक्स्ट हैं, और प्रॉम्प्ट यूज़र द्वारा चुने गए टेम्पलेट हैं।"
+        },
+        {
+          "question": "आपका stdio सर्वर यूनिट टेस्ट में काम करता है, लेकिन पहली कॉल के बाद होस्ट अमान्य JSON रिपोर्ट करता है। सबसे संभावित कारण क्या है?",
+          "options": [
+            "सर्वर टाइप हिंट का उपयोग करता है",
+            "print() स्टेटमेंट stdout पर लिखता है, जो प्रोटोकॉल चैनल है",
+            "logging को stderr पर लिखने के लिए कॉन्फ़िगर किया गया है",
+            "टूल एक dict लौटाता है"
+          ],
+          "answer": 1,
+          "explanation": "stdio ट्रांसपोर्ट के साथ, stdout JSON-RPC संदेश ले जाता है। stdout पर कोई भी अन्य टेक्स्ट स्ट्रीम को बिगाड़ देता है, इसलिए डायग्नोस्टिक stderr पर जाने चाहिए।"
+        },
+        {
+          "question": "कौन-से डिज़ाइन विकल्प नेटवर्क MCP सर्वर को मॉडल के सामने रखना अधिक सुरक्षित बनाते हैं? (जो लागू हों वे सभी चुनें।)",
+          "options": [
+            "डिवाइसों की अनुमति सूची और सत्यापित आर्गुमेंट फ़ॉर्मेट",
+            "लचीलेपन के लिए एकल run_cli(command) टूल",
+            "राइट टूल जिनका डिफ़ॉल्ट dry_run=True हो",
+            "एनवायरनमेंट या वॉल्ट से लोड किए गए क्रेडेंशियल",
+            "हर क्वेरी के लिए पूरा running configuration लौटाना"
+          ],
+          "answer": [
+            0,
+            2,
+            3
+          ],
+          "explanation": "अनुमति सूची, सत्यापन, सुरक्षित डिफ़ॉल्ट और बाहर रखे गए न्यूनतम विशेषाधिकार वाले क्रेडेंशियल सीमित करते हैं कि गलत या बहकाई गई कॉल क्या कर सकती है। सामान्य CLI टूल और विशाल कच्चे आउटपुट इसका उल्टा करते हैं।"
+        },
+        {
+          "question": "stdio के बजाय Streamable HTTP ट्रांसपोर्ट कब चुनना चाहिए? (जो लागू हों वे सभी चुनें।)",
+          "options": [
+            "जब कई यूज़र या होस्ट को एक केंद्रीय सर्वर साझा करना हो",
+            "जब सर्वर को होस्ट से अलग मशीन पर चलना हो",
+            "जब आप किसी भी ऑथेंटिकेशन से बचना चाहते हों",
+            "जब आप केवल MCP Inspector में लोकल टेस्ट करते हों"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "Streamable HTTP दूरस्थ और साझा सर्वर के लिए उपयुक्त है, और तब उसे TLS और ऑथेंटिकेशन से सुरक्षित करना ज़रूरी है। लोकल डेवलपमेंट और एकल-यूज़र डेस्कटॉप होस्ट के लिए stdio सरल है।"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## सारांश\n\n- **MCP** मानकीकृत करता है कि AI होस्ट बाहरी क्षमताओं को कैसे खोजते और कॉल करते हैं। होस्ट क्लाइंट चलाते हैं; आपका कोड **सर्वर** है।\n- सर्वर **stdio** या **Streamable HTTP** पर JSON-RPC 2.0 के ज़रिए **टूल** (मॉडल-नियंत्रित), **रिसोर्स** (एप्लिकेशन-नियंत्रित) और **प्रॉम्प्ट** (यूज़र-चयनित) प्रदान करते हैं।\n- **FastMCP** डेकोरेट किए गए फ़ंक्शन को टूल में बदलता है, स्कीमा टाइप हिंट से और विवरण डॉकस्ट्रिंग से निकालता है।\n- मॉडल जोड़ने से पहले **MCP Inspector** (`mcp dev`) और सामान्य यूनिट टेस्ट से टेस्ट करें।\n- सर्वर को कोड में सुरक्षित बनाएँ: पहले रीड-ओनली टूल, अनुमति सूचियाँ, इनपुट सत्यापन, `dry_run` डिफ़ॉल्ट, न्यूनतम विशेषाधिकार वाले क्रेडेंशियल, छोटे संरचित परिणाम और लॉगिंग। stdio सर्वर में कभी stdout पर न लिखें।"
+    }
+  ]
+}

@@ -1,0 +1,281 @@
+{
+  "title": "Python Ağ Otomasyon Çözümleri",
+  "summary": "İdempotent, güvenli, eşzamanlı ve test edilebilir bir Python ağ otomasyon çözümü tasarlayın ve her cihaz arayüzü için doğru kütüphaneyi seçin.",
+  "objectives": [
+    "Belirli bir arayüz için requests, ncclient, Netmiko ve Nornir arasında seçim yapmak",
+    "Bir çözümü envanter, istenen durum, mantık ve raporlama olarak yapılandırmak",
+    "İdempotency, zaman aşımlarını, yeniden denemeleri ve cihaz başına hata yönetimini uygulamak",
+    "Cihaz görevlerini hedefi aşırı yüklemeden eşzamanlı çalıştırmak",
+    "Otomasyon kodunu mock'lar ve CI ile test etmek"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Bir değişiklik talebi geliyor: 40 şube yönlendiricisini yeni bir NTP sunucusuna yönlendirin. Bunu elle yapmak bir öğleden sonrayı alır ve yazım hatalarına davetiye çıkarır. Kısa bir Python betiği bunu bir dakikada yapabilir, ancak dizüstü bilgisayarınızda çalışan bir betik henüz bir *çözüm* değildir. Parolayı kodda saklıyorsa, ulaşılamayan ilk yönlendiricide çöküyorsa veya aynı değişikliği iki kez yapıyorsa, ortadan kaldırdığından daha fazla risk yaratır.\n\nBu ders, hızlı bir betiği üretimde güvenebileceğiniz bir Python ağ otomasyon çözümünden neyin ayırdığını gösterir: her arayüz için doğru kütüphane, açık bir yapı, idempotent davranış, hata yönetimi, eşzamanlılık ve testler."
+    },
+    {
+      "id": "libs",
+      "type": "text",
+      "markdown": "## Arayüze göre kütüphaneyi seçin\n\nCihazınızın sunduğu arayüz kütüphaneyi belirler. Cihazın desteklediği en üst düzey seçeneği seçin.\n\n| Arayüz | Yaygın Python kütüphanesi | Tipik kullanım |\n|:--|:--|:--|\n| SSH CLI | Netmiko, Scrapli | Eski cihazlar, `show` komutları, metin yapılandırması |\n| NETCONF (SSH üzerinden XML) | ncclient | YANG ile model güdümlü yapılandırma ve durum |\n| RESTCONF veya REST (HTTPS) | requests | IOS XE, Catalyst Center, Meraki, ACI |\n| Çok üreticili soyutlama | NAPALM, Nornir | Platformlar arasında tek API, envanter ve iş parçacığı (threading) |\n| CLI ayrıştırma | Genie parser'ları, TextFSM | `show` çıktısını sözlüklere (dictionaries) dönüştürme |\n\nCLI ayıklama (scraping) son çaredir. Çıktı metni sürümler arasında değişir; [RESTCONF](/learn/network-automation-devops/restconf-with-yang-models) üzerinden bir YANG modeli ise kararlı bir şemayla yapılandırılmış veri verir. CLI'yi yalnızca hiçbir API yoksa kullanın ve çıktısını mümkün olan en erken aşamada veriye ayrıştırın."
+    },
+    {
+      "id": "struct",
+      "type": "text",
+      "markdown": "## Bir çözümün yapısı\n\nSürdürülebilir bir çözüm dört kaygıyı ayırır:\n\n1. **Envanter (ne):** cihazları ve değişkenlerini listeleyen bir YAML veya JSON dosyası ya da NetBox gibi bir doğruluk kaynağı (source of truth). Kodun içinde cihaz adı olmaz. Bkz. [Doğruluk Kaynağı Entegrasyonu](/learn/network-automation-devops/source-of-truth-integration).\n2. **İstenen durum (nasıl görünmeli):** yapılandırmayı veya JSON yüklerini üreten değişkenler ve Jinja2 şablonları.\n3. **Mantık (ne yapılacak):** her biri tek iş yapan küçük fonksiyonlar: bağlan, oku, karşılaştır, değiştir, doğrula.\n4. **Raporlama (ne oldu):** günlük kaydı ve cihaz başına bir sonuç. Bkz. [Otomasyon Çözümleri için Günlük Kaydı](/learn/network-automation-devops/logging-for-automation-solutions).\n\nMantığı tür ipuçları (type hints) ve docstring'lerle modüller olarak paketleyin, yapılandırmayı ortam değişkenlerinde veya bir vault'ta tutun ve CI çalıştırıcısı ile dizüstü bilgisayarınızın aynı davranması için bağımlılıkları `requirements.txt` içinde sabitleyin."
+    },
+    {
+      "id": "code",
+      "type": "code",
+      "language": "python",
+      "filename": "ntp_sync.py",
+      "code": "import logging\nimport os\nfrom concurrent.futures import ThreadPoolExecutor, as_completed\n\nimport requests\nimport yaml\nfrom requests.adapters import HTTPAdapter\nfrom urllib3.util.retry import Retry\n\nlog = logging.getLogger(\"ntp-sync\")\nJSON = \"application/yang-data+json\"\n\n\ndef make_session():\n    s = requests.Session()\n    s.auth = (os.environ[\"NET_USER\"], os.environ[\"NET_PASS\"])  # never hard-code\n    s.headers.update({\"Accept\": JSON, \"Content-Type\": JSON})\n    s.verify = \"/etc/ssl/certs/lab-ca.pem\"                      # keep TLS checks on\n    retry = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])\n    s.mount(\"https://\", HTTPAdapter(max_retries=retry))\n    return s\n\n\ndef ensure_ntp(host, server):\n    url = f\"https://{host}/restconf/data/Cisco-IOS-XE-native:native\"\n    with make_session() as s:\n        r = s.get(url + \"/ntp\", timeout=10)\n        if r.status_code == 200 and server in r.text:\n            return host, \"unchanged\"                            # idempotent\n        body = {\"Cisco-IOS-XE-ntp:ntp\": {\"server\": {\"server-list\": [{\"ip-address\": server}]}}}\n        r = s.patch(url + \"/ntp\", json=body, timeout=10)\n        r.raise_for_status()\n        return host, \"changed\"\n\n\ndef main():\n    inv = yaml.safe_load(open(\"inventory.yaml\"))\n    with ThreadPoolExecutor(max_workers=5) as pool:\n        jobs = {pool.submit(ensure_ntp, h, inv[\"ntp_server\"]): h for h in inv[\"hosts\"]}\n        for job in as_completed(jobs):\n            try:\n                host, state = job.result()\n                log.info(\"%s %s\", host, state)\n            except requests.RequestException as exc:\n                log.error(\"%s FAILED %s\", jobs[job], exc)\n\n\nif __name__ == \"__main__\":\n    logging.basicConfig(level=logging.INFO, format=\"%(asctime)s %(levelname)s %(message)s\")\n    main()\n",
+      "caption": "Küçük bir RESTCONF çözümü: ortamdan alınan kimlik bilgileri, TLS doğrulaması, yeniden denemeler, bir idempotency denetimi, iş parçacıkları ve cihaz başına sonuçlar.",
+      "highlight": [
+        16,
+        17,
+        18,
+        24,
+        28,
+        29,
+        41
+      ]
+    },
+    {
+      "id": "inv",
+      "type": "code",
+      "language": "yaml",
+      "filename": "inventory.yaml",
+      "code": "ntp_server: 192.0.2.123\nhosts:\n  - 198.51.100.11\n  - 198.51.100.12\n  - 198.51.100.13\n",
+      "caption": "Envanter veridir; bu yüzden aynı kod bir laboratuvara veya üretime karşı çalışır."
+    },
+    {
+      "id": "run",
+      "type": "terminal",
+      "title": "python ntp_sync.py",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "export NET_USER=automation NET_PASS='<from-vault>'"
+        },
+        {
+          "cmd": "python ntp_sync.py",
+          "output": "2026-03-02 09:14:01,220 INFO 198.51.100.11 changed\n2026-03-02 09:14:01,305 INFO 198.51.100.13 changed\n2026-03-02 09:14:11,873 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+          "comment": "Ulaşılamayan bir yönlendirici günlüğe kaydedilir ve diğer ikisini durdurmaz."
+        },
+        {
+          "cmd": "python ntp_sync.py",
+          "output": "2026-03-02 09:15:40,114 INFO 198.51.100.11 unchanged\n2026-03-02 09:15:40,201 INFO 198.51.100.13 unchanged\n2026-03-02 09:15:50,630 ERROR 198.51.100.12 FAILED HTTPSConnectionPool(host='198.51.100.12', port=443): Max retries exceeded",
+          "comment": "İkinci çalıştırma hiçbir şeyi değiştirmez: betik idempotent'tir."
+        }
+      ],
+      "caption": "Sonuç her cihazı ayrı ayrı listeler; böylece kısmi bir başarısızlık görünür olur ve yeniden çalıştırmak güvenlidir."
+    },
+    {
+      "id": "props",
+      "type": "text",
+      "markdown": "## Üretim sınıfı bir betiğin özellikleri\n\n- **İdempotent:** önce mevcut durumu okuyun ve yalnızca farklı olanı değiştirin. Bir başarısızlıktan sonra yeniden çalıştırmak güvenli olmalıdır. Yukarıdaki betik, yama (patch) uygulamadan önce sunucuyu kontrol eder.\n- **Çalıştırma başına değil, cihaz başına başarısız olun:** en dar istisnaları yakalayın (`requests.RequestException`, çıplak `except` değil), başarısızlığı kaydedin ve devam edin. Çağıranın çıkış kodunu ayarlayabilmesi için bir sonuç nesnesi döndürün.\n- **Zaman aşımları ve yeniden denemeler:** her ağ çağrısı bir `timeout` gerektirir. Yalnızca geçici hataları (502, 503, 504, bağlantı sıfırlamaları) geri çekilmeyle (back-off) yeniden deneyin. Bir `400` veya `401` hatasını asla yeniden denemeyin.\n- **Eşzamanlılık:** ağ çağrıları G/Ç'de (I/O) bekler, bu yüzden iş parçacıkları yardımcı olur. Bir denetleyiciyi aşırı yüklememek ve hız sınırlarına takılmamak için sınırlı bir havuz (`max_workers=5`) kullanın. Bkz. [Gelişmiş REST API'leri](/learn/network-automation-devops/advanced-rest-apis-pagination-auth-and-rate-limits).\n- **Gizli bilgiler ve TLS:** kimlik bilgilerini ortamdan veya bir vault'tan okuyun ve sertifikaları bir CA paketiyle doğrulayın. Bir hatayı susturmak için asla `verify=False` ayarlamayın. Bkz. [Güvenli Kodlama](/learn/network-automation-devops/secure-coding-input-validation-and-secret-management).\n- **Deneme çalıştırması (dry run):** amaçlanan değişikliği yazdıran bir `--check` modu, gözden geçirmeyi kolaylaştırır."
+    },
+    {
+      "id": "anim",
+      "type": "animation",
+      "kind": "flow",
+      "title": "Bir otomasyon çalıştırmasının yaşam döngüsü",
+      "caption": "Her aşamanın tek bir görevi vardır ve tek başına test edilebilir.",
+      "data": {
+        "token": "Değişiklik",
+        "nodes": [
+          {
+            "id": "inv",
+            "label": "Envanter (Inventory)",
+            "sub": "YAML / NetBox",
+            "icon": "file"
+          },
+          {
+            "id": "code",
+            "label": "Python",
+            "sub": "requests / ncclient",
+            "icon": "cpu"
+          },
+          {
+            "id": "dev",
+            "label": "Cihaz (Device)",
+            "sub": "RESTCONF",
+            "icon": "router"
+          },
+          {
+            "id": "log",
+            "label": "Sonuç günlüğü (Result log)",
+            "sub": "cihaz başına",
+            "icon": "log"
+          }
+        ],
+        "steps": [
+          {
+            "at": "inv",
+            "caption": "Ana bilgisayarlar ve değişkenler koddan değil, veriden yüklenir."
+          },
+          {
+            "at": "code",
+            "caption": "Betik; kimlik bilgileri, TLS ve yeniden denemelerle tek bir oturum oluşturur."
+          },
+          {
+            "at": "dev",
+            "token": "GET",
+            "caption": "Önce mevcut durumu okur."
+          },
+          {
+            "at": "code",
+            "token": "Fark (Diff)",
+            "caption": "Durumu istenen değerle karşılaştırır ve bir değişikliğin gerekip gerekmediğine karar verir."
+          },
+          {
+            "at": "dev",
+            "token": "PATCH",
+            "caption": "Yalnızca bir fark yazmayı tetikler.",
+            "tone": "success"
+          },
+          {
+            "at": "log",
+            "caption": "Sonuç (değişti, değişmedi veya başarısız) her cihaz için günlüğe kaydedilir.",
+            "tone": "success"
+          }
+        ]
+      }
+    },
+    {
+      "id": "scale",
+      "type": "text",
+      "markdown": "## Bir betikten ekip aracına\n\nBir kişinin çalıştırdığı bir betik, başkaları ona bağımlı olduğunda bir araca dönüşür. Bu noktada birkaç alışkanlık ekleyin.\n\n- **Bir komut satırı arayüzü.** Kullanıcıların kodu düzenlemek yerine envanteri, hedef grubu ve `--check` gibi bayrakları iletmesi için `argparse` veya `click` kullanın.\n- **Anlamlı çıkış kodları.** Bir hattın (pipeline) başarısızlıkta durabilmesi için `0` değerini yalnızca her cihaz başarılı olduysa döndürün.\n- **Sürümlü sürümler.** Kodu Git'te tutun, sürümleri etiketleyin ve bağımlılık sürümlerini sabitleyin; böylece bir çalıştırma aylar sonra yeniden üretilebilir. Bkz. [Gelişmiş Git](/learn/network-automation-devops/advanced-git-merge-squash-cherry-pick-reset-and-revert).\n- **Dokümantasyon.** Amacı, girdileri, gerekli ortam değişkenlerini ve örnek bir çalıştırmayı içeren kısa bir README, bir sonraki mühendise saatler kazandırır.\n\n### Bir veri modeli seçme\n\nMetin birleştirmek yerine yapılandırılmış veriyi tercih edin. RESTCONF gövdesini bir Python sözlüğü (dictionary) olarak oluşturun ve metin birleştirmek yerine `json`'un serileştirmesine izin verin. CLI yapılandırması için değişkenlerden bir Jinja2 şablonu üretin ve önce değişkenleri doğrulayın (örneğin `pydantic` veya bir JSON Şeması ile); böylece envanterdeki bir yazım hatası bir yönlendiriciye ulaşmadan başarısız olur."
+    },
+    {
+      "id": "test",
+      "type": "text",
+      "markdown": "## Güvenmeden önce test edin\n\nCihazlarla konuşan iş mantığını test etmek zordur; bu yüzden onu ince tutun ve kararları veri alıp veri döndüren saf fonksiyonlara koyun. Bunları `pytest` ile birim testine tabi tutun ve ağı bir mock ile değiştirin (`unittest.mock` veya `responses` kütüphanesi). Testleri, `flake8` gibi bir linter'ı ve bir biçimlendirici denetimini CI'da her işlemede (commit) çalıştırın. Ardından üretimden önce [Cisco Modeling Labs](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing) kullanarak simüle edilmiş bir ağa karşı doğrulayın ve sonucu [pyATS](/learn/network-automation-devops/change-validation-with-pyats) ile doğrulayın. Ayrıca bkz. [Python Birim Testi](/learn/network-automation-devops/python-unit-testing)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Yaygın hatalar",
+      "markdown": "İstek gövdelerini veya başlıklarını günlüğe yazmayın: kimlik bilgileri içerirler. `Exception` yakalayıp `pass` yapmayın: sessiz bir başarısızlık başarı gibi görünür. \"Çalışsın diye\" sertifika denetimlerini devre dışı bırakmayın. Bunun yerine güven zincirini düzeltin."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Kullanma yetkiniz olan bir DevNet Sandbox IOS XE cihazı veya bir CML yönlendiricisi ile:\n\n1. `ntp_sync.py` ve `inventory.yaml` dosyalarını kopyalayın, envanteri kendi cihazınızla değiştirin ve `NET_USER` ile `NET_PASS` değişkenlerini dışa aktarın.\n2. İki kez çalıştırın. İlk çalıştırmanın `changed`, ikincisinin `unchanged` dediğini doğrulayın.\n3. `PATCH` göndermeden planlanan değişikliği yazdıran bir `--check` seçeneği ekleyin.\n4. `True` veya `False` döndüren `needs_change(current_json, server)` fonksiyonu için bir `pytest` testi yazın."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "İdempotent (Idempotent)",
+          "definition": "Kaç kez çalıştırılırsa çalıştırılsın aynı sonucu veren işlem."
+        },
+        {
+          "term": "Netmiko",
+          "definition": "Ağ cihazlarındaki SSH CLI oturumlarını otomatikleştiren bir Python kütüphanesi."
+        },
+        {
+          "term": "ncclient",
+          "definition": "Model güdümlü yapılandırma ve durum için bir Python NETCONF istemcisi."
+        },
+        {
+          "term": "Nornir",
+          "definition": "Cihazlar arasında envanter ve iş parçacıklı görev yürütme için bir Python çerçevesi."
+        },
+        {
+          "term": "Geri çekilmeyle yeniden deneme (Retry with back-off)",
+          "definition": "Başarısız bir çağrıyı, yalnızca geçici hatalar için, artan gecikmelerle tekrarlama."
+        },
+        {
+          "term": "Mock (sahte nesne)",
+          "definition": "Bir ağ çağrısını denetimli bir yanıtla değiştiren test yedeği (test double)."
+        },
+        {
+          "term": "Deneme çalıştırması (Dry run)",
+          "definition": "Amaçlanan değişikliği uygulamadan raporlayan bir mod."
+        },
+        {
+          "term": "requirements.txt",
+          "definition": "Bir projenin ihtiyaç duyduğu tam paket sürümlerini sabitleyen dosya."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı kontrol edin",
+      "questions": [
+        {
+          "question": "Betik neden yama (patch) uygulamadan önce NTP yapılandırmasını okur?",
+          "options": [
+            "Betiği idempotent yapmak ve gereksiz değişiklikleri önlemek için",
+            "Çünkü RESTCONF okuma olmadan yazmayı yasaklar",
+            "TLS anlaşmasını hızlandırmak için",
+            "Kimlik bilgisi kullanmaktan kaçınmak için"
+          ],
+          "answer": 0,
+          "explanation": "Mevcut ve istenen durumu karşılaştırmak, yeniden çalıştırmanın hiçbir şeyi değiştirmemesi demektir."
+        },
+        {
+          "question": "Üretim ortamındaki bir Python otomasyon betiği için hangileri iyi uygulamalardır? Uygun olanların hepsini seçin.",
+          "options": [
+            "Kimlik bilgilerini ortam değişkenlerinden veya bir vault'tan okumak",
+            "Her istek için bir zaman aşımı ayarlamak",
+            "Sertifika hatalarından kaçınmak için verify=False kullanmak",
+            "Dar istisnaları yakalayıp diğer cihazlarla devam etmek"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "Sertifika doğrulamasını devre dışı bırakmak TLS korumasını kaldırır. Diğer üçü güvenliği ve dayanıklılığı artırır."
+        },
+        {
+          "question": "YANG modelleriyle NETCONF'u destekleyen bir cihaz için hangi kütüphane uygundur?",
+          "options": [
+            "ncclient",
+            "Yalnızca TextFSM",
+            "Netmiko ile ekran ayıklama (screen scraping)",
+            "smtplib"
+          ],
+          "answer": 0,
+          "explanation": "ncclient NETCONF konuşur ve yapılandırılmış veri döndürür. CLI'yi ayıklamak son çaredir."
+        },
+        {
+          "question": "Hangi hata geri çekilmeyle (back-off) otomatik olarak yeniden denenmelidir?",
+          "options": [
+            "401 Unauthorized",
+            "400 Bad Request",
+            "503 Service Unavailable",
+            "Yanlış bir yol için 404 Not Found"
+          ],
+          "answer": 2,
+          "explanation": "503 geçicidir. 400, 401 ve 404 her seferinde aynı şekilde başarısız olur."
+        },
+        {
+          "question": "Neden sınırlı bir iş parçacığı havuzu kullanılır?",
+          "options": [
+            "Denetleyicileri aşırı yüklemekten ve hız sınırlarına takılmaktan kaçınmak için",
+            "Çünkü Python beşten fazla iş parçacığı oluşturamaz",
+            "Trafiği şifrelemek için",
+            "Günlük kaydını atlamak için"
+          ],
+          "answer": 0,
+          "explanation": "Sınırsız paralellik bir API'yi bunaltabilir ve kısıtlamayı (throttling) tetikleyebilir."
+        }
+      ]
+    },
+    {
+      "id": "sum",
+      "type": "text",
+      "markdown": "## Özet\n\n- Kütüphaneyi arayüze göre seçin: RESTCONF/REST için requests, NETCONF için ncclient, CLI için Netmiko veya Scrapli, çok üreticili işler için Nornir veya NAPALM.\n- Envanteri, istenen durumu, mantığı ve raporlamayı ayırın.\n- Her çalıştırmayı idempotent, zaman ve eşzamanlılık bakımından sınırlı ve cihaz başına yalıtılmış yapın.\n- Gizli bilgileri koddan uzak tutun, TLS doğrulamasını açık bırakın ve her sonucu günlüğe kaydedin.\n- Mantığı birim testine tabi tutun, CML'de simüle edin ve değişiklikleri pyATS ile doğrulayın."
+    }
+  ]
+}

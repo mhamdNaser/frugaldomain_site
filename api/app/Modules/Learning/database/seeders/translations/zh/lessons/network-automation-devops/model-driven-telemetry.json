@@ -1,0 +1,415 @@
+{
+  "title": "模型驱动遥测 (Model-Driven Telemetry)",
+  "summary": "通过拨入和拨出订阅、周期性和变更触发策略，以及 Telegraf、InfluxDB 和 Grafana 流水线，从 IOS XE 流式传输基于 YANG 建模的运行数据。",
+  "objectives": [
+    "对比模型驱动遥测与 SNMP 轮询",
+    "区分拨入 (dial-in) 与拨出 (dial-out) 订阅及其协议和编码",
+    "在周期性 (periodic) 与变更触发 (on-change) 更新策略之间做出选择",
+    "在 IOS XE 上配置并验证 gRPC 拨出订阅，并使用 gNMI 进行订阅",
+    "设计、保护并运维遥测采集器流水线"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "用户反映每天下午视频通话都会卡顿几秒钟。SNMP 图表却看不出任何问题：接口利用率峰值只有 40%。这些图表是对五分钟轮询取平均得到的，因此一次填满队列的 20 秒微突发流量 (microburst) 就被平均值掩盖了。\n\n**模型驱动遥测 (Model-Driven Telemetry, MDT)** 颠覆了监控方式。设备不再等待轮询器逐个询问计数器，而是将基于 YANG 建模的数据以固定间隔或在发生变化的瞬间**流式推送**给采集器。AUTOCOR 考试大纲要求你能够配置并使用 MDT：选择拨入或拨出、周期性或变更触发，选定编码和路径，并构建采集器流水线。"
+    },
+    {
+      "id": "why",
+      "type": "text",
+      "markdown": "## 为什么推送取代轮询\n\n| | SNMP 轮询 | 模型驱动遥测 |\n|:--|:--|:--|\n| 方向 | 采集器拉取，每次 OID 遍历发送一次请求 | 设备在一次订阅后主动推送 |\n| 典型粒度 | 1 到 5 分钟 | 秒级，或变化发生的瞬间 |\n| 数据模型 | MIB | YANG（原生、IETF、OpenConfig） |\n| 编码 | BER | kvGPB、GPB、JSON、XML |\n| 传输 | UDP | gRPC (HTTP/2)、基于 SSH 的 NETCONF、gNMI |\n| 设备开销 | 遍历表时 CPU 出现尖峰 | 数据只读取一次，并发送给所有接收端 |\n\n遥测使用的是你已经通过 NETCONF 和 RESTCONF 配置的**同一套 YANG 模型**；运行状态 (`-oper`) 模型提供状态数据。诸如 `/process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds` 的路径就是指向该树的 XPath。参见 [基于 YANG 模型的 YAML / JSON 配置](/learn/network-automation-devops/yaml-json-configurations-from-yang-models)。\n\nSNMP 在小型网络和老旧设备中仍有用武之地。在现代平台上，遥测是容量规划、快速故障检测和闭环自动化的数据来源。"
+    },
+    {
+      "id": "subs",
+      "type": "text",
+      "markdown": "## 订阅：拨入与拨出\n\n**订阅 (subscription)** 告诉设备发送什么（路径过滤器）、何时发送（更新策略）以及如何编码。\n\n| | 拨入（动态） | 拨出（配置式） |\n|:--|:--|:--|\n| 谁发起连接 | 采集器连接到设备 | 设备连接到接收端 |\n| 定义位置 | 在采集器的会话中 | 在设备配置中 |\n| 生命周期 | 会话关闭即结束 | 重启和重连后依然保留 |\n| IOS XE 选项 | NETCONF `establish-subscription` (XML)，gNMI `Subscribe` (JSON_IETF，默认 TCP 9339) | gRPC (`grpc-tcp` 或 `grpc-tls`)，使用 kvGPB |\n| 对防火墙的影响 | 入站到设备 | 从设备出站 |\n\n**拨入 (Dial-in)** 适合按需启动和停止的工具，例如故障排查脚本，或自行管理订阅列表的 gNMI 采集器。在 IOS XE 上，使用 `gnxi`、`gnxi secure-trustpoint <trustpoint>` 和 `gnxi secure-server` 启用 gNMI。\n\n**拨出 (Dial-out)** 适合常驻监控。订阅保存在配置中，因此可以像其他配置一样进行版本控制和部署，并且在采集器重启后会自动重新连接。\n\n### gNMI 订阅模式\n\n- **STREAM：** 长期存在的数据流。`SAMPLE` 每隔一个间隔发送一次，`ON_CHANGE` 仅发送变化，`TARGET_DEFINED` 由设备针对每条路径自行选择。\n- **ONCE：** 一次快照，随后数据流关闭。\n- **POLL：** 客户端在已打开的数据流上触发每一次更新。"
+    },
+    {
+      "id": "policy",
+      "type": "text",
+      "markdown": "## 周期性还是变更触发\n\n- **周期性 (Periodic)** 更新按固定间隔发送当前值。在 IOS XE 上，`update-policy periodic` 的单位是**厘秒**，因此 `6000` 表示 60 秒。适用于 CPU、内存、接口字节数和队列丢包等计数器和计量值。\n- **变更触发 (On-change)** 更新只在值发生变化时发送数据，并在开始时发送一次完整快照。适用于事件和变化缓慢的状态：邻居列表、接口运行状态 (oper-status)、路由邻接关系。只有平台标记为支持变更触发的路径才接受该策略。\n\n过滤器要尽量精确。以 10 秒间隔订阅整个 `-oper` 模型，每台设备可能产生数千个值，使设备和采集器都不堪重负。先从你要绘图或告警的叶节点 (leaf) 开始。"
+    },
+    {
+      "id": "dialout",
+      "type": "terminal",
+      "title": "在 IOS XE 上配置并验证拨出订阅",
+      "prompt": "R1#",
+      "lines": [
+        {
+          "cmd": "configure terminal",
+          "prompt": "R1#",
+          "output": "Enter configuration commands, one per line.  End with CNTL/Z."
+        },
+        {
+          "cmd": "telemetry ietf subscription 101",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "encoding encode-kvgpb",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "filter xpath /process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "source-address 192.0.2.1",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "stream yang-push",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "update-policy periodic 6000",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "receiver ip address 198.51.100.50 57000 protocol grpc-tcp",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "comment": "订阅 101 通过 gRPC 以 kvGPB 编码，每 60 秒（6000 厘秒）发送一次五秒 CPU 值。"
+        },
+        {
+          "cmd": "exit",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "telemetry ietf subscription 102",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "encoding encode-kvgpb",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "filter xpath /cdp-ios-xe-oper:cdp-neighbor-details/cdp-neighbor-detail",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "source-address 192.0.2.1",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "stream yang-push",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "update-policy on-change",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "receiver ip address 198.51.100.50 57000 protocol grpc-tcp",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "end",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "comment": "订阅 102 对 CDP 邻居详细信息使用变更触发策略：先发送一次初始快照，之后只发送变化。"
+        },
+        {
+          "cmd": "show telemetry ietf subscription all",
+          "prompt": "R1#",
+          "output": "  ID         Type        State       State Description\n  101        Configured  Valid       Subscription validated\n  102        Configured  Valid       Subscription validated"
+        },
+        {
+          "cmd": "show telemetry ietf subscription 101 detail",
+          "prompt": "R1#",
+          "output": "Telemetry subscription detail:\n\n  Subscription ID: 101\n  Type: Configured\n  State: Valid\n  Stream: yang-push\n  Filter:\n    Filter type: xpath\n    XPath: /process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds\n  Update policy:\n    Update Trigger: periodic\n    Period: 6000\n  Encoding: encode-kvgpb\n  Source VRF:\n  Source Address: 192.0.2.1\n  Notes:\n\n  Receivers:\n    Address                                    Port     Protocol         Protocol Profile\n    -----------------------------------------------------------------------------------------\n    198.51.100.50                              57000    grpc-tcp"
+        },
+        {
+          "cmd": "show telemetry ietf subscription 101 receiver",
+          "prompt": "R1#",
+          "output": "Telemetry subscription receivers detail:\n\n  Subscription ID: 101\n  Address: 198.51.100.50\n  Port: 57000\n  Protocol: grpc-tcp\n  Profile:\n  Connection: 1\n  State: Connected\n  Explanation:"
+        },
+        {
+          "comment": "State: Valid 表示设备已接受该路径、编码和策略。Connected 表示到接收端的 gRPC 会话已建立。"
+        },
+        {
+          "comment": "Invalid 通常意味着 XPath 错误或策略不受支持；Disconnected 则指向接收端、路由或 ACL 问题。"
+        }
+      ],
+      "caption": "实验输出。在生产环境中，请使用 protocol grpc-tls，并配合接收端配置文件 (receiver profile) 和 CA 签发的证书。"
+    },
+    {
+      "id": "seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "拨出遥测接入 TIG 技术栈",
+      "caption": "设备只需连接一次，随后持续推送；采集器写入时间序列，仪表板和告警从中读取。",
+      "data": {
+        "actors": [
+          {
+            "id": "r",
+            "label": "R1",
+            "sub": "IOS XE，订阅 101/102",
+            "icon": "router"
+          },
+          {
+            "id": "t",
+            "label": "Telegraf",
+            "sub": "198.51.100.50:57000",
+            "icon": "server"
+          },
+          {
+            "id": "db",
+            "label": "InfluxDB",
+            "sub": "存储桶 telemetry",
+            "icon": "database"
+          },
+          {
+            "id": "g",
+            "label": "Grafana",
+            "sub": "仪表板、告警",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "from": "r",
+            "to": "t",
+            "label": "gRPC 连接",
+            "detail": "源地址 192.0.2.1，TCP 57000",
+            "note": "由路由器发起连接。在拨出模式下，设备是客户端，因此设备上无需打开任何入站端口。",
+            "tone": "secure"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB 更新",
+            "detail": "订阅 101，cpu five-seconds = 7",
+            "note": "每隔 6000 厘秒（60 秒），路由器无需被询问就会推送该值。"
+          },
+          {
+            "from": "t",
+            "to": "db",
+            "label": "写入数据点",
+            "detail": "测量值 + 标签 + 字段",
+            "note": "Telegraf 解码 kvGPB，并写入带有来源和订阅标签的数据点。",
+            "tone": "success"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB 更新",
+            "detail": "订阅 101，cpu five-seconds = 82",
+            "note": "下一次采样显示 CPU 出现尖峰。每五分钟一次的 SNMP 轮询可能会错过它。"
+          },
+          {
+            "from": "t",
+            "to": "db",
+            "label": "写入数据点",
+            "detail": "同一时间序列",
+            "note": "新值加入同一条时间序列。"
+          },
+          {
+            "from": "g",
+            "to": "db",
+            "label": "查询",
+            "detail": "最近 15 分钟",
+            "note": "Grafana 查询 InfluxDB，并绘制 CPU 面板和告警规则。"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB 更新",
+            "detail": "订阅 102，变更触发：CDP 邻居丢失",
+            "note": "订阅 102 仅在 CDP 邻居出现或消失时发送数据，延迟在数秒之内。",
+            "tone": "warning"
+          },
+          {
+            "from": "g",
+            "to": "g",
+            "label": "告警",
+            "detail": "邻居中断 + CPU 偏高",
+            "note": "告警规则对两条时间序列进行关联，并通知值班工程师。",
+            "tone": "warning"
+          }
+        ]
+      }
+    },
+    {
+      "id": "telegraf",
+      "type": "code",
+      "language": "ini",
+      "filename": "telegraf.conf",
+      "caption": "Telegraf 通过 cisco_telemetry_mdt 输入插件接收 gRPC 拨出数据并写入 InfluxDB。令牌来自环境变量。",
+      "code": "# telegraf.conf - collector for IOS XE gRPC dial-out\n[[inputs.cisco_telemetry_mdt]]\n  transport = \"grpc\"\n  service_address = \":57000\"\n  ## For protocol grpc-tls on the router, present a CA-signed certificate:\n  # tls_cert = \"/etc/telegraf/certs/collector.pem\"\n  # tls_key  = \"/etc/telegraf/certs/collector.key\"\n\n[[outputs.influxdb_v2]]\n  urls = [\"http://influxdb:8086\"]\n  token = \"${INFLUX_TOKEN}\"          # injected from the environment, never committed\n  organization = \"netops\"\n  bucket = \"telemetry\"\n",
+      "highlight": [
+        2,
+        4
+      ]
+    },
+    {
+      "id": "dialin",
+      "type": "terminal",
+      "title": "使用 gnmic 的 gNMI 拨入订阅",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "gnmic -a r1.example.com:9339 -u netops -p <password-placeholder> --tls-ca ca.pem --encoding json_ietf subscribe --path \"/interfaces/interface[name=GigabitEthernet1]/state/counters/in-octets\" --mode stream --stream-mode sample --sample-interval 10s",
+          "output": "{\n  \"source\": \"r1.example.com:9339\",\n  \"subscription-name\": \"default-1762683300\",\n  \"timestamp\": 1762683302104000000,\n  \"time\": \"2026-11-09T10:15:02.104Z\",\n  \"updates\": [\n    {\n      \"Path\": \"interfaces/interface[name=GigabitEthernet1]/state/counters/in-octets\",\n      \"values\": {\n        \"interfaces/interface/state/counters/in-octets\": \"918273645\"\n      }\n    }\n  ]\n}\n... a new update arrives every 10 seconds ..."
+        },
+        {
+          "comment": "订阅由采集器打开，因此 gnmic 停止时订阅随之结束。counter64 值以字符串形式到达，这是 RFC 7951 的要求。"
+        }
+      ],
+      "caption": "实验输出（已精简）。gnmic 使用实验 CA 验证路由器证书。"
+    },
+    {
+      "id": "pipeline",
+      "type": "text",
+      "markdown": "## 采集器流水线及其运维\n\n最常见的开源技术栈是 **TIG**：**Telegraf** 负责接收和解码，**InfluxDB**（或 Prometheus）存储时间序列，**Grafana** 负责可视化和告警。在实验中可以用 Docker Compose 运行它。参见 [Docker Compose](/learn/network-automation-devops/docker-compose)。大规模部署时，接收端与存储之间会加入 Kafka 之类的消息总线，Crosswork 和 Catalyst Center 等 Cisco 平台也使用相同的数据流。\n\n### 像对待生产代码一样运维它\n\n- **保护传输。** 拨出时使用 `grpc-tls`，并配合接收端配置文件和信任点 (trustpoint)；gNMI 使用 TLS（最好是双向 TLS）。使用 CA 签发的证书，而不是自签名证书。参见 [CA 签发的 TLS 证书](/learn/network-automation-devops/ca-signed-tls-certificates)。\n- **控制源地址。** 设置 `source-address`（管理 VRF 则同时设置 `source-vrf`），使 ACL 和采集器过滤规则能够匹配它。\n- **同步时间。** 每个样本都带有设备时间戳。没有 NTP，跨设备关联就毫无意义。\n- **关注基数 (cardinality)。** 标签（设备、接口、队列）的每一种唯一组合都是一条新的时间序列。请使用稳定的标识符作为标签，不要用计数器之类的值作标签。\n- **监控监控系统本身。** 当订阅离开 `Valid` 状态、接收端不是 `Connected`，或某条时间序列停止更新时发出告警。\n- **自动化订阅。** 通过 NETCONF、RESTCONF 或 Ansible 从你的事实来源 (source of truth) 推送订阅，使新设备自动开始推送数据。参见 [事实来源集成](/learn/network-automation-devops/source-of-truth-integration)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "工程师常见的错误",
+      "markdown": "- **把周期值当作秒。** `update-policy periodic 60` 表示每 0.6 秒发送一次，而不是每分钟。\n- **混用编码和传输。** 在 IOS XE 上，gRPC 拨出使用 `encode-kvgpb`。期望 JSON 的接收端无法解码它。\n- **在 XPath 中使用模块名。** IOS XE 过滤器使用模块前缀，例如 `process-cpu-ios-xe-oper:`，而不是模块名 `Cisco-IOS-XE-process-cpu-oper`。\n- **指望所有路径都支持变更触发。** 订阅不支持变更触发的路径会被拒绝。请检查 `State` 字段。\n- **在错误的方向上阻断会话。** 拨出需要从设备到接收端端口的出站 TCP；拨入需要到设备的入站 TCP。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试试",
+      "markdown": "在 Cisco Modeling Labs 中使用一台 Catalyst 8000v，并准备一台能访问它的 Linux 虚拟机。\n\n1. 使用上面的 `telegraf.conf`，通过 Docker Compose 启动 InfluxDB、Telegraf 和 Grafana。\n2. 将路由器自身的地址作为 `source-address` 配置订阅 101，并确认 `show telemetry ietf subscription 101 receiver` 显示 `Connected`。\n3. 在 Grafana 中绘制五秒 CPU 值的曲线。在路由器上制造负载，例如运行 `show tech-support`，然后观察尖峰。\n4. 使用 `update-policy on-change` 为 CDP 邻居添加订阅 102。关闭到某个邻居的链路，测量更新到达的速度。\n5. 在路由器上启用 gNMI 并运行上面的 `gnmic` 命令。在 oper-status 路径上对比 `sample` 数据流与 `--stream-mode on-change`。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "模型驱动遥测 (Model-Driven Telemetry, MDT)",
+          "definition": "将基于 YANG 建模的运行数据从设备流式传输到采集器，而不是通过轮询获取。"
+        },
+        {
+          "term": "订阅 (Subscription)",
+          "definition": "对发送什么数据（路径）、何时发送（更新策略）以及如何发送（编码和传输）的定义。"
+        },
+        {
+          "term": "拨入 (Dial-in)",
+          "definition": "由采集器在到设备的会话上打开的动态订阅；随会话结束而结束。"
+        },
+        {
+          "term": "拨出 (Dial-out)",
+          "definition": "由设备连接到接收端的配置式订阅；保存在配置中，持续存在。"
+        },
+        {
+          "term": "周期性更新 (Periodic update)",
+          "definition": "按固定间隔发送当前值，在 IOS XE 上单位为厘秒。"
+        },
+        {
+          "term": "变更触发更新 (On-change update)",
+          "definition": "在发送初始快照之后，仅在值发生变化时发送数据。"
+        },
+        {
+          "term": "kvGPB",
+          "definition": "键值 Google Protocol Buffers，一种自描述的二进制编码，用于 IOS XE gRPC 拨出。"
+        },
+        {
+          "term": "gNMI",
+          "definition": "gRPC 网络管理接口 (gRPC Network Management Interface)，通过 gRPC 提供 Get、Set 和 Subscribe RPC。"
+        },
+        {
+          "term": "TIG 技术栈 (TIG stack)",
+          "definition": "Telegraf、InfluxDB 和 Grafana：用于采集、存储和展示遥测数据的常见开源流水线。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "工程师在 IOS XE 上配置了 'update-policy periodic 3000'。路由器多久发送一次更新？",
+          "options": [
+            "每 3,000 秒",
+            "每 30 秒",
+            "每 3 秒",
+            "每 3,000 毫秒"
+          ],
+          "answer": 1,
+          "explanation": "IOS XE 的周期值单位是厘秒（百分之一秒），因此 3000 表示 30 秒。"
+        },
+        {
+          "question": "以下哪些陈述描述了配置式拨出订阅？（选择所有适用项。）",
+          "options": [
+            "它是配置的一部分，因此重启后依然保留",
+            "由设备发起到接收端的连接",
+            "采集器关闭会话时它随之结束",
+            "它要求采集器能够入站访问设备"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "拨出订阅保存在配置中，并由设备向外发起连接。随会话结束而结束以及需要入站访问，描述的是拨入。"
+        },
+        {
+          "question": "哪种更新策略最适合 CDP 邻居和接口运行状态 (oper-status) 数据？",
+          "options": [
+            "每秒周期性",
+            "变更触发 (On-change)",
+            "每分钟一次 gNMI ONCE 请求",
+            "SNMP 轮询"
+          ],
+          "answer": 1,
+          "explanation": "邻居列表和运行状态很少变化，但一旦变化就需要立即知晓。变更触发先发送一次快照，之后只在变化发生时立即发送变化。"
+        },
+        {
+          "question": "某个拨出订阅显示 State: Valid，但接收端状态不是 Connected。你应该检查什么？（选择所有适用项。）",
+          "options": [
+            "Telegraf 是否在配置的端口上监听",
+            "ACL 或防火墙是否允许从源地址到接收端的 TCP",
+            "接收端是否能够到达该源地址",
+            "路由器是否启用了 NETCONF"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "订阅有效但没有连接，属于传输问题：监听器、经过 ACL 和防火墙的路径，以及源地址的路由。gRPC 拨出并不依赖 NETCONF。"
+        },
+        {
+          "question": "IOS XE 的 gRPC 拨出遥测使用哪种编码？",
+          "options": [
+            "encode-kvgpb",
+            "BER",
+            "JSON_IETF",
+            "CSV"
+          ],
+          "answer": 0,
+          "explanation": "IOS XE 上的 gRPC 拨出使用键值 GPB。JSON_IETF 用于 gNMI 拨入，BER 是 SNMP 的编码。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- **MDT** 以数秒的间隔或在变化发生的瞬间推送基于 YANG 建模的数据，取代 SNMP 轮询，实现快速而详细的可视性。\n- **拨入**订阅（NETCONF、gNMI）存在于采集器会话中。**拨出**订阅（使用 kvGPB 的 gRPC）存在于设备配置中，重启后依然保留。\n- **周期性**策略在 IOS XE 上使用厘秒。**变更触发**适用于受支持路径上的事件和变化缓慢的状态。\n- 使用 `show telemetry ietf subscription` 及其 `detail` 和 `receiver` 视图进行验证。\n- 构建 Telegraf、InfluxDB 和 Grafana 之类的流水线，并像对待任何生产服务一样对其进行安全加固、时间同步、容量规划和监控。\n\n接下来，请在 [自动化方案的日志记录](/learn/network-automation-devops/logging-for-automation-solutions) 中了解自动化本身应如何记录它所做的事情。"
+    }
+  ]
+}

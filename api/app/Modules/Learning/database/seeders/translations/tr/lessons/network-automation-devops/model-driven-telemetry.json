@@ -1,0 +1,415 @@
+{
+  "title": "Modele Dayalı Telemetri (Model-Driven Telemetry)",
+  "summary": "IOS XE üzerinden YANG ile modellenmiş işletim verilerini dial-in ve dial-out abonelikleri, periyodik ve değişimde (on-change) güncelleme politikaları ve Telegraf, InfluxDB ve Grafana işlem hattı ile akıtın.",
+  "objectives": [
+    "Modele dayalı telemetriyi SNMP sorgulamasıyla (polling) karşılaştırmak",
+    "Dial-in ve dial-out aboneliklerini, protokollerini ve kodlamalarını (encoding) ayırt etmek",
+    "Periyodik ve değişimde (on-change) güncelleme politikaları arasında seçim yapmak",
+    "IOS XE üzerinde gRPC dial-out aboneliklerini yapılandırmak ve doğrulamak, gNMI ile abone olmak",
+    "Bir telemetri toplayıcı (collector) işlem hattını tasarlamak, güvenli hale getirmek ve işletmek"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "Kullanıcılar, video görüşmelerinin her öğleden sonra birkaç saniye donduğunu bildiriyor. SNMP grafikleri hiçbir sorun göstermiyor: arayüz kullanımı en fazla %40'a çıkıyor. Grafikler beş dakikalık sorgulamaların ortalamasını aldığı için kuyruğu dolduran 20 saniyelik bir mikro patlama (microburst) ortalamanın içinde kayboluyor.\n\n**Modele dayalı telemetri (Model-Driven Telemetry, MDT)** izlemeyi tersine çevirir. Bir sorgulayıcının (poller) her cihazdan sayaçları istemesi yerine her cihaz, YANG ile modellenmiş veriyi ya sabit bir aralıkla ya da bir şey değiştiği anda toplayıcılara **akıtır (stream)**. AUTOCOR blueprint'i MDT'yi yapılandırmanızı ve kullanmanızı bekler: dial-in veya dial-out, periyodik veya değişimde güncelleme arasında seçim yapın, bir kodlama ve bir yol (path) belirleyin ve bir toplayıcı işlem hattı kurun."
+    },
+    {
+      "id": "why",
+      "type": "text",
+      "markdown": "## Neden itme (push) sorgulamanın (poll) yerini alıyor\n\n| | SNMP sorgulaması | Modele dayalı telemetri |\n|:--|:--|:--|\n| Yön | Toplayıcı çeker, her OID taraması için bir istek | Cihaz tek bir abonelikten sonra iter |\n| Tipik ayrıntı düzeyi | 1 ila 5 dakika | Saniyeler veya değişimin olduğu an |\n| Veri modeli | MIB'ler | YANG (yerel, IETF, OpenConfig) |\n| Kodlama | BER | kvGPB, GPB, JSON, XML |\n| Taşıma | UDP | gRPC (HTTP/2), SSH üzerinden NETCONF, gNMI |\n| Cihaz maliyeti | Taramalar tabloları gezdikçe CPU ani yükselmeleri | Veri bir kez okunur ve tüm alıcılara gönderilir |\n\nTelemetri, NETCONF ve RESTCONF ile zaten yapılandırdığınız **aynı YANG modellerini** kullanır; durum bilgisini işletim (`-oper`) modelleri sağlar. `/process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds` gibi bir yol, bu ağacın içine bir XPath'tir. Bkz. [YANG Modellerinden YAML / JSON Yapılandırmaları](/learn/network-automation-devops/yaml-json-configurations-from-yang-models).\n\nSNMP küçük ağlar ve eski cihazlar için hâlâ yerini koruyor. Modern platformlarda telemetri; kapasite planlaması, hızlı arıza tespiti ve kapalı çevrim otomasyonu (closed-loop automation) için veri kaynağıdır."
+    },
+    {
+      "id": "subs",
+      "type": "text",
+      "markdown": "## Abonelikler: dial-in ve dial-out\n\nBir **abonelik (subscription)**, cihaza neyi göndereceğini (yol filtresi), ne zaman göndereceğini (güncelleme politikası) ve nasıl kodlayacağını söyler.\n\n| | Dial-in (dinamik) | Dial-out (yapılandırılmış) |\n|:--|:--|:--|\n| Kim bağlanır | Toplayıcı cihaza bağlanır | Cihaz alıcıya bağlanır |\n| Nerede tanımlanır | Toplayıcının oturumunda | Cihaz yapılandırmasında |\n| Ömrü | Oturum kapandığında biter | Yeniden başlatmalar ve yeniden bağlanmalar boyunca kalıcıdır |\n| IOS XE seçenekleri | NETCONF `establish-subscription` (XML), gNMI `Subscribe` (JSON_IETF, varsayılan olarak TCP 9339) | kvGPB ile gRPC (`grpc-tcp` veya `grpc-tls`) |\n| Güvenlik duvarı etkisi | Cihaza gelen (inbound) | Cihazdan giden (outbound) |\n\n**Dial-in**, sorun giderme betiği veya kendi abonelik listesini yöneten bir gNMI toplayıcısı gibi, isteğe bağlı başlayıp duran araçlara uygundur. IOS XE üzerinde gNMI'yi `gnxi`, `gnxi secure-trustpoint <trustpoint>` ve `gnxi secure-server` ile etkinleştirin.\n\n**Dial-out**, sürekli çalışan izlemeye uygundur. Abonelik yapılandırmanın içinde yaşar; bu yüzden sürüm kontrolüne alınır, diğer yapılandırmalar gibi dağıtılır ve toplayıcı yeniden başlatıldıktan sonra otomatik olarak yeniden bağlanır.\n\n### gNMI abonelik modları\n\n- **STREAM:** uzun ömürlü bir akış. `SAMPLE` her aralıkta gönderir, `ON_CHANGE` yalnızca değişiklikleri gönderir, `TARGET_DEFINED` ise her yol için seçimi cihaza bırakır.\n- **ONCE:** tek bir anlık görüntü (snapshot), ardından akış kapanır.\n- **POLL:** istemci, açık bir akışta her güncellemeyi kendisi tetikler."
+    },
+    {
+      "id": "policy",
+      "type": "text",
+      "markdown": "## Periyodik mi, değişimde mi\n\n- **Periyodik (periodic)** güncellemeler, geçerli değeri sabit bir aralıkla gönderir. IOS XE'de `update-policy periodic` **santisaniye** cinsindendir; yani `6000`, 60 saniye demektir. CPU, bellek, arayüz oktetleri ve kuyruk düşürmeleri gibi sayaçlar ve göstergeler için kullanın.\n- **Değişimde (on-change)** güncellemeler, yalnızca değer değiştiğinde ve ilk tam anlık görüntüde veri gönderir. Olaylar ve yavaş değişen durumlar için kullanın: komşu listeleri, arayüz oper-status değeri, yönlendirme komşulukları. Yalnızca platformun on-change destekli olarak işaretlediği yollar bunu kabul eder.\n\nFiltreleri dar tutun. Bir `-oper` modelinin tamamına 10 saniyelik aralıkla abone olmak, cihaz başına binlerce değer üretebilir ve hem cihazı hem toplayıcıyı aşırı yükleyebilir. Grafiğini çizeceğiniz veya alarm kuracağınız yapraklarla (leaf) başlayın."
+    },
+    {
+      "id": "dialout",
+      "type": "terminal",
+      "title": "IOS XE üzerinde dial-out aboneliklerini yapılandırma ve doğrulama",
+      "prompt": "R1#",
+      "lines": [
+        {
+          "cmd": "configure terminal",
+          "prompt": "R1#",
+          "output": "Enter configuration commands, one per line.  End with CNTL/Z."
+        },
+        {
+          "cmd": "telemetry ietf subscription 101",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "encoding encode-kvgpb",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "filter xpath /process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "source-address 192.0.2.1",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "stream yang-push",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "update-policy periodic 6000",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "receiver ip address 198.51.100.50 57000 protocol grpc-tcp",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "comment": "101 numaralı abonelik, beş saniyelik CPU değerini her 60 saniyede bir (6000 santisaniye) kvGPB ile gRPC üzerinden gönderir."
+        },
+        {
+          "cmd": "exit",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "telemetry ietf subscription 102",
+          "prompt": "R1(config)#",
+          "output": ""
+        },
+        {
+          "cmd": "encoding encode-kvgpb",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "filter xpath /cdp-ios-xe-oper:cdp-neighbor-details/cdp-neighbor-detail",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "source-address 192.0.2.1",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "stream yang-push",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "update-policy on-change",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "receiver ip address 198.51.100.50 57000 protocol grpc-tcp",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "cmd": "end",
+          "prompt": "R1(config-mdt-subs)#",
+          "output": ""
+        },
+        {
+          "comment": "102 numaralı abonelik, CDP komşu ayrıntıları için on-change politikasını kullanır: önce bir anlık görüntü, sonra yalnızca değişiklikler."
+        },
+        {
+          "cmd": "show telemetry ietf subscription all",
+          "prompt": "R1#",
+          "output": "  ID         Type        State       State Description\n  101        Configured  Valid       Subscription validated\n  102        Configured  Valid       Subscription validated"
+        },
+        {
+          "cmd": "show telemetry ietf subscription 101 detail",
+          "prompt": "R1#",
+          "output": "Telemetry subscription detail:\n\n  Subscription ID: 101\n  Type: Configured\n  State: Valid\n  Stream: yang-push\n  Filter:\n    Filter type: xpath\n    XPath: /process-cpu-ios-xe-oper:cpu-usage/cpu-utilization/five-seconds\n  Update policy:\n    Update Trigger: periodic\n    Period: 6000\n  Encoding: encode-kvgpb\n  Source VRF:\n  Source Address: 192.0.2.1\n  Notes:\n\n  Receivers:\n    Address                                    Port     Protocol         Protocol Profile\n    -----------------------------------------------------------------------------------------\n    198.51.100.50                              57000    grpc-tcp"
+        },
+        {
+          "cmd": "show telemetry ietf subscription 101 receiver",
+          "prompt": "R1#",
+          "output": "Telemetry subscription receivers detail:\n\n  Subscription ID: 101\n  Address: 198.51.100.50\n  Port: 57000\n  Protocol: grpc-tcp\n  Profile:\n  Connection: 1\n  State: Connected\n  Explanation:"
+        },
+        {
+          "comment": "State: Valid, cihazın yolu, kodlamayı ve politikayı kabul ettiği anlamına gelir. Connected, alıcıya giden gRPC oturumunun açık olduğu anlamına gelir."
+        },
+        {
+          "comment": "Invalid genellikle yanlış bir XPath veya desteklenmeyen bir politika demektir; Disconnected ise alıcıyı, yönlendirmeyi veya bir ACL'yi işaret eder."
+        }
+      ],
+      "caption": "Laboratuvar çıktısı. Üretimde, bir alıcı profili (receiver profile) ve CA imzalı sertifika ile grpc-tls protokolünü kullanın."
+    },
+    {
+      "id": "seq",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "Bir TIG yığınına dial-out telemetri",
+      "caption": "Cihaz bir kez bağlanır, sonra iter; toplayıcı, panoların ve alarmların okuduğu zaman serilerini yazar.",
+      "data": {
+        "actors": [
+          {
+            "id": "r",
+            "label": "R1",
+            "sub": "IOS XE, abonelik 101/102",
+            "icon": "router"
+          },
+          {
+            "id": "t",
+            "label": "Telegraf",
+            "sub": "198.51.100.50:57000",
+            "icon": "server"
+          },
+          {
+            "id": "db",
+            "label": "InfluxDB",
+            "sub": "telemetry bucket'ı",
+            "icon": "database"
+          },
+          {
+            "id": "g",
+            "label": "Grafana",
+            "sub": "panolar, alarmlar",
+            "icon": "eye"
+          }
+        ],
+        "steps": [
+          {
+            "from": "r",
+            "to": "t",
+            "label": "gRPC bağlantısı",
+            "detail": "kaynak 192.0.2.1, TCP 57000",
+            "note": "Bağlantıyı yönlendirici açar. Dial-out'ta cihaz istemcidir; bu yüzden üzerinde gelen yönde hiçbir port açılmaz.",
+            "tone": "secure"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB güncellemesi",
+            "detail": "abonelik 101, cpu five-seconds = 7",
+            "note": "Her 6000 santisaniyede (60 saniye) yönlendirici, istenmeden değeri iter."
+          },
+          {
+            "from": "t",
+            "to": "db",
+            "label": "Noktaları yaz",
+            "detail": "ölçüm (measurement) + etiketler (tags) + alanlar (fields)",
+            "note": "Telegraf kvGPB'yi çözer ve kaynak ile abonelik etiketlerini taşıyan bir nokta yazar.",
+            "tone": "success"
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB güncellemesi",
+            "detail": "abonelik 101, cpu five-seconds = 82",
+            "note": "Sonraki örnek bir CPU yükselmesi gösterir. Beş dakikada bir yapılan SNMP sorgulaması bunu kaçırabilirdi."
+          },
+          {
+            "from": "t",
+            "to": "db",
+            "label": "Noktaları yaz",
+            "detail": "aynı seri",
+            "note": "Yeni değer aynı zaman serisine katılır."
+          },
+          {
+            "from": "g",
+            "to": "db",
+            "label": "Sorgu",
+            "detail": "son 15 dakika",
+            "note": "Grafana, InfluxDB'yi sorgular; CPU panelini ve alarm kuralını çizer."
+          },
+          {
+            "from": "r",
+            "to": "t",
+            "label": "kvGPB güncellemesi",
+            "detail": "abonelik 102, on-change: CDP komşusu kayboldu",
+            "note": "102 numaralı abonelik, yalnızca bir CDP komşusu göründüğünde veya kaybolduğunda, saniyeler içinde veri gönderir.",
+            "tone": "warning"
+          },
+          {
+            "from": "g",
+            "to": "g",
+            "label": "Alarm",
+            "detail": "komşu kapalı + CPU yüksek",
+            "note": "Alarm kuralı iki seriyi ilişkilendirir ve nöbetçi mühendisi bilgilendirir.",
+            "tone": "warning"
+          }
+        ]
+      }
+    },
+    {
+      "id": "telegraf",
+      "type": "code",
+      "language": "ini",
+      "filename": "telegraf.conf",
+      "caption": "Telegraf, cisco_telemetry_mdt girdisiyle gRPC dial-out verisini alır ve InfluxDB'ye yazar. Token, bir ortam değişkeninden gelir.",
+      "code": "# telegraf.conf - collector for IOS XE gRPC dial-out\n[[inputs.cisco_telemetry_mdt]]\n  transport = \"grpc\"\n  service_address = \":57000\"\n  ## For protocol grpc-tls on the router, present a CA-signed certificate:\n  # tls_cert = \"/etc/telegraf/certs/collector.pem\"\n  # tls_key  = \"/etc/telegraf/certs/collector.key\"\n\n[[outputs.influxdb_v2]]\n  urls = [\"http://influxdb:8086\"]\n  token = \"${INFLUX_TOKEN}\"          # injected from the environment, never committed\n  organization = \"netops\"\n  bucket = \"telemetry\"\n",
+      "highlight": [
+        2,
+        4
+      ]
+    },
+    {
+      "id": "dialin",
+      "type": "terminal",
+      "title": "gnmic ile bir gNMI dial-in aboneliği",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "gnmic -a r1.example.com:9339 -u netops -p <password-placeholder> --tls-ca ca.pem --encoding json_ietf subscribe --path \"/interfaces/interface[name=GigabitEthernet1]/state/counters/in-octets\" --mode stream --stream-mode sample --sample-interval 10s",
+          "output": "{\n  \"source\": \"r1.example.com:9339\",\n  \"subscription-name\": \"default-1762683300\",\n  \"timestamp\": 1762683302104000000,\n  \"time\": \"2026-11-09T10:15:02.104Z\",\n  \"updates\": [\n    {\n      \"Path\": \"interfaces/interface[name=GigabitEthernet1]/state/counters/in-octets\",\n      \"values\": {\n        \"interfaces/interface/state/counters/in-octets\": \"918273645\"\n      }\n    }\n  ]\n}\n... a new update arrives every 10 seconds ..."
+        },
+        {
+          "comment": "Aboneliği toplayıcı açar; bu yüzden gnmic durduğunda abonelik de biter. counter64 değeri, RFC 7951'in gerektirdiği şekilde bir dize (string) olarak gelir."
+        }
+      ],
+      "caption": "Laboratuvar çıktısı, kısaltılmış. gnmic, yönlendirici sertifikasını laboratuvar CA'sıyla doğrular."
+    },
+    {
+      "id": "pipeline",
+      "type": "text",
+      "markdown": "## Toplayıcı işlem hattı ve işletimi\n\nEn yaygın açık kaynak yığın **TIG**'dir: **Telegraf** alır ve çözer, **InfluxDB** (veya Prometheus) zaman serilerini depolar, **Grafana** ise görselleştirir ve alarm üretir. Laboratuvarda Docker Compose ile çalıştırın. Bkz. [Docker Compose](/learn/network-automation-devops/docker-compose). Büyük ölçekte alıcılarla depolama arasında Kafka gibi bir mesaj yolu (message bus) bulunur; Crosswork ve Catalyst Center gibi Cisco platformları da aynı akışları tüketir.\n\n### Üretim kodu gibi işletin\n\n- **Taşımayı güvenli hale getirin.** Dial-out için bir alıcı profili ve trustpoint ile `grpc-tls`, gNMI için TLS (tercihen karşılıklı TLS, mutual TLS) kullanın. Kendinden imzalı değil, CA imzalı sertifikalar kullanın. Bkz. [CA İmzalı TLS Sertifikaları](/learn/network-automation-devops/ca-signed-tls-certificates).\n- **Kaynağı denetleyin.** ACL'lerin ve toplayıcı filtrelerinin eşleştirebilmesi için `source-address` (ve yönetim VRF'i için `source-vrf`) ayarlayın.\n- **Zamanı eşitleyin.** Her örnek bir cihaz zaman damgası taşır. NTP olmadan cihazlar arası ilişkilendirme anlamsızdır.\n- **Kardinaliteyi (cardinality) izleyin.** Etiketlerin (cihaz, arayüz, kuyruk) her benzersiz birleşimi yeni bir seridir. Kararlı tanımlayıcılarla etiketleyin; sayaçlar gibi değerlerle etiketlemeyin.\n- **İzlemeyi izleyin.** Bir abonelik `Valid` durumundan çıktığında, bir alıcı `Connected` olmadığında veya bir seri güncellenmeyi bıraktığında alarm verin.\n- **Abonelikleri otomatikleştirin.** Bunları doğruluk kaynağınızdan (source of truth) NETCONF, RESTCONF veya Ansible ile gönderin; böylece yeni cihazlar kendiliğinden akış göndermeye başlar. Bkz. [Tek Doğru Kaynak (Source of Truth) Entegrasyonu](/learn/network-automation-devops/source-of-truth-integration)."
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "Mühendislerin yanıldığı yerler",
+      "markdown": "- **Periyodu saniye olarak okumak.** `update-policy periodic 60` her dakika değil, her 0,6 saniyede bir gönderir.\n- **Kodlamaları ve taşımaları karıştırmak.** IOS XE'de gRPC dial-out `encode-kvgpb` kullanır. JSON bekleyen bir alıcı bunu çözemez.\n- **XPath'te modül adlarını kullanmak.** IOS XE filtreleri, `Cisco-IOS-XE-process-cpu-oper` modül adını değil, `process-cpu-ios-xe-oper:` gibi modül önekini kullanır.\n- **Her yerde on-change beklemek.** On-change'i desteklemeyen bir yola yapılan abonelik reddedilir. `State` alanını kontrol edin.\n- **Oturumu yanlış yönde engellemek.** Dial-out, cihazdan alıcı portuna giden (outbound) TCP ister; dial-in ise cihaza gelen (inbound) TCP ister."
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "Kendiniz deneyin",
+      "markdown": "Cisco Modeling Labs'ta bir Catalyst 8000v ve ona erişebilen bir Linux VM kullanın.\n\n1. Yukarıdaki `telegraf.conf` ile InfluxDB, Telegraf ve Grafana'yı Docker Compose ile başlatın.\n2. 101 numaralı aboneliği, `source-address` olarak yönlendiricinin kendi adresiyle yapılandırın ve `show telemetry ietf subscription 101 receiver` komutunun `Connected` gösterdiğini doğrulayın.\n3. Grafana'da beş saniyelik CPU değerinin grafiğini çizin. Yönlendiricide, örneğin `show tech-support` çalıştırarak yük oluşturun ve yükselmeyi izleyin.\n4. `update-policy on-change` ile CDP komşuları için 102 numaralı aboneliği ekleyin. Bir komşuya giden bağlantıyı kapatın ve güncellemenin ne kadar hızlı geldiğini ölçün.\n5. Yönlendiricide gNMI'yi etkinleştirin ve yukarıdaki `gnmic` komutunu çalıştırın. Oper-status yolunda bir `sample` akışını `--stream-mode on-change` ile karşılaştırın."
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "Anahtar terimler",
+      "items": [
+        {
+          "term": "Modele dayalı telemetri (Model-Driven Telemetry, MDT)",
+          "definition": "YANG ile modellenmiş işletim verilerini sorgulamak yerine cihazlardan toplayıcılara akıtmak."
+        },
+        {
+          "term": "Abonelik (Subscription)",
+          "definition": "Hangi verinin (yol), ne zaman (güncelleme politikası) ve nasıl (kodlama ve taşıma) gönderileceğinin tanımı."
+        },
+        {
+          "term": "Dial-in",
+          "definition": "Toplayıcının cihaza açtığı bir oturumda oluşturulan dinamik abonelik; oturumla birlikte sona erer."
+        },
+        {
+          "term": "Dial-out",
+          "definition": "Cihazın alıcıya bağlandığı yapılandırılmış bir abonelik; yapılandırmada kalıcıdır."
+        },
+        {
+          "term": "Periyodik güncelleme (Periodic update)",
+          "definition": "Geçerli değeri sabit bir aralıkla göndermek; IOS XE'de santisaniye cinsindendir."
+        },
+        {
+          "term": "Değişimde güncelleme (On-change update)",
+          "definition": "İlk anlık görüntüden sonra veriyi yalnızca değer değiştiğinde göndermek."
+        },
+        {
+          "term": "kvGPB",
+          "definition": "Anahtar-değer Google Protocol Buffers; IOS XE gRPC dial-out tarafından kullanılan, kendini tanımlayan (self-describing) ikili bir kodlama."
+        },
+        {
+          "term": "gNMI",
+          "definition": "gRPC üzerinden Get, Set ve Subscribe RPC'leri sağlayan gRPC Network Management Interface."
+        },
+        {
+          "term": "TIG yığını (TIG stack)",
+          "definition": "Telegraf, InfluxDB ve Grafana: telemetriyi toplamak, depolamak ve göstermek için yaygın bir açık kaynak işlem hattı."
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "Anlayışınızı sınayın",
+      "questions": [
+        {
+          "question": "Bir mühendis IOS XE üzerinde 'update-policy periodic 3000' yapılandırıyor. Yönlendirici güncellemeleri ne sıklıkla gönderir?",
+          "options": [
+            "Her 3.000 saniyede bir",
+            "Her 30 saniyede bir",
+            "Her 3 saniyede bir",
+            "Her 3.000 milisaniyede bir"
+          ],
+          "answer": 1,
+          "explanation": "IOS XE periyodik değeri santisaniye (saniyenin yüzde biri) cinsindendir; dolayısıyla 3000, 30 saniye demektir."
+        },
+        {
+          "question": "Hangi ifadeler yapılandırılmış bir dial-out aboneliğini tanımlar? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "Yapılandırmanın parçası olduğu için yeniden başlatmadan sonra da kalır",
+            "Alıcıya bağlantıyı cihaz başlatır",
+            "Toplayıcı oturumunu kapattığında sona erer",
+            "Toplayıcıdan cihaza gelen (inbound) erişim gerektirir"
+          ],
+          "answer": [
+            0,
+            1
+          ],
+          "explanation": "Dial-out abonelikleri yapılandırmada yaşar ve cihaz dışarıya doğru bağlanır. Oturumla birlikte sona ermek ve gelen erişim gerektirmek dial-in'i tanımlar."
+        },
+        {
+          "question": "CDP komşusu ve arayüz oper-status verileri için hangi güncelleme politikası en uygundur?",
+          "options": [
+            "Her saniye periyodik",
+            "On-change",
+            "Her dakika bir gNMI ONCE isteği",
+            "SNMP sorgulaması"
+          ],
+          "answer": 1,
+          "explanation": "Komşu listeleri ve oper-status nadiren değişir ama hemen önem kazanır. On-change önce bir anlık görüntü gönderir, sonra yalnızca değişiklikleri, olur olmaz iletir."
+        },
+        {
+          "question": "Bir dial-out aboneliği State: Valid gösteriyor, ancak alıcı durumu Connected değil. Nelere bakmalısınız? (Uygun olanların hepsini seçin.)",
+          "options": [
+            "Telegraf'ın yapılandırılan portu dinlediğine",
+            "Bir ACL veya güvenlik duvarının kaynak adresinden alıcıya TCP'ye izin verdiğine",
+            "Kaynak adresine alıcıdan erişilebildiğine",
+            "Yönlendiricide NETCONF'un etkin olduğuna"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "Geçerli ama bağlantısız bir abonelik bir taşıma sorunudur: dinleyici, ACL'ler ve güvenlik duvarlarından geçen yol ve kaynak adresinin yönlendirmesi. gRPC dial-out, NETCONF'a bağlı değildir."
+        },
+        {
+          "question": "IOS XE, gRPC dial-out telemetrisi için hangi kodlamayı kullanır?",
+          "options": [
+            "encode-kvgpb",
+            "BER",
+            "JSON_IETF",
+            "CSV"
+          ],
+          "answer": 0,
+          "explanation": "IOS XE üzerinde gRPC dial-out anahtar-değer GPB kullanır. JSON_IETF gNMI dial-in tarafından kullanılır, BER ise SNMP kodlamasıdır."
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## Özet\n\n- **MDT**, YANG ile modellenmiş veriyi cihazlardan saniyelik aralıklarla veya değişim anında iter ve hızlı, ayrıntılı görünürlük için SNMP sorgulamasının yerini alır.\n- **Dial-in** abonelikleri (NETCONF, gNMI) bir toplayıcı oturumunda yaşar. **Dial-out** abonelikleri (kvGPB ile gRPC) cihaz yapılandırmasında yaşar ve yeniden başlatmalardan sonra da kalır.\n- **Periyodik** politikalar IOS XE'de santisaniye kullanır. **On-change**, desteklenen yollarda olaylar ve yavaş değişen durumlar için uygundur.\n- `show telemetry ietf subscription` komutuyla ve onun `detail` ve `receiver` görünümleriyle doğrulayın.\n- Telegraf, InfluxDB ve Grafana gibi bir işlem hattı kurun; onu herhangi bir üretim servisi gibi güvenli hale getirin, zamanını eşitleyin, boyutlandırın ve izleyin.\n\nSırada, otomasyonunuzun yaptıklarını kendisinin nasıl kaydetmesi gerektiğini [Otomasyon Çözümleri için Günlük Kaydı](/learn/network-automation-devops/logging-for-automation-solutions) dersinde öğrenin."
+    }
+  ]
+}

@@ -1,0 +1,323 @@
+{
+  "title": "用于网络配置的 Ansible",
+  "summary": "使用 Ansible 大规模配置 Cisco 设备：清单、连接插件、资源模块及其状态、检查模式、Vault，以及排查失败剧本的工作流程。",
+  "objectives": [
+    "解释 Ansible 如何通过 network_cli、netconf 和 httpapi 连接插件访问网络设备",
+    "构建带有组变量和 Vault 保护凭据的 YAML 清单 (Inventory)",
+    "选择正确的资源模块状态（merged、replaced、overridden、deleted、gathered、rendered、parsed）",
+    "使用检查模式 (Check Mode) 安全地运行剧本，并验证幂等性 (Idempotency)",
+    "排查主机不可达、权限错误、超时和非幂等任务"
+  ],
+  "blocks": [
+    {
+      "id": "intro",
+      "type": "text",
+      "markdown": "一家零售公司有 120 个分支机构，每个机构有一两台 Catalyst 接入交换机。新的 IP 电话部署需要在每台交换机上创建名为 `VOICE` 的 VLAN 30，并且每个用户端口都需要配置语音 VLAN。如果手工完成，就要进行数百次 SSH 会话，而且结果永远不会完全一致：某个分支打错了字，另一个分支漏了 `name`。\n\n**Ansible** 把这件事变成一个经过评审的文件和一条命令。你描述想要的状态，Ansible 连接到每台交换机，找出缺少什么，并且只修改这些内容。第二次运行不会改变任何东西。CCNP Automation 核心考试 (AUTOCOR 350-901) 要求你能够构建、阅读并排查用于配置 Cisco 设备的剧本 (playbook)，因此本课重点讲解 Ansible 实际上如何与网络设备通信，以及如何让运行过程安全且可重复。"
+    },
+    {
+      "id": "how",
+      "type": "text",
+      "markdown": "## Ansible 如何管理网络设备\n\nAnsible 是**无代理 (Agentless)** 的。*控制节点 (Control Node)*（你的笔记本电脑、CI 运行器或自动化服务器）保存三类内容：设备**清单 (Inventory)**、列出任务的**剧本 (Playbook)**，以及包含各模块的**集合 (Collection)**。对于服务器，Ansible 会把 Python 代码复制到目标上并在那里运行。网络操作系统无法运行这类代码，因此网络模块在**控制节点上**执行，并通过*连接插件 (Connection Plugin)* 来驱动设备。\n\n| `ansible_connection` | 传输方式 | 典型目标 |\n|:--|:--|:--|\n| `ansible.netcommon.network_cli` | 通过 SSH 访问 CLI | IOS XE、NX-OS、IOS XR、ASA |\n| `ansible.netcommon.netconf` | 基于 SSH 的 NETCONF (830) | IOS XE、IOS XR、Junos |\n| `ansible.netcommon.httpapi` | HTTPS API | NX-API、FTD/FMC、Check Point |\n| `local` | 模块自己调用 REST API | Meraki Dashboard、Catalyst Center、ACI |\n\nCisco 在 Ansible Galaxy 和 Automation Hub 上提供经过认证的集合：`cisco.ios`、`cisco.nxos`、`cisco.iosxr`、`cisco.asa`、`cisco.aci`、`cisco.meraki` 和 `cisco.dnac`（Catalyst Center）。使用 `ansible-galaxy collection install cisco.ios` 安装它们，并在 `requirements.yml` 中固定版本，使每位工程师和每条流水线运行的代码都相同。\n\n`network_cli` 会在整个 play 期间保持一个**持久连接 (Persistent Connection)**，因此包含十个任务的剧本不会登录十次。"
+    },
+    {
+      "id": "run-anim",
+      "type": "animation",
+      "kind": "sequence",
+      "title": "针对一台交换机的一个 Ansible 任务",
+      "caption": "网络模块在控制节点上运行，比较期望状态与当前状态，并且只发送差异部分。",
+      "data": {
+        "actors": [
+          {
+            "id": "eng",
+            "label": "工程师",
+            "sub": "Git + CI",
+            "icon": "user"
+          },
+          {
+            "id": "ctl",
+            "label": "控制节点",
+            "sub": "ansible-core + cisco.ios",
+            "icon": "server"
+          },
+          {
+            "id": "sw",
+            "label": "分支交换机",
+            "sub": "sw-br01 (IOS XE)",
+            "icon": "switch"
+          }
+        ],
+        "steps": [
+          {
+            "from": "eng",
+            "to": "ctl",
+            "label": "ansible-playbook vlans.yml",
+            "detail": "清单 + 剧本 + vault",
+            "note": "运行从控制节点开始。交换机上不安装任何东西：Ansible 是无代理的。"
+          },
+          {
+            "from": "ctl",
+            "to": "ctl",
+            "label": "解析清单和变量",
+            "detail": "group_vars、host_vars、vault",
+            "note": "Ansible 合并清单变量、组变量和主机变量，并在内存中解密 Vault 保护的密钥。"
+          },
+          {
+            "from": "ctl",
+            "to": "sw",
+            "label": "SSH (network_cli)",
+            "detail": "持久连接，enable",
+            "tone": "secure",
+            "note": "模块代码在控制节点上运行，并为每台设备打开一个持久 SSH 会话。"
+          },
+          {
+            "from": "ctl",
+            "to": "sw",
+            "label": "收集当前状态",
+            "detail": "show running-config | section ^vlan",
+            "note": "资源模块读取配置的相关部分，并将其解析为结构化数据。"
+          },
+          {
+            "from": "ctl",
+            "to": "ctl",
+            "label": "比较期望状态与当前状态",
+            "detail": "state: merged",
+            "note": "只有差异部分会变成命令。如果没有差异，就不会生成任何命令。"
+          },
+          {
+            "from": "ctl",
+            "to": "sw",
+            "label": "vlan 30 / name VOICE",
+            "tone": "warning",
+            "note": "在检查模式下会跳过这一步，只报告将要执行的命令。"
+          },
+          {
+            "from": "sw",
+            "to": "ctl",
+            "label": "提示符返回，无错误",
+            "tone": "success",
+            "note": "连接插件会监视 CLI 中的错误字符串，例如 '% Invalid input'。"
+          },
+          {
+            "from": "ctl",
+            "to": "eng",
+            "label": "PLAY RECAP: changed=1",
+            "tone": "success",
+            "note": "第二次运行报告 changed=0。这就是幂等性，也是定时运行得以安全的原因。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "inventory",
+      "type": "text",
+      "markdown": "## 清单和变量\n\n清单说明了存在*哪些*设备以及*如何*访问它们。YAML 清单对主机进行分组，并把变量附加到组上。在实际项目中，清单通常通过清单插件从 NetBox 之类的事实来源 (Source of Truth) 生成，详见[事实来源集成](/learn/network-automation-devops/source-of-truth-integration)。\n\n变量遵循优先级顺序。你最常用到的几种，从弱到强依次是：组变量（`group_vars/<group>.yml`）、主机变量（`host_vars/<host>.yml`）、play 变量，以及通过 `-e` 传入的额外变量。请把连接设置放在 `group_vars` 中，把站点相关数据（VLAN 列表、NTP 服务器）放在主机或组文件中，而不要放进剧本里。\n\n对于 Cisco 设备，有三个变量必不可少：`ansible_network_os`（加载哪个平台插件）、`ansible_connection`，以及当用户登录后不在特权 EXEC 模式时使用的 `ansible_become`/`ansible_become_method: enable`。"
+    },
+    {
+      "id": "inv-code",
+      "type": "code",
+      "language": "yaml",
+      "filename": "inventory.yml",
+      "caption": "在组级别设置连接变量的 YAML 清单。密码来自 Ansible Vault 变量，绝不使用明文。",
+      "highlight": [
+        11,
+        12,
+        14
+      ],
+      "code": "# inventory.yml\nall:\n  children:\n    branch_switches:\n      hosts:\n        sw-br01:\n          ansible_host: 10.20.1.11\n        sw-br02:\n          ansible_host: 10.20.2.11\n      vars:\n        ansible_network_os: cisco.ios.ios\n        ansible_connection: ansible.netcommon.network_cli\n        ansible_user: netauto\n        ansible_password: \"{{ vault_netauto_password }}\"   # defined in an encrypted vars file\n        ansible_become: true\n        ansible_become_method: enable"
+    },
+    {
+      "id": "resource",
+      "type": "text",
+      "markdown": "## 资源模块和状态\n\n较旧的剧本使用带有原始 `lines:` 和 `parents:` 的 `ios_config`。它可以工作，但比较的是文本，很容易变得非幂等。**资源模块 (Resource Module)**（`ios_vlans`、`ios_interfaces`、`ios_l2_interfaces`、`ios_l3_interfaces`、`ios_bgp_global`、`ios_acls` 等等）把一个功能建模为结构化数据，并支持一组通用的 `state` 值：\n\n| `state` | 效果 |\n|:--|:--|\n| `merged` | 添加或更新所列内容；其余保持不变 |\n| `replaced` | 使每个所列对象精确匹配；未列出的对象不受影响 |\n| `overridden` | 使整个功能与列表一致；删除所有未列出的内容 |\n| `deleted` | 删除所列对象（如果 `config` 为空，则删除整个功能） |\n| `gathered` | 读取设备并返回结构化数据，不做任何更改 |\n| `rendered` | 离线生成命令，不需要设备 |\n| `parsed` | 把保存的 `running_config` 文本转换为结构化数据 |\n\n`merged` 是安全的默认选择。`overridden` 能给你真正的声明式控制，但在接入交换机上，它也会删除别人在 Ansible 之外添加的 VLAN，因此只有当剧本确实是事实来源时才使用它。"
+    },
+    {
+      "id": "play-code",
+      "type": "code",
+      "language": "yaml",
+      "filename": "vlans.yml",
+      "caption": "使用资源模块的剧本。已注册的结果会显示为设备生成的准确命令。",
+      "highlight": [
+        8,
+        14,
+        15,
+        18,
+        30,
+        34,
+        35
+      ],
+      "code": "---\n- name: Standardize branch VLANs and access ports\n  hosts: branch_switches\n  gather_facts: false\n\n  tasks:\n    - name: Ensure standard VLANs exist\n      cisco.ios.ios_vlans:\n        config:\n          - vlan_id: 10\n            name: USERS\n          - vlan_id: 30\n            name: VOICE\n        state: merged\n      register: vlan_result\n\n    - name: Configure user access ports\n      cisco.ios.ios_l2_interfaces:\n        config:\n          - name: GigabitEthernet1/0/5\n            mode: access\n            access:\n              vlan: 10\n            voice:\n              vlan: 30\n        state: merged\n\n    - name: Show commands that were (or would be) sent\n      ansible.builtin.debug:\n        var: vlan_result.commands\n\n    - name: Save the running configuration if it differs from startup\n      cisco.ios.ios_config:\n        save_when: modified\n      when: not ansible_check_mode"
+    },
+    {
+      "id": "run",
+      "type": "terminal",
+      "title": "先检查模式，再正式运行，然后重新运行",
+      "prompt": "$",
+      "lines": [
+        {
+          "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --check --limit sw-br01",
+          "output": "Vault password: \n\nPLAY [Standardize branch VLANs and access ports] *******************************\n\nTASK [Ensure standard VLANs exist] *********************************************\nchanged: [sw-br01]\n\nTASK [Configure user access ports] *********************************************\nchanged: [sw-br01]\n\nTASK [Show commands that were (or would be) sent] ******************************\nok: [sw-br01] => {\n    \"vlan_result.commands\": [\n        \"vlan 30\",\n        \"name VOICE\"\n    ]\n}\n\nTASK [Save the running configuration if it differs from startup] ***************\nskipping: [sw-br01]\n\nPLAY RECAP *********************************************************************\nsw-br01   : ok=3    changed=2    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0"
+        },
+        {
+          "comment": "检查模式 (--check) 会连接设备、比较并报告命令，但不会发送它们。保存任务因其 when: 条件而被跳过，因为检查模式从不写入设备。"
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --limit sw-br01",
+          "output": "...\nPLAY RECAP *********************************************************************\nsw-br01   : ok=4    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+        },
+        {
+          "cmd": "ansible-playbook -i inventory.yml vlans.yml --ask-vault-pass --limit sw-br01",
+          "output": "...\nPLAY RECAP *********************************************************************\nsw-br01   : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0"
+        },
+        {
+          "comment": "第二次正式运行报告 changed=0。如果重新运行仍显示有更改，说明该任务不是幂等的：请查找 ios_config 各行中的缩写命令，或设备以不同方式规范化的值。"
+        }
+      ],
+      "caption": "添加 --diff 可为支持该选项的模块显示前后对比输出。"
+    },
+    {
+      "id": "templates",
+      "type": "text",
+      "markdown": "## 模板、角色和密钥\n\n对于较大的功能，你通常会用 **Jinja2** 模板渲染配置，并通过 `ios_config: src: ntp.j2` 推送，或者为资源模块渲染结构化数据。模板中的逻辑要保持简单：对数据的循环和少量条件判断。复杂逻辑应放在 Python 过滤器中。\n\n随着项目增长，请把它拆分为**角色 (Role)**（`roles/access_switch/tasks/main.yml`、`defaults/`、`templates/`）。角色是可复用的单元，可以单独测试，并在多个剧本之间共享。\n\n凭据应放进 **Ansible Vault**。`ansible-vault encrypt group_vars/branch_switches/vault.yml` 会加密整个文件；`ansible-vault encrypt_string` 则加密单个值。在流水线中，Vault 密码来自 CI 系统的受保护变量，而不是代码仓库。许多团队还会在**执行环境 (Execution Environment)** 中运行剧本，这是一个用 `ansible-builder` 构建、用 `ansible-navigator` 运行的容器镜像，以确保 Python 库和集合版本在各处完全一致。"
+    },
+    {
+      "id": "troubleshoot",
+      "type": "text",
+      "markdown": "## 排查失败的剧本\n\n任务失败时，从传输层向上逐层排查：\n\n1. **可达性和身份验证。** `unreachable=1` 通常意味着 SSH、主机密钥或凭据有问题。使用 `ansible sw-br01 -i inventory.yml -m cisco.ios.ios_facts --ask-vault-pass` 进行测试。\n2. **权限。** *\"unable to elevate privilege to enable mode\"*（无法提升到 enable 模式的权限）表示缺少 `ansible_become`，或者 enable 密码错误。\n3. **超时。** 在大型配置上执行 `copy` 或 `write memory` 等较慢的命令，可能需要更高的 `ansible_command_timeout`。\n4. **设备错误。** CLI 返回了 `% Invalid input`：该命令在此平台或版本上不存在。使用 `-vvv` 运行，并启用持久连接日志（`ansible.cfg` 中的 `log_path`），以查看确切的交互过程。\n5. **幂等性。** 总是显示 `changed` 的任务属于设计缺陷，而不只是外观问题，因为它会掩盖真实的配置漂移 (drift)。"
+    },
+    {
+      "id": "warn",
+      "type": "callout",
+      "variant": "warning",
+      "title": "工程师常犯的错误",
+      "markdown": "- **在没有先用检查模式运行的情况下执行 `overridden` 或 `deleted`。** 务必先运行 `--check` 并阅读生成的命令。\n- **假设每个模块都支持检查模式。** `ios_command` 无法预测命令会做什么；请用 `when: not ansible_check_mode` 来保护这类任务。\n- **在 `group_vars` 中使用明文密码。** 一旦提交到 Git，它们就永远留在历史记录中。请使用 Vault 或外部密钥管理器。\n- **忘记保存。** 更改只会落在运行配置中。请使用 `save_when: modified`（或处理程序 handler），这样重新加载就不会撤销已完成的工作。"
+    },
+    {
+      "id": "tip",
+      "type": "callout",
+      "variant": "tip",
+      "title": "考试提示",
+      "markdown": "要清楚 `merged`、`replaced` 和 `overridden` 的区别，以及哪种 `ansible_connection` 值适合某个目标（基于 SSH 的 CLI、NETCONF 或 HTTP API）。关于 Ansible 与 Terraform 及自定义代码的更全面比较，请参见[选择方法：IaC、低代码还是自定义应用](/learn/network-automation-devops/choosing-an-approach-iac-low-code-or-custom-apps)。"
+    },
+    {
+      "id": "lab",
+      "type": "callout",
+      "variant": "lab",
+      "title": "动手试一试",
+      "markdown": "使用你自己拥有的实验环境：一个 Cisco Modeling Labs 拓扑，或带有一两台 IOS XE 交换机的 DevNet 沙箱。参见 [用于测试的 Cisco Modeling Labs (CML)](/learn/network-automation-devops/cisco-modeling-labs-cml-for-testing)。\n\n1. 创建一个虚拟环境，然后运行 `pip install ansible-core ansible-pylibssh` 和 `ansible-galaxy collection install cisco.ios`。\n2. 使用你的实验环境地址构建上面的清单。把密码放进 `group_vars/branch_switches/vault.yml`，并用 `ansible-vault encrypt` 加密。\n3. 为 `ios_vlans` 运行一个 `gathered` 任务并打印结果。把它与交换机上的 `show vlan brief` 进行比较。\n4. 先用 `--check` 运行 `vlans.yml`，然后正式运行，再运行一次。确认最后一次运行显示 `changed=0`。\n5. 在交换机上手工添加一个 VLAN，然后把任务改为 `state: overridden` 并且只在检查模式下运行。阅读 Ansible 为删除你手工添加的 VLAN 会发送哪些命令。"
+    },
+    {
+      "id": "terms",
+      "type": "keyterms",
+      "title": "关键术语",
+      "items": [
+        {
+          "term": "控制节点 (Control node)",
+          "definition": "运行 Ansible 的机器。对于网络设备，模块代码也在这里执行。"
+        },
+        {
+          "term": "清单 (Inventory)",
+          "definition": "受管设备、它们所属的组以及它们的连接变量的列表。"
+        },
+        {
+          "term": "剧本 (Playbook)",
+          "definition": "由 play 和任务组成的 YAML 文件，描述期望的配置和工作顺序。"
+        },
+        {
+          "term": "集合 (Collection)",
+          "definition": "带有版本的模块、插件和角色的软件包，例如 cisco.ios。"
+        },
+        {
+          "term": "network_cli",
+          "definition": "通过持久 SSH 会话驱动设备 CLI 的连接插件。"
+        },
+        {
+          "term": "资源模块 (Resource module)",
+          "definition": "把一个配置功能建模为结构化数据，并支持 merged 和 overridden 等状态的模块。"
+        },
+        {
+          "term": "幂等性 (Idempotency)",
+          "definition": "再次运行同一任务不会产生任何进一步更改的特性。"
+        },
+        {
+          "term": "Ansible Vault",
+          "definition": "Ansible 内置的功能，用于加密保存密钥的变量和文件。"
+        }
+      ]
+    },
+    {
+      "id": "quiz",
+      "type": "quiz",
+      "title": "检查你的理解",
+      "questions": [
+        {
+          "question": "cisco.ios.ios_vlans 模块在配置交换机时，其代码在哪里运行？",
+          "options": [
+            "在交换机上，由 Ansible 复制过去之后",
+            "在控制节点上，它通过连接插件驱动交换机",
+            "在交换机 guest shell 中的容器内",
+            "在 Catalyst Center 上"
+          ],
+          "answer": 1,
+          "explanation": "网络设备无法运行 Ansible 的 Python 模块，因此网络模块在控制节点上运行，并使用 network_cli、netconf 或 httpapi 访问设备。"
+        },
+        {
+          "question": "一台交换机有 VLAN 10、20 和 99。某个任务使用 state: overridden，只列出 VLAN 10 和 30。结果是什么？",
+          "options": [
+            "存在 VLAN 10、20、30 和 99",
+            "存在 VLAN 10 和 30；20 和 99 被删除",
+            "只添加 VLAN 30",
+            "任务失败，因为 20 和 99 没有列出"
+          ],
+          "answer": 1,
+          "explanation": "overridden 会使整个功能与列表完全一致，因此未列出的 VLAN 会被删除，缺少的 VLAN 会被创建。"
+        },
+        {
+          "question": "以下哪些做法有助于在生产环境中保证 Ansible 运行安全？（选择所有适用项。）",
+          "options": [
+            "使用 --check 运行剧本并审查生成的命令",
+            "使用 Ansible Vault 或外部密钥管理器存储凭据",
+            "所有配置更改都使用 ios_command",
+            "在 requirements.yml 中固定集合版本"
+          ],
+          "answer": [
+            0,
+            1,
+            3
+          ],
+          "explanation": "检查模式、受保护的密钥和固定的版本使运行结果可预测。ios_command 用于 show 命令，无法报告某项更改将会做什么。"
+        },
+        {
+          "question": "即使没有人动过设备，某个剧本每次运行都报告 changed=2。最可能的原因是什么？",
+          "options": [
+            "清单使用 YAML 而不是 INI",
+            "某个任务不是幂等的，例如设备以不同形式存储的 ios_config 行",
+            "ansible_become 被设置为 true",
+            "持久连接超时"
+          ],
+          "answer": 1,
+          "explanation": "反复出现更改意味着比较始终无法匹配。ios_config 行中的缩写或被规范化的命令是典型原因；资源模块可以避免其中大多数问题。"
+        },
+        {
+          "question": "哪些 state 值不会对设备做任何更改？（选择所有适用项。）",
+          "options": [
+            "gathered",
+            "rendered",
+            "parsed",
+            "merged"
+          ],
+          "answer": [
+            0,
+            1,
+            2
+          ],
+          "explanation": "gathered 只读取设备，rendered 离线生成命令，parsed 把保存的文本转换为结构化数据。merged 会添加或更新配置。"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "type": "text",
+      "markdown": "## 小结\n\n- Ansible 是无代理的。对于网络设备，模块在**控制节点**上运行，并通过 `network_cli`、`netconf` 或 `httpapi` 访问设备。\n- **清单**和 `group_vars` 保存设备和连接设置；`ansible_network_os` 用于选择平台。\n- **资源模块**把功能变成结构化数据。`merged` 添加，`replaced` 修正所列对象，`overridden` 强制执行完整列表，而 `gathered`/`rendered`/`parsed` 不做任何更改。\n- 始终先运行 `--check`，重新运行时力求 `changed=0`，使用 `save_when` 保存，并把密钥放在 **Vault** 中。\n- 按照从传输层到权限再到设备错误的顺序排查，使用 `-vvv` 和持久连接日志。\n\n接下来，请在 [用于网络配置的 Terraform](/learn/network-automation-devops/terraform-for-network-configuration) 中把这种过程式方法与有状态的声明式方法进行比较，并在 [GitLab CI/CD 流水线：构建、验证与部署](/learn/network-automation-devops/gitlab-ci-cd-pipelines-build-validate-and-deploy) 中了解如何从流水线运行剧本。"
+    }
+  ]
+}
