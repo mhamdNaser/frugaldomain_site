@@ -28,8 +28,7 @@ $ttl = $theme && empty($cached['failed']) ? APPEARANCE_TTL : APPEARANCE_FAILURE_
 
 if (! $mtime || time() - $mtime >= $ttl) {
     $context = stream_context_create([
-        'http' => ['timeout' => APPEARANCE_TIMEOUT, 'ignore_errors' => true, 'header' => "Accept: application/json
-"],
+        'http' => ['timeout' => APPEARANCE_TIMEOUT, 'ignore_errors' => true, 'header' => "Accept: application/json\r\n"],
         'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
     ]);
     $body = @file_get_contents(APPEARANCE_URL, false, $context);

@@ -41,4 +41,12 @@ check(str_contains(fg_css($t), '--fg-logo-dark: url(https://x.test/d.svg)'), 'da
 $t['radius'] = 0;
 check(str_contains(fg_css($t), '--fg-radius: 0px'), 'radius 0');
 
+$t = fg_defaults();
+check(str_contains(fg_css($t), 'family=IBM+Plex+Sans+Arabic:wght@300;400;600;700&'), 'plex weights');
+$t['font_body'] = 'Tajawal';
+$t['font_heading'] = 'Noto Naskh Arabic';
+$w = fg_css($t);
+check(str_contains($w, 'family=Tajawal:wght@300;400;700&') && ! str_contains($w, 'Tajawal:wght@300;400;600'), 'tajawal has no 600');
+check(str_contains($w, 'family=Noto+Naskh+Arabic:wght@400;600;700&') && ! str_contains($w, 'Naskh+Arabic:wght@300'), 'naskh has no 300');
+
 echo "ok\n";
