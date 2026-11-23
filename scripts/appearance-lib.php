@@ -163,13 +163,49 @@ function fg_home_html(array $sections, string $lang): string
 
         return null;
     };
+    // A list's items (lang list, else en), zipped with props by index like listItems() in the app.
+    $items = function (array $sec, array $texts, array $en, string $key): array {
+        $tx = array_values(is_array($texts[$key] ?? null) && $texts[$key] ? $texts[$key] : (is_array($en[$key] ?? null) ? $en[$key] : []));
+        $props = is_array($sec['props'] ?? null) && is_array($sec['props'][$key] ?? null) ? array_values($sec['props'][$key]) : [];
+        $out = [];
+        for ($i = 0, $n = max(count($tx), count($props)); $i < $n; $i++) {
+            $out[] = (is_array($props[$i] ?? null) ? $props[$i] : []) + (is_array($tx[$i] ?? null) ? $tx[$i] : []);
+        }
+
+        return $out;
+    };
+    $has = fn (array $item, string ...$keys) => array_reduce($keys, fn ($ok, $k) => $ok && is_string($item[$k] ?? null) && trim($item[$k]) !== '', true);
+    // Types whose component renders nothing without these items (mirrors the React sections).
+    $renders = [
+        'testimonials' => fn ($it) => $has($it, 'quote'),
+        'faq' => fn ($it) => $has($it, 'q', 'a'),
+        'feature_cards' => fn ($it) => $has($it, 'title'),
+        'stats_bar' => fn ($it) => $has($it, 'label') && (in_array($it['source'] ?? null, ['icons', 'courses'], true) || (is_scalar($it['value'] ?? null) && (string) $it['value'] !== '')),
+    ];
+    $listKey = ['testimonials' => 'quotes', 'faq' => 'items', 'feature_cards' => 'cards', 'stats_bar' => 'items'];
+
     $out = '';
+    $h1 = false;
     foreach ($sections as $sec) {
         $i18n = is_array($sec['i18n'] ?? null) ? $sec['i18n'] : [];
-        if (! is_array($sec) || empty($sec['visible']) || ! is_array($i18n['en'] ?? null)) {
+        $type = is_string($sec['type'] ?? null) ? $sec['type'] : '';
+        // continue_learning depends on the visitor's own progress: nothing to show a crawler.
+        if (! is_array($sec) || empty($sec['visible']) || ! is_array($i18n['en'] ?? null) || $type === 'continue_learning') {
             continue;
         }
         $texts = is_array($i18n[$lang] ?? null) ? $i18n[$lang] : $i18n['en'];
+        if (isset($renders[$type]) && ! array_filter($items($sec, $texts, $i18n['en'], $listKey[$type]), $renders[$type])) {
+            continue;
+        }
+        if ($type === 'hero_paths' && ! $h1) {
+            $title = trim(($pick($texts, ['title']) ?? $pick($i18n['en'], ['title']) ?? '') . ' ' . ($pick($texts, ['highlight']) ?? $pick($i18n['en'], ['highlight']) ?? ''));
+            if ($title !== '') {
+                $h1 = true;
+                $para = $pick($texts, ['subtitle']) ?? $pick($i18n['en'], ['subtitle']);
+                $out .= '<section><h1>' . $e($title) . '</h1>' . ($para === null ? '' : '<p>' . $e($para) . '</p>') . '</section>';
+                continue;
+            }
+        }
         $heading = $pick($texts, ['headline', 'heading', 'title']);
         if ($heading === null) {
             $texts = $i18n['en'];
@@ -183,6 +219,22 @@ function fg_home_html(array $sections, string $lang): string
     }
 
     return $out;
+}
+
+/** The prerendered page with the sections' text as its <main>'s content (all else kept) and the sections handed to the app. */
+function fg_home_page(string $html, array $sections, string $lang): string
+{
+    // By position, not preg_replace: the json holds backslashes and dollars.
+    $script = '<script>window.__HOME_SECTIONS__=' . fg_home_json($sections) . ';</script>';
+    $open = stripos($html, '<main');
+    $openEnds = $open === false ? false : strpos($html, '>', $open);
+    $close = strripos($html, '</main>');
+    if ($openEnds !== false && $close !== false && $close > $openEnds) {
+        $html = substr($html, 0, $openEnds + 1) . fg_home_html($sections, $lang) . substr($html, $close);
+    }
+    $head = stripos($html, '</head>');
+
+    return $head === false ? $script . $html : substr($html, 0, $head) . $script . substr($html, $head);
 }
 
 function fg_home_json(array $sections): string
