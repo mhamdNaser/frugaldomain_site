@@ -108,9 +108,10 @@ function fg_css($theme): string
         $root .= "--fg-logo: url({$t['logo_url']});--fg-logo-dark: url({$t['logo_dark_url']});";
     }
 
+    // :root:root outranks the bundle's own :root defaults, which load after this sheet.
     return "@import url(\"https://fonts.googleapis.com/css2?$families&display=swap\");\n"
-        . ":root{{$root}}\n"
-        . ':root[data-theme="dark"]{' . $block($t['dark']) . "}\n";
+        . ":root:root{{$root}}\n"
+        . ':root:root[data-theme="dark"]{' . $block($t['dark']) . "}\n";
 }
 
 // FG_API_BASE (e.g. http://127.0.0.1:8765/api) points a local stack at a local api; production leaves it unset.
