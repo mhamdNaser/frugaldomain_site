@@ -4,8 +4,10 @@ namespace App\Modules\Appearance\Controllers;
 
 use App\Http\Controllers\Controller;
 use App\Modules\Appearance\Models\SiteSetting;
+use App\Modules\Appearance\Requests\UpdateHomeSectionsRequest;
 use App\Modules\Appearance\Requests\UpdateThemeRequest;
 use App\Modules\Appearance\Support\AppearanceDefaults;
+use App\Modules\Appearance\Support\SectionSanitizer;
 use Illuminate\Http\JsonResponse;
 
 class AppearanceController extends Controller
@@ -27,6 +29,14 @@ class AppearanceController extends Controller
         SiteSetting::put('theme', $theme);
 
         return response()->json($theme);
+    }
+
+    public function updateHomeSections(UpdateHomeSectionsRequest $request): JsonResponse
+    {
+        $sections = SectionSanitizer::clean($request->validated('sections'));
+        SiteSetting::put('home_sections', $sections);
+
+        return response()->json($sections);
     }
 
     private function theme(): array

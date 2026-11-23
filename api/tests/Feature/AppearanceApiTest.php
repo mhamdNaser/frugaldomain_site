@@ -60,3 +60,45 @@ it('validates colours and fonts', function () {
     }
     $this->putJson('/api/admin/appearance/theme', ['logo_url' => '/images/logo.svg'])->assertOk();
 });
+
+it('rejects trailing newline and backslash tricks', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    // TrimStrings strips a trailing newline over HTTP, so assert the regexes directly (defence in depth).
+    expect(preg_match(\App\Modules\Appearance\Support\AppearanceDefaults::HEX_REGEX, "#112233\n"))->toBe(0)
+        ->and(preg_match(\App\Modules\Appearance\Support\AppearanceDefaults::LINK_REGEX, "/\\evil.com"))->toBe(0);
+    $this->putJson('/api/admin/appearance/theme', ['logo_url' => '/\\evil.com'])->assertStatus(422);
+});
+
+function section(array $o = []): array
+{
+    return array_merge(['id' => 's1', 'type' => 'hero_paths', 'visible' => true, 'props' => [], 'i18n' => []], $o);
+}
+
+it('saves and returns sections in order', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['id' => 'b']), section(['id' => 'a', 'type' => 'faq'])]])
+        ->assertOk()->assertJsonPath('0.id', 'b');
+    $this->getJson('/api/site/appearance')->assertJsonPath('home_sections.0.id', 'b')->assertJsonPath('home_sections.1.id', 'a');
+});
+
+it('rejects unknown section types', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['type' => 'nope'])]])->assertStatus(422);
+});
+
+it('rejects javascript links anywhere', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['props' => ['cards' => [['link' => 'javascript:x']]]])]])->assertStatus(422);
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['props' => ['color' => 'red']])]])->assertStatus(422);
+});
+
+it('strips html from text', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['i18n' => ['en' => ['headline' => '<b>Hi</b><script>x</script>']]])]])
+        ->assertOk()->assertJsonPath('0.i18n.en.headline', 'Hix');
+});
+
+it('rejects unknown languages', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['i18n' => ['fr' => ['headline' => 'x']]])]])->assertStatus(422);
+});

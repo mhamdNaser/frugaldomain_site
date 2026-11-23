@@ -8,6 +8,19 @@ class AppearanceDefaults
         'IBM Plex Sans Arabic', 'Readex Pro', 'Noto Kufi Arabic', 'Tajawal', 'Cairo', 'Noto Naskh Arabic',
     ];
 
+    public const SECTION_TYPES = [
+        'hero_paths', 'stats_bar', 'continue_learning', 'feature_cards', 'image_text', 'cta_banner',
+        'testimonials', 'faq', 'forms_showcase', 'learn_showcase', 'icons_showcase', 'draw_simulate',
+        'image_tools', 'dev_tools', 'components_showcase', 'apps_showcase', 'programs_showcase',
+    ];
+
+    public const LANGUAGES = ['en', 'ar', 'hi', 'zh', 'tr'];
+
+    /** http(s) or a single-slash relative path (no `//` or `/\`); D stops a trailing-newline bypass. */
+    public const LINK_REGEX = '#^(https?://|/(?![/\x5c]))#D';
+
+    public const HEX_REGEX = '/^#[0-9a-fA-F]{6}$/D';
+
     public static function theme(): array
     {
         return [
