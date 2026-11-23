@@ -38,6 +38,10 @@ $ok = fg_css($t);
 check(str_contains($ok, '--fg-logo: url(/uploads/logo.png)') && str_contains($ok, '--fg-logo-dark: url(/uploads/logo.png)'), 'logo fallback');
 $t['logo_dark_url'] = 'https://x.test/d.svg';
 check(str_contains(fg_css($t), '--fg-logo-dark: url(https://x.test/d.svg)'), 'dark logo');
+$d = fg_defaults();
+$d['logo_dark_url'] = '/uploads/dark.svg';
+$darkOnly = fg_css($d);
+check(str_contains($darkOnly, '--fg-logo-dark: url(/uploads/dark.svg)') && ! str_contains($darkOnly, '--fg-logo:'), 'dark-only logo');
 $t['radius'] = 0;
 check(str_contains(fg_css($t), '--fg-radius: 0px'), 'radius 0');
 
@@ -48,5 +52,13 @@ $t['font_heading'] = 'Noto Naskh Arabic';
 $w = fg_css($t);
 check(str_contains($w, 'family=Tajawal:wght@300;400;700&') && ! str_contains($w, 'Tajawal:wght@300;400;600'), 'tajawal has no 600');
 check(str_contains($w, 'family=Noto+Naskh+Arabic:wght@400;600;700&') && ! str_contains($w, 'Naskh+Arabic:wght@300'), 'naskh has no 300');
+
+$dir = sys_get_temp_dir() . '/fg-check-' . getmypid();
+@mkdir($dir);
+fg_write_cache("$dir/c.json", '{"a":1}');
+fg_write_cache("$dir/c.json", '{"a":2}');
+check(file_get_contents("$dir/c.json") === '{"a":2}' && glob("$dir/*.tmp") === [], 'atomic cache write replaces, leaves no tmp');
+array_map('unlink', glob("$dir/*"));
+rmdir($dir);
 
 echo "ok\n";

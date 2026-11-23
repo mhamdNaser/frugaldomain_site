@@ -104,8 +104,12 @@ function fg_css($theme): string
         . '--fg-font-body: ' . $stack($t['font_body']) . ';'
         . '--fg-font-heading: ' . $stack($t['font_heading']) . ';'
         . "--fg-radius: {$t['radius']}px;";
+    // Independent: a dark-only logo still prints (the CSS falls back light -> default itself).
     if ($t['logo_url']) {
-        $root .= "--fg-logo: url({$t['logo_url']});--fg-logo-dark: url({$t['logo_dark_url']});";
+        $root .= "--fg-logo: url({$t['logo_url']});";
+    }
+    if ($t['logo_dark_url']) {
+        $root .= "--fg-logo-dark: url({$t['logo_dark_url']});";
     }
 
     // :root:root outranks the bundle's own :root defaults, which load after this sheet.
@@ -123,7 +127,8 @@ const FG_APPEARANCE_TIMEOUT = 2.5;
 /** The api's appearance payload (theme, home_sections), cached on disk; a failing api serves the stale copy, then []. */
 function fg_fetch_appearance(): array
 {
-    $cacheFile = sys_get_temp_dir() . '/fruga-appearance.json';
+    // Keyed by the api url, so a local stack and production never share a cache.
+    $cacheFile = sys_get_temp_dir() . '/fruga-appearance-' . md5(FG_APPEARANCE_URL) . '.json';
     $raw = @file_get_contents($cacheFile);
     $cached = $raw === false ? null : json_decode($raw, true);
     $payload = is_array($cached['theme'] ?? null) ? ['theme' => $cached['theme'], 'home_sections' => is_array($cached['home_sections'] ?? null) ? $cached['home_sections'] : []] : [];
@@ -140,14 +145,23 @@ function fg_fetch_appearance(): array
         $data = $body ? json_decode($body, true) : null;
         if (is_array($data['theme'] ?? null)) {
             $payload = ['theme' => $data['theme'], 'home_sections' => is_array($data['home_sections'] ?? null) ? $data['home_sections'] : []];
-            @file_put_contents($cacheFile, json_encode($payload));
+            fg_write_cache($cacheFile, json_encode($payload));
         } else {
             // Keep the stale payload (or none) and do not refetch for a few seconds.
-            @file_put_contents($cacheFile, json_encode($payload + ['theme' => null, 'failed' => true]));
+            fg_write_cache($cacheFile, json_encode($payload + ['theme' => null, 'failed' => true]));
         }
     }
 
     return $payload;
+}
+
+/** tmp + rename, so a concurrent reader never sees a half-written file. */
+function fg_write_cache(string $file, string $json): void
+{
+    $tmp = $file . '.' . getmypid() . '.' . mt_rand() . '.tmp';
+    if (@file_put_contents($tmp, $json) === false || ! @rename($tmp, $file)) {
+        @unlink($tmp);
+    }
 }
 
 /** Visible sections as crawlable text, in $lang with English as the fallback; no English headline, no section. */
