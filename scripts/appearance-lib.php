@@ -113,7 +113,8 @@ function fg_css($theme): string
         . ':root[data-theme="dark"]{' . $block($t['dark']) . "}\n";
 }
 
-const FG_APPEARANCE_URL = 'https://api.frugaldomain.site/api/site/appearance';
+// FG_API_BASE (e.g. http://127.0.0.1:8765/api) points a local stack at a local api; production leaves it unset.
+define('FG_APPEARANCE_URL', rtrim(getenv('FG_API_BASE') ?: 'https://api.frugaldomain.site/api', '/') . '/site/appearance');
 const FG_APPEARANCE_TTL = 60;
 const FG_APPEARANCE_FAILURE_TTL = 15;
 const FG_APPEARANCE_TIMEOUT = 2.5;
