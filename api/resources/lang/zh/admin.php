@@ -1071,6 +1071,8 @@ return array (
   'Low contrast' => '对比度低',
   '{count} colour pairs are below 4.5:1 and may be hard to read. Save anyway?' => '{count} 组颜色的对比度低于 4.5:1，可能难以阅读。仍要保存吗？',
   'Save anyway' => '仍然保存',
+  'Could not load the appearance settings.' => '无法加载外观设置。',
+  'Try again' => '重试',
   'Something went wrong' => '出了点问题',
   'Brand & colours' => '品牌与颜色',
   'Appearance' => '外观',

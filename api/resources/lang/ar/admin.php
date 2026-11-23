@@ -1088,6 +1088,8 @@ return array (
   'Low contrast' => 'تباين منخفض',
   '{count} colour pairs are below 4.5:1 and may be hard to read. Save anyway?' => '{count} من أزواج الألوان أقل من 4.5:1 وقد يصعب قراءتها. هل تريد الحفظ على أي حال؟',
   'Save anyway' => 'احفظ على أي حال',
+  'Could not load the appearance settings.' => 'تعذّر تحميل إعدادات المظهر.',
+  'Try again' => 'أعد المحاولة',
   'Something went wrong' => 'حدث خطأ ما',
   'Brand & colours' => 'الهوية والألوان',
   'Appearance' => 'المظهر',

@@ -1071,6 +1071,8 @@ return array (
   'Low contrast' => 'कम कंट्रास्ट',
   '{count} colour pairs are below 4.5:1 and may be hard to read. Save anyway?' => '{count} रंग जोड़ियाँ 4.5:1 से कम हैं और पढ़ने में कठिन हो सकती हैं। फिर भी सहेजें?',
   'Save anyway' => 'फिर भी सहेजें',
+  'Could not load the appearance settings.' => 'दिखावट की सेटिंग लोड नहीं हो सकीं।',
+  'Try again' => 'फिर से कोशिश करें',
   'Something went wrong' => 'कुछ गलत हो गया',
   'Brand & colours' => 'ब्रांड और रंग',
   'Appearance' => 'रूप-रंग',

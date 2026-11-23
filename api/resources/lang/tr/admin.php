@@ -1071,6 +1071,8 @@ return array (
   'Low contrast' => 'Düşük kontrast',
   '{count} colour pairs are below 4.5:1 and may be hard to read. Save anyway?' => '{count} renk çifti 4.5:1 değerinin altında ve okunması zor olabilir. Yine de kaydedilsin mi?',
   'Save anyway' => 'Yine de kaydet',
+  'Could not load the appearance settings.' => 'Görünüm ayarları yüklenemedi.',
+  'Try again' => 'Tekrar dene',
   'Something went wrong' => 'Bir şeyler ters gitti',
   'Brand & colours' => 'Marka ve renkler',
   'Appearance' => 'Görünüm',
