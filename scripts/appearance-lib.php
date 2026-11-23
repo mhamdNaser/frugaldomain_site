@@ -112,3 +112,78 @@ function fg_css($theme): string
         . ":root{{$root}}\n"
         . ':root[data-theme="dark"]{' . $block($t['dark']) . "}\n";
 }
+
+const FG_APPEARANCE_URL = 'https://api.frugaldomain.site/api/site/appearance';
+const FG_APPEARANCE_TTL = 60;
+const FG_APPEARANCE_FAILURE_TTL = 15;
+const FG_APPEARANCE_TIMEOUT = 2.5;
+
+/** The api's appearance payload (theme, home_sections), cached on disk; a failing api serves the stale copy, then []. */
+function fg_fetch_appearance(): array
+{
+    $cacheFile = sys_get_temp_dir() . '/fruga-appearance.json';
+    $raw = @file_get_contents($cacheFile);
+    $cached = $raw === false ? null : json_decode($raw, true);
+    $payload = is_array($cached['theme'] ?? null) ? ['theme' => $cached['theme'], 'home_sections' => is_array($cached['home_sections'] ?? null) ? $cached['home_sections'] : []] : [];
+    $mtime = $raw === false ? 0 : (int) @filemtime($cacheFile);
+    // A failure marker, a missing theme or a corrupt file is only trusted for the short window.
+    $ttl = $payload && empty($cached['failed']) ? FG_APPEARANCE_TTL : FG_APPEARANCE_FAILURE_TTL;
+
+    if (! $mtime || time() - $mtime >= $ttl) {
+        $context = stream_context_create([
+            'http' => ['timeout' => FG_APPEARANCE_TIMEOUT, 'ignore_errors' => true, 'header' => "Accept: application/json\r\n"],
+            'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
+        ]);
+        $body = @file_get_contents(FG_APPEARANCE_URL, false, $context);
+        $data = $body ? json_decode($body, true) : null;
+        if (is_array($data['theme'] ?? null)) {
+            $payload = ['theme' => $data['theme'], 'home_sections' => is_array($data['home_sections'] ?? null) ? $data['home_sections'] : []];
+            @file_put_contents($cacheFile, json_encode($payload));
+        } else {
+            // Keep the stale payload (or none) and do not refetch for a few seconds.
+            @file_put_contents($cacheFile, json_encode($payload + ['theme' => null, 'failed' => true]));
+        }
+    }
+
+    return $payload;
+}
+
+/** Visible sections as crawlable text, in $lang with English as the fallback; no English headline, no section. */
+function fg_home_html(array $sections, string $lang): string
+{
+    $e = fn ($s) => htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $pick = function (array $texts, array $keys) {
+        foreach ($keys as $k) {
+            if (isset($texts[$k]) && is_string($texts[$k]) && $texts[$k] !== '') {
+                return $texts[$k];
+            }
+        }
+
+        return null;
+    };
+    $out = '';
+    foreach ($sections as $sec) {
+        $i18n = is_array($sec['i18n'] ?? null) ? $sec['i18n'] : [];
+        if (! is_array($sec) || empty($sec['visible']) || ! is_array($i18n['en'] ?? null)) {
+            continue;
+        }
+        $texts = is_array($i18n[$lang] ?? null) ? $i18n[$lang] : $i18n['en'];
+        $heading = $pick($texts, ['headline', 'heading', 'title']);
+        if ($heading === null) {
+            $texts = $i18n['en'];
+            $heading = $pick($texts, ['headline', 'heading', 'title']);
+        }
+        if ($heading === null) {
+            continue;
+        }
+        $para = $pick($texts, ['subtitle', 'text', 'description']);
+        $out .= '<section><h2>' . $e($heading) . '</h2>' . ($para === null ? '' : '<p>' . $e($para) . '</p>') . '</section>';
+    }
+
+    return $out;
+}
+
+function fg_home_json(array $sections): string
+{
+    return (string) json_encode($sections, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+}
