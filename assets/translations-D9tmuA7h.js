@@ -1,0 +1,1 @@
+const c=[{code:"ar",label:"العربية",dir:"rtl"},{code:"hi",label:"हिन्दी",dir:"ltr"},{code:"zh",label:"中文",dir:"ltr"},{code:"tr",label:"Türkçe",dir:"ltr"}];function n(l){const e={};for(const{code:r}of c){const o=Object.fromEntries(Object.entries(l?.[r]||{}).filter(([,t])=>typeof t=="string"?t.trim()!=="":t!=null));Object.keys(o).length&&(e[r]=o)}return e}export{c as L,n as c};
