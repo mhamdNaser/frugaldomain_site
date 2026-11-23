@@ -1190,4 +1190,7 @@ return array (
   'Components showcase' => 'عرض المكونات',
   'Apps showcase' => 'عرض التطبيقات',
   'Programs showcase' => 'عرض البرامج',
+  // Home sections builder
+  'Add at least one section. With no sections the site shows the default home page.' => 'أضف قسمًا واحدًا على الأقل. بدون أقسام يعرض الموقع الصفحة الرئيسية الافتراضية.',
+  'Fix the highlighted links before publishing.' => 'صحّح الروابط المميزة قبل النشر.',
 );

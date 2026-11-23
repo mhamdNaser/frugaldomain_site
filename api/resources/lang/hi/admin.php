@@ -1173,4 +1173,7 @@ return array (
   'Components showcase' => 'कंपोनेंट प्रदर्शन',
   'Apps showcase' => 'ऐप प्रदर्शन',
   'Programs showcase' => 'प्रोग्राम प्रदर्शन',
+  // Home sections builder
+  'Add at least one section. With no sections the site shows the default home page.' => 'कम से कम एक अनुभाग जोड़ें। बिना अनुभागों के साइट डिफ़ॉल्ट होम पेज दिखाती है।',
+  'Fix the highlighted links before publishing.' => 'प्रकाशित करने से पहले चिह्नित लिंक ठीक करें।',
 );

@@ -1173,4 +1173,7 @@ return array (
   'Components showcase' => '组件展示',
   'Apps showcase' => '应用展示',
   'Programs showcase' => '程序展示',
+  // Home sections builder
+  'Add at least one section. With no sections the site shows the default home page.' => '请至少添加一个版块。没有版块时，网站会显示默认首页。',
+  'Fix the highlighted links before publishing.' => '发布前请修正标出的链接。',
 );

@@ -1173,4 +1173,7 @@ return array (
   'Components showcase' => 'Bileşen vitrini',
   'Apps showcase' => 'Uygulama vitrini',
   'Programs showcase' => 'Program vitrini',
+  // Home sections builder
+  'Add at least one section. With no sections the site shows the default home page.' => 'En az bir bölüm ekleyin. Bölüm yoksa site varsayılan ana sayfayı gösterir.',
+  'Fix the highlighted links before publishing.' => 'Yayınlamadan önce işaretli bağlantıları düzeltin.',
 );
