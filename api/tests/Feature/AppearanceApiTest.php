@@ -102,3 +102,11 @@ it('rejects unknown languages', function () {
     Sanctum::actingAs(appearanceUser('admin'));
     $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['i18n' => ['fr' => ['headline' => 'x']]])]])->assertStatus(422);
 });
+
+it('rejects control characters and backslash tricks in links', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/theme', ['logo_url' => "/\t/evil.com"])->assertStatus(422);
+    foreach (["/\t/evil.com", '/\evil.com'] as $link) {
+        $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['props' => ['link' => $link]])]])->assertStatus(422);
+    }
+});
