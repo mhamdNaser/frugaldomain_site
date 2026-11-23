@@ -92,6 +92,16 @@ it('rejects javascript links anywhere', function () {
     $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['props' => ['color' => 'red']])]])->assertStatus(422);
 });
 
+it('keys sanitizer errors by section index', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [
+        section(),
+        section(['id' => 's2', 'type' => 'feature_cards', 'props' => ['cards' => [['link' => 'javascript:x']]]]),
+    ]])->assertStatus(422)->assertJsonValidationErrors(['sections.1.props.cards.0.link']);
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['i18n' => ['ar' => ['color' => 'red']]])]])
+        ->assertStatus(422)->assertJsonValidationErrors(['sections.0.i18n.ar.color']);
+});
+
 it('strips html from text', function () {
     Sanctum::actingAs(appearanceUser('admin'));
     $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['i18n' => ['en' => ['headline' => '<b>Hi</b><script>x</script>']]])]])

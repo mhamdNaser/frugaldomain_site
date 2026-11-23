@@ -9,10 +9,13 @@ class SectionSanitizer
     /** Shape is already validated by the request; this cleans props/i18n values recursively. */
     public static function clean(array $sections): array
     {
-        return array_map(fn ($s) => [
+        // Error keys carry the section index (sections.N.props...), like the request's own rules.
+        $sections = array_values($sections);
+
+        return array_map(fn ($s, $i) => [
             'id' => $s['id'], 'type' => $s['type'], 'visible' => (bool) $s['visible'],
-            'props' => self::walk($s['props'], 'props'), 'i18n' => self::walk($s['i18n'], 'i18n'),
-        ], array_values($sections));
+            'props' => self::walk($s['props'], "sections.$i.props"), 'i18n' => self::walk($s['i18n'], "sections.$i.i18n"),
+        ], $sections, array_keys($sections));
     }
 
     private static function walk(array $node, string $path): array
