@@ -35,7 +35,7 @@ class AppearanceDefaults
             ],
             'light' => [
                 'canvas' => '#f7f5f0', 'surface' => '#ffffff', 'text' => '#1a1a1a',
-                'muted' => '#6b6b6b', 'accent' => '#9a7a3f', 'hairline' => '#e7e2d6',
+                'muted' => '#6b6b6b', 'accent' => '#80632c', 'hairline' => '#e7e2d6',
             ],
             'radius' => 14,
             'default_mode' => 'dark',

@@ -37,7 +37,7 @@ it('lets an admin save the theme', function () {
     $this->getJson('/api/site/appearance')->assertOk()
         ->assertJsonPath('theme.dark.accent', '#112233')
         ->assertJsonPath('theme.dark.canvas', '#0a0f1c')
-        ->assertJsonPath('theme.light.accent', '#9a7a3f');
+        ->assertJsonPath('theme.light.accent', '#80632c');
 });
 
 it('rejects non-admins', function () {

@@ -18,7 +18,7 @@
 - Colour tokens are space-separated RGB triplets (`--fg-accent: 201 169 110;`) consumed as `rgb(var(--fg-accent) / a)`. Saved colours are 6-digit hex only (`/^#[0-9a-f]{6}$/i`).
 - Default theme (verbatim from spec, hairlines made opaque so they fit the triplet format):
   - dark: canvas `#0a0f1c`, surface `#111827`, text `#e8e6e1`, muted `#9aa3b5`, accent `#c9a96e`, hairline `#1c2438`
-  - light: canvas `#f7f5f0`, surface `#ffffff`, text `#1a1a1a`, muted `#6b6b6b`, accent `#9a7a3f`, hairline `#e7e2d6`
+  - light: canvas `#f7f5f0`, surface `#ffffff`, text `#1a1a1a`, muted `#6b6b6b`, accent `#80632c`, hairline `#e7e2d6`
   - fonts: body + heading `IBM Plex Sans Arabic`; radius `14`; default_mode `dark`
 - Curated fonts (only these accepted): `IBM Plex Sans Arabic`, `Readex Pro`, `Noto Kufi Arabic`, `Tajawal`, `Cairo`, `Noto Naskh Arabic`. Every stack ends with `"Noto Sans Devanagari", "Noto Sans SC", system-ui, sans-serif`.
 - Languages: `en, ar, hi, zh, tr`. Missing language text → `en`; missing `en` → section not rendered.
@@ -53,7 +53,7 @@
 
 - [ ] **Step 1: Write failing Pest tests**
   - `it returns defaults when nothing is saved`: GET → `theme.dark.accent == '#c9a96e'`, `theme.font_body == 'IBM Plex Sans Arabic'`, `home_sections == []`.
-  - `it lets an admin save the theme`: PUT with `dark.accent = '#112233'` → 200; subsequent GET → `theme.dark.accent == '#112233'` and `theme.light.accent == '#9a7a3f'` (unsent keys keep defaults).
+  - `it lets an admin save the theme`: PUT with `dark.accent = '#112233'` → 200; subsequent GET → `theme.dark.accent == '#112233'` and `theme.light.accent == '#80632c'` (unsent keys keep defaults).
   - `it rejects non-admins`: guest → 401; user without admin role → 403.
   - `it validates colours and fonts`: `dark.accent = 'red'` → 422; `'#12345'` → 422; `font_body = 'Comic Sans'` → 422; `logo_url = 'javascript:alert(1)'` → 422; `logo_url = '/images/logo.svg'` → 200; `radius = 99` → 422 (range 0–32); `default_mode = 'blue'` → 422.
 - [ ] **Step 2: Run** `cd api && php artisan test --filter=AppearanceApiTest` → FAIL (route missing).
@@ -104,7 +104,7 @@
   - `fg_css(array $theme): string` — `:root{…light tokens…; --fg-font-body; --fg-font-heading; --fg-radius; --fg-logo:url(…); --fg-logo-dark:url(…)}` and `:root[data-theme="dark"]{…dark tokens…}`, preceded by an `@import` of Google Fonts for the chosen families (weights 300;400;600;700).
 - Caching like `learn-preview.php` (`sys_get_temp_dir()` file, TTL 60 s); on fetch failure use the stale cache, else built-in defaults. Response: `Content-Type: text/css`, `Cache-Control: public, max-age=60`.
 
-- [ ] **Step 1: Write `scripts/check-appearance.php`** asserting: `fg_triplet('#c9a96e') === '201 169 110'`; `fg_mix('#000000','#ffffff',0.5) === '#808080'`; `fg_css(defaults)` contains `--fg-accent: 154 122 63` (light) and, inside the dark block, `--fg-accent: 201 169 110`; contains `IBM+Plex+Sans+Arabic`; `fg_css` with a theme whose JSON is `null`/garbage falls back to defaults (no exception).
+- [ ] **Step 1: Write `scripts/check-appearance.php`** asserting: `fg_triplet('#c9a96e') === '201 169 110'`; `fg_mix('#000000','#ffffff',0.5) === '#808080'`; `fg_css(defaults)` contains `--fg-accent: 128 99 44` (light) and, inside the dark block, `--fg-accent: 201 169 110`; contains `IBM+Plex+Sans+Arabic`; `fg_css` with a theme whose JSON is `null`/garbage falls back to defaults (no exception).
 - [ ] **Step 2: Run** `php scripts/check-appearance.php` → FAIL (functions missing).
 - [ ] **Step 3: Implement** `scripts/appearance-lib.php` and `appearance.php` (fetch + cache + `echo fg_css($theme)`).
 - [ ] **Step 4: Run** check → prints `ok`, exit 0. Then `php -S localhost:8099` in the worktree root and `curl -s localhost:8099/appearance.php | head` shows `:root{`.

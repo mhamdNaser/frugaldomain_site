@@ -90,11 +90,13 @@ two keys:
     "dark":  { "canvas": "#0a0f1c", "surface": "#111827", "text": "#e8e6e1",
                "muted": "#9aa3b5", "accent": "#c9a96e", "hairline": "#ffffff14" },
     "light": { "canvas": "#f7f5f0", "surface": "#ffffff", "text": "#1a1a1a",
-               "muted": "#6b6b6b", "accent": "#9a7a3f", "hairline": "#e7e2d6" },
+               "muted": "#6b6b6b", "accent": "#80632c", "hairline": "#e7e2d6" },
     "radius": 14,
     "default_mode": "dark"
   }
   ```
+
+Note: the light accent default is `#80632c` (was `#9a7a3f`) so gold links and active items meet WCAG AA: 5.15:1 on the canvas and 5.62:1 on the surface (the old value was 3.69:1 and 4.02:1). Dark values are unchanged.
 - `home_sections`: ordered array of
   `{ "id": "uuid", "type": "<template>", "visible": true, "props": {...},
      "i18n": { "en": {...}, "ar": {...}, ... } }` —

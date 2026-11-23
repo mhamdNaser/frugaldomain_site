@@ -10,7 +10,7 @@ check(fg_triplet('#c9a96e') === '201 169 110', 'triplet');
 check(fg_mix('#000000', '#ffffff', 0.5) === '#808080', 'mix');
 
 $css = fg_css(fg_defaults());
-check(str_contains($css, '--fg-accent: 154 122 63'), 'light accent');
+check(str_contains($css, '--fg-accent: 128 99 44'), 'light accent');
 $dark = substr($css, strpos($css, ':root[data-theme="dark"]'));
 check(str_contains($dark, '--fg-accent: 201 169 110'), 'dark accent');
 check(str_contains($css, 'IBM+Plex+Sans+Arabic'), 'font import');
@@ -27,7 +27,7 @@ $t['radius'] = 99;
 $t['logo_url'] = 'https://x.test/a).svg';
 $t['logo_dark_url'] = '//evil.test/x.svg';
 $bad = fg_css($t);
-check(str_contains($bad, '--fg-accent: 154 122 63') && ! str_contains($bad, 'display:none'), 'bad accent');
+check(str_contains($bad, '--fg-accent: 128 99 44') && ! str_contains($bad, 'display:none'), 'bad accent');
 check(str_contains($bad, '--fg-canvas: 10 15 28'), 'bad canvas');
 check(! str_contains($bad, 'Evil') && str_contains($bad, '--fg-radius: 14px'), 'bad font/radius');
 check(! str_contains($bad, '--fg-logo'), 'bad logo omitted');
