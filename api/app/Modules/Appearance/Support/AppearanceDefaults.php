@@ -19,6 +19,9 @@ class AppearanceDefaults
     /** http(s) or a single-slash relative path (no `//` or `/\`); D stops a trailing-newline bypass. */
     public const LINK_REGEX = '#^(https?://|/(?![/\x5c]))[^\x00-\x20\x7f]*$#D';
 
+    // Theme urls are printed into CSS url(...): also no quotes, parentheses or backslashes (fg_sanitize in scripts/appearance-lib.php).
+    public const THEME_URL_REGEX = '#^(https?://|/(?![/\x5c]))[^\x00-\x20\x7f"\'()\x5c]*$#D';
+
     public const HEX_REGEX = '/^#[0-9a-fA-F]{6}$/D';
 
     public static function theme(): array

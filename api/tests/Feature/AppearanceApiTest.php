@@ -69,6 +69,15 @@ it('rejects trailing newline and backslash tricks', function () {
     $this->putJson('/api/admin/appearance/theme', ['logo_url' => '/\\evil.com'])->assertStatus(422);
 });
 
+it('rejects theme urls the css sanitiser would drop', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    foreach (['/images/logo(1).png', "/a'b.png", '/a"b.png', '/a b.png'] as $url) {
+        $this->putJson('/api/admin/appearance/theme', ['logo_url' => $url])->assertStatus(422);
+    }
+    $this->putJson('/api/admin/appearance/theme', ['favicon_url' => '/images/logo(1).png'])->assertStatus(422);
+    $this->putJson('/api/admin/appearance/theme', ['logo_url' => 'https://cdn.test/logo-1.png'])->assertOk();
+});
+
 function section(array $o = []): array
 {
     return array_merge(['id' => 's1', 'type' => 'hero_paths', 'visible' => true, 'props' => [], 'i18n' => []], $o);
