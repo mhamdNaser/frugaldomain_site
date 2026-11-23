@@ -3,6 +3,8 @@
 /** Pure helpers behind /appearance.css. Every value is re-validated: the api checks too, but this prints into CSS. */
 
 const FG_FONTS = ['IBM Plex Sans Arabic', 'Readex Pro', 'Noto Kufi Arabic', 'Tajawal', 'Cairo', 'Noto Naskh Arabic'];
+// Google Fonts css2 answers 400 for a weight a family lacks, which would kill the whole @import.
+const FG_WEIGHTS = ['Tajawal' => '300;400;700', 'Noto Naskh Arabic' => '400;600;700'];
 const FG_FONT_TAIL = '"Noto Sans Devanagari", "Noto Sans SC", system-ui, sans-serif';
 const FG_COLOR_KEYS = ['canvas', 'surface', 'text', 'muted', 'accent', 'hairline'];
 const FG_INK = [0 => 0, 50 => .04, 100 => .1, 300 => .35, 500 => .55, 700 => .75, 800 => .85, 900 => .93, 950 => 1];
@@ -94,7 +96,7 @@ function fg_css($theme): string
 
     $stack = fn (string $f) => "\"$f\", " . FG_FONT_TAIL;
     $families = implode('&', array_map(
-        fn ($f) => 'family=' . str_replace(' ', '+', $f) . ':wght@300;400;600;700',
+        fn ($f) => 'family=' . str_replace(' ', '+', $f) . ':wght@' . (FG_WEIGHTS[$f] ?? '300;400;600;700'),
         array_unique([$t['font_body'], $t['font_heading']])
     ));
 

@@ -16,22 +16,30 @@ const APPEARANCE_TIMEOUT = 2.5;
 header('Content-Type: text/css; charset=UTF-8');
 header('Cache-Control: public, max-age=60');
 
-$cacheFile = sys_get_temp_dir() . '/fruga-appearance.json';
-$cached = is_readable($cacheFile) ? json_decode((string) file_get_contents($cacheFile), true) : null;
-$theme = is_array($cached) ? $cached : null;
+const APPEARANCE_FAILURE_TTL = 15;
 
-if (! $theme || time() - filemtime($cacheFile) >= APPEARANCE_TTL) {
+$cacheFile = sys_get_temp_dir() . '/fruga-appearance.json';
+$raw = @file_get_contents($cacheFile);
+$cached = $raw === false ? null : json_decode($raw, true);
+$theme = is_array($cached['theme'] ?? null) ? $cached['theme'] : null;
+$mtime = $raw === false ? 0 : (int) @filemtime($cacheFile);
+// A failure marker, a missing theme or a corrupt file is only trusted for the short window.
+$ttl = $theme && empty($cached['failed']) ? APPEARANCE_TTL : APPEARANCE_FAILURE_TTL;
+
+if (! $mtime || time() - $mtime >= $ttl) {
     $context = stream_context_create([
-        'http' => ['timeout' => APPEARANCE_TIMEOUT, 'ignore_errors' => true, 'header' => "Accept: application/json\r\n"],
+        'http' => ['timeout' => APPEARANCE_TIMEOUT, 'ignore_errors' => true, 'header' => "Accept: application/json
+"],
         'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
     ]);
     $body = @file_get_contents(APPEARANCE_URL, false, $context);
     $data = $body ? json_decode($body, true) : null;
     if (is_array($data['theme'] ?? null)) {
         $theme = $data['theme'];
-        @file_put_contents($cacheFile, json_encode($theme));
-    } elseif (is_readable($cacheFile)) {
-        @touch($cacheFile); // keep serving stale without hammering a failing api
+        @file_put_contents($cacheFile, json_encode(['theme' => $theme]));
+    } else {
+        // Keep the stale theme (or none) and do not refetch for a few seconds.
+        @file_put_contents($cacheFile, json_encode(['theme' => $theme, 'failed' => true]));
     }
 }
 
