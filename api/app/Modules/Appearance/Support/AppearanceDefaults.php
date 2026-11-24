@@ -50,4 +50,20 @@ class AppearanceDefaults
     {
         return [];
     }
+
+    /** Popup that points visitors to the Shopify feature page. */
+    public static function promo(): array
+    {
+        return [
+            'enabled' => true,
+            'link' => '/shopify',
+            'i18n' => [
+                'en' => ['title' => 'New: run your Shopify store', 'text' => 'Products, orders and customers in one place, synced both ways. Free.', 'button' => 'See how it works'],
+                'ar' => ['title' => 'جديد: أدِر متجر Shopify', 'text' => 'المنتجات والطلبات والعملاء في مكان واحد، بمزامنة بالاتجاهين. مجاناً.', 'button' => 'اكتشف الميزة'],
+                'hi' => ['title' => 'नया: अपना Shopify स्टोर चलाएँ', 'text' => 'उत्पाद, ऑर्डर और ग्राहक एक ही जगह, दोनों तरफ़ सिंक। मुफ़्त।', 'button' => 'देखें यह कैसे काम करता है'],
+                'zh' => ['title' => '新功能：管理您的 Shopify 店铺', 'text' => '商品、订单和客户集中在一处，双向同步。免费。', 'button' => '了解详情'],
+                'tr' => ['title' => 'Yeni: Shopify mağazanızı yönetin', 'text' => 'Ürünler, siparişler ve müşteriler tek yerde, iki yönlü senkron. Ücretsiz.', 'button' => 'Nasıl çalıştığını görün'],
+            ],
+        ];
+    }
 }

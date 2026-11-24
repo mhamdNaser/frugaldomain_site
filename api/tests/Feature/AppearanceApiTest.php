@@ -129,3 +129,34 @@ it('rejects control characters and backslash tricks in links', function () {
         $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['props' => ['link' => $link]])]])->assertStatus(422);
     }
 });
+
+it('returns the default promo popup in five languages', function () {
+    $promo = $this->getJson('/api/site/appearance')->assertOk()->json('promo');
+
+    expect($promo['enabled'])->toBeTrue()
+        ->and($promo['link'])->toBe('/shopify');
+    foreach (['en', 'ar', 'hi', 'zh', 'tr'] as $lang) {
+        expect($promo['i18n'][$lang]['title'] ?? '')->not->toBe('');
+    }
+});
+
+it('lets an admin save the promo popup', function () {
+    $this->actingAs(appearanceUser('admin'))->putJson('/api/admin/appearance/promo', [
+        'enabled' => false,
+        'link' => '/shopify',
+        'i18n' => ['ar' => ['title' => '<b>عنوان</b>', 'text' => 'نص', 'button' => 'اكتشف']],
+    ])->assertOk();
+
+    $promo = $this->getJson('/api/site/appearance')->json('promo');
+    expect($promo['enabled'])->toBeFalse()
+        ->and($promo['i18n']['ar']['title'])->toBe('عنوان')
+        ->and($promo['i18n']['en']['title'])->not->toBe('');
+});
+
+it('rejects unsafe promo links', function () {
+    $this->actingAs(appearanceUser('admin'))->putJson('/api/admin/appearance/promo', ['link' => 'javascript:alert(1)'])->assertStatus(422);
+});
+
+it('forbids non-admins from saving the promo', function () {
+    $this->actingAs(appearanceUser('partner'))->putJson('/api/admin/appearance/promo', ['enabled' => false])->assertForbidden();
+});
