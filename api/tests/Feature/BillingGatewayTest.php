@@ -165,3 +165,11 @@ it('shows a renamed or disabled plan to partners right away', function () {
     $names = collect($this->actingAs($this->owner)->getJson('/api/admin/billing/plans')->json('data'))->pluck('name');
     expect($names)->not->toContain('Pro Max');
 });
+
+it('returns each plan with its linked payment method ids for the admin form', function () {
+    $id = manualMethod($this);
+    $this->paid->paymentMethods()->sync([$id]);
+
+    $this->actingAs($this->admin)->getJson("/api/admin/plans/{$this->paid->id}")
+        ->assertOk()->assertJsonPath('data.payment_method_ids', [$id]);
+});

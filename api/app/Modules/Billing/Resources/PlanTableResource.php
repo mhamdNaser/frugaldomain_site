@@ -18,6 +18,7 @@ class PlanTableResource extends JsonResource
             'max_team_members' => (int) $this->max_team_members,
             'description' => $this->description,
             'features' => $this->features ?? [],
+            'payment_method_ids' => $this->paymentMethods()->pluck('payment_methods.id')->all(),
             'subscriptions_count' => $this->subscriptions_count ?? 0,
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,
