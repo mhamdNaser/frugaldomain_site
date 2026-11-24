@@ -12,6 +12,7 @@ class AppearanceDefaults
         'hero_paths', 'stats_bar', 'continue_learning', 'feature_cards', 'image_text', 'cta_banner',
         'testimonials', 'faq', 'forms_showcase', 'learn_showcase', 'icons_showcase', 'draw_simulate',
         'image_tools', 'dev_tools', 'components_showcase', 'apps_showcase', 'programs_showcase',
+        'shopify_showcase',
     ];
 
     public const LANGUAGES = ['en', 'ar', 'hi', 'zh', 'tr'];

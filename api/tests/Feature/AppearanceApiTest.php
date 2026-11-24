@@ -90,6 +90,15 @@ it('saves and returns sections in order', function () {
     $this->getJson('/api/site/appearance')->assertJsonPath('home_sections.0.id', 'b')->assertJsonPath('home_sections.1.id', 'a');
 });
 
+it('saves a shopify_showcase section', function () {
+    Sanctum::actingAs(appearanceUser('admin'));
+    $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section([
+        'type' => 'shopify_showcase',
+        'props' => ['link' => '/shopify'],
+        'i18n' => ['en' => ['heading' => 'H', 'text' => 'T', 'bullets' => [['text' => 'B']], 'button_label' => 'Go']],
+    ])]])->assertOk()->assertJsonPath('0.type', 'shopify_showcase');
+});
+
 it('rejects unknown section types', function () {
     Sanctum::actingAs(appearanceUser('admin'));
     $this->putJson('/api/admin/appearance/home-sections', ['sections' => [section(['type' => 'nope'])]])->assertStatus(422);
