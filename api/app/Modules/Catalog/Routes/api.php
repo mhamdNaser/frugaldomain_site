@@ -25,7 +25,7 @@ Route::prefix('admin')->group(function () {
             Route::get('products/{id}', 'show');
             Route::put('products/{id}', 'update');
             Route::patch('products/{id}/variants/price', 'updateVariantsPrice');
-            Route::delete('products/{product}', 'destroy');
+            Route::delete('products/{id}', 'destroy');
             Route::patch('products/{id}/status', 'changeStatus');
         });
 

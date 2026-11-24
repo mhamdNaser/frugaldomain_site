@@ -76,3 +76,31 @@ it('keeps admin-only routes forbidden to store staff', function () {
 
     $this->actingAs($staff)->postJson('/api/admin/allPlans')->assertForbidden();
 });
+
+it('still lets an account that enabled Shopify but never connected a store delete itself', function () {
+    $user = siteAccount(['password' => bcrypt('secret-pass')]);
+    $this->actingAs($user)->postJson('/api/account/shopify/enable')->assertOk();
+
+    $this->actingAs($user->fresh())->deleteJson('/api/account', ['password' => 'secret-pass'])->assertOk();
+    expect(User::query()->whereKey($user->id)->exists())->toBeFalse();
+});
+
+it('keeps blocking self-deletion for a store owner with a store', function () {
+    $user = siteAccount(['password' => bcrypt('secret-pass')]);
+    $user->assignRole('partner');
+    Store::query()->create([
+        'id' => (string) Str::uuid(), 'owner_id' => $user->id, 'shopify_domain' => 'keep.myshopify.com',
+        'shopify_access_token' => Crypt::encryptString('shpat_keep'), 'name' => 'Keep',
+    ]);
+
+    $this->actingAs($user)->deleteJson('/api/account', ['password' => 'secret-pass'])->assertForbidden();
+});
+
+it('gives every store on the free plan room for a team', function () {
+    expect(app(\App\Modules\Billing\Services\FreePlanService::class)->plan()->max_team_members)->toBeGreaterThanOrEqual(5);
+});
+
+it('has unique route names so route:cache works', function () {
+    $names = collect(\Illuminate\Support\Facades\Route::getRoutes()->getRoutes())->map->getName()->filter();
+    expect($names->duplicates()->values()->all())->toBe([]);
+});

@@ -27,6 +27,10 @@ class EnforceStorePermissions
             abort(403, 'Your account has been disabled by the store owner.');
         }
 
+        // A raw GraphQL passthrough runs with the owner's Shopify token and would bypass
+        // every section and hidden-field rule below, so staff may never send one.
+        abort_if($request->has('shopify_sync'), 403, 'You do not have permission to do this.');
+
         $permission = StorePermissions::requiredFor($request);
 
         if ($permission === null) {

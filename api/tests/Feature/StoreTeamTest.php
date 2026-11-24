@@ -200,3 +200,12 @@ it('lets the super admin create, edit and delete plans with their details', func
 
     $this->actingAs($this->owner)->postJson('/api/admin/plans', ['name' => 'Hack', 'price' => 0, 'billing_interval' => 'month'])->assertForbidden();
 });
+
+it('never lets a staff member send raw Shopify queries with the owner\'s token', function () {
+    $staff = staffWith(['tags.view', 'tags.create', 'tags.edit'], $this);
+
+    $this->actingAs($staff)->postJson('/api/admin/tags', [
+        'store_id' => $this->store->id, 'name' => 'x', 'slug' => 'x',
+        'shopify_sync' => ['query' => '{ customers(first: 5) { edges { node { email } } } }'],
+    ])->assertForbidden();
+});

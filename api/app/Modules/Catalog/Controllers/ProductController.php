@@ -163,8 +163,10 @@ class ProductController extends Controller
     /**
      * Remove the specified resource from storage.
      */
-    public function destroy(Product $product)
+    public function destroy($id)
     {
+        // Through the tenant-scoped repository: a store owner can only reach their own products.
+        $product = $this->repo->find((int) $id);
         $validated = request()->validate([
             'shopify_sync' => ['sometimes', 'array'],
             'shopify_sync.mutation' => ['sometimes', 'required_without:shopify_sync.query', 'string'],
@@ -305,9 +307,11 @@ class ProductController extends Controller
      */
     private function resolveStoreIdForCreate(array $validated): string
     {
+        // Only a platform admin may pick the store; everyone else writes to their own.
         $storeId = (string) ($validated['store_id'] ?? '');
+        $user = auth()->user();
 
-        if ($storeId !== '') {
+        if ($storeId !== '' && $user?->hasRole('admin')) {
             return $storeId;
         }
 

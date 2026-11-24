@@ -14,12 +14,20 @@ class FreePlanService
 {
     public const PLAN_NAME = 'Free';
 
+    /** Generous on purpose: while billing is not live nothing should be blocked. */
+    public const TEAM_MEMBERS = 5;
+
     public function plan(): Plan
     {
         $plan = Plan::withTrashed()->firstOrCreate(
             ['name' => self::PLAN_NAME, 'billing_interval' => 'month'],
-            ['price' => 0, 'trial_days' => null, 'is_active' => true],
+            ['price' => 0, 'trial_days' => null, 'is_active' => true, 'max_team_members' => self::TEAM_MEMBERS],
         );
+
+        // Older rows were created with room for no team at all.
+        if ((int) $plan->max_team_members < self::TEAM_MEMBERS) {
+            $plan->forceFill(['max_team_members' => self::TEAM_MEMBERS])->save();
+        }
 
         if ($plan->trashed()) {
             $plan->restore();

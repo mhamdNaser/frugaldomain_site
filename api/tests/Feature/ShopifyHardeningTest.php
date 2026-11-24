@@ -90,3 +90,44 @@ it('does not wipe the whole cache when roles change', function () {
 
     expect(Cache::get('unrelated_sentinel'))->toBe('keep-me');
 });
+
+function hardeningPartnerWithStore(string $domain): array
+{
+    $u = User::create([
+        'first_name' => 'P', 'last_name' => 'O', 'name' => 'owner-'.Str::random(5),
+        'email' => Str::random(6).'@test.com', 'password' => 'secret-pass', 'status' => 1,
+    ]);
+    $u->assignRole('partner');
+    $store = Store::query()->create([
+        'id' => (string) Str::uuid(), 'owner_id' => $u->id, 'shopify_domain' => $domain,
+        'shopify_access_token' => Crypt::encryptString('shpat_'.Str::random(6)), 'name' => $domain,
+    ]);
+
+    return [$u, $store];
+}
+
+it('stops a store owner from deleting another store\'s product or reaching its Shopify', function () {
+    \Illuminate\Support\Facades\Http::fake();
+    [$attacker] = hardeningPartnerWithStore('attacker.myshopify.com');
+    $victim = \App\Modules\Catalog\Models\Product::query()->create([
+        'store_id' => $this->store->id, 'title' => 'Victim', 'slug' => 'victim', 'handle' => 'victim',
+    ]);
+
+    $this->actingAs($attacker)->deleteJson("/api/admin/products/{$victim->id}", [
+        'shopify_sync' => ['query' => '{ customers(first: 5) { edges { node { email } } } }'],
+    ])->assertNotFound();
+
+    expect(\App\Modules\Catalog\Models\Product::query()->whereKey($victim->id)->exists())->toBeTrue();
+    \Illuminate\Support\Facades\Http::assertNothingSent();
+});
+
+it('creates a store owner\'s product in their own store whatever store_id they send', function () {
+    \Illuminate\Support\Facades\Http::fake();
+    [$owner, $own] = hardeningPartnerWithStore('own.myshopify.com');
+
+    $this->actingAs($owner)->postJson('/api/admin/products', [
+        'store_id' => $this->store->id, 'title' => 'Mine', 'slug' => 'mine', 'handle' => 'mine',
+    ]);
+
+    expect(\App\Modules\Catalog\Models\Product::query()->where('store_id', $this->store->id)->where('title', 'Mine')->exists())->toBeFalse();
+});

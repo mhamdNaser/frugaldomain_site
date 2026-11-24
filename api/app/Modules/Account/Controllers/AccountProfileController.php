@@ -47,7 +47,8 @@ class AccountProfileController extends Controller
 
         // An admin or a store owner deleting themselves would orphan the site
         // or a shop's data. Those accounts are closed by an administrator.
-        if ($user->hasAnyRole(['admin', 'partner']) || $user->hasStore()) {
+        // Enabling Shopify alone (partner role, no store yet) must not lock the account.
+        if ($user->hasRole('admin') || $user->hasStore() || $user->isStoreStaff()) {
             return response()->json([
                 'message' => 'This account manages the site or a store and cannot be deleted here.',
             ], 403);
