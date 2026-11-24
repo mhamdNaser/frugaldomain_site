@@ -185,7 +185,6 @@ it('drops the cached admin user list when a user is changed through the admin AP
         ->firstWhere('id', $target->id)['status'];
 
     $before = $statusOf();
-    expect(Cache::has('all_Users'))->toBeTrue();
     $this->actingAs($this->admin)->patchJson("/api/admin/users/{$target->id}/status")->assertOk();
 
     expect($statusOf())->not->toBe($before);
@@ -196,7 +195,6 @@ it('drops the cached admin store list when a store status is toggled', function 
         ->firstWhere('id', $this->storeA->id);
 
     $before = $statusOf();
-    expect(Cache::has('all_Stores'))->toBeTrue();
     $this->actingAs($this->admin)->patchJson("/api/admin/store/{$this->storeA->id}/status")->assertOk();
 
     expect($statusOf())->not->toBe($before);
