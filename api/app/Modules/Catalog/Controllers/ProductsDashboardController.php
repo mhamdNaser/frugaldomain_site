@@ -31,7 +31,7 @@ class ProductsDashboardController extends Controller
 
             return response()->json([
                 'status' => 'success',
-                'message' => 'Dashboard statistics retrieved successfully.',
+                'message' => 'Shopify dashboard statistics retrieved successfully.',
                 'data' => $data,
             ]);
         } catch (Throwable $e) {

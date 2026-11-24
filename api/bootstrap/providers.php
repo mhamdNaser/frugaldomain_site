@@ -5,6 +5,7 @@ return [
     App\Modules\Appearance\Providers\AppearanceServiceProvider::class,
     App\Modules\App\Providers\AppCatalogueServiceProvider::class,
     App\Modules\Billing\Providers\BillingServiceProvider::class,
+    App\Modules\Shopify\Providers\ShopifyServiceProvider::class,
     App\Modules\Catalog\Providers\CatalogServiceProvider::class,
     App\Modules\CMS\Providers\CMSServiceProvider::class,
     App\Modules\Convert\Providers\ConvertServiceProvider::class,

@@ -15,9 +15,13 @@ class Plan extends Model
         'billing_interval',
         'trial_days',
         'is_active',
+        'max_team_members',
+        'description',
+        'features',
     ];
 
     protected $casts = [
+        'features' => 'array',
         'price' => 'decimal:2',
         'trial_days' => 'integer',
         'is_active' => 'boolean',

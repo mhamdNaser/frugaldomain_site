@@ -52,7 +52,8 @@ class FrontendProductsRepository implements ProductsRepositoryInterface
                 'collections',
                 'tags',
                 'files',
-                'productMedia',
+                // Images already come through `files`; listing their media rows too showed each image twice.
+                'productMedia' => fn ($query) => $query->where(fn ($q) => $q->whereNull('media_content_type')->orWhereNotIn('media_content_type', ['IMAGE', 'MediaImage'])),
                 'metafields.metaobjects',
                 'options.values',
                 'variants' => fn ($query) => $query->orderBy('position')->orderBy('id'),

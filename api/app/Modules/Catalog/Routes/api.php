@@ -16,7 +16,7 @@ Route::prefix('admin')->group(function () {
     Route::middleware(['auth:sanctum', 'role:partner'])->group(function () {
 
         Route::controller(ProductsDashboardController::class)->group(function () {
-            Route::get('/dashboard/statistics', 'statistics')->name('catalog-statistics');
+            Route::get('/dashboard/statistics', 'statistics')->name('statistics');
         });
         
         Route::controller(ProductController::class)->group(function () {
@@ -72,11 +72,9 @@ Route::prefix('admin')->group(function () {
         });
 
         Route::controller(CategoriesController::class)->group(function () {
+            // Read-only: Shopify's standard product taxonomy cannot be changed through the API.
             Route::post('allCategories', 'index');
-            Route::post('categories', 'store');
             Route::get('categories/{id}', 'show');
-            Route::put('categories/{id}', 'update');
-            Route::delete('categories/{id}', 'destroy');
         });
 
         Route::controller(TagsController::class)->group(function () {

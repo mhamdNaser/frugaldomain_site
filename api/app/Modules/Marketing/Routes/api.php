@@ -31,7 +31,6 @@ Route::prefix('admin')->group(function () {
         Route::controller(DiscountUsageController::class)->group(function () {
             Route::post('allDiscountUsages', 'index');
             Route::get('discount-usages/{id}', 'show');
-            Route::put('discount-usages/{id}', 'update');
         });
 
         Route::controller(ExchangeController::class)->group(function () {

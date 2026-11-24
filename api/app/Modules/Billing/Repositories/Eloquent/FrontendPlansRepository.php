@@ -41,6 +41,18 @@ class FrontendPlansRepository implements PlansRepositoryInterface
             ->findOrFail($id);
     }
 
+    public function create(array $data)
+    {
+        $plan = $this->model->newQuery()->create($data);
+
+        return $this->findForFrontend($plan->id);
+    }
+
+    public function delete(int $id): void
+    {
+        $this->find($id)->delete();
+    }
+
     public function update(int $id, array $data)
     {
         $plan = $this->find($id);

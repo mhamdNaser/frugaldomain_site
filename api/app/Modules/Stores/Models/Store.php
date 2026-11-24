@@ -4,6 +4,7 @@ namespace App\Modules\Stores\Models;
 
 use App\Modules\Catalog\Models\Option;
 use App\Modules\CMS\Models\File;
+use App\Modules\Billing\Models\Plan;
 use App\Modules\User\Models\User;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
@@ -29,7 +30,7 @@ class Store extends Model
         'email',
         'currency',
         'timezone',
-        'plan',
+        'plan_id',
         'status',
         'installed_at',
         'uninstalled_at',
@@ -46,6 +47,17 @@ class Store extends Model
     public function owner()
     {
         return $this->belongsTo(User::class, 'owner_id');
+    }
+
+    public function plan()
+    {
+        return $this->belongsTo(Plan::class);
+    }
+
+    /** Staff members the owner added (users.store_id). */
+    public function teamMembers()
+    {
+        return $this->hasMany(User::class, 'store_id');
     }
 
     // Settings

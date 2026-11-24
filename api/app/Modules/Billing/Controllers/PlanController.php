@@ -2,6 +2,7 @@
 
 namespace App\Modules\Billing\Controllers;
 
+use App\Modules\Stores\Models\Store;
 use App\Http\Controllers\Controller;
 use App\Modules\Billing\Repositories\Interfaces\PlansRepositoryInterface;
 use App\Modules\Billing\Requests\PlansIndexRequest;
@@ -47,6 +48,30 @@ class PlanController extends Controller
         return response()->json([
             'data' => new PlanTableResource($this->repo->findForFrontend((int) $id)),
         ]);
+    }
+
+    public function store(UpdatePlanRequest $request)
+    {
+        return response()->json([
+            'message' => 'Plan created successfully',
+            'data' => new PlanTableResource($this->repo->create($request->validated())),
+        ], 201);
+    }
+
+    /** A plan stores are subscribed to cannot be deleted; deactivate it instead. */
+    public function destroy($id)
+    {
+        $plan = $this->repo->find((int) $id);
+
+        abort_if(
+            $plan->subscriptions()->exists() || Store::query()->where('plan_id', $plan->id)->exists(),
+            422,
+            'Stores are using this plan. Deactivate it instead of deleting it.',
+        );
+
+        $this->repo->delete((int) $id);
+
+        return response()->json(['message' => 'Plan deleted successfully']);
     }
 
     public function update(UpdatePlanRequest $request, $id)

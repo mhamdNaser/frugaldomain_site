@@ -3,8 +3,6 @@
 namespace App\Modules\Catalog\Controllers;
 
 use App\Http\Controllers\Controller;
-use App\Modules\Catalog\Models\Collection;
-use App\Modules\Catalog\Models\Option;
 use App\Modules\Catalog\Models\Product;
 use App\Modules\Catalog\Models\ProductVariant;
 use App\Modules\Catalog\Repositories\Interfaces\ProductsRepositoryInterface;
@@ -12,7 +10,9 @@ use App\Modules\Catalog\Requests\ProductIndexRequest;
 use App\Modules\Catalog\Requests\UpdateProductRequest;
 use App\Modules\Catalog\Resources\ProductDetailResource;
 use App\Modules\Catalog\Resources\ProductTableResource;
-use App\Modules\Stores\Models\Store;
+use App\Modules\Shopify\AutoSync\ShopifyAutoSync;
+use App\Modules\Shopify\OutboundSync\Services\LocalChangeOutboundSyncDispatcher;
+use App\Modules\Shopify\OutboundSync\Services\ShopifyFirstSyncService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
 
@@ -23,6 +23,9 @@ class ProductController extends Controller
 
     public function __construct(
         ProductsRepositoryInterface $repo,
+        private readonly LocalChangeOutboundSyncDispatcher $outboundSyncDispatcher,
+        private readonly ShopifyFirstSyncService $shopifyFirstSyncService,
+        private readonly ShopifyAutoSync $shopifySync,
     )
     {
         $this->repo = $repo;
@@ -81,17 +84,38 @@ class ProductController extends Controller
             'collection_ids.*' => ['integer', 'exists:collections,id'],
             'option_ids' => ['nullable', 'array'],
             'option_ids.*' => ['integer', 'exists:options,id'],
+            'shopify_sync' => ['sometimes', 'array'],
+            'shopify_sync.mutation' => ['sometimes', 'required_without:shopify_sync.query', 'string'],
+            'shopify_sync.query' => ['sometimes', 'required_without:shopify_sync.mutation', 'string'],
+            'shopify_sync.variables' => ['nullable', 'array'],
+            'shopify_sync.resource_path' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.user_errors_path' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.idempotency_key' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.correlation_id' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.priority' => ['nullable', 'integer', 'min:0', 'max:9'],
+            'shopify_sync.max_attempts' => ['nullable', 'integer', 'min:1', 'max:20'],
         ]);
 
         $storeId = $this->resolveStoreIdForCreate($validated);
+        $validated['store_id'] = $storeId;
+        $shopifyExecuted = $this->shopifyFirstSyncService->syncOrFail($validated, $storeId);
 
-        $created = $this->repo->create($validated);
-        $outboundSyncId = null;
+        $created = $this->shopifySync->create(fn () => $this->repo->create($validated));
+        $outboundSyncId = $shopifyExecuted ? null : $this->outboundSyncDispatcher->dispatchFromValidated(
+                validated: $validated,
+                storeId: (string) $created->store_id,
+                entityType: 'product',
+                entityId: (string) $created->id,
+                action: 'create',
+            );
 
         return response()->json([
             'message' => 'Product created successfully',
             'data' => new ProductDetailResource($created),
-            'meta' => ['outbound_sync_id' => $outboundSyncId],
+            'meta' => [
+                'outbound_sync_id' => $outboundSyncId,
+                'shopify_sync' => $this->shopifySync->report(),
+            ],
         ], 201);
     }
 
@@ -111,14 +135,27 @@ class ProductController extends Controller
     public function update(UpdateProductRequest $request, $id)
     {
         $validated = $request->validated();
-        $updated = $this->repo->update((int) $id, $validated);
-        $outboundSyncId = null;
+        $before = $this->repo->findForFrontend((int) $id);
+        $shopifyExecuted = $this->shopifyFirstSyncService->syncOrFail($validated, (string) $before->store_id);
+        $updated = $this->shopifySync->update(
+            $before,
+            array_keys($validated),
+            fn () => $this->repo->update((int) $id, $validated),
+        );
+        $outboundSyncId = $shopifyExecuted ? null : $this->outboundSyncDispatcher->dispatchFromValidated(
+                validated: $validated,
+                storeId: (string) $updated->store_id,
+                entityType: 'product',
+                entityId: (string) $updated->id,
+                action: 'update',
+            );
 
         return response()->json([
             'message' => 'Product updated successfully',
             'data' => new ProductDetailResource($updated),
             'meta' => [
                 'outbound_sync_id' => $outboundSyncId,
+                'shopify_sync' => $this->shopifySync->report(),
             ],
         ]);
     }
@@ -128,28 +165,54 @@ class ProductController extends Controller
      */
     public function destroy(Product $product)
     {
-        $validated = request()->validate([]);
+        $validated = request()->validate([
+            'shopify_sync' => ['sometimes', 'array'],
+            'shopify_sync.mutation' => ['sometimes', 'required_without:shopify_sync.query', 'string'],
+            'shopify_sync.query' => ['sometimes', 'required_without:shopify_sync.mutation', 'string'],
+            'shopify_sync.variables' => ['nullable', 'array'],
+            'shopify_sync.resource_path' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.user_errors_path' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.idempotency_key' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.correlation_id' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.priority' => ['nullable', 'integer', 'min:0', 'max:9'],
+            'shopify_sync.max_attempts' => ['nullable', 'integer', 'min:1', 'max:20'],
+        ]);
 
         $storeId = (string) $product->store_id;
         $entityId = (string) $product->id;
-        $this->repo->delete((int) $product->id);
+        $shopifyExecuted = $this->shopifyFirstSyncService->syncOrFail($validated, $storeId);
+        $this->shopifySync->delete($product, fn () => $this->repo->delete((int) $product->id));
 
-        $outboundSyncId = null;
+        $outboundSyncId = $shopifyExecuted ? null : $this->outboundSyncDispatcher->dispatchFromValidated(
+                validated: $validated,
+                storeId: $storeId,
+                entityType: 'product',
+                entityId: $entityId,
+                action: 'delete',
+            );
 
         return response()->json([
             'message' => 'Product deleted successfully',
-            'meta' => ['outbound_sync_id' => $outboundSyncId],
+            'meta' => [
+                'outbound_sync_id' => $outboundSyncId,
+                'shopify_sync' => $this->shopifySync->report(),
+            ],
         ]);
     }
 
     public function changeStatus($id)
     {
-        $icon = $this->repo->toggleStatus($id);
+        $product = $this->shopifySync->update(
+            $this->repo->find((int) $id),
+            ['status'],
+            fn () => $this->repo->toggleStatus($id),
+        );
 
         return response()->json([
             'success' => true,
             'message' => 'Status changed successfully',
-            'data' => new ProductTableResource($icon)
+            'data' => new ProductTableResource($product),
+            'meta' => ['shopify_sync' => $this->shopifySync->report()],
         ]);
     }
 
@@ -158,9 +221,20 @@ class ProductController extends Controller
         $validated = $request->validate([
             'price' => ['required', 'numeric', 'min:0'],
             'compare_at_price' => ['nullable', 'numeric', 'min:0'],
+            'shopify_sync' => ['sometimes', 'array'],
+            'shopify_sync.mutation' => ['sometimes', 'required_without:shopify_sync.query', 'string'],
+            'shopify_sync.query' => ['sometimes', 'required_without:shopify_sync.mutation', 'string'],
+            'shopify_sync.variables' => ['nullable', 'array'],
+            'shopify_sync.resource_path' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.user_errors_path' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.idempotency_key' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.correlation_id' => ['nullable', 'string', 'max:255'],
+            'shopify_sync.priority' => ['nullable', 'integer', 'min:0', 'max:9'],
+            'shopify_sync.max_attempts' => ['nullable', 'integer', 'min:1', 'max:20'],
         ]);
 
         $product = $this->repo->find((int) $id);
+        $shopifyExecuted = $this->shopifyFirstSyncService->syncOrFail($validated, (string) $product->store_id);
         $price = (float) $validated['price'];
         $compareAtPrice = array_key_exists('compare_at_price', $validated)
             ? ($validated['compare_at_price'] !== null ? (float) $validated['compare_at_price'] : null)
@@ -184,12 +258,27 @@ class ProductController extends Controller
             $product->price_max = $price;
             $product->save();
 
+            $this->shopifySync->run((string) $product->store_id, function ($ctx) use ($variants, $validated) {
+                $changed = array_key_exists('compare_at_price', $validated) ? ['price', 'compare_at_price'] : ['price'];
+                $syncer = $ctx->syncer(ProductVariant::class);
+
+                foreach ($variants as $variant) {
+                    $syncer->update($variant, [], $changed, $ctx);
+                }
+            });
+
             return $variants;
         });
 
         $outboundSyncIds = [];
         foreach ($updatedVariants as $variant) {
-            $syncId = null;
+            $syncId = $shopifyExecuted ? null : $this->outboundSyncDispatcher->dispatchFromValidated(
+                validated: $validated,
+                storeId: (string) $product->store_id,
+                entityType: 'product_variant',
+                entityId: (string) $variant->id,
+                action: 'update',
+            );
 
             if ($syncId) {
                 $outboundSyncIds[] = $syncId;
@@ -206,13 +295,13 @@ class ProductController extends Controller
             ],
             'meta' => [
                 'outbound_sync_ids' => $outboundSyncIds,
+                'shopify_sync' => $this->shopifySync->report(),
             ],
         ]);
     }
 
     /**
      * @param array<string, mixed> $validated
-     * @return array<int, int>
      */
     private function resolveStoreIdForCreate(array $validated): string
     {
