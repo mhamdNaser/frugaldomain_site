@@ -65,7 +65,8 @@ class PermissionsRepository implements PermissionsRepositoryInterface
 
         $role->syncPermissions($permissions);
 
-        Cache::flush();
+        Cache::forget('all_permissions');
+        app(\Spatie\Permission\PermissionRegistrar::class)->forgetCachedPermissions();
     }
 
     public function deleteArray(array $ids)

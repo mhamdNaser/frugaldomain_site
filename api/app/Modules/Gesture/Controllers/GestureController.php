@@ -20,7 +20,9 @@ class GestureController extends Controller
             $perPage = (int) $request->get('per_page', 50); // عدد الإيماءات لكل صفحة
             $page = (int) $request->get('page', 1);        // رقم الصفحة المطلوبة
 
-            $cacheKey = "gestures_page_{$page}_per_{$perPage}";
+            // The version bumps on every save, so stale pages are simply never read again.
+            $version = (int) Cache::get('gestures_version', 0);
+            $cacheKey = "gestures_v{$version}_page_{$page}_per_{$perPage}";
 
             // محاولة قراءة الصفحة من الكاش
             $cachedPage = Cache::get($cacheKey);
@@ -154,7 +156,7 @@ class GestureController extends Controller
 
             DB::commit();
 
-            Cache::flush();
+            Cache::forever('gestures_version', (int) Cache::get('gestures_version', 0) + 1);
 
             return response()->json([
                 'message' => 'Gesture saved successfully',

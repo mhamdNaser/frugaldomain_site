@@ -60,14 +60,16 @@ class AdminRoleRepository implements AdminRoleRepositoryInterface
     public function deleteArray(array $ids)
     {
         $this->model->whereIn('id', $ids)->delete();
-        Cache::flush();
+        Cache::forget('all_roles');
+        app(\Spatie\Permission\PermissionRegistrar::class)->forgetCachedPermissions();
     }
 
     public function deleteRole($id)
     {
         $role = $this->model::findOrFail($id);
         $role->delete();
-        Cache::flush();
+        Cache::forget('all_roles');
+        app(\Spatie\Permission\PermissionRegistrar::class)->forgetCachedPermissions();
     }
 
 
@@ -75,7 +77,8 @@ class AdminRoleRepository implements AdminRoleRepositoryInterface
     {
         $role = $this->model::findOrFail($id);
         $role->syncPermissions($permissions);
-        Cache::flush();
+        Cache::forget('all_roles');
+        app(\Spatie\Permission\PermissionRegistrar::class)->forgetCachedPermissions();
         return $role;
     }
 }

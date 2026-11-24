@@ -28,9 +28,8 @@ class StoreRepository implements StoreRepositoryInterface
     public function all($search = null, $rowsPerPage = 10, $page = 1)
     {
 
-        $items = Cache::remember($this->cacheKey, 60, function () {
-            return $this->model::orderBy('id', 'desc')->get();
-        });
+        // Not cached: full rows carry secrets (password hashes, Shopify tokens).
+        $items = $this->model::orderBy('id', 'desc')->get();
 
         if ($search) {
             $items = $items->filter(function ($item) use ($search) {
