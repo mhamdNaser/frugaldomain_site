@@ -21,6 +21,7 @@ class ShopifyServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([
                 DispatchDueOutboundSyncsCommand::class,
+                \App\Modules\Shopify\Webhooks\Console\RegisterWebhooksCommand::class,
             ]);
         }
     }
