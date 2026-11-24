@@ -19,7 +19,7 @@ use Throwable;
  *   unique on their Shopify id so they cannot duplicate, and the mobile app's carts,
  *   devices and sessions hang off them;
  * - metafields / metaobjects, tax rates, inventory movements: not fully rebuilt by the import;
- * - everything local to Collectify (team, settings, logs, sync history, carts, analytics).
+ * - everything local to this site (team, settings, logs, sync history, carts, analytics).
  */
 class ResetStoreShopifyDataAction
 {
