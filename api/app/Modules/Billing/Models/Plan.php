@@ -27,6 +27,19 @@ class Plan extends Model
         'is_active' => 'boolean',
     ];
 
+    protected static function booted(): void
+    {
+        // Partners read a cached plans list; any plan change must show at once.
+        $forget = fn () => \Illuminate\Support\Facades\Cache::forget(\App\Modules\Billing\Controllers\PaymentMethodController::PLANS_CACHE);
+        static::saved($forget);
+        static::deleted($forget);
+    }
+
+    public function paymentMethods()
+    {
+        return $this->belongsToMany(PaymentMethod::class, 'plan_payment_method');
+    }
+
     public function subscriptions()
     {
         return $this->hasMany(Subscription::class);

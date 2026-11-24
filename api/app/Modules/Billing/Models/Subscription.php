@@ -12,6 +12,8 @@ class Subscription extends Model
     protected $fillable = [
         'store_id',
         'plan_id',
+        'payment_method_id',
+        'reference',
         'status',
         'started_at',
         'ends_at',

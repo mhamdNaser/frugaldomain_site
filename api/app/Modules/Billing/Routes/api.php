@@ -25,6 +25,12 @@ Route::prefix('admin')->group(function () {
         });
     });
 
+    // Store owner: choose a plan and pay for it.
+    Route::middleware(['auth:sanctum', 'role:partner'])->controller(\App\Modules\Billing\Controllers\CheckoutController::class)->group(function () {
+        Route::get('billing/plans', 'plans');
+        Route::post('billing/checkout', 'checkout')->middleware('throttle:10,1');
+    });
+
     // Plans and subscriptions are platform billing settings: super admin only.
     // A store owner sees their own plan through GET /admin/my-store.
     Route::middleware(['auth:sanctum', 'role:admin'])->group(function () {
@@ -42,5 +48,15 @@ Route::prefix('admin')->group(function () {
             Route::get('subscriptions/{id}', 'show');
             Route::put('subscriptions/{id}', 'update');
         });
+
+        Route::controller(\App\Modules\Billing\Controllers\PaymentMethodController::class)->group(function () {
+            Route::get('billing/drivers', 'drivers');
+            Route::get('payment-methods', 'index');
+            Route::post('payment-methods', 'store');
+            Route::put('payment-methods/{id}', 'update');
+            Route::delete('payment-methods/{id}', 'destroy');
+            Route::put('plans/{planId}/payment-methods', 'syncPlan');
+        });
+        Route::post('subscriptions/{id}/confirm', [\App\Modules\Billing\Controllers\CheckoutController::class, 'confirm']);
     });
 });
