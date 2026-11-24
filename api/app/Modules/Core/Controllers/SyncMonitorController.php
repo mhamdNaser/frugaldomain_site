@@ -18,7 +18,10 @@ class SyncMonitorController extends Controller
         abort_unless(in_array($type, $this->repo->allowedTypes(), true), 404, 'Unknown sync monitor type.');
 
         $data = $request->validated();
-        $store = $request->user()?->store()->first();
+        $user = $request->user();
+        $store = $user?->store()->first();
+        // A null store id means "every store" to the repository, so only admins may get it.
+        abort_if(!$store && !$user?->hasRole('admin'), 404, 'No store is linked to the authenticated user.');
         $result = $this->repo->all(
             type: $type,
             storeId: $store?->id,

@@ -36,6 +36,8 @@ Route::middleware('auth:sanctum')->prefix('account')->group(function () {
     Route::post('email/send-code', [EmailVerificationController::class, 'send'])->middleware('throttle:6,15');
     Route::post('email/verify', [EmailVerificationController::class, 'verify'])->middleware('throttle:10,1');
 
+    Route::post('shopify/enable', [\App\Modules\Account\Controllers\ShopifyAccessController::class, 'enable'])->middleware('throttle:10,1');
+
     Route::get('me', [AccountProfileController::class, 'me']);
     Route::get('overview', [AccountProfileController::class, 'overview']);
     Route::put('profile', [AccountProfileController::class, 'update']);

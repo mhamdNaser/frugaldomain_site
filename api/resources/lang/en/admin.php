@@ -30,4 +30,5 @@ return array (
   'Forms' => 'Forms',
   'My Forms' => 'My Forms',
   'New Form' => 'New Form',
+  '' => NULL,
 );

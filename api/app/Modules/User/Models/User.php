@@ -8,6 +8,7 @@ use App\Modules\Locale\Models\City;
 use App\Modules\Locale\Models\Country;
 use App\Modules\Locale\Models\State;
 use App\Modules\Stores\Models\Store;
+use App\Modules\User\Team\StorePermissions;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
@@ -18,12 +19,12 @@ use Spatie\Permission\Traits\HasRoles;
 class User extends Authenticatable
 {
     /** @use HasFactory<\Database\Factories\UserFactory> */
+    // users.id is an auto-increment bigint (see create_users_table) and every
+    // foreign key to users is a bigint, so the model must not generate UUIDs.
     use HasFactory, Notifiable, HasApiTokens, HasRoles;
 
-    // The users table uses an auto-incrementing bigint primary key
-    // ($table->id()), and every FK pointing at it (icons.user_id,
-    // personal_access_tokens.tokenable_id, model_has_roles.model_id, ...)
-    // is an unsignedBigInteger, so this model must stay auto-incrementing.
+    // If you are using UUIDs, you should set the $incrementing property to false and the $keyType property to 'string':
+    // public $incrementing = false;
     // protected $guard_name = 'web';
 
     /**
@@ -47,6 +48,7 @@ class User extends Authenticatable
         'status',
         'email',
         'image',
+        'store_id',
     ];
 
     /**
@@ -87,9 +89,51 @@ class User extends Authenticatable
         return $this->belongsTo(City::class);
     }
 
+    /**
+     * The store this user works on: the one they own, or, for a staff member, their
+     * employer's. Everything scoped by $user->store works for staff unchanged.
+     */
     public function store()
     {
-        return $this->hasOne(Store::class, 'owner_id');
+        return $this->store_id
+            ? $this->belongsTo(Store::class, 'store_id')
+            : $this->hasOne(Store::class, 'owner_id');
+    }
+
+    public function storeRoles()
+    {
+        return $this->belongsToMany(StoreRole::class, 'store_role_user');
+    }
+
+    /** A staff member added by a store owner (not the owner, not a platform admin). */
+    public function isStoreStaff(): bool
+    {
+        return $this->store_id !== null;
+    }
+
+    /**
+     * What this user may do in their store dashboard. Owners get every key; staff get
+     * the union of their roles.
+     *
+     * @return array<int, string>
+     */
+    public function storePermissions(): array
+    {
+        if (!$this->isStoreStaff()) {
+            return StorePermissions::allKeys();
+        }
+
+        return $this->storeRoles
+            ->pluck('permissions')
+            ->flatten()
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    public function canInStore(string $permission): bool
+    {
+        return $permission === '' || in_array($permission, $this->storePermissions(), true);
     }
 
     public function hasStore(): bool

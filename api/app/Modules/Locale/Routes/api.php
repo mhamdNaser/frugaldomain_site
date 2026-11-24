@@ -16,7 +16,8 @@ Route::get('states/{id}', [StateController::class, 'index'])->name('states-count
 Route::get('cities/{id}', [CityController::class, 'index'])->name('cities-state-id');
 
 
-Route::prefix('admin')->group(function () {
+// Admin only: these routes rewrite translation files and delete language folders.
+Route::prefix('admin')->middleware(['auth:sanctum', 'role:admin'])->group(function () {
 
     Route::controller(CountryController::class)->group(function () {
         Route::post('countries', 'allCountry')->name('admin-countries');

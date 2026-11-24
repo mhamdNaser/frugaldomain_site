@@ -16,6 +16,10 @@ class UserResource extends JsonResource
             'last_name' => $this->last_name,
             'email' => $this->email,
             'email_verified' => $this->email_verified_at !== null,
+            // Store team: staff see only what their store roles grant (owners get every key).
+            'is_store_staff' => $this->isStoreStaff(),
+            'store_permissions' => $this->storePermissions(),
+            'store_hidden_fields' => $this->isStoreStaff() ? \App\Modules\User\Team\StorePermissions::hiddenFieldsBySection($this->storePermissions()) : (object) [],
             'phone' => $this->phone,
             'address' => [
                 'address_1' => $this->address_1,

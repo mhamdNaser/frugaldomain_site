@@ -3,6 +3,8 @@
 use App\Modules\User\Controllers\AdminRoleController;
 use App\Modules\User\Controllers\AuthController;
 use App\Modules\User\Controllers\CustomerController;
+use App\Modules\User\Controllers\TeamMemberController;
+use App\Modules\User\Controllers\TeamRoleController;
 use App\Modules\User\Controllers\UserController;
 use App\Modules\User\Controllers\PermissionsController;
 use Illuminate\Support\Facades\Route;
@@ -32,6 +34,21 @@ Route::prefix('admin')->group(function () {
             Route::get('customers/{id}', 'show')->name('selected-customer');
             Route::put('customers/{id}', 'update')->name('update-customer');
             Route::delete('customers/{id}', 'destroy')->name('delete-customer');
+        });
+
+        // Store team: staff members and the roles the owner gives them.
+        Route::controller(TeamMemberController::class)->group(function () {
+            Route::get('team/members', 'index');
+            Route::post('team/members', 'store');
+            Route::put('team/members/{id}', 'update');
+            Route::delete('team/members/{id}', 'destroy');
+        });
+        Route::controller(TeamRoleController::class)->group(function () {
+            Route::get('team/roles', 'index');
+            Route::get('team/permissions', 'catalog');
+            Route::post('team/roles', 'store');
+            Route::put('team/roles/{id}', 'update');
+            Route::delete('team/roles/{id}', 'destroy');
         });
     });
 

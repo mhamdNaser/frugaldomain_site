@@ -53,6 +53,10 @@ class AuthController extends Controller
             return response()->json(['message' => 'Invalid credentials'], 401);
         }
 
+        if ($user->isStoreStaff() && !$user->status) {
+            return response()->json(['message' => 'Your account has been disabled by the store owner.'], 403);
+        }
+
         // حذف التوكنات القديمة (اختياري)
         $user->tokens()->delete();
 
