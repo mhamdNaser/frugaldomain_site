@@ -12,14 +12,15 @@ class LocaleController extends Controller
     {
         App::setLocale($lang);
 
-        // Bump this suffix whenever resources/lang/* changes: the payload is
-        // cached for a day, so an edit to a translation file is otherwise
-        // invisible until the entry expires.
-        $cacheKey = 'translations_all_' . $lang . '_v7';
+        $adminPath = resource_path("lang/{$lang}/admin.php");
+        $sitePath = resource_path("lang/{$lang}/site.php");
 
-        $payload = Cache::remember($cacheKey, 86400, function () use ($lang) {
-            $adminPath = resource_path("lang/{$lang}/admin.php");
-            $sitePath = resource_path("lang/{$lang}/site.php");
+        // The key follows the files' modification times, so uploading a new
+        // translation file shows at once instead of after the day-long cache.
+        $stamp = (file_exists($adminPath) ? filemtime($adminPath) : 0) . '_' . (file_exists($sitePath) ? filemtime($sitePath) : 0);
+        $cacheKey = 'translations_all_' . $lang . '_' . $stamp;
+
+        $payload = Cache::remember($cacheKey, 86400, function () use ($lang, $adminPath, $sitePath) {
 
             $admin = file_exists($adminPath) ? require $adminPath : [];
             $site = file_exists($sitePath) ? require $sitePath : [];
