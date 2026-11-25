@@ -1988,4 +1988,5 @@ return array (
   '{count} {language} blocks' => '{count} {language} ब्लॉक',
   'No {language} content yet - the site shows the English version.' => 'अभी {language} सामग्री नहीं है, साइट अंग्रेज़ी संस्करण दिखाती है।',
   'Slug, minutes and status are shared by all languages.' => 'स्लग, मिनट और स्थिति सभी भाषाओं में एक जैसे हैं।',
+  'notActive' => 'निष्क्रिय',
 );

@@ -1988,4 +1988,5 @@ return array (
   '{count} {language} blocks' => '{count} 个{language}内容块',
   'No {language} content yet - the site shows the English version.' => '还没有{language}内容，网站显示英文版本。',
   'Slug, minutes and status are shared by all languages.' => '链接标识、时长和状态在所有语言间共享。',
+  'notActive' => '停用',
 );

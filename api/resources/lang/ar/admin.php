@@ -2007,4 +2007,5 @@ return array (
   '{count} {language} blocks' => '{count} كتلة {language}',
   'No {language} content yet - the site shows the English version.' => 'لا يوجد محتوى {language} بعد، ويعرض الموقع النسخة الإنجليزية.',
   'Slug, minutes and status are shared by all languages.' => 'الرابط والمدة والحالة مشتركة بين كل اللغات.',
+  'notActive' => 'غير نشط',
 );

@@ -1988,4 +1988,5 @@ return array (
   '{count} {language} blocks' => '{count} {language} blok',
   'No {language} content yet - the site shows the English version.' => 'Henüz {language} içerik yok; site İngilizce sürümü gösteriyor.',
   'Slug, minutes and status are shared by all languages.' => 'Kısa ad, dakika ve durum tüm dillerde ortaktır.',
+  'notActive' => 'Devre dışı',
 );
