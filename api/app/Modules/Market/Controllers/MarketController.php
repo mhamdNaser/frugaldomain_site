@@ -40,9 +40,10 @@ class MarketController extends Controller
         return response()->json(['data' => $resource->resolve()]);
     }
 
+    /** Any status: the dashboard shows drafts' logos too, and a logo is not private. */
     public function logo(string $slug)
     {
-        $item = $this->published($slug);
+        $item = MarketItem::where('slug', $slug)->firstOrFail();
         abort_unless($item->logo_path && Storage::disk('local')->exists($item->logo_path), 404);
 
         return response()->file(Storage::disk('local')->path($item->logo_path), ['Cache-Control' => 'public, max-age=86400']);
@@ -121,6 +122,13 @@ class MarketController extends Controller
                 'paid_at' => $p->paid_at,
                 'created_at' => $p->created_at,
                 'payment_method' => $p->paymentMethod?->only(['id', 'name', 'driver']),
+                // Still to pay offline: where to send it (never the method's secrets).
+                'pay_to' => $p->status === 'pending' && $p->paymentMethod && in_array($p->paymentMethod->driver, ['manual', 'shamcash'], true) ? [
+                    'instructions' => (object) ($p->paymentMethod->instructions ?? []),
+                    'account' => $p->paymentMethod->driver === 'shamcash'
+                        ? ['code' => $p->paymentMethod->config['account_code'] ?? '', 'name' => $p->paymentMethod->config['account_name'] ?? '']
+                        : null,
+                ] : null,
                 'item' => $p->item ? (new MarketItemResource($p->item))->resolve() : null,
             ]);
 

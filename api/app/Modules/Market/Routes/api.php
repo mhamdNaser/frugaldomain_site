@@ -31,7 +31,6 @@ Route::prefix('admin/market')->middleware(['auth:sanctum', 'role:admin'])->contr
     Route::delete('items/{id}', 'destroy');
     Route::post('items/{id}/file', 'uploadFile');
     Route::post('items/{id}/logo', 'uploadLogo');
-    Route::get('items/{id}/logo', 'logo');
     Route::post('items/{id}/sync', 'sync')->middleware('throttle:10,1');
     Route::get('purchases', 'purchases');
     Route::post('purchases/{id}/confirm', 'confirm');

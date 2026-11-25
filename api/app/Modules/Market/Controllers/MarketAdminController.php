@@ -126,18 +126,10 @@ class MarketAdminController extends Controller
         return $item->toArray() + [
             'has_token' => (bool) $item->github_token,
             'has_file' => (bool) $item->file_path,
-            'logo_url' => $item->logo_path ? url('/api/admin/market/items/'.$item->id.'/logo').'?v='.$item->updated_at?->timestamp : null,
+            'logo_url' => $item->logo_path ? url('/api/market/items/'.$item->slug.'/logo').'?v='.$item->updated_at?->timestamp : null,
             'file_name' => $item->file_path ? $item->downloadFilename() : null,
             'github_repo' => $item->github_repo,
         ];
-    }
-
-    public function logo(int $id)
-    {
-        $item = MarketItem::findOrFail($id);
-        abort_unless($item->logo_path && Storage::disk('local')->exists($item->logo_path), 404);
-
-        return response()->file(Storage::disk('local')->path($item->logo_path), ['Cache-Control' => 'private, max-age=300']);
     }
 
     private function forget(): void
