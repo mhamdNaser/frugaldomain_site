@@ -13,6 +13,7 @@ return [
     App\Modules\Component\Providers\ComponentServiceProvider::class,
     App\Modules\Drawing\Providers\DrawingServiceProvider::class,
     App\Modules\DesktopSoftware\Providers\DesktopSoftwareServiceProvider::class,
+    App\Modules\Market\Providers\MarketServiceProvider::class,
     App\Modules\Rating\Providers\RatingServiceProvider::class,
     App\Modules\Form\Providers\FormServiceProvider::class,
     App\Modules\Fulfillment\Providers\FulfillmentServiceProvider::class,

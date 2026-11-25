@@ -3,7 +3,6 @@
 namespace App\Modules\Billing\Gateways;
 
 use App\Modules\Billing\Models\PaymentMethod;
-use App\Modules\Billing\Models\Subscription;
 use Illuminate\Support\Facades\Http;
 
 /**
@@ -25,39 +24,39 @@ class StripeGateway implements PaymentGateway
         ]];
     }
 
-    public function checkout(Subscription $subscription, PaymentMethod $method): array
+    public function checkout(Payable $payable, PaymentMethod $method): array
     {
-        $return = rtrim((string) config('app.frontend_url'), '/').'/admin/billing/upgrade?subscription='.$subscription->id;
+        $return = rtrim((string) config('app.frontend_url'), '/').$payable->payableReturnPath();
 
         $session = $this->http($method)->asForm()->post('https://api.stripe.com/v1/checkout/sessions', [
             'mode' => 'payment',
-            'client_reference_id' => (string) $subscription->id,
+            'client_reference_id' => (string) $payable->getKey(),
             'success_url' => $return.'&paid=1',
             'cancel_url' => $return.'&canceled=1',
             'line_items' => [[
                 'quantity' => 1,
                 'price_data' => [
                     'currency' => $this->currency($method),
-                    'unit_amount' => $this->cents($subscription),
-                    'product_data' => ['name' => $subscription->plan->name],
+                    'unit_amount' => $this->cents($payable),
+                    'product_data' => ['name' => $payable->payableTitle()],
                 ],
             ]],
         ])->throw()->json();
 
-        $subscription->forceFill(['reference' => $session['id']])->save();
+        $payable->forceFill(['reference' => $session['id']])->save();
 
         return ['type' => 'redirect', 'url' => $session['url']];
     }
 
-    public function verify(Subscription $subscription, PaymentMethod $method): ?bool
+    public function verify(Payable $payable, PaymentMethod $method): ?bool
     {
-        if (! $subscription->reference) {
+        if (! $payable->reference) {
             return false;
         }
-        $session = $this->http($method)->get('https://api.stripe.com/v1/checkout/sessions/'.$subscription->reference)->throw()->json();
+        $session = $this->http($method)->get('https://api.stripe.com/v1/checkout/sessions/'.$payable->reference)->throw()->json();
 
         return ($session['payment_status'] ?? null) === 'paid'
-            && (int) ($session['amount_total'] ?? -1) === $this->cents($subscription)
+            && (int) ($session['amount_total'] ?? -1) === $this->cents($payable)
             && strtolower((string) ($session['currency'] ?? '')) === $this->currency($method);
     }
 
@@ -76,8 +75,8 @@ class StripeGateway implements PaymentGateway
         return strtolower(($method->config['currency'] ?? '') ?: 'usd');
     }
 
-    private function cents(Subscription $subscription): int
+    private function cents(Payable $payable): int
     {
-        return (int) round((float) $subscription->plan->price * 100);
+        return (int) round($payable->payableAmount() * 100);
     }
 }

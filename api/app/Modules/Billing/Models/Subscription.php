@@ -5,7 +5,7 @@ namespace App\Modules\Billing\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
-class Subscription extends Model
+class Subscription extends Model implements \App\Modules\Billing\Gateways\Payable
 {
     use SoftDeletes;
 
@@ -41,6 +41,21 @@ class Subscription extends Model
     public function paymentMethod()
     {
         return $this->belongsTo(PaymentMethod::class);
+    }
+
+    public function payableAmount(): float
+    {
+        return (float) $this->plan->price;
+    }
+
+    public function payableTitle(): string
+    {
+        return (string) $this->plan->name;
+    }
+
+    public function payableReturnPath(): string
+    {
+        return '/admin/billing/upgrade?subscription='.$this->id;
     }
 
     public function store()

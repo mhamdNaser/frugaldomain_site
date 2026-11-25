@@ -41,3 +41,18 @@ Schedule::command("queue:work --queue={$queues} --stop-when-empty --max-time=50 
 Schedule::command('shopify:outbound-dispatch-due --limit=100')
     ->everyMinute()
     ->withoutOverlapping(5);
+
+// Marketplace items linked to a private GitHub repo: fetch the newest release zip.
+Artisan::command('market:sync-releases', function (App\Modules\Market\Services\MarketReleaseService $releases) {
+    App\Modules\Market\Models\MarketItem::where('source', 'github')->whereNotNull('github_repo')->each(function ($item) use ($releases) {
+        try {
+            $releases->sync($item);
+            $this->info("{$item->slug}: {$item->version}");
+        } catch (Throwable $e) {
+            Illuminate\Support\Facades\Log::warning("market:sync-releases {$item->slug}: ".$e->getMessage());
+            $this->warn("{$item->slug}: ".$e->getMessage());
+        }
+    });
+})->purpose('Download the newest GitHub release of every linked marketplace item');
+
+Schedule::command('market:sync-releases')->hourly()->withoutOverlapping(30);

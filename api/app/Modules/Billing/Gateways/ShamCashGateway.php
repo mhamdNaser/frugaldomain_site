@@ -3,7 +3,6 @@
 namespace App\Modules\Billing\Gateways;
 
 use App\Modules\Billing\Models\PaymentMethod;
-use App\Modules\Billing\Models\Subscription;
 
 /**
  * Sham Cash has no public payment API: the owner sends the amount to the admin's
@@ -25,21 +24,22 @@ class ShamCashGateway implements PaymentGateway
         ]];
     }
 
-    public function checkout(Subscription $subscription, PaymentMethod $method): array
+    public function checkout(Payable $payable, PaymentMethod $method): array
     {
         $config = $method->config ?? [];
 
         return [
             'type' => 'instructions',
-            'subscription_id' => $subscription->id,
+            'subscription_id' => $payable->getKey(),
+            'payable_id' => $payable->getKey(),
             'instructions' => (object) ($method->instructions ?? []),
             'account' => ['code' => $config['account_code'] ?? '', 'name' => $config['account_name'] ?? ''],
-            'amount' => number_format((float) $subscription->plan->price, 2, '.', ''),
+            'amount' => number_format($payable->payableAmount(), 2, '.', ''),
             'proof' => $this->proof(),
         ];
     }
 
-    public function verify(Subscription $subscription, PaymentMethod $method): ?bool
+    public function verify(Payable $payable, PaymentMethod $method): ?bool
     {
         return null;
     }

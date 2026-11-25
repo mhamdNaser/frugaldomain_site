@@ -3,7 +3,6 @@
 namespace App\Modules\Billing\Gateways;
 
 use App\Modules\Billing\Models\PaymentMethod;
-use App\Modules\Billing\Models\Subscription;
 
 /** Bank transfer, card details or cash: shows the admin's instructions; the admin confirms the payment. */
 class ManualGateway implements PaymentGateway
@@ -18,17 +17,19 @@ class ManualGateway implements PaymentGateway
         return ['key' => 'manual', 'label' => 'Manual (bank transfer, confirmed by admin)', 'fields' => []];
     }
 
-    public function checkout(Subscription $subscription, PaymentMethod $method): array
+    public function checkout(Payable $payable, PaymentMethod $method): array
     {
         return [
             'type' => 'instructions',
-            'subscription_id' => $subscription->id,
+            'subscription_id' => $payable->getKey(),
+            'payable_id' => $payable->getKey(),
+            'amount' => number_format($payable->payableAmount(), 2, '.', ''),
             'instructions' => (object) ($method->instructions ?? []),
             'proof' => $this->proof(),
         ];
     }
 
-    public function verify(Subscription $subscription, PaymentMethod $method): ?bool
+    public function verify(Payable $payable, PaymentMethod $method): ?bool
     {
         return null;
     }

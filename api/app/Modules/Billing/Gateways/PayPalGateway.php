@@ -3,7 +3,6 @@
 namespace App\Modules\Billing\Gateways;
 
 use App\Modules\Billing\Models\PaymentMethod;
-use App\Modules\Billing\Models\Subscription;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Facades\Http;
 
@@ -29,17 +28,17 @@ class PayPalGateway implements PaymentGateway
         ]];
     }
 
-    public function checkout(Subscription $subscription, PaymentMethod $method): array
+    public function checkout(Payable $payable, PaymentMethod $method): array
     {
         [$http, $base] = $this->client($method);
-        $return = rtrim((string) config('app.frontend_url'), '/').'/admin/billing/upgrade?subscription='.$subscription->id;
+        $return = rtrim((string) config('app.frontend_url'), '/').$payable->payableReturnPath();
 
         $order = $http->post("{$base}/v2/checkout/orders", [
             'intent' => 'CAPTURE',
             'purchase_units' => [[
-                'custom_id' => (string) $subscription->id,
-                'description' => $subscription->plan->name,
-                'amount' => ['currency_code' => $this->currency($method), 'value' => $this->amount($subscription)],
+                'custom_id' => (string) $payable->getKey(),
+                'description' => mb_substr($payable->payableTitle(), 0, 120),
+                'amount' => ['currency_code' => $this->currency($method), 'value' => $this->amount($payable)],
             ]],
             'application_context' => [
                 'return_url' => $return.'&paid=1',
@@ -49,29 +48,29 @@ class PayPalGateway implements PaymentGateway
             ],
         ])->throw()->json();
 
-        $subscription->forceFill(['reference' => $order['id']])->save();
+        $payable->forceFill(['reference' => $order['id']])->save();
         $approve = collect($order['links'] ?? [])->firstWhere('rel', 'approve') ?? collect($order['links'] ?? [])->firstWhere('rel', 'payer-action');
         abort_unless($approve, 502, 'PayPal did not return an approval link.');
 
         return ['type' => 'redirect', 'url' => $approve['href']];
     }
 
-    public function verify(Subscription $subscription, PaymentMethod $method): ?bool
+    public function verify(Payable $payable, PaymentMethod $method): ?bool
     {
-        if (! $subscription->reference) {
+        if (! $payable->reference) {
             return false;
         }
         [$http, $base] = $this->client($method);
 
-        $res = $http->post("{$base}/v2/checkout/orders/{$subscription->reference}/capture", (object) []);
+        $res = $http->post("{$base}/v2/checkout/orders/{$payable->reference}/capture", (object) []);
         // Already captured (a second click, or a reload): read the order instead.
-        $order = $res->successful() ? $res->json() : $http->get("{$base}/v2/checkout/orders/{$subscription->reference}")->json();
+        $order = $res->successful() ? $res->json() : $http->get("{$base}/v2/checkout/orders/{$payable->reference}")->json();
 
         $capture = data_get($order, 'purchase_units.0.payments.captures.0');
 
         return data_get($order, 'status') === 'COMPLETED'
             && data_get($capture, 'status') === 'COMPLETED'
-            && data_get($capture, 'amount.value') === $this->amount($subscription)
+            && data_get($capture, 'amount.value') === $this->amount($payable)
             && strtoupper((string) data_get($capture, 'amount.currency_code')) === $this->currency($method);
     }
 
@@ -99,8 +98,8 @@ class PayPalGateway implements PaymentGateway
         return strtoupper(($method->config['currency'] ?? '') ?: 'USD');
     }
 
-    private function amount(Subscription $subscription): string
+    private function amount(Payable $payable): string
     {
-        return number_format((float) $subscription->plan->price, 2, '.', '');
+        return number_format($payable->payableAmount(), 2, '.', '');
     }
 }
