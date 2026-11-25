@@ -5,7 +5,7 @@ namespace App\Modules\Billing\Gateways;
 use App\Modules\Billing\Models\PaymentMethod;
 use App\Modules\Billing\Models\Subscription;
 
-/** Bank transfer or cash: shows the admin's instructions; the admin confirms the payment. */
+/** Bank transfer, card details or cash: shows the admin's instructions; the admin confirms the payment. */
 class ManualGateway implements PaymentGateway
 {
     public function key(): string
@@ -20,11 +20,21 @@ class ManualGateway implements PaymentGateway
 
     public function checkout(Subscription $subscription, PaymentMethod $method): array
     {
-        return ['type' => 'instructions', 'instructions' => (object) ($method->instructions ?? [])];
+        return [
+            'type' => 'instructions',
+            'subscription_id' => $subscription->id,
+            'instructions' => (object) ($method->instructions ?? []),
+            'proof' => $this->proof(),
+        ];
     }
 
-    public function cancel(Subscription $subscription, PaymentMethod $method): void
+    public function verify(Subscription $subscription, PaymentMethod $method): ?bool
     {
-        // Nothing to undo outside this app.
+        return null;
+    }
+
+    public function proof(): ?string
+    {
+        return 'optional';
     }
 }

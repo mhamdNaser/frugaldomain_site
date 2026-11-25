@@ -55,6 +55,9 @@ Route::prefix('admin')->group(function () {
     Route::middleware(['auth:sanctum', 'role:admin'])->group(function () {
         Route::post('logout', [AuthController::class, 'logout']);
 
+        Route::get('partners', [\App\Modules\User\Controllers\PartnerController::class, 'index']);
+        Route::post('partners', [\App\Modules\User\Controllers\PartnerController::class, 'store'])->middleware('throttle:20,1');
+
 
         Route::controller(AdminRoleController::class)->group(function () {
             Route::get('/roles', 'allRoles')->name('all-roles');

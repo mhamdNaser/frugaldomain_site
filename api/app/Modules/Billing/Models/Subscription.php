@@ -18,13 +18,35 @@ class Subscription extends Model
         'started_at',
         'ends_at',
         'trial_ends_at',
+        'receipt_path',
+        'proof_submitted_at',
     ];
+
+    protected $hidden = ['receipt_path'];
 
     protected $casts = [
         'started_at' => 'datetime',
         'ends_at' => 'datetime',
         'trial_ends_at' => 'datetime',
+        'proof_submitted_at' => 'datetime',
     ];
+
+    protected $appends = ['has_receipt'];
+
+    public function getHasReceiptAttribute(): bool
+    {
+        return (bool) $this->receipt_path;
+    }
+
+    public function paymentMethod()
+    {
+        return $this->belongsTo(PaymentMethod::class);
+    }
+
+    public function store()
+    {
+        return $this->belongsTo(\App\Modules\Stores\Models\Store::class);
+    }
 
     public function plan()
     {

@@ -29,6 +29,8 @@ Route::prefix('admin')->group(function () {
     Route::middleware(['auth:sanctum', 'role:partner'])->controller(\App\Modules\Billing\Controllers\CheckoutController::class)->group(function () {
         Route::get('billing/plans', 'plans');
         Route::post('billing/checkout', 'checkout')->middleware('throttle:10,1');
+        Route::post('billing/subscriptions/{id}/verify', 'verify')->middleware('throttle:20,1');
+        Route::post('billing/subscriptions/{id}/proof', 'proof')->middleware('throttle:10,1');
     });
 
     // Plans and subscriptions are platform billing settings: super admin only.
@@ -58,5 +60,6 @@ Route::prefix('admin')->group(function () {
             Route::put('plans/{planId}/payment-methods', 'syncPlan');
         });
         Route::post('subscriptions/{id}/confirm', [\App\Modules\Billing\Controllers\CheckoutController::class, 'confirm']);
+        Route::get('subscriptions/{id}/receipt', [\App\Modules\Billing\Controllers\CheckoutController::class, 'receipt']);
     });
 });

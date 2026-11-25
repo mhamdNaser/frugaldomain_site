@@ -78,10 +78,28 @@ in Google Search Console.
 
 ## 7. Billing (optional now)
 
-Admin → Shopify → **Payment Methods**: add "Bank transfer" (manual) with
-instructions in each language; Admin → Shopify → **Plans**: create a paid plan
-and tick its payment methods. Pending payments are confirmed from
-**Subscriptions** → *Confirm payment*. The free plan stays the default.
+`.env` must have `FRONTEND_URL=https://frugaldomain.site`: PayPal and Stripe send
+the buyer back to `/admin/billing/upgrade` on that host.
+
+Admin → Shopify → **Payment Methods** → *Add payment method*, then pick the type:
+
+| Type | What to fill in | How the plan switches |
+|--|--|--|
+| PayPal (also Visa / Mastercard) | Client ID + secret from developer.paypal.com → Apps & Credentials, mode `sandbox` first, then `live` | automatically after the capture |
+| Stripe (Visa / Mastercard) | secret key `sk_test_...` (then `sk_live_...`) | automatically once the session is paid |
+| Sham Cash | your account code (+ holder name) | the owner sends the transfer number / receipt photo; you press *Confirm payment* |
+| Manual | instructions in each language (bank or card details) | same as Sham Cash, proof optional |
+
+Then Admin → Shopify → **Plans**: create a paid plan and tick its payment
+methods. Receipts show under **Subscriptions** (*Receipt* button); they are
+stored privately in `api/storage/app/private/billing-receipts`, never in public.
+The free plan stays the default.
+
+## 7b. Store owners
+
+Admin → Shopify → **Store Owners** lists every store owner (with or without a
+store) and adds one by hand. Owners can also sign up on their own at
+`/shopify/register` and sign in at `/shopify/login`.
 
 ## 8. Popup
 

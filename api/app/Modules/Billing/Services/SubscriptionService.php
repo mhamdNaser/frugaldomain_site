@@ -7,7 +7,9 @@ use App\Modules\Billing\Models\PaymentMethod;
 use App\Modules\Billing\Models\Plan;
 use App\Modules\Billing\Models\Subscription;
 use App\Modules\Stores\Models\Store;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
 
 class SubscriptionService
@@ -48,6 +50,52 @@ class SubscriptionService
         });
 
         return $this->gateways->get($method->driver)->checkout($subscription, $method);
+    }
+
+    /** The store's own subscription, or 404 (another store's id looks like a missing one). */
+    public function ownedBy(Store $store, int $id): Subscription
+    {
+        return Subscription::where('store_id', $store->id)->with(['plan', 'paymentMethod'])->findOrFail($id);
+    }
+
+    /** Back from an online gateway: asks the provider, and switches the plan only on a full payment. */
+    public function verifyPayment(Subscription $subscription): Subscription
+    {
+        if ($subscription->status === 'active') {
+            return $subscription;
+        }
+        abort_unless($subscription->status === 'pending' && $subscription->paymentMethod, 422, 'This payment is no longer open.');
+
+        $paid = $this->gateways->get($subscription->paymentMethod->driver)->verify($subscription, $subscription->paymentMethod);
+        abort_if($paid === null, 422, 'This payment is confirmed by the site admin.');
+        abort_unless($paid, 422, 'The payment is not complete yet.');
+
+        return $this->activate($subscription);
+    }
+
+    /** Transfer number and / or receipt photo for an offline payment; the admin then confirms it. */
+    public function submitProof(Subscription $subscription, ?string $reference, ?UploadedFile $receipt): Subscription
+    {
+        abort_unless($subscription->status === 'pending' && $subscription->paymentMethod, 422, 'This payment is no longer open.');
+        $proof = $this->gateways->get($subscription->paymentMethod->driver)->proof();
+        abort_if($proof === null, 422, 'This payment method does not take a receipt.');
+
+        if ($reference === null && $receipt === null) {
+            throw ValidationException::withMessages(['reference' => 'Enter the transfer number or attach the receipt.']);
+        }
+
+        $old = $subscription->receipt_path;
+        $subscription->forceFill([
+            'reference' => $reference ?? $subscription->reference,
+            'receipt_path' => $receipt ? $receipt->store('billing-receipts', 'local') : $old,
+            'proof_submitted_at' => now(),
+        ])->save();
+
+        if ($receipt && $old) {
+            Storage::disk('local')->delete($old);
+        }
+
+        return $subscription;
     }
 
     /** Idempotent: confirming an already active subscription changes nothing. */

@@ -18,12 +18,13 @@ class FrontendSubscriptionsRepository implements SubscriptionsRepositoryInterfac
         $storeId = $this->resolveTenantStoreId($storeId);
 
         return $this->applyTenantScope(Subscription::query())
-            ->with('plan:id,name,price,billing_interval,is_active')
+            ->with(['plan:id,name,price,billing_interval,is_active', 'paymentMethod:id,name,driver', 'store:id,name,shopify_domain'])
             ->when($storeId, fn ($query) => $query->where('store_id', $storeId))
             ->when($planId, fn ($query) => $query->where('plan_id', $planId))
             ->when($search, function ($query, string $search) {
                 $query->where(function ($query) use ($search) {
                     $query->where('status', 'like', "%{$search}%")
+                        ->orWhere('reference', 'like', "%{$search}%")
                         ->orWhereHas('plan', fn ($query) => $query->where('name', 'like', "%{$search}%"));
                 });
             })

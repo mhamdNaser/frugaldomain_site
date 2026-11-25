@@ -8,6 +8,7 @@ use App\Modules\Billing\Models\Subscription;
 use App\Modules\Billing\Services\SubscriptionService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Storage;
 
 class CheckoutController extends Controller
 {
@@ -51,6 +52,46 @@ class CheckoutController extends Controller
         $result = $this->subscriptions->checkout($store, Plan::findOrFail($data['plan_id']), $data['payment_method_id'] ?? null);
 
         return response()->json(['data' => $result]);
+    }
+
+    /** Store owner, back from PayPal or Stripe. */
+    public function verify(Request $request, int $id)
+    {
+        $subscription = $this->subscriptions->verifyPayment($this->subscriptions->ownedBy($this->ownStore($request), $id));
+
+        return response()->json(['data' => ['status' => $subscription->status]]);
+    }
+
+    /** Store owner: transfer number and / or receipt photo for a manual or Sham Cash payment. */
+    public function proof(Request $request, int $id)
+    {
+        $subscription = $this->subscriptions->ownedBy($this->ownStore($request), $id);
+        $data = $request->validate([
+            'reference' => ['nullable', 'string', 'max:120'],
+            'receipt' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,pdf', 'max:5120'],
+        ]);
+        $reference = isset($data['reference']) ? trim(strip_tags($data['reference'])) : '';
+
+        $this->subscriptions->submitProof($subscription, $reference !== '' ? $reference : null, $request->file('receipt'));
+
+        return response()->json(['message' => 'Thanks. We will confirm the payment soon.']);
+    }
+
+    /** Super admin: the receipt a store owner uploaded (private file). */
+    public function receipt(int $id)
+    {
+        $path = Subscription::findOrFail($id)->receipt_path;
+        abort_unless($path && Storage::disk('local')->exists($path), 404);
+
+        return Storage::disk('local')->response($path);
+    }
+
+    private function ownStore(Request $request)
+    {
+        $store = $request->user()->store()->first();
+        abort_unless($store, 404, 'Connect a store first.');
+
+        return $store;
     }
 
     /** Super admin: confirm a manual payment. Safe to repeat. */

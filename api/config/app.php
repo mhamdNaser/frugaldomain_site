@@ -54,6 +54,9 @@ return [
 
     'url' => env('APP_URL', 'http://localhost'),
 
+    // The React site, for links the API sends people back to (payment returns).
+    'frontend_url' => env('FRONTEND_URL', 'https://frugaldomain.site'),
+
     /*
     |--------------------------------------------------------------------------
     | Application Timezone
