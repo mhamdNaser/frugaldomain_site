@@ -129,7 +129,7 @@ HTML;
     }
 
     /**
-     * Reads `?dir=rtl` and `?theme=dark` off the URL.
+     * Reads `?dir=rtl`, `?theme=dark` and `?accent=c9a96e` (6 hex digits) off the URL.
      *
      * Every template is a static file, so there is no server to negotiate
      * with: this is what lets the gallery show the same component in Arabic
@@ -145,6 +145,8 @@ HTML;
             . "  if(dir==='rtl')document.documentElement.lang='ar';\n"
             . "  var theme=q.get('theme');\n"
             . "  if(theme==='dark'||theme==='light')document.documentElement.dataset.theme=theme;\n"
+            . "  var acc=q.get('accent');\n"
+            . "  if(acc&&/^[0-9a-f]{6}$/i.test(acc)){var st=document.documentElement.style;st.setProperty('--acc','#'+acc);st.setProperty('--acc-dk','#'+acc);st.setProperty('--acc-soft','#'+acc+'29');}\n"
             . '})();';
     }
 
