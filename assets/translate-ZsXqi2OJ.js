@@ -1,0 +1,1 @@
+import{cA as e}from"./index-BnTdlsqD.js";function f(n,t,i){if(t==null||t==="")return"";const o=typeof i=="string"?i:"";let r=n?.[t]??n?.site?.[t]??n?.admin?.[t]??(o||t);return typeof r!="string"&&(r=String(t)),r}function a(n,t){return f(e.getState().translation.translations,n,t)}export{a as t};
