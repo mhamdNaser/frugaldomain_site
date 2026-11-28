@@ -244,7 +244,17 @@ function fg_home_page(string $html, array $sections, string $lang): string
     $openEnds = $open === false ? false : strpos($html, '>', $open);
     $close = strripos($html, '</main>');
     if ($openEnds !== false && $close !== false && $close > $openEnds) {
-        $html = substr($html, 0, $openEnds + 1) . fg_home_html($sections, $lang) . substr($html, $close);
+        $body = fg_home_html($sections, $lang);
+        // The frugaldomain.online banner is part of the page, not an admin section:
+        // carry the prerendered block over, right after the hero.
+        $bannerAt = strpos($html, '<section class="fg-section" data-online-banner');
+        $bannerEnds = $bannerAt === false ? false : strpos($html, '</section>', $bannerAt);
+        if ($bannerAt !== false && $bannerEnds !== false && $bannerEnds < $close) {
+            $banner = substr($html, $bannerAt, $bannerEnds + 10 - $bannerAt);
+            $heroEnds = strpos($body, '</section>');
+            $body = $heroEnds === false ? $banner . $body : substr($body, 0, $heroEnds + 10) . $banner . substr($body, $heroEnds + 10);
+        }
+        $html = substr($html, 0, $openEnds + 1) . $body . substr($html, $close);
     }
     $head = stripos($html, '</head>');
 

@@ -1,7 +1,7 @@
 <?php
 
 /**
- * What a course, a component or a marketplace item's address is served.
+ * What a course or a marketplace item's address is served.
  *
  * Same approach as learn-preview.php (lessons): these pages have no prerendered
  * snapshot, so a crawler would otherwise get the bare app page. This fetches
@@ -11,7 +11,6 @@
  * replaces these tags, which carry data-rh for that).
  *
  *   page-preview.php?kind=course&lang=ar&slug=networking-foundations-ccna
- *   page-preview.php?kind=component&lang=&slug=pricing-cards
  *   page-preview.php?kind=market&type=themes&lang=&slug=aurora
  */
 
@@ -41,7 +40,6 @@ $marketType = ($_GET['type'] ?? '') === 'apps' ? 'apps' : 'themes';
 
 $page = match ($kind) {
     'course' => coursePage($lang, $slug),
-    'component' => componentPage($lang, $slug),
     'market' => marketPage($lang, $slug, $marketType),
     default => ['status' => 404],
 };
@@ -135,47 +133,6 @@ function coursePage(string $lang, string $slug): array
         ],
         'crumbs' => [[$t['home'], '/'], [$t['learn'], '/learn'], [$course['title'], '/learn/' . $slug]],
         'body' => $body,
-    ];
-}
-
-function componentPage(string $lang, string $slug): array
-{
-    [$status, $data] = api('en', '/components/' . rawurlencode($slug), $slug);
-    $c = $data['component'] ?? null;
-    if (! $c) {
-        return ['status' => $status];
-    }
-    $ar = $lang === 'ar';
-    $name = (string) (($ar ? ($c['name_ar'] ?? '') : '') ?: $c['name']);
-    $tagline = (string) (($ar ? ($c['tagline_ar'] ?? '') : '') ?: ($c['tagline'] ?? ''));
-    $summary = (string) (($ar ? ($c['summary_ar'] ?? '') : '') ?: ($c['summary'] ?? ''));
-    $t = label($lang);
-
-    $features = [];
-    foreach ((array) ($c['features'] ?? []) as $f) {
-        $features[] = (string) (($ar ? ($f['label_ar'] ?? '') : '') ?: ($f['label'] ?? ''));
-    }
-
-    return [
-        'status' => 200,
-        'path' => '/components/' . $slug,
-        // Only English and Arabic are written; hi / zh / tr show the English and stay out of the index.
-        'locales' => ! empty($c['name_ar']) ? ['en', 'ar'] : ['en'],
-        'title' => sprintf($t['component_title'], $name),
-        'description' => $tagline ?: $summary ?: $name,
-        'og_type' => 'article',
-        'schema' => [
-            '@type' => 'SoftwareSourceCode',
-            'name' => $name,
-            'description' => singleLine($tagline ?: $summary ?: $name),
-            'programmingLanguage' => implode(', ', (array) ($c['stack'] ?? [])) ?: 'HTML',
-            'keywords' => implode(', ', (array) ($c['tags'] ?? [])),
-            'dateModified' => $c['updated'] ?? null,
-            'isAccessibleForFree' => true,
-        ],
-        'crumbs' => [[$t['home'], '/'], [$t['components'], '/components'], [$name, '/components/' . $slug]],
-        'body' => '<p style="margin:0;font-size:13px;opacity:.7">' . e($t['components']) . '</p>' . h1($name)
-            . para($tagline, 'font-size:18px;opacity:.8') . para($summary) . listOf(array_filter($features)),
     ];
 }
 
